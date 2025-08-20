@@ -1,3 +1,4 @@
 eslint.config.mjs
 node_modules/
 .prettierrc
+**/*.db
