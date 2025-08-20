@@ -1,0 +1,181 @@
+import type { NextFunction, Request, Response } from "express";
+import express from "express";
+import {
+	AddBooking,
+	AddCustomer,
+	AddEmailToCustomer,
+	AddTable,
+	GetCustomerId,
+} from "./database.ts";
+const app = express();
+const port = 3000;
+
+function validate(req: Request, res: Response, next: NextFunction) {
+	next();
+	// return res.status(400).json({ error: "Auth failed" });
+}
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+async function GetCustomerIdOrCreateCustomer(
+	name: string,
+	number: string,
+	email?: string | undefined,
+): Promise<number | null> {
+	let customer = { name, number, email };
+	let cust_id: number | null = await GetCustomerId(
+		customer.name,
+		customer.number,
+	);
+	if (cust_id == null) {
+		cust_id = (
+			await AddCustomer(customer.name, customer.number, customer.email)
+		).dataValues.customer_id;
+	}
+
+	if (cust_id && customer.email) {
+		AddEmailToCustomer(cust_id, customer.email);
+	}
+
+	return cust_id;
+}
+
+/*
+    Needs request body as
+    {
+       "customer": {
+           "name": "Example",
+           "number": "+91 9923523232", // try keeping all in the same format whatever the format is
+           "email": "k@gmail.com" // Optional
+       }
+    }
+    returns the customer_id if you want to store it somewhere
+*/
+
+app.post("/add-customer", validate, async (req, res) => {
+	let customer = req.body.customer;
+	if (!(customer.name && customer.number)) {
+		res.status(400).json({ error: "Missing required fields" });
+		return;
+	}
+
+	let cust_id = await GetCustomerIdOrCreateCustomer(
+		customer.name,
+		customer.number,
+		customer.email,
+	);
+
+	console.log(cust_id);
+	res.send(cust_id);
+});
+
+/*
+    Needs request body as
+    {
+       "table": {
+           "name": "T1",
+           "capacity": 4 // Optional
+       }
+    }
+    returns the table_name if you want to store it somewhere
+*/
+app.post("/add-table", validate, async (req, res) => {
+	let table = req.body.table;
+	if (!table.name) {
+		res.status(400).json({ error: "Missing required fields" });
+		return;
+	}
+
+	let table_name;
+	try {
+		table_name = (await AddTable(table.name, parseInt(table.capacity)))
+			.dataValues.table_name;
+	} catch {
+		table_name = null;
+	}
+	if (!table_name) {
+		res.status(400).json({ error: "Table exists" });
+		return;
+	}
+
+	res.send(table_name);
+});
+
+/*
+Needs request body as
+{
+    // creates customer if the name+number does not exist
+    "customer": {
+       "name": "Jhon",
+       "number": "9972955566",
+       "email": "example@gmail.com" //optional
+   },
+   // Table must exist
+   "booking": {
+        "table_name": "T1",
+        "date": "YYYY-MM-DDThh:mm:ssTZD"
+        "duration": "30" // in minutes
+        "number_of_people": "3"
+   }
+}
+returns the booking id
+*/
+app.post("/add-booking", validate, async (req, res) => {
+	let customer = req.body.customer;
+	if (!(customer.name && customer.number)) {
+		res.status(400).json({ error: "Missing customer field(s)" });
+		return;
+	}
+
+	let booking_request = req.body.booking;
+	if (
+		!(
+			booking_request.table_name &&
+			booking_request.date &&
+			booking_request.duration &&
+			booking_request.number_of_people
+		)
+	) {
+		res.status(400).json({ error: "Missing booking field(s)" });
+		return;
+	}
+	let cust_id = await GetCustomerIdOrCreateCustomer(
+		customer.name,
+		customer.number,
+		customer.email,
+	);
+	if (cust_id == null) {
+		res.status(400).json({
+			error: "Something went wrong in creating/getting customer id",
+		});
+		return;
+	}
+
+	let date: Date = new Date(booking_request.date);
+	if (isNaN(date.getTime())) {
+		res.status(400).json({ error: "Time is in the wrong format" });
+		return;
+	}
+
+    let booking;
+    try {
+        booking = await AddBooking(
+            cust_id,
+            booking_request.table_name,
+            date,
+            booking_request.duration,
+            booking_request.number_of_people,
+        );
+    } catch (error) {
+        res.status(400).json({error: "Oops something went wrong"});
+        return;
+    }
+	let booking_id = booking.dataValues.booking_id;
+
+	res.json(booking_id);
+});
+
+app.listen(port, () => {
+	console.log(`Server listening at http://localhost:${port}`);
+});
