@@ -62,6 +62,7 @@ Needs request body as
             "date": "YYYY-MM-DDThh:mm:ssTZD"
                 "duration": "30" // in minutes
                 "number_of_people": "3"
+                "source": "EasyDiner" //Optional
         }
     ```
 }

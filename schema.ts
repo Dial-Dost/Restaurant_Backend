@@ -88,6 +88,9 @@ const Booking = sequelize.define(
             type: DataTypes.INTEGER,
             allowNull: false,
         },
+        source: {
+            type: DataTypes.STRING,
+        }
     },
     {
         tableName: "Bookings",

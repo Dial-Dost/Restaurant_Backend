@@ -117,6 +117,7 @@ Needs request body as
         "date": "YYYY-MM-DDThh:mm:ssTZD"
         "duration": "30" // in minutes
         "number_of_people": "3"
+        "source": "EasyDiner"
    }
 }
 returns the booking id
@@ -134,7 +135,7 @@ app.post("/add-booking", validate, async (req, res) => {
 			booking_request.table_name &&
 			booking_request.date &&
 			booking_request.duration &&
-			booking_request.number_of_people
+			booking_request.number_of_people &&
 		)
 	) {
 		res.status(400).json({ error: "Missing booking field(s)" });
@@ -166,6 +167,7 @@ app.post("/add-booking", validate, async (req, res) => {
             date,
             booking_request.duration,
             booking_request.number_of_people,
+            booking_request.source,
         );
     } catch (error) {
         res.status(400).json({error: "Oops something went wrong"});

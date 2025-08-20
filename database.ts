@@ -24,10 +24,11 @@ function AddTable(table_name: string, capacity?: number): Promise<Model> {
 
 function AddBooking(
 	customer_id: number,
-	table_name: number,
+	table_name: string,
 	booking_date_time: Date,
 	duration: number,
 	number_of_people: number,
+	source?: string,
 ): Promise<Model> {
 	const newBooking = Booking.create({
 		customer_id: customer_id,
@@ -35,6 +36,7 @@ function AddBooking(
 		booking_date_time: booking_date_time,
 		duration_mins: duration,
 		number_of_people: number_of_people,
+		source: source,
 	});
 
 	return newBooking;
