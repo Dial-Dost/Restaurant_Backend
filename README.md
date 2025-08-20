@@ -68,5 +68,37 @@ Needs request body as
 }
 returns the booking id
 
+### /get-tables
+Returns tables in a 2d array in ascending order of capacity.
+```json
+[
+    [
+        {
+            "table_name": "T1",
+            "capacity": 1
+        },
+        {
+            "table_name": "T2",
+            "capacity": 1
+        },
+    ],
+    [
+        {
+            "table_name": "T6",
+            "capacity": 3
+        },
+        {
+            "table_name": "T7",
+            "capacity": 3
+        }
+    ],
+    [
+        {
+            "table_name": "T10",
+            "capacity": 6
+        }
+    ]
+]
+```
 ## Todo
 Implementing auth for each request

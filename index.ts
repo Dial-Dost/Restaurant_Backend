@@ -210,6 +210,37 @@ function FoldedTables(table: any[]): any[][] {
 	return folded_tables;
 }
 
+/*
+Returns tables in a 2d array in ascending order of capacity.
+[
+    [
+        {
+            "table_name": "T1",
+            "capacity": 1
+        },
+        {
+            "table_name": "T2",
+            "capacity": 1
+        },
+    ],
+    [
+        {
+            "table_name": "T6",
+            "capacity": 3
+        },
+        {
+            "table_name": "T7",
+            "capacity": 3
+        }
+    ],
+    [
+        {
+            "table_name": "T10",
+            "capacity": 6
+        }
+    ]
+]
+*/
 app.get("/get-tables", validate, async (req, res) => {
 	let tables;
 	try {
