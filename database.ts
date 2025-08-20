@@ -91,4 +91,19 @@ async function AddEmailToCustomer(cust_id: number, email: string) {
 	}
 }
 
-export { GetCustomerId, AddCustomer, AddEmailToCustomer, AddTable, AddBooking };
+async function GetTables() {
+	return (
+		await Table.findAll({
+			order: [["capacity", "ASC"]],
+		})
+	).map((x) => x.dataValues);
+}
+
+export {
+	GetCustomerId,
+	AddCustomer,
+	AddEmailToCustomer,
+	AddTable,
+	AddBooking,
+	GetTables,
+};

@@ -6,7 +6,9 @@ import {
 	AddEmailToCustomer,
 	AddTable,
 	GetCustomerId,
+	GetTables,
 } from "./database.ts";
+import { sequelize, Table } from "./schema.ts";
 const app = express();
 const port = 3000;
 
@@ -117,7 +119,7 @@ Needs request body as
         "date": "YYYY-MM-DDThh:mm:ssTZD"
         "duration": "30" // in minutes
         "number_of_people": "3"
-        "source": "EasyDiner"
+        "source": "EasyDiner" //Optional
    }
 }
 returns the booking id
@@ -135,7 +137,7 @@ app.post("/add-booking", validate, async (req, res) => {
 			booking_request.table_name &&
 			booking_request.date &&
 			booking_request.duration &&
-			booking_request.number_of_people &&
+			booking_request.number_of_people
 		)
 	) {
 		res.status(400).json({ error: "Missing booking field(s)" });
@@ -159,23 +161,64 @@ app.post("/add-booking", validate, async (req, res) => {
 		return;
 	}
 
-    let booking;
-    try {
-        booking = await AddBooking(
-            cust_id,
-            booking_request.table_name,
-            date,
-            booking_request.duration,
-            booking_request.number_of_people,
-            booking_request.source,
-        );
-    } catch (error) {
-        res.status(400).json({error: "Oops something went wrong"});
-        return;
-    }
+	let booking;
+	try {
+		booking = await AddBooking(
+			cust_id,
+			booking_request.table_name,
+			date,
+			booking_request.duration,
+			booking_request.number_of_people,
+			booking_request.source,
+		);
+	} catch (error) {
+		res.status(400).json({ error: "Oops something went wrong" });
+		return;
+	}
 	let booking_id = booking.dataValues.booking_id;
 
 	res.json(booking_id);
+});
+
+function FoldedTables(table: any[]): any[][] {
+	if (table.length == 0) {
+		return [];
+	}
+
+	let min: number = table[0]["capacity"];
+	let max: number = table[table.length - 1]["capacity"];
+
+	let folded_tables = [];
+
+	let curr_index: number = 0;
+	for (let capacity = min; capacity <= max; capacity++) {
+		let cur_table = [];
+		let push = false;
+		while (
+			table.length > curr_index &&
+			table[curr_index]["capacity"] == capacity
+		) {
+			cur_table.push(table[curr_index]);
+			curr_index += 1;
+			push = true;
+		}
+		if (push) {
+			folded_tables.push(cur_table);
+		}
+	}
+
+	return folded_tables;
+}
+
+app.get("/get-tables", validate, async (req, res) => {
+	let tables;
+	try {
+		tables = await GetTables();
+	} catch {
+		res.status(400).send({ error: "Oops something went wrong" });
+		return;
+	}
+	res.send(FoldedTables(tables));
 });
 
 app.listen(port, () => {
