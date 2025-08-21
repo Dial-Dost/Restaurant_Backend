@@ -1,4 +1,4 @@
-import { literal, Model, Op } from "sequelize";
+import { col, fn, literal, Model, Op, where } from "sequelize";
 import { Booking, Customer, sequelize, Table } from "./schema.ts";
 
 function AddCustomer(
@@ -66,7 +66,6 @@ async function GetCustomerId(
 			console.warn(
 				"Error: multiple customers with same number and same name detected",
 			);
-			console.log(customers.map((x) => x.dataValues));
 		}
 		return customers[0]?.dataValues.customer_id;
 	} catch (error) {
@@ -123,12 +122,56 @@ async function GetBookingsAfterTime(time?: string) {
 	return bookings.map((x) => x.dataValues);
 }
 
+async function GetCustomerAndBookings() {
+	let customers = await Customer.findAll({
+		attributes: [
+			"customer_id",
+			"name",
+			[fn("COUNT", col("Bookings.booking_id")), "booking_count"],
+		],
+		include: [
+			{
+				model: Booking,
+				attributes: [],
+				required: false,
+			},
+		],
+		group: ["Customer.customer_id", "Customer.name"],
+	});
+	return customers.map((x) => x.dataValues);
+}
+
+async function HasActiveBooking(cust_id: number, time?: Date): Promise<boolean> {
+	if (!time) {
+		time = new Date();
+	}
+
+	let booking = await Booking.findOne({
+		where: {
+			[Op.and]: [
+				{ customer_id: cust_id },
+				literal(
+					` DateTime(booking_date_time, '+' || duration_mins || ' minutes') > DateTime('${time.toISOString()}') `,
+				),
+			],
+		},
+	});
+
+	if (booking) {
+		return true;
+	} else {
+		return false;
+	}
+}
+
 export {
-    AddBooking,
-    AddCustomer,
-    AddEmailToCustomer,
-    AddTable,
-    GetBookingsAfterTime,
-    GetCustomerId,
-    GetTables
+	AddBooking,
+	AddCustomer,
+	AddEmailToCustomer,
+	AddTable,
+	GetBookingsAfterTime,
+	GetCustomerAndBookings,
+	GetCustomerId,
+	GetTables,
+    HasActiveBooking,
 };

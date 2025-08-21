@@ -123,6 +123,19 @@ Returns in this format
 ]
 ```
 
+### /get-customers
+    Returns all customer data
+```json
+    [
+        {
+            "customer_id": 1,
+            "name": "Dodo",
+            "booking_count": 5,
+            "has_booking": true // Does the customer have an active booking
+        }
+    ]
+```
+
 
 ## Todo
 Implementing auth for each request

@@ -14,6 +14,7 @@ const Customer = sequelize.define(
             allowNull: false,
             primaryKey: true,
             autoIncrement: true,
+            field: "customer_id",
         },
         name: {
             type: DataTypes.STRING,
@@ -61,6 +62,7 @@ const Booking = sequelize.define(
             allowNull: false,
             primaryKey: true,
             autoIncrement: true,
+            field: 'booking_id',
         },
         customer_id: {
             type: DataTypes.INTEGER,
@@ -125,7 +127,7 @@ Booking.belongsTo(Table, {
 })
 
 try {
-    await sequelize.sync({alter: true, });
+    await sequelize.sync();
     console.log("Database synchronized!");
 } catch (error) {
     console.error("Error synchronizing the database:", error);

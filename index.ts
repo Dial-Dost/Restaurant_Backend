@@ -1,15 +1,16 @@
 import type { NextFunction, Request, Response } from "express";
 import express from "express";
 import {
-    AddBooking,
-    AddCustomer,
-    AddEmailToCustomer,
-    AddTable,
-    GetBookingsAfterTime,
-    GetCustomerId,
-    GetTables,
+	AddBooking,
+	AddCustomer,
+	AddEmailToCustomer,
+	AddTable,
+	GetBookingsAfterTime,
+	HasActiveBooking,
+	GetCustomerAndBookings,
+	GetCustomerId,
+	GetTables,
 } from "./database.ts";
-import { sequelize, Table } from "./schema.ts";
 const app = express();
 const port = 3000;
 
@@ -69,7 +70,6 @@ app.post("/add-customer", validate, async (req, res) => {
 		customer.email,
 	);
 
-	console.log(cust_id);
 	res.send(cust_id);
 });
 
@@ -94,7 +94,8 @@ app.post("/add-table", validate, async (req, res) => {
 	try {
 		table_name = (await AddTable(table.name, parseInt(table.capacity)))
 			.dataValues.table_name;
-	} catch {
+	} catch (error) {
+		console.log(error);
 		table_name = null;
 	}
 	if (!table_name) {
@@ -306,6 +307,37 @@ app.get("/get-bookings", validate, async (req, res) => {
 			return { booking: booking, active: IsActiveBooking(booking, time) };
 		}),
 	);
+});
+
+/*
+    Returns all customer data
+    [
+        {
+            "customer_id": 1,
+            "name": "Dodo",
+            "booking_count": 5,
+            "has_booking": true // Does the customer have an active booking
+        }
+    ]
+*/
+app.get("/get-customers", validate, async (req, res) => {
+    let customers;
+    try {
+        customers = await GetCustomerAndBookings();
+    } catch {
+        res.status(400).send({ error: "Oops something went wrong" });
+        return;
+    }
+
+	let promises = customers.map(async (x) => {
+		x["has_booking"] = await HasActiveBooking(x["customer_id"]);
+        return x;
+	});
+
+    let customers_with_bookings = await Promise.all(promises);
+
+
+	res.send(customers_with_bookings);
 });
 
 app.listen(port, () => {
