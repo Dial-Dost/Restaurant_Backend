@@ -68,6 +68,7 @@ const Booking = sequelize.define(
                 model: Customer,
                 key: "customer_id",
             },
+            unique: false,
         },
         table_name: {
             type: DataTypes.STRING,
@@ -75,6 +76,7 @@ const Booking = sequelize.define(
                 model: Table,
                 key: "table_name",
             },
+            unique: false,
         },
         booking_date_time: {
             type: DataTypes.DATE,

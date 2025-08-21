@@ -100,5 +100,29 @@ Returns tables in a 2d array in ascending order of capacity.
     ]
 ]
 ```
+
+### /get-tables
+
+Gets all bookings that have not yet completed 
+If needed can be modified to get bookings after a certain time very easily
+Returns in this format
+```json
+[
+    {
+        "booking": {
+            "booking_id": 1, //database stuff
+            "customer_id": 1, //database stuff
+            "table_name": "T3",
+            "booking_date_time": "2025-08-21T23:30:34.036Z", //time of booking ISO string
+            "duration_mins": 60,
+            "number_of_people": 3,
+            "source": null // source of the booking
+        },
+        "active": true/false //whether or not the booking is currently happening
+    }
+]
+```
+
+
 ## Todo
 Implementing auth for each request

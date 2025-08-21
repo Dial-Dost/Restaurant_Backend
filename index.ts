@@ -7,6 +7,7 @@ import {
 	AddTable,
 	GetCustomerId,
 	GetTables,
+	GetBookingsAfterTime,
 } from "./database.ts";
 import { sequelize, Table } from "./schema.ts";
 const app = express();
@@ -241,6 +242,7 @@ Returns tables in a 2d array in ascending order of capacity.
     ]
 ]
 */
+
 app.get("/get-tables", validate, async (req, res) => {
 	let tables;
 	try {
@@ -250,6 +252,60 @@ app.get("/get-tables", validate, async (req, res) => {
 		return;
 	}
 	res.send(FoldedTables(tables));
+});
+
+function IsActiveBooking(booking: any, time: Date): boolean {
+	let booking_start = new Date(booking.booking_date_time).getTime();
+	let booking_end =
+		new Date(booking_start).getTime() + booking.duration_mins * 60 * 1000;
+
+	if (booking_start <= time.getTime() && time.getTime() <= booking_end) {
+		return true;
+	}
+
+	return false;
+}
+
+/*
+Gets all bookings that have not yet completed 
+If needed can be modified to get bookings after a certain time very easily
+Returns in this format
+[
+    {
+        "booking": {
+            "booking_id": 1, //database stuff
+            "customer_id": 1, //database stuff
+            "table_name": "T3",
+            "booking_date_time": "2025-08-21T23:30:34.036Z", //time of booking ISO string
+            "duration_mins": 60,
+            "number_of_people": 3,
+            "source": null // source of the booking
+        },
+        "active": true/false //whether or not the booking is currently happening
+    }
+]
+ */
+app.get("/get-bookings", validate, async (req, res) => {
+	let bookings;
+	let time = new Date();
+
+	try {
+		bookings = await GetBookingsAfterTime();
+	} catch (error) {
+		console.log(error);
+		res.status(400).send({ error: "Oops something went wrong" });
+		return;
+	}
+	if (bookings == null) {
+		res.status(400).send({ error: "Time is invalid" });
+		return;
+	}
+
+	res.send(
+		bookings.map((booking) => {
+			return { booking: booking, active: IsActiveBooking(booking, time) };
+		}),
+	);
 });
 
 app.listen(port, () => {
