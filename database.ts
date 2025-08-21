@@ -141,7 +141,10 @@ async function GetCustomerAndBookings() {
 	return customers.map((x) => x.dataValues);
 }
 
-async function HasActiveBooking(cust_id: number, time?: Date): Promise<boolean> {
+async function HasActiveBooking(
+	cust_id: number,
+	time?: Date,
+): Promise<boolean> {
 	if (!time) {
 		time = new Date();
 	}
@@ -164,7 +167,23 @@ async function HasActiveBooking(cust_id: number, time?: Date): Promise<boolean> 
 	}
 }
 
+async function GetBookingsInRange(start: Date, end: Date): Promise<number | null> {
+	let bookings;
+	try {
+		bookings = await Booking.findAndCountAll({
+			where: {
+				booking_date_time: { [Op.between]: [start, end] },
+			},
+		});
+	} catch {
+		return null;
+	}
+
+	return bookings.count;
+}
+
 export {
+    GetBookingsInRange,
 	AddBooking,
 	AddCustomer,
 	AddEmailToCustomer,
@@ -173,5 +192,5 @@ export {
 	GetCustomerAndBookings,
 	GetCustomerId,
 	GetTables,
-    HasActiveBooking,
+	HasActiveBooking,
 };

@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import express from "express";
 import {
 	AddBooking,
+    GetBookingsInRange,
 	AddCustomer,
 	AddEmailToCustomer,
 	AddTable,
@@ -339,6 +340,39 @@ app.get("/get-customers", validate, async (req, res) => {
 
 	res.send(customers_with_bookings);
 });
+
+/*
+    returns the count of bookings in a range
+    requests body must be like this
+    {
+        start: 1004038434 // anything that can be parsed by Date()
+        end: 1004038434 // anything that can be parsed by Date()
+    }
+    Date.parse documentation
+    https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/parse
+    for the best results just send ms since epoch
+    returns the number of bookings in that range
+*/
+app.get("/get-withen-range", validate, async (req, res) => {
+    if (!(req.body.start && req.body.end)) {
+        res.status(400).send({Error: "Missing fields"})
+    }
+
+    let start = new Date(req.body.start);
+    let end = new Date(req.body.end);
+
+    if (isNaN(start.valueOf()) || isNaN(end.valueOf())) {
+        res.status(400).send({Error: "Dates provided is not formated correctley"})
+    }
+
+    let count = await GetBookingsInRange(start, end);
+
+    if (count == null) {
+        res.status(400).send({Error: "Oops something went wrong"})
+    }
+
+    return count
+})
 
 app.listen(port, () => {
 	console.log(`Server listening at http://localhost:${port}`);

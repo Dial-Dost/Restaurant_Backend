@@ -136,6 +136,18 @@ Returns in this format
     ]
 ```
 
+### /get-withen-range
+returns the count of bookings in a range
+requests body must be like this
+```json
+{
+    start: 1004038434 // anything that can be parsed by Date()
+    end: 1004038434 // anything that can be parsed by Date()
+}
+```
+Date.parse documentation
+https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/parse
+for the best results just send ms since epoch
 
 ## Todo
 Implementing auth for each request
