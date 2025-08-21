@@ -183,14 +183,14 @@ async function GetBookingsInRange(start: Date, end: Date): Promise<number | null
 }
 
 export {
+    AddBooking,
+    AddCustomer,
+    AddEmailToCustomer,
+    AddTable,
+    GetBookingsAfterTime,
     GetBookingsInRange,
-	AddBooking,
-	AddCustomer,
-	AddEmailToCustomer,
-	AddTable,
-	GetBookingsAfterTime,
-	GetCustomerAndBookings,
-	GetCustomerId,
-	GetTables,
-	HasActiveBooking,
+    GetCustomerAndBookings,
+    GetCustomerId,
+    GetTables,
+    HasActiveBooking
 };

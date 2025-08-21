@@ -22,7 +22,7 @@ function validate(req: Request, res: Response, next: NextFunction) {
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
+    
 async function GetCustomerIdOrCreateCustomer(
 	name: string,
 	number: string,
@@ -354,7 +354,7 @@ app.get("/get-customers", validate, async (req, res) => {
     returns the number of bookings in that range
 */
 app.get("/get-withen-range", validate, async (req, res) => {
-    if (!(req.body.start && req.body.end)) {
+    if (!(req.body["start"] && req.body["end"])) {
         res.status(400).send({Error: "Missing fields"})
     }
 
@@ -371,8 +371,15 @@ app.get("/get-withen-range", validate, async (req, res) => {
         res.status(400).send({Error: "Oops something went wrong"})
     }
 
-    return count
+    res.send(count)
 })
+
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    if (err instanceof SyntaxError && 'body' in err) {
+        return res.status(400).json({ error: 'The request body contains invalid JSON.' });
+    }
+    next(err);
+});
 
 app.listen(port, () => {
 	console.log(`Server listening at http://localhost:${port}`);

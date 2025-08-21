@@ -149,5 +149,7 @@ Date.parse documentation
 https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/parse
 for the best results just send ms since epoch
 
+returns the number of bookings in that range
+
 ## Todo
 Implementing auth for each request

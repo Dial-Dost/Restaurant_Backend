@@ -48519,7 +48519,7 @@ var require__baseIsNative = __commonJS((exports, module) => {
   module.exports = baseIsNative;
 });
 
-// node_modules/uuid/dist/rng.js
+// node_modules/sequelize/node_modules/uuid/dist/rng.js
 var require_rng = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48540,7 +48540,7 @@ var require_rng = __commonJS((exports) => {
   }
 });
 
-// node_modules/uuid/dist/regex.js
+// node_modules/sequelize/node_modules/uuid/dist/regex.js
 var require_regex = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48550,7 +48550,7 @@ var require_regex = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/validate.js
+// node_modules/sequelize/node_modules/uuid/dist/validate.js
 var require_validate = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48567,7 +48567,7 @@ var require_validate = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/stringify.js
+// node_modules/sequelize/node_modules/uuid/dist/stringify.js
 var require_stringify2 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48592,7 +48592,7 @@ var require_stringify2 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/v1.js
+// node_modules/sequelize/node_modules/uuid/dist/v1.js
 var require_v1 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48659,7 +48659,7 @@ var require_v1 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/parse.js
+// node_modules/sequelize/node_modules/uuid/dist/parse.js
 var require_parse2 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48697,7 +48697,7 @@ var require_parse2 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/v35.js
+// node_modules/sequelize/node_modules/uuid/dist/v35.js
 var require_v35 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48756,7 +48756,7 @@ var require_v35 = __commonJS((exports) => {
   }
 });
 
-// node_modules/uuid/dist/md5.js
+// node_modules/sequelize/node_modules/uuid/dist/md5.js
 var require_md5 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48778,7 +48778,7 @@ var require_md5 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/v3.js
+// node_modules/sequelize/node_modules/uuid/dist/v3.js
 var require_v3 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48794,7 +48794,7 @@ var require_v3 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/v4.js
+// node_modules/sequelize/node_modules/uuid/dist/v4.js
 var require_v4 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48823,7 +48823,7 @@ var require_v4 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/sha1.js
+// node_modules/sequelize/node_modules/uuid/dist/sha1.js
 var require_sha1 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48845,7 +48845,7 @@ var require_sha1 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/v5.js
+// node_modules/sequelize/node_modules/uuid/dist/v5.js
 var require_v5 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48861,7 +48861,7 @@ var require_v5 = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/nil.js
+// node_modules/sequelize/node_modules/uuid/dist/nil.js
 var require_nil = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48871,7 +48871,7 @@ var require_nil = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/version.js
+// node_modules/sequelize/node_modules/uuid/dist/version.js
 var require_version = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -48891,7 +48891,7 @@ var require_version = __commonJS((exports) => {
   exports.default = _default;
 });
 
-// node_modules/uuid/dist/index.js
+// node_modules/sequelize/node_modules/uuid/dist/index.js
 var require_dist3 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", {
     value: true
@@ -49023,7 +49023,7 @@ var require_operators = __commonJS((exports, module) => {
   module.exports = Op;
 });
 
-// node_modules/inflection/lib/inflection.js
+// node_modules/sequelize/node_modules/inflection/lib/inflection.js
 var require_inflection = __commonJS((exports, module) => {
   /*!
    * inflection
@@ -58057,7 +58057,7 @@ var require_semver2 = __commonJS((exports, module) => {
   };
 });
 
-// node_modules/sequelize-pool/lib/TimeoutError.js
+// node_modules/sequelize/node_modules/sequelize-pool/lib/TimeoutError.js
 var require_TimeoutError = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.TimeoutError = undefined;
@@ -58067,7 +58067,7 @@ var require_TimeoutError = __commonJS((exports) => {
   exports.TimeoutError = TimeoutError;
 });
 
-// node_modules/sequelize-pool/lib/AggregateError.js
+// node_modules/sequelize/node_modules/sequelize-pool/lib/AggregateError.js
 var require_AggregateError = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.AggregateError = undefined;
@@ -58089,7 +58089,7 @@ ${this.errors.map((error) => error === this ? "[Circular AggregateError]" : erro
   exports.AggregateError = AggregateError2;
 });
 
-// node_modules/sequelize-pool/lib/Deferred.js
+// node_modules/sequelize/node_modules/sequelize-pool/lib/Deferred.js
 var require_Deferred = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.Deferred = undefined;
@@ -58130,7 +58130,7 @@ var require_Deferred = __commonJS((exports) => {
   exports.Deferred = Deferred;
 });
 
-// node_modules/sequelize-pool/lib/Pool.js
+// node_modules/sequelize/node_modules/sequelize-pool/lib/Pool.js
 var require_Pool = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.Pool = undefined;
@@ -58406,7 +58406,7 @@ var require_Pool = __commonJS((exports) => {
   exports.Pool = Pool;
 });
 
-// node_modules/sequelize-pool/lib/index.js
+// node_modules/sequelize/node_modules/sequelize-pool/lib/index.js
 var require_lib4 = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.Pool = exports.AggregateError = exports.TimeoutError = undefined;
@@ -72311,7 +72311,8 @@ var Customer = sequelize.define("Customer", {
     type: DataTypes.INTEGER,
     allowNull: false,
     primaryKey: true,
-    autoIncrement: true
+    autoIncrement: true,
+    field: "customer_id"
   },
   name: {
     type: DataTypes.STRING,
@@ -72348,21 +72349,24 @@ var Booking = sequelize.define("Booking", {
     type: DataTypes.INTEGER,
     allowNull: false,
     primaryKey: true,
-    autoIncrement: true
+    autoIncrement: true,
+    field: "booking_id"
   },
   customer_id: {
     type: DataTypes.INTEGER,
     references: {
       model: Customer,
       key: "customer_id"
-    }
+    },
+    unique: false
   },
   table_name: {
     type: DataTypes.STRING,
     references: {
       model: Table,
       key: "table_name"
-    }
+    },
+    unique: false
   },
   booking_date_time: {
     type: DataTypes.DATE,
@@ -72375,6 +72379,9 @@ var Booking = sequelize.define("Booking", {
   number_of_people: {
     type: DataTypes.INTEGER,
     allowNull: false
+  },
+  source: {
+    type: DataTypes.STRING
   }
 }, {
   tableName: "Bookings",
@@ -72401,7 +72408,7 @@ Booking.belongsTo(Table, {
   }
 });
 try {
-  await sequelize.sync({ alter: true });
+  await sequelize.sync();
   console.log("Database synchronized!");
 } catch (error) {
   console.error("Error synchronizing the database:", error);
@@ -72423,13 +72430,14 @@ function AddTable(table_name, capacity) {
   });
   return newCustomer;
 }
-function AddBooking(customer_id, table_name, booking_date_time, duration, number_of_people) {
+function AddBooking(customer_id, table_name, booking_date_time, duration, number_of_people, source) {
   const newBooking = Booking.create({
     customer_id,
     table_name,
     booking_date_time,
     duration_mins: duration,
-    number_of_people
+    number_of_people,
+    source
   });
   return newBooking;
 }
@@ -72448,7 +72456,6 @@ async function GetCustomerId(name, number) {
     }
     if (customers.length > 1) {
       console.warn("Error: multiple customers with same number and same name detected");
-      console.log(customers.map((x) => x.dataValues));
     }
     return customers[0]?.dataValues.customer_id;
   } catch (error) {
@@ -72470,6 +72477,82 @@ async function AddEmailToCustomer(cust_id, email) {
     console.log(error);
     return null;
   }
+}
+async function GetTables() {
+  return (await Table.findAll({
+    order: [["capacity", "ASC"]]
+  })).map((x) => x.dataValues);
+}
+async function GetBookingsAfterTime(time) {
+  if (!time) {
+    time = new Date().toISOString();
+  }
+  if (time) {
+    let test_date = new Date(time);
+    if (isNaN(test_date.getTime())) {
+      return null;
+    }
+  }
+  const bookings = await Booking.findAll({
+    where: literal(`
+        DateTime(booking_date_time, '+' || duration_mins || ' minutes') > DateTime('${time}')
+      `),
+    order: [
+      literal(`DATETIME(booking_date_time, '+' || duration_mins || ' minutes') ASC`)
+    ]
+  });
+  return bookings.map((x) => x.dataValues);
+}
+async function GetCustomerAndBookings() {
+  let customers = await Customer.findAll({
+    attributes: [
+      "customer_id",
+      "name",
+      [fn("COUNT", col("Bookings.booking_id")), "booking_count"]
+    ],
+    include: [
+      {
+        model: Booking,
+        attributes: [],
+        required: false
+      }
+    ],
+    group: ["Customer.customer_id", "Customer.name"]
+  });
+  return customers.map((x) => x.dataValues);
+}
+async function HasActiveBooking(cust_id, time) {
+  if (!time) {
+    time = new Date;
+  }
+  let booking = await Booking.findOne({
+    where: {
+      [Op.and]: [
+        { customer_id: cust_id },
+        literal(` DateTime(booking_date_time, '+' || duration_mins || ' minutes') > DateTime('${time.toISOString()}') `)
+      ]
+    }
+  });
+  if (booking) {
+    return true;
+  } else {
+    return false;
+  }
+}
+async function GetBookingsInRange(start, end) {
+  let bookings;
+  console.log(start);
+  console.log(end);
+  try {
+    bookings = await Booking.findAndCountAll({
+      where: {
+        booking_date_time: { [Op.between]: [start, end] }
+      }
+    });
+  } catch {
+    return null;
+  }
+  return bookings.count;
 }
 
 // index.ts
@@ -72498,7 +72581,6 @@ app.post("/add-customer", validate, async (req, res) => {
     return;
   }
   let cust_id = await GetCustomerIdOrCreateCustomer(customer.name, customer.number, customer.email);
-  console.log(cust_id);
   res.send(cust_id);
 });
 app.post("/add-table", validate, async (req, res) => {
@@ -72510,7 +72592,8 @@ app.post("/add-table", validate, async (req, res) => {
   let table_name;
   try {
     table_name = (await AddTable(table.name, parseInt(table.capacity))).dataValues.table_name;
-  } catch {
+  } catch (error) {
+    console.log(error);
     table_name = null;
   }
   if (!table_name) {
@@ -72544,13 +72627,107 @@ app.post("/add-booking", validate, async (req, res) => {
   }
   let booking;
   try {
-    booking = await AddBooking(cust_id, booking_request.table_name, date, booking_request.duration, booking_request.number_of_people);
+    booking = await AddBooking(cust_id, booking_request.table_name, date, booking_request.duration, booking_request.number_of_people, booking_request.source);
   } catch (error) {
     res.status(400).json({ error: "Oops something went wrong" });
     return;
   }
   let booking_id = booking.dataValues.booking_id;
   res.json(booking_id);
+});
+function FoldedTables(table) {
+  if (table.length == 0) {
+    return [];
+  }
+  let min = table[0]["capacity"];
+  let max = table[table.length - 1]["capacity"];
+  let folded_tables = [];
+  let curr_index = 0;
+  for (let capacity = min;capacity <= max; capacity++) {
+    let cur_table = [];
+    let push = false;
+    while (table.length > curr_index && table[curr_index]["capacity"] == capacity) {
+      cur_table.push(table[curr_index]);
+      curr_index += 1;
+      push = true;
+    }
+    if (push) {
+      folded_tables.push(cur_table);
+    }
+  }
+  return folded_tables;
+}
+app.get("/get-tables", validate, async (req, res) => {
+  let tables;
+  try {
+    tables = await GetTables();
+  } catch {
+    res.status(400).send({ error: "Oops something went wrong" });
+    return;
+  }
+  res.send(FoldedTables(tables));
+});
+function IsActiveBooking(booking, time) {
+  let booking_start = new Date(booking.booking_date_time).getTime();
+  let booking_end = new Date(booking_start).getTime() + booking.duration_mins * 60 * 1000;
+  if (booking_start <= time.getTime() && time.getTime() <= booking_end) {
+    return true;
+  }
+  return false;
+}
+app.get("/get-bookings", validate, async (req, res) => {
+  let bookings;
+  let time = new Date;
+  try {
+    bookings = await GetBookingsAfterTime();
+  } catch (error) {
+    console.log(error);
+    res.status(400).send({ error: "Oops something went wrong" });
+    return;
+  }
+  if (bookings == null) {
+    res.status(400).send({ error: "Time is invalid" });
+    return;
+  }
+  res.send(bookings.map((booking) => {
+    return { booking, active: IsActiveBooking(booking, time) };
+  }));
+});
+app.get("/get-customers", validate, async (req, res) => {
+  let customers;
+  try {
+    customers = await GetCustomerAndBookings();
+  } catch {
+    res.status(400).send({ error: "Oops something went wrong" });
+    return;
+  }
+  let promises = customers.map(async (x) => {
+    x["has_booking"] = await HasActiveBooking(x["customer_id"]);
+    return x;
+  });
+  let customers_with_bookings = await Promise.all(promises);
+  res.send(customers_with_bookings);
+});
+app.get("/get-withen-range", validate, async (req, res) => {
+  if (!(req.body["start"] && req.body["end"])) {
+    res.status(400).send({ Error: "Missing fields" });
+  }
+  let start = new Date(req.body.start);
+  let end = new Date(req.body.end);
+  if (isNaN(start.valueOf()) || isNaN(end.valueOf())) {
+    res.status(400).send({ Error: "Dates provided is not formated correctley" });
+  }
+  let count = await GetBookingsInRange(start, end);
+  if (count == null) {
+    res.status(400).send({ Error: "Oops something went wrong" });
+  }
+  res.send(count);
+});
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({ error: "The request body contains invalid JSON." });
+  }
+  next(err);
 });
 app.listen(port, () => {
   console.log(`Server listening at http://localhost:${port}`);
