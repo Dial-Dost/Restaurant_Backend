@@ -1,13 +1,13 @@
 import type { NextFunction, Request, Response } from "express";
 import express from "express";
 import {
-	AddBooking,
-	AddCustomer,
-	AddEmailToCustomer,
-	AddTable,
-	GetCustomerId,
-	GetTables,
-	GetBookingsAfterTime,
+    AddBooking,
+    AddCustomer,
+    AddEmailToCustomer,
+    AddTable,
+    GetBookingsAfterTime,
+    GetCustomerId,
+    GetTables,
 } from "./database.ts";
 import { sequelize, Table } from "./schema.ts";
 const app = express();

@@ -1,4 +1,4 @@
-import { Model, Op, col, fn, literal } from "sequelize";
+import { literal, Model, Op } from "sequelize";
 import { Booking, Customer, sequelize, Table } from "./schema.ts";
 
 function AddCustomer(
@@ -101,13 +101,13 @@ async function GetTables() {
 
 async function GetBookingsAfterTime(time?: string) {
 	if (!time) {
-        time = new Date().toISOString();
+		time = new Date().toISOString();
 	}
 	if (time) {
 		let test_date = new Date(time);
-        if (isNaN(test_date.getTime())) {
-            return null;
-        }
+		if (isNaN(test_date.getTime())) {
+			return null;
+		}
 	}
 	const bookings = await Booking.findAll({
 		where: literal(`
@@ -120,15 +120,15 @@ async function GetBookingsAfterTime(time?: string) {
 		],
 	});
 
-	return bookings.map(x => x.dataValues);
+	return bookings.map((x) => x.dataValues);
 }
 
 export {
-	GetCustomerId,
-	AddCustomer,
-	AddEmailToCustomer,
-	AddTable,
-	AddBooking,
-	GetTables,
-	GetBookingsAfterTime,
+    AddBooking,
+    AddCustomer,
+    AddEmailToCustomer,
+    AddTable,
+    GetBookingsAfterTime,
+    GetCustomerId,
+    GetTables
 };
