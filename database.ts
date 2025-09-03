@@ -90,12 +90,47 @@ async function AddEmailToCustomer(cust_id: number, email: string) {
 	}
 }
 
-async function GetTables() {
+async function GetTables(time?: string) {
+	if (!time) {
+		time = new Date().toISOString();
+	}
+	if (time) {
+		let test_date = new Date(time);
+		if (isNaN(test_date.getTime())) {
+			return null;
+		}
+	}
+
 	return (
 		await Table.findAll({
+			attributes: [
+				"table_name",
+				"capacity",
+				[
+					sequelize.col("Bookings.booking_date_time"),
+					"booking_date_time",
+				],
+			],
+			include: [
+				{
+					model: Booking,
+					required: false,
+					attributes: [],
+					where: sequelize.literal(`
+                                             DateTime(booking_date_time) < DateTime('${time}') and
+                                             DateTime(booking_date_time, '+' || duration_mins || ' minutes') > DateTime('${time}')
+                                             `),
+				},
+			],
 			order: [["capacity", "ASC"]],
 		})
-	).map((x) => x.dataValues);
+	)
+		.map((x) => x.dataValues)
+		.map((x) => {
+			x.booked = x.booking_date_time == null ? false : true;
+			delete x.booking_date_time;
+			return x;
+		});
 }
 
 async function GetBookingsAfterTime(time?: string) {
@@ -117,7 +152,7 @@ async function GetBookingsAfterTime(time?: string) {
 			"duration_mins",
 			"number_of_people",
 			"source",
-            [sequelize.col('Customer.name'), 'customer_name'] // Adds customer name as flat field
+			[sequelize.col("Customer.name"), "customer_name"], // Adds customer name as flat field
 		],
 		include: [
 			{

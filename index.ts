@@ -12,6 +12,7 @@ import {
 	GetCustomerId,
 	GetTables,
 } from "./database.ts";
+import e from "express";
 const app = express();
 const port = 3000;
 
@@ -19,7 +20,7 @@ function log(req: Request, res: Response, next: NextFunction) {
 	console.log(req);
 	next();
 }
-app.use(log);
+// app.use(log);
 
 function validate(req: Request, res: Response, next: NextFunction) {
 	next();
@@ -232,27 +233,32 @@ Returns tables in a 2d array in ascending order of capacity.
     [
         {
             "table_name": "T1",
-            "capacity": 1
+            "capacity": 1,
+            "booked": true
         },
         {
             "table_name": "T2",
             "capacity": 1
+            "booked": true
         },
     ],
     [
         {
             "table_name": "T6",
             "capacity": 3
+            "booked": true
         },
         {
             "table_name": "T7",
             "capacity": 3
+            "booked": true
         }
     ],
     [
         {
             "table_name": "T10",
             "capacity": 6
+            "booked": true
         }
     ]
 ]
@@ -262,11 +268,14 @@ app.get("/get-tables", validate, async (req, res) => {
 	let tables;
 	try {
 		tables = await GetTables();
-	} catch {
+		if (tables == null) {
+			tables = [];
+		}
+	} catch (e) {
 		res.status(400).send({ error: "Oops something went wrong" });
 		return;
 	}
-	res.send(FoldedTables(tables));
+	res.send(tables);
 });
 
 function IsActiveBooking(booking: any, time: Date): boolean {
