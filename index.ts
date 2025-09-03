@@ -2,7 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import express from "express";
 import {
 	AddBooking,
-    GetBookingsInRange,
+	GetBookingsInRange,
 	AddCustomer,
 	AddEmailToCustomer,
 	AddTable,
@@ -15,14 +15,27 @@ import {
 const app = express();
 const port = 3000;
 
+function log(req: Request, res: Response, next: NextFunction) {
+	console.log(req);
+	next();
+}
+app.use(log);
+
 function validate(req: Request, res: Response, next: NextFunction) {
 	next();
 	// return res.status(400).json({ error: "Auth failed" });
 }
 
+app.use((req, res, next) => {
+	res.header("Access-Control-Allow-Origin", "http://localhost:9002");
+	res.header("Access-Control-Allow-Headers", "Content-Type");
+	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE");
+	next();
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-    
+
 async function GetCustomerIdOrCreateCustomer(
 	name: string,
 	number: string,
@@ -274,15 +287,14 @@ If needed can be modified to get bookings after a certain time very easily
 Returns in this format
 [
     {
-        "booking": {
-            "booking_id": 1, //database stuff
-            "customer_id": 1, //database stuff
-            "table_name": "T3",
-            "booking_date_time": "2025-08-21T23:30:34.036Z", //time of booking ISO string
-            "duration_mins": 60,
-            "number_of_people": 3,
-            "source": null // source of the booking
-        },
+        "booking_id": 1, //database stuff
+        "customer_id": 1, //database stuff
+        "customer_name": "Jhon", //name
+        "table_name": "T3",
+        "booking_date_time": "2025-08-21T23:30:34.036Z", //time of booking ISO string
+        "duration_mins": 60,
+        "number_of_people": 3,
+        "source": null // source of the booking
         "active": true/false //whether or not the booking is currently happening
     }
 ]
@@ -305,7 +317,8 @@ app.get("/get-bookings", validate, async (req, res) => {
 
 	res.send(
 		bookings.map((booking) => {
-			return { booking: booking, active: IsActiveBooking(booking, time) };
+			booking.active = IsActiveBooking(booking, time);
+			return booking;
 		}),
 	);
 });
@@ -322,21 +335,20 @@ app.get("/get-bookings", validate, async (req, res) => {
     ]
 */
 app.get("/get-customers", validate, async (req, res) => {
-    let customers;
-    try {
-        customers = await GetCustomerAndBookings();
-    } catch {
-        res.status(400).send({ error: "Oops something went wrong" });
-        return;
-    }
+	let customers;
+	try {
+		customers = await GetCustomerAndBookings();
+	} catch {
+		res.status(400).send({ error: "Oops something went wrong" });
+		return;
+	}
 
 	let promises = customers.map(async (x) => {
 		x["has_booking"] = await HasActiveBooking(x["customer_id"]);
-        return x;
+		return x;
 	});
 
-    let customers_with_bookings = await Promise.all(promises);
-
+	let customers_with_bookings = await Promise.all(promises);
 
 	res.send(customers_with_bookings);
 });
@@ -354,31 +366,35 @@ app.get("/get-customers", validate, async (req, res) => {
     returns the number of bookings in that range
 */
 app.get("/get-withen-range", validate, async (req, res) => {
-    if (!(req.body["start"] && req.body["end"])) {
-        res.status(400).send({Error: "Missing fields"})
-    }
+	if (!(req.body["start"] && req.body["end"])) {
+		res.status(400).send({ Error: "Missing fields" });
+	}
 
-    let start = new Date(req.body.start);
-    let end = new Date(req.body.end);
+	let start = new Date(req.body.start);
+	let end = new Date(req.body.end);
 
-    if (isNaN(start.valueOf()) || isNaN(end.valueOf())) {
-        res.status(400).send({Error: "Dates provided is not formated correctley"})
-    }
+	if (isNaN(start.valueOf()) || isNaN(end.valueOf())) {
+		res.status(400).send({
+			Error: "Dates provided is not formated correctley",
+		});
+	}
 
-    let count = await GetBookingsInRange(start, end);
+	let count = await GetBookingsInRange(start, end);
 
-    if (count == null) {
-        res.status(400).send({Error: "Oops something went wrong"})
-    }
+	if (count == null) {
+		res.status(400).send({ Error: "Oops something went wrong" });
+	}
 
-    res.send(count)
-})
+	res.send(count);
+});
 
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
-    if (err instanceof SyntaxError && 'body' in err) {
-        return res.status(400).json({ error: 'The request body contains invalid JSON.' });
-    }
-    next(err);
+	if (err instanceof SyntaxError && "body" in err) {
+		return res
+			.status(400)
+			.json({ error: "The request body contains invalid JSON." });
+	}
+	next(err);
 });
 
 app.listen(port, () => {

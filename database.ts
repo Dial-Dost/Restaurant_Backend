@@ -109,6 +109,23 @@ async function GetBookingsAfterTime(time?: string) {
 		}
 	}
 	const bookings = await Booking.findAll({
+		attributes: [
+			"booking_id",
+			"customer_id",
+			"table_name",
+			"booking_date_time",
+			"duration_mins",
+			"number_of_people",
+			"source",
+            [sequelize.col('Customer.name'), 'customer_name'] // Adds customer name as flat field
+		],
+		include: [
+			{
+				model: Customer,
+				attributes: [],
+				required: true,
+			},
+		],
 		where: literal(`
         DateTime(booking_date_time, '+' || duration_mins || ' minutes') > DateTime('${time}')
       `),
@@ -167,7 +184,10 @@ async function HasActiveBooking(
 	}
 }
 
-async function GetBookingsInRange(start: Date, end: Date): Promise<number | null> {
+async function GetBookingsInRange(
+	start: Date,
+	end: Date,
+): Promise<number | null> {
 	let bookings;
 	try {
 		bookings = await Booking.findAndCountAll({
@@ -183,14 +203,14 @@ async function GetBookingsInRange(start: Date, end: Date): Promise<number | null
 }
 
 export {
-    AddBooking,
-    AddCustomer,
-    AddEmailToCustomer,
-    AddTable,
-    GetBookingsAfterTime,
-    GetBookingsInRange,
-    GetCustomerAndBookings,
-    GetCustomerId,
-    GetTables,
-    HasActiveBooking
+	AddBooking,
+	AddCustomer,
+	AddEmailToCustomer,
+	AddTable,
+	GetBookingsAfterTime,
+	GetBookingsInRange,
+	GetCustomerAndBookings,
+	GetCustomerId,
+	GetTables,
+	HasActiveBooking,
 };
