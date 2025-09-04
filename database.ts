@@ -179,6 +179,8 @@ async function GetCustomerAndBookings() {
 		attributes: [
 			"customer_id",
 			"name",
+            "phone_number",
+            "email",
 			[fn("COUNT", col("Bookings.booking_id")), "booking_count"],
 		],
 		include: [
@@ -189,6 +191,7 @@ async function GetCustomerAndBookings() {
 			},
 		],
 		group: ["Customer.customer_id", "Customer.name"],
+        order: [["name", "ASC"]],
 	});
 	return customers.map((x) => x.dataValues);
 }
