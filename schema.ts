@@ -94,6 +94,10 @@ const Booking = sequelize.define(
         },
         source: {
             type: DataTypes.STRING,
+        },
+        from: {
+            type: DataTypes.STRING,
+            allowNull: true,
         }
     },
     {

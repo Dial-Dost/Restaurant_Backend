@@ -29,6 +29,7 @@ function AddBooking(
 	duration: number,
 	number_of_people: number,
 	source?: string,
+	from?: string,
 ): Promise<Model> {
 	const newBooking = Booking.create({
 		customer_id: customer_id,
@@ -37,6 +38,7 @@ function AddBooking(
 		duration_mins: duration,
 		number_of_people: number_of_people,
 		source: source,
+		from: from,
 	});
 
 	return newBooking;
@@ -179,8 +181,8 @@ async function GetCustomerAndBookings() {
 		attributes: [
 			"customer_id",
 			"name",
-            "phone_number",
-            "email",
+			"phone_number",
+			"email",
 			[fn("COUNT", col("Bookings.booking_id")), "booking_count"],
 		],
 		include: [
@@ -191,7 +193,7 @@ async function GetCustomerAndBookings() {
 			},
 		],
 		group: ["Customer.customer_id", "Customer.name"],
-        order: [["name", "ASC"]],
+		order: [["name", "ASC"]],
 	});
 	return customers.map((x) => x.dataValues);
 }
@@ -208,9 +210,10 @@ async function HasActiveBooking(
 		where: {
 			[Op.and]: [
 				{ customer_id: cust_id },
-				literal(
-					` DateTime(booking_date_time, '+' || duration_mins || ' minutes') > DateTime('${time.toISOString()}') `,
-				),
+				literal(`
+                             DateTime(booking_date_time) < DateTime('${time.toISOString()}') and
+                             DateTime(booking_date_time, '+' || duration_mins || ' minutes') > DateTime('${time.toISOString()}')
+                 `),
 			],
 		},
 	});

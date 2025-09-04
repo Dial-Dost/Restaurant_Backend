@@ -187,6 +187,7 @@ app.post("/add-booking", validate, async (req, res) => {
 			booking_request.duration,
 			booking_request.number_of_people,
 			booking_request.source,
+			booking_request.from,
 		);
 	} catch (error) {
 		res.status(400).json({ error: "Oops something went wrong" });
