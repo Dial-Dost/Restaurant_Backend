@@ -11,6 +11,8 @@ import {
 	GetCustomerAndBookings,
 	GetCustomerId,
 	GetTables,
+	UpdateBookingStatus,
+	DeleteBooking,
 } from "./database.ts";
 import e from "express";
 const app = express();
@@ -187,6 +189,7 @@ app.post("/add-booking", validate, async (req, res) => {
 			booking_request.duration,
 			booking_request.number_of_people,
 			booking_request.source,
+			booking_request.status ?? "Confirmed",
 			booking_request.from,
 		);
 	} catch (error) {
@@ -265,10 +268,11 @@ Returns tables in a 2d array in ascending order of capacity.
 ]
 */
 
-app.get("/get-tables", validate, async (req, res) => {
+	app.get("/get-tables", validate, async (req, res) => {
 	let tables;
+	const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
 	try {
-		tables = await GetTables();
+		tables = await GetTables(timeQuery as string | undefined);
 		if (tables == null) {
 			tables = [];
 		}
@@ -309,12 +313,13 @@ Returns in this format
     }
 ]
  */
-app.get("/get-bookings", validate, async (req, res) => {
+	app.get("/get-bookings", validate, async (req, res) => {
 	let bookings;
 	let time = new Date();
+	const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
 
 	try {
-		bookings = await GetBookingsAfterTime();
+		bookings = await GetBookingsAfterTime(timeQuery as string | undefined);
 	} catch (error) {
 		console.log(error);
 		res.status(400).send({ error: "Oops something went wrong" });
@@ -331,6 +336,43 @@ app.get("/get-bookings", validate, async (req, res) => {
 			return booking;
 		}),
 	);
+});
+
+
+app.patch("/booking/:id/status", validate, async (req, res) => {
+	const rawId = req.params.id;
+	const status = req.body?.status;
+	const bookingId = rawId ? Number.parseInt(rawId, 10) : Number.NaN;
+	if (!status || Number.isNaN(bookingId)) {
+		res.status(400).json({ error: "Missing or invalid status/booking id" });
+		return;
+	}
+
+	const updated = await UpdateBookingStatus(bookingId, status);
+	if (!updated) {
+		res.status(404).json({ error: "Booking not found" });
+		return;
+	}
+
+	res.json({ success: true });
+});
+
+
+app.delete("/booking/:id", validate, async (req, res) => {
+	const bookingIdParam = req.params.id;
+	const bookingId = bookingIdParam ? Number.parseInt(bookingIdParam, 10) : Number.NaN;
+	if (Number.isNaN(bookingId)) {
+		res.status(400).json({ error: "Invalid booking id" });
+		return;
+	}
+
+	const deleted = await DeleteBooking(bookingId);
+	if (!deleted) {
+		res.status(404).json({ error: "Booking not found" });
+		return;
+	}
+
+	res.status(204).send();
 });
 
 /*

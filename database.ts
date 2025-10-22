@@ -29,6 +29,7 @@ function AddBooking(
 	duration: number,
 	number_of_people: number,
 	source?: string,
+	status?: string,
 	from?: string,
 ): Promise<Model> {
 	const newBooking = Booking.create({
@@ -38,6 +39,7 @@ function AddBooking(
 		duration_mins: duration,
 		number_of_people: number_of_people,
 		source: source,
+		status: status,
 		from: from,
 	});
 
@@ -154,6 +156,7 @@ async function GetBookingsAfterTime(time?: string) {
 			"duration_mins",
 			"number_of_people",
 			"source",
+			"status",
 			[sequelize.col("Customer.name"), "customer_name"], // Adds customer name as flat field
 		],
 		include: [
@@ -174,6 +177,26 @@ async function GetBookingsAfterTime(time?: string) {
 	});
 
 	return bookings.map((x) => x.dataValues);
+}
+
+async function UpdateBookingStatus(booking_id: number, status: string): Promise<boolean> {
+	try {
+		const [updated] = await Booking.update({ status }, { where: { booking_id } });
+		return updated > 0;
+	} catch (error) {
+		console.error("Error updating booking status:", error);
+		return false;
+	}
+}
+
+async function DeleteBooking(booking_id: number): Promise<boolean> {
+	try {
+		const deleted = await Booking.destroy({ where: { booking_id } });
+		return deleted > 0;
+	} catch (error) {
+		console.error("Error deleting booking:", error);
+		return false;
+	}
 }
 
 async function GetCustomerAndBookings() {
@@ -254,4 +277,6 @@ export {
 	GetCustomerId,
 	GetTables,
 	HasActiveBooking,
+ 	UpdateBookingStatus,
+ 	DeleteBooking,
 };

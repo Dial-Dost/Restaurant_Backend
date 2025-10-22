@@ -95,6 +95,11 @@ const Booking = sequelize.define(
         source: {
             type: DataTypes.STRING,
         },
+        status: {
+            type: DataTypes.STRING,
+            allowNull: true,
+            defaultValue: "Confirmed",
+        },
         from: {
             type: DataTypes.STRING,
             allowNull: true,
