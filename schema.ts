@@ -1,145 +1,56 @@
-import { Sequelize, DataTypes } from "sequelize";
+import { MongoClient, type Collection, type Db, type Document } from "mongodb";
 
-const sequelize = new Sequelize({
-    dialect: "sqlite",
-    storage: "./test_restaurant.db",
-    logging: false,
-});
+const mongoUri = process.env.MONGODB_URI;
+const databaseName = process.env.MONGODB_DB_NAME ?? "reception";
 
-const Customer = sequelize.define(
-    "Customer",
-    {
-        customer_id: {
-            type: DataTypes.INTEGER,
-            allowNull: false,
-            primaryKey: true,
-            autoIncrement: true,
-            field: "customer_id",
-        },
-        name: {
-            type: DataTypes.STRING,
-            allowNull: false,
-        },
-        phone_number: {
-            type: DataTypes.STRING(15),
-            allowNull: false,
-        },
-        email: {
-            type: DataTypes.STRING,
-            allowNull: true,
-        },
-    },
-    {
-        tableName: "Customers",
-        timestamps: false,
-    },
-);
+let client: MongoClient | null = null;
+let db: Db | null = null;
+let connectPromise: Promise<Db> | null = null;
 
-const Table = sequelize.define(
-    "Table",
-    {
-        table_name: {
-            type: DataTypes.STRING,
-            allowNull: false,
-            primaryKey: true,
-        },
-        capacity: {
-            type: DataTypes.INTEGER,
-            allowNull: true,
-        },
-    },
-    {
-        timestamps: false,
-        tableName: "Tables",
-    },
-);
+async function connectToMongo(): Promise<Db> {
+	if (db) {
+		return db;
+	}
 
-const Booking = sequelize.define(
-    "Booking",
-    {
-        booking_id: {
-            type: DataTypes.INTEGER,
-            allowNull: false,
-            primaryKey: true,
-            autoIncrement: true,
-            field: 'booking_id',
-        },
-        customer_id: {
-            type: DataTypes.INTEGER,
-            references: {
-                model: Customer,
-                key: "customer_id",
-            },
-            unique: false,
-        },
-        table_name: {
-            type: DataTypes.STRING,
-            references: {
-                model: Table,
-                key: "table_name",
-            },
-            unique: false,
-        },
-        booking_date_time: {
-            type: DataTypes.DATE,
-            allowNull: false,
-        },
-        duration_mins: {
-            type: DataTypes.INTEGER,
-            allowNull: false,
-        },
-        number_of_people: {
-            type: DataTypes.INTEGER,
-            allowNull: false,
-        },
-        source: {
-            type: DataTypes.STRING,
-        },
-        status: {
-            type: DataTypes.STRING,
-            allowNull: true,
-            defaultValue: "Confirmed",
-        },
-        from: {
-            type: DataTypes.STRING,
-            allowNull: true,
-        }
-    },
-    {
-        tableName: "Bookings",
-        timestamps: false,
-    },
-);
+	if (!mongoUri) {
+		throw new Error("MONGODB_URI environment variable is not set.");
+	}
 
-Customer.hasMany(Booking, {
-    foreignKey: {
-        name: "customer_id",
-    },
-});
+	if (!connectPromise) {
+		client = new MongoClient(mongoUri);
+		connectPromise = client
+			.connect()
+			.then((connectedClient: MongoClient) => {
+				db = connectedClient.db(databaseName);
+				console.log(`Connected to MongoDB database: ${databaseName}`);
+				return db;
+			})
+			.catch((error: unknown) => {
+				connectPromise = null;
+				console.error("Failed to connect to MongoDB", error);
+				throw error;
+			});
+	}
 
-Booking.belongsTo(Customer, {
-    foreignKey: {
-        name: "customer_id",
-    },
-});
-
-Table.hasMany(Booking, {
-    foreignKey: {
-        name: "table_name",
-    },
-})
-
-Booking.belongsTo(Table, {
-    foreignKey: {
-        name: "table_name",
-    },
-})
-
-try {
-    await sequelize.sync();
-    console.log("Database synchronized!");
-} catch (error) {
-    console.error("Error synchronizing the database:", error);
+	return connectPromise;
 }
 
-export { sequelize, Customer, Booking, Table};
+export async function getDb(): Promise<Db> {
+	return connectToMongo();
+}
+
+export async function getCollection<TSchema extends Document = Document>(
+	name: string,
+): Promise<Collection<TSchema>> {
+	const database = await connectToMongo();
+	return database.collection<TSchema>(name);
+}
+
+export async function closeMongoConnection(): Promise<void> {
+	if (client) {
+		await client.close();
+		client = null;
+		db = null;
+		connectPromise = null;
+	}
+}

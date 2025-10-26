@@ -13,8 +13,11 @@ import {
 	GetTables,
 	UpdateBookingStatus,
 	DeleteBooking,
-} from "./database.ts";
-import e from "express";
+	AssignTableToBooking,
+	AddAuditLogEntry,
+	GetAuditLogs,
+	EnsureRestaurantSeed,
+} from "./database.js";
 const app = express();
 const port = 3000;
 
@@ -29,9 +32,31 @@ function validate(req: Request, res: Response, next: NextFunction) {
 	// return res.status(400).json({ error: "Auth failed" });
 }
 
+function extractRestaurantId(req: Request): string | null {
+	const headerValue = req.headers["x-restaurant-id"];
+	const headerId = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+	if (typeof headerId === "string" && headerId.trim().length > 0) {
+		return headerId.trim();
+	}
+
+	const queryValue = req.query.restaurantId;
+	const queryId = Array.isArray(queryValue) ? queryValue[0] : queryValue;
+	if (typeof queryId === "string" && queryId.trim().length > 0) {
+		return queryId.trim();
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const bodyValue = body?.restaurantId;
+	if (typeof bodyValue === "string" && bodyValue.trim().length > 0) {
+		return bodyValue.trim();
+	}
+
+	return null;
+}
+
 app.use((req, res, next) => {
 	res.header("Access-Control-Allow-Origin", "http://localhost:9002");
-	res.header("Access-Control-Allow-Headers", "Content-Type");
+	res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id");
 	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE");
 	next();
 });
@@ -40,26 +65,38 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 async function GetCustomerIdOrCreateCustomer(
+	restaurantId: string,
 	name: string,
 	number: string,
 	email?: string | undefined,
-): Promise<number | null> {
-	let customer = { name, number, email };
-	let cust_id: number | null = await GetCustomerId(
-		customer.name,
-		customer.number,
-	);
-	if (cust_id == null) {
-		cust_id = (
-			await AddCustomer(customer.name, customer.number, customer.email)
-		).dataValues.customer_id;
+): Promise<string | null> {
+	const normalizedName = name.trim();
+	const normalizedNumber = number.trim();
+	let customerId = await GetCustomerId(restaurantId, normalizedName, normalizedNumber);
+
+	if (!customerId) {
+		const createdCustomer = await AddCustomer(
+			restaurantId,
+			normalizedName,
+			normalizedNumber,
+			email,
+		);
+		customerId = createdCustomer._id;
 	}
 
-	if (cust_id && customer.email) {
-		AddEmailToCustomer(cust_id, customer.email);
+	if (customerId && email) {
+		await AddEmailToCustomer(restaurantId, customerId, email);
 	}
 
-	return cust_id;
+	if (!customerId) {
+		return null;
+	}
+
+	return typeof customerId === "string"
+		? customerId
+		: typeof customerId.toHexString === "function"
+			? customerId.toHexString()
+			: customerId.toString();
 }
 
 /*
@@ -75,6 +112,12 @@ async function GetCustomerIdOrCreateCustomer(
 */
 
 app.post("/add-customer", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
 	let customer = req.body.customer;
 	if (!(customer.name && customer.number)) {
 		res.status(400).json({ error: "Missing required fields" });
@@ -82,6 +125,7 @@ app.post("/add-customer", validate, async (req, res) => {
 	}
 
 	let cust_id = await GetCustomerIdOrCreateCustomer(
+		restaurantId,
 		customer.name,
 		customer.number,
 		customer.email,
@@ -101,16 +145,26 @@ app.post("/add-customer", validate, async (req, res) => {
     returns the table_name if you want to store it somewhere
 */
 app.post("/add-table", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
 	let table = req.body.table;
 	if (!table.name) {
 		res.status(400).json({ error: "Missing required fields" });
 		return;
 	}
 
-	let table_name;
+	let table_name: string | null = null;
 	try {
-		table_name = (await AddTable(table.name, parseInt(table.capacity)))
-			.dataValues.table_name;
+		const created = await AddTable(
+			restaurantId,
+			table.name,
+			table.capacity !== undefined ? parseInt(table.capacity) : undefined,
+		);
+		table_name = created.table_name;
 	} catch (error) {
 		console.log(error);
 		table_name = null;
@@ -144,6 +198,12 @@ Needs request body as
 returns the booking id
 */
 app.post("/add-booking", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
 	let customer = req.body.customer;
 	if (!(customer.name && customer.number)) {
 		res.status(400).json({ error: "Missing customer field(s)" });
@@ -153,7 +213,7 @@ app.post("/add-booking", validate, async (req, res) => {
 	let booking_request = req.body.booking;
 	if (
 		!(
-			booking_request.table_name &&
+			booking_request &&
 			booking_request.date &&
 			booking_request.duration &&
 			booking_request.number_of_people
@@ -163,6 +223,7 @@ app.post("/add-booking", validate, async (req, res) => {
 		return;
 	}
 	let cust_id = await GetCustomerIdOrCreateCustomer(
+		restaurantId,
 		customer.name,
 		customer.number,
 		customer.email,
@@ -180,14 +241,27 @@ app.post("/add-booking", validate, async (req, res) => {
 		return;
 	}
 
+	const durationMinutes = Number.parseInt(booking_request.duration, 10);
+	if (!Number.isFinite(durationMinutes)) {
+		res.status(400).json({ error: "Duration must be a valid number" });
+		return;
+	}
+
+	const partySize = Number.parseInt(booking_request.number_of_people, 10);
+	if (!Number.isFinite(partySize)) {
+		res.status(400).json({ error: "number_of_people must be a valid number" });
+		return;
+	}
+
 	let booking;
 	try {
 		booking = await AddBooking(
+			restaurantId,
 			cust_id,
-			booking_request.table_name,
 			date,
-			booking_request.duration,
-			booking_request.number_of_people,
+			durationMinutes,
+			partySize,
+			booking_request.table_name,
 			booking_request.source,
 			booking_request.status ?? "Confirmed",
 			booking_request.from,
@@ -196,9 +270,14 @@ app.post("/add-booking", validate, async (req, res) => {
 		res.status(400).json({ error: "Oops something went wrong" });
 		return;
 	}
-	let booking_id = booking.dataValues.booking_id;
+	const booking_id =
+		typeof booking._id === "string"
+			? booking._id
+			: typeof booking._id.toHexString === "function"
+				? booking._id.toHexString()
+				: booking._id.toString();
 
-	res.json(booking_id);
+	res.json({ booking_id });
 });
 
 function FoldedTables(table: any[]): any[][] {
@@ -269,18 +348,21 @@ Returns tables in a 2d array in ascending order of capacity.
 */
 
 	app.get("/get-tables", validate, async (req, res) => {
-	let tables;
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
 	const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
+	const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
 	try {
-		tables = await GetTables(timeQuery as string | undefined);
-		if (tables == null) {
-			tables = [];
-		}
+		const tables = await GetTables(restaurantId, requestedTime);
+		res.send(tables ?? []);
 	} catch (e) {
 		res.status(400).send({ error: "Oops something went wrong" });
 		return;
 	}
-	res.send(tables);
 });
 
 function IsActiveBooking(booking: any, time: Date): boolean {
@@ -314,12 +396,19 @@ Returns in this format
 ]
  */
 	app.get("/get-bookings", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
 	let bookings;
-	let time = new Date();
+	const time = new Date();
 	const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
+	const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
 
 	try {
-		bookings = await GetBookingsAfterTime(timeQuery as string | undefined);
+		bookings = await GetBookingsAfterTime(restaurantId, requestedTime);
 	} catch (error) {
 		console.log(error);
 		res.status(400).send({ error: "Oops something went wrong" });
@@ -331,10 +420,10 @@ Returns in this format
 	}
 
 	res.send(
-		bookings.map((booking) => {
-			booking.active = IsActiveBooking(booking, time);
-			return booking;
-		}),
+		bookings.map((booking) => ({
+			...booking,
+			active: IsActiveBooking(booking, time),
+		})),
 	);
 });
 
@@ -342,15 +431,55 @@ Returns in this format
 app.patch("/booking/:id/status", validate, async (req, res) => {
 	const rawId = req.params.id;
 	const status = req.body?.status;
-	const bookingId = rawId ? Number.parseInt(rawId, 10) : Number.NaN;
-	if (!status || Number.isNaN(bookingId)) {
+	const bookingId = typeof rawId === "string" ? rawId.trim() : "";
+	if (!status || !bookingId) {
 		res.status(400).json({ error: "Missing or invalid status/booking id" });
 		return;
 	}
 
-	const updated = await UpdateBookingStatus(bookingId, status);
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const updated = await UpdateBookingStatus(restaurantId, bookingId, status);
 	if (!updated) {
 		res.status(404).json({ error: "Booking not found" });
+		return;
+	}
+
+	res.json({ success: true });
+});
+
+app.patch("/booking/:id/table", validate, async (req, res) => {
+	const rawId = req.params.id;
+	const bookingId = typeof rawId === "string" ? rawId.trim() : "";
+	if (!bookingId) {
+		res.status(400).json({ error: "Invalid booking id" });
+		return;
+	}
+
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const tableNameRaw = req.body?.table_name;
+	const tableName =
+		tableNameRaw === null || tableNameRaw === undefined
+			? null
+			: String(tableNameRaw).trim() || null;
+
+	try {
+		const updated = await AssignTableToBooking(restaurantId, bookingId, tableName);
+		if (!updated) {
+			res.status(404).json({ error: "Booking not found" });
+			return;
+		}
+	} catch (error) {
+		res.status(400).json({ error: "Unable to assign table" });
 		return;
 	}
 
@@ -360,13 +489,19 @@ app.patch("/booking/:id/status", validate, async (req, res) => {
 
 app.delete("/booking/:id", validate, async (req, res) => {
 	const bookingIdParam = req.params.id;
-	const bookingId = bookingIdParam ? Number.parseInt(bookingIdParam, 10) : Number.NaN;
-	if (Number.isNaN(bookingId)) {
+	const bookingId = typeof bookingIdParam === "string" ? bookingIdParam.trim() : "";
+	if (!bookingId) {
 		res.status(400).json({ error: "Invalid booking id" });
 		return;
 	}
 
-	const deleted = await DeleteBooking(bookingId);
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const deleted = await DeleteBooking(restaurantId, bookingId);
 	if (!deleted) {
 		res.status(404).json({ error: "Booking not found" });
 		return;
@@ -387,22 +522,28 @@ app.delete("/booking/:id", validate, async (req, res) => {
     ]
 */
 app.get("/get-customers", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
 	let customers;
 	try {
-		customers = await GetCustomerAndBookings();
+		customers = await GetCustomerAndBookings(restaurantId);
 	} catch {
 		res.status(400).send({ error: "Oops something went wrong" });
 		return;
 	}
 
-	let promises = customers.map(async (x) => {
-		x["has_booking"] = await HasActiveBooking(x["customer_id"]);
-		return x;
-	});
+	const customersWithStatus = await Promise.all(
+		customers.map(async (customer) => ({
+			...customer,
+			has_booking: await HasActiveBooking(restaurantId, customer.customer_id),
+		})),
+	);
 
-	let customers_with_bookings = await Promise.all(promises);
-
-	res.send(customers_with_bookings);
+	res.send(customersWithStatus);
 });
 
 /*
@@ -418,6 +559,11 @@ app.get("/get-customers", validate, async (req, res) => {
     returns the number of bookings in that range
 */
 app.get("/get-withen-range", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).send({ Error: "Missing restaurantId" });
+		return;
+	}
 	if (!(req.body["start"] && req.body["end"])) {
 		res.status(400).send({ Error: "Missing fields" });
 	}
@@ -431,13 +577,56 @@ app.get("/get-withen-range", validate, async (req, res) => {
 		});
 	}
 
-	let count = await GetBookingsInRange(start, end);
+	let count = await GetBookingsInRange(restaurantId, start, end);
 
 	if (count == null) {
 		res.status(400).send({ Error: "Oops something went wrong" });
 	}
 
 	res.send(count);
+});
+
+app.get("/audit-logs", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const limitParam = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+	const limit = limitParam ? Number.parseInt(String(limitParam), 10) : 100;
+
+	try {
+		const logs = await GetAuditLogs(restaurantId, Number.isFinite(limit) ? limit : 100);
+		res.json(logs);
+	} catch (error) {
+		res.status(500).json({ error: "Unable to fetch audit logs" });
+	}
+});
+
+app.post("/audit-logs", validate, async (req, res) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const { employee, action, details } = req.body ?? {};
+	if (!employee || !action) {
+		res.status(400).json({ error: "Missing employee or action" });
+		return;
+	}
+
+	try {
+		await AddAuditLogEntry(restaurantId, {
+			employee: String(employee),
+			action: String(action),
+			details: details ? String(details) : null,
+		});
+		res.status(201).json({ success: true });
+	} catch (error) {
+		res.status(500).json({ error: "Unable to record audit log" });
+	}
 });
 
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
@@ -449,6 +638,39 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
 	next(err);
 });
 
-app.listen(port, () => {
-	console.log(`Server listening at http://localhost:${port}`);
+async function bootstrap(): Promise<void> {
+	try {
+		await EnsureRestaurantSeed({
+			name: "CSR Organics",
+			admin: {
+				employeeId: "admin",
+				name: "Admin",
+				password: "admin123",
+			},
+			tables: [
+				{ name: "T1", capacity: 2 },
+				{ name: "T2", capacity: 4 },
+				{ name: "T3", capacity: 4 },
+				{ name: "T4", capacity: 6 },
+			],
+			profile: {
+				address: "12 Example Street, Bengaluru",
+				phone: "+91 98765 43210",
+				email: "reservations@csrorganics.example",
+				hours: "11:00 AM - 11:00 PM",
+			},
+		});
+		console.log("✅ CSR Organics seed ensured");
+	} catch (error) {
+		console.error("Failed to ensure CSR Organics seed", error);
+	}
+
+	app.listen(port, () => {
+		console.log(`Server listening at http://localhost:${port}`);
+	});
+}
+
+bootstrap().catch(error => {
+	console.error("Server bootstrap failed", error);
+	process.exit(1);
 });
