@@ -54,7 +54,7 @@ function extractRestaurantId(req: Request): string | null {
 	return null;
 }
 
-app.use((req, res, next) => {
+app.use((req: Request, res: Response, next: NextFunction) => {
 	res.header("Access-Control-Allow-Origin", "http://localhost:9002");
 	res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id");
 	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE");
@@ -111,7 +111,7 @@ async function GetCustomerIdOrCreateCustomer(
     returns the customer_id if you want to store it somewhere
 */
 
-app.post("/add-customer", validate, async (req, res) => {
+app.post("/add-customer", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -144,7 +144,7 @@ app.post("/add-customer", validate, async (req, res) => {
     }
     returns the table_name if you want to store it somewhere
 */
-app.post("/add-table", validate, async (req, res) => {
+app.post("/add-table", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -197,7 +197,7 @@ Needs request body as
 }
 returns the booking id
 */
-app.post("/add-booking", validate, async (req, res) => {
+app.post("/add-booking", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -347,7 +347,7 @@ Returns tables in a 2d array in ascending order of capacity.
 ]
 */
 
-	app.get("/get-tables", validate, async (req, res) => {
+	app.get("/get-tables", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -395,7 +395,7 @@ Returns in this format
     }
 ]
  */
-	app.get("/get-bookings", validate, async (req, res) => {
+	app.get("/get-bookings", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -428,7 +428,7 @@ Returns in this format
 });
 
 
-app.patch("/booking/:id/status", validate, async (req, res) => {
+app.patch("/booking/:id/status", validate, async (req: Request, res: Response) => {
 	const rawId = req.params.id;
 	const status = req.body?.status;
 	const bookingId = typeof rawId === "string" ? rawId.trim() : "";
@@ -452,7 +452,7 @@ app.patch("/booking/:id/status", validate, async (req, res) => {
 	res.json({ success: true });
 });
 
-app.patch("/booking/:id/table", validate, async (req, res) => {
+app.patch("/booking/:id/table", validate, async (req: Request, res: Response) => {
 	const rawId = req.params.id;
 	const bookingId = typeof rawId === "string" ? rawId.trim() : "";
 	if (!bookingId) {
@@ -487,7 +487,7 @@ app.patch("/booking/:id/table", validate, async (req, res) => {
 });
 
 
-app.delete("/booking/:id", validate, async (req, res) => {
+app.delete("/booking/:id", validate, async (req: Request, res: Response) => {
 	const bookingIdParam = req.params.id;
 	const bookingId = typeof bookingIdParam === "string" ? bookingIdParam.trim() : "";
 	if (!bookingId) {
@@ -521,7 +521,7 @@ app.delete("/booking/:id", validate, async (req, res) => {
         }
     ]
 */
-app.get("/get-customers", validate, async (req, res) => {
+app.get("/get-customers", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -558,7 +558,7 @@ app.get("/get-customers", validate, async (req, res) => {
     for the best results just send ms since epoch
     returns the number of bookings in that range
 */
-app.get("/get-withen-range", validate, async (req, res) => {
+app.get("/get-withen-range", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).send({ Error: "Missing restaurantId" });
@@ -586,7 +586,7 @@ app.get("/get-withen-range", validate, async (req, res) => {
 	res.send(count);
 });
 
-app.get("/audit-logs", validate, async (req, res) => {
+app.get("/audit-logs", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -604,7 +604,7 @@ app.get("/audit-logs", validate, async (req, res) => {
 	}
 });
 
-app.post("/audit-logs", validate, async (req, res) => {
+app.post("/audit-logs", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });

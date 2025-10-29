@@ -3,14 +3,16 @@
     // Environment setup & latest features
     "lib": ["ESNext"],
     "target": "ESNext",
-    "module": "ESNext",
+  "module": "NodeNext",
     "moduleDetection": "force",
     "jsx": "react-jsx",
     "allowJs": true,
 
     // Bundler mode
-    "moduleResolution": "NodeNext",
-    "verbatimModuleSyntax": true,
+  "moduleResolution": "NodeNext",
+  "verbatimModuleSyntax": true,
+  "esModuleInterop": true,
+  "allowSyntheticDefaultImports": true,
     "noEmit": true,
 
     // Best practices
