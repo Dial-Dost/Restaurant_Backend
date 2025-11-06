@@ -18,6 +18,13 @@ import {
 	GetAuditLogs,
 	EnsureRestaurantSeed,
 } from "./database.js";
+import {
+	OPENAI_REALTIME_MODEL,
+	checkAvailabilityForRequest,
+	createReceptionSession,
+	createReservationForRequest,
+	getRestaurantKnowledgeSnapshot,
+} from "./realtime_reception_agent.js";
 const app = express();
 const port = 3000;
 
@@ -54,15 +61,117 @@ function extractRestaurantId(req: Request): string | null {
 	return null;
 }
 
+const allowedOrigins = new Set([
+	"http://localhost:9002",
+	"http://localhost:3000",
+	"http://localhost:3001",
+	"https://nw39853t-9002.inc1.devtunnels.ms", // TUNNEL URL goes here!!!!!
+]);
+
 app.use((req: Request, res: Response, next: NextFunction) => {
-	res.header("Access-Control-Allow-Origin", "http://localhost:9002");
+	const origin = req.headers.origin;
+	if (origin && allowedOrigins.has(origin)) {
+		res.header("Access-Control-Allow-Origin", origin);
+	}
 	res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id");
-	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE");
+	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+	if (req.method === "OPTIONS") {
+		res.sendStatus(204);
+		return;
+	}
 	next();
 });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.get("/reception/info", (_req: Request, res: Response) => {
+	const snapshot = getRestaurantKnowledgeSnapshot();
+	res.json(snapshot);
+});
+
+app.post("/reception/check-availability", async (req: Request, res: Response) => {
+	const { reservationDate, reservationTime, partySize } = req.body ?? {};
+	if (!reservationDate || !reservationTime || typeof partySize !== "number") {
+		res.status(400).json({ error: "reservationDate, reservationTime, and partySize are required" });
+		return;
+	}
+
+	try {
+		const result = await checkAvailabilityForRequest({
+			reservationDate: String(reservationDate),
+			reservationTime: String(reservationTime),
+			partySize: Number(partySize),
+		});
+		res.json(result);
+	} catch (error) {
+		console.error("check_availability_failed", error);
+		res.status(500).json({ error: "Unable to check availability" });
+	}
+});
+
+app.post("/reception/create-reservation", async (req: Request, res: Response) => {
+	const payload = req.body ?? {};
+	const required = ["guestName", "contactNumber", "partySize", "reservationDate", "reservationTime"] as const;
+	const missing = required.filter((key) => !payload[key]);
+	if (missing.length > 0) {
+		res.status(400).json({ error: `Missing fields: ${missing.join(", ")}` });
+		return;
+	}
+
+	try {
+		const result = await createReservationForRequest({
+			guestName: String(payload.guestName),
+			contactNumber: String(payload.contactNumber),
+			partySize: Number(payload.partySize),
+			reservationDate: String(payload.reservationDate),
+			reservationTime: String(payload.reservationTime),
+			tablePreference:
+				payload.tablePreference === null || payload.tablePreference === undefined
+					? null
+					: String(payload.tablePreference),
+			specialRequests:
+				payload.specialRequests === null || payload.specialRequests === undefined
+					? null
+					: String(payload.specialRequests),
+		});
+		res.json(result);
+	} catch (error) {
+		console.error("create_reservation_failed", error);
+		res.status(500).json({ error: "Unable to create reservation" });
+	}
+});
+
+app.post("/realtime/session", async (_req: Request, res: Response) => {
+	const apiKey = process.env.OPENAI_API_KEY;
+	if (!apiKey) {
+		res.status(500).json({ error: "OPENAI_API_KEY is not configured on the server" });
+		return;
+	}
+
+	try {
+		const response = await fetch("https://api.openai.com/v1/realtime/sessions", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				model: OPENAI_REALTIME_MODEL,
+				voice: "alloy",
+			}),
+		});
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+	} catch (error) {
+		console.error("realtime_session_failed", error);
+		res.status(500).json({ error: "Unable to create realtime session" });
+	}
+});
 
 async function GetCustomerIdOrCreateCustomer(
 	restaurantId: string,

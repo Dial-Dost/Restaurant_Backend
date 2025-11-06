@@ -9,6 +9,9 @@ function normalizeName(name) {
 function normalizePhone(number) {
     return number.replace(/[^0-9+]/g, "");
 }
+function normalizeRestaurantId(name) {
+    return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
 function toObjectId(id) {
     if (id instanceof ObjectId) {
         return id;
@@ -31,12 +34,14 @@ async function ensureIndexes() {
             const tables = db.collection("tables");
             const bookings = db.collection("bookings");
             const auditLogs = db.collection("audit_logs");
+            const restaurants = db.collection("restaurants");
             await Promise.allSettled([
                 customers.createIndex({ restaurant_id: 1, name_lower: 1, phone_normalized: 1 }, { unique: true, name: "customer_identity_per_restaurant" }),
                 tables.createIndex({ restaurant_id: 1, table_name: 1 }, { unique: true, name: "table_name_per_restaurant" }),
                 bookings.createIndex({ restaurant_id: 1, customer_id: 1 }, { name: "booking_customer_per_restaurant" }),
                 bookings.createIndex({ restaurant_id: 1, table_name: 1, booking_date_time: 1 }, { name: "booking_table_time_per_restaurant" }),
                 auditLogs.createIndex({ restaurant_id: 1, timestamp: -1 }, { name: "audit_logs_recent_per_restaurant" }),
+                restaurants.createIndex({ id: 1 }, { unique: true, name: "restaurant_id_unique" }),
             ]);
             indexesEnsured = true;
         })();
@@ -58,6 +63,10 @@ async function bookingsCollection() {
 async function auditLogsCollection() {
     await ensureIndexes();
     return getCollection("audit_logs");
+}
+async function restaurantsCollection() {
+    await ensureIndexes();
+    return getCollection("restaurants");
 }
 export async function AddCustomer(restaurantId, name, number, email) {
     const customers = await customersCollection();
@@ -344,5 +353,105 @@ export async function GetAuditLogs(restaurantId, limit = 100) {
         details: doc.details ?? null,
         timestamp: doc.timestamp,
     }));
+}
+export async function EnsureRestaurantSeed(seed) {
+    const restaurantId = seed.id ?? normalizeRestaurantId(seed.name);
+    const restaurants = await restaurantsCollection();
+    const profile = seed.profile ?? {};
+    const desiredProfile = {
+        name: seed.name,
+        address: profile.address ?? "",
+        phone: profile.phone ?? "",
+        email: profile.email ?? "",
+        hours: profile.hours ?? "",
+    };
+    let restaurant = await restaurants.findOne({ id: restaurantId });
+    if (!restaurant) {
+        const tablesData = seed.tables.map((table, index) => ({
+            id: index + 1,
+            name: table.name,
+            capacity: table.capacity,
+            status: "Available",
+        }));
+        const newDoc = {
+            id: restaurantId,
+            name: seed.name,
+            users: [
+                {
+                    employeeId: seed.admin.employeeId,
+                    name: seed.admin.name,
+                    password: seed.admin.password,
+                    role: "admin",
+                },
+            ],
+            data: {
+                profile: desiredProfile,
+                bookings: [],
+                customers: [],
+                inventory: [],
+                menuItems: [],
+                menuCategories: ["Appetizers", "Main Courses", "Desserts", "Beverages"],
+                orders: [],
+                tables: tablesData,
+                auditLogs: [],
+            },
+        };
+        const insertResult = await restaurants.insertOne(newDoc);
+        restaurant = { ...newDoc, _id: insertResult.insertedId };
+    }
+    else {
+        const users = restaurant.users ?? [];
+        const adminIndex = users.findIndex(user => user.employeeId?.toLowerCase() === seed.admin.employeeId.toLowerCase());
+        if (adminIndex === -1) {
+            users.push({
+                employeeId: seed.admin.employeeId,
+                name: seed.admin.name,
+                password: seed.admin.password,
+                role: "admin",
+            });
+        }
+        else {
+            const existingAdmin = users[adminIndex];
+            users[adminIndex] = {
+                ...existingAdmin,
+                employeeId: existingAdmin?.employeeId ?? seed.admin.employeeId,
+                name: seed.admin.name,
+                password: seed.admin.password,
+                role: "admin",
+            };
+        }
+        const tablesData = restaurant.data?.tables ?? [];
+        const tableNames = new Set(tablesData.map(table => table.name));
+        let nextId = tablesData.reduce((max, table) => Math.max(max, table.id ?? 0), 0) + 1;
+        for (const table of seed.tables) {
+            if (!tableNames.has(table.name)) {
+                tablesData.push({
+                    id: nextId,
+                    name: table.name,
+                    capacity: table.capacity,
+                    status: "Available",
+                });
+                nextId += 1;
+            }
+        }
+        await restaurants.updateOne({ _id: restaurant._id }, {
+            $set: {
+                users,
+                "data.tables": tablesData,
+                "data.profile": desiredProfile,
+            },
+        });
+    }
+    for (const table of seed.tables) {
+        try {
+            await AddTable(restaurantId, table.name, table.capacity);
+        }
+        catch (error) {
+            if (error instanceof Error && /exists/i.test(error.message)) {
+                continue;
+            }
+            console.warn("ensure_table_failed", { restaurantId, table: table.name, error });
+        }
+    }
 }
 //# sourceMappingURL=database.js.map
