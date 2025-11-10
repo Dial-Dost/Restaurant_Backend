@@ -374,6 +374,7 @@ app.post("/add-booking", validate, async (req: Request, res: Response) => {
 			booking_request.source,
 			booking_request.status ?? "Confirmed",
 			booking_request.from,
+			booking_request.notes ?? booking_request.additional_information ?? null,
 		);
 	} catch (error) {
 		res.status(400).json({ error: "Oops something went wrong" });

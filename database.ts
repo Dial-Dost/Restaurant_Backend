@@ -33,6 +33,7 @@ interface BookingFields extends Document {
 	source?: string | null;
 	status?: string | null;
 	from?: string | null;
+	notes?: string | null;
 	created_at: Date;
 }
 
@@ -60,6 +61,7 @@ type BookingSummary = {
 	source?: string | null;
 	status?: string | null;
 	from?: string | null;
+	notes?: string | null;
 };
 
 type TableAvailability = {
@@ -272,6 +274,7 @@ export async function AddBooking(
 	source?: string,
 	status?: string,
 	from?: string,
+	notes?: string | null,
 ): Promise<BookingDoc> {
 	ensureValidDate(booking_date_time);
 	const bookings = await bookingsCollection();
@@ -298,6 +301,7 @@ export async function AddBooking(
 		source: source ?? null,
 		status: status ?? null,
 		from: from ?? null,
+		notes: notes ?? null,
 		created_at: new Date(),
 	};
 	const result = await bookings.insertOne(doc);
@@ -421,6 +425,7 @@ export async function GetBookingsAfterTime(
 					source: 1,
 					status: 1,
 					from: 1,
+					notes: 1,
 				},
 			},
 			{ $sort: { booking_date_time: 1 } },

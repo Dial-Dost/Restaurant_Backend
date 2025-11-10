@@ -34,6 +34,7 @@ const allowedOrigins = new Set([
     "http://localhost:9002",
     "http://localhost:3000",
     "http://localhost:3001",
+    "https://nw39853t-9002.inc1.devtunnels.ms", // TUNNEL URL goes here!!!!!
 ]);
 app.use((req, res, next) => {
     const origin = req.headers.origin;
