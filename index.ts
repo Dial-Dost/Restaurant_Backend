@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import type { NextFunction, Request, Response } from "express";
 import express from "express";
 import {
@@ -84,6 +85,11 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Lightweight health endpoint for readiness/liveness checks
+app.get("/health", (_req: Request, res: Response) => {
+    res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() });
+});
 
 app.get("/reception/info", (_req: Request, res: Response) => {
 	const snapshot = getRestaurantKnowledgeSnapshot();
