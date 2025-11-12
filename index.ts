@@ -18,6 +18,7 @@ import {
 	AddAuditLogEntry,
 	GetAuditLogs,
 	EnsureRestaurantSeed,
+	AllocateBestTable,
 } from "./database.js";
 import {
 	OPENAI_REALTIME_MODEL,
@@ -87,8 +88,19 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Lightweight health endpoint for readiness/liveness checks
-app.get("/health", (_req: Request, res: Response) => {
-    res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() });
+import { getDb } from "./schema.js";
+
+app.get("/health", async (_req: Request, res: Response) => {
+	const result: any = { status: "ok", uptime: process.uptime(), time: new Date().toISOString() };
+	try {
+		const db = await getDb();
+		const ping = await db.command({ ping: 1 });
+		result.mongo = { ok: ping?.ok === 1 ? true : false };
+	} catch (err: any) {
+		result.mongo = { ok: false, error: String(err?.message ?? err) };
+		result.status = "degraded";
+	}
+	res.json(result);
 });
 
 app.get("/reception/info", (_req: Request, res: Response) => {
@@ -369,14 +381,29 @@ app.post("/add-booking", validate, async (req: Request, res: Response) => {
 	}
 
 	let booking;
+	let tableName: string | null = (booking_request.table_name ?? null);
 	try {
+		if (!tableName) {
+			// Auto-allocate best fitting table if none provided
+			try {
+				const allocated = await AllocateBestTable(restaurantId, date, durationMinutes, partySize);
+				if (allocated) {
+					tableName = allocated;
+				}
+			} catch (allocErr) {
+				console.warn("table_allocation_failed", { restaurantId, error: allocErr });
+			}
+			if (!tableName) {
+				return res.status(409).json({ error: "No table available for the requested time window", reason: "no_table_available" });
+			}
+		}
 		booking = await AddBooking(
 			restaurantId,
 			cust_id,
 			date,
 			durationMinutes,
 			partySize,
-			booking_request.table_name,
+			tableName,
 			booking_request.source,
 			booking_request.status ?? "Confirmed",
 			booking_request.from,
@@ -393,7 +420,7 @@ app.post("/add-booking", validate, async (req: Request, res: Response) => {
 				? booking._id.toHexString()
 				: booking._id.toString();
 
-	res.json({ booking_id });
+	res.json({ booking_id, table_name: tableName });
 });
 
 function FoldedTables(table: any[]): any[][] {

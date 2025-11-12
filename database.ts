@@ -382,6 +382,74 @@ export async function GetTables(
 	}));
 }
 
+// Determine table availability for an interval [start, end) and return the free tables with their capacities
+export async function GetAvailableTablesForInterval(
+	restaurantId: string,
+	start: Date,
+	durationMins: number,
+): Promise<Array<{ table_name: string; capacity: number | null }>> {
+	ensureValidDate(start);
+	const end = new Date(start.getTime() + durationMins * MINUTE_IN_MS);
+	const tables = await tablesCollection();
+	const bookings = await bookingsCollection();
+
+	const allTables = await tables
+		.find({ restaurant_id: restaurantId }, { projection: { table_name: 1, capacity: 1 } })
+		.toArray();
+
+	// Find tables that have an overlapping booking with [start, end)
+	const overlapping = await bookings
+		.aggregate<{ table_name: string }>([
+			{ $match: { restaurant_id: restaurantId, table_name: { $ne: null } } },
+			{
+				$addFields: {
+					booking_end: {
+						$add: ["$booking_date_time", { $multiply: ["$duration_mins", MINUTE_IN_MS] }],
+					},
+				},
+			},
+			{
+				$match: {
+					$expr: {
+						$and: [
+							{ $lt: ["$booking_date_time", end] }, // starts before end
+							{ $gt: ["$booking_end", start] }, // ends after start
+						],
+					},
+				},
+			},
+			{ $project: { table_name: 1 } },
+		])
+		.toArray();
+
+	const busy = new Set(overlapping.map(o => o.table_name));
+	return allTables
+		.filter(t => !busy.has(t.table_name))
+		.map(t => ({ table_name: t.table_name, capacity: t.capacity ?? null }));
+}
+
+// Pick the smallest capacity table that can fit partySize (>= partySize). If none, return null.
+export async function AllocateBestTable(
+	restaurantId: string,
+	start: Date,
+	durationMins: number,
+	partySize: number,
+): Promise<string | null> {
+	const free = await GetAvailableTablesForInterval(restaurantId, start, durationMins);
+	if (free.length === 0) return null;
+	// Partition into fit and too-small; choose minimal capacity among fit
+	const fit = free.filter(t => (t.capacity ?? Infinity) >= partySize);
+	if (fit.length === 0) return null;
+	fit.sort((a, b) => {
+		const ca = a.capacity ?? Number.MAX_SAFE_INTEGER;
+		const cb = b.capacity ?? Number.MAX_SAFE_INTEGER;
+		if (ca !== cb) return ca - cb;
+		return a.table_name.localeCompare(b.table_name);
+	});
+	const chosen = fit[0];
+	return chosen ? chosen.table_name : null;
+}
+
 export async function GetBookingsAfterTime(
 	restaurantId: string,
 	time?: string,
