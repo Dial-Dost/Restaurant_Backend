@@ -68,6 +68,7 @@ type TableAvailability = {
 	table_name: string;
 	capacity: number | null;
 	booked: boolean;
+	reserved: boolean;
 };
 
 type CustomerSummary = {
@@ -183,6 +184,10 @@ async function ensureIndexes(): Promise<void> {
 					{ restaurant_id: 1, table_name: 1, booking_date_time: 1 },
 					{ name: "booking_table_time_per_restaurant" },
 				),
+				bookings.createIndex(
+					{ booking_date_time: 1 },
+					{ name: "booking_datetime_auto_expire_2h", expireAfterSeconds: 2 * 60 * 60 },
+				),
 				auditLogs.createIndex(
 					{ restaurant_id: 1, timestamp: -1 },
 					{ name: "audit_logs_recent_per_restaurant" },
@@ -262,6 +267,15 @@ export async function AddTable(
 	};
 	const result = await tables.insertOne(doc);
 	return { ...doc, _id: result.insertedId } as TableDoc;
+}
+
+export async function RemoveTable(
+	restaurantId: string,
+	table_name: string,
+): Promise<boolean> {
+	const tables = await tablesCollection();
+	const deleteResult = await tables.deleteOne({ restaurant_id: restaurantId, table_name });
+	return deleteResult.deletedCount > 0;
 }
 
 export async function AddBooking(
@@ -371,14 +385,31 @@ export async function GetTables(
 		])
 		.toArray();
 
+	const dayEnd = new Date(at);
+	dayEnd.setHours(23, 59, 59, 999);
+	const upcomingBookings = await bookings
+		.find(
+			{
+				restaurant_id: restaurantId,
+				table_name: { $ne: null },
+				booking_date_time: { $gt: at, $lte: dayEnd },
+			},
+			{ projection: { table_name: 1 } },
+		)
+		.toArray();
+
 	const bookedTables = new Set(
 		activeBookings.map((booking: { table_name: string }) => booking.table_name),
+	);
+	const reservedTables = new Set(
+		upcomingBookings.map((booking: { table_name: string }) => booking.table_name),
 	);
 
 	return tablesList.map((table: { table_name: string; capacity?: number | null }) => ({
 		table_name: table.table_name,
 		capacity: table.capacity ?? null,
 		booked: table.table_name ? bookedTables.has(table.table_name) : false,
+		reserved: table.table_name ? reservedTables.has(table.table_name) : false,
 	}));
 }
 

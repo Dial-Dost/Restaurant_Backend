@@ -7,6 +7,7 @@ import {
 	AddCustomer,
 	AddEmailToCustomer,
 	AddTable,
+	RemoveTable,
 	GetBookingsAfterTime,
 	HasActiveBooking,
 	GetCustomerAndBookings,
@@ -302,6 +303,29 @@ app.post("/add-table", validate, async (req: Request, res: Response) => {
 	}
 
 	res.send(table_name);
+});
+
+app.delete("/table/:name", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const rawName = req.params.name;
+	const tableName = typeof rawName === "string" ? rawName.trim() : "";
+	if (!tableName) {
+		res.status(400).json({ error: "Invalid table name" });
+		return;
+	}
+
+	const deleted = await RemoveTable(restaurantId, tableName);
+	if (!deleted) {
+		res.status(404).json({ error: "Table not found" });
+		return;
+	}
+
+	res.status(204).send();
 });
 
 /*
