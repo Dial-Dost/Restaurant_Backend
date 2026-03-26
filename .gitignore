@@ -2,3 +2,14 @@ eslint.config.mjs
 node_modules/
 .prettierrc
 **/*.db
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.env
+*.log
