@@ -19,6 +19,7 @@ Valet-state with no.
 import uvicorn
 import random
 import time
+import os
 from util.logger import info, exception
 from db import get_all_feedback, shutdown_db, get_valet_state_from_db, update_valet_state_from_db
 from fastapi import FastAPI
@@ -103,7 +104,7 @@ async def update_valet_state(number_plate: str, state: int):
         return {"error": "Invalid valet state"}
 
 def main():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PY_SERVER_PORT", 8000)))
 
 if __name__ == "__main__":
     main()

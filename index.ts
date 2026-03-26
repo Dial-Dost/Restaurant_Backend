@@ -173,6 +173,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Lightweight health endpoint for readiness/liveness checks
 import { getDb } from "./schema.js";
+import { ca } from 'zod/v4/locales';
 
 app.get("/health", async (_req: Request, res: Response) => {
 	const result: any = { status: "ok", uptime: process.uptime(), time: new Date().toISOString() };
@@ -909,6 +910,82 @@ app.post("/audit-logs", validate, async (req: Request, res: Response) => {
 		res.status(500).json({ error: "Unable to record audit log" });
 	}
 });
+
+// Rtamanyu's integration
+app.post("/get_valet_state", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
+	if (!number_plate) {
+		res.status(400).json({ error: "Missing number plate" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate),
+		);
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("fetch_valet_state_failed", error);
+		res.status(500).json({ error: "Unable to fetch valet state" });
+		return;
+	}
+});
+
+
+app.post("/update_valet_state", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
+	const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
+	if (!number_plate || !state) {
+		res.status(400).json({ error: "Missing number plate or state" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(state),
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+			},
+		);
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("update_valet_state_failed", error);
+		res.status(500).json({ error: "Unable to update valet state" });
+		return;
+	}
+});
+
+
+export { app };
 
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
 	if (err instanceof SyntaxError && "body" in err) {

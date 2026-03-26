@@ -3,13 +3,16 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node ./build/index.js",
-    "dev": "tsx watch index.ts",
+    "start": "concurrently --kill-others --raw \"node ./build/index.js\" \"npm:run-python\"",
+    "tsx-watch": "tsx watch index.ts",
+    "run-python": "node scripts/run-python.js",
+    "dev": "concurrently --kill-others --raw \"npm:tsx-watch\" \"npm:run-python\"",
     "build": "tsc --project tsconfig.build.json",
     "test:integration": "tsx test/booking_roundtrip.ts",
     "test:allocation": "tsx test/allocation_roundtrip.ts",
     "test:overlap": "tsx test/overlap_allocation.ts",
     "test:threshold": "tsx test/capacity_threshold.ts",
+    "test:valet_api": "tsx test/valet_api_test.ts",
     "jest": "jest",
     "jest:watch": "jest --watch",
     "test:ci": "npm run build && jest --runInBand"
@@ -21,7 +24,8 @@
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "jest": "^29.7.0",
-    "ts-jest": "^29.2.4"
+    "ts-jest": "^29.2.4",
+    "concurrently": "^8.2.0"
   },
   "dependencies": {
     "@openai/agents": "^0.3.0",
