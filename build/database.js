@@ -40,6 +40,7 @@ async function ensureIndexes() {
                 tables.createIndex({ restaurant_id: 1, table_name: 1 }, { unique: true, name: "table_name_per_restaurant" }),
                 bookings.createIndex({ restaurant_id: 1, customer_id: 1 }, { name: "booking_customer_per_restaurant" }),
                 bookings.createIndex({ restaurant_id: 1, table_name: 1, booking_date_time: 1 }, { name: "booking_table_time_per_restaurant" }),
+                bookings.createIndex({ booking_date_time: 1 }, { name: "booking_datetime_auto_expire_2h", expireAfterSeconds: 2 * 60 * 60 }),
                 auditLogs.createIndex({ restaurant_id: 1, timestamp: -1 }, { name: "audit_logs_recent_per_restaurant" }),
                 restaurants.createIndex({ id: 1 }, { unique: true, name: "restaurant_id_unique" }),
             ]);
@@ -97,7 +98,12 @@ export async function AddTable(restaurantId, table_name, capacity) {
     const result = await tables.insertOne(doc);
     return { ...doc, _id: result.insertedId };
 }
-export async function AddBooking(restaurantId, customer_id, booking_date_time, duration, number_of_people, table_name, source, status, from) {
+export async function RemoveTable(restaurantId, table_name) {
+    const tables = await tablesCollection();
+    const deleteResult = await tables.deleteOne({ restaurant_id: restaurantId, table_name });
+    return deleteResult.deletedCount > 0;
+}
+export async function AddBooking(restaurantId, customer_id, booking_date_time, duration, number_of_people, table_name, source, status, from, notes) {
     ensureValidDate(booking_date_time);
     const bookings = await bookingsCollection();
     const customerObjectId = toObjectId(customer_id);
@@ -122,6 +128,7 @@ export async function AddBooking(restaurantId, customer_id, booking_date_time, d
         source: source ?? null,
         status: status ?? null,
         from: from ?? null,
+        notes: notes ?? null,
         created_at: new Date(),
     };
     const result = await bookings.insertOne(doc);
@@ -170,12 +177,84 @@ export async function GetTables(restaurantId, time) {
         { $project: { table_name: 1 } },
     ])
         .toArray();
-    const bookedTables = new Set(activeBookings.map((booking) => booking.table_name));
+    const dayEnd = new Date(at);
+    dayEnd.setHours(23, 59, 59, 999);
+    const upcomingBookings = await bookings
+        .find({
+        restaurant_id: restaurantId,
+        table_name: { $ne: null },
+        booking_date_time: { $gt: at, $lte: dayEnd },
+    }, { projection: { table_name: 1 } })
+        .toArray();
+    const bookedTables = new Set(activeBookings
+        .map((booking) => booking.table_name)
+        .filter((tableName) => typeof tableName === "string" && tableName.length > 0));
+    const reservedTables = new Set(upcomingBookings
+        .map((booking) => booking.table_name)
+        .filter((tableName) => typeof tableName === "string" && tableName.length > 0));
     return tablesList.map((table) => ({
         table_name: table.table_name,
         capacity: table.capacity ?? null,
         booked: table.table_name ? bookedTables.has(table.table_name) : false,
+        reserved: table.table_name ? reservedTables.has(table.table_name) : false,
     }));
+}
+// Determine table availability for an interval [start, end) and return the free tables with their capacities
+export async function GetAvailableTablesForInterval(restaurantId, start, durationMins) {
+    ensureValidDate(start);
+    const end = new Date(start.getTime() + durationMins * MINUTE_IN_MS);
+    const tables = await tablesCollection();
+    const bookings = await bookingsCollection();
+    const allTables = await tables
+        .find({ restaurant_id: restaurantId }, { projection: { table_name: 1, capacity: 1 } })
+        .toArray();
+    // Find tables that have an overlapping booking with [start, end)
+    const overlapping = await bookings
+        .aggregate([
+        { $match: { restaurant_id: restaurantId, table_name: { $ne: null } } },
+        {
+            $addFields: {
+                booking_end: {
+                    $add: ["$booking_date_time", { $multiply: ["$duration_mins", MINUTE_IN_MS] }],
+                },
+            },
+        },
+        {
+            $match: {
+                $expr: {
+                    $and: [
+                        { $lt: ["$booking_date_time", end] }, // starts before end
+                        { $gt: ["$booking_end", start] }, // ends after start
+                    ],
+                },
+            },
+        },
+        { $project: { table_name: 1 } },
+    ])
+        .toArray();
+    const busy = new Set(overlapping.map(o => o.table_name));
+    return allTables
+        .filter(t => !busy.has(t.table_name))
+        .map(t => ({ table_name: t.table_name, capacity: t.capacity ?? null }));
+}
+// Pick the smallest capacity table that can fit partySize (>= partySize). If none, return null.
+export async function AllocateBestTable(restaurantId, start, durationMins, partySize) {
+    const free = await GetAvailableTablesForInterval(restaurantId, start, durationMins);
+    if (free.length === 0)
+        return null;
+    // Partition into fit and too-small; choose minimal capacity among fit
+    const fit = free.filter(t => (t.capacity ?? Infinity) >= partySize);
+    if (fit.length === 0)
+        return null;
+    fit.sort((a, b) => {
+        const ca = a.capacity ?? Number.MAX_SAFE_INTEGER;
+        const cb = b.capacity ?? Number.MAX_SAFE_INTEGER;
+        if (ca !== cb)
+            return ca - cb;
+        return a.table_name.localeCompare(b.table_name);
+    });
+    const chosen = fit[0];
+    return chosen ? chosen.table_name : null;
 }
 export async function GetBookingsAfterTime(restaurantId, time) {
     const at = time ? new Date(time) : new Date();
@@ -215,6 +294,7 @@ export async function GetBookingsAfterTime(restaurantId, time) {
                 source: 1,
                 status: 1,
                 from: 1,
+                notes: 1,
             },
         },
         { $sort: { booking_date_time: 1 } },
@@ -353,6 +433,19 @@ export async function GetAuditLogs(restaurantId, limit = 100) {
         details: doc.details ?? null,
         timestamp: doc.timestamp,
     }));
+}
+export async function GetRestaurantUserRole(restaurantId, employeeId) {
+    const normalizedEmployeeId = employeeId.trim().toLowerCase();
+    if (!normalizedEmployeeId) {
+        return null;
+    }
+    const restaurants = await restaurantsCollection();
+    const restaurant = await restaurants.findOne({ id: restaurantId });
+    if (!restaurant?.users?.length) {
+        return null;
+    }
+    const user = restaurant.users.find((entry) => entry.employeeId?.trim().toLowerCase() === normalizedEmployeeId);
+    return user?.role ?? null;
 }
 export async function EnsureRestaurantSeed(seed) {
     const restaurantId = seed.id ?? normalizeRestaurantId(seed.name);
