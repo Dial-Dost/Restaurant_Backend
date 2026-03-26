@@ -1,6 +1,8 @@
 eslint.config.mjs
 node_modules/
 .prettierrc
+.env.local
+.env*
 **/*.db
 
 # Python-generated files

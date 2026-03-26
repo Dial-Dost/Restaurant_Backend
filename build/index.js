@@ -1,5 +1,6 @@
+import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, EnsureRestaurantSeed, } from "./database.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, } from "./database.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 const app = express();
 const port = 3000;
@@ -11,6 +12,16 @@ function log(req, res, next) {
 function validate(req, res, next) {
     next();
     // return res.status(400).json({ error: "Auth failed" });
+}
+function normalizeRole(rawRole) {
+    if (typeof rawRole !== "string") {
+        return null;
+    }
+    const lowered = rawRole.trim().toLowerCase();
+    if (lowered === "admin" || lowered === "employee" || lowered === "valet") {
+        return lowered;
+    }
+    return null;
 }
 function extractRestaurantId(req) {
     const headerValue = req.headers["x-restaurant-id"];
@@ -30,6 +41,55 @@ function extractRestaurantId(req) {
     }
     return null;
 }
+function extractEmployeeId(req) {
+    const headerValue = req.headers["x-employee-id"];
+    const headerId = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    if (typeof headerId === "string" && headerId.trim().length > 0) {
+        return headerId.trim();
+    }
+    const queryValue = req.query.employeeId;
+    const queryId = Array.isArray(queryValue) ? queryValue[0] : queryValue;
+    if (typeof queryId === "string" && queryId.trim().length > 0) {
+        return queryId.trim();
+    }
+    const body = req.body;
+    const bodyValue = body?.employeeId;
+    if (typeof bodyValue === "string" && bodyValue.trim().length > 0) {
+        return bodyValue.trim();
+    }
+    return null;
+}
+async function resolveRoleForRequest(req, restaurantId) {
+    const employeeId = extractEmployeeId(req);
+    if (!employeeId) {
+        return null;
+    }
+    const roleFromRestaurant = await GetRestaurantUserRole(restaurantId, employeeId);
+    if (roleFromRestaurant) {
+        return roleFromRestaurant;
+    }
+    return null;
+}
+async function enforceRoles(req, res, allowedRoles) {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return null;
+    }
+    const role = await resolveRoleForRequest(req, restaurantId);
+    if (!role) {
+        res.status(401).json({
+            error: "Unauthorized",
+            details: "Missing or invalid employee identity",
+        });
+        return null;
+    }
+    if (!allowedRoles.includes(role)) {
+        res.status(403).json({ error: "Forbidden", requiredRoles: allowedRoles });
+        return null;
+    }
+    return { restaurantId, role };
+}
 const allowedOrigins = new Set([
     "http://localhost:9002",
     "http://localhost:3000",
@@ -41,8 +101,8 @@ app.use((req, res, next) => {
     if (origin && allowedOrigins.has(origin)) {
         res.header("Access-Control-Allow-Origin", origin);
     }
-    res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id");
-    res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role");
+    res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     if (req.method === "OPTIONS") {
         res.sendStatus(204);
         return;
@@ -51,6 +111,21 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+// Lightweight health endpoint for readiness/liveness checks
+import { getDb } from "./schema.js";
+app.get("/health", async (_req, res) => {
+    const result = { status: "ok", uptime: process.uptime(), time: new Date().toISOString() };
+    try {
+        const db = await getDb();
+        const ping = await db.command({ ping: 1 });
+        result.mongo = { ok: ping?.ok === 1 ? true : false };
+    }
+    catch (err) {
+        result.mongo = { ok: false, error: String(err?.message ?? err) };
+        result.status = "degraded";
+    }
+    res.json(result);
+});
 app.get("/reception/info", (_req, res) => {
     const snapshot = getRestaurantKnowledgeSnapshot();
     res.json(snapshot);
@@ -214,6 +289,25 @@ app.post("/add-table", validate, async (req, res) => {
     }
     res.send(table_name);
 });
+app.delete("/table/:name", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const rawName = req.params.name;
+    const tableName = typeof rawName === "string" ? rawName.trim() : "";
+    if (!tableName) {
+        res.status(400).json({ error: "Invalid table name" });
+        return;
+    }
+    const deleted = await RemoveTable(restaurantId, tableName);
+    if (!deleted) {
+        res.status(404).json({ error: "Table not found" });
+        return;
+    }
+    res.status(204).send();
+});
 /*
 Needs request body as
 {
@@ -276,8 +370,24 @@ app.post("/add-booking", validate, async (req, res) => {
         return;
     }
     let booking;
+    let tableName = (booking_request.table_name ?? null);
     try {
-        booking = await AddBooking(restaurantId, cust_id, date, durationMinutes, partySize, booking_request.table_name, booking_request.source, booking_request.status ?? "Confirmed", booking_request.from);
+        if (!tableName) {
+            // Auto-allocate best fitting table if none provided
+            try {
+                const allocated = await AllocateBestTable(restaurantId, date, durationMinutes, partySize);
+                if (allocated) {
+                    tableName = allocated;
+                }
+            }
+            catch (allocErr) {
+                console.warn("table_allocation_failed", { restaurantId, error: allocErr });
+            }
+            if (!tableName) {
+                return res.status(409).json({ error: "No table available for the requested time window", reason: "no_table_available" });
+            }
+        }
+        booking = await AddBooking(restaurantId, cust_id, date, durationMinutes, partySize, tableName, booking_request.source, booking_request.status ?? "Confirmed", booking_request.from, booking_request.notes ?? booking_request.additional_information ?? null);
     }
     catch (error) {
         res.status(400).json({ error: "Oops something went wrong" });
@@ -288,7 +398,7 @@ app.post("/add-booking", validate, async (req, res) => {
         : typeof booking._id.toHexString === "function"
             ? booking._id.toHexString()
             : booking._id.toString();
-    res.json({ booking_id });
+    res.json({ booking_id, table_name: tableName });
 });
 function FoldedTables(table) {
     if (table.length == 0) {
@@ -419,7 +529,40 @@ app.get("/get-bookings", validate, async (req, res) => {
         active: IsActiveBooking(booking, time),
     })));
 });
+app.get("/valet-info", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
+    const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
+    const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
+    const now = new Date();
+    try {
+        const [tables, bookings] = await Promise.all([
+            GetTables(auth.restaurantId, requestedTime),
+            GetBookingsAfterTime(auth.restaurantId, requestedTime),
+        ]);
+        const safeBookings = bookings ?? [];
+        res.json({
+            role: auth.role,
+            generated_at: new Date().toISOString(),
+            tables,
+            bookings: safeBookings.map((booking) => ({
+                ...booking,
+                active: IsActiveBooking(booking, now),
+            })),
+        });
+    }
+    catch (error) {
+        console.error("valet_info_failed", error);
+        res.status(500).json({ error: "Unable to fetch valet info" });
+    }
+});
 app.patch("/booking/:id/status", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
     const rawId = req.params.id;
     const status = req.body?.status;
     const bookingId = typeof rawId === "string" ? rawId.trim() : "";
@@ -427,12 +570,7 @@ app.patch("/booking/:id/status", validate, async (req, res) => {
         res.status(400).json({ error: "Missing or invalid status/booking id" });
         return;
     }
-    const restaurantId = extractRestaurantId(req);
-    if (!restaurantId) {
-        res.status(400).json({ error: "Missing restaurantId" });
-        return;
-    }
-    const updated = await UpdateBookingStatus(restaurantId, bookingId, status);
+    const updated = await UpdateBookingStatus(auth.restaurantId, bookingId, status);
     if (!updated) {
         res.status(404).json({ error: "Booking not found" });
         return;
@@ -440,15 +578,14 @@ app.patch("/booking/:id/status", validate, async (req, res) => {
     res.json({ success: true });
 });
 app.patch("/booking/:id/table", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
     const rawId = req.params.id;
     const bookingId = typeof rawId === "string" ? rawId.trim() : "";
     if (!bookingId) {
         res.status(400).json({ error: "Invalid booking id" });
-        return;
-    }
-    const restaurantId = extractRestaurantId(req);
-    if (!restaurantId) {
-        res.status(400).json({ error: "Missing restaurantId" });
         return;
     }
     const tableNameRaw = req.body?.table_name;
@@ -456,7 +593,7 @@ app.patch("/booking/:id/table", validate, async (req, res) => {
         ? null
         : String(tableNameRaw).trim() || null;
     try {
-        const updated = await AssignTableToBooking(restaurantId, bookingId, tableName);
+        const updated = await AssignTableToBooking(auth.restaurantId, bookingId, tableName);
         if (!updated) {
             res.status(404).json({ error: "Booking not found" });
             return;

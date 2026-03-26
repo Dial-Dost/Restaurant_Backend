@@ -3,7 +3,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import { config as loadEnv } from "dotenv";
-import { parse } from "csv-parse/sync";
 import { z } from "zod";
 import { RealtimeAgent, RealtimeSession, tool } from "@openai/agents/realtime";
 loadEnv({ path: path.resolve(process.cwd(), "../.env") });
@@ -16,40 +15,24 @@ const BOOKING_DURATION_MINUTES = Number.parseInt(process.env.RECEPTION_BOOKING_D
 const BOOKING_SOURCE = process.env.RECEPTION_BOOKING_SOURCE ?? "Voice";
 export const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL ?? "gpt-4o-realtime-preview";
 if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY must be set before starting the realtime agent");
+    console.warn("OPENAI_API_KEY is not configured. Realtime receptionist sessions are disabled.");
 }
 const reservationsCsvPath = path.resolve(repoRoot, "reservations.csv");
-const ironhillCsvPath = path.resolve(repoRoot, "ironhill.csv");
+const fallbackRestaurantKnowledge = {
+    infoEntries: [],
+    infoContext: "Restaurant knowledge file is unavailable.",
+    openingTime: "12:00 PM",
+    closingTime: "11:00 PM",
+};
 function loadRestaurantKnowledge() {
-    if (!fs.existsSync(ironhillCsvPath)) {
-        throw new Error(`ironhill.csv was not found at ${ironhillCsvPath}. The realtime receptionist relies on this file.`);
-    }
-    const csvRaw = fs.readFileSync(ironhillCsvPath, "utf-8");
-    const records = parse(csvRaw, {
-        from_line: 3,
-        columns: true,
-        skip_empty_lines: true,
-        relax_column_count: true,
-        trim: true,
-    });
-    const infoEntries = records
-        .map((record) => {
-        const fieldRaw = record.Field?.trim();
-        const valueRaw = record.Value?.trim();
-        if (!fieldRaw || !valueRaw) {
-            return null;
-        }
-        return { field: fieldRaw, value: valueRaw };
-    })
-        .filter((entry) => entry !== null);
-    const infoContext = infoEntries
-        .map((entry) => `${entry.field}: ${entry.value}`)
-        .join("\n");
-    const openingTime = infoEntries.find((entry) => entry.field.toLowerCase() === "opening time")?.value ??
-        "12:00 PM";
-    const closingTime = infoEntries.find((entry) => entry.field.toLowerCase() === "closing time")?.value ??
-        "11:00 PM";
-    return { infoEntries, infoContext, openingTime, closingTime };
+    const openingTime = process.env.RECEPTION_OPENING_TIME?.trim() || fallbackRestaurantKnowledge.openingTime;
+    const closingTime = process.env.RECEPTION_CLOSING_TIME?.trim() || fallbackRestaurantKnowledge.closingTime;
+    return {
+        infoEntries: [],
+        infoContext: "",
+        openingTime,
+        closingTime,
+    };
 }
 const restaurantKnowledge = loadRestaurantKnowledge();
 export function getRestaurantKnowledgeSnapshot() {

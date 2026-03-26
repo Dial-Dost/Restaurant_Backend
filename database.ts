@@ -83,7 +83,7 @@ type RestaurantUser = {
 	employeeId: string;
 	name: string;
 	password?: string | null;
-	role: "admin" | "employee";
+	role: "admin" | "employee" | "valet";
 };
 
 type RestaurantTable = {
@@ -399,10 +399,14 @@ export async function GetTables(
 		.toArray();
 
 	const bookedTables = new Set(
-		activeBookings.map((booking: { table_name: string }) => booking.table_name),
+		activeBookings
+			.map((booking) => booking.table_name)
+			.filter((tableName): tableName is string => typeof tableName === "string" && tableName.length > 0),
 	);
 	const reservedTables = new Set(
-		upcomingBookings.map((booking: { table_name: string }) => booking.table_name),
+		upcomingBookings
+			.map((booking) => booking.table_name)
+			.filter((tableName): tableName is string => typeof tableName === "string" && tableName.length > 0),
 	);
 
 	return tablesList.map((table: { table_name: string; capacity?: number | null }) => ({
@@ -716,6 +720,27 @@ export async function GetAuditLogs(
 		details: doc.details ?? null,
 		timestamp: doc.timestamp,
 	}));
+}
+
+export async function GetRestaurantUserRole(
+	restaurantId: string,
+	employeeId: string,
+): Promise<RestaurantUser["role"] | null> {
+	const normalizedEmployeeId = employeeId.trim().toLowerCase();
+	if (!normalizedEmployeeId) {
+		return null;
+	}
+
+	const restaurants = await restaurantsCollection();
+	const restaurant = await restaurants.findOne({ id: restaurantId });
+	if (!restaurant?.users?.length) {
+		return null;
+	}
+
+	const user = restaurant.users.find(
+		(entry) => entry.employeeId?.trim().toLowerCase() === normalizedEmployeeId,
+	);
+	return user?.role ?? null;
 }
 
 type RestaurantSeedInput = {

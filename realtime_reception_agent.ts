@@ -3,7 +3,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import { config as loadEnv } from "dotenv";
-import { parse } from "csv-parse/sync";
 import { z } from "zod";
 import { RealtimeAgent, RealtimeSession, tool } from "@openai/agents/realtime";
 import type { RealtimeItem } from "@openai/agents/realtime";
@@ -29,11 +28,10 @@ export const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL ?? "gpt-4o-realtime-preview";
 
 if (!process.env.OPENAI_API_KEY) {
-  throw new Error("OPENAI_API_KEY must be set before starting the realtime agent");
+  console.warn("OPENAI_API_KEY is not configured. Realtime receptionist sessions are disabled.");
 }
 
 const reservationsCsvPath = path.resolve(repoRoot, "reservations.csv");
-const ironhillCsvPath = path.resolve(repoRoot, "ironhill.csv");
 
 export type RestaurantInfoEntry = {
   field: string;
@@ -76,45 +74,23 @@ type RestaurantKnowledge = {
   closingTime: string;
 };
 
+const fallbackRestaurantKnowledge: RestaurantKnowledge = {
+  infoEntries: [],
+  infoContext: "Restaurant knowledge file is unavailable.",
+  openingTime: "12:00 PM",
+  closingTime: "11:00 PM",
+};
+
 function loadRestaurantKnowledge(): RestaurantKnowledge {
-  if (!fs.existsSync(ironhillCsvPath)) {
-    throw new Error(
-      `ironhill.csv was not found at ${ironhillCsvPath}. The realtime receptionist relies on this file.`,
-    );
-  }
+  const openingTime = process.env.RECEPTION_OPENING_TIME?.trim() || fallbackRestaurantKnowledge.openingTime;
+  const closingTime = process.env.RECEPTION_CLOSING_TIME?.trim() || fallbackRestaurantKnowledge.closingTime;
 
-  const csvRaw = fs.readFileSync(ironhillCsvPath, "utf-8");
-  const records = parse(csvRaw, {
-    from_line: 3,
-    columns: true,
-    skip_empty_lines: true,
-    relax_column_count: true,
-    trim: true,
-  }) as Array<Record<string, string>>;
-
-  const infoEntries: RestaurantInfoEntry[] = records
-    .map((record) => {
-      const fieldRaw = record.Field?.trim();
-      const valueRaw = record.Value?.trim();
-      if (!fieldRaw || !valueRaw) {
-        return null;
-      }
-      return { field: fieldRaw, value: valueRaw } satisfies RestaurantInfoEntry;
-    })
-    .filter((entry): entry is RestaurantInfoEntry => entry !== null);
-
-  const infoContext = infoEntries
-    .map((entry) => `${entry.field}: ${entry.value}`)
-    .join("\n");
-
-  const openingTime =
-    infoEntries.find((entry) => entry.field.toLowerCase() === "opening time")?.value ??
-    "12:00 PM";
-  const closingTime =
-    infoEntries.find((entry) => entry.field.toLowerCase() === "closing time")?.value ??
-    "11:00 PM";
-
-  return { infoEntries, infoContext, openingTime, closingTime };
+  return {
+    infoEntries: [],
+    infoContext: "",
+    openingTime,
+    closingTime,
+  };
 }
 
 const restaurantKnowledge = loadRestaurantKnowledge();
