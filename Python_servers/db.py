@@ -3,7 +3,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
-
+from bson.objectid import ObjectId
 from google import genai
 from util.logger import info, exception
 from questions import FeedbackQuestions, count_tokens_with_retry
@@ -93,60 +93,239 @@ def get_all_feedback() -> dict:
         return {}
 
 
-def get_valet_state_from_db(number_plate: str) -> dict:
-    """Retrieves the current state of a valet car based on its number plate."""
+def create_valet_record_in_db(number_plate: str, restaurant_id: str) -> dict:
+    """Creates a new valet record in the database."""
+    try:
+        collection = mongo_db["valet_state"]
+
+        new_record = {
+            "number_plate": number_plate,
+            "restaurant_id": restaurant_id,
+            "state": 1,  # Default state when creating a new record
+            "entry_time": datetime.now().isoformat(),
+            "exit_time": None,
+            "bay_id": None,
+        }
+        collection.insert_one(new_record)
+        return {
+            "message": "New valet record created successfully.",
+            "booking_id": str(new_record["_id"]),
+            "entry_time": new_record["entry_time"],
+        }
+
+    except Exception as e:
+        exception(f"❌ Error creating valet record in MongoDB: {e}")
+        return {"error": "Database error occurred."}
+
+
+# def get_valet_state_from_db(number_plate: str) -> dict:
+#     """Retrieves the current state of a valet car based on its number plate."""
+#     try:
+#         collection = mongo_db["valet_state"]
+
+#         # Sort by entry_time descending to always get the most recent valet interaction for that plate
+#         record = collection.find_one(
+#             {"number_plate": number_plate}, sort=[("entry_time", -1)]
+#         )
+
+#         if record:
+#             return {
+#                 "booking_id": str(record.get("_id")),
+#                 "number_plate": record.get("number_plate"),
+#                 "state": record.get("state"),
+#                 "entry_time": record.get("entry_time"),
+#                 "exit_time": record.get("exit_time"),
+#                 "bay_name": record.get("bay_name")
+#             }
+#         else:
+#             return {"error": "No valet found with that number plate."}
+
+#     except Exception as e:
+#         exception(f"❌ Error retrieving valet state from MongoDB: {e}")
+#         return {"error": "Database error occurred."}
+
+
+def get_valet_info_from_db(booking_id: str) -> dict:
+    """Retrieves the current state of a valet car based on its booking ID."""
     try:
         collection = mongo_db["valet_state"]
 
         # Sort by entry_time descending to always get the most recent valet interaction for that plate
-        record = collection.find_one(
-            {"number_plate": number_plate}, sort=[("entry_time", -1)]
-        )
+        record = collection.find_one({"_id": ObjectId(booking_id)})
 
         if record:
             return {
+                "booking_id": str(record.get("_id")),
                 "number_plate": record.get("number_plate"),
                 "state": record.get("state"),
                 "entry_time": record.get("entry_time"),
                 "exit_time": record.get("exit_time"),
+                "bay_id": record.get("bay_id"),
             }
         else:
-            return {"error": "No valet found with that number plate."}
+            return {"error": f"No valet found with that booking ID - {booking_id}."}
 
     except Exception as e:
         exception(f"❌ Error retrieving valet state from MongoDB: {e}")
         return {"error": "Database error occurred."}
 
 
-def update_valet_state_from_db(number_plate: str, state: int) -> dict:
+# def update_valet_state_from_db(number_plate: str, state: int) -> dict:
+#     """Updates the state of a valet car or creates a new one if exit time is None."""
+#     try:
+#         collection = mongo_db["valet_state"]
+
+#         # Look for an active session (where the car hasn't exited yet)
+#         active_record = collection.find_one(
+#             {"number_plate": number_plate, "exit_time": None}
+#         )
+
+#         if active_record:
+#             update_data: dict[str, int | str] = {"state": state}
+#             if state == 6:  # If the state is 'Car Picked Up', set the exit time
+#                 update_data["exit_time"] = datetime.now().isoformat()
+
+#             collection.update_one({"_id": active_record["_id"]}, {"$set": update_data})
+#             return {"message": "Valet state updated successfully.", "booking_id": str(active_record["_id"]), "entry_time": active_record["entry_time"], "exit_time": update_data.get("exit_time"), "bay_name": active_record["bay_name"]}
+#         else:
+#             # If no active record exists, we can choose to create a new one or return an error
+#             return {"error": "No active valet record found for that number plate."}
+
+#     except Exception as e:
+#         exception(f"❌ Error updating valet state in MongoDB: {e}")
+#         return {"error": "Database error occurred."}
+
+
+def update_valet_state_from_db(booking_id: str, state: int) -> dict:
     """Updates the state of a valet car or creates a new one if exit time is None."""
     try:
         collection = mongo_db["valet_state"]
 
         # Look for an active session (where the car hasn't exited yet)
-        active_record = collection.find_one(
-            {"number_plate": number_plate, "exit_time": None}
-        )
+        active_record = collection.find_one({"_id": ObjectId(booking_id)})
 
         if active_record:
-            update_data = {"state": state}
+            update_data: dict[str, int | str] = {"state": state}
             if state == 6:  # If the state is 'Car Picked Up', set the exit time
-                update_data["exit_time"] = datetime.now()
+                update_data["exit_time"] = datetime.now().isoformat()
 
             collection.update_one({"_id": active_record["_id"]}, {"$set": update_data})
-            return {"message": "Valet state updated successfully."}
-        else:
-            new_record = {
-                "number_plate": number_plate,
-                "state": state,
-                "entry_time": datetime.now(),
-                "exit_time": None,
+            return {
+                "message": "Valet state updated successfully.",
+                "booking_id": str(active_record["_id"]),
+                # "entry_time": active_record["entry_time"],
+                # "exit_time": update_data.get("exit_time"),
+                # "bay_name": active_record["bay_name"],
             }
-            collection.insert_one(new_record)
-            return {"message": "New valet record created successfully."}
+        else:
+            # If no active record exists, we can choose to create a new one or return an error
+            return {
+                "error": f"No active valet record found for that booking ID - {booking_id}."
+            }
 
     except Exception as e:
         exception(f"❌ Error updating valet state in MongoDB: {e}")
+        return {"error": "Database error occurred."}
+
+
+def update_valet_bay_from_db(booking_id: str, bay_id: str) -> dict:
+    """Updates the bay_id of a valet car or creates a new one if exit time is None."""
+    try:
+        collection = mongo_db["valet_state"]
+
+        # Look for an active session (where the car hasn't exited yet)
+        active_record = collection.find_one({"_id": ObjectId(booking_id)})
+
+        if active_record:
+            update_data: dict[str, str] = {"bay_id": bay_id}
+
+            collection.update_one({"_id": active_record["_id"]}, {"$set": update_data})
+            return {
+                "message": "Valet bay updated successfully.",
+                "booking_id": str(active_record["_id"]),
+            }
+        else:
+            return {
+                "error": f"No active valet record found for that booking ID - {booking_id}."
+            }
+
+    except Exception as e:
+        exception(f"❌ Error updating valet bay in MongoDB: {e}")
+        return {"error": "Database error occurred."}
+
+
+def get_all_valet_records_from_db(restaurant_id: str) -> list[dict]:
+    """Retrieves all valet records for a specific restaurant."""
+    try:
+        collection = mongo_db["valet_state"]
+        raw_records = list(collection.find({"restaurant_id": restaurant_id}))
+
+        # Convert ObjectId to string and normalize field names for JSON transport
+        records: list[dict] = []
+        for r in raw_records:
+            rec = {
+                "booking_id": str(r.get("_id")) if r.get("_id") is not None else None,
+                "number_plate": r.get("number_plate"),
+                "state": r.get("state"),
+                "entry_time": r.get("entry_time"),
+                "exit_time": r.get("exit_time"),
+                "bay_id": r.get("bay_id"),
+                "restaurant_id": r.get("restaurant_id"),
+            }
+            records.append(rec)
+
+        return records
+    except Exception as e:
+        exception(f"❌ Error fetching valet records from MongoDB: {e}")
+        return []
+
+
+def get_all_bays_from_db(restaurant_id: str) -> list[dict]:
+    """Retrieves all Bays for a specific restaurant."""
+    try:
+        collection = mongo_db["Bays"]
+        raw = list(collection.find({"restaurant_id": restaurant_id}))
+
+        bays: list[dict] = []
+        for r in raw:
+            bays.append(
+                {
+                    "Bay_id": str(r.get("_id")) if r.get("_id") is not None else None,
+                    "Bay_name": r.get("Bay_name"),
+                    "current_capacity": int(r.get("current_capacity", 0) or 0),
+                    "total_capacity": int(r.get("total_capacity", 0) or 0),
+                    "restaurant_id": r.get("restaurant_id"),
+                }
+            )
+
+        return bays
+    except Exception as e:
+        exception(f"❌ Error fetching Bays from MongoDB: {e}")
+        return []
+
+
+def add_bay_in_db(
+    restaurant_id: str, bay_name: str, total_capacity: int | None = None
+) -> dict:
+    """Adds a new Bay document for a restaurant."""
+    try:
+        collection = mongo_db["Bays"]
+        new_doc = {
+            "Bay_name": bay_name,
+            "current_capacity": 0,
+            "total_capacity": int(total_capacity) if total_capacity is not None else 0,
+            "restaurant_id": restaurant_id,
+        }
+        result = collection.insert_one(new_doc)
+        return {
+            "message": "Bay added",
+            "Bay_id": str(result.inserted_id),
+            "Bay_name": bay_name,
+            "current_capacity": 0,
+            "total_capacity": new_doc["total_capacity"],
+        }
+    except Exception as e:
+        exception(f"❌ Error adding Bay to MongoDB: {e}")
         return {"error": "Database error occurred."}
 
 

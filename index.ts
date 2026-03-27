@@ -105,15 +105,13 @@ function extractEmployeeId(req: Request): string | null {
 async function resolveRoleForRequest(req: Request, restaurantId: string): Promise<AppRole | null> {
 	const employeeId = extractEmployeeId(req);
 	if (!employeeId) {
+		console.debug("resolveRoleForRequest: missing employeeId", { restaurantId });
 		return null;
 	}
 
 	const roleFromRestaurant = await GetRestaurantUserRole(restaurantId, employeeId);
-	if (roleFromRestaurant) {
-		return roleFromRestaurant;
-	}
-
-	return null;
+	console.debug("resolveRoleForRequest: resolved role", { restaurantId, employeeId, roleFromRestaurant });
+	return roleFromRestaurant ?? null;
 }
 
 async function enforceRoles(
@@ -128,6 +126,7 @@ async function enforceRoles(
 	}
 
 	const role = await resolveRoleForRequest(req, restaurantId);
+	console.log("enforceRoles: resolved role for request", { restaurantId, role, allowedRoles });
 	if (!role) {
 		res.status(401).json({
 			error: "Unauthorized",
@@ -684,32 +683,96 @@ app.get("/valet-info", validate, async (req: Request, res: Response) => {
 		return;
 	}
 
-	const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
-	const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
-	const now = new Date();
-
+	// Proxy to Python valet service to fetch valet_state records for this restaurant
 	try {
-		const [tables, bookings] = await Promise.all([
-			GetTables(auth.restaurantId, requestedTime),
-			GetBookingsAfterTime(auth.restaurantId, requestedTime),
-		]);
+		const response = await fetch(
+			"http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(auth.restaurantId),
+		);
 
-		const safeBookings = bookings ?? [];
+		const records = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(records);
+			return;
+		}
+
+		// records are expected to be an array of valet_state documents
+		const now = new Date();
+
+		const bookings = (Array.isArray(records) ? records : []).map((r: any) => {
+			const stateNum = typeof r.state === "number" ? r.state : Number(r.state);
+			// Map numeric state to frontend stage strings
+			const stateMap: Record<number, string> = {
+				1: "Vehicle added",
+				2: "Parked",
+				3: "Request to bring car (from customer)",
+				4: "Request accepted (from valet)",
+				5: "Car arrived at entrance",
+				6: "Customer took car",
+			};
+
+			const status = stateMap[stateNum] ?? "Vehicle added";
+
+			return {
+				booking_id: r._id ? String(r._id) : r.booking_id ?? undefined,
+				customer_name: r.customer_name ?? undefined,
+				bay_id: r.bay_id ?? undefined,
+				booking_date_time: r.entry_time ?? r.booking_date_time ?? undefined,
+				exit_date_time: r.exit_time ?? r.exit_date_time ?? undefined,
+				status,
+				active: stateNum !== 6,
+				number_plate: r.number_plate ?? undefined,
+				notes: r.notes ?? (r.number_plate ? `Vehicle Plate: ${r.number_plate}` : undefined),
+			};
+		});
+
+		// Fetch canonical Bays from Python service and compute capacities
+		let bays: any[] = [];
+		try {
+			const baysResp = await fetch("http://127.0.0.1:8000/get_bays/" + encodeURIComponent(auth.restaurantId));
+			const baysData = await baysResp.json();
+			if (baysResp.ok && Array.isArray(baysData)) {
+				bays = baysData.map((b: any) => ({
+					Bay_id: b.Bay_id ?? b.Bay_id,
+					Bay_name: b.Bay_name ?? b.Bay_name,
+					current_capacity: 0,
+					total_capacity: b.total_capacity ?? null,
+				}));
+			}
+		} catch (err) {
+			// ignore and fallback to deriving from records
+			bays = [];
+		}
+
+		if (bays.length === 0) {
+			// Fallback: derive bay list from bookings' bay_id values
+			const bayIds = Array.from(new Set((bookings.map((b: any) => b.bay_id).filter(Boolean) as string[])));
+			bays = bayIds.map((id, idx) => ({
+				Bay_id: id,
+				Bay_name: id,
+				current_capacity: bookings.filter((b: any) => b.bay_id === id && b.active).length,
+				total_capacity: null,
+			}));
+		} else {
+			// compute current_capacity based on bookings
+			bays = bays.map((bay) => ({
+				...bay,
+				current_capacity: bookings.filter((b: any) => b.bay_id === bay.Bay_id && b.active).length,
+			}));
+		}
 
 		res.json({
 			role: auth.role,
 			generated_at: new Date().toISOString(),
-			tables,
-			bookings: safeBookings.map((booking) => ({
-				...booking,
-				active: IsActiveBooking(booking, now),
-			})),
+			bays,
+			bookings,
 		});
 	} catch (error) {
 		console.error("valet_info_failed", error);
 		res.status(500).json({ error: "Unable to fetch valet info" });
 	}
 });
+
+// (debug endpoint removed)
 
 
 app.patch("/booking/:id/status", validate, async (req: Request, res: Response) => {
@@ -912,10 +975,127 @@ app.post("/audit-logs", validate, async (req: Request, res: Response) => {
 });
 
 // Rtamanyu's integration
-app.post("/get_valet_state", validate, async (req: Request, res: Response) => {
-	const restaurantId = extractRestaurantId(req);
-	if (!restaurantId) {
-		res.status(400).json({ error: "Missing restaurantId" });
+app.get("/valet-bays", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) {
+		return;
+	}
+
+	try {
+		const response = await fetch("http://127.0.0.1:8000/get_bays/" + encodeURIComponent(auth.restaurantId));
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("fetch_valet_bays_failed", error);
+		res.status(500).json({ error: "Unable to fetch valet bays" });
+		return;
+	}
+});
+
+app.post("/add-valet-bay", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) {
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const bayName = typeof body?.Bay_name === 'string' ? body.Bay_name.trim() : undefined;
+	const totalCapacity = body?.total_capacity === null || body?.total_capacity === undefined ? undefined : Number(body.total_capacity);
+	if (!bayName) {
+		res.status(400).json({ error: "Missing Bay_name" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/add_bay/" + encodeURIComponent(auth.restaurantId),
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ Bay_name: bayName, total_capacity: Number.isFinite(totalCapacity) ? totalCapacity : 0 }),
+			},
+		);
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("add_valet_bay_failed", error);
+		res.status(500).json({ error: "Unable to add valet bay" });
+		return;
+	}
+});
+// 	try {
+// 		const response = await fetch(
+// 			"http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate),
+// 		);
+// 		const data = await response.json();
+// 		if (!response.ok) {
+// 			res.status(response.status).json(data);
+// 			return;
+// 		}
+// 		res.json(data);
+// 		return;
+// 	} catch (error) {
+// 		console.error("fetch_valet_state_failed", error);
+// 		res.status(500).json({ error: "Unable to fetch valet state" });
+// 		return;
+// 	}
+// });
+
+
+// app.post("/update_valet_state", validate, async (req: Request, res: Response) => {
+// 	const restaurantId = extractRestaurantId(req);
+// 	if (!restaurantId) {
+// 		res.status(400).json({ error: "Missing restaurantId" });
+// 		return;
+// 	}
+
+// 	const body = req.body as Record<string, unknown> | undefined;
+// 	const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
+// 	const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
+// 	if (!number_plate || !state) {
+// 		res.status(400).json({ error: "Missing number plate or state" });
+// 		return;
+// 	}
+
+// 	try {
+// 		const response = await fetch(
+// 			"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(state),
+// 			{
+// 				method: "POST",
+// 				headers: {
+// 					"Content-Type": "application/json",
+// 				},
+// 			},
+// 		);
+// 		const data = await response.json();
+// 		if (!response.ok) {
+// 			res.status(response.status).json(data);
+// 			return;
+// 		}
+// 		res.json(data);
+// 		return;
+// 	} catch (error) {
+// 		console.error("update_valet_state_failed", error);
+// 		res.status(500).json({ error: "Unable to update valet state" });
+// 		return;
+// 	}
+// });
+
+app.post("/create_valet_record", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) {
 		return;
 	}
 
@@ -928,7 +1108,13 @@ app.post("/get_valet_state", validate, async (req: Request, res: Response) => {
 
 	try {
 		const response = await fetch(
-			"http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate),
+			"http://127.0.0.1:8000/create_valet_record/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(auth.restaurantId),
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+			},
 		);
 		const data = await response.json();
 		if (!response.ok) {
@@ -938,31 +1124,61 @@ app.post("/get_valet_state", validate, async (req: Request, res: Response) => {
 		res.json(data);
 		return;
 	} catch (error) {
-		console.error("fetch_valet_state_failed", error);
-		res.status(500).json({ error: "Unable to fetch valet state" });
+		console.error("create_valet_record_failed", error);
+		res.status(500).json({ error: "Unable to create valet record" });
+		return;
+	}
+});
+
+app.post("/get_valet_info", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) {
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
+	if (!booking_id) {
+		res.status(400).json({ error: "Missing booking ID" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/get_valet_info/" + encodeURIComponent(booking_id),
+		);
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("fetch_valet_info_failed", error);
+		res.status(500).json({ error: "Unable to fetch valet info" });
 		return;
 	}
 });
 
 
 app.post("/update_valet_state", validate, async (req: Request, res: Response) => {
-	const restaurantId = extractRestaurantId(req);
-	if (!restaurantId) {
-		res.status(400).json({ error: "Missing restaurantId" });
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) {
 		return;
 	}
 
 	const body = req.body as Record<string, unknown> | undefined;
-	const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
+	const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
 	const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
-	if (!number_plate || !state) {
-		res.status(400).json({ error: "Missing number plate or state" });
+	if (!booking_id || !state) {
+		res.status(400).json({ error: "Missing booking ID or state" });
 		return;
 	}
 
 	try {
 		const response = await fetch(
-			"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(state),
+			"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(booking_id) + "/" + encodeURIComponent(state),
 			{
 				method: "POST",
 				headers: {
@@ -984,6 +1200,46 @@ app.post("/update_valet_state", validate, async (req: Request, res: Response) =>
 	}
 });
 
+app.post("/update_valet_bay", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) {
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
+	// Accept bay_id in body; fall back to bay_name for backward compatibility
+	const bay_id_raw = body?.bay_id ?? body?.bay_name;
+	const bay_id = bay_id_raw === null || bay_id_raw === undefined ? undefined : String(bay_id_raw).trim();
+	if (!booking_id || !bay_id) {
+		res.status(400).json({ error: "Missing booking ID or bay id" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/update_valet_bay/" + encodeURIComponent(booking_id) + "/" + encodeURIComponent(bay_id),
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+			},
+		);
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("update_valet_bay_failed", error);
+		res.status(500).json({ error: "Unable to update valet bay" });
+		return;
+	}
+});
+
 app.post("/get_main_feedback_question", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
@@ -995,6 +1251,10 @@ app.post("/get_main_feedback_question", validate, async (req: Request, res: Resp
 	const category = typeof body?.category === 'number' ? body.category : undefined;
 	if (!category) {
 		res.status(400).json({ error: "Missing category" });
+		return;
+	}
+	if(category < 1 || category > 7) {
+		res.status(400).json({ error: "Invalid category" });
 		return;
 	}
 	try {
@@ -1029,6 +1289,15 @@ app.post("/get_follow_up_question", validate, async (req: Request, res: Response
 		res.status(400).json({ error: "Missing category or rate" });
 		return;
 	}
+	if(category < 1 || category > 7) {
+		res.status(400).json({ error: "Invalid category" });
+		return;
+	}
+	if(rate < 1 || rate > 5) {
+		res.status(400).json({ error: "Invalid rate" });
+		return;
+	}
+
 	try {
 		const response = await fetch(
 			"http://127.0.0.1:8000/get_follow_up_question/" + encodeURIComponent(category) + "/" + encodeURIComponent(rate),

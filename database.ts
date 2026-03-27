@@ -728,18 +728,24 @@ export async function GetRestaurantUserRole(
 ): Promise<RestaurantUser["role"] | null> {
 	const normalizedEmployeeId = employeeId.trim().toLowerCase();
 	if (!normalizedEmployeeId) {
+		console.warn("get_user_role_invalid_employee_id", { restaurantId, employeeId });
 		return null;
 	}
 
 	const restaurants = await restaurantsCollection();
 	const restaurant = await restaurants.findOne({ id: restaurantId });
 	if (!restaurant?.users?.length) {
+		console.warn("get_user_role_no_users_found", { restaurantId, employeeId });
 		return null;
 	}
 
 	const user = restaurant.users.find(
 		(entry) => entry.employeeId?.trim().toLowerCase() === normalizedEmployeeId,
 	);
+
+	if (!user) {
+		console.warn("get_user_role_user_not_found", { restaurantId, employeeId, restaurantUsers: restaurant.users });
+	}
 	return user?.role ?? null;
 }
 

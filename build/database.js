@@ -437,11 +437,13 @@ export async function GetAuditLogs(restaurantId, limit = 100) {
 export async function GetRestaurantUserRole(restaurantId, employeeId) {
     const normalizedEmployeeId = employeeId.trim().toLowerCase();
     if (!normalizedEmployeeId) {
+        console.log("GetRestaurantUserRole: missing or empty employeeId", { restaurantId, employeeId });
         return null;
     }
     const restaurants = await restaurantsCollection();
     const restaurant = await restaurants.findOne({ id: restaurantId });
     if (!restaurant?.users?.length) {
+        console.log("GetRestaurantUserRole: no users found for restaurant", { restaurantId });
         return null;
     }
     const user = restaurant.users.find((entry) => entry.employeeId?.trim().toLowerCase() === normalizedEmployeeId);
