@@ -1,6 +1,4 @@
 import 'dotenv/config';
-import http from 'http';
-import { date } from 'zod/v4';
 
 const API_BASE = process.env.RECEPTION_API_BASE_URL || 'http://localhost:3000';
 const RESTAURANT_ID = process.env.RESTAURANT_ID || 'csrorganics';
@@ -78,6 +76,44 @@ async function run() {
   }
 
   console.log('✅ Valet update state passed');
+
+  // Test get_main_feedback_question
+  const mainResp = await fetch(`${API_BASE}/get_main_feedback_question`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Restaurant-Id': RESTAURANT_ID,
+    },
+    body: JSON.stringify({ category: 2 }),
+  });
+  if (!mainResp.ok) {
+    const txt = await mainResp.text();
+    throw new Error(`/get_main_feedback_question failed: ${mainResp.status} ${txt}`);
+  }
+  const mainBody = await mainResp.json();
+  if (!mainBody || typeof mainBody !== 'object') {
+    throw new Error('Invalid response from /get_main_feedback_question');
+  }
+  console.log('✅ get_main_feedback_question passed');
+
+  // Test get_follow_up_question
+  const followResp = await fetch(`${API_BASE}/get_follow_up_question`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Restaurant-Id': RESTAURANT_ID,
+    },
+    body: JSON.stringify({ category: 1, rate: 4 }),
+  });
+  if (!followResp.ok) {
+    const txt = await followResp.text();
+    throw new Error(`/get_follow_up_question failed: ${followResp.status} ${txt}`);
+  }
+  const followBody = await followResp.json();
+  if (!followBody || typeof followBody !== 'object') {
+    throw new Error('Invalid response from /get_follow_up_question');
+  }
+  console.log('✅ get_follow_up_question passed');
   console.log('✅✅ Valet API integration test passed');
 }
 

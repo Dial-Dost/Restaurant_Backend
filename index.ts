@@ -984,6 +984,69 @@ app.post("/update_valet_state", validate, async (req: Request, res: Response) =>
 	}
 });
 
+app.post("/get_main_feedback_question", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const category = typeof body?.category === 'number' ? body.category : undefined;
+	if (!category) {
+		res.status(400).json({ error: "Missing category" });
+		return;
+	}
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/get_main_feedback_question/" + encodeURIComponent(category),
+		);
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("get_main_feedback_question_failed", error);
+		res.status(500).json({ error: "Unable to fetch main feedback question" });
+		return;
+	}
+});
+
+app.post("/get_follow_up_question", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const category = typeof body?.category === 'number' ? body.category : undefined;
+	const rate = body?.rate === null || body?.rate === undefined ? undefined : Number(body.rate);
+	if (!category || !rate) {
+		res.status(400).json({ error: "Missing category or rate" });
+		return;
+	}
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/get_follow_up_question/" + encodeURIComponent(category) + "/" + encodeURIComponent(rate),
+		);
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("get_follow_up_question_failed", error);
+		res.status(500).json({ error: "Unable to fetch follow-up question" });
+		return;
+	}
+});
+
 
 export { app };
 
