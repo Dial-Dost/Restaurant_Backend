@@ -205,17 +205,45 @@ def update_valet_state_from_db(booking_id: str, state: int) -> dict:
         active_record = collection.find_one({"_id": ObjectId(booking_id)})
 
         if active_record:
+            prev_state = int(active_record.get("state", 1) or 1)
+            bay_id = active_record.get("bay_id")
+
+            # Determine capacity effect based on state transition
+            # Counted states: 2,3,4 -> vehicle is occupying bay
+            counted = lambda s: 2 <= int(s) <= 4
+
+            try:
+                # If transitioning from non-counted -> counted, increment bay
+                if not counted(prev_state) and counted(state):
+                    _adjust_bay_capacity(active_record.get("restaurant_id"), bay_id, 1)
+
+                # If transitioning from counted -> non-counted, decrement bay
+                if counted(prev_state) and not counted(state):
+                    _adjust_bay_capacity(active_record.get("restaurant_id"), bay_id, -1)
+            except Exception as e:
+                # log but proceed with updating state
+                exception(
+                    f"❌ Error while updating capacities during state change: {e}"
+                )
+
             update_data: dict[str, int | str] = {"state": state}
             if state == 6:  # If the state is 'Car Picked Up', set the exit time
                 update_data["exit_time"] = datetime.now().isoformat()
 
             collection.update_one({"_id": active_record["_id"]}, {"$set": update_data})
+
+            # If vehicle has left (states 5 or 6), clear bay assignment so it becomes unassigned
+            try:
+                if int(state) in (5, 6) and bay_id:
+                    collection.update_one(
+                        {"_id": active_record["_id"]}, {"$set": {"bay_id": None}}
+                    )
+            except Exception as e:
+                exception(f"❌ Error while clearing bay assignment on exit: {e}")
+
             return {
                 "message": "Valet state updated successfully.",
                 "booking_id": str(active_record["_id"]),
-                # "entry_time": active_record["entry_time"],
-                # "exit_time": update_data.get("exit_time"),
-                # "bay_name": active_record["bay_name"],
             }
         else:
             # If no active record exists, we can choose to create a new one or return an error
@@ -237,6 +265,32 @@ def update_valet_bay_from_db(booking_id: str, bay_id: str) -> dict:
         active_record = collection.find_one({"_id": ObjectId(booking_id)})
 
         if active_record:
+            prev_bay = active_record.get("bay_id")
+            state = int(active_record.get("state", 1) or 1)
+
+            # If vehicle is in counted state (2-4) we must move occupancy
+            counted = lambda s: 2 <= int(s) <= 4
+            try:
+                if prev_bay and prev_bay != bay_id and counted(state):
+                    # decrement previous bay
+                    _adjust_bay_capacity(
+                        active_record.get("restaurant_id"), prev_bay, -1
+                    )
+                    # increment new bay
+                    _adjust_bay_capacity(active_record.get("restaurant_id"), bay_id, 1)
+                elif not prev_bay and counted(state):
+                    # newly assigned while counted -> increment new bay
+                    _adjust_bay_capacity(active_record.get("restaurant_id"), bay_id, 1)
+                elif prev_bay and not bay_id and counted(state):
+                    # unassigning while counted -> decrement previous bay
+                    _adjust_bay_capacity(
+                        active_record.get("restaurant_id"), prev_bay, -1
+                    )
+            except Exception as e:
+                exception(
+                    f"❌ Error while adjusting bay capacities during bay update: {e}"
+                )
+
             update_data: dict[str, str] = {"bay_id": bay_id}
 
             collection.update_one({"_id": active_record["_id"]}, {"$set": update_data})
@@ -304,6 +358,39 @@ def get_all_bays_from_db(restaurant_id: str) -> list[dict]:
         return []
 
 
+def _adjust_bay_capacity(restaurant_id: str, bay_id: str | None, delta: int) -> None:
+    """Safely adjusts the current_capacity of a Bay by delta (can be negative).
+    Clamps to >= 0. No-op when bay_id is falsy.
+    """
+    if not bay_id:
+        return
+    try:
+        collection = mongo_db["Bays"]
+        try:
+            obj_id = ObjectId(bay_id)
+            query = {"_id": obj_id, "restaurant_id": restaurant_id}
+        except Exception:
+            query = {"_id": bay_id, "restaurant_id": restaurant_id}
+
+        # Use a find_one to get current value then update with clamp
+        doc = collection.find_one(query)
+        if not doc:
+            # Try resolving by Bay_name as a fallback (frontend may send name instead of id)
+            try:
+                doc = collection.find_one(
+                    {"Bay_name": bay_id, "restaurant_id": restaurant_id}
+                )
+            except Exception:
+                doc = None
+        if not doc:
+            return
+        curr = int(doc.get("current_capacity", 0) or 0)
+        new = max(0, curr + int(delta))
+        collection.update_one({"_id": doc["_id"]}, {"$set": {"current_capacity": new}})
+    except Exception as e:
+        exception(f"❌ Error adjusting bay capacity: {e}")
+
+
 def add_bay_in_db(
     restaurant_id: str, bay_name: str, total_capacity: int | None = None
 ) -> dict:
@@ -326,6 +413,133 @@ def add_bay_in_db(
         }
     except Exception as e:
         exception(f"❌ Error adding Bay to MongoDB: {e}")
+        return {"error": "Database error occurred."}
+
+
+def update_bay_in_db(
+    restaurant_id: str,
+    bay_id: str | None,
+    bay_name: str,
+    total_capacity: int | None = None,
+) -> dict:
+    """Updates an existing Bay by Bay_id and restaurant_id. Returns updated doc."""
+    try:
+        collection = mongo_db["Bays"]
+        query = {"restaurant_id": restaurant_id}
+        if bay_id:
+            try:
+                query["_id"] = ObjectId(bay_id)
+            except Exception:
+                # fallback to string match
+                query["_id"] = bay_id
+
+        match = collection.find_one(query)
+        if not match:
+            return {"error": "Bay not found"}
+
+        update_fields: dict = {
+            "Bay_name": bay_name,
+            "total_capacity": int(total_capacity) if total_capacity is not None else 0,
+        }
+        collection.update_one({"_id": match["_id"]}, {"$set": update_fields})
+        # Preserve existing current_capacity if present (avoid accidental reset)
+        existing_current = int(match.get("current_capacity", 0) or 0)
+        collection.update_one({"_id": match["_id"]}, {"$set": update_fields})
+
+        updated = collection.find_one({"_id": match["_id"]})
+        # If for some reason current_capacity is missing after update, restore it
+        if updated is not None and (updated.get("current_capacity") is None):
+            try:
+                collection.update_one(
+                    {"_id": match["_id"]},
+                    {"$set": {"current_capacity": existing_current}},
+                )
+                updated = collection.find_one({"_id": match["_id"]})
+            except Exception:
+                # ignore failure to restore
+                pass
+        return {
+            "message": "Bay updated",
+            "Bay_id": str(updated.get("_id")),
+            "Bay_name": updated.get("Bay_name"),
+            "total_capacity": int(updated.get("total_capacity", 0) or 0),
+            "current_capacity": int(updated.get("current_capacity", 0) or 0),
+        }
+    except Exception as e:
+        exception(f"❌ Error updating Bay in MongoDB: {e}")
+        return {"error": "Database error occurred."}
+
+
+def delete_bay_in_db(
+    restaurant_id: str, bay_id: str | None = None, bay_name: str | None = None
+) -> dict:
+    """Deletes a Bay document by Bay_id+restaurant_id or by Bay_name+restaurant_id and removes any valet_state entries referencing it."""
+    try:
+        collection = mongo_db["Bays"]
+        query = {"restaurant_id": restaurant_id}
+        if bay_id:
+            try:
+                query["_id"] = ObjectId(bay_id)
+            except Exception:
+                query["_id"] = bay_id
+        elif bay_name:
+            query["Bay_name"] = bay_name
+        else:
+            return {"error": "Provide Bay_id or Bay_name"}
+
+        match = collection.find_one(query)
+        if not match:
+            return {"error": "Bay not found"}
+
+        bay_obj_id = match.get("_id")
+        collection.delete_one({"_id": bay_obj_id})
+
+        valet_col = mongo_db["valet_state"]
+        res = valet_col.delete_many({"bay_id": str(bay_obj_id)})
+
+        return {
+            "message": "Bay deleted",
+            "Bay_id": str(bay_obj_id),
+            "deleted_valet_count": res.deleted_count,
+        }
+
+    except Exception as e:
+        exception(f"❌ Error deleting Bay from MongoDB: {e}")
+        return {"error": "Database error occurred."}
+
+
+def set_bay_current_in_db(
+    restaurant_id: str, bay_id: str, current_capacity: int
+) -> dict:
+    """Sets the current_capacity of a Bay document to the provided value (clamped >= 0).
+    Returns the updated Bay document representation.
+    """
+    try:
+        collection = mongo_db["Bays"]
+        try:
+            query = {"_id": ObjectId(bay_id), "restaurant_id": restaurant_id}
+        except Exception:
+            query = {"_id": bay_id, "restaurant_id": restaurant_id}
+
+        match = collection.find_one(query)
+        if not match:
+            return {"error": "Bay not found"}
+
+        new_val = max(0, int(current_capacity))
+        collection.update_one(
+            {"_id": match["_id"]}, {"$set": {"current_capacity": new_val}}
+        )
+
+        updated = collection.find_one({"_id": match["_id"]})
+        return {
+            "message": "Bay current capacity set",
+            "Bay_id": str(updated.get("_id")),
+            "Bay_name": updated.get("Bay_name"),
+            "total_capacity": int(updated.get("total_capacity", 0) or 0),
+            "current_capacity": int(updated.get("current_capacity", 0) or 0),
+        }
+    except Exception as e:
+        exception(f"❌ Error setting Bay current_capacity in MongoDB: {e}")
         return {"error": "Database error occurred."}
 
 

@@ -110,7 +110,6 @@ async function resolveRoleForRequest(req: Request, restaurantId: string): Promis
 	}
 
 	const roleFromRestaurant = await GetRestaurantUserRole(restaurantId, employeeId);
-	console.debug("resolveRoleForRequest: resolved role", { restaurantId, employeeId, roleFromRestaurant });
 	return roleFromRestaurant ?? null;
 }
 
@@ -126,7 +125,6 @@ async function enforceRoles(
 	}
 
 	const role = await resolveRoleForRequest(req, restaurantId);
-	console.log("enforceRoles: resolved role for request", { restaurantId, role, allowedRoles });
 	if (!role) {
 		res.status(401).json({
 			error: "Unauthorized",
@@ -1035,6 +1033,128 @@ app.post("/add-valet-bay", validate, async (req: Request, res: Response) => {
 		return;
 	}
 });
+
+app.post("/delete-valet-bay", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) {
+		return;
+	}
+	const body = req.body as Record<string, unknown> | undefined;
+	const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
+	const bayName = typeof body?.Bay_name === 'string' ? body.Bay_name.trim() : undefined;
+	if (!bayId && !bayName) {
+		res.status(400).json({ error: "Missing Bay_id or Bay_name" });
+		return;
+	}
+
+	try {
+		const payload: Record<string, unknown> = {};
+		if (bayId) payload.Bay_id = bayId;
+		if (bayName) payload.Bay_name = bayName;
+
+		const response = await fetch(
+			"http://127.0.0.1:8000/delete_bay/" + encodeURIComponent(auth.restaurantId),
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(payload),
+			},
+		);
+
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("delete_valet_bay_failed", error);
+		res.status(500).json({ error: "Unable to delete valet bay" });
+		return;
+	}
+});
+
+
+app.post("/update-valet-bay", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) return;
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
+	const bayName = typeof body?.Bay_name === 'string' ? body.Bay_name.trim() : undefined;
+	const totalCapacity = body?.total_capacity === null || body?.total_capacity === undefined ? undefined : Number(body.total_capacity);
+
+	if (!bayName) {
+		res.status(400).json({ error: "Missing Bay_name" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/update_bay/" + encodeURIComponent(auth.restaurantId),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ Bay_id: bayId, Bay_name: bayName, total_capacity: Number.isFinite(totalCapacity) ? totalCapacity : 0 }),
+			},
+		);
+
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+
+		res.json(data);
+		return;
+	} catch (err) {
+		console.error("update_valet_bay_failed", err);
+		res.status(500).json({ error: "Unable to update valet bay" });
+	}
+});
+
+
+app.post("/set-valet-bay-current", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) return;
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
+	const current = body?.current_capacity === null || body?.current_capacity === undefined ? undefined : Number(body.current_capacity);
+
+	if (!bayId || current === undefined || Number.isNaN(current)) {
+		res.status(400).json({ error: "Missing Bay_id or current_capacity" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/set_bay_current/" + encodeURIComponent(auth.restaurantId),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ Bay_id: bayId, current_capacity: Number(current) }),
+			},
+		);
+
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+
+		res.json(data);
+		return;
+	} catch (err) {
+		console.error("set_valet_bay_current_failed", err);
+		res.status(500).json({ error: "Unable to set bay current capacity" });
+		return;
+	}
+});
 // 	try {
 // 		const response = await fetch(
 // 			"http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate),
@@ -1236,6 +1356,40 @@ app.post("/update_valet_bay", validate, async (req: Request, res: Response) => {
 	} catch (error) {
 		console.error("update_valet_bay_failed", error);
 		res.status(500).json({ error: "Unable to update valet bay" });
+		return;
+	}
+});
+
+app.post("/unassign-valet-bay", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "valet"]);
+	if (!auth) return;
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
+	if (!booking_id) {
+		res.status(400).json({ error: "Missing booking ID" });
+		return;
+	}
+
+	try {
+		const response = await fetch(
+			"http://127.0.0.1:8000/unassign_valet_bay/" + encodeURIComponent(booking_id),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+			},
+		);
+
+		const data = await response.json();
+		if (!response.ok) {
+			res.status(response.status).json(data);
+			return;
+		}
+		res.json(data);
+		return;
+	} catch (error) {
+		console.error("unassign_valet_bay_failed", error);
+		res.status(500).json({ error: "Unable to unassign valet bay" });
 		return;
 	}
 });

@@ -239,6 +239,25 @@ async function run() {
   const added = await addBayResp.json();
   console.log('✅ add-valet-bay response:', added);
 
+  // Test delete valet bay via backend proxy
+  const deleteResp = await fetch(`${API_BASE}/delete-valet-bay`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Restaurant-Id': RESTAURANT_ID,
+      'X-Employee-Id': EMPLOYEE_ID,
+    },
+    body: JSON.stringify({ Bay_name: 'Main' }),
+  });
+
+  if (!deleteResp.ok) {
+    const txt = await deleteResp.text();
+    throw new Error(`POST /delete-valet-bay failed: ${deleteResp.status} ${txt}`);
+  }
+
+  const deleted = await deleteResp.json();
+  console.log('✅ delete-valet-bay response:', deleted);
+
   // Test get_main_feedback_question
   const mainResp = await fetch(`${API_BASE}/get_main_feedback_question`, {
     method: 'POST',
