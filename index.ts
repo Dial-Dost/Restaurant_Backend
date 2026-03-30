@@ -1117,6 +1117,13 @@ app.post("/add-valet-bay", validate, async (req: Request, res: Response) => {
 			res.status(response.status).json(data);
 			return;
 		}
+
+		// Broadcast bay added
+		try {
+			emitRestaurant(auth.restaurantId, "valet:bay_added", data);
+		} catch (err) {
+			console.warn("emit valet:bay_added failed", err);
+		}
 		res.json(data);
 		return;
 	} catch (error) {
@@ -1161,6 +1168,12 @@ app.post("/delete-valet-bay", validate, async (req: Request, res: Response) => {
 			return;
 		}
 
+		// Broadcast bay deleted
+		try {
+			emitRestaurant(auth.restaurantId, "valet:bay_deleted", data);
+		} catch (err) {
+			console.warn("emit valet:bay_deleted failed", err);
+		}
 		res.json(data);
 		return;
 	} catch (error) {
@@ -1201,6 +1214,12 @@ app.post("/update-valet-bay", validate, async (req: Request, res: Response) => {
 			return;
 		}
 
+		// Broadcast bay updated
+		try {
+			emitRestaurant(auth.restaurantId, "valet:bay_updated", data);
+		} catch (err) {
+			console.warn("emit valet:bay_updated failed", err);
+		}
 		res.json(data);
 		return;
 	} catch (err) {
@@ -1239,6 +1258,12 @@ app.post("/set-valet-bay-current", validate, async (req: Request, res: Response)
 			return;
 		}
 
+		// Broadcast bay current capacity update
+		try {
+			emitRestaurant(auth.restaurantId, "valet:bay_current_set", { Bay_id: body?.Bay_id, current_capacity: Number(current) });
+		} catch (err) {
+			console.warn("emit valet:bay_current_set failed", err);
+		}
 		res.json(data);
 		return;
 	} catch (err) {
@@ -1656,6 +1681,13 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 			source: typeof body?.source === "string" ? body.source : "feedback_form",
 		});
 
+		// Notify realtime clients subscribed to this restaurant
+		try {
+			emitRestaurant(restaurantId, "feedback:created", saved);
+		} catch (err) {
+			console.warn("emit feedback:created failed", err);
+		}
+
 		res.status(201).json({ success: true, id: saved.id, submitted_at: saved.submitted_at });
 	} catch (error) {
 		console.error("submit_feedback_failed", error);
@@ -1694,6 +1726,127 @@ app.get("/feedback/summary", validate, async (req: Request, res: Response) => {
 	} catch (error) {
 		console.error("get_feedback_summary_failed", error);
 		res.status(500).json({ error: "Unable to fetch feedback summary" });
+	}
+});
+
+app.get("/feedback/stats", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "employee"]);
+	if (!auth) return;
+
+	try {
+		const mode = String(req.query.mode ?? "daily");
+		const rows = await GetFeedbackEntries(auth.restaurantId, 5000);
+
+		// helper to parse ISO date (yyyy-mm-dd)
+		const parseDateISO = (s: string | undefined | null) => {
+			if (!s) return null;
+			const d = new Date(s);
+			if (!isNaN(d.getTime())) return d;
+			const parts = (s || "").split("-");
+			if (parts.length >= 3) {
+				const y = Number(parts[0]);
+				const m = Number(parts[1]) - 1;
+				const day = Number(parts[2]);
+				const dt = new Date(Date.UTC(y, m, day));
+				return dt;
+			}
+			return null;
+		};
+
+		if (mode === "daily") {
+			const dateParam = String(req.query.date ?? "");
+			const date = parseDateISO(dateParam) ?? new Date();
+			const targetYMD = date.toISOString().slice(0, 10);
+			const hours = Array.from({ length: 24 }, (_, i) => ({ hour: i, count: 0 }));
+			for (const r of rows) {
+				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				if (isNaN(s.getTime())) continue;
+				const ymd = s.toISOString().slice(0, 10);
+				if (ymd === targetYMD) {
+					const h = s.getUTCHours();
+					hours[h].count += 1;
+				}
+			}
+			return res.json({ mode: "daily", date: targetYMD, hours });
+		}
+
+		if (mode === "weekly") {
+			const weekParam = String(req.query.weekStart ?? "");
+			let weekStart = parseDateISO(weekParam) ?? new Date();
+			const day = weekStart.getUTCDay();
+			const diff = (day + 6) % 7;
+			weekStart = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() - diff));
+			const days = [] as Array<{ label: string; date: string; count: number }>;
+			for (let i = 0; i < 7; i++) {
+				const d = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() + i));
+				days.push({ label: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][i], date: d.toISOString().slice(0, 10), count: 0 });
+			}
+			const startMs = Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate());
+			const endMs = startMs + 7 * 24 * 60 * 60 * 1000;
+			for (const r of rows) {
+				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				if (isNaN(s.getTime())) continue;
+				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
+				if (t >= startMs && t < endMs) {
+					const idx = Math.floor((t - startMs) / (24 * 60 * 60 * 1000));
+					if (idx >= 0 && idx < 7) days[idx].count += 1;
+				}
+			}
+			return res.json({ mode: "weekly", weekStart: days[0].date, days });
+		}
+
+		if (mode === "monthly") {
+			// For monthly mode, return week buckets that cover the full calendar month of the provided start date.
+			const startParam = String(req.query.start ?? "");
+			const requested = parseDateISO(startParam) ?? new Date();
+			const year = requested.getUTCFullYear();
+			const month = requested.getUTCMonth();
+			// monthStart is first day of the month (UTC)
+			const monthStart = new Date(Date.UTC(year, month, 1));
+			const monthEnd = new Date(Date.UTC(year, month + 1, 1));
+			// weekStart is the Monday on or before monthStart
+			const day0 = monthStart.getUTCDay();
+			const diff0 = (day0 + 6) % 7; // days since Monday
+			let weekStart = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth(), monthStart.getUTCDate() - diff0));
+			const weeks = [] as Array<{ start: string; end: string; label: string; count: number }>;
+			while (weekStart < monthEnd) {
+				const s = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate()));
+				const e = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + 7));
+				weeks.push({ start: s.toISOString().slice(0, 10), end: e.toISOString().slice(0, 10), label: `${s.toISOString().slice(5, 10)}`, count: 0 });
+				weekStart = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() + 7));
+			}
+			// count events
+			for (const r of rows) {
+				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				if (isNaN(s.getTime())) continue;
+				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
+				for (let idx = 0; idx < weeks.length; idx++) {
+					const ws = weeks[idx];
+					const wsMs = Date.UTC(Number(ws.start.slice(0,4)), Number(ws.start.slice(5,7)) - 1, Number(ws.start.slice(8,10)));
+					const weMs = Date.UTC(Number(ws.end.slice(0,4)), Number(ws.end.slice(5,7)) - 1, Number(ws.end.slice(8,10)));
+					if (t >= wsMs && t < weMs) { weeks[idx].count += 1; break; }
+				}
+			}
+			return res.json({ mode: "monthly", month: `${year}-${(month+1).toString().padStart(2,'0')}`, start: weeks[0]?.start ?? monthStart.toISOString().slice(0,10), weeks });
+		}
+
+		if (mode === "yearly") {
+			const yearParam = Number(req.query.year ?? new Date().getUTCFullYear());
+			const months = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, label: ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][i], count: 0 }));
+			for (const r of rows) {
+				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				if (isNaN(s.getTime())) continue;
+				if (s.getUTCFullYear() === yearParam) {
+					months[s.getUTCMonth()].count += 1;
+				}
+			}
+			return res.json({ mode: "yearly", year: yearParam, months });
+		}
+
+		return res.status(400).json({ error: "Unknown mode" });
+	} catch (error) {
+		console.error('get_feedback_stats_failed', error);
+		res.status(500).json({ error: 'Unable to fetch feedback stats' });
 	}
 });
 

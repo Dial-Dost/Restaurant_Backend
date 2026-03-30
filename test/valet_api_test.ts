@@ -1,8 +1,8 @@
 import 'dotenv/config';
 
 const API_BASE = process.env.RECEPTION_API_BASE_URL || 'http://localhost:3000';
-const RESTAURANT_ID = process.env.RESTAURANT_ID || 'csrorganics';
-const EMPLOYEE_ID = process.env.EMPLOYEE_ID || 'test-employee';
+const RESTAURANT_ID = process.env.TEST_RESTAURANT_ID || 'csrorganics';
+const EMPLOYEE_ID = process.env.TEST_EMPLOYEE_ID || 'admin';
 
 async function waitForHealth(timeoutMs = 10000): Promise<void> {
   const start = Date.now();

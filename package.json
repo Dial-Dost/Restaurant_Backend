@@ -13,6 +13,7 @@
     "test:overlap": "tsx test/overlap_allocation.ts",
     "test:threshold": "tsx test/capacity_threshold.ts",
     "test:valet_api": "tsx test/valet_api_test.ts",
+    "test:feedback_api": "tsx test/feedback_api_test.ts",
     "jest": "jest",
     "jest:watch": "jest --watch",
     "test:ci": "npm run build && jest --runInBand"
