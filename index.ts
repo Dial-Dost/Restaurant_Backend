@@ -21,6 +21,9 @@ import {
 	GetRestaurantUserRole,
 	EnsureRestaurantSeed,
 	AllocateBestTable,
+	AddFeedbackEntry,
+	GetFeedbackEntries,
+	GetFeedbackSummary,
 } from "./database.js";
 import {
 	OPENAI_REALTIME_MODEL,
@@ -56,6 +59,58 @@ function normalizeRole(rawRole: unknown): AppRole | null {
 	}
 
 	return null;
+}
+
+function getFeedbackCategoryLabel(category: number | string): string {
+	if (typeof category === "number") {
+		switch (category) {
+			case 1:
+				return "initial greeting";
+			case 2:
+				return "waiter service";
+			case 3:
+				return "food";
+			case 4:
+				return "ambience";
+			case 5:
+				return "restroom";
+			case 6:
+				return "valet parking";
+			default:
+				return "this question";
+		}
+	}
+
+	const normalized = category.trim().toLowerCase();
+	if (!normalized) {
+		return "this question";
+	}
+	if (normalized === "1") return "initial greeting";
+	if (normalized === "2") return "waiter service";
+	if (normalized === "3") return "food";
+	if (normalized === "4") return "ambience";
+	if (normalized === "5") return "restroom";
+	if (normalized === "6") return "valet parking";
+	return normalized.replace(/_/g, " ");
+}
+
+function normalizeFollowUpPromptForCategory(prompt: string, categoryLabel: string, rate: number): string {
+	const compact = prompt.replace(/\s+/g, " ").trim();
+	if (!compact) {
+		return `You rated ${categoryLabel} ${rate}/5. Could you share what influenced that rating?`;
+	}
+
+	let next = compact;
+	const replacement = categoryLabel === "food" ? "food" : categoryLabel;
+
+	if (categoryLabel !== "food") {
+		next = next.replace(/\bthe\s+food\b/gi, `the ${replacement}`);
+		next = next.replace(/\bfood\b/gi, replacement);
+	}
+
+	next = next.replace(/\bthe\s+this\s+question\b/gi, "this question");
+	next = next.replace(/\bthe\s+1\b/gi, "this question");
+	return next;
 }
 
 function extractRestaurantId(req: Request): string | null {
@@ -148,6 +203,8 @@ const allowedOrigins = new Set([
 	"http://localhost:9002",
 	"http://localhost:3000",
 	"http://localhost:3001",
+	"http://localhost:5173",
+	"http://localhost:9003",
 	"https://nw39853t-9002.inc1.devtunnels.ms", // TUNNEL URL goes here!!!!!
 ]);
 
@@ -264,7 +321,8 @@ app.post("/realtime/session", async (_req: Request, res: Response) => {
 				voice: "alloy",
 			}),
 		});
-		const data = await response.json();
+		const dataUnknown = await response.json();
+		const data = (dataUnknown ?? {}) as Record<string, unknown>;
 		if (!response.ok) {
 			res.status(response.status).json(data);
 			return;
@@ -1033,17 +1091,203 @@ app.post("/get_follow_up_question", validate, async (req: Request, res: Response
 		const response = await fetch(
 			"http://127.0.0.1:8000/get_follow_up_question/" + encodeURIComponent(category) + "/" + encodeURIComponent(rate),
 		);
-		const data = await response.json();
+		const payload = await response.json();
+		const data = (payload ?? {}) as Record<string, unknown>;
 		if (!response.ok) {
 			res.status(response.status).json(data);
 			return;
 		}
-		res.json(data);
+		const categoryLabel = getFeedbackCategoryLabel(category);
+		const rawFeedback = typeof data.feedback === "string" ? data.feedback : "";
+		const normalizedFeedback = normalizeFollowUpPromptForCategory(rawFeedback, categoryLabel, rate);
+		res.json({ ...data, feedback: normalizedFeedback });
 		return;
 	} catch (error) {
 		console.error("get_follow_up_question_failed", error);
 		res.status(500).json({ error: "Unable to fetch follow-up question" });
 		return;
+	}
+});
+
+app.post("/feedback/dynamic-follow-up", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const categoryLabel = typeof body?.category_label === "string" ? body.category_label.trim() : "";
+	const rating = Number(body?.rating);
+	const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
+	const mainQuestion = typeof body?.main_question === "string" ? body.main_question.trim() : "";
+	const firstFollowUpQuestion =
+		typeof body?.first_follow_up_question === "string" ? body.first_follow_up_question.trim() : "";
+
+	if (!categoryLabel || !Number.isFinite(rating) || !reason) {
+		res.status(400).json({ error: "category_label, rating, and reason are required" });
+		return;
+	}
+
+	if (reason.length < 8) {
+		res.status(400).json({ error: "reason is too short" });
+		return;
+	}
+
+	try {
+		const proxyResponse = await fetch(
+			"http://127.0.0.1:8000/get_follow_up_question/"
+				+ encodeURIComponent(categoryLabel)
+				+ "/"
+				+ encodeURIComponent(rating),
+		);
+		const proxyData = (await proxyResponse.json()) as Record<string, unknown>;
+		if (!proxyResponse.ok) {
+			res.status(proxyResponse.status).json(proxyData);
+			return;
+		}
+
+		const aiPrompt = typeof proxyData.feedback === "string" ? proxyData.feedback.trim() : "";
+		const normalizedAiPrompt = normalizeFollowUpPromptForCategory(aiPrompt, categoryLabel.toLowerCase(), rating);
+		const contextualFallback =
+			mainQuestion && firstFollowUpQuestion
+				? `Thanks for sharing. Based on your feedback about ${categoryLabel}, what one change should we prioritize?`
+				: `Thanks for sharing. What one change should we prioritize for ${categoryLabel}?`;
+		const followUpPrompt = normalizedAiPrompt.length > 0 ? normalizedAiPrompt : contextualFallback;
+		res.json({ follow_up_prompt: followUpPrompt });
+	} catch (error) {
+		console.error("feedback_dynamic_follow_up_failed", error);
+		res.status(500).json({ error: "Unable to generate dynamic follow-up" });
+	}
+});
+
+app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const numberPlate = typeof body?.number_plate === "string" ? body.number_plate.trim() : "";
+	if (!numberPlate) {
+		res.status(400).json({ error: "number_plate is required" });
+		return;
+	}
+
+	const categoryRatingsRaw = body?.category_ratings;
+	if (!Array.isArray(categoryRatingsRaw) || categoryRatingsRaw.length === 0) {
+		res.status(400).json({ error: "category_ratings must be a non-empty array" });
+		return;
+	}
+
+	try {
+		const category_ratings = categoryRatingsRaw
+			.map((item) => {
+				const row = item as Record<string, unknown>;
+				return {
+					key: String(row.key ?? "").trim(),
+					label: String(row.label ?? "").trim(),
+					rating: Number(row.rating),
+					question: row.question === null || row.question === undefined ? null : String(row.question),
+					follow_up:
+						row.follow_up === null || row.follow_up === undefined ? null : String(row.follow_up),
+					follow_up_answer:
+						row.follow_up_answer === null || row.follow_up_answer === undefined
+							? null
+							: String(row.follow_up_answer),
+				};
+			})
+			.filter((item) => item.key.length > 0 && item.label.length > 0 && Number.isFinite(item.rating));
+
+		if (category_ratings.length === 0) {
+			res.status(400).json({ error: "No valid category ratings found" });
+			return;
+		}
+
+		const visitDateRaw = body?.visit_date;
+		const visitDate =
+			typeof visitDateRaw === "string" && visitDateRaw.trim().length > 0
+				? new Date(visitDateRaw)
+				: null;
+
+		const valetResponse = await fetch(
+			"http://127.0.0.1:8000/update_valet_state/"
+				+ encodeURIComponent(numberPlate)
+				+ "/2",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+			},
+		);
+
+		if (!valetResponse.ok) {
+			const valetErrorPayload = (await valetResponse.json().catch(() => ({}))) as Record<string, unknown>;
+			res.status(502).json({
+				error: "Unable to update valet stage to 2 for this number plate",
+				details: valetErrorPayload,
+			});
+			return;
+		}
+
+		const saved = await AddFeedbackEntry(restaurantId, {
+			customer_name:
+				typeof body?.customer_name === "string" ? body.customer_name : null,
+			visit_date: visitDate && !Number.isNaN(visitDate.getTime()) ? visitDate : null,
+			comments: typeof body?.comments === "string" ? body.comments : null,
+			category_ratings,
+			image_theme:
+				body?.image_theme && typeof body.image_theme === "object"
+					? {
+						background: String((body.image_theme as Record<string, unknown>).background ?? ""),
+						surface: String((body.image_theme as Record<string, unknown>).surface ?? ""),
+						text: String((body.image_theme as Record<string, unknown>).text ?? ""),
+						accent: String((body.image_theme as Record<string, unknown>).accent ?? ""),
+					}
+					: null,
+			source: typeof body?.source === "string" ? body.source : "feedback_form",
+		});
+
+		res.status(201).json({ success: true, id: saved.id, submitted_at: saved.submitted_at });
+	} catch (error) {
+		console.error("submit_feedback_failed", error);
+		res.status(500).json({ error: "Unable to submit feedback" });
+	}
+});
+
+app.get("/feedback", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "employee"]);
+	if (!auth) {
+		return;
+	}
+
+	const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+	const parsedLimit = typeof rawLimit === "string" ? Number.parseInt(rawLimit, 10) : 100;
+	const limit = Number.isFinite(parsedLimit) ? parsedLimit : 100;
+
+	try {
+		const items = await GetFeedbackEntries(auth.restaurantId, limit);
+		res.json({ items });
+	} catch (error) {
+		console.error("get_feedback_failed", error);
+		res.status(500).json({ error: "Unable to fetch feedback" });
+	}
+});
+
+app.get("/feedback/summary", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "employee"]);
+	if (!auth) {
+		return;
+	}
+
+	try {
+		const summary = await GetFeedbackSummary(auth.restaurantId);
+		res.json(summary);
+	} catch (error) {
+		console.error("get_feedback_summary_failed", error);
+		res.status(500).json({ error: "Unable to fetch feedback summary" });
 	}
 });
 

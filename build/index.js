@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, } from "./database.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, } from "./database.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 const app = express();
 const port = 3000;
@@ -22,6 +22,58 @@ function normalizeRole(rawRole) {
         return lowered;
     }
     return null;
+}
+function getFeedbackCategoryLabel(category) {
+    if (typeof category === "number") {
+        switch (category) {
+            case 1:
+                return "initial greeting";
+            case 2:
+                return "waiter service";
+            case 3:
+                return "food";
+            case 4:
+                return "ambience";
+            case 5:
+                return "restroom";
+            case 6:
+                return "valet parking";
+            default:
+                return "this question";
+        }
+    }
+    const normalized = category.trim().toLowerCase();
+    if (!normalized) {
+        return "this question";
+    }
+    if (normalized === "1")
+        return "initial greeting";
+    if (normalized === "2")
+        return "waiter service";
+    if (normalized === "3")
+        return "food";
+    if (normalized === "4")
+        return "ambience";
+    if (normalized === "5")
+        return "restroom";
+    if (normalized === "6")
+        return "valet parking";
+    return normalized.replace(/_/g, " ");
+}
+function normalizeFollowUpPromptForCategory(prompt, categoryLabel, rate) {
+    const compact = prompt.replace(/\s+/g, " ").trim();
+    if (!compact) {
+        return `You rated ${categoryLabel} ${rate}/5. Could you share what influenced that rating?`;
+    }
+    let next = compact;
+    const replacement = categoryLabel === "food" ? "food" : categoryLabel;
+    if (categoryLabel !== "food") {
+        next = next.replace(/\bthe\s+food\b/gi, `the ${replacement}`);
+        next = next.replace(/\bfood\b/gi, replacement);
+    }
+    next = next.replace(/\bthe\s+this\s+question\b/gi, "this question");
+    next = next.replace(/\bthe\s+1\b/gi, "this question");
+    return next;
 }
 function extractRestaurantId(req) {
     const headerValue = req.headers["x-restaurant-id"];
@@ -94,6 +146,8 @@ const allowedOrigins = new Set([
     "http://localhost:9002",
     "http://localhost:3000",
     "http://localhost:3001",
+    "http://localhost:5173",
+    "http://localhost:9003",
     "https://nw39853t-9002.inc1.devtunnels.ms", // TUNNEL URL goes here!!!!!
 ]);
 app.use((req, res, next) => {
@@ -113,6 +167,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // Lightweight health endpoint for readiness/liveness checks
 import { getDb } from "./schema.js";
+import { ca } from 'zod/v4/locales';
 app.get("/health", async (_req, res) => {
     const result = { status: "ok", uptime: process.uptime(), time: new Date().toISOString() };
     try {
@@ -196,7 +251,8 @@ app.post("/realtime/session", async (_req, res) => {
                 voice: "alloy",
             }),
         });
-        const data = await response.json();
+        const dataUnknown = await response.json();
+        const data = (dataUnknown ?? {});
         if (!response.ok) {
             res.status(response.status).json(data);
             return;
@@ -728,6 +784,284 @@ app.post("/audit-logs", validate, async (req, res) => {
         res.status(500).json({ error: "Unable to record audit log" });
     }
 });
+// Rtamanyu's integration
+app.post("/get_valet_state", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
+    if (!number_plate) {
+        res.status(400).json({ error: "Missing number plate" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate));
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("fetch_valet_state_failed", error);
+        res.status(500).json({ error: "Unable to fetch valet state" });
+        return;
+    }
+});
+app.post("/update_valet_state", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
+    const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
+    if (!number_plate || !state) {
+        res.status(400).json({ error: "Missing number plate or state" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(state), {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("update_valet_state_failed", error);
+        res.status(500).json({ error: "Unable to update valet state" });
+        return;
+    }
+});
+app.post("/get_main_feedback_question", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const category = typeof body?.category === 'number' ? body.category : undefined;
+    if (!category) {
+        res.status(400).json({ error: "Missing category" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/get_main_feedback_question/" + encodeURIComponent(category));
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("get_main_feedback_question_failed", error);
+        res.status(500).json({ error: "Unable to fetch main feedback question" });
+        return;
+    }
+});
+app.post("/get_follow_up_question", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const category = typeof body?.category === 'number' ? body.category : undefined;
+    const rate = body?.rate === null || body?.rate === undefined ? undefined : Number(body.rate);
+    if (!category || !rate) {
+        res.status(400).json({ error: "Missing category or rate" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/get_follow_up_question/" + encodeURIComponent(category) + "/" + encodeURIComponent(rate));
+        const payload = await response.json();
+        const data = (payload ?? {});
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        const categoryLabel = getFeedbackCategoryLabel(category);
+        const rawFeedback = typeof data.feedback === "string" ? data.feedback : "";
+        const normalizedFeedback = normalizeFollowUpPromptForCategory(rawFeedback, categoryLabel, rate);
+        res.json({ ...data, feedback: normalizedFeedback });
+        return;
+    }
+    catch (error) {
+        console.error("get_follow_up_question_failed", error);
+        res.status(500).json({ error: "Unable to fetch follow-up question" });
+        return;
+    }
+});
+app.post("/feedback/dynamic-follow-up", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const categoryLabel = typeof body?.category_label === "string" ? body.category_label.trim() : "";
+    const rating = Number(body?.rating);
+    const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
+    const mainQuestion = typeof body?.main_question === "string" ? body.main_question.trim() : "";
+    const firstFollowUpQuestion = typeof body?.first_follow_up_question === "string" ? body.first_follow_up_question.trim() : "";
+    if (!categoryLabel || !Number.isFinite(rating) || !reason) {
+        res.status(400).json({ error: "category_label, rating, and reason are required" });
+        return;
+    }
+    if (reason.length < 8) {
+        res.status(400).json({ error: "reason is too short" });
+        return;
+    }
+    try {
+        const proxyResponse = await fetch("http://127.0.0.1:8000/get_follow_up_question/"
+            + encodeURIComponent(categoryLabel)
+            + "/"
+            + encodeURIComponent(rating));
+        const proxyData = (await proxyResponse.json());
+        if (!proxyResponse.ok) {
+            res.status(proxyResponse.status).json(proxyData);
+            return;
+        }
+        const aiPrompt = typeof proxyData.feedback === "string" ? proxyData.feedback.trim() : "";
+        const normalizedAiPrompt = normalizeFollowUpPromptForCategory(aiPrompt, categoryLabel.toLowerCase(), rating);
+        const contextualFallback = mainQuestion && firstFollowUpQuestion
+            ? `Thanks for sharing. Based on your feedback about ${categoryLabel}, what one change should we prioritize?`
+            : `Thanks for sharing. What one change should we prioritize for ${categoryLabel}?`;
+        const followUpPrompt = normalizedAiPrompt.length > 0 ? normalizedAiPrompt : contextualFallback;
+        res.json({ follow_up_prompt: followUpPrompt });
+    }
+    catch (error) {
+        console.error("feedback_dynamic_follow_up_failed", error);
+        res.status(500).json({ error: "Unable to generate dynamic follow-up" });
+    }
+});
+app.post("/feedback/submit", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const numberPlate = typeof body?.number_plate === "string" ? body.number_plate.trim() : "";
+    if (!numberPlate) {
+        res.status(400).json({ error: "number_plate is required" });
+        return;
+    }
+    const categoryRatingsRaw = body?.category_ratings;
+    if (!Array.isArray(categoryRatingsRaw) || categoryRatingsRaw.length === 0) {
+        res.status(400).json({ error: "category_ratings must be a non-empty array" });
+        return;
+    }
+    try {
+        const category_ratings = categoryRatingsRaw
+            .map((item) => {
+            const row = item;
+            return {
+                key: String(row.key ?? "").trim(),
+                label: String(row.label ?? "").trim(),
+                rating: Number(row.rating),
+                question: row.question === null || row.question === undefined ? null : String(row.question),
+                follow_up: row.follow_up === null || row.follow_up === undefined ? null : String(row.follow_up),
+                follow_up_answer: row.follow_up_answer === null || row.follow_up_answer === undefined
+                    ? null
+                    : String(row.follow_up_answer),
+            };
+        })
+            .filter((item) => item.key.length > 0 && item.label.length > 0 && Number.isFinite(item.rating));
+        if (category_ratings.length === 0) {
+            res.status(400).json({ error: "No valid category ratings found" });
+            return;
+        }
+        const visitDateRaw = body?.visit_date;
+        const visitDate = typeof visitDateRaw === "string" && visitDateRaw.trim().length > 0
+            ? new Date(visitDateRaw)
+            : null;
+        const valetResponse = await fetch("http://127.0.0.1:8000/update_valet_state/"
+            + encodeURIComponent(numberPlate)
+            + "/2", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+        });
+        if (!valetResponse.ok) {
+            const valetErrorPayload = (await valetResponse.json().catch(() => ({})));
+            res.status(502).json({
+                error: "Unable to update valet stage to 2 for this number plate",
+                details: valetErrorPayload,
+            });
+            return;
+        }
+        const saved = await AddFeedbackEntry(restaurantId, {
+            customer_name: typeof body?.customer_name === "string" ? body.customer_name : null,
+            visit_date: visitDate && !Number.isNaN(visitDate.getTime()) ? visitDate : null,
+            comments: typeof body?.comments === "string" ? body.comments : null,
+            category_ratings,
+            image_theme: body?.image_theme && typeof body.image_theme === "object"
+                ? {
+                    background: String(body.image_theme.background ?? ""),
+                    surface: String(body.image_theme.surface ?? ""),
+                    text: String(body.image_theme.text ?? ""),
+                    accent: String(body.image_theme.accent ?? ""),
+                }
+                : null,
+            source: typeof body?.source === "string" ? body.source : "feedback_form",
+        });
+        res.status(201).json({ success: true, id: saved.id, submitted_at: saved.submitted_at });
+    }
+    catch (error) {
+        console.error("submit_feedback_failed", error);
+        res.status(500).json({ error: "Unable to submit feedback" });
+    }
+});
+app.get("/feedback", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "employee"]);
+    if (!auth) {
+        return;
+    }
+    const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+    const parsedLimit = typeof rawLimit === "string" ? Number.parseInt(rawLimit, 10) : 100;
+    const limit = Number.isFinite(parsedLimit) ? parsedLimit : 100;
+    try {
+        const items = await GetFeedbackEntries(auth.restaurantId, limit);
+        res.json({ items });
+    }
+    catch (error) {
+        console.error("get_feedback_failed", error);
+        res.status(500).json({ error: "Unable to fetch feedback" });
+    }
+});
+app.get("/feedback/summary", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "employee"]);
+    if (!auth) {
+        return;
+    }
+    try {
+        const summary = await GetFeedbackSummary(auth.restaurantId);
+        res.json(summary);
+    }
+    catch (error) {
+        console.error("get_feedback_summary_failed", error);
+        res.status(500).json({ error: "Unable to fetch feedback summary" });
+    }
+});
+export { app };
 app.use((err, req, res, next) => {
     if (err instanceof SyntaxError && "body" in err) {
         return res

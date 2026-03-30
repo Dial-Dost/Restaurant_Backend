@@ -85,7 +85,18 @@ async def get_follow_up_question(category: str, rate: int):
     random.seed(time.time())  # Ensure different random selection each time
     ques_idx = random.randint(0, tot_ques_each_cat - 1)
     ques = feedback["follow_up_questions"][ques_idx]['question']
-    ques = ques.replace("<service>", category)
+
+    # Follow-up templates can include <service>. The UI currently sends numeric category ids,
+    # so avoid showing awkward text like "for the 1".
+    normalized_category = category.strip()
+    if normalized_category.isdigit():
+        normalized_category = "this question"
+    else:
+        normalized_category = normalized_category.replace("_", " ").strip().lower()
+        if not normalized_category:
+            normalized_category = "this question"
+
+    ques = ques.replace("<service>", normalized_category)
     ques = ques.replace("<rate>", str(rate))
     info(f"Selected follow-up question: {ques}")
     return {"feedback": ques}

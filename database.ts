@@ -45,10 +45,39 @@ interface AuditLogFields extends Document {
 	timestamp: Date;
 }
 
+interface FeedbackCategoryRating {
+	key: string;
+	label: string;
+	rating: number;
+	question?: string | null;
+	follow_up?: string | null;
+	follow_up_answer?: string | null;
+}
+
+interface FeedbackTheme {
+	background: string;
+	surface: string;
+	text: string;
+	accent: string;
+}
+
+interface FeedbackEntryFields extends Document {
+	restaurant_id: string;
+	customer_name?: string | null;
+	visit_date?: Date | null;
+	comments?: string | null;
+	overall_rating?: number | null;
+	category_ratings: FeedbackCategoryRating[];
+	image_theme?: FeedbackTheme | null;
+	source?: string | null;
+	submitted_at: Date;
+}
+
 type CustomerDoc = WithId<CustomerFields>;
 type TableDoc = WithId<TableFields>;
 type BookingDoc = WithId<BookingFields>;
 type AuditLogDoc = WithId<AuditLogFields>;
+type FeedbackEntryDoc = WithId<FeedbackEntryFields>;
 
 type BookingSummary = {
 	booking_id: string;
@@ -124,6 +153,52 @@ type NewCustomerDoc = OptionalUnlessRequiredId<CustomerFields>;
 type NewTableDoc = OptionalUnlessRequiredId<TableFields>;
 type NewBookingDoc = OptionalUnlessRequiredId<BookingFields>;
 type NewAuditLogDoc = OptionalUnlessRequiredId<AuditLogFields>;
+type NewFeedbackEntryDoc = OptionalUnlessRequiredId<FeedbackEntryFields>;
+
+export type FeedbackCategoryRatingInput = {
+	key: string;
+	label: string;
+	rating: number;
+	question?: string | null;
+	follow_up?: string | null;
+	follow_up_answer?: string | null;
+};
+
+export type FeedbackThemeInput = {
+	background: string;
+	surface: string;
+	text: string;
+	accent: string;
+};
+
+export type FeedbackSubmissionInput = {
+	customer_name?: string | null;
+	visit_date?: Date | null;
+	comments?: string | null;
+	category_ratings: FeedbackCategoryRatingInput[];
+	image_theme?: FeedbackThemeInput | null;
+	source?: string | null;
+};
+
+export type FeedbackEntry = {
+	id: string;
+	restaurant_id: string;
+	customer_name?: string | null;
+	visit_date?: Date | null;
+	comments?: string | null;
+	overall_rating?: number | null;
+	category_ratings: FeedbackCategoryRatingInput[];
+	image_theme?: FeedbackThemeInput | null;
+	source?: string | null;
+	submitted_at: Date;
+};
+
+export type FeedbackSummary = {
+	totalResponses: number;
+	averageRating: number | null;
+	categoryAverages: Record<string, { label: string; average: number | null }>;
+	last30DaysResponses: number;
+};
 
 let indexesEnsured = false;
 let ensureIndexesPromise: Promise<void> | null = null;
@@ -166,6 +241,7 @@ async function ensureIndexes(): Promise<void> {
 			const bookings = db.collection<BookingDoc>("bookings");
 			const auditLogs = db.collection<AuditLogDoc>("audit_logs");
 			const restaurants = db.collection<RestaurantDoc>("restaurants");
+			const feedbackEntries = db.collection<FeedbackEntryDoc>("feedback_entries");
 
 			await Promise.allSettled([
 				customers.createIndex(
@@ -195,6 +271,10 @@ async function ensureIndexes(): Promise<void> {
 				restaurants.createIndex(
 					{ id: 1 },
 					{ unique: true, name: "restaurant_id_unique" },
+				),
+				feedbackEntries.createIndex(
+					{ restaurant_id: 1, submitted_at: -1 },
+					{ name: "feedback_recent_per_restaurant" },
 				),
 			]);
 			indexesEnsured = true;
@@ -227,6 +307,24 @@ async function auditLogsCollection() {
 async function restaurantsCollection() {
 	await ensureIndexes();
 	return getCollection<RestaurantDoc>("restaurants");
+}
+
+async function feedbackEntriesCollection() {
+	await ensureIndexes();
+	return getCollection<FeedbackEntryFields>("feedback_entries");
+}
+
+function clampRating(value: number): number {
+	if (!Number.isFinite(value)) {
+		return 1;
+	}
+	if (value < 1) {
+		return 1;
+	}
+	if (value > 5) {
+		return 5;
+	}
+	return Math.round(value);
 }
 
 export async function AddCustomer(
@@ -741,6 +839,163 @@ export async function GetRestaurantUserRole(
 		(entry) => entry.employeeId?.trim().toLowerCase() === normalizedEmployeeId,
 	);
 	return user?.role ?? null;
+}
+
+export async function AddFeedbackEntry(
+	restaurantId: string,
+	entry: FeedbackSubmissionInput,
+): Promise<{ id: string; submitted_at: Date }> {
+	const feedbackEntries = await feedbackEntriesCollection();
+	const submittedAt = new Date();
+
+	const normalizedRatings = entry.category_ratings
+		.filter(
+			(item) =>
+				typeof item?.key === "string" &&
+				item.key.trim().length > 0 &&
+				typeof item?.label === "string" &&
+				item.label.trim().length > 0,
+		)
+		.map((item) => ({
+			key: item.key.trim(),
+			label: item.label.trim(),
+			rating: clampRating(item.rating),
+			question:
+				typeof item.question === "string" && item.question.trim().length > 0
+					? item.question.trim()
+					: null,
+			follow_up:
+				typeof item.follow_up === "string" && item.follow_up.trim().length > 0
+					? item.follow_up.trim()
+					: null,
+			follow_up_answer:
+				typeof item.follow_up_answer === "string" && item.follow_up_answer.trim().length > 0
+					? item.follow_up_answer.trim()
+					: null,
+		}));
+
+	const overallRating =
+		normalizedRatings.length > 0
+			? Number(
+				(
+					normalizedRatings.reduce((sum, current) => sum + current.rating, 0) /
+					normalizedRatings.length
+				).toFixed(2),
+			)
+			: null;
+
+	const doc: NewFeedbackEntryDoc = {
+		restaurant_id: restaurantId,
+		customer_name:
+			typeof entry.customer_name === "string" && entry.customer_name.trim().length > 0
+				? entry.customer_name.trim()
+				: null,
+		visit_date: entry.visit_date instanceof Date && !Number.isNaN(entry.visit_date.getTime())
+			? entry.visit_date
+			: null,
+		comments:
+			typeof entry.comments === "string" && entry.comments.trim().length > 0
+				? entry.comments.trim()
+				: null,
+		overall_rating: overallRating,
+		category_ratings: normalizedRatings,
+		image_theme: entry.image_theme ?? null,
+		source:
+			typeof entry.source === "string" && entry.source.trim().length > 0
+				? entry.source.trim()
+				: "feedback_form",
+		submitted_at: submittedAt,
+	};
+
+	const result = await feedbackEntries.insertOne(doc);
+	return { id: result.insertedId.toHexString(), submitted_at: submittedAt };
+}
+
+export async function GetFeedbackEntries(
+	restaurantId: string,
+	limit = 100,
+): Promise<FeedbackEntry[]> {
+	const feedbackEntries = await feedbackEntriesCollection();
+	const safeLimit = Math.max(1, Math.min(limit, 500));
+	const docs = await feedbackEntries
+		.find({ restaurant_id: restaurantId })
+		.sort({ submitted_at: -1 })
+		.limit(safeLimit)
+		.toArray();
+
+	return docs.map((doc: FeedbackEntryDoc) => ({
+		id: doc._id.toHexString(),
+		restaurant_id: doc.restaurant_id,
+		customer_name: doc.customer_name ?? null,
+		visit_date: doc.visit_date ?? null,
+		comments: doc.comments ?? null,
+		overall_rating: doc.overall_rating ?? null,
+		category_ratings: doc.category_ratings ?? [],
+		image_theme: doc.image_theme ?? null,
+		source: doc.source ?? null,
+		submitted_at: doc.submitted_at,
+	}));
+}
+
+export async function GetFeedbackSummary(
+	restaurantId: string,
+): Promise<FeedbackSummary> {
+	const now = new Date();
+	const last30Start = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+	const feedbackEntries = await feedbackEntriesCollection();
+	const docs = await feedbackEntries
+		.find(
+			{ restaurant_id: restaurantId },
+			{ projection: { overall_rating: 1, category_ratings: 1, submitted_at: 1 } },
+		)
+		.toArray();
+
+	let overallTotal = 0;
+	let overallCount = 0;
+	let last30DaysResponses = 0;
+	const categoryTotals = new Map<string, { label: string; total: number; count: number }>();
+
+	for (const doc of docs) {
+		if (typeof doc.overall_rating === "number") {
+			overallTotal += doc.overall_rating;
+			overallCount += 1;
+		}
+		if (doc.submitted_at instanceof Date && doc.submitted_at >= last30Start) {
+			last30DaysResponses += 1;
+		}
+		for (const category of doc.category_ratings ?? []) {
+			const key = category.key.trim();
+			if (!key) {
+				continue;
+			}
+			const existing = categoryTotals.get(key) ?? {
+				label: category.label,
+				total: 0,
+				count: 0,
+			};
+			existing.total += clampRating(category.rating);
+			existing.count += 1;
+			if (category.label.trim().length > 0) {
+				existing.label = category.label;
+			}
+			categoryTotals.set(key, existing);
+		}
+	}
+
+	const categoryAverages: Record<string, { label: string; average: number | null }> = {};
+	for (const [key, value] of categoryTotals.entries()) {
+		categoryAverages[key] = {
+			label: value.label,
+			average: value.count > 0 ? Number((value.total / value.count).toFixed(2)) : null,
+		};
+	}
+
+	return {
+		totalResponses: docs.length,
+		averageRating: overallCount > 0 ? Number((overallTotal / overallCount).toFixed(2)) : null,
+		categoryAverages,
+		last30DaysResponses,
+	};
 }
 
 type RestaurantSeedInput = {
