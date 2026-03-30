@@ -124,20 +124,6 @@ async def get_follow_up_question(category: str, rate: int):
     return {"feedback": ques}
 
 
-# @app.get("/get_valet_state/{number_plate}")
-# async def get_valet_state(number_plate: str):
-#     return {"valet_state": get_valet_state_from_db(number_plate)}
-
-
-# @app.post("/update_valet_state/{number_plate}/{state}")
-# async def update_valet_state(number_plate: str, state: int):
-#     if 1 <= state <= 6:
-#         return update_valet_state_from_db(number_plate, state)
-#     else:
-#         exception(f"Invalid valet state update requested: {state}")
-#         return {"error": "Invalid valet state"}
-
-
 @app.get("/get_valet_info/{booking_id}")
 async def get_valet_info(booking_id: str):
     return get_valet_info_from_db(booking_id)
