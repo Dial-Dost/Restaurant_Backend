@@ -455,16 +455,19 @@ export async function GetAuditLogs(restaurantId, limit = 100) {
 export async function GetRestaurantUserRole(restaurantId, employeeId) {
     const normalizedEmployeeId = employeeId.trim().toLowerCase();
     if (!normalizedEmployeeId) {
-        console.log("GetRestaurantUserRole: missing or empty employeeId", { restaurantId, employeeId });
+        console.warn("get_user_role_invalid_employee_id", { restaurantId, employeeId });
         return null;
     }
     const restaurants = await restaurantsCollection();
     const restaurant = await restaurants.findOne({ id: restaurantId });
     if (!restaurant?.users?.length) {
-        console.log("GetRestaurantUserRole: no users found for restaurant", { restaurantId });
+        console.warn("get_user_role_no_users_found", { restaurantId, employeeId });
         return null;
     }
     const user = restaurant.users.find((entry) => entry.employeeId?.trim().toLowerCase() === normalizedEmployeeId);
+    if (!user) {
+        console.warn("get_user_role_user_not_found", { restaurantId, employeeId, restaurantUsers: restaurant.users });
+    }
     return user?.role ?? null;
 }
 export async function AddFeedbackEntry(restaurantId, entry) {
