@@ -1852,12 +1852,16 @@ app.get("/feedback/stats", validate, async (req: Request, res: Response) => {
 			const targetYMD = date.toISOString().slice(0, 10);
 			const hours = Array.from({ length: 24 }, (_, i) => ({ hour: i, count: 0 }));
 			for (const r of rows) {
-				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const s = new Date(raw);
 				if (isNaN(s.getTime())) continue;
 				const ymd = s.toISOString().slice(0, 10);
 				if (ymd === targetYMD) {
 					const h = s.getUTCHours();
-					hours[h].count += 1;
+					if (h >= 0 && h < hours.length) {
+						const bucket = hours[h];
+						if (bucket) bucket.count += 1;
+					}
 				}
 			}
 			return res.json({ mode: "daily", date: targetYMD, hours });
@@ -1870,22 +1874,27 @@ app.get("/feedback/stats", validate, async (req: Request, res: Response) => {
 			const diff = (day + 6) % 7;
 			weekStart = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() - diff));
 			const days = [] as Array<{ label: string; date: string; count: number }>;
+			const dayLabels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 			for (let i = 0; i < 7; i++) {
 				const d = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() + i));
-				days.push({ label: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][i], date: d.toISOString().slice(0, 10), count: 0 });
+				days.push({ label: dayLabels[i]!, date: d.toISOString().slice(0, 10), count: 0 });
 			}
 			const startMs = Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate());
 			const endMs = startMs + 7 * 24 * 60 * 60 * 1000;
 			for (const r of rows) {
-				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const s = new Date(raw);
 				if (isNaN(s.getTime())) continue;
 				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
 				if (t >= startMs && t < endMs) {
 					const idx = Math.floor((t - startMs) / (24 * 60 * 60 * 1000));
-					if (idx >= 0 && idx < 7) days[idx].count += 1;
+					if (idx >= 0 && idx < days.length) {
+						const bucket = days[idx];
+						if (bucket) bucket.count += 1;
+					}
 				}
 			}
-			return res.json({ mode: "weekly", weekStart: days[0].date, days });
+			return res.json({ mode: "weekly", weekStart: days[0]!.date, days });
 		}
 
 		if (mode === "monthly") {
@@ -1910,14 +1919,15 @@ app.get("/feedback/stats", validate, async (req: Request, res: Response) => {
 			}
 			// count events
 			for (const r of rows) {
-				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const s = new Date(raw);
 				if (isNaN(s.getTime())) continue;
 				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
 				for (let idx = 0; idx < weeks.length; idx++) {
-					const ws = weeks[idx];
+					const ws = weeks[idx]!;
 					const wsMs = Date.UTC(Number(ws.start.slice(0,4)), Number(ws.start.slice(5,7)) - 1, Number(ws.start.slice(8,10)));
 					const weMs = Date.UTC(Number(ws.end.slice(0,4)), Number(ws.end.slice(5,7)) - 1, Number(ws.end.slice(8,10)));
-					if (t >= wsMs && t < weMs) { weeks[idx].count += 1; break; }
+					if (t >= wsMs && t < weMs) { weeks[idx]!.count += 1; break; }
 				}
 			}
 			return res.json({ mode: "monthly", month: `${year}-${(month+1).toString().padStart(2,'0')}`, start: weeks[0]?.start ?? monthStart.toISOString().slice(0,10), weeks });
@@ -1927,10 +1937,15 @@ app.get("/feedback/stats", validate, async (req: Request, res: Response) => {
 			const yearParam = Number(req.query.year ?? new Date().getUTCFullYear());
 			const months = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, label: ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][i], count: 0 }));
 			for (const r of rows) {
-				const s = new Date(r.submitted_at ?? r.submittedAt ?? r.submittedAt);
+				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const s = new Date(raw);
 				if (isNaN(s.getTime())) continue;
 				if (s.getUTCFullYear() === yearParam) {
-					months[s.getUTCMonth()].count += 1;
+					const mi = s.getUTCMonth();
+					if (mi >= 0 && mi < months.length) {
+						const bucket = months[mi];
+						if (bucket) bucket.count += 1;
+					}
 				}
 			}
 			return res.json({ mode: "yearly", year: yearParam, months });
