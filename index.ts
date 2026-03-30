@@ -115,6 +115,66 @@ function normalizeFollowUpPromptForCategory(prompt: string, categoryLabel: strin
 	return next;
 }
 
+const GEMINI_FEEDBACK_MODEL = process.env.GEMINI_FEEDBACK_MODEL ?? "gemini-2.5-flash-lite";
+
+async function generateGeminiFeedbackFollowUpPrompt(input: {
+	categoryLabel: string;
+	rating: number;
+	reason: string;
+	mainQuestion: string;
+	firstFollowUpQuestion: string;
+}): Promise<string> {
+	const apiKey = process.env.GEMINI_API_KEY;
+	if (!apiKey) {
+		throw new Error("GEMINI_API_KEY is not configured on the server");
+	}
+
+	const prompt = [
+		"You generate one follow-up question for restaurant feedback.",
+		"Output plain text only.",
+		"Keep it empathetic, specific, and actionable.",
+		`Category: ${input.categoryLabel}`,
+		`Rating: ${input.rating}/5`,
+		`Customer reason: ${input.reason}`,
+		input.mainQuestion ? `Main question: ${input.mainQuestion}` : "",
+		input.firstFollowUpQuestion ? `First follow-up: ${input.firstFollowUpQuestion}` : "",
+	].filter(Boolean).join("\n");
+
+	const response = await fetch(
+		`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_FEEDBACK_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				contents: [{ parts: [{ text: prompt }] }],
+				generationConfig: {
+					temperature: 0.4,
+					maxOutputTokens: 80,
+				},
+			}),
+		},
+	);
+
+	const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+	if (!response.ok) {
+		throw new Error(`Gemini follow-up generation failed (${response.status})`);
+	}
+
+	const candidates = Array.isArray(payload?.candidates) ? payload?.candidates : [];
+	const firstCandidate = (candidates[0] ?? null) as Record<string, unknown> | null;
+	const content = (firstCandidate?.content ?? null) as Record<string, unknown> | null;
+	const parts = Array.isArray(content?.parts) ? content?.parts : [];
+	const firstPart = (parts[0] ?? null) as Record<string, unknown> | null;
+	const text = typeof firstPart?.text === "string" ? firstPart.text.trim() : "";
+	if (!text) {
+		throw new Error("Gemini returned empty follow-up prompt");
+	}
+
+	return text;
+}
+
 function extractRestaurantId(req: Request): string | null {
 	const headerValue = req.headers["x-restaurant-id"];
 	const headerId = Array.isArray(headerValue) ? headerValue[0] : headerValue;
@@ -1587,19 +1647,13 @@ app.post("/feedback/dynamic-follow-up", validate, async (req: Request, res: Resp
 	}
 
 	try {
-		const proxyResponse = await fetch(
-			"http://127.0.0.1:8000/get_follow_up_question/"
-				+ encodeURIComponent(categoryLabel)
-				+ "/"
-				+ encodeURIComponent(rating),
-		);
-		const proxyData = (await proxyResponse.json()) as Record<string, unknown>;
-		if (!proxyResponse.ok) {
-			res.status(proxyResponse.status).json(proxyData);
-			return;
-		}
-
-		const aiPrompt = typeof proxyData.feedback === "string" ? proxyData.feedback.trim() : "";
+		const aiPrompt = await generateGeminiFeedbackFollowUpPrompt({
+			categoryLabel,
+			rating,
+			reason,
+			mainQuestion,
+			firstFollowUpQuestion,
+		});
 		const normalizedAiPrompt = normalizeFollowUpPromptForCategory(aiPrompt, categoryLabel.toLowerCase(), rating);
 		const contextualFallback =
 			mainQuestion && firstFollowUpQuestion
