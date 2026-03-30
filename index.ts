@@ -29,6 +29,8 @@ import {
 	createReservationForRequest,
 	getRestaurantKnowledgeSnapshot,
 } from "./realtime_reception_agent.js";
+import { initRealtime, emitRestaurant } from "./realtime.js";
+import { createServer } from "http";
 const app = express();
 const port = 3000;
 
@@ -383,6 +385,12 @@ app.post("/add-table", validate, async (req: Request, res: Response) => {
 		return;
 	}
 
+	try {
+		emitRestaurant(restaurantId, "table:added", { table_name, capacity: table.capacity });
+	} catch (err) {
+		console.warn("emit table:added failed", err);
+	}
+
 	res.send(table_name);
 });
 
@@ -404,6 +412,12 @@ app.delete("/table/:name", validate, async (req: Request, res: Response) => {
 	if (!deleted) {
 		res.status(404).json({ error: "Table not found" });
 		return;
+	}
+
+	try {
+		emitRestaurant(restaurantId, "table:deleted", { table_name: tableName });
+	} catch (err) {
+		console.warn("emit table:deleted failed", err);
 	}
 
 	res.status(204).send();
@@ -524,6 +538,12 @@ app.post("/add-booking", validate, async (req: Request, res: Response) => {
 			: typeof booking._id.toHexString === "function"
 				? booking._id.toHexString()
 				: booking._id.toString();
+
+	try {
+		emitRestaurant(restaurantId, "booking:created", { booking_id, table_name: tableName });
+	} catch (err) {
+		console.warn("emit booking:created failed", err);
+	}
 
 	res.json({ booking_id, table_name: tableName });
 });
@@ -793,6 +813,12 @@ app.patch("/booking/:id/status", validate, async (req: Request, res: Response) =
 		return;
 	}
 
+	try {
+		emitRestaurant(auth.restaurantId, "booking:status_updated", { booking_id: bookingId, status });
+	} catch (err) {
+		console.warn("emit booking:status_updated failed", err);
+	}
+
 	res.json({ success: true });
 });
 
@@ -848,6 +874,12 @@ app.delete("/booking/:id", validate, async (req: Request, res: Response) => {
 	if (!deleted) {
 		res.status(404).json({ error: "Booking not found" });
 		return;
+	}
+
+	try {
+		emitRestaurant(restaurantId, "booking:deleted", { booking_id: bookingId });
+	} catch (err) {
+		console.warn("emit booking:deleted failed", err);
 	}
 
 	res.status(204).send();
@@ -1241,6 +1273,9 @@ app.post("/create_valet_record", validate, async (req: Request, res: Response) =
 			res.status(response.status).json(data);
 			return;
 		}
+
+		// Broadcast created valet record to connected frontends
+		emitRestaurant(auth.restaurantId, "valet:created", data);
 		res.json(data);
 		return;
 	} catch (error) {
@@ -1311,6 +1346,9 @@ app.post("/update_valet_state", validate, async (req: Request, res: Response) =>
 			res.status(response.status).json(data);
 			return;
 		}
+
+		// Broadcast updated valet state
+		emitRestaurant(auth.restaurantId, "valet:updated", { booking_id, state, detail: data });
 		res.json(data);
 		return;
 	} catch (error) {
@@ -1509,7 +1547,14 @@ async function bootstrap(): Promise<void> {
 		console.error("Failed to ensure CSR Organics seed", error);
 	}
 
-	app.listen(port, () => {
+	const httpServer = createServer(app);
+	try {
+		await initRealtime(httpServer);
+	} catch (err) {
+		console.warn("initRealtime failed", err);
+	}
+
+	httpServer.listen(port, () => {
 		console.log(`Server listening at http://localhost:${port}`);
 	});
 }
