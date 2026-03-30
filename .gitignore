@@ -6,6 +6,8 @@ node_modules/
 **/*.db
 package-lock.json
 
+build/
+
 # Python-generated files
 __pycache__/
 *.py[oc]
