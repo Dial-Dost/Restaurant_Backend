@@ -4,6 +4,7 @@ node_modules/
 .env.local
 .env*
 **/*.db
+package-lock.json
 
 # Python-generated files
 __pycache__/

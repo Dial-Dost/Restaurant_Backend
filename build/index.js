@@ -2,6 +2,8 @@ import 'dotenv/config';
 import express from "express";
 import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, } from "./database.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
+import { initRealtime, emitRestaurant } from "./realtime.js";
+import { createServer } from "http";
 const app = express();
 const port = 3000;
 function log(req, res, next) {
@@ -114,13 +116,11 @@ function extractEmployeeId(req) {
 async function resolveRoleForRequest(req, restaurantId) {
     const employeeId = extractEmployeeId(req);
     if (!employeeId) {
+        console.debug("resolveRoleForRequest: missing employeeId", { restaurantId });
         return null;
     }
     const roleFromRestaurant = await GetRestaurantUserRole(restaurantId, employeeId);
-    if (roleFromRestaurant) {
-        return roleFromRestaurant;
-    }
-    return null;
+    return roleFromRestaurant ?? null;
 }
 async function enforceRoles(req, res, allowedRoles) {
     const restaurantId = extractRestaurantId(req);
@@ -343,6 +343,12 @@ app.post("/add-table", validate, async (req, res) => {
         res.status(400).json({ error: "Table exists" });
         return;
     }
+    try {
+        emitRestaurant(restaurantId, "table:added", { table_name, capacity: table.capacity });
+    }
+    catch (err) {
+        console.warn("emit table:added failed", err);
+    }
     res.send(table_name);
 });
 app.delete("/table/:name", validate, async (req, res) => {
@@ -361,6 +367,12 @@ app.delete("/table/:name", validate, async (req, res) => {
     if (!deleted) {
         res.status(404).json({ error: "Table not found" });
         return;
+    }
+    try {
+        emitRestaurant(restaurantId, "table:deleted", { table_name: tableName });
+    }
+    catch (err) {
+        console.warn("emit table:deleted failed", err);
     }
     res.status(204).send();
 });
@@ -454,6 +466,12 @@ app.post("/add-booking", validate, async (req, res) => {
         : typeof booking._id.toHexString === "function"
             ? booking._id.toHexString()
             : booking._id.toString();
+    try {
+        emitRestaurant(restaurantId, "booking:created", { booking_id, table_name: tableName });
+    }
+    catch (err) {
+        console.warn("emit booking:created failed", err);
+    }
     res.json({ booking_id, table_name: tableName });
 });
 function FoldedTables(table) {
@@ -590,23 +608,80 @@ app.get("/valet-info", validate, async (req, res) => {
     if (!auth) {
         return;
     }
-    const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
-    const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
-    const now = new Date();
+    // Proxy to Python valet service to fetch valet_state records for this restaurant
     try {
-        const [tables, bookings] = await Promise.all([
-            GetTables(auth.restaurantId, requestedTime),
-            GetBookingsAfterTime(auth.restaurantId, requestedTime),
-        ]);
-        const safeBookings = bookings ?? [];
+        const response = await fetch("http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(auth.restaurantId));
+        const records = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(records);
+            return;
+        }
+        // records are expected to be an array of valet_state documents
+        const now = new Date();
+        const bookings = (Array.isArray(records) ? records : []).map((r) => {
+            const stateNum = typeof r.state === "number" ? r.state : Number(r.state);
+            // Map numeric state to frontend stage strings
+            const stateMap = {
+                1: "Vehicle added",
+                2: "Parked",
+                3: "Request to bring car (from customer)",
+                4: "Request accepted (from valet)",
+                5: "Car arrived at entrance",
+                6: "Customer took car",
+            };
+            const status = stateMap[stateNum] ?? "Vehicle added";
+            return {
+                booking_id: r._id ? String(r._id) : r.booking_id ?? undefined,
+                customer_name: r.customer_name ?? undefined,
+                bay_id: r.bay_id ?? undefined,
+                booking_date_time: r.entry_time ?? r.booking_date_time ?? undefined,
+                exit_date_time: r.exit_time ?? r.exit_date_time ?? undefined,
+                status,
+                active: stateNum !== 6,
+                number_plate: r.number_plate ?? undefined,
+                notes: r.notes ?? (r.number_plate ? `Vehicle Plate: ${r.number_plate}` : undefined),
+            };
+        });
+        // Fetch canonical Bays from Python service and compute capacities
+        let bays = [];
+        try {
+            const baysResp = await fetch("http://127.0.0.1:8000/get_bays/" + encodeURIComponent(auth.restaurantId));
+            const baysData = await baysResp.json();
+            if (baysResp.ok && Array.isArray(baysData)) {
+                bays = baysData.map((b) => ({
+                    Bay_id: b.Bay_id ?? b.Bay_id,
+                    Bay_name: b.Bay_name ?? b.Bay_name,
+                    current_capacity: 0,
+                    total_capacity: b.total_capacity ?? null,
+                }));
+            }
+        }
+        catch (err) {
+            // ignore and fallback to deriving from records
+            bays = [];
+        }
+        if (bays.length === 0) {
+            // Fallback: derive bay list from bookings' bay_id values
+            const bayIds = Array.from(new Set(bookings.map((b) => b.bay_id).filter(Boolean)));
+            bays = bayIds.map((id, idx) => ({
+                Bay_id: id,
+                Bay_name: id,
+                current_capacity: bookings.filter((b) => b.bay_id === id && b.active).length,
+                total_capacity: null,
+            }));
+        }
+        else {
+            // compute current_capacity based on bookings
+            bays = bays.map((bay) => ({
+                ...bay,
+                current_capacity: bookings.filter((b) => b.bay_id === bay.Bay_id && b.active).length,
+            }));
+        }
         res.json({
             role: auth.role,
             generated_at: new Date().toISOString(),
-            tables,
-            bookings: safeBookings.map((booking) => ({
-                ...booking,
-                active: IsActiveBooking(booking, now),
-            })),
+            bays,
+            bookings,
         });
     }
     catch (error) {
@@ -614,6 +689,7 @@ app.get("/valet-info", validate, async (req, res) => {
         res.status(500).json({ error: "Unable to fetch valet info" });
     }
 });
+// (debug endpoint removed)
 app.patch("/booking/:id/status", validate, async (req, res) => {
     const auth = await enforceRoles(req, res, ["admin", "valet"]);
     if (!auth) {
@@ -630,6 +706,12 @@ app.patch("/booking/:id/status", validate, async (req, res) => {
     if (!updated) {
         res.status(404).json({ error: "Booking not found" });
         return;
+    }
+    try {
+        emitRestaurant(auth.restaurantId, "booking:status_updated", { booking_id: bookingId, status });
+    }
+    catch (err) {
+        console.warn("emit booking:status_updated failed", err);
     }
     res.json({ success: true });
 });
@@ -677,6 +759,12 @@ app.delete("/booking/:id", validate, async (req, res) => {
     if (!deleted) {
         res.status(404).json({ error: "Booking not found" });
         return;
+    }
+    try {
+        emitRestaurant(restaurantId, "booking:deleted", { booking_id: bookingId });
+    }
+    catch (err) {
+        console.warn("emit booking:deleted failed", err);
     }
     res.status(204).send();
 });
@@ -785,20 +873,13 @@ app.post("/audit-logs", validate, async (req, res) => {
     }
 });
 // Rtamanyu's integration
-app.post("/get_valet_state", validate, async (req, res) => {
-    const restaurantId = extractRestaurantId(req);
-    if (!restaurantId) {
-        res.status(400).json({ error: "Missing restaurantId" });
-        return;
-    }
-    const body = req.body;
-    const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
-    if (!number_plate) {
-        res.status(400).json({ error: "Missing number plate" });
+app.get("/valet-bays", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
         return;
     }
     try {
-        const response = await fetch("http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate));
+        const response = await fetch("http://127.0.0.1:8000/get_bays/" + encodeURIComponent(auth.restaurantId));
         const data = await response.json();
         if (!response.ok) {
             res.status(response.status).json(data);
@@ -808,26 +889,326 @@ app.post("/get_valet_state", validate, async (req, res) => {
         return;
     }
     catch (error) {
-        console.error("fetch_valet_state_failed", error);
-        res.status(500).json({ error: "Unable to fetch valet state" });
+        console.error("fetch_valet_bays_failed", error);
+        res.status(500).json({ error: "Unable to fetch valet bays" });
         return;
     }
 });
-app.post("/update_valet_state", validate, async (req, res) => {
-    const restaurantId = extractRestaurantId(req);
-    if (!restaurantId) {
-        res.status(400).json({ error: "Missing restaurantId" });
+app.post("/add-valet-bay", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
+    const body = req.body;
+    const bayName = typeof body?.Bay_name === 'string' ? body.Bay_name.trim() : undefined;
+    const totalCapacity = body?.total_capacity === null || body?.total_capacity === undefined ? undefined : Number(body.total_capacity);
+    if (!bayName) {
+        res.status(400).json({ error: "Missing Bay_name" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/add_bay/" + encodeURIComponent(auth.restaurantId), {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ Bay_name: bayName, total_capacity: Number.isFinite(totalCapacity) ? totalCapacity : 0 }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("add_valet_bay_failed", error);
+        res.status(500).json({ error: "Unable to add valet bay" });
+        return;
+    }
+});
+app.post("/delete-valet-bay", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
+    const body = req.body;
+    const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
+    const bayName = typeof body?.Bay_name === 'string' ? body.Bay_name.trim() : undefined;
+    if (!bayId && !bayName) {
+        res.status(400).json({ error: "Missing Bay_id or Bay_name" });
+        return;
+    }
+    try {
+        const payload = {};
+        if (bayId)
+            payload.Bay_id = bayId;
+        if (bayName)
+            payload.Bay_name = bayName;
+        const response = await fetch("http://127.0.0.1:8000/delete_bay/" + encodeURIComponent(auth.restaurantId), {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("delete_valet_bay_failed", error);
+        res.status(500).json({ error: "Unable to delete valet bay" });
+        return;
+    }
+});
+app.post("/update-valet-bay", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth)
+        return;
+    const body = req.body;
+    const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
+    const bayName = typeof body?.Bay_name === 'string' ? body.Bay_name.trim() : undefined;
+    const totalCapacity = body?.total_capacity === null || body?.total_capacity === undefined ? undefined : Number(body.total_capacity);
+    if (!bayName) {
+        res.status(400).json({ error: "Missing Bay_name" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/update_bay/" + encodeURIComponent(auth.restaurantId), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ Bay_id: bayId, Bay_name: bayName, total_capacity: Number.isFinite(totalCapacity) ? totalCapacity : 0 }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (err) {
+        console.error("update_valet_bay_failed", err);
+        res.status(500).json({ error: "Unable to update valet bay" });
+    }
+});
+app.post("/set-valet-bay-current", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth)
+        return;
+    const body = req.body;
+    const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
+    const current = body?.current_capacity === null || body?.current_capacity === undefined ? undefined : Number(body.current_capacity);
+    if (!bayId || current === undefined || Number.isNaN(current)) {
+        res.status(400).json({ error: "Missing Bay_id or current_capacity" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/set_bay_current/" + encodeURIComponent(auth.restaurantId), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ Bay_id: bayId, current_capacity: Number(current) }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (err) {
+        console.error("set_valet_bay_current_failed", err);
+        res.status(500).json({ error: "Unable to set bay current capacity" });
+        return;
+    }
+});
+// 	try {
+// 		const response = await fetch(
+// 			"http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate),
+// 		);
+// 		const data = await response.json();
+// 		if (!response.ok) {
+// 			res.status(response.status).json(data);
+// 			return;
+// 		}
+// 		res.json(data);
+// 		return;
+// 	} catch (error) {
+// 		console.error("fetch_valet_state_failed", error);
+// 		res.status(500).json({ error: "Unable to fetch valet state" });
+// 		return;
+// 	}
+// });
+// app.post("/update_valet_state", validate, async (req: Request, res: Response) => {
+// 	const restaurantId = extractRestaurantId(req);
+// 	if (!restaurantId) {
+// 		res.status(400).json({ error: "Missing restaurantId" });
+// 		return;
+// 	}
+// 	const body = req.body as Record<string, unknown> | undefined;
+// 	const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
+// 	const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
+// 	if (!number_plate || !state) {
+// 		res.status(400).json({ error: "Missing number plate or state" });
+// 		return;
+// 	}
+// 	try {
+// 		const response = await fetch(
+// 			"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(state),
+// 			{
+// 				method: "POST",
+// 				headers: {
+// 					"Content-Type": "application/json",
+// 				},
+// 			},
+// 		);
+// 		const data = await response.json();
+// 		if (!response.ok) {
+// 			res.status(response.status).json(data);
+// 			return;
+// 		}
+// 		res.json(data);
+// 		return;
+// 	} catch (error) {
+// 		console.error("update_valet_state_failed", error);
+// 		res.status(500).json({ error: "Unable to update valet state" });
+// 		return;
+// 	}
+// });
+app.post("/create_valet_record", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
         return;
     }
     const body = req.body;
     const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
-    const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
-    if (!number_plate || !state) {
-        res.status(400).json({ error: "Missing number plate or state" });
+    if (!number_plate) {
+        res.status(400).json({ error: "Missing number plate" });
         return;
     }
     try {
-        const response = await fetch("http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(state), {
+        const response = await fetch("http://127.0.0.1:8000/create_valet_record/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(auth.restaurantId), {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        // Broadcast created valet record to connected frontends
+        emitRestaurant(auth.restaurantId, "valet:created", data);
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("create_valet_record_failed", error);
+        res.status(500).json({ error: "Unable to create valet record" });
+        return;
+    }
+});
+app.post("/get_valet_info", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
+    const body = req.body;
+    const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
+    if (!booking_id) {
+        res.status(400).json({ error: "Missing booking ID" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/get_valet_info/" + encodeURIComponent(booking_id));
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("fetch_valet_info_failed", error);
+        res.status(500).json({ error: "Unable to fetch valet info" });
+        return;
+    }
+});
+async function updateValetStateAndPublish(restaurantId, bookingId, state) {
+    const response = await fetch("http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(bookingId) + "/" + encodeURIComponent(state), {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+    });
+    const payload = (await response.json().catch(() => ({})));
+    if (!response.ok) {
+        const err = Object.assign(new Error("Unable to update valet state"), {
+            status: response.status,
+            payload,
+        });
+        throw err;
+    }
+    // Centralized publisher path for valet state updates.
+    emitRestaurant(restaurantId, "valet:updated", { booking_id: bookingId, state, detail: payload });
+    return payload;
+}
+app.post("/update_valet_state", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
+    const body = req.body;
+    const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
+    const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
+    if (!booking_id || !state) {
+        res.status(400).json({ error: "Missing booking ID or state" });
+        return;
+    }
+    try {
+        const data = await updateValetStateAndPublish(auth.restaurantId, booking_id, state);
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("update_valet_state_failed", error);
+        const status = typeof error?.status === "number"
+            ? (error.status)
+            : 500;
+        const payload = error?.payload;
+        if (status !== 500 && payload && typeof payload === "object") {
+            res.status(status).json(payload);
+            return;
+        }
+        res.status(500).json({ error: "Unable to update valet state" });
+        return;
+    }
+});
+app.post("/update_valet_bay", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth) {
+        return;
+    }
+    const body = req.body;
+    const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
+    // Accept bay_id in body; fall back to bay_name for backward compatibility
+    const bay_id_raw = body?.bay_id ?? body?.bay_name;
+    const bay_id = bay_id_raw === null || bay_id_raw === undefined ? undefined : String(bay_id_raw).trim();
+    if (!booking_id || !bay_id) {
+        res.status(400).json({ error: "Missing booking ID or bay id" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/update_valet_bay/" + encodeURIComponent(booking_id) + "/" + encodeURIComponent(bay_id), {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -842,8 +1223,37 @@ app.post("/update_valet_state", validate, async (req, res) => {
         return;
     }
     catch (error) {
-        console.error("update_valet_state_failed", error);
-        res.status(500).json({ error: "Unable to update valet state" });
+        console.error("update_valet_bay_failed", error);
+        res.status(500).json({ error: "Unable to update valet bay" });
+        return;
+    }
+});
+app.post("/unassign-valet-bay", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "valet"]);
+    if (!auth)
+        return;
+    const body = req.body;
+    const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
+    if (!booking_id) {
+        res.status(400).json({ error: "Missing booking ID" });
+        return;
+    }
+    try {
+        const response = await fetch("http://127.0.0.1:8000/unassign_valet_bay/" + encodeURIComponent(booking_id), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            res.status(response.status).json(data);
+            return;
+        }
+        res.json(data);
+        return;
+    }
+    catch (error) {
+        console.error("unassign_valet_bay_failed", error);
+        res.status(500).json({ error: "Unable to unassign valet bay" });
         return;
     }
 });
@@ -857,6 +1267,10 @@ app.post("/get_main_feedback_question", validate, async (req, res) => {
     const category = typeof body?.category === 'number' ? body.category : undefined;
     if (!category) {
         res.status(400).json({ error: "Missing category" });
+        return;
+    }
+    if (category < 1 || category > 7) {
+        res.status(400).json({ error: "Invalid category" });
         return;
     }
     try {
@@ -886,6 +1300,14 @@ app.post("/get_follow_up_question", validate, async (req, res) => {
     const rate = body?.rate === null || body?.rate === undefined ? undefined : Number(body.rate);
     if (!category || !rate) {
         res.status(400).json({ error: "Missing category or rate" });
+        return;
+    }
+    if (category < 1 || category > 7) {
+        res.status(400).json({ error: "Invalid category" });
+        return;
+    }
+    if (rate < 1 || rate > 5) {
+        res.status(400).json({ error: "Invalid rate" });
         return;
     }
     try {
@@ -951,7 +1373,7 @@ app.post("/feedback/dynamic-follow-up", validate, async (req, res) => {
         res.status(500).json({ error: "Unable to generate dynamic follow-up" });
     }
 });
-app.post("/feedback/submit", validate, async (req, res) => {
+app.post("/feedback/valet-checkin", validate, async (req, res) => {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
         res.status(400).json({ error: "Missing restaurantId" });
@@ -963,6 +1385,80 @@ app.post("/feedback/submit", validate, async (req, res) => {
         res.status(400).json({ error: "number_plate is required" });
         return;
     }
+    const normalizedPlate = numberPlate.replace(/\s+/g, "").toUpperCase();
+    try {
+        const recordsResponse = await fetch("http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(restaurantId));
+        const recordsPayload = (await recordsResponse.json().catch(() => null));
+        if (!recordsResponse.ok) {
+            res.status(502).json({
+                error: "Unable to verify valet record",
+                details: recordsPayload ?? {},
+            });
+            return;
+        }
+        const records = Array.isArray(recordsPayload)
+            ? recordsPayload
+            : Array.isArray(recordsPayload?.records)
+                ? recordsPayload.records
+                : [];
+        const matching = records.filter((record) => {
+            const plate = typeof record.number_plate === "string" ? record.number_plate : "";
+            return plate.replace(/\s+/g, "").toUpperCase() === normalizedPlate;
+        });
+        if (matching.length === 0) {
+            res.status(404).json({ error: "No valet record found for this vehicle number" });
+            return;
+        }
+        const recordWithState2 = matching.find((record) => Number(record.state) === 2);
+        const candidate = recordWithState2 ?? matching[0];
+        if (!candidate) {
+            res.status(404).json({ error: "No valet record found for this vehicle number" });
+            return;
+        }
+        const currentState = Number(candidate.state);
+        if (Number.isFinite(currentState) && currentState > 3) {
+            res.json({ success: true, action: "ignored", current_state: currentState });
+            return;
+        }
+        if (currentState === 2) {
+            const bookingIdRaw = typeof candidate.booking_id === "string"
+                ? candidate.booking_id
+                : typeof candidate.bookingId === "string"
+                    ? candidate.bookingId
+                    : "";
+            const bookingId = bookingIdRaw.trim();
+            if (!bookingId) {
+                res.status(500).json({ error: "Unable to update valet stage: missing booking id" });
+                return;
+            }
+            try {
+                await updateValetStateAndPublish(restaurantId, bookingId, "3");
+            }
+            catch (error) {
+                const payload = error?.payload;
+                res.status(502).json({
+                    error: "Unable to update valet stage to 3 for this vehicle number",
+                    details: payload && typeof payload === "object" ? payload : {},
+                });
+                return;
+            }
+            res.json({ success: true, action: "updated_to_3", current_state: 3 });
+            return;
+        }
+        res.json({ success: true, action: "ignored", current_state: Number.isFinite(currentState) ? currentState : null });
+    }
+    catch (error) {
+        console.error("feedback_valet_checkin_failed", error);
+        res.status(500).json({ error: "Unable to verify valet vehicle number" });
+    }
+});
+app.post("/feedback/submit", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
     const categoryRatingsRaw = body?.category_ratings;
     if (!Array.isArray(categoryRatingsRaw) || categoryRatingsRaw.length === 0) {
         res.status(400).json({ error: "category_ratings must be a non-empty array" });
@@ -992,22 +1488,6 @@ app.post("/feedback/submit", validate, async (req, res) => {
         const visitDate = typeof visitDateRaw === "string" && visitDateRaw.trim().length > 0
             ? new Date(visitDateRaw)
             : null;
-        const valetResponse = await fetch("http://127.0.0.1:8000/update_valet_state/"
-            + encodeURIComponent(numberPlate)
-            + "/2", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-        });
-        if (!valetResponse.ok) {
-            const valetErrorPayload = (await valetResponse.json().catch(() => ({})));
-            res.status(502).json({
-                error: "Unable to update valet stage to 2 for this number plate",
-                details: valetErrorPayload,
-            });
-            return;
-        }
         const saved = await AddFeedbackEntry(restaurantId, {
             customer_name: typeof body?.customer_name === "string" ? body.customer_name : null,
             visit_date: visitDate && !Number.isNaN(visitDate.getTime()) ? visitDate : null,
@@ -1097,7 +1577,14 @@ async function bootstrap() {
     catch (error) {
         console.error("Failed to ensure CSR Organics seed", error);
     }
-    app.listen(port, () => {
+    const httpServer = createServer(app);
+    try {
+        await initRealtime(httpServer);
+    }
+    catch (err) {
+        console.warn("initRealtime failed", err);
+    }
+    httpServer.listen(port, () => {
         console.log(`Server listening at http://localhost:${port}`);
     });
 }

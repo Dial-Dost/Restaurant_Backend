@@ -1344,6 +1344,35 @@ app.post("/get_valet_info", validate, async (req: Request, res: Response) => {
 	}
 });
 
+async function updateValetStateAndPublish(
+	restaurantId: string,
+	bookingId: string,
+	state: string,
+): Promise<Record<string, unknown>> {
+	const response = await fetch(
+		"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(bookingId) + "/" + encodeURIComponent(state),
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
+		},
+	);
+
+	const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+	if (!response.ok) {
+		const err = Object.assign(new Error("Unable to update valet state"), {
+			status: response.status,
+			payload,
+		});
+		throw err;
+	}
+
+	// Centralized publisher path for valet state updates.
+	emitRestaurant(restaurantId, "valet:updated", { booking_id: bookingId, state, detail: payload });
+	return payload;
+}
+
 
 app.post("/update_valet_state", validate, async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
@@ -1360,27 +1389,19 @@ app.post("/update_valet_state", validate, async (req: Request, res: Response) =>
 	}
 
 	try {
-		const response = await fetch(
-			"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(booking_id) + "/" + encodeURIComponent(state),
-			{
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-				},
-			},
-		);
-		const data = await response.json();
-		if (!response.ok) {
-			res.status(response.status).json(data);
-			return;
-		}
-
-		// Broadcast updated valet state
-		emitRestaurant(auth.restaurantId, "valet:updated", { booking_id, state, detail: data });
+		const data = await updateValetStateAndPublish(auth.restaurantId, booking_id, state);
 		res.json(data);
 		return;
 	} catch (error) {
 		console.error("update_valet_state_failed", error);
+		const status = typeof (error as { status?: unknown })?.status === "number"
+			? ((error as { status: number }).status)
+			: 500;
+		const payload = (error as { payload?: unknown })?.payload;
+		if (status !== 500 && payload && typeof payload === "object") {
+			res.status(status).json(payload as Record<string, unknown>);
+			return;
+		}
 		res.status(500).json({ error: "Unable to update valet state" });
 		return;
 	}
@@ -1592,7 +1613,7 @@ app.post("/feedback/dynamic-follow-up", validate, async (req: Request, res: Resp
 	}
 });
 
-app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
+app.post("/feedback/valet-checkin", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1605,6 +1626,99 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 		res.status(400).json({ error: "number_plate is required" });
 		return;
 	}
+
+	const normalizedPlate = numberPlate.replace(/\s+/g, "").toUpperCase();
+
+	try {
+		const recordsResponse = await fetch(
+			"http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(restaurantId),
+		);
+
+		const recordsPayload = (await recordsResponse.json().catch(() => null)) as
+			| Record<string, unknown>
+			| Array<Record<string, unknown>>
+			| null;
+
+		if (!recordsResponse.ok) {
+			res.status(502).json({
+				error: "Unable to verify valet record",
+				details: recordsPayload ?? {},
+			});
+			return;
+		}
+
+		const records = Array.isArray(recordsPayload)
+			? recordsPayload
+			: Array.isArray((recordsPayload as Record<string, unknown> | null)?.records)
+				? (((recordsPayload as Record<string, unknown>).records as unknown[]) as Array<Record<string, unknown>>)
+				: [];
+
+		const matching = records.filter((record) => {
+			const plate = typeof record.number_plate === "string" ? record.number_plate : "";
+			return plate.replace(/\s+/g, "").toUpperCase() === normalizedPlate;
+		});
+
+		if (matching.length === 0) {
+			res.status(404).json({ error: "No valet record found for this vehicle number" });
+			return;
+		}
+
+		const recordWithState2 = matching.find((record) => Number(record.state) === 2);
+		const candidate = recordWithState2 ?? matching[0];
+		if (!candidate) {
+			res.status(404).json({ error: "No valet record found for this vehicle number" });
+			return;
+		}
+		const currentState = Number(candidate.state);
+
+		if (Number.isFinite(currentState) && currentState > 3) {
+			res.json({ success: true, action: "ignored", current_state: currentState });
+			return;
+		}
+
+		if (currentState === 2) {
+			const bookingIdRaw =
+				typeof candidate.booking_id === "string"
+					? candidate.booking_id
+					: typeof candidate.bookingId === "string"
+						? candidate.bookingId
+						: "";
+			const bookingId = bookingIdRaw.trim();
+			if (!bookingId) {
+				res.status(500).json({ error: "Unable to update valet stage: missing booking id" });
+				return;
+			}
+
+			try {
+				await updateValetStateAndPublish(restaurantId, bookingId, "3");
+			} catch (error) {
+				const payload = (error as { payload?: unknown })?.payload;
+				res.status(502).json({
+					error: "Unable to update valet stage to 3 for this vehicle number",
+					details: payload && typeof payload === "object" ? payload : {},
+				});
+				return;
+			}
+
+			res.json({ success: true, action: "updated_to_3", current_state: 3 });
+			return;
+		}
+
+		res.json({ success: true, action: "ignored", current_state: Number.isFinite(currentState) ? currentState : null });
+	} catch (error) {
+		console.error("feedback_valet_checkin_failed", error);
+		res.status(500).json({ error: "Unable to verify valet vehicle number" });
+	}
+});
+
+app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
 
 	const categoryRatingsRaw = body?.category_ratings;
 	if (!Array.isArray(categoryRatingsRaw) || categoryRatingsRaw.length === 0) {
@@ -1641,27 +1755,6 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 			typeof visitDateRaw === "string" && visitDateRaw.trim().length > 0
 				? new Date(visitDateRaw)
 				: null;
-
-		const valetResponse = await fetch(
-			"http://127.0.0.1:8000/update_valet_state/"
-				+ encodeURIComponent(numberPlate)
-				+ "/2",
-			{
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-				},
-			},
-		);
-
-		if (!valetResponse.ok) {
-			const valetErrorPayload = (await valetResponse.json().catch(() => ({}))) as Record<string, unknown>;
-			res.status(502).json({
-				error: "Unable to update valet stage to 2 for this number plate",
-				details: valetErrorPayload,
-			});
-			return;
-		}
 
 		const saved = await AddFeedbackEntry(restaurantId, {
 			customer_name:
