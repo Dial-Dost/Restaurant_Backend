@@ -1062,6 +1062,8 @@ app.post("/audit-logs", validate, async (req: Request, res: Response) => {
 	}
 });
 
+
+
 // Rtamanyu's integration
 app.get("/valet-bays", validate, async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
@@ -1245,63 +1247,6 @@ app.post("/set-valet-bay-current", validate, async (req: Request, res: Response)
 		return;
 	}
 });
-// 	try {
-// 		const response = await fetch(
-// 			"http://127.0.0.1:8000/get_valet_state/" + encodeURIComponent(number_plate),
-// 		);
-// 		const data = await response.json();
-// 		if (!response.ok) {
-// 			res.status(response.status).json(data);
-// 			return;
-// 		}
-// 		res.json(data);
-// 		return;
-// 	} catch (error) {
-// 		console.error("fetch_valet_state_failed", error);
-// 		res.status(500).json({ error: "Unable to fetch valet state" });
-// 		return;
-// 	}
-// });
-
-
-// app.post("/update_valet_state", validate, async (req: Request, res: Response) => {
-// 	const restaurantId = extractRestaurantId(req);
-// 	if (!restaurantId) {
-// 		res.status(400).json({ error: "Missing restaurantId" });
-// 		return;
-// 	}
-
-// 	const body = req.body as Record<string, unknown> | undefined;
-// 	const number_plate = typeof body?.number_plate === 'string' ? body.number_plate.trim() : undefined;
-// 	const state = body?.state === null || body?.state === undefined ? undefined : String(body.state).trim();
-// 	if (!number_plate || !state) {
-// 		res.status(400).json({ error: "Missing number plate or state" });
-// 		return;
-// 	}
-
-// 	try {
-// 		const response = await fetch(
-// 			"http://127.0.0.1:8000/update_valet_state/" + encodeURIComponent(number_plate) + "/" + encodeURIComponent(state),
-// 			{
-// 				method: "POST",
-// 				headers: {
-// 					"Content-Type": "application/json",
-// 				},
-// 			},
-// 		);
-// 		const data = await response.json();
-// 		if (!response.ok) {
-// 			res.status(response.status).json(data);
-// 			return;
-// 		}
-// 		res.json(data);
-// 		return;
-// 	} catch (error) {
-// 		console.error("update_valet_state_failed", error);
-// 		res.status(500).json({ error: "Unable to update valet state" });
-// 		return;
-// 	}
-// });
 
 app.post("/create_valet_record", validate, async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
