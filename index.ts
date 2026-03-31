@@ -24,6 +24,7 @@ import {
 	AddFeedbackEntry,
 	GetFeedbackEntries,
 	GetFeedbackSummary,
+    GetRestaurantUsers,
 } from "./database.js";
 import {
 	OPENAI_REALTIME_MODEL,
@@ -48,7 +49,9 @@ function validate(req: Request, res: Response, next: NextFunction) {
 	// return res.status(400).json({ error: "Auth failed" });
 }
 
-type AppRole = "admin" | "employee" | "valet";
+
+
+type AppRole = "admin" | "employee" | "valet" | "waiter";
 
 function normalizeRole(rawRole: unknown): AppRole | null {
 	if (typeof rawRole !== "string") {
@@ -56,7 +59,7 @@ function normalizeRole(rawRole: unknown): AppRole | null {
 	}
 
 	const lowered = rawRole.trim().toLowerCase();
-	if (lowered === "admin" || lowered === "employee" || lowered === "valet") {
+	if (lowered === "admin" || lowered === "employee" || lowered === "valet" || lowered === "waiter") {
 		return lowered;
 	}
 
@@ -113,66 +116,6 @@ function normalizeFollowUpPromptForCategory(prompt: string, categoryLabel: strin
 	next = next.replace(/\bthe\s+this\s+question\b/gi, "this question");
 	next = next.replace(/\bthe\s+1\b/gi, "this question");
 	return next;
-}
-
-const GEMINI_FEEDBACK_MODEL = process.env.GEMINI_FEEDBACK_MODEL ?? "gemini-2.5-flash-lite";
-
-async function generateGeminiFeedbackFollowUpPrompt(input: {
-	categoryLabel: string;
-	rating: number;
-	reason: string;
-	mainQuestion: string;
-	firstFollowUpQuestion: string;
-}): Promise<string> {
-	const apiKey = process.env.GEMINI_API_KEY;
-	if (!apiKey) {
-		throw new Error("GEMINI_API_KEY is not configured on the server");
-	}
-
-	const prompt = [
-		"You generate one follow-up question for restaurant feedback.",
-		"Output plain text only.",
-		"Keep it empathetic, specific, and actionable.",
-		`Category: ${input.categoryLabel}`,
-		`Rating: ${input.rating}/5`,
-		`Customer reason: ${input.reason}`,
-		input.mainQuestion ? `Main question: ${input.mainQuestion}` : "",
-		input.firstFollowUpQuestion ? `First follow-up: ${input.firstFollowUpQuestion}` : "",
-	].filter(Boolean).join("\n");
-
-	const response = await fetch(
-		`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_FEEDBACK_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-		{
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				contents: [{ parts: [{ text: prompt }] }],
-				generationConfig: {
-					temperature: 0.4,
-					maxOutputTokens: 80,
-				},
-			}),
-		},
-	);
-
-	const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-	if (!response.ok) {
-		throw new Error(`Gemini follow-up generation failed (${response.status})`);
-	}
-
-	const candidates = Array.isArray(payload?.candidates) ? payload?.candidates : [];
-	const firstCandidate = (candidates[0] ?? null) as Record<string, unknown> | null;
-	const content = (firstCandidate?.content ?? null) as Record<string, unknown> | null;
-	const parts = Array.isArray(content?.parts) ? content?.parts : [];
-	const firstPart = (parts[0] ?? null) as Record<string, unknown> | null;
-	const text = typeof firstPart?.text === "string" ? firstPart.text.trim() : "";
-	if (!text) {
-		throw new Error("Gemini returned empty follow-up prompt");
-	}
-
-	return text;
 }
 
 function extractRestaurantId(req: Request): string | null {
@@ -1647,13 +1590,20 @@ app.post("/feedback/dynamic-follow-up", validate, async (req: Request, res: Resp
 	}
 
 	try {
-		const aiPrompt = await generateGeminiFeedbackFollowUpPrompt({
-			categoryLabel,
-			rating,
-			reason,
-			mainQuestion,
-			firstFollowUpQuestion,
-		});
+		const proxyResponse = await fetch(
+			"http://127.0.0.1:8000/get_follow_up_question/"
+			+ encodeURIComponent(categoryLabel)
+			+ "/"
+			+ encodeURIComponent(rating),
+		);
+
+		const proxyData = (await proxyResponse. json()) as Record<string, unknown>;
+		if (!proxyResponse.ok) {
+			res.status(proxyResponse.status).json(proxyData);
+			return;
+		}
+
+		const aiPrompt = typeof proxyData.feedback === "string" ? proxyData. feedback. trim() : "";		
 		const normalizedAiPrompt = normalizeFollowUpPromptForCategory(aiPrompt, categoryLabel.toLowerCase(), rating);
 		const contextualFallback =
 			mainQuestion && firstFollowUpQuestion
@@ -1767,10 +1717,40 @@ app.post("/feedback/valet-checkin", validate, async (req: Request, res: Response
 
 app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
+	const employeeId = extractEmployeeId(req);
+
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
 		return;
 	}
+	if (!employeeId) {
+		res.status(400).json({ error: "Missing employeeId" });
+		return;
+	}
+
+	// Validate restaurant exists and the submitting employee is part of it
+	try {
+		const users = await GetRestaurantUsers(restaurantId);
+		if (!users || users.length === 0) {
+			res.status(400).json({ error: "Unknown restaurant" });
+			return;
+		}
+		const matched = users.find((u) => String(u.employeeId) === String(employeeId));
+		if (!matched) {
+			res.status(403).json({ error: "Employee not found in restaurant" });
+			return;
+		}
+		const role = (matched.role ?? "").toString().trim().toLowerCase();
+		if (role !== "waiter") {
+			res.status(403).json({ error: "Employee role not allowed", requiredRole: "waiter", actualRole: matched.role ?? null });
+			return;
+		}
+	} catch (err) {
+		console.error('validate_employee_failed', err);
+		res.status(500).json({ error: 'Unable to validate employee' });
+		return;
+	}
+
 
 	const body = req.body as Record<string, unknown> | undefined;
 
@@ -1810,7 +1790,7 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 				? new Date(visitDateRaw)
 				: null;
 
-		const saved = await AddFeedbackEntry(restaurantId, {
+		const saved = await AddFeedbackEntry(restaurantId, employeeId,{
 			customer_name:
 				typeof body?.customer_name === "string" ? body.customer_name : null,
 			visit_date: visitDate && !Number.isNaN(visitDate.getTime()) ? visitDate : null,
@@ -1839,6 +1819,19 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 	} catch (error) {
 		console.error("submit_feedback_failed", error);
 		res.status(500).json({ error: "Unable to submit feedback" });
+	}
+});
+
+app.get("/restaurant/users", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "employee"]);
+	if (!auth) return;
+
+	try {
+		const users = await GetRestaurantUsers(auth.restaurantId);
+		res.json({ users });
+	} catch (err) {
+		console.error('get_restaurant_users_failed', err);
+		res.status(500).json({ error: 'Unable to fetch restaurant users' });
 	}
 });
 

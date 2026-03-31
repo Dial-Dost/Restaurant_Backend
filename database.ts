@@ -183,6 +183,7 @@ export type FeedbackSubmissionInput = {
 export type FeedbackEntry = {
 	id: string;
 	restaurant_id: string;
+	employee_id: string;
 	customer_name?: string | null;
 	visit_date?: Date | null;
 	comments?: string | null;
@@ -849,6 +850,7 @@ export async function GetRestaurantUserRole(
 
 export async function AddFeedbackEntry(
 	restaurantId: string,
+	employeeId: string,
 	entry: FeedbackSubmissionInput,
 ): Promise<{ id: string; submitted_at: Date }> {
 	const feedbackEntries = await feedbackEntriesCollection();
@@ -892,6 +894,7 @@ export async function AddFeedbackEntry(
 
 	const doc: NewFeedbackEntryDoc = {
 		restaurant_id: restaurantId,
+		employee_id: employeeId,
 		customer_name:
 			typeof entry.customer_name === "string" && entry.customer_name.trim().length > 0
 				? entry.customer_name.trim()
@@ -932,6 +935,7 @@ export async function GetFeedbackEntries(
 	return docs.map((doc: FeedbackEntryDoc) => ({
 		id: doc._id.toHexString(),
 		restaurant_id: doc.restaurant_id,
+		employee_id: doc.employee_id,
 		customer_name: doc.customer_name ?? null,
 		visit_date: doc.visit_date ?? null,
 		comments: doc.comments ?? null,
@@ -1002,6 +1006,12 @@ export async function GetFeedbackSummary(
 		categoryAverages,
 		last30DaysResponses,
 	};
+}
+
+export async function GetRestaurantUsers(restaurantId: string): Promise<RestaurantUser[]> {
+	const restaurants = await restaurantsCollection();
+	const r = await restaurants.findOne({ id: restaurantId });
+	return (r && Array.isArray(r.users)) ? r.users : [];
 }
 
 type RestaurantSeedInput = {
