@@ -1741,8 +1741,9 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 			return;
 		}
 		const role = (matched.role ?? "").toString().trim().toLowerCase();
-		if (role !== "waiter") {
-			res.status(403).json({ error: "Employee role not allowed", requiredRole: "waiter", actualRole: matched.role ?? null });
+		const allowedRoles = new Set(["admin", "employee", "valet", "waiter"]);
+		if (!allowedRoles.has(role)) {
+			res.status(403).json({ error: "Employee role not allowed", actualRole: matched.role ?? null });
 			return;
 		}
 	} catch (err) {

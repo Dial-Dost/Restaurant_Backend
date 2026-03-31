@@ -470,7 +470,7 @@ export async function GetRestaurantUserRole(restaurantId, employeeId) {
     }
     return user?.role ?? null;
 }
-export async function AddFeedbackEntry(restaurantId, entry) {
+export async function AddFeedbackEntry(restaurantId, employeeId, entry) {
     const feedbackEntries = await feedbackEntriesCollection();
     const submittedAt = new Date();
     const normalizedRatings = entry.category_ratings
@@ -498,6 +498,7 @@ export async function AddFeedbackEntry(restaurantId, entry) {
         : null;
     const doc = {
         restaurant_id: restaurantId,
+        employee_id: employeeId,
         customer_name: typeof entry.customer_name === "string" && entry.customer_name.trim().length > 0
             ? entry.customer_name.trim()
             : null,
@@ -529,6 +530,7 @@ export async function GetFeedbackEntries(restaurantId, limit = 100) {
     return docs.map((doc) => ({
         id: doc._id.toHexString(),
         restaurant_id: doc.restaurant_id,
+        employee_id: doc.employee_id,
         customer_name: doc.customer_name ?? null,
         visit_date: doc.visit_date ?? null,
         comments: doc.comments ?? null,
@@ -589,6 +591,11 @@ export async function GetFeedbackSummary(restaurantId) {
         categoryAverages,
         last30DaysResponses,
     };
+}
+export async function GetRestaurantUsers(restaurantId) {
+    const restaurants = await restaurantsCollection();
+    const r = await restaurants.findOne({ id: restaurantId });
+    return (r && Array.isArray(r.users)) ? r.users : [];
 }
 export async function EnsureRestaurantSeed(seed) {
     const restaurantId = seed.id ?? normalizeRestaurantId(seed.name);
