@@ -52,5 +52,11 @@ jobs:
       - name: Threshold regression
         run: npm run test:threshold
 
+      - name: Feedback (Dashboard) API Tests
+        run: npm run test:feedback_api
+
+      - name: Valet and feedback Question API test
+        run: npm run test:valet_api
+
       - name: Jest unit tests
         run: npm run jest -- --passWithNoTests
