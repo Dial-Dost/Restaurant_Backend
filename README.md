@@ -5,7 +5,7 @@ Node/Express API that stores restaurant bookings, customer profiles, and table a
 ## Tech Stack
 
 - Node 20 + Express 5 (ESM)
-- MongoDB 6+ using the native driver
+- Supabase Postgres (direct connection)
 - Zod for payload validation and csv-parse for the knowledge snapshot
 - Jest + TSX-powered integration scripts for allocation regressions
 
@@ -13,7 +13,7 @@ Node/Express API that stores restaurant bookings, customer profiles, and table a
 
 - Node 20 (use `nvm use 20` or Volta)
 - npm 10+
-- MongoDB (local install, Docker container, or Atlas cluster)
+- Supabase project with direct Postgres URL
 - Optional: OpenAI key if you call the realtime session endpoint
 
 ## Quick Start
@@ -29,9 +29,10 @@ npm run dev
 ### Environment Variables
 
 | Name | Required | Description |
-|------|----------|-------------|
-| `MONGODB_URI` | Yes | Connection string (e.g. `mongodb://localhost:27017`). |
-| `MONGODB_DB_NAME` | No | Defaults to `reception`; pick another to isolate data per org. |
+| ---- | -------- | ----------- |
+| `SUPABASE_DIRECT_URL` | Yes | Direct Postgres URL from Supabase project settings. |
+| `DATABASE_URL` | No | Optional alias; defaults to `SUPABASE_DIRECT_URL` when unset. |
+| `DIRECT_URL` | No | Optional alias; defaults to `SUPABASE_DIRECT_URL` when unset. |
 | `ALLOWED_ORIGINS` | No | Comma separated list used by the simple CORS guard. |
 | `OPENAI_API_KEY` | No | Enables `/realtime/session` for Realtime API key vending. |
 
@@ -40,7 +41,7 @@ Place secrets in `.env` locally and in repository/environment secrets for CI/CD.
 ## NPM Scripts
 
 | Command | Purpose |
-|---------|---------|
+| ------- | ------- |
 | `npm run dev` | Watches `index.ts` with TSX; auto-restarts on change. |
 | `npm run build` | Emits JS to `build/` using `tsconfig.build.json`. |
 | `npm run start` | Runs the compiled server (`node ./build/index.js`). |
@@ -53,7 +54,7 @@ Place secrets in `.env` locally and in repository/environment secrets for CI/CD.
 
 ## API Surface
 
-- `GET /health` – Readiness probe that also pings Mongo.
+- `GET /health` – Readiness probe that also pings Supabase Postgres.
 - `GET /reception/info` – Returns the static restaurant knowledge snapshot.
 - `POST /reception/check-availability` – Pure availability calculation.
 - `POST /reception/create-reservation` – Allocates tables and persists bookings.
@@ -65,7 +66,7 @@ Every mutating route expects a `restaurantId` via header `x-restaurant-id`, quer
 
 ## Running Tests Locally
 
-1. Ensure MongoDB is reachable at `MONGODB_URI` and the seed restaurant can be written.
+1. Ensure Supabase Postgres is reachable at `SUPABASE_DIRECT_URL` and the seed restaurant can be written.
 2. Run `npm test` style commands above. For the full integration parity run: `npm run test:ci`.
 3. Use `npm run build && node ./build/index.js` to mimic production start-up before cutting a release.
 
@@ -74,8 +75,9 @@ Every mutating route expects a `restaurantId` via header `x-restaurant-id`, quer
 - Build artifacts live in `build/` and can be packaged into a Docker image or Azure Web App.
 - The server listens on port `3000`; set `PORT` in your host environment if you need to override (process managers can wrap `npm run start`).
 - Provision the following secrets for your deployment target:
-  - `MONGODB_URI`
-  - `MONGODB_DB_NAME`
+  - `SUPABASE_DIRECT_URL`
+  - `DATABASE_URL` (optional alias)
+  - `DIRECT_URL` (optional alias)
   - `OPENAI_API_KEY` (optional)
   - `ALLOWED_ORIGINS` (set to your dashboard + receptionist hostnames)
 
@@ -86,21 +88,21 @@ This repository ships with `.github/workflows/backend-ci.yml` which runs on push
 1. Checkout + install dependencies with `npm ci`.
 2. Build the TypeScript project.
 3. Start the compiled server in the background.
-4. Poll `/health` to confirm Mongo connectivity (uses `MONGODB_URI` secret).
+4. Poll `/health` to confirm Postgres connectivity (uses `SUPABASE_DIRECT_URL` secret).
 5. Run the allocation, overlap, threshold, and Jest suites.
 
 ### Required Secrets for CI
 
 | Secret | Use |
-|--------|-----|
-| `MONGODB_URI` | Connection string to a CI database (Atlas or MongoDB Atlas free tier works). |
-| `MONGODB_DB_NAME` | Optional override; defaults to `reception`. |
+| ------ | --- |
+| `SUPABASE_DIRECT_URL` | Direct Postgres connection string for CI. |
+| `DATABASE_URL` | Optional alias for tools expecting this key. |
 
-The workflow automatically waits for `/health`; ensure the Mongo user has permissions to create collections.
+The workflow automatically waits for `/health`; ensure the Postgres user has permissions to read/write required tables.
 
 ## Repository Hygiene
 
 - Run `npm run lint` (if you add ESLint) before opening PRs.
-- Keep `schema.ts` in sync with any Mongo collection changes.
+- Keep `schema.ts` in sync with any Postgres schema changes.
 - When altering restaurant seed data, update `EnsureRestaurantSeed` plus downstream fixtures.
 - Always add/refresh unit or integration scripts for new booking edge cases to keep regression coverage high.

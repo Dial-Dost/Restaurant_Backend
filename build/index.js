@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, } from "./database.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, CheckDatabaseHealth, } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant } from "./realtime.js";
 import { createServer } from "http";
@@ -166,17 +166,30 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // Lightweight health endpoint for readiness/liveness checks
-import { getDb } from "./schema.js";
 import { ca } from 'zod/v4/locales';
+app.get("/", (_req, res) => {
+    res.json({
+        service: "restaurant-backend",
+        status: "ok",
+        docs: {
+            health: "/health",
+            bookings: "/get-bookings",
+            tables: "/get-tables",
+            customers: "/get-customers",
+        },
+    });
+});
 app.get("/health", async (_req, res) => {
     const result = { status: "ok", uptime: process.uptime(), time: new Date().toISOString() };
     try {
-        const db = await getDb();
-        const ping = await db.command({ ping: 1 });
-        result.mongo = { ok: ping?.ok === 1 ? true : false };
+        const ok = await CheckDatabaseHealth();
+        result.database = { ok, provider: "supabase-postgres" };
+        if (!ok) {
+            result.status = "degraded";
+        }
     }
     catch (err) {
-        result.mongo = { ok: false, error: String(err?.message ?? err) };
+        result.database = { ok: false, error: String(err?.message ?? err), provider: "supabase-postgres" };
         result.status = "degraded";
     }
     res.json(result);
@@ -278,11 +291,7 @@ async function GetCustomerIdOrCreateCustomer(restaurantId, name, number, email) 
     if (!customerId) {
         return null;
     }
-    return typeof customerId === "string"
-        ? customerId
-        : typeof customerId.toHexString === "function"
-            ? customerId.toHexString()
-            : customerId.toString();
+    return String(customerId);
 }
 /*
     Needs request body as
@@ -461,11 +470,7 @@ app.post("/add-booking", validate, async (req, res) => {
         res.status(400).json({ error: "Oops something went wrong" });
         return;
     }
-    const booking_id = typeof booking._id === "string"
-        ? booking._id
-        : typeof booking._id.toHexString === "function"
-            ? booking._id.toHexString()
-            : booking._id.toString();
+    const booking_id = String(booking._id);
     try {
         emitRestaurant(restaurantId, "booking:created", { booking_id, table_name: tableName });
     }
