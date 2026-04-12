@@ -1,25 +1,37 @@
-from pymongo import MongoClient
-from pymongo.server_api import ServerApi
 import os
+
 from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file
-
-# Use MONGO_URI from env, or default to local Mongo instance
-mongo_uri = os.environ.get(
-    "MONGO_URI",
-    "mongodb+srv://<db_username>:<db_password>@restaurantcluster.sxtqbek.mongodb.net/?appName=restaurantcluster",
-)
-mongo_db_name = os.environ.get("MONGO_DB_NAME", "reception")
-
-# new connection setup with Server API versioning for better compatibility with MongoDB Atlas
-# Create a new client and connect to the server
-client = MongoClient(mongo_uri, server_api=ServerApi("1"))
-mongo_db = client[mongo_db_name]
-# Send a ping to confirm a successful connection
 try:
-    client.admin.command("ping")
-    print("Pinged your deployment. You successfully connected to MongoDB!")
-    print(mongo_db.list_collection_names())
-except Exception as e:
-    print(e)
+    import psycopg
+except ModuleNotFoundError as exc:
+    raise RuntimeError(
+        "psycopg is required for Supabase/Postgres tests. Install with: pip install 'psycopg[binary]'"
+    ) from exc
+
+load_dotenv()
+
+
+def _connection_string() -> str:
+    value = (
+        os.environ.get("SUPABASE_DIRECT_URL")
+        or os.environ.get("DATABASE_URL")
+        or os.environ.get("DIRECT_URL")
+    )
+    if not value:
+        raise RuntimeError(
+            "Missing SUPABASE_DIRECT_URL (or DATABASE_URL / DIRECT_URL) in environment"
+        )
+    return value
+
+
+def test_supabase_connection():
+    conn = psycopg.connect(_connection_string())
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select 1 as ok")
+            row = cur.fetchone()
+            assert row is not None
+            assert int(row[0]) == 1
+    finally:
+        conn.close()

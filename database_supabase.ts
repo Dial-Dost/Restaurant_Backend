@@ -39,6 +39,7 @@ type RestaurantUser = {
   name: string;
   password?: string | null;
   role: "admin" | "employee" | "valet" | "waiter";
+  role_all?: string[];
 };
 
 export type FeedbackCategoryRatingInput = {
@@ -116,12 +117,133 @@ type CustomerSummary = {
   booking_count: number;
 };
 
+export type ParkingBayRecord = {
+  Bay_id: string;
+  Bay_name: string;
+  current_capacity: number;
+  total_capacity: number;
+  restaurant_id: string;
+};
+
+export type ValetVehicleStateRecord = {
+  booking_id: string;
+  state: number;
+  entry_time: string | null;
+  exit_time: string | null;
+  bay_id: string | null;
+};
+
+export type ValetVehicleMetaRecord = {
+  booking_id: string;
+  number_plate: string;
+  customer_name: string | null;
+};
+
 type AuditLogEntry = {
   id: string;
   employee: string;
   action: string;
   details?: string | null;
   timestamp: Date;
+};
+
+export type InventoryItemRecord = {
+  id: string;
+  name: string;
+  category: string;
+  stock: number;
+  unit: string;
+  status: "In Stock" | "Low Stock" | "Out of Stock";
+};
+
+export type MenuItemRecord = {
+  id: string;
+  name: string;
+  price: number;
+  category: string;
+};
+
+export type OrderItemRecord = {
+  id: string;
+  name: string;
+  quantity: number;
+  price: number;
+  orderedAt: string;
+};
+
+export type OrderRecord = {
+  id: string;
+  table: string;
+  customer: string;
+  items: OrderItemRecord[];
+  subtotal: number;
+  serviceChargePercentage?: number;
+  taxes?: Array<{ id: string; name: string; percentage: number }>;
+  applyServiceCharge: boolean;
+  total: number;
+  status: "Preparing" | "Served" | "Paid";
+};
+
+export type TableAssignmentRecord = {
+  id: string;
+  table_name: string;
+  employee_id: string;
+  employee_name: string;
+  employee_role: string;
+};
+
+export type ApcZone = "red" | "yellow" | "green";
+
+export type OrderApcInsight = {
+  order_id: string;
+  table_name: string;
+  created_at: string;
+  total: number;
+  people_count: number;
+  target_total: number;
+  zone: ApcZone;
+  assigned_employee_id: string | null;
+  assigned_employee_name: string | null;
+};
+
+export type EmployeeApcIncentive = {
+  employee_id: string;
+  employee_name: string;
+  employee_role: string;
+  assigned_tables: string[];
+  orders_count: number;
+  covers_count: number;
+  mean_apc: number;
+  zone: ApcZone;
+};
+
+export type MonthlyApcInsight = {
+  month: string;
+  monthly_apc: number;
+  total_revenue: number;
+  total_covers: number;
+  yellow_band_percent: number;
+  orders: OrderApcInsight[];
+  employee_incentives: EmployeeApcIncentive[];
+};
+
+export type RestaurantProfileRecord = {
+  name: string;
+  address: string;
+  phone: string;
+  email: string;
+  hours: string;
+};
+
+export type RoleRecord = {
+  id: string;
+  role_name: string;
+  actions_performable: string[];
+};
+
+type EmployeeRolesPayload = {
+  primary: string;
+  all: string[];
 };
 
 type RestaurantSeedInput = {
@@ -160,6 +282,10 @@ function normalizePhone(number: string): string {
   return number.replace(/[^0-9]/g, "");
 }
 
+function normalizeVehiclePlate(value: string): string {
+  return value.replace(/\s+/g, "").toUpperCase();
+}
+
 function splitName(fullName: string): { first: string; last: string } {
   const trimmed = fullName.trim().replace(/\s+/g, " ");
   if (!trimmed) {
@@ -185,6 +311,10 @@ function parseNumeric(value: unknown): number {
   return 0;
 }
 
+function toNonNegativeInt(value: unknown): number {
+  return Math.max(0, Math.round(parseNumeric(value)));
+}
+
 function clampRating(value: number): number {
   if (!Number.isFinite(value)) return 1;
   if (value < 1) return 1;
@@ -198,6 +328,90 @@ function toRole(raw: unknown): RestaurantUser["role"] {
     return role;
   }
   return "employee";
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> | null {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function parseEmployeeRoles(raw: unknown): EmployeeRolesPayload {
+  const parsed = parseJsonObject(raw);
+  const primaryRaw = String(parsed?.primary ?? "employee").trim().toLowerCase() || "employee";
+  const allRaw = Array.isArray(parsed?.all)
+    ? parsed!.all.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean)
+    : [];
+
+  const all = Array.from(new Set([primaryRaw, ...allRaw]));
+  return {
+    primary: primaryRaw,
+    all: all.length > 0 ? all : ["employee"],
+  };
+}
+
+function inventoryStatusFromStock(stock: number): InventoryItemRecord["status"] {
+  if (stock <= 0) return "Out of Stock";
+  if (stock < 10) return "Low Stock";
+  return "In Stock";
+}
+
+function encodeInventoryDescription(payload: { category?: string; unit?: string }): string {
+  return JSON.stringify({
+    category: payload.category?.trim() || "General",
+    unit: payload.unit?.trim() || "pcs",
+  });
+}
+
+function parseInventoryDescription(description: string | null): { category: string; unit: string } {
+  if (!description) {
+    return { category: "General", unit: "pcs" };
+  }
+  const parsed = parseJsonObject(description);
+  if (!parsed) {
+    return { category: "General", unit: "pcs" };
+  }
+  return {
+    category: String(parsed.category ?? "General") || "General",
+    unit: String(parsed.unit ?? "pcs") || "pcs",
+  };
+}
+
+function encodeMenuDescription(payload: { price: number }): string {
+  return JSON.stringify({ price: Number.isFinite(payload.price) ? payload.price : 0 });
+}
+
+function parseMenuDescription(description: string | null): { price: number } {
+  if (!description) return { price: 0 };
+  const parsed = parseJsonObject(description);
+  if (!parsed) return { price: 0 };
+  return { price: parseNumeric(parsed.price) };
+}
+
+function toOrderStatusCode(status: string | undefined): number {
+  const lowered = String(status ?? "preparing").trim().toLowerCase();
+  if (lowered === "paid") return 3;
+  if (lowered === "served") return 2;
+  return 1;
+}
+
+function fromOrderStatusCode(status: unknown): OrderRecord["status"] {
+  const code = Math.round(parseNumeric(status));
+  if (code >= 3) return "Paid";
+  if (code === 2) return "Served";
+  return "Preparing";
 }
 
 function encodeSlot(payload: SlotPayload): string {
@@ -969,6 +1183,590 @@ export async function GetCustomerAndBookings(
   }));
 }
 
+async function resolveParkingBayId(
+  context: RestaurantContext,
+  bayIdentifier: string,
+  client?: PoolClient,
+): Promise<string | null> {
+  const trimmed = bayIdentifier.trim();
+  if (!trimmed) return null;
+
+  if (isUuid(trimmed)) {
+    const rows = await runQuery<{ id: string }>(
+      `
+        select id
+        from "Parking_Bays"
+        where res_id = $1 and outlet_id = $2 and id = $3
+        limit 1
+      `,
+      [context.res_id, context.outlet_id, trimmed],
+      client,
+    );
+    if (rows[0]?.id) return rows[0].id;
+  }
+
+  const byName = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Parking_Bays"
+      where res_id = $1 and outlet_id = $2 and lower(bay_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, trimmed],
+    client,
+  );
+
+  return byName[0]?.id ?? null;
+}
+
+async function ensureDefaultParkingBayId(
+  context: RestaurantContext,
+  client?: PoolClient,
+): Promise<string> {
+  const preferredName = "Main";
+
+  const preferred = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Parking_Bays"
+      where res_id = $1 and outlet_id = $2 and lower(bay_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, preferredName],
+    client,
+  );
+  if (preferred[0]?.id) return preferred[0].id;
+
+  const first = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Parking_Bays"
+      where res_id = $1 and outlet_id = $2
+      order by created_at asc
+      limit 1
+    `,
+    [context.res_id, context.outlet_id],
+    client,
+  );
+  if (first[0]?.id) return first[0].id;
+
+  const inserted = await runQuery<{ id: string }>(
+    `
+      insert into "Parking_Bays"
+        (id, created_at, bay_name, current_capacity, total_capacity, res_id, outlet_id)
+      values
+        ($1, now(), $2, 0, $3, $4, $5)
+      returning id
+    `,
+    [randomUUID(), preferredName, 5, context.res_id, context.outlet_id],
+    client,
+  );
+
+  return inserted[0]!.id;
+}
+
+async function ensureValetVehicleMetaTable(client?: PoolClient): Promise<void> {
+  await runQuery(
+    `
+      create table if not exists "Valet_vehicle_meta" (
+        booking_id uuid primary key,
+        res_id uuid not null,
+        outlet_id uuid not null,
+        number_plate text not null,
+        customer_name text null,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+      )
+    `,
+    [],
+    client,
+  );
+
+  await runQuery(
+    `
+      create index if not exists valet_vehicle_meta_lookup_idx
+      on "Valet_vehicle_meta" (res_id, outlet_id, booking_id)
+    `,
+    [],
+    client,
+  );
+}
+
+export async function GetParkingBays(
+  restaurantId: string,
+): Promise<ParkingBayRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    id: string;
+    bay_name: string;
+    current_capacity: unknown;
+    total_capacity: unknown;
+  }>(
+    `
+      select id, bay_name, current_capacity, total_capacity
+      from "Parking_Bays"
+      where res_id = $1 and outlet_id = $2
+      order by created_at asc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows.map((row) => ({
+    Bay_id: row.id,
+    Bay_name: row.bay_name,
+    current_capacity: toNonNegativeInt(row.current_capacity),
+    total_capacity: toNonNegativeInt(row.total_capacity),
+    restaurant_id: context.inputId,
+  }));
+}
+
+export async function AddParkingBay(
+  restaurantId: string,
+  bayName: string,
+  totalCapacity: number,
+): Promise<ParkingBayRecord> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const normalizedName = bayName.trim();
+
+    const existing = await runQuery<{
+      id: string;
+      bay_name: string;
+      current_capacity: unknown;
+      total_capacity: unknown;
+    }>(
+      `
+        select id, bay_name, current_capacity, total_capacity
+        from "Parking_Bays"
+        where res_id = $1 and outlet_id = $2 and lower(bay_name) = lower($3)
+        limit 1
+      `,
+      [context.res_id, context.outlet_id, normalizedName],
+      client,
+    );
+
+    if (existing[0]) {
+      return {
+        Bay_id: existing[0].id,
+        Bay_name: existing[0].bay_name,
+        current_capacity: toNonNegativeInt(existing[0].current_capacity),
+        total_capacity: toNonNegativeInt(existing[0].total_capacity),
+        restaurant_id: context.inputId,
+      };
+    }
+
+    const inserted = await runQuery<{
+      id: string;
+      bay_name: string;
+      current_capacity: unknown;
+      total_capacity: unknown;
+    }>(
+      `
+        insert into "Parking_Bays"
+          (id, created_at, bay_name, current_capacity, total_capacity, res_id, outlet_id)
+        values
+          ($1, now(), $2, 0, $3, $4, $5)
+        returning id, bay_name, current_capacity, total_capacity
+      `,
+      [
+        randomUUID(),
+        normalizedName,
+        toNonNegativeInt(totalCapacity),
+        context.res_id,
+        context.outlet_id,
+      ],
+      client,
+    );
+
+    const row = inserted[0]!;
+    return {
+      Bay_id: row.id,
+      Bay_name: row.bay_name,
+      current_capacity: toNonNegativeInt(row.current_capacity),
+      total_capacity: toNonNegativeInt(row.total_capacity),
+      restaurant_id: context.inputId,
+    };
+  });
+}
+
+export async function UpdateParkingBay(
+  restaurantId: string,
+  bayId: string | null,
+  bayName: string,
+  totalCapacity: number,
+): Promise<ParkingBayRecord | null> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const normalizedName = bayName.trim();
+
+    let targetId: string | null = null;
+    if (bayId?.trim()) {
+      targetId = await resolveParkingBayId(context, bayId.trim(), client);
+    }
+    if (!targetId) {
+      targetId = await resolveParkingBayId(context, normalizedName, client);
+    }
+    if (!targetId) return null;
+
+    const rows = await runQuery<{
+      id: string;
+      bay_name: string;
+      current_capacity: unknown;
+      total_capacity: unknown;
+    }>(
+      `
+        update "Parking_Bays"
+        set bay_name = $4, total_capacity = $5
+        where id = $1 and res_id = $2 and outlet_id = $3
+        returning id, bay_name, current_capacity, total_capacity
+      `,
+      [
+        targetId,
+        context.res_id,
+        context.outlet_id,
+        normalizedName,
+        toNonNegativeInt(totalCapacity),
+      ],
+      client,
+    );
+
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      Bay_id: row.id,
+      Bay_name: row.bay_name,
+      current_capacity: toNonNegativeInt(row.current_capacity),
+      total_capacity: toNonNegativeInt(row.total_capacity),
+      restaurant_id: context.inputId,
+    };
+  });
+}
+
+export async function DeleteParkingBay(
+  restaurantId: string,
+  bayId: string | null,
+  bayName: string | null,
+): Promise<{ Bay_id: string; deleted_valet_count: number } | null> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+
+    let targetId: string | null = null;
+    if (bayId?.trim()) {
+      targetId = await resolveParkingBayId(context, bayId.trim(), client);
+    }
+    if (!targetId && bayName?.trim()) {
+      targetId = await resolveParkingBayId(context, bayName.trim(), client);
+    }
+    if (!targetId) return null;
+
+    const deletedValetRows = await runQuery<{ id: string }>(
+      `
+        delete from "Valet_vehicle_state"
+        where res_id = $1 and outlet_id = $2 and bay_id = $3
+        returning id
+      `,
+      [context.res_id, context.outlet_id, targetId],
+      client,
+    );
+
+    const deletedBayRows = await runQuery<{ id: string }>(
+      `
+        delete from "Parking_Bays"
+        where id = $1 and res_id = $2 and outlet_id = $3
+        returning id
+      `,
+      [targetId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    if (!deletedBayRows[0]) return null;
+
+    return {
+      Bay_id: targetId,
+      deleted_valet_count: deletedValetRows.length,
+    };
+  });
+}
+
+export async function SetParkingBayCurrent(
+  restaurantId: string,
+  bayId: string,
+  currentCapacity: number,
+): Promise<ParkingBayRecord | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const targetId = await resolveParkingBayId(context, bayId);
+  if (!targetId) return null;
+
+  const rows = await runQuery<{
+    id: string;
+    bay_name: string;
+    current_capacity: unknown;
+    total_capacity: unknown;
+  }>(
+    `
+      update "Parking_Bays"
+      set current_capacity = $4
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id, bay_name, current_capacity, total_capacity
+    `,
+    [targetId, context.res_id, context.outlet_id, toNonNegativeInt(currentCapacity)],
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    Bay_id: row.id,
+    Bay_name: row.bay_name,
+    current_capacity: toNonNegativeInt(row.current_capacity),
+    total_capacity: toNonNegativeInt(row.total_capacity),
+    restaurant_id: context.inputId,
+  };
+}
+
+export async function GetValetVehicleStates(
+  restaurantId: string,
+): Promise<ValetVehicleStateRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    id: string;
+    entry_time: Date | string | null;
+    exit_time: Date | string | null;
+    state: unknown;
+    bay_id: string | null;
+  }>(
+    `
+      select id, entry_time, exit_time, state, bay_id
+      from "Valet_vehicle_state"
+      where res_id = $1 and outlet_id = $2
+      order by entry_time desc nulls last
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows.map((row) => ({
+    booking_id: row.id,
+    state: toNonNegativeInt(row.state),
+    entry_time: row.entry_time ? new Date(row.entry_time).toISOString() : null,
+    exit_time: row.exit_time ? new Date(row.exit_time).toISOString() : null,
+    bay_id: row.bay_id,
+  }));
+}
+
+export async function GetValetVehicleMetaByBookingIds(
+  restaurantId: string,
+  bookingIds: string[],
+): Promise<Record<string, ValetVehicleMetaRecord>> {
+  if (bookingIds.length === 0) {
+    return {};
+  }
+
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureValetVehicleMetaTable();
+
+  const rows = await runQuery<{
+    booking_id: string;
+    number_plate: string;
+    customer_name: string | null;
+  }>(
+    `
+      select booking_id, number_plate, customer_name
+      from "Valet_vehicle_meta"
+      where res_id = $1 and outlet_id = $2 and booking_id = any($3::uuid[])
+    `,
+    [context.res_id, context.outlet_id, bookingIds],
+  );
+
+  const out: Record<string, ValetVehicleMetaRecord> = {};
+  for (const row of rows) {
+    out[row.booking_id] = {
+      booking_id: row.booking_id,
+      number_plate: row.number_plate,
+      customer_name: row.customer_name,
+    };
+  }
+  return out;
+}
+
+export async function UpsertValetVehicleMeta(
+  restaurantId: string,
+  bookingId: string,
+  numberPlate: string,
+  customerName?: string | null,
+): Promise<ValetVehicleMetaRecord> {
+  const normalizedPlate = normalizeVehiclePlate(numberPlate);
+  if (!normalizedPlate) {
+    throw new Error("number_plate is required");
+  }
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    await ensureValetVehicleMetaTable(client);
+
+    const rows = await runQuery<{
+      booking_id: string;
+      number_plate: string;
+      customer_name: string | null;
+    }>(
+      `
+        insert into "Valet_vehicle_meta"
+          (booking_id, res_id, outlet_id, number_plate, customer_name, created_at, updated_at)
+        values
+          ($1, $2, $3, $4, $5, now(), now())
+        on conflict (booking_id)
+        do update set
+          number_plate = excluded.number_plate,
+          customer_name = excluded.customer_name,
+          updated_at = now()
+        returning booking_id, number_plate, customer_name
+      `,
+      [
+        bookingId,
+        context.res_id,
+        context.outlet_id,
+        normalizedPlate,
+        customerName?.trim() ? customerName.trim() : null,
+      ],
+      client,
+    );
+
+    const row = rows[0]!;
+    return {
+      booking_id: row.booking_id,
+      number_plate: row.number_plate,
+      customer_name: row.customer_name,
+    };
+  });
+}
+
+export async function CreateValetVehicleState(
+  restaurantId: string,
+  entryTime?: Date,
+  bayIdentifier?: string,
+): Promise<{ booking_id: string; entry_time: string; bay_id: string }> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    let bayId: string | null = null;
+    if (bayIdentifier?.trim()) {
+      bayId = await resolveParkingBayId(context, bayIdentifier, client);
+    }
+    if (!bayId) {
+      bayId = await ensureDefaultParkingBayId(context, client);
+    }
+    const normalizedEntryTime = entryTime && !Number.isNaN(entryTime.getTime()) ? entryTime : new Date();
+
+    const rows = await runQuery<{ id: string; entry_time: Date | string; bay_id: string }>(
+      `
+        insert into "Valet_vehicle_state"
+          (id, entry_time, res_id, outlet_id, state, exit_time, bay_id)
+        values
+          ($1, $2, $3, $4, 1, null, $5)
+        returning id, entry_time, bay_id
+      `,
+      [randomUUID(), normalizedEntryTime.toISOString(), context.res_id, context.outlet_id, bayId],
+      client,
+    );
+
+    const row = rows[0]!;
+    return {
+      booking_id: row.id,
+      entry_time: new Date(row.entry_time).toISOString(),
+      bay_id: row.bay_id,
+    };
+  });
+}
+
+export async function GetValetVehicleState(
+  restaurantId: string,
+  bookingId: string,
+): Promise<ValetVehicleStateRecord | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    id: string;
+    entry_time: Date | string | null;
+    exit_time: Date | string | null;
+    state: unknown;
+    bay_id: string | null;
+  }>(
+    `
+      select id, entry_time, exit_time, state, bay_id
+      from "Valet_vehicle_state"
+      where id = $1 and res_id = $2 and outlet_id = $3
+      limit 1
+    `,
+    [bookingId, context.res_id, context.outlet_id],
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    booking_id: row.id,
+    state: toNonNegativeInt(row.state),
+    entry_time: row.entry_time ? new Date(row.entry_time).toISOString() : null,
+    exit_time: row.exit_time ? new Date(row.exit_time).toISOString() : null,
+    bay_id: row.bay_id,
+  };
+}
+
+export async function UpdateValetVehicleState(
+  restaurantId: string,
+  bookingId: string,
+  state: number,
+): Promise<{ booking_id: string } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const normalizedState = toNonNegativeInt(state);
+
+  const rows = await runQuery<{ id: string }>(
+    `
+      update "Valet_vehicle_state"
+      set
+        state = $4::int,
+        exit_time = case when $4::int = 6 then now() else exit_time end
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id
+    `,
+    [bookingId, context.res_id, context.outlet_id, normalizedState],
+  );
+
+  if (!rows[0]) return null;
+  return { booking_id: rows[0].id };
+}
+
+export async function UpdateValetVehicleBay(
+  restaurantId: string,
+  bookingId: string,
+  bayIdentifier: string | null,
+): Promise<{ booking_id: string; bay_id: string | null } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+
+  let resolvedBayId: string | null = null;
+  if (bayIdentifier && bayIdentifier.trim()) {
+    resolvedBayId = await resolveParkingBayId(context, bayIdentifier.trim());
+    if (!resolvedBayId) {
+      throw new Error(`Unknown bay id or name: ${bayIdentifier}`);
+    }
+  } else {
+    // Some deployed schemas require bay_id to be NOT NULL, so fallback to a default bay.
+    resolvedBayId = await ensureDefaultParkingBayId(context);
+  }
+
+  const rows = await runQuery<{ id: string; bay_id: string | null }>(
+    `
+      update "Valet_vehicle_state"
+      set bay_id = $4
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id, bay_id
+    `,
+    [bookingId, context.res_id, context.outlet_id, resolvedBayId],
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    booking_id: row.id,
+    bay_id: row.bay_id,
+  };
+}
+
 export async function HasActiveBooking(
   restaurantId: string,
   cust_id: string,
@@ -1111,6 +1909,1343 @@ export async function GetAuditLogs(
     details: row.reason,
     timestamp: new Date(row.created_at),
   }));
+}
+
+export async function GetInventoryItems(restaurantId: string): Promise<InventoryItemRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    barcode: string;
+    name: string;
+    description: string | null;
+    quantity: unknown;
+  }>(
+    `
+      select
+        barcode,
+        name,
+        description,
+        "Quantity" as quantity
+      from "Inventory"
+      where res_id = $1 and outlet_id = $2
+      order by created_at desc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows.map((row) => {
+    const qty = Math.max(0, Math.round(parseNumeric(row.quantity)));
+    const meta = parseInventoryDescription(row.description);
+    return {
+      id: row.barcode,
+      name: row.name,
+      category: meta.category,
+      stock: qty,
+      unit: meta.unit,
+      status: inventoryStatusFromStock(qty),
+    };
+  });
+}
+
+export async function UpsertInventoryItem(
+  restaurantId: string,
+  item: {
+    id?: string;
+    name: string;
+    category?: string;
+    stock: number;
+    unit?: string;
+  },
+): Promise<{ id: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const barcode = (item.id?.trim() || randomUUID()).slice(0, 128);
+
+  await runQuery(
+    `
+      insert into "Inventory"
+        (barcode, created_at, name, res_id, outlet_id, description, "Quantity")
+      values
+        ($1, now(), $2, $3, $4, $5, $6)
+      on conflict (barcode, res_id, outlet_id)
+      do update set
+        name = excluded.name,
+        description = excluded.description,
+        "Quantity" = excluded."Quantity"
+    `,
+    [
+      barcode,
+      item.name.trim(),
+      context.res_id,
+      context.outlet_id,
+      encodeInventoryDescription({ category: item.category, unit: item.unit }),
+      Math.max(0, Math.round(item.stock)),
+    ],
+  );
+
+  return { id: barcode };
+}
+
+export async function DeleteInventoryItem(
+  restaurantId: string,
+  inventoryId: string,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ barcode: string }>(
+    `
+      delete from "Inventory"
+      where res_id = $1 and outlet_id = $2 and barcode = $3
+      returning barcode
+    `,
+    [context.res_id, context.outlet_id, inventoryId.trim()],
+  );
+
+  return rows.length > 0;
+}
+
+async function ensureMenuCategoryIds(
+  context: RestaurantContext,
+  categoryName: string,
+  client?: PoolClient,
+): Promise<{ main_cat_id: string; sub_cat_id: string }> {
+  const normalized = categoryName.trim() || "General";
+
+  let main = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Menue_main_cat"
+      where res_id = $1 and outlet_id = $2 and lower(name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+    client,
+  );
+
+  let mainId = main[0]?.id;
+  if (!mainId) {
+    mainId = randomUUID();
+    await runQuery(
+      `
+        insert into "Menue_main_cat"
+          (id, created_at, res_id, outlet_id, name, avg_time)
+        values
+          ($1, now(), $2, $3, $4, $5)
+      `,
+      [mainId, context.res_id, context.outlet_id, normalized, "15 mins"],
+      client,
+    );
+  }
+
+  let sub = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Menue_sub_cat"
+      where res_id = $1 and outlet_id = $2 and main_cat_id = $3 and lower(name) = lower($4)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, mainId, normalized],
+    client,
+  );
+
+  let subId = sub[0]?.id;
+  if (!subId) {
+    subId = randomUUID();
+    await runQuery(
+      `
+        insert into "Menue_sub_cat"
+          (id, created_at, res_id, outlet_id, name, avg_time, main_cat_id)
+        values
+          ($1, now(), $2, $3, $4, $5, $6)
+      `,
+      [subId, context.res_id, context.outlet_id, normalized, "15 mins", mainId],
+      client,
+    );
+  }
+
+  return { main_cat_id: mainId, sub_cat_id: subId };
+}
+
+export async function GetMenuItems(restaurantId: string): Promise<MenuItemRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    id: string;
+    name: string;
+    description: string | null;
+    sub_category: string | null;
+    main_category: string | null;
+  }>(
+    `
+      select
+        m.id,
+        m.name,
+        m.description,
+        ms.name as sub_category,
+        mm.name as main_category
+      from "Menu" m
+      left join "Menue_sub_cat" ms
+        on ms.id = m.sub_cat_id and ms.res_id = m.res_id and ms.outlet_id = m.outlet_id
+      left join "Menue_main_cat" mm
+        on mm.id = m.main_cat_id and mm.res_id = m.res_id and mm.outlet_id = m.outlet_id
+      where m.res_id = $1 and m.outlet_id = $2
+      order by m.created_at desc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows.map((row) => {
+    const parsed = parseMenuDescription(row.description);
+    return {
+      id: row.id,
+      name: row.name,
+      price: parsed.price,
+      category: row.sub_category ?? row.main_category ?? "General",
+    };
+  });
+}
+
+export async function GetMenuCategories(restaurantId: string): Promise<string[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ category_name: string }>(
+    `
+      select distinct name as category_name
+      from "Menue_sub_cat"
+      where res_id = $1 and outlet_id = $2
+      order by category_name asc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows.map((row) => row.category_name).filter(Boolean);
+}
+
+export async function UpsertMenuItem(
+  restaurantId: string,
+  item: MenuItemRecord,
+  client?: PoolClient,
+): Promise<{ id: string }> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  const ids = await ensureMenuCategoryIds(context, item.category, client);
+  const itemId = isUuid(item.id) ? item.id : randomUUID();
+
+  await runQuery(
+    `
+      insert into "Menu"
+        (id, created_at, res_id, outlet_id, name, description, main_cat_id, sub_cat_id, avg_time)
+      values
+        ($1, now(), $2, $3, $4, $5, $6, $7, $8)
+      on conflict (id, res_id, outlet_id)
+      do update set
+        name = excluded.name,
+        description = excluded.description,
+        main_cat_id = excluded.main_cat_id,
+        sub_cat_id = excluded.sub_cat_id,
+        avg_time = excluded.avg_time
+    `,
+    [
+      itemId,
+      context.res_id,
+      context.outlet_id,
+      item.name.trim(),
+      encodeMenuDescription({ price: item.price }),
+      ids.main_cat_id,
+      ids.sub_cat_id,
+      "15 mins",
+    ],
+    client,
+  );
+
+  return { id: itemId };
+}
+
+export async function SaveMenuItems(
+  restaurantId: string,
+  items: MenuItemRecord[],
+): Promise<void> {
+  await withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const keepIds: string[] = [];
+
+    for (const item of items) {
+      const upserted = await UpsertMenuItem(
+        restaurantId,
+        {
+          id: item.id,
+          name: item.name,
+          price: item.price,
+          category: item.category,
+        },
+        client,
+      );
+      keepIds.push(upserted.id);
+    }
+
+    if (keepIds.length === 0) {
+      await runQuery(
+        `
+          delete from "Menu"
+          where res_id = $1 and outlet_id = $2
+        `,
+        [context.res_id, context.outlet_id],
+        client,
+      );
+      return;
+    }
+
+    await runQuery(
+      `
+        delete from "Menu"
+        where res_id = $1 and outlet_id = $2 and not (id = any($3::uuid[]))
+      `,
+      [context.res_id, context.outlet_id, keepIds],
+      client,
+    );
+  });
+}
+
+export async function EnsureMenuCategory(
+  restaurantId: string,
+  categoryName: string,
+): Promise<void> {
+  await withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    await ensureMenuCategoryIds(context, categoryName, client);
+  });
+}
+
+export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    id: string;
+    food: unknown;
+    status: unknown;
+    table_name: string | null;
+  }>(
+    `
+      select
+        o.id,
+        o.food,
+        o.status,
+        t.table_name
+      from "Orders" o
+      left join "Tables" t
+        on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+      where o.res_id = $1 and o.outlet_id = $2
+      order by o.created_at desc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows.map((row) => {
+    const payload = parseJsonObject(row.food) ?? {};
+    const items = Array.isArray(payload.items)
+      ? payload.items.map((entry: any) => ({
+          id: String(entry.id ?? randomUUID()),
+          name: String(entry.name ?? "Unknown"),
+          quantity: Math.max(1, Math.round(parseNumeric(entry.quantity))),
+          price: parseNumeric(entry.price),
+          orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
+        }))
+      : [];
+
+    const subtotal = parseNumeric(payload.subtotal);
+    const total = parseNumeric(payload.total);
+    return {
+      id: row.id,
+      table: String(payload.table ?? row.table_name ?? ""),
+      customer: String(payload.customer ?? "Guest"),
+      items,
+      subtotal,
+      serviceChargePercentage: Number.isFinite(parseNumeric(payload.serviceChargePercentage))
+        ? parseNumeric(payload.serviceChargePercentage)
+        : undefined,
+      taxes: Array.isArray(payload.taxes)
+        ? payload.taxes.map((tax: any) => ({
+            id: String(tax.id ?? randomUUID()),
+            name: String(tax.name ?? "Tax"),
+            percentage: parseNumeric(tax.percentage),
+          }))
+        : undefined,
+      applyServiceCharge: Boolean(payload.applyServiceCharge),
+      total: total > 0 ? total : subtotal,
+      status: (String(payload.status ?? "").trim() as OrderRecord["status"]) || fromOrderStatusCode(row.status),
+    };
+  });
+}
+
+export async function AddOrder(
+  restaurantId: string,
+  order: Partial<OrderRecord>,
+): Promise<{ id: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tableName = String(order.table ?? "").trim();
+  if (!tableName) {
+    throw new Error("Order table is required");
+  }
+
+  const tableRows = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, tableName],
+  );
+  const table = tableRows[0];
+  if (!table) {
+    throw new Error("Table not found for order");
+  }
+
+  let customerId: string | null = null;
+  const customerName = String(order.customer ?? "").trim();
+  if (customerName) {
+    const parts = splitName(customerName);
+    const customerRows = await runQuery<{ id: string }>(
+      `
+        select id
+        from "Customers"
+        where
+          res_id = $1 and outlet_id = $2
+          and lower("cust_Fname") = lower($3)
+          and lower("cust_Lname") = lower($4)
+        limit 1
+      `,
+      [context.res_id, context.outlet_id, parts.first, parts.last],
+    );
+    customerId = customerRows[0]?.id ?? null;
+  }
+
+  const id = isUuid(String(order.id ?? "")) ? String(order.id) : randomUUID();
+  const statusCode = toOrderStatusCode(String(order.status ?? "Preparing"));
+  const payload = {
+    id,
+    table: tableName,
+    customer: customerName || "Guest",
+    items: Array.isArray(order.items) ? order.items : [],
+    subtotal: parseNumeric(order.subtotal),
+    serviceChargePercentage: parseNumeric(order.serviceChargePercentage),
+    taxes: Array.isArray(order.taxes) ? order.taxes : [],
+    applyServiceCharge: Boolean(order.applyServiceCharge),
+    total: parseNumeric(order.total),
+    status: String(order.status ?? "Preparing"),
+  };
+
+  await runQuery(
+    `
+      insert into "Orders"
+        (id, created_at, res_id, outlet_id, food, table_id, status, cust_id)
+      values
+        ($1, now(), $2, $3, $4::json, $5, $6, $7)
+      on conflict (id, res_id, outlet_id)
+      do update set
+        food = excluded.food,
+        table_id = excluded.table_id,
+        status = excluded.status,
+        cust_id = excluded.cust_id
+    `,
+    [id, context.res_id, context.outlet_id, JSON.stringify(payload), table.id, statusCode, customerId],
+  );
+
+  return { id };
+}
+
+async function ensureTableAssignmentsTable(client?: PoolClient): Promise<void> {
+  await runQuery(
+    `
+      create table if not exists "Table_assignments" (
+        id uuid primary key,
+        created_at timestamptz not null default now(),
+        res_id uuid not null,
+        outlet_id uuid not null,
+        table_id uuid not null,
+        employee_id uuid not null
+      )
+    `,
+    [],
+    client,
+  );
+
+  await runQuery(
+    `
+      create unique index if not exists idx_table_assignments_unique
+      on "Table_assignments" (res_id, outlet_id, table_id)
+    `,
+    [],
+    client,
+  );
+
+  await runQuery(
+    `
+      create index if not exists idx_table_assignments_employee
+      on "Table_assignments" (res_id, outlet_id, employee_id)
+    `,
+    [],
+    client,
+  );
+}
+
+function toApcZone(current: number, target: number, yellowBandPercent = 0.1): ApcZone {
+  if (!Number.isFinite(target) || target <= 0) {
+    return "yellow";
+  }
+
+  const lower = target * (1 - yellowBandPercent);
+  const upper = target * (1 + yellowBandPercent);
+  if (current < lower) return "red";
+  if (current <= upper) return "yellow";
+  return "green";
+}
+
+function round2(value: number): number {
+  return Number(value.toFixed(2));
+}
+
+async function resolveTableByName(
+  context: RestaurantContext,
+  tableName: string,
+  client?: PoolClient,
+): Promise<{ id: string; table_name: string } | null> {
+  const rows = await runQuery<{ id: string; table_name: string }>(
+    `
+      select id, table_name
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, tableName.trim()],
+    client,
+  );
+  return rows[0] ?? null;
+}
+
+async function resolveEmployeeByUsername(
+  context: RestaurantContext,
+  employeeId: string,
+  client?: PoolClient,
+): Promise<{ id: string; username: string; name: string; role_primary: string } | null> {
+  const rows = await runQuery<{
+    id: string;
+    username: string;
+    fname: string;
+    lname: string;
+    role_primary: string | null;
+  }>(
+    `
+      select
+        e.id,
+        l.emp_username as username,
+        e."emp_Fname" as fname,
+        e."emp_Lname" as lname,
+        e.emp_roles->>'primary' as role_primary
+      from "Login" l
+      join "Employees" e
+        on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      where
+        l.res_id = $1
+        and l.outlet_id = $2
+        and lower(l.emp_username) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, employeeId.trim()],
+    client,
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    username: row.username,
+    name: `${row.fname} ${row.lname}`.trim(),
+    role_primary: row.role_primary ?? "employee",
+  };
+}
+
+export async function AssignTableToEmployee(
+  restaurantId: string,
+  tableName: string,
+  employeeId: string,
+): Promise<TableAssignmentRecord> {
+  return withTransaction(async (client) => {
+    await ensureTableAssignmentsTable(client);
+    const context = await requireRestaurantContext(restaurantId, client);
+
+    const table = await resolveTableByName(context, tableName, client);
+    if (!table) {
+      throw new Error("Table not found");
+    }
+
+    const employee = await resolveEmployeeByUsername(context, employeeId, client);
+    if (!employee) {
+      throw new Error("Employee not found");
+    }
+
+    const assignmentId = randomUUID();
+    await runQuery(
+      `
+        insert into "Table_assignments" (id, created_at, res_id, outlet_id, table_id, employee_id)
+        values ($1, now(), $2, $3, $4, $5)
+        on conflict (res_id, outlet_id, table_id)
+        do update set employee_id = excluded.employee_id
+      `,
+      [assignmentId, context.res_id, context.outlet_id, table.id, employee.id],
+      client,
+    );
+
+    return {
+      id: assignmentId,
+      table_name: table.table_name,
+      employee_id: employee.username,
+      employee_name: employee.name,
+      employee_role: employee.role_primary,
+    };
+  });
+}
+
+export async function UnassignTableEmployee(
+  restaurantId: string,
+  tableName: string,
+): Promise<boolean> {
+  return withTransaction(async (client) => {
+    await ensureTableAssignmentsTable(client);
+    const context = await requireRestaurantContext(restaurantId, client);
+    const table = await resolveTableByName(context, tableName, client);
+    if (!table) {
+      return false;
+    }
+
+    const rows = await runQuery<{ id: string }>(
+      `
+        delete from "Table_assignments"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+        returning id
+      `,
+      [context.res_id, context.outlet_id, table.id],
+      client,
+    );
+
+    return Boolean(rows[0]);
+  });
+}
+
+export async function GetTableAssignments(
+  restaurantId: string,
+): Promise<TableAssignmentRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableAssignmentsTable();
+
+  const rows = await runQuery<{
+    id: string;
+    table_name: string;
+    employee_username: string;
+    fname: string;
+    lname: string;
+    role_primary: string | null;
+  }>(
+    `
+      select
+        ta.id,
+        t.table_name,
+        l.emp_username as employee_username,
+        e."emp_Fname" as fname,
+        e."emp_Lname" as lname,
+        e.emp_roles->>'primary' as role_primary
+      from "Table_assignments" ta
+      join "Tables" t
+        on t.id = ta.table_id and t.res_id = ta.res_id and t.outlet_id = ta.outlet_id
+      join "Employees" e
+        on e.id = ta.employee_id and e.res_id = ta.res_id and e.outlet_id = ta.outlet_id
+      left join "Login" l
+        on l.emp_id = e.id and l.res_id = e.res_id and l.outlet_id = e.outlet_id
+      where ta.res_id = $1 and ta.outlet_id = $2
+      order by t.table_name asc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    table_name: row.table_name,
+    employee_id: row.employee_username,
+    employee_name: `${row.fname} ${row.lname}`.trim(),
+    employee_role: row.role_primary ?? "employee",
+  }));
+}
+
+export async function GetMonthlyApcInsights(
+  restaurantId: string,
+  monthStartInput?: Date,
+): Promise<MonthlyApcInsight> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableAssignmentsTable();
+
+  const now = new Date();
+  const base = monthStartInput && !Number.isNaN(monthStartInput.getTime()) ? monthStartInput : now;
+  const monthStart = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), 1, 0, 0, 0, 0));
+  const monthEnd = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + 1, 1, 0, 0, 0, 0));
+  const monthLabel = `${monthStart.getUTCFullYear()}-${String(monthStart.getUTCMonth() + 1).padStart(2, "0")}`;
+  const yellowBandPercent = 0.1;
+
+  const orderRows = await runQuery<{
+    id: string;
+    created_at: Date | string;
+    table_id: string;
+    table_name: string | null;
+    food: unknown;
+  }>(
+    `
+      select o.id, o.created_at, o.table_id, t.table_name, o.food
+      from "Orders" o
+      left join "Tables" t
+        on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+      where
+        o.res_id = $1 and o.outlet_id = $2
+        and o.created_at >= $3 and o.created_at < $4
+      order by o.created_at desc
+    `,
+    [context.res_id, context.outlet_id, monthStart.toISOString(), monthEnd.toISOString()],
+  );
+
+  const bookingRows = await runQuery<{
+    table_id: string;
+    num_adults: unknown;
+    num_kids: unknown;
+    slot: string;
+    created_at: Date;
+  }>(
+    `
+      select table_id, num_adults, num_kids, slot, created_at
+      from "Bookings"
+      where
+        res_id = $1 and outlet_id = $2
+        and created_at >= ($3::timestamptz - interval '2 days')
+        and created_at < ($4::timestamptz + interval '2 days')
+    `,
+    [context.res_id, context.outlet_id, monthStart.toISOString(), monthEnd.toISOString()],
+  );
+
+  const assignmentRows = await runQuery<{
+    table_id: string;
+    table_name: string;
+    employee_username: string | null;
+    employee_name: string;
+    employee_role: string | null;
+  }>(
+    `
+      select
+        ta.table_id,
+        t.table_name,
+        l.emp_username as employee_username,
+        trim(e."emp_Fname" || ' ' || e."emp_Lname") as employee_name,
+        e.emp_roles->>'primary' as employee_role
+      from "Table_assignments" ta
+      join "Tables" t
+        on t.id = ta.table_id and t.res_id = ta.res_id and t.outlet_id = ta.outlet_id
+      join "Employees" e
+        on e.id = ta.employee_id and e.res_id = ta.res_id and e.outlet_id = ta.outlet_id
+      left join "Login" l
+        on l.emp_id = e.id and l.res_id = e.res_id and l.outlet_id = e.outlet_id
+      where ta.res_id = $1 and ta.outlet_id = $2
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  const bookingsByTable = new Map<string, Array<{
+    start: Date;
+    end: Date;
+    people: number;
+  }>>();
+
+  for (const row of bookingRows) {
+    const slot = decodeSlot(row.slot, row.created_at);
+    const start = new Date(slot.start);
+    const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      continue;
+    }
+
+    const people = Math.max(1, toNonNegativeInt(row.num_adults) + toNonNegativeInt(row.num_kids));
+    const current = bookingsByTable.get(row.table_id) ?? [];
+    current.push({ start, end, people });
+    bookingsByTable.set(row.table_id, current);
+  }
+
+  const assignmentByTableId = new Map<string, {
+    employee_id: string | null;
+    employee_name: string | null;
+    employee_role: string | null;
+    table_name: string;
+  }>();
+
+  for (const row of assignmentRows) {
+    assignmentByTableId.set(row.table_id, {
+      employee_id: row.employee_username,
+      employee_name: row.employee_name || row.employee_username || null,
+      employee_role: row.employee_role ?? "employee",
+      table_name: row.table_name,
+    });
+  }
+
+  const precomputedOrders = orderRows.map((row) => {
+    const payload = parseJsonObject(row.food) ?? {};
+    const createdAt = new Date(row.created_at);
+    const subtotal = parseNumeric(payload.subtotal);
+    const total = parseNumeric(payload.total) > 0 ? parseNumeric(payload.total) : subtotal;
+
+    const payloadPeopleRaw = parseNumeric(
+      (payload.people_count as unknown) ?? (payload.number_of_people as unknown),
+    );
+
+    let people = payloadPeopleRaw > 0 ? Math.max(1, Math.round(payloadPeopleRaw)) : 1;
+    if (!(payloadPeopleRaw > 0)) {
+      const candidates = bookingsByTable.get(row.table_id) ?? [];
+      let bestScore = Number.POSITIVE_INFINITY;
+      let bestPeople = 1;
+
+      for (const candidate of candidates) {
+        let score = 0;
+        if (createdAt < candidate.start) {
+          score = candidate.start.getTime() - createdAt.getTime();
+        } else if (createdAt > candidate.end) {
+          score = createdAt.getTime() - candidate.end.getTime();
+        }
+
+        if (score < bestScore) {
+          bestScore = score;
+          bestPeople = candidate.people;
+        }
+      }
+
+      // Accept nearest same-table booking if within 6 hours; otherwise fallback to 1 cover.
+      people = bestScore <= 6 * 60 * 60 * 1000 ? Math.max(1, bestPeople) : 1;
+    }
+
+    const assignment = assignmentByTableId.get(row.table_id);
+    return {
+      order_id: row.id,
+      table_name: row.table_name ?? String(payload.table ?? ""),
+      created_at: createdAt.toISOString(),
+      total: round2(total),
+      people_count: people,
+      assigned_employee_id: assignment?.employee_id ?? null,
+      assigned_employee_name: assignment?.employee_name ?? null,
+      assigned_employee_role: assignment?.employee_role ?? null,
+    };
+  });
+
+  const totalRevenue = round2(precomputedOrders.reduce((sum, order) => sum + order.total, 0));
+  const totalCovers = precomputedOrders.reduce((sum, order) => sum + order.people_count, 0);
+  const monthlyApc = totalCovers > 0 ? round2(totalRevenue / totalCovers) : 0;
+
+  const orders: OrderApcInsight[] = precomputedOrders.map((order) => {
+    const target = round2(monthlyApc * order.people_count);
+    return {
+      order_id: order.order_id,
+      table_name: order.table_name,
+      created_at: order.created_at,
+      total: order.total,
+      people_count: order.people_count,
+      target_total: target,
+      zone: toApcZone(order.total, target, yellowBandPercent),
+      assigned_employee_id: order.assigned_employee_id,
+      assigned_employee_name: order.assigned_employee_name,
+    };
+  });
+
+  const employeeAccumulator = new Map<string, {
+    employee_name: string;
+    employee_role: string;
+    assigned_tables: Set<string>;
+    orders_count: number;
+    covers_count: number;
+    revenue: number;
+  }>();
+
+  for (const assignment of assignmentRows) {
+    if (!assignment.employee_username) continue;
+    const existing = employeeAccumulator.get(assignment.employee_username) ?? {
+      employee_name: assignment.employee_name || assignment.employee_username,
+      employee_role: assignment.employee_role ?? "employee",
+      assigned_tables: new Set<string>(),
+      orders_count: 0,
+      covers_count: 0,
+      revenue: 0,
+    };
+    existing.assigned_tables.add(assignment.table_name);
+    employeeAccumulator.set(assignment.employee_username, existing);
+  }
+
+  for (const order of orders) {
+    if (!order.assigned_employee_id) continue;
+    const existing = employeeAccumulator.get(order.assigned_employee_id);
+    if (!existing) continue;
+    existing.orders_count += 1;
+    existing.covers_count += order.people_count;
+    existing.revenue += order.total;
+  }
+
+  const employee_incentives: EmployeeApcIncentive[] = Array.from(employeeAccumulator.entries())
+    .map(([employeeId, data]) => {
+      const meanApc = data.covers_count > 0 ? round2(data.revenue / data.covers_count) : 0;
+      return {
+        employee_id: employeeId,
+        employee_name: data.employee_name,
+        employee_role: data.employee_role,
+        assigned_tables: Array.from(data.assigned_tables).sort((a, b) => a.localeCompare(b)),
+        orders_count: data.orders_count,
+        covers_count: data.covers_count,
+        mean_apc: meanApc,
+        zone: toApcZone(meanApc, monthlyApc, yellowBandPercent),
+      };
+    })
+    .sort((a, b) => b.mean_apc - a.mean_apc);
+
+  return {
+    month: monthLabel,
+    monthly_apc: monthlyApc,
+    total_revenue: totalRevenue,
+    total_covers: totalCovers,
+    yellow_band_percent: yellowBandPercent,
+    orders,
+    employee_incentives,
+  };
+}
+
+async function selectProfileEmployee(
+  context: RestaurantContext,
+  employeeId?: string,
+): Promise<{ id: string; email: string | null; phone: string | null; address: string | null } | null> {
+  if (employeeId?.trim()) {
+    const rows = await runQuery<{
+      id: string;
+      email: string | null;
+      phone: string | null;
+      address: string | null;
+    }>(
+      `
+        select
+          e.id,
+          e.emp_email as email,
+          cast(e.emp_ph as text) as phone,
+          e.emp_add as address
+        from "Login" l
+        join "Employees" e
+          on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+        where
+          l.res_id = $1
+          and l.outlet_id = $2
+          and lower(l.emp_username) = lower($3)
+        limit 1
+      `,
+      [context.res_id, context.outlet_id, employeeId.trim()],
+    );
+    return rows[0] ?? null;
+  }
+
+  const rows = await runQuery<{
+    id: string;
+    email: string | null;
+    phone: string | null;
+    address: string | null;
+  }>(
+    `
+      select
+        e.id,
+        e.emp_email as email,
+        cast(e.emp_ph as text) as phone,
+        e.emp_add as address
+      from "Employees" e
+      where e.res_id = $1 and e.outlet_id = $2
+      order by
+        case when lower(e.emp_roles->>'primary') = 'admin' then 0 else 1 end,
+        e.created_at asc
+      limit 1
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  return rows[0] ?? null;
+}
+
+export async function GetRestaurantProfile(
+  restaurantId: string,
+  employeeId?: string,
+): Promise<RestaurantProfileRecord> {
+  const context = await requireRestaurantContext(restaurantId);
+
+  const outletRows = await runQuery<{
+    outlet_name: string;
+    outlet_add: string;
+    outlet_phone: string | null;
+    outlet_hours: string | null;
+  }>(
+    `
+      select
+        outlet_name,
+        outlet_add,
+        cast(outlet_main_ph as text) as outlet_phone,
+        outlet_working_hours as outlet_hours
+      from "Outlets"
+      where id = $1 and res_id = $2
+      limit 1
+    `,
+    [context.outlet_id, context.res_id],
+  );
+
+  const employee = await selectProfileEmployee(context, employeeId);
+  const outlet = outletRows[0];
+
+  return {
+    name: outlet?.outlet_name ?? context.restaurant_name,
+    address: employee?.address ?? outlet?.outlet_add ?? "",
+    phone: employee?.phone ?? outlet?.outlet_phone ?? "",
+    email: employee?.email ?? "",
+    hours: outlet?.outlet_hours ?? "",
+  };
+}
+
+export async function UpdateRestaurantProfile(
+  restaurantId: string,
+  profile: RestaurantProfileRecord,
+  employeeId?: string,
+): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId);
+
+  await withTransaction(async (client) => {
+    await runQuery(
+      `
+        update "Restaurant"
+        set
+          res_name = $2,
+          main_office_add = $3
+        where id = $1
+      `,
+      [context.res_id, profile.name.trim(), profile.address.trim() || null],
+      client,
+    );
+
+    await runQuery(
+      `
+        update "Outlets"
+        set
+          outlet_name = $3,
+          outlet_add = $4,
+          outlet_main_ph = $5,
+          outlet_working_hours = $6
+        where id = $1 and res_id = $2
+      `,
+      [
+        context.outlet_id,
+        context.res_id,
+        profile.name.trim(),
+        profile.address.trim(),
+        normalizePhone(profile.phone) || null,
+        profile.hours.trim() || null,
+      ],
+      client,
+    );
+
+    const employee = await selectProfileEmployee(context, employeeId);
+    if (employee) {
+      await runQuery(
+        `
+          update "Employees"
+          set
+            emp_email = $4,
+            emp_ph = $5,
+            emp_add = $6
+          where id = $1 and res_id = $2 and outlet_id = $3
+        `,
+        [
+          employee.id,
+          context.res_id,
+          context.outlet_id,
+          profile.email.trim() || null,
+          normalizePhone(profile.phone) || null,
+          profile.address.trim() || null,
+        ],
+        client,
+      );
+    }
+  });
+}
+
+export async function GetRoles(restaurantId: string): Promise<RoleRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    id: string;
+    role_name: string;
+    actions_performable: unknown;
+  }>(
+    `
+      select id, role_name, actions_performable
+      from "Roles"
+      where res_id = $1
+      order by role_name asc
+    `,
+    [context.res_id],
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    role_name: row.role_name,
+    actions_performable: Array.isArray(row.actions_performable)
+      ? row.actions_performable.map((entry) => String(entry))
+      : [],
+  }));
+}
+
+export async function CreateRole(
+  restaurantId: string,
+  role_name: string,
+  actions_performable: string[] = [],
+): Promise<RoleRecord> {
+  const context = await requireRestaurantContext(restaurantId);
+  const name = role_name.trim().toLowerCase();
+  if (!name) {
+    throw new Error("Role name is required");
+  }
+
+  const existing = await runQuery<{ id: string; role_name: string; actions_performable: unknown }>(
+    `
+      select id, role_name, actions_performable
+      from "Roles"
+      where res_id = $1 and lower(role_name) = lower($2)
+      limit 1
+    `,
+    [context.res_id, name],
+  );
+
+  const normalizedActions = Array.from(
+    new Set(actions_performable.map((entry) => entry.trim()).filter(Boolean)),
+  );
+
+  const row = existing[0];
+  if (row) {
+    await runQuery(
+      `
+        update "Roles"
+        set actions_performable = $3::json
+        where id = $1 and res_id = $2
+      `,
+      [row.id, context.res_id, JSON.stringify(normalizedActions)],
+    );
+
+    return {
+      id: row.id,
+      role_name: row.role_name,
+      actions_performable: normalizedActions,
+    };
+  }
+
+  const id = randomUUID();
+  await runQuery(
+    `
+      insert into "Roles" (id, created_at, role_name, actions_performable, res_id)
+      values ($1, now(), $2, $3::json, $4)
+    `,
+    [id, name, JSON.stringify(normalizedActions), context.res_id],
+  );
+
+  return {
+    id,
+    role_name: name,
+    actions_performable: normalizedActions,
+  };
+}
+
+async function getEmployeeRoleRow(
+  context: RestaurantContext,
+  employeeId: string,
+  client?: PoolClient,
+): Promise<{ emp_id: string; emp_roles: unknown } | null> {
+  const rows = await runQuery<{ emp_id: string; emp_roles: unknown }>(
+    `
+      select l.emp_id, e.emp_roles
+      from "Login" l
+      join "Employees" e
+        on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      where
+        l.res_id = $1
+        and l.outlet_id = $2
+        and lower(l.emp_username) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, employeeId.trim()],
+    client,
+  );
+
+  return rows[0] ?? null;
+}
+
+export async function AssignRoleToEmployee(
+  restaurantId: string,
+  employeeId: string,
+  roleName: string,
+): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId);
+  const normalizedRole = roleName.trim().toLowerCase();
+  if (!normalizedRole) {
+    throw new Error("Role is required");
+  }
+
+  await withTransaction(async (client) => {
+    if (!["admin", "employee", "valet", "waiter"].includes(normalizedRole)) {
+      const roleRows = await runQuery<{ id: string }>(
+        `
+          select id
+          from "Roles"
+          where res_id = $1 and lower(role_name) = lower($2)
+          limit 1
+        `,
+        [context.res_id, normalizedRole],
+        client,
+      );
+      if (!roleRows[0]) {
+        throw new Error("Role does not exist");
+      }
+    }
+
+    const employee = await getEmployeeRoleRow(context, employeeId, client);
+    if (!employee) {
+      throw new Error("Employee not found");
+    }
+
+    const roles = parseEmployeeRoles(employee.emp_roles);
+    const nextAll = Array.from(new Set([...roles.all, normalizedRole]));
+    const nextPrimary = roles.primary || "employee";
+
+    await runQuery(
+      `
+        update "Employees"
+        set emp_roles = $4::json
+        where id = $1 and res_id = $2 and outlet_id = $3
+      `,
+      [
+        employee.emp_id,
+        context.res_id,
+        context.outlet_id,
+        JSON.stringify({ primary: nextPrimary, all: nextAll }),
+      ],
+      client,
+    );
+  });
+}
+
+export async function RemoveRoleFromEmployee(
+  restaurantId: string,
+  employeeId: string,
+  roleName: string,
+): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId);
+  const normalizedRole = roleName.trim().toLowerCase();
+  if (!normalizedRole) {
+    throw new Error("Role is required");
+  }
+
+  await withTransaction(async (client) => {
+    const employee = await getEmployeeRoleRow(context, employeeId, client);
+    if (!employee) {
+      throw new Error("Employee not found");
+    }
+
+    const roles = parseEmployeeRoles(employee.emp_roles);
+    const nextAll = roles.all.filter((role) => role !== normalizedRole);
+    const nextPrimary = roles.primary === normalizedRole
+      ? (nextAll.find((role) => role === "admin" || role === "employee" || role === "valet" || role === "waiter") ?? "employee")
+      : roles.primary;
+
+    const normalizedAll = Array.from(new Set([nextPrimary, ...nextAll]));
+
+    await runQuery(
+      `
+        update "Employees"
+        set emp_roles = $4::json
+        where id = $1 and res_id = $2 and outlet_id = $3
+      `,
+      [
+        employee.emp_id,
+        context.res_id,
+        context.outlet_id,
+        JSON.stringify({ primary: nextPrimary, all: normalizedAll }),
+      ],
+      client,
+    );
+  });
+}
+
+export async function DeleteRole(
+  restaurantId: string,
+  roleId: string,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(roleId)) {
+    return false;
+  }
+
+  return withTransaction(async (client) => {
+    const roleRows = await runQuery<{ id: string; role_name: string }>(
+      `
+        select id, role_name
+        from "Roles"
+        where id = $1 and res_id = $2
+        limit 1
+      `,
+      [roleId, context.res_id],
+      client,
+    );
+    const role = roleRows[0];
+    if (!role) return false;
+    if (["admin", "employee", "valet"].includes(role.role_name.trim().toLowerCase())) {
+      throw new Error("Core roles cannot be deleted");
+    }
+
+    await runQuery(
+      `
+        delete from "Roles"
+        where id = $1 and res_id = $2
+      `,
+      [role.id, context.res_id],
+      client,
+    );
+
+    const employees = await runQuery<{ id: string; emp_roles: unknown }>(
+      `
+        select id, emp_roles
+        from "Employees"
+        where res_id = $1 and outlet_id = $2
+      `,
+      [context.res_id, context.outlet_id],
+      client,
+    );
+
+    for (const employee of employees) {
+      const parsed = parseEmployeeRoles(employee.emp_roles);
+      if (!parsed.all.includes(role.role_name)) {
+        continue;
+      }
+
+      const all = parsed.all.filter((entry) => entry !== role.role_name);
+      const primary = parsed.primary === role.role_name
+        ? (all.find((entry) => ["admin", "employee", "valet", "waiter"].includes(entry)) ?? "employee")
+        : parsed.primary;
+      const normalizedAll = Array.from(new Set([primary, ...all]));
+
+      await runQuery(
+        `
+          update "Employees"
+          set emp_roles = $4::json
+          where id = $1 and res_id = $2 and outlet_id = $3
+        `,
+        [
+          employee.id,
+          context.res_id,
+          context.outlet_id,
+          JSON.stringify({ primary, all: normalizedAll }),
+        ],
+        client,
+      );
+    }
+
+    return true;
+  });
 }
 
 export async function GetRestaurantUserRole(
@@ -1326,6 +3461,7 @@ export async function GetRestaurantUsers(
     fname: string;
     lname: string;
     role_primary: string | null;
+    emp_roles: unknown;
   }>(
     `
       select
@@ -1334,7 +3470,8 @@ export async function GetRestaurantUsers(
         l.emp_pass,
         e."emp_Fname" as fname,
         e."emp_Lname" as lname,
-        e.emp_roles->>'primary' as role_primary
+        e.emp_roles->>'primary' as role_primary,
+        e.emp_roles as emp_roles
       from "Login" l
       join "Employees" e
         on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
@@ -1349,6 +3486,7 @@ export async function GetRestaurantUsers(
     name: `${row.fname} ${row.lname}`.trim(),
     password: row.emp_pass,
     role: toRole(row.role_primary),
+    role_all: parseEmployeeRoles(row.emp_roles).all,
   }));
 }
 

@@ -30,7 +30,7 @@ npm run dev
 
 | Name | Required | Description |
 | ---- | -------- | ----------- |
-| `SUPABASE_DIRECT_URL` | Yes | Direct Postgres URL from Supabase project settings. |
+| `SUPABASE_DIRECT_URL` | Yes | Direct Postgres URL from Supabase project settings (also used by optional Python legacy service in `npm run dev:full` / `npm run start:full`). |
 | `DATABASE_URL` | No | Optional alias; defaults to `SUPABASE_DIRECT_URL` when unset. |
 | `DIRECT_URL` | No | Optional alias; defaults to `SUPABASE_DIRECT_URL` when unset. |
 | `ALLOWED_ORIGINS` | No | Comma separated list used by the simple CORS guard. |
@@ -42,9 +42,11 @@ Place secrets in `.env` locally and in repository/environment secrets for CI/CD.
 
 | Command | Purpose |
 | ------- | ------- |
-| `npm run dev` | Watches `index.ts` with TSX; auto-restarts on change. |
+| `npm run dev` | Default local development (Node + Supabase only). Watches `index.ts` with TSX and auto-restarts on change. |
+| `npm run dev:full` | Runs Node + the optional Python legacy service together. |
 | `npm run build` | Emits JS to `build/` using `tsconfig.build.json`. |
-| `npm run start` | Runs the compiled server (`node ./build/index.js`). |
+| `npm run start` | Runs the compiled Node server only (`node ./build/index.js`). |
+| `npm run start:full` | Runs compiled Node server + optional Python legacy service. |
 | `npm run test:allocation` | Deterministic table-allocation regression test. |
 | `npm run test:overlap` | Verifies overlapping bookings are rejected. |
 | `npm run test:threshold` | Exercises configurable capacity limits. |
