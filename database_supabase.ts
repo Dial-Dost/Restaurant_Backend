@@ -219,12 +219,21 @@ export type EmployeeApcIncentive = {
 
 export type MonthlyApcInsight = {
   month: string;
+  period: "day" | "week" | "month";
+  period_start: string;
+  period_end: string;
   monthly_apc: number;
   total_revenue: number;
   total_covers: number;
   yellow_band_percent: number;
   orders: OrderApcInsight[];
   employee_incentives: EmployeeApcIncentive[];
+};
+
+type ApcInsightOptions = {
+  period?: "day" | "week" | "month";
+  periodStart?: Date;
+  employeeId?: string;
 };
 
 export type RestaurantProfileRecord = {
@@ -1903,8 +1912,7 @@ export async function GetAuditLogs(
   return rows.map((row) => ({
     id: row.id,
     employee:
-      row.emp_username ??
-      (`${row.fname ?? ""} ${row.lname ?? ""}`.trim() || "Unknown"),
+      (`${row.fname ?? ""} ${row.lname ?? ""}`.trim() || row.emp_username || "Unknown"),
     action: row.action_name,
     details: row.reason,
     timestamp: new Date(row.created_at),
@@ -2571,16 +2579,48 @@ export async function GetTableAssignments(
 
 export async function GetMonthlyApcInsights(
   restaurantId: string,
-  monthStartInput?: Date,
+  monthStartInput?: Date | ApcInsightOptions,
 ): Promise<MonthlyApcInsight> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableAssignmentsTable();
 
   const now = new Date();
-  const base = monthStartInput && !Number.isNaN(monthStartInput.getTime()) ? monthStartInput : now;
-  const monthStart = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), 1, 0, 0, 0, 0));
-  const monthEnd = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + 1, 1, 0, 0, 0, 0));
-  const monthLabel = `${monthStart.getUTCFullYear()}-${String(monthStart.getUTCMonth() + 1).padStart(2, "0")}`;
+  const options: ApcInsightOptions =
+    monthStartInput instanceof Date
+      ? { period: "month", periodStart: monthStartInput }
+      : (monthStartInput ?? {});
+  const period = options.period ?? "month";
+  const base =
+    options.periodStart && !Number.isNaN(options.periodStart.getTime())
+      ? options.periodStart
+      : now;
+
+  let monthStart: Date;
+  let monthEnd: Date;
+  let monthLabel: string;
+
+  if (period === "day") {
+    monthStart = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), 0, 0, 0, 0));
+    monthEnd = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate() + 1, 0, 0, 0, 0));
+    monthLabel = `${monthStart.getUTCFullYear()}-${String(monthStart.getUTCMonth() + 1).padStart(2, "0")}-${String(monthStart.getUTCDate()).padStart(2, "0")}`;
+  } else if (period === "week") {
+    const day = base.getUTCDay();
+    const offsetToMonday = day === 0 ? -6 : 1 - day;
+    monthStart = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate() + offsetToMonday, 0, 0, 0, 0));
+    monthEnd = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth(), monthStart.getUTCDate() + 7, 0, 0, 0, 0));
+
+    const firstJan = new Date(Date.UTC(monthStart.getUTCFullYear(), 0, 1));
+    const dayOffset = Math.floor((monthStart.getTime() - firstJan.getTime()) / (24 * 60 * 60 * 1000));
+    const firstJanWeekday = (firstJan.getUTCDay() + 6) % 7;
+    const weekNumber = Math.floor((dayOffset + firstJanWeekday) / 7) + 1;
+    monthLabel = `${monthStart.getUTCFullYear()}-W${String(weekNumber).padStart(2, "0")}`;
+  } else {
+    monthStart = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), 1, 0, 0, 0, 0));
+    monthEnd = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + 1, 1, 0, 0, 0, 0));
+    monthLabel = `${monthStart.getUTCFullYear()}-${String(monthStart.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  const employeeFilter = options.employeeId?.trim().toLowerCase() || null;
   const yellowBandPercent = 0.1;
 
   const orderRows = await runQuery<{
@@ -2730,11 +2770,19 @@ export async function GetMonthlyApcInsights(
     };
   });
 
-  const totalRevenue = round2(precomputedOrders.reduce((sum, order) => sum + order.total, 0));
-  const totalCovers = precomputedOrders.reduce((sum, order) => sum + order.people_count, 0);
+  const scopedOrders = employeeFilter
+    ? precomputedOrders.filter((order) =>
+        order.assigned_employee_id
+          ? order.assigned_employee_id.toLowerCase() === employeeFilter
+          : false,
+      )
+    : precomputedOrders;
+
+  const totalRevenue = round2(scopedOrders.reduce((sum, order) => sum + order.total, 0));
+  const totalCovers = scopedOrders.reduce((sum, order) => sum + order.people_count, 0);
   const monthlyApc = totalCovers > 0 ? round2(totalRevenue / totalCovers) : 0;
 
-  const orders: OrderApcInsight[] = precomputedOrders.map((order) => {
+  const orders: OrderApcInsight[] = scopedOrders.map((order) => {
     const target = round2(monthlyApc * order.people_count);
     return {
       order_id: order.order_id,
@@ -2760,6 +2808,7 @@ export async function GetMonthlyApcInsights(
 
   for (const assignment of assignmentRows) {
     if (!assignment.employee_username) continue;
+    if (employeeFilter && assignment.employee_username.toLowerCase() !== employeeFilter) continue;
     const existing = employeeAccumulator.get(assignment.employee_username) ?? {
       employee_name: assignment.employee_name || assignment.employee_username,
       employee_role: assignment.employee_role ?? "employee",
@@ -2799,6 +2848,9 @@ export async function GetMonthlyApcInsights(
 
   return {
     month: monthLabel,
+    period,
+    period_start: monthStart.toISOString(),
+    period_end: monthEnd.toISOString(),
     monthly_apc: monthlyApc,
     total_revenue: totalRevenue,
     total_covers: totalCovers,
@@ -3488,6 +3540,64 @@ export async function GetRestaurantUsers(
     role: toRole(row.role_primary),
     role_all: parseEmployeeRoles(row.emp_roles).all,
   }));
+}
+
+export type EmployeeLoginResult = {
+  employeeId: string;
+  name: string;
+  role: "admin" | "employee" | "valet" | "waiter";
+  role_all: string[];
+  restaurantId: string;
+  restaurantName: string;
+};
+
+export async function AuthenticateRestaurantEmployee(
+  restaurantId: string,
+  employeeId: string,
+  password: string,
+): Promise<EmployeeLoginResult | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const normalizedEmployeeId = employeeId.trim();
+  if (!normalizedEmployeeId) return null;
+
+  const rows = await runQuery<{
+    emp_username: string;
+    fname: string;
+    lname: string;
+    role_primary: string | null;
+    emp_roles: unknown;
+  }>(
+    `
+      select
+        l.emp_username,
+        e."emp_Fname" as fname,
+        e."emp_Lname" as lname,
+        e.emp_roles->>'primary' as role_primary,
+        e.emp_roles as emp_roles
+      from "Login" l
+      join "Employees" e
+        on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      where
+        l.res_id = $1
+        and l.outlet_id = $2
+        and lower(l.emp_username) = lower($3)
+        and l.emp_pass = $4
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalizedEmployeeId, password],
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+
+  return {
+    employeeId: row.emp_username,
+    name: `${row.fname} ${row.lname}`.trim(),
+    role: toRole(row.role_primary),
+    role_all: parseEmployeeRoles(row.emp_roles).all,
+    restaurantId: context.restaurant_slug,
+    restaurantName: context.restaurant_name,
+  };
 }
 
 export async function EnsureRestaurantSeed(seed: RestaurantSeedInput): Promise<void> {

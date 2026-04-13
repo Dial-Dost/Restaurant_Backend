@@ -59,6 +59,7 @@ import {
 	UpdateValetVehicleBay,
 	GetValetVehicleMetaByBookingIds,
 	UpsertValetVehicleMeta,
+	AuthenticateRestaurantEmployee,
 } from "./database_supabase.js";
 import {
 	OPENAI_REALTIME_MODEL,
@@ -196,6 +197,10 @@ function extractEmployeeId(req: Request): string | null {
 	return null;
 }
 
+function normalizeRestaurantSlug(value: string): string {
+	return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 async function resolveRoleForRequest(req: Request, restaurantId: string): Promise<AppRole | null> {
 	const employeeId = extractEmployeeId(req);
 	if (!employeeId) {
@@ -291,6 +296,107 @@ app.get("/health", async (_req: Request, res: Response) => {
 		result.status = "degraded";
 	}
 	res.json(result);
+});
+
+app.post("/auth/register-restaurant", validate, async (req: Request, res: Response) => {
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const restaurantName = typeof body.restaurantName === "string" ? body.restaurantName.trim() : "";
+	const adminName = typeof body.adminName === "string" ? body.adminName.trim() : "";
+	const adminEmployeeId = typeof body.adminEmployeeId === "string" ? body.adminEmployeeId.trim() : "";
+	const password = typeof body.password === "string" ? body.password : "";
+
+	if (!restaurantName || !adminName || !adminEmployeeId || !password) {
+		res.status(400).json({
+			error: "restaurantName, adminName, adminEmployeeId, and password are required",
+		});
+		return;
+	}
+
+	const restaurantId = normalizeRestaurantSlug(restaurantName);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Restaurant name must include letters or numbers" });
+		return;
+	}
+
+	try {
+		try {
+			await GetRestaurantUsers(restaurantId);
+			res.status(409).json({ error: `Restaurant \"${restaurantName}\" is already registered.` });
+			return;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (!message.includes("Unknown restaurant id")) {
+				throw error;
+			}
+		}
+
+		await EnsureRestaurantSeed({
+			id: restaurantId,
+			name: restaurantName,
+			admin: {
+				employeeId: adminEmployeeId,
+				name: adminName,
+				password,
+			},
+			tables: [],
+		});
+
+		res.status(201).json({
+			restaurantId,
+			restaurantName,
+			admin: {
+				employeeId: adminEmployeeId,
+				name: adminName,
+				role: "admin",
+			},
+		});
+	} catch (error) {
+		console.error("register_restaurant_failed", error);
+		res.status(500).json({ error: "Unable to register restaurant" });
+	}
+});
+
+app.post("/auth/employee-login", validate, async (req: Request, res: Response) => {
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const employeeId = typeof body.employeeId === "string" ? body.employeeId.trim() : "";
+	const password = typeof body.password === "string" ? body.password : "";
+	const restaurantIdRaw = typeof body.restaurantId === "string" ? body.restaurantId.trim() : "";
+	const restaurantName = typeof body.restaurantName === "string" ? body.restaurantName.trim() : "";
+
+	if (!employeeId || !password || (!restaurantIdRaw && !restaurantName)) {
+		res.status(400).json({
+			error: "employeeId, password, and restaurantName (or restaurantId) are required",
+		});
+		return;
+	}
+
+	const restaurantId = restaurantIdRaw || normalizeRestaurantSlug(restaurantName);
+
+	try {
+		const user = await AuthenticateRestaurantEmployee(restaurantId, employeeId, password);
+		if (!user) {
+			res.status(401).json({ error: "Invalid employee ID or password." });
+			return;
+		}
+
+		res.json({
+			uid: user.employeeId,
+			employeeId: user.employeeId,
+			name: user.name,
+			role: user.role,
+			restaurantId: user.restaurantId,
+			restaurantName: user.restaurantName,
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (message.includes("Unknown restaurant id")) {
+			res.status(404).json({ error: "Invalid restaurant name." });
+			return;
+		}
+
+		console.error("employee_login_failed", error);
+		res.status(500).json({ error: "Unable to sign in." });
+	}
 });
 
 app.get("/reception/info", (_req: Request, res: Response) => {
@@ -1042,7 +1148,14 @@ app.post("/audit-logs", validate, async (req: Request, res: Response) => {
 		return;
 	}
 
-	const { employee, action, details } = req.body ?? {};
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const employeeFromHeader = extractEmployeeId(req)?.trim() ?? "";
+	const employeeFromBody = typeof body.employee === "string" ? body.employee.trim() : "";
+	const employeeIdFromBody = typeof body.employee_id === "string" ? body.employee_id.trim() : "";
+	const employee = employeeFromHeader || employeeIdFromBody || employeeFromBody;
+	const action = typeof body.action === "string" ? body.action.trim() : "";
+	const details = typeof body.details === "string" ? body.details.trim() : "";
+
 	if (!employee || !action) {
 		res.status(400).json({ error: "Missing employee or action" });
 		return;
@@ -1050,12 +1163,13 @@ app.post("/audit-logs", validate, async (req: Request, res: Response) => {
 
 	try {
 		await AddAuditLogEntry(restaurantId, {
-			employee: String(employee),
-			action: String(action),
-			details: details ? String(details) : null,
+			employee,
+			action,
+			details: details || null,
 		});
 		res.status(201).json({ success: true });
 	} catch (error) {
+		console.error("add_audit_log_failed", error);
 		res.status(500).json({ error: "Unable to record audit log" });
 	}
 });
@@ -1283,6 +1397,11 @@ app.get("/orders/apc", validate, async (req: Request, res: Response) => {
 		return;
 	}
 
+	const periodRaw = typeof req.query.period === "string" ? req.query.period.trim().toLowerCase() : "";
+	const period = (periodRaw === "day" || periodRaw === "week" || periodRaw === "month"
+		? periodRaw
+		: "month") as "day" | "week" | "month";
+
 	const monthRaw = typeof req.query.month === "string" ? req.query.month.trim() : "";
 	let monthStart: Date | undefined;
 	if (monthRaw) {
@@ -1294,8 +1413,15 @@ app.get("/orders/apc", validate, async (req: Request, res: Response) => {
 		monthStart = parsed;
 	}
 
+	const employeeQuery = typeof req.query.employeeId === "string" ? req.query.employeeId.trim() : "";
+	const employeeId = employeeQuery || extractEmployeeId(req) || undefined;
+
 	try {
-		const insight = await GetMonthlyApcInsights(restaurantId, monthStart);
+		const insight = await GetMonthlyApcInsights(restaurantId, {
+			period,
+			periodStart: monthStart,
+			employeeId,
+		});
 		res.json(insight);
 	} catch (error) {
 		console.error("get_orders_apc_failed", error);

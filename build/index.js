@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetRestaurantProfile, UpdateRestaurantProfile, GetRoles, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, } from "./database_supabase.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetRoles, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant } from "./realtime.js";
 import { createServer } from "http";
@@ -113,6 +113,9 @@ function extractEmployeeId(req) {
     }
     return null;
 }
+function normalizeRestaurantSlug(value) {
+    return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
 async function resolveRoleForRequest(req, restaurantId) {
     const employeeId = extractEmployeeId(req);
     if (!employeeId) {
@@ -192,6 +195,98 @@ app.get("/health", async (_req, res) => {
         result.status = "degraded";
     }
     res.json(result);
+});
+app.post("/auth/register-restaurant", validate, async (req, res) => {
+    const body = (req.body ?? {});
+    const restaurantName = typeof body.restaurantName === "string" ? body.restaurantName.trim() : "";
+    const adminName = typeof body.adminName === "string" ? body.adminName.trim() : "";
+    const adminEmployeeId = typeof body.adminEmployeeId === "string" ? body.adminEmployeeId.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!restaurantName || !adminName || !adminEmployeeId || !password) {
+        res.status(400).json({
+            error: "restaurantName, adminName, adminEmployeeId, and password are required",
+        });
+        return;
+    }
+    const restaurantId = normalizeRestaurantSlug(restaurantName);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Restaurant name must include letters or numbers" });
+        return;
+    }
+    try {
+        try {
+            await GetRestaurantUsers(restaurantId);
+            res.status(409).json({ error: `Restaurant \"${restaurantName}\" is already registered.` });
+            return;
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!message.includes("Unknown restaurant id")) {
+                throw error;
+            }
+        }
+        await EnsureRestaurantSeed({
+            id: restaurantId,
+            name: restaurantName,
+            admin: {
+                employeeId: adminEmployeeId,
+                name: adminName,
+                password,
+            },
+            tables: [],
+        });
+        res.status(201).json({
+            restaurantId,
+            restaurantName,
+            admin: {
+                employeeId: adminEmployeeId,
+                name: adminName,
+                role: "admin",
+            },
+        });
+    }
+    catch (error) {
+        console.error("register_restaurant_failed", error);
+        res.status(500).json({ error: "Unable to register restaurant" });
+    }
+});
+app.post("/auth/employee-login", validate, async (req, res) => {
+    const body = (req.body ?? {});
+    const employeeId = typeof body.employeeId === "string" ? body.employeeId.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const restaurantIdRaw = typeof body.restaurantId === "string" ? body.restaurantId.trim() : "";
+    const restaurantName = typeof body.restaurantName === "string" ? body.restaurantName.trim() : "";
+    if (!employeeId || !password || (!restaurantIdRaw && !restaurantName)) {
+        res.status(400).json({
+            error: "employeeId, password, and restaurantName (or restaurantId) are required",
+        });
+        return;
+    }
+    const restaurantId = restaurantIdRaw || normalizeRestaurantSlug(restaurantName);
+    try {
+        const user = await AuthenticateRestaurantEmployee(restaurantId, employeeId, password);
+        if (!user) {
+            res.status(401).json({ error: "Invalid employee ID or password." });
+            return;
+        }
+        res.json({
+            uid: user.employeeId,
+            employeeId: user.employeeId,
+            name: user.name,
+            role: user.role,
+            restaurantId: user.restaurantId,
+            restaurantName: user.restaurantName,
+        });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("Unknown restaurant id")) {
+            res.status(404).json({ error: "Invalid restaurant name." });
+            return;
+        }
+        console.error("employee_login_failed", error);
+        res.status(500).json({ error: "Unable to sign in." });
+    }
 });
 app.get("/reception/info", (_req, res) => {
     const snapshot = getRestaurantKnowledgeSnapshot();
@@ -819,20 +914,27 @@ app.post("/audit-logs", validate, async (req, res) => {
         res.status(400).json({ error: "Missing restaurantId" });
         return;
     }
-    const { employee, action, details } = req.body ?? {};
+    const body = (req.body ?? {});
+    const employeeFromHeader = extractEmployeeId(req)?.trim() ?? "";
+    const employeeFromBody = typeof body.employee === "string" ? body.employee.trim() : "";
+    const employeeIdFromBody = typeof body.employee_id === "string" ? body.employee_id.trim() : "";
+    const employee = employeeFromHeader || employeeIdFromBody || employeeFromBody;
+    const action = typeof body.action === "string" ? body.action.trim() : "";
+    const details = typeof body.details === "string" ? body.details.trim() : "";
     if (!employee || !action) {
         res.status(400).json({ error: "Missing employee or action" });
         return;
     }
     try {
         await AddAuditLogEntry(restaurantId, {
-            employee: String(employee),
-            action: String(action),
-            details: details ? String(details) : null,
+            employee,
+            action,
+            details: details || null,
         });
         res.status(201).json({ success: true });
     }
     catch (error) {
+        console.error("add_audit_log_failed", error);
         res.status(500).json({ error: "Unable to record audit log" });
     }
 });
@@ -1034,6 +1136,41 @@ app.post("/orders", validate, async (req, res) => {
         res.status(400).json({ error: String(error?.message ?? "Unable to add order") });
     }
 });
+app.get("/orders/apc", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const periodRaw = typeof req.query.period === "string" ? req.query.period.trim().toLowerCase() : "";
+    const period = (periodRaw === "day" || periodRaw === "week" || periodRaw === "month"
+        ? periodRaw
+        : "month");
+    const monthRaw = typeof req.query.month === "string" ? req.query.month.trim() : "";
+    let monthStart;
+    if (monthRaw) {
+        const parsed = new Date(`${monthRaw}-01T00:00:00.000Z`);
+        if (Number.isNaN(parsed.getTime())) {
+            res.status(400).json({ error: "Invalid month. Use YYYY-MM." });
+            return;
+        }
+        monthStart = parsed;
+    }
+    const employeeQuery = typeof req.query.employeeId === "string" ? req.query.employeeId.trim() : "";
+    const employeeId = employeeQuery || extractEmployeeId(req) || undefined;
+    try {
+        const insight = await GetMonthlyApcInsights(restaurantId, {
+            period,
+            periodStart: monthStart,
+            employeeId,
+        });
+        res.json(insight);
+    }
+    catch (error) {
+        console.error("get_orders_apc_failed", error);
+        res.status(500).json({ error: "Unable to fetch APC insights" });
+    }
+});
 app.get("/restaurant/profile", validate, async (req, res) => {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
@@ -1173,6 +1310,63 @@ app.post("/roles/remove", validate, async (req, res) => {
     catch (error) {
         console.error("remove_role_failed", error);
         res.status(400).json({ error: String(error?.message ?? "Unable to remove role") });
+    }
+});
+app.get("/table-assignments", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin", "employee"]);
+    if (!auth) {
+        return;
+    }
+    try {
+        const assignments = await GetTableAssignments(auth.restaurantId);
+        res.json(assignments);
+    }
+    catch (error) {
+        console.error("get_table_assignments_failed", error);
+        res.status(500).json({ error: "Unable to fetch table assignments" });
+    }
+});
+app.post("/table-assignments/assign", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin"]);
+    if (!auth) {
+        return;
+    }
+    const tableName = typeof req.body?.table_name === "string" ? req.body.table_name.trim() : "";
+    const employeeId = typeof req.body?.employeeId === "string" ? req.body.employeeId.trim() : "";
+    if (!tableName || !employeeId) {
+        res.status(400).json({ error: "table_name and employeeId are required" });
+        return;
+    }
+    try {
+        const assigned = await AssignTableToEmployee(auth.restaurantId, tableName, employeeId);
+        res.json(assigned);
+    }
+    catch (error) {
+        console.error("assign_table_employee_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to assign table") });
+    }
+});
+app.post("/table-assignments/unassign", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin"]);
+    if (!auth) {
+        return;
+    }
+    const tableName = typeof req.body?.table_name === "string" ? req.body.table_name.trim() : "";
+    if (!tableName) {
+        res.status(400).json({ error: "table_name is required" });
+        return;
+    }
+    try {
+        const removed = await UnassignTableEmployee(auth.restaurantId, tableName);
+        if (!removed) {
+            res.status(404).json({ error: "Table assignment not found" });
+            return;
+        }
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error("unassign_table_employee_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to unassign table") });
     }
 });
 // Rtamanyu's integration
