@@ -43,19 +43,19 @@ class FeedbackQuestions(BaseModel):
         min_length=20,
         max_length=20,
     )
-    valet_parking: List[str] = Field(
+    valet: List[str] = Field(
         description="20 distinct feedback questions regarding the valet parking service.",
         min_length=20,
         max_length=20,
     )
-    follow_up_questions: List[str] = Field(
+    follow_up: List[str] = Field(
         description="20 follow-up questions asking for more description based on a previous rating. MUST contain exact strings <rate> and <service>.",
         min_length=20,
         max_length=20,
     )
 
     # Pydantic rule/validator to ensure the exact placeholders are present
-    @field_validator("follow_up_questions")
+    @field_validator("follow_up")
     @classmethod
     def check_placeholders(cls, questions: List[str]) -> List[str]:
         for i, q in enumerate(questions):
@@ -158,9 +158,9 @@ def generate_questions():
     - food
     - ambience
     - restroom
-    - valet_parking
+    - valet
     
-    Additionally, create a list of exactly 20 "follow_up_questions". 
+    Additionally, create a list of exactly 20 "follow_up". 
     CRITICAL RULE: Every single follow-up question MUST include the exact literal strings "<rate>" and "<service>".
     Example of a valid follow-up: "You rated the <service> as <rate>. Could you please provide more details on why you gave this rating?"
     

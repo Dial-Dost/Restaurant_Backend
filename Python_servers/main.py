@@ -49,8 +49,8 @@ categories = [
     "food",
     "ambience",
     "restroom",
-    "valet_parking",
-    "follow_up_questions",
+    "valet",
+    "follow_up",
 ]
 tot_ques_each_cat = 20
 feedback = {}
@@ -106,7 +106,7 @@ async def get_follow_up_question(category: str, rate: int):
     )
     random.seed(time.time())  # Ensure different random selection each time
     ques_idx = random.randint(0, tot_ques_each_cat - 1)
-    ques = feedback["follow_up_questions"][ques_idx]['question']
+    ques = feedback["follow_up"][ques_idx]['question']
 
     # Follow-up templates can include <service>. The UI currently sends numeric category ids,
     # so avoid showing awkward text like "for the 1".

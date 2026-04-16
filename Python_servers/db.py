@@ -49,8 +49,8 @@ DEFAULT_QUESTIONS = {
     "food": "How satisfied were you with the food quality and taste?",
     "ambience": "How did you feel about the ambience and overall atmosphere?",
     "restroom": "How would you rate the cleanliness of the restroom?",
-    "valet_parking": "How was your valet parking experience today?",
-    "follow_up_questions": "You rated the <service> as <rate>. Could you share what influenced that rating?",
+    "valet": "How was your valet parking experience today?",
+    "follow_up": "You rated the <service> as <rate>. Could you share what influenced that rating?",
 }
 
 
@@ -292,7 +292,7 @@ def save_to_feedback_database(
         with conn.transaction():
             with conn.cursor() as cur:
                 for cat in categories:
-                    cur.execute("delete from feedback_questions where category = %s", (cat,))
+                    # cur.execute("delete from feedback_questions where category = %s", (cat,))
                     questions = getattr(feedback_data, cat)
 
                     for q in questions:
