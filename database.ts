@@ -1011,7 +1011,15 @@ export async function GetFeedbackSummary(
 export async function GetRestaurantUsers(restaurantId: string): Promise<RestaurantUser[]> {
 	const restaurants = await restaurantsCollection();
 	const r = await restaurants.findOne({ id: restaurantId });
-	return (r && Array.isArray(r.users)) ? r.users : [];
+	const users = (r && Array.isArray(r.users)) ? r.users : [];
+	return users.map((u: any) => ({
+		...u,
+		// preserve any existing id field and also expose a normalized employee_id
+		id: u?.id ?? u?.employeeId ?? u?.uuid ?? null,
+		employee_id: u?.id ?? u?.employeeId ?? u?.uuid ?? null,
+		emp_Fname: String(u?.emp_Fname ?? u?.name ?? u?.employeeId ?? "").trim(),
+		emp_Lname: u?.emp_Lname ?? null,
+	}));
 }
 
 type RestaurantSeedInput = {

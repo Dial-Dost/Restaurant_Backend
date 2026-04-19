@@ -1,3 +1,15 @@
+// Status - Bill
+//   1. bill verification
+//   2. paid
+//   3. cancelled
+
+// Status - order
+//   1. preparing
+//   2. served
+//   3. bill verification
+//   4. paid
+//   5. cancelled
+
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 
@@ -5,6 +17,8 @@ const connectionString =
   process.env.SUPABASE_DIRECT_URL ??
   process.env.DATABASE_URL ??
   process.env.DIRECT_URL;
+
+const ipv4FallbackString = process.env.SUPABASE_IPV4_URL;
 
 if (!connectionString) {
   throw new Error(
@@ -16,6 +30,13 @@ const pool = new Pool({
   connectionString,
   ssl: { rejectUnauthorized: false },
 });
+
+const ipv4pool = new Pool({
+  connectionString: ipv4FallbackString,
+  ssl: { rejectUnauthorized: false },
+});
+
+let isipv4Fallback = false;
 
 type RestaurantContext = {
   inputId: string;
@@ -35,9 +56,15 @@ type SlotPayload = {
 };
 
 type RestaurantUser = {
-  employeeId: string;
-  name: string;
-  password?: string | null;
+  id: string,
+  res_id: string,
+  outlet_id: string,
+  employee_id: string,
+  employee_Username: string,
+  emp_Fname: string,
+  emp_Lname?: string | null,
+  // name: string;
+  password: string;
   role: "admin" | "employee" | "valet" | "waiter";
   role_all?: string[];
 };
@@ -70,12 +97,17 @@ export type FeedbackSubmissionInput = {
 export type FeedbackEntry = {
   id: string;
   restaurant_id: string;
-  employee_id: string;
-  customer_name?: string | null;
-  visit_date?: Date | null;
-  comments?: string | null;
-  overall_rating?: number | null;
-  category_ratings: FeedbackCategoryRatingInput[];
+  employeeId: string; // uuid of Employees.id
+  employeeUsername: string; // login username
+  name: string;
+  role: "admin" | "employee" | "valet" | "waiter";
+  role_all: string[];
+  restaurantId: string;
+  restaurantName: string;
+  res_id: string;
+  outlet_id: string;
+  emp_Fname: string | null;
+  emp_Lname: string | null;
   image_theme?: FeedbackThemeInput | null;
   source?: string | null;
   submitted_at: Date;
@@ -181,7 +213,7 @@ export type OrderRecord = {
   taxes?: Array<{ id: string; name: string; percentage: number }>;
   applyServiceCharge: boolean;
   total: number;
-  status: "Preparing" | "Served" | "Paid";
+  status: "Preparing" | "Served" | "Bill Verification" | "Paid" | "Cancelled";
 };
 
 export type TableAssignmentRecord = {
@@ -411,16 +443,29 @@ function parseMenuDescription(description: string | null): { price: number } {
 
 function toOrderStatusCode(status: string | undefined): number {
   const lowered = String(status ?? "preparing").trim().toLowerCase();
-  if (lowered === "paid") return 3;
+  if (lowered === "cancelled" || lowered === "canceled") return 5;
+  if (lowered === "paid") return 4;
+  if (lowered === "bill verification" || lowered === "bill_verification" || lowered === "verification") return 3;
   if (lowered === "served") return 2;
-  return 1;
+  return 1; // Preparing
 }
 
 function fromOrderStatusCode(status: unknown): OrderRecord["status"] {
   const code = Math.round(parseNumeric(status));
-  if (code >= 3) return "Paid";
-  if (code === 2) return "Served";
-  return "Preparing";
+  switch (code) {
+    case 1:
+      return "Preparing";
+    case 2:
+      return "Served";
+    case 3:
+      return "Bill Verification";
+    case 4:
+      return "Paid";
+    case 5:
+      return "Cancelled";
+    default:
+      return "Preparing";
+  }
 }
 
 function encodeSlot(payload: SlotPayload): string {
@@ -487,13 +532,24 @@ async function runQuery<TRow extends QueryResultRow = QueryResultRow>(
   params: unknown[] = [],
   client?: PoolClient,
 ): Promise<TRow[]> {
-  const runner = client ?? pool;
+  const runner = client ?? ( isipv4Fallback ? ipv4pool : pool );
   const result = await runner.query<TRow>(sql, params);
   return result.rows;
 }
 
 async function withTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
+  let client;
+  try{
+    client = await pool.connect();
+    isipv4Fallback = false;
+  }
+  catch (error) {
+    client = await ipv4pool.connect();
+    isipv4Fallback = true;
+  }
+  if (!client) {
+    throw new Error("Failed to acquire database client");
+  }
   try {
     await client.query("BEGIN");
     const value = await work(client);
@@ -510,8 +566,49 @@ async function withTransaction<T>(work: (client: PoolClient) => Promise<T>): Pro
 async function resolveRestaurantContext(
   restaurantId: string,
   client?: PoolClient,
+  outletOverride?: string,
 ): Promise<RestaurantContext | null> {
   const normalized = normalizeRestaurantId(restaurantId);
+
+  if (outletOverride && outletOverride.trim()) {
+    // If an outlet override is provided, try to resolve the specific outlet for this restaurant.
+    const rows = await runQuery<{
+      res_id: string;
+      outlet_id: string | null;
+      restaurant_slug: string;
+      restaurant_name: string;
+    }>(
+      `
+        select
+          r.id as res_id,
+          o.id as outlet_id,
+          r.res_username as restaurant_slug,
+          r.res_name as restaurant_name
+        from "Restaurant" r
+        left join "Outlets" o on o.res_id = r.id
+        where
+          (lower(r.res_username) = lower($1)
+            or lower(r.res_username) = lower($2)
+            or r.id::text = $3)
+          and (o.id::text = $4 or lower(o.outlet_name) = lower($4))
+        limit 1
+      `,
+      [restaurantId, normalized, restaurantId, outletOverride],
+      client,
+    );
+
+    const row = rows[0];
+    if (!row || !row.outlet_id) return null;
+
+    return {
+      inputId: restaurantId,
+      res_id: row.res_id,
+      outlet_id: row.outlet_id,
+      restaurant_slug: row.restaurant_slug,
+      restaurant_name: row.restaurant_name,
+    };
+  }
+
   const rows = await runQuery<{
     res_id: string;
     outlet_id: string | null;
@@ -554,8 +651,9 @@ async function resolveRestaurantContext(
 async function requireRestaurantContext(
   restaurantId: string,
   client?: PoolClient,
+  outletOverride?: string,
 ): Promise<RestaurantContext> {
-  const context = await resolveRestaurantContext(restaurantId, client);
+  const context = await resolveRestaurantContext(restaurantId, client, outletOverride);
   if (!context) {
     throw new Error(`Unknown restaurant id: ${restaurantId}`);
   }
@@ -579,6 +677,7 @@ async function findOrCreateActionId(actionName: string, client: PoolClient): Pro
   if (found) return found.id;
 
   const id = randomUUID();
+
   await runQuery(
     `
       insert into "Actions" (id, created_at, action_name, action_desc)
@@ -591,13 +690,13 @@ async function findOrCreateActionId(actionName: string, client: PoolClient): Pro
   return id;
 }
 
-async function findOrCreateEmployeeIdByUsername(
+async function findEmployeeIdByUsername(
   context: RestaurantContext,
-  employeeIdOrUsername: string,
+  _username: string,
   fallbackDisplayName: string,
   client: PoolClient,
 ): Promise<string> {
-  const username = employeeIdOrUsername.trim();
+  const username = _username.trim();
 
   const existing = await runQuery<{ emp_id: string }>(
     `
@@ -613,7 +712,9 @@ async function findOrCreateEmployeeIdByUsername(
   const existingRow = existing[0];
   if (existingRow) return existingRow.emp_id;
 
-  const parts = splitName(fallbackDisplayName || username);
+  throw new Error(`Employee with username '${_username}' not found in restaurant '${context.restaurant_name}', '${context.res_id}'`);
+
+  const parts = splitName(fallbackDisplayName || _username);
   const employeeUuid = randomUUID();
 
   await runQuery(
@@ -639,11 +740,104 @@ async function findOrCreateEmployeeIdByUsername(
       insert into "Login" (emp_id, created_at, res_id, outlet_id, emp_username, emp_pass)
       values ($1, now(), $2, $3, $4, $5)
     `,
-    [employeeUuid, context.res_id, context.outlet_id, username, "changeme"],
+    [employeeUuid, context.res_id, context.outlet_id, _username, "changeme"],
     client,
   );
 
   return employeeUuid;
+}
+
+export async function AddRestaurantUser(
+  restaurantId: string,
+  outletId: string | null,
+  payload: {
+    emp_Fname: string;
+    emp_Lname?: string | null;
+    email?: string | null;
+    role?: string | null;
+    password?: string | null;
+    employeeId?: string | null;
+    username?: string | null;
+    ph?: string | null;
+    add?: string | null;
+  },
+): Promise<Record<string, unknown>> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client, outletId ?? undefined);
+
+    const username = (payload.username ?? "").trim();
+    if (!username) {
+      throw new Error("username is required");
+    }
+
+    // ensure username not already taken for this restaurant/outlet
+    const existing = await runQuery<{ emp_id: string }>(
+      `select emp_id from "Login" where res_id = $1 and outlet_id = $2 and lower(emp_username) = lower($3) limit 1`,
+      [context.res_id, context.outlet_id, username],
+      client,
+    );
+    if (existing[0]) {
+      throw new Error("username already exists");
+    }
+
+    const employeeUuid = payload.employeeId && isUuid(payload.employeeId) ? payload.employeeId : randomUUID();
+
+    const empRoles = JSON.stringify({ primary: toRole(payload.role), all: [toRole(payload.role)] });
+
+    try {
+      await runQuery(
+        `
+      insert into "Employees"
+        (id, created_at, "emp_Fname", "emp_email", "emp_ph", "emp_add", emp_roles, res_id, outlet_id, "emp_Lname")
+      values
+        ($1, now(), $2, $3, $4, $5, $6::json, $7, $8, $9)
+    `,
+        [
+          employeeUuid,
+          payload.emp_Fname.trim(),
+          payload.email?.trim() || null,
+          payload.ph?.trim() || null,
+          payload.add?.trim() || null,
+          empRoles,
+          context.res_id,
+          context.outlet_id,
+          payload.emp_Lname?.trim() || null,
+        ],
+        client,
+      );
+    } catch (err: any) {
+      // Detect unique constraint on outlet_id which indicates a schema problem
+      if (err && (err.code === "23505" || err.constraint === "Employees_outlet_id_key")) {
+        throw new Error(
+          "Database constraint violation: the Employees table has a unique constraint on outlet_id. Multiple employees cannot share the same outlet_id. Please remove or fix the constraint (see README).",
+        );
+      }
+      throw err;
+    }
+
+    const pass = payload.password?.trim() || "changeme";
+
+    await runQuery(
+      `
+      insert into "Login" (emp_id, created_at, res_id, outlet_id, emp_username, emp_pass)
+      values ($1, now(), $2, $3, $4, $5)
+    `,
+      [employeeUuid, context.res_id, context.outlet_id, username, pass],
+      client,
+    );
+
+    const rows = await runQuery<Record<string, unknown>>(
+      `select id, created_at, "emp_Fname", "emp_Lname", "emp_email", "emp_ph", "emp_add", "emp_roles", "res_id", "outlet_id" from "Employees" where id = $1 limit 1`,
+      [employeeUuid],
+      client,
+    );
+
+    const created = rows[0] ?? null;
+    if (!created) throw new Error("failed to create employee");
+
+    // attach employee_id for compatibility with callers
+    return { ...created, employee_id: employeeUuid };
+  });
 }
 
 export async function CheckDatabaseHealth(): Promise<boolean> {
@@ -867,29 +1061,29 @@ export async function AddEmailToCustomer(
 
 async function getBookingsWithTableMeta(
   context: RestaurantContext,
-): Promise<
-  Array<{
-    id: string;
+): Promise<Array<{ table_id: string; slot: string; created_at: string }>> {
+  const rows = await runQuery<{
     table_id: string;
     slot: string;
-    created_at: Date;
-  }>
-> {
-  return runQuery(
+    created_at: string;
+  }>(
     `
-      select id, table_id, slot, created_at
+      select table_id, slot, created_at
       from "Bookings"
       where res_id = $1 and outlet_id = $2
+      order by created_at asc
     `,
     [context.res_id, context.outlet_id],
   );
+
+  return rows;
 }
 
 export async function GetTables(
   restaurantId: string,
-  time?: string,
-): Promise<TableAvailability[] | null> {
-  const at = time ? new Date(time) : new Date();
+  time?: string | Date | null,
+): Promise<Array<{ table_name: string; capacity: number | null; booked?: boolean; reserved?: boolean }> | null> {
+  const at = time ? new Date(time as any) : new Date();
   if (Number.isNaN(at.getTime())) return null;
 
   const context = await requireRestaurantContext(restaurantId);
@@ -908,31 +1102,46 @@ export async function GetTables(
     [context.res_id, context.outlet_id],
   );
 
-  const bookings = await getBookingsWithTableMeta(context);
-  const bookedIds = new Set<string>();
-  const reservedIds = new Set<string>();
+  const bookings = await runQuery<{
+    table_id: string | null;
+    slot: string;
+    created_at: string;
+  }>(
+    `
+      select table_id, slot, created_at
+      from "Bookings"
+      where res_id = $1 and outlet_id = $2 and table_id is not null
+    `,
+    [context.res_id, context.outlet_id],
+  );
 
+  const dayEnd = new Date(at);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  const active = [] as typeof bookings;
+  const upcoming = [] as typeof bookings;
   for (const booking of bookings) {
-    const slot = decodeSlot(booking.slot, booking.created_at);
+    const slot = decodeSlot(booking.slot, new Date(booking.created_at));
     const start = new Date(slot.start);
     const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) continue;
-
     if (start <= at && end > at) {
-      bookedIds.add(booking.table_id);
+      active.push(booking);
       continue;
     }
-
-    if (start > at) {
-      reservedIds.add(booking.table_id);
+    if (start > at && start <= dayEnd) {
+      upcoming.push(booking);
     }
   }
+
+  const bookedTables = new Set(active.map((b) => b.table_id).filter(Boolean));
+  const reservedTables = new Set(upcoming.map((b) => b.table_id).filter(Boolean));
 
   return tableRows.map((row) => ({
     table_name: row.table_name,
     capacity: parseNumeric(row.capacity),
-    booked: bookedIds.has(row.id),
-    reserved: reservedIds.has(row.id),
+    booked: bookedTables.has(row.id),
+    reserved: reservedTables.has(row.id),
   }));
 }
 
@@ -962,7 +1171,7 @@ export async function GetAvailableTablesForInterval(
   const busyIds = new Set<string>();
 
   for (const booking of bookings) {
-    const slot = decodeSlot(booking.slot, booking.created_at);
+    const slot = decodeSlot(booking.slot, new Date(booking.created_at));
     const bookingStart = new Date(slot.start);
     const bookingEnd = new Date(bookingStart.getTime() + slot.duration * MINUTE_IN_MS);
     if (Number.isNaN(bookingStart.getTime()) || Number.isNaN(bookingEnd.getTime())) continue;
@@ -1303,8 +1512,9 @@ async function ensureValetVehicleMetaTable(client?: PoolClient): Promise<void> {
 
 export async function GetParkingBays(
   restaurantId: string,
+  outletOverride?: string,
 ): Promise<ParkingBayRecord[]> {
-  const context = await requireRestaurantContext(restaurantId);
+  const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
   const rows = await runQuery<{
     id: string;
     bay_name: string;
@@ -1333,9 +1543,10 @@ export async function AddParkingBay(
   restaurantId: string,
   bayName: string,
   totalCapacity: number,
+  outletOverride?: string,
 ): Promise<ParkingBayRecord> {
   return withTransaction(async (client) => {
-    const context = await requireRestaurantContext(restaurantId, client);
+    const context = await requireRestaurantContext(restaurantId, client, outletOverride);
     const normalizedName = bayName.trim();
 
     const existing = await runQuery<{
@@ -1403,9 +1614,10 @@ export async function UpdateParkingBay(
   bayId: string | null,
   bayName: string,
   totalCapacity: number,
+  outletOverride?: string,
 ): Promise<ParkingBayRecord | null> {
   return withTransaction(async (client) => {
-    const context = await requireRestaurantContext(restaurantId, client);
+    const context = await requireRestaurantContext(restaurantId, client, outletOverride);
     const normalizedName = bayName.trim();
 
     let targetId: string | null = null;
@@ -1455,9 +1667,10 @@ export async function DeleteParkingBay(
   restaurantId: string,
   bayId: string | null,
   bayName: string | null,
+  outletOverride?: string,
 ): Promise<{ Bay_id: string; deleted_valet_count: number } | null> {
   return withTransaction(async (client) => {
-    const context = await requireRestaurantContext(restaurantId, client);
+    const context = await requireRestaurantContext(restaurantId, client, outletOverride);
 
     let targetId: string | null = null;
     if (bayId?.trim()) {
@@ -1501,8 +1714,9 @@ export async function SetParkingBayCurrent(
   restaurantId: string,
   bayId: string,
   currentCapacity: number,
+  outletOverride?: string,
 ): Promise<ParkingBayRecord | null> {
-  const context = await requireRestaurantContext(restaurantId);
+  const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
   const targetId = await resolveParkingBayId(context, bayId);
   if (!targetId) return null;
 
@@ -1534,8 +1748,9 @@ export async function SetParkingBayCurrent(
 
 export async function GetValetVehicleStates(
   restaurantId: string,
+  outletOverride?: string,
 ): Promise<ValetVehicleStateRecord[]> {
-  const context = await requireRestaurantContext(restaurantId);
+  const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
   const rows = await runQuery<{
     id: string;
     entry_time: Date | string | null;
@@ -1564,12 +1779,13 @@ export async function GetValetVehicleStates(
 export async function GetValetVehicleMetaByBookingIds(
   restaurantId: string,
   bookingIds: string[],
+  outletOverride?: string,
 ): Promise<Record<string, ValetVehicleMetaRecord>> {
   if (bookingIds.length === 0) {
     return {};
   }
 
-  const context = await requireRestaurantContext(restaurantId);
+  const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
   await ensureValetVehicleMetaTable();
 
   const rows = await runQuery<{
@@ -1601,6 +1817,7 @@ export async function UpsertValetVehicleMeta(
   bookingId: string,
   numberPlate: string,
   customerName?: string | null,
+  outletOverride?: string,
 ): Promise<ValetVehicleMetaRecord> {
   const normalizedPlate = normalizeVehiclePlate(numberPlate);
   if (!normalizedPlate) {
@@ -1608,7 +1825,7 @@ export async function UpsertValetVehicleMeta(
   }
 
   return withTransaction(async (client) => {
-    const context = await requireRestaurantContext(restaurantId, client);
+    const context = await requireRestaurantContext(restaurantId, client, outletOverride);
     await ensureValetVehicleMetaTable(client);
 
     const rows = await runQuery<{
@@ -1651,9 +1868,10 @@ export async function CreateValetVehicleState(
   restaurantId: string,
   entryTime?: Date,
   bayIdentifier?: string,
+  outletOverride?: string,
 ): Promise<{ booking_id: string; entry_time: string; bay_id: string }> {
   return withTransaction(async (client) => {
-    const context = await requireRestaurantContext(restaurantId, client);
+    const context = await requireRestaurantContext(restaurantId, client, outletOverride);
     let bayId: string | null = null;
     if (bayIdentifier?.trim()) {
       bayId = await resolveParkingBayId(context, bayIdentifier, client);
@@ -1687,8 +1905,9 @@ export async function CreateValetVehicleState(
 export async function GetValetVehicleState(
   restaurantId: string,
   bookingId: string,
+  outletOverride?: string,
 ): Promise<ValetVehicleStateRecord | null> {
-  const context = await requireRestaurantContext(restaurantId);
+  const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
   const rows = await runQuery<{
     id: string;
     entry_time: Date | string | null;
@@ -1720,8 +1939,9 @@ export async function UpdateValetVehicleState(
   restaurantId: string,
   bookingId: string,
   state: number,
+  outletOverride?: string,
 ): Promise<{ booking_id: string } | null> {
-  const context = await requireRestaurantContext(restaurantId);
+  const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
   const normalizedState = toNonNegativeInt(state);
 
   const rows = await runQuery<{ id: string }>(
@@ -1744,8 +1964,9 @@ export async function UpdateValetVehicleBay(
   restaurantId: string,
   bookingId: string,
   bayIdentifier: string | null,
+  outletOverride?: string,
 ): Promise<{ booking_id: string; bay_id: string | null } | null> {
-  const context = await requireRestaurantContext(restaurantId);
+  const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
 
   let resolvedBayId: string | null = null;
   if (bayIdentifier && bayIdentifier.trim()) {
@@ -1845,7 +2066,7 @@ export async function AddAuditLogEntry(
   const context = await requireRestaurantContext(restaurantId);
 
   await withTransaction(async (client) => {
-    const employeeId = await findOrCreateEmployeeIdByUsername(
+    const employeeId = await findEmployeeIdByUsername(
       context,
       entry.employee,
       entry.employee,
@@ -2255,6 +2476,11 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
 
     const subtotal = parseNumeric(payload.subtotal);
     const total = parseNumeric(payload.total);
+    // Prefer authoritative status from the DB row status column; fall back to embedded JSON payload.status
+    const statusFromRow = fromOrderStatusCode(row.status);
+    const statusFromPayload = (String(payload.status ?? "").trim() as OrderRecord["status"]) || undefined;
+    const finalStatus = statusFromRow || statusFromPayload || 'Preparing';
+
     return {
       id: row.id,
       table: String(payload.table ?? row.table_name ?? ""),
@@ -2273,7 +2499,7 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
         : undefined,
       applyServiceCharge: Boolean(payload.applyServiceCharge),
       total: total > 0 ? total : subtotal,
-      status: (String(payload.status ?? "").trim() as OrderRecord["status"]) || fromOrderStatusCode(row.status),
+      status: finalStatus,
     };
   });
 }
@@ -2355,6 +2581,202 @@ export async function AddOrder(
   return { id };
 }
 
+export async function AddBill(
+  restaurantId: string,
+  bill: {
+    id?: string;
+    emp_id?: string | null;
+    status: number;
+    reason?: string | null;
+    order_id: string;
+    total_amt: number;
+    tax_breakdown?: any;
+  },
+): Promise<{ id: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const id = isUuid(String(bill.id ?? '')) ? String(bill.id) : randomUUID();
+
+  // Try to resolve table_id from order
+  const orderRows = await runQuery<{ table_id: string }>(
+    `
+      select table_id
+      from "Orders"
+      where id = $1 and res_id = $2 and outlet_id = $3
+      limit 1
+    `,
+    [bill.order_id, context.res_id, context.outlet_id],
+  );
+  const tableId = orderRows[0]?.table_id ?? null;
+
+  const empId = isUuid(String(bill.emp_id ?? '')) ? String(bill.emp_id) : null;
+  if (bill.emp_id && !empId) {
+    console.warn(`AddBill: provided emp_id is not a uuid, treating as null: ${String(bill.emp_id)}`);
+  }
+
+  await runQuery(
+    `
+      insert into "Bills"
+        (id, created_at, res_id, outlet_id, table_id, emp_id, status, reason, order_id, total_amt, tax_breakdown)
+      values
+        ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      on conflict (id, res_id, outlet_id)
+      do update set
+        emp_id = excluded.emp_id,
+        status = excluded.status,
+        reason = excluded.reason,
+        total_amt = excluded.total_amt,
+        tax_breakdown = excluded.tax_breakdown
+    `,
+    [
+      id,
+      context.res_id,
+      context.outlet_id,
+      tableId,
+      empId,
+      bill.status,
+      bill.reason ?? null,
+      bill.order_id,
+      bill.total_amt,
+      bill.tax_breakdown ? JSON.stringify(bill.tax_breakdown) : null,
+    ],
+  );
+
+  return { id };
+}
+
+export async function UpdateBillStatusByOrder(
+  restaurantId: string,
+  orderId: string,
+  status: number,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  await runQuery(
+    `
+      update "Bills"
+      set status = $1
+      where order_id = $2 and res_id = $3 and outlet_id = $4
+    `,
+    [status, orderId, context.res_id, context.outlet_id],
+  );
+  return true;
+}
+
+export async function ReplaceBill(
+  restaurantId: string,
+  payload: {
+    old_order_id: string;
+    reason: string | null;
+    new_order: {
+      table: string;
+      customer: string;
+      items: OrderItemRecord[];
+      subtotal: number;
+      serviceChargePercentage?: number | null;
+      applyServiceCharge?: boolean;
+      taxes?: Array<{ id?: string; name: string; percentage: number }>;
+    };
+    new_bill: {
+      total_amt: number;
+      emp_id?: string | null;
+      status?: number;
+      tax_breakdown?: any;
+    };
+  },
+): Promise<{ newOrderId: string; newBillId: string } | null> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const oldOrderId = String(payload.old_order_id ?? '').trim();
+    if (!oldOrderId) throw new Error('Missing old_order_id');
+
+    // locate existing bill (if any)
+    const existing = await runQuery<{ id: string }>(
+      `select id from "Bills" where order_id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [oldOrderId, context.res_id, context.outlet_id],
+      client,
+    );
+    const oldBillId = existing[0]?.id ?? null;
+
+    // mark old bill cancelled and record reason
+    if (oldBillId) {
+      await runQuery(
+        `update "Bills" set status = $1, reason = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
+        [5, payload.reason ?? null, oldBillId, context.res_id, context.outlet_id],
+        client,
+      );
+    }
+
+    // mark old order cancelled and update embedded JSON status to keep read model consistent
+    await runQuery(
+      `
+      update "Orders"
+      set status = $1,
+          food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
+      where id = $3 and res_id = $4 and outlet_id = $5
+    `,
+      [5, 'Cancelled', oldOrderId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    // create new order id
+    const newOrderId = randomUUID();
+    const newOrderPayload = {
+      id: newOrderId,
+      table: String(payload.new_order.table ?? ''),
+      customer: String(payload.new_order.customer ?? 'Guest'),
+      items: Array.isArray(payload.new_order.items) ? payload.new_order.items : [],
+      subtotal: parseNumeric(payload.new_order.subtotal ?? 0),
+      serviceChargePercentage: parseNumeric(payload.new_order.serviceChargePercentage ?? 0),
+      taxes: Array.isArray(payload.new_order.taxes) ? payload.new_order.taxes : [],
+      applyServiceCharge: Boolean(payload.new_order.applyServiceCharge),
+      total: parseNumeric(payload.new_bill.total_amt ?? 0),
+      status: 'Bill Verification',
+    };
+
+    // resolve table id
+    const tableRows = await runQuery<{ id: string }>(
+      `select id from "Tables" where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3) limit 1`,
+      [context.res_id, context.outlet_id, newOrderPayload.table],
+      client,
+    );
+    const tableId = tableRows[0]?.id ?? null;
+
+    await runQuery(
+      `
+      insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, cust_id)
+      values ($1, now(), $2, $3, $4::json, $5, $6, null)
+    `,
+      [newOrderId, context.res_id, context.outlet_id, JSON.stringify(newOrderPayload), tableId, toOrderStatusCode('Bill Verification')],
+      client,
+    );
+
+    // create new bill row
+    const newBillId = randomUUID();
+    const empId = isUuid(String(payload.new_bill.emp_id ?? '')) ? String(payload.new_bill.emp_id) : null;
+
+    await runQuery(
+      `
+      insert into "Bills" (id, created_at, res_id, outlet_id, table_id, emp_id, status, reason, order_id, total_amt, tax_breakdown)
+      values ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `,
+      [
+        newBillId,
+        context.res_id,
+        context.outlet_id,
+        tableId,
+        empId,
+        payload.new_bill.status ?? 1,
+        null,
+        newOrderId,
+        payload.new_bill.total_amt ?? 0,
+        payload.new_bill.tax_breakdown ? JSON.stringify(payload.new_bill.tax_breakdown) : null,
+      ],
+      client,
+    );
+
+    return { newOrderId, newBillId };
+  });
+}
+
 async function ensureTableAssignmentsTable(client?: PoolClient): Promise<void> {
   await runQuery(
     `
@@ -2428,7 +2850,7 @@ async function resolveEmployeeByUsername(
   context: RestaurantContext,
   employeeId: string,
   client?: PoolClient,
-): Promise<{ id: string; username: string; name: string; role_primary: string } | null> {
+): Promise<{ id: string; username: string; fname: string | null; lname: string | null; role_primary: string } | null> {
   const rows = await runQuery<{
     id: string;
     username: string;
@@ -2461,7 +2883,8 @@ async function resolveEmployeeByUsername(
   return {
     id: row.id,
     username: row.username,
-    name: `${row.fname} ${row.lname}`.trim(),
+    fname: row.fname ?? null,
+    lname: row.lname ?? null,
     role_primary: row.role_primary ?? "employee",
   };
 }
@@ -2501,7 +2924,7 @@ export async function AssignTableToEmployee(
       id: assignmentId,
       table_name: table.table_name,
       employee_id: employee.username,
-      employee_name: employee.name,
+      employee_name: `${employee.fname ?? ''} ${employee.lname ?? ''}`.trim(),
       employee_role: employee.role_primary,
     };
   });
@@ -2629,9 +3052,10 @@ export async function GetMonthlyApcInsights(
     table_id: string;
     table_name: string | null;
     food: unknown;
+    status: unknown;
   }>(
     `
-      select o.id, o.created_at, o.table_id, t.table_name, o.food
+      select o.id, o.created_at, o.table_id, t.table_name, o.food, o.status
       from "Orders" o
       left join "Tables" t
         on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
@@ -2767,8 +3191,13 @@ export async function GetMonthlyApcInsights(
       assigned_employee_id: assignment?.employee_id ?? null,
       assigned_employee_name: assignment?.employee_name ?? null,
       assigned_employee_role: assignment?.employee_role ?? null,
+      // derive status from row.status (authoritative) or payload.status as fallback
+      status: fromOrderStatusCode(row.status) || ((String(payload.status ?? "").trim() as OrderApcInsight["order_id"]) && String(payload.status)) || 'Preparing',
     };
   });
+
+  // Exclude cancelled orders from revenue/covers calculations
+  const nonCancelled = precomputedOrders.filter(o => String(o.status).toLowerCase() !== 'cancelled');
 
   const scopedOrders = employeeFilter
     ? precomputedOrders.filter((order) =>
@@ -2778,11 +3207,14 @@ export async function GetMonthlyApcInsights(
       )
     : precomputedOrders;
 
-  const totalRevenue = round2(scopedOrders.reduce((sum, order) => sum + order.total, 0));
-  const totalCovers = scopedOrders.reduce((sum, order) => sum + order.people_count, 0);
+  // apply non-cancelled filter to scopedOrders for revenue calculations
+  const effectiveOrders = scopedOrders.filter(o => String(o.status).toLowerCase() !== 'cancelled');
+
+  const totalRevenue = round2(effectiveOrders.reduce((sum, order) => sum + order.total, 0));
+  const totalCovers = effectiveOrders.reduce((sum, order) => sum + order.people_count, 0);
   const monthlyApc = totalCovers > 0 ? round2(totalRevenue / totalCovers) : 0;
 
-  const orders: OrderApcInsight[] = scopedOrders.map((order) => {
+  const orders: OrderApcInsight[] = effectiveOrders.map((order) => {
     const target = round2(monthlyApc * order.people_count);
     return {
       order_id: order.order_id,
@@ -3019,6 +3451,93 @@ export async function UpdateRestaurantProfile(
   });
 }
 
+export async function GetOutletDefaultTax(restaurantId: string): Promise<Record<string, number> | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    default_tax: any;
+  }>(
+    `
+      select default_tax
+      from "Outlets"
+      where id = $1 and res_id = $2
+      limit 1
+    `,
+    [context.outlet_id, context.res_id],
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+  return row.default_tax ?? null;
+}
+
+export async function GetRestaurantLogo(restaurantId: string): Promise<string | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    logo_base64: string | null;
+  }>(
+    `
+      select encode(r.logo, 'base64') as logo_base64
+      from "Restaurant" r
+      where r.id = $1
+      limit 1
+    `,
+    [context.res_id],
+  );
+  const row = rows[0];
+  if (!row || !row.logo_base64) return null;
+  return row.logo_base64;
+}
+
+export async function GetBillByOrder(restaurantId: string, orderId: string) {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    id: string;
+    status: number;
+    total_amt: number;
+    emp_id: string | null;
+    tax_breakdown: any;
+  }>(
+    `
+      select id, status, total_amt, emp_id, tax_breakdown
+      from "Bills"
+      where order_id = $1 and res_id = $2 and outlet_id = $3
+      limit 1
+    `,
+    [orderId, context.res_id, context.outlet_id],
+  );
+  return rows[0] ?? null;
+}
+
+export async function GetRestaurantLogoRaw(restaurantId: string): Promise<Buffer | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{
+    logo: Buffer | null;
+  }>(
+    `
+      select r.logo
+      from "Restaurant" r
+      where r.id = $1
+      limit 1
+    `,
+    [context.res_id],
+  );
+  const row = rows[0];
+  if (!row || !row.logo) return null;
+  return row.logo as Buffer;
+}
+
+export async function UpdateOutletDefaultTax(restaurantId: string, defaultTax: Record<string, number> | null): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId);
+  await runQuery(
+    `
+      update "Outlets"
+      set default_tax = $2
+      where id = $1 and res_id = $3
+    `,
+    [context.outlet_id, JSON.stringify(defaultTax), context.res_id],
+  );
+}
+
 export async function GetRoles(restaurantId: string): Promise<RoleRecord[]> {
   const context = await requireRestaurantContext(restaurantId);
   const rows = await runQuery<{
@@ -3117,7 +3636,7 @@ async function getEmployeeRoleRow(
       where
         l.res_id = $1
         and l.outlet_id = $2
-        and lower(l.emp_username) = lower($3)
+        and l.emp_id = $3
       limit 1
     `,
     [context.res_id, context.outlet_id, employeeId.trim()],
@@ -3305,8 +3824,11 @@ export async function GetRestaurantUserRole(
   employeeId: string,
 ): Promise<RestaurantUser["role"] | null> {
   const context = await requireRestaurantContext(restaurantId);
-  const normalizedEmployeeId = employeeId.trim().toLowerCase();
+  const normalizedEmployeeId = employeeId.trim();
   if (!normalizedEmployeeId) return null;
+
+  // Accept either employee username (case-insensitive) or employee UUID (emp_id)
+  const normalizedEmployeeLower = normalizedEmployeeId.toLowerCase();
 
   const rows = await runQuery<{ role_primary: string | null }>(
     `
@@ -3317,10 +3839,13 @@ export async function GetRestaurantUserRole(
       where
         l.res_id = $1
         and l.outlet_id = $2
-        and lower(l.emp_username) = lower($3)
+        and (
+          lower(l.emp_username) = $3
+          or l.emp_id = $4
+        )
       limit 1
     `,
-    [context.res_id, context.outlet_id, normalizedEmployeeId],
+    [context.res_id, context.outlet_id, normalizedEmployeeLower, normalizedEmployeeId],
   );
 
   const row = rows[0];
@@ -3355,9 +3880,7 @@ export async function AddFeedbackEntry(
     Math.min(5, Math.round(ratings.reduce((acc, cur) => acc + cur.rating, 0) / ratings.length)),
   );
 
-  const empUuid = await withTransaction(async (client) =>
-    findOrCreateEmployeeIdByUsername(context, employeeId, employeeId, client),
-  );
+  const empUuid = employeeId;
 
   const id = randomUUID();
   const visitDate =
@@ -3393,7 +3916,7 @@ export async function AddFeedbackEntry(
 export async function GetFeedbackEntries(
   restaurantId: string,
   limit = 100,
-): Promise<FeedbackEntry[]> {
+): Promise<any[]> {
   const context = await requireRestaurantContext(restaurantId);
   const safeLimit = Math.max(1, Math.min(limit, 5000));
 
@@ -3404,7 +3927,7 @@ export async function GetFeedbackEntries(
     cust_name: string | null;
     comments: string | null;
     overall_rating: number;
-    cattegory_ratings: unknown;
+    category_ratings: unknown;
     visit_date: Date;
     source: string;
     submitted_at: Date;
@@ -3437,8 +3960,8 @@ export async function GetFeedbackEntries(
     visit_date: row.visit_date ? new Date(row.visit_date) : null,
     comments: row.comments,
     overall_rating: parseNumeric(row.overall_rating),
-    category_ratings: Array.isArray(row.cattegory_ratings)
-      ? (row.cattegory_ratings as FeedbackCategoryRatingInput[])
+    category_ratings: Array.isArray(row.category_ratings)
+      ? (row.category_ratings as FeedbackCategoryRatingInput[])
       : [],
     image_theme: null,
     source: row.source,
@@ -3534,8 +4057,14 @@ export async function GetRestaurantUsers(
   );
 
   return rows.map((row) => ({
-    employeeId: row.emp_username,
-    name: `${row.fname} ${row.lname}`.trim(),
+    // include the Employees.id (UUID) as `id` and `employee_id` so callers can match by UUID
+    id: row.employee_id,
+    res_id: context.res_id,
+    outlet_id: context.outlet_id,
+    employee_id: row.employee_id,
+    employee_Username: row.emp_username,
+    emp_Fname: String(row.fname ?? row.emp_username ?? "").trim(),
+    emp_Lname: row.lname ?? null,
     password: row.emp_pass,
     role: toRole(row.role_primary),
     role_all: parseEmployeeRoles(row.emp_roles).all,
@@ -3543,37 +4072,47 @@ export async function GetRestaurantUsers(
 }
 
 export type EmployeeLoginResult = {
-  employeeId: string;
-  name: string;
+  employeeId: string; // uuid of Employees.id
+  employeeUsername: string; // login username
   role: "admin" | "employee" | "valet" | "waiter";
   role_all: string[];
   restaurantId: string;
   restaurantName: string;
+  res_id: string;
+  outlet_id: string;
+  emp_Fname: string;
+  emp_Lname: string | null;
 };
 
 export async function AuthenticateRestaurantEmployee(
   restaurantId: string,
-  employeeId: string,
+  employeeUsername: string,
   password: string,
 ): Promise<EmployeeLoginResult | null> {
   const context = await requireRestaurantContext(restaurantId);
-  const normalizedEmployeeId = employeeId.trim();
-  if (!normalizedEmployeeId) return null;
+  const normalizedEmployeeUsername = employeeUsername.trim();
+  if (!normalizedEmployeeUsername) return null;
 
   const rows = await runQuery<{
+    emp_id: string;
     emp_username: string;
-    fname: string;
-    lname: string;
+    emp_fname: string | null;
+    emp_lname: string | null;
     role_primary: string | null;
     emp_roles: unknown;
+    res_id: string;
+    outlet_id: string;
   }>(
     `
       select
+        e.id as emp_id,
         l.emp_username,
-        e."emp_Fname" as fname,
-        e."emp_Lname" as lname,
+        e."emp_Fname" as emp_fname,
+        e."emp_Lname" as emp_lname,
         e.emp_roles->>'primary' as role_primary,
-        e.emp_roles as emp_roles
+        e.emp_roles as emp_roles,
+        e.res_id,
+        e.outlet_id
       from "Login" l
       join "Employees" e
         on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
@@ -3584,19 +4123,23 @@ export async function AuthenticateRestaurantEmployee(
         and l.emp_pass = $4
       limit 1
     `,
-    [context.res_id, context.outlet_id, normalizedEmployeeId, password],
+    [context.res_id, context.outlet_id, normalizedEmployeeUsername, password],
   );
 
   const row = rows[0];
   if (!row) return null;
 
   return {
-    employeeId: row.emp_username,
-    name: `${row.fname} ${row.lname}`.trim(),
+    employeeId: row.emp_id,
+    employeeUsername: row.emp_username,
     role: toRole(row.role_primary),
     role_all: parseEmployeeRoles(row.emp_roles).all,
     restaurantId: context.restaurant_slug,
     restaurantName: context.restaurant_name,
+    res_id: row.res_id,
+    outlet_id: row.outlet_id,
+    emp_Fname: String(row.emp_fname ?? row.emp_username ?? "").trim(),
+    emp_Lname: row.emp_lname ?? null,
   };
 }
 

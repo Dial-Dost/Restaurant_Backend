@@ -27,6 +27,7 @@ connection_string = (
     or os.environ.get("DATABASE_URL")
     or os.environ.get("DIRECT_URL")
 )
+ipv4_fallback_string = os.environ.get("SUPABASE_IPV4_URL")
 
 if not connection_string:
     raise RuntimeError(
@@ -73,7 +74,15 @@ def _get_conn():
         return _pg_conn
 
     info("Connecting to Supabase Postgres...")
-    _pg_conn = psycopg.connect(connection_string, row_factory=dict_row)
+    try:
+        _pg_conn = psycopg.connect(connection_string, row_factory=dict_row)
+    except Exception as e:
+        info("Failed to connect to Supabase Postgres. Trying IPv4 fallback...")
+        if ipv4_fallback_string:
+            _pg_conn = psycopg.connect(ipv4_fallback_string, row_factory=dict_row)
+        else:
+            raise e
+
     with _pg_conn.cursor() as cur:
         cur.execute("select 1")
     info("Connected to Supabase Postgres successfully.")
@@ -86,7 +95,7 @@ def _get_conn():
 def _ensure_feedback_questions_table(conn):
     with conn.cursor() as cur:
         cur.execute(
-            '''
+            """
             create table if not exists feedback_questions (
                 id uuid primary key,
                 category text not null,
@@ -94,13 +103,13 @@ def _ensure_feedback_questions_table(conn):
                 tokens integer not null default 0,
                 created_at timestamptz not null default now()
             )
-            '''
+            """
         )
         cur.execute(
-            '''
+            """
             create index if not exists idx_feedback_questions_category_created
             on feedback_questions (category, created_at)
-            '''
+            """
         )
     conn.commit()
 
@@ -108,7 +117,7 @@ def _ensure_feedback_questions_table(conn):
 def _ensure_valet_vehicle_meta_table(conn):
     with conn.cursor() as cur:
         cur.execute(
-            '''
+            """
             create table if not exists "Valet_vehicle_meta" (
                 booking_id uuid primary key,
                 res_id uuid not null,
@@ -118,41 +127,71 @@ def _ensure_valet_vehicle_meta_table(conn):
                 created_at timestamptz not null default now(),
                 updated_at timestamptz not null default now()
             )
-            '''
+            """
         )
         cur.execute(
-            '''
+            """
             create unique index if not exists idx_valet_vehicle_meta_res_outlet_booking
             on "Valet_vehicle_meta" (res_id, outlet_id, booking_id)
-            '''
+            """
         )
     conn.commit()
 
 
-def _resolve_restaurant_context(restaurant_id: str) -> dict:
+def _resolve_restaurant_context(
+    restaurant_id: str, outlet_override: str | None = None
+) -> dict:
     conn = _get_conn()
     normalized = _normalize_restaurant_id(restaurant_id)
 
-    with conn.cursor() as cur:
-        cur.execute(
-            '''
-            select
-                r.id as res_id,
-                o.id as outlet_id,
-                r.res_username as restaurant_slug,
-                r.res_name as restaurant_name
-            from "Restaurant" r
-            left join "Outlets" o on o.res_id = r.id
-            where
-                lower(r.res_username) = lower(%s)
-                or lower(r.res_username) = lower(%s)
-                or r.id::text = %s
-            order by o.created_at asc nulls last
-            limit 1
-            ''',
-            (restaurant_id, normalized, restaurant_id),
-        )
-        row = cur.fetchone()
+    if outlet_override and outlet_override.strip():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    r.id as res_id,
+                    o.id as outlet_id,
+                    r.res_username as restaurant_slug,
+                    r.res_name as restaurant_name
+                from "Restaurant" r
+                left join "Outlets" o on o.res_id = r.id
+                where
+                    (lower(r.res_username) = lower(%s)
+                        or lower(r.res_username) = lower(%s)
+                        or r.id::text = %s)
+                    and (o.id::text = %s or lower(o.outlet_name) = lower(%s))
+                limit 1
+                """,
+                (
+                    restaurant_id,
+                    normalized,
+                    restaurant_id,
+                    outlet_override,
+                    outlet_override,
+                ),
+            )
+            row = cur.fetchone()
+    else:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    r.id as res_id,
+                    o.id as outlet_id,
+                    r.res_username as restaurant_slug,
+                    r.res_name as restaurant_name
+                from "Restaurant" r
+                left join "Outlets" o on o.res_id = r.id
+                where
+                    lower(r.res_username) = lower(%s)
+                    or lower(r.res_username) = lower(%s)
+                    or r.id::text = %s
+                order by o.created_at asc nulls last
+                limit 1
+                """,
+                (restaurant_id, normalized, restaurant_id),
+            )
+            row = cur.fetchone()
 
     if not row or not row.get("outlet_id"):
         raise ValueError(f"Unknown restaurant id: {restaurant_id}")
@@ -179,12 +218,12 @@ def _resolve_bay_id(context: dict, bay_identifier: str | None):
     with conn.cursor() as cur:
         if _is_uuid(ident):
             cur.execute(
-                '''
+                """
                 select id
                 from "Parking_Bays"
                 where res_id = %s and outlet_id = %s and id = %s
                 limit 1
-                ''',
+                """,
                 (context["res_id"], context["outlet_id"], ident),
             )
             row = cur.fetchone()
@@ -192,12 +231,12 @@ def _resolve_bay_id(context: dict, bay_identifier: str | None):
                 return row["id"]
 
         cur.execute(
-            '''
+            """
             select id
             from "Parking_Bays"
             where res_id = %s and outlet_id = %s and lower(bay_name) = lower(%s)
             limit 1
-            ''',
+            """,
             (context["res_id"], context["outlet_id"], ident),
         )
         row = cur.fetchone()
@@ -209,12 +248,12 @@ def _ensure_default_parking_bay_id(context: dict) -> str:
 
     with conn.cursor() as cur:
         cur.execute(
-            '''
+            """
             select id
             from "Parking_Bays"
             where res_id = %s and outlet_id = %s and lower(bay_name) = lower(%s)
             limit 1
-            ''',
+            """,
             (context["res_id"], context["outlet_id"], "Main"),
         )
         row = cur.fetchone()
@@ -222,13 +261,13 @@ def _ensure_default_parking_bay_id(context: dict) -> str:
             return row["id"]
 
         cur.execute(
-            '''
+            """
             select id
             from "Parking_Bays"
             where res_id = %s and outlet_id = %s
             order by created_at asc
             limit 1
-            ''',
+            """,
             (context["res_id"], context["outlet_id"]),
         )
         row = cur.fetchone()
@@ -237,12 +276,12 @@ def _ensure_default_parking_bay_id(context: dict) -> str:
 
         bay_id = str(uuid4())
         cur.execute(
-            '''
+            """
             insert into "Parking_Bays"
                 (id, created_at, bay_name, current_capacity, total_capacity, res_id, outlet_id)
             values
                 (%s, now(), %s, %s, %s, %s, %s)
-            ''',
+            """,
             (bay_id, "Main", 0, 5, context["res_id"], context["outlet_id"]),
         )
 
@@ -257,11 +296,11 @@ def _adjust_bay_capacity_by_context(context: dict, bay_id: str | None, delta: in
     conn = _get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            '''
+            """
             update "Parking_Bays"
             set current_capacity = greatest(0, coalesce(current_capacity, 0) + %s)
             where id = %s and res_id = %s and outlet_id = %s
-            ''',
+            """,
             (int(delta), bay_id, context["res_id"], context["outlet_id"]),
         )
 
@@ -298,10 +337,10 @@ def save_to_feedback_database(
                     for q in questions:
                         tokens_spent = count_tokens_with_retry(client, model_name, q)
                         cur.execute(
-                            '''
+                            """
                             insert into feedback_questions (id, category, question, tokens, created_at)
                             values (%s, %s, %s, %s, now())
-                            ''',
+                            """,
                             (str(uuid4()), cat, q, int(tokens_spent)),
                         )
 
@@ -325,12 +364,12 @@ def get_all_feedback() -> dict:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                '''
+                """
                 select category, question, tokens
                 from feedback_questions
                 where category = any(%s)
                 order by created_at asc
-                ''',
+                """,
                 (categories,),
             )
             rows = cur.fetchall()
@@ -363,10 +402,12 @@ def get_all_feedback() -> dict:
     return all_feedback
 
 
-def create_valet_record_in_db(number_plate: str, restaurant_id: str) -> dict:
+def create_valet_record_in_db(
+    number_plate: str, restaurant_id: str, outlet_override: str | None = None
+) -> dict:
     """Creates a new valet record in Supabase Postgres."""
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         conn = _get_conn()
 
         booking_id = str(uuid4())
@@ -376,12 +417,12 @@ def create_valet_record_in_db(number_plate: str, restaurant_id: str) -> dict:
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
-                    '''
+                    """
                     insert into "Valet_vehicle_state"
                         (id, entry_time, res_id, outlet_id, state, exit_time, bay_id)
                     values
                         (%s, %s, %s, %s, 1, null, %s)
-                    ''',
+                    """,
                     (
                         booking_id,
                         _now_iso(),
@@ -392,7 +433,7 @@ def create_valet_record_in_db(number_plate: str, restaurant_id: str) -> dict:
                 )
 
                 cur.execute(
-                    '''
+                    """
                     insert into "Valet_vehicle_meta"
                         (booking_id, res_id, outlet_id, number_plate, customer_name, created_at, updated_at)
                     values
@@ -401,7 +442,7 @@ def create_valet_record_in_db(number_plate: str, restaurant_id: str) -> dict:
                     do update set
                         number_plate = excluded.number_plate,
                         updated_at = now()
-                    ''',
+                    """,
                     (
                         booking_id,
                         context["res_id"],
@@ -421,28 +462,47 @@ def create_valet_record_in_db(number_plate: str, restaurant_id: str) -> dict:
         return {"error": "Database error occurred."}
 
 
-def get_valet_info_from_db(booking_id: str) -> dict:
+def get_valet_info_from_db(booking_id: str, outlet_override: str | None = None) -> dict:
     """Retrieves valet state by booking ID from Supabase Postgres."""
     try:
         conn = _get_conn()
         with conn.cursor() as cur:
-            cur.execute(
-                '''
-                select
-                    s.id as booking_id,
-                    s.state,
-                    s.entry_time,
-                    s.exit_time,
-                    s.bay_id,
-                    m.number_plate
-                from "Valet_vehicle_state" s
-                left join "Valet_vehicle_meta" m
-                    on m.booking_id = s.id and m.res_id = s.res_id and m.outlet_id = s.outlet_id
-                where s.id = %s
-                limit 1
-                ''',
-                (booking_id,),
-            )
+            if outlet_override and outlet_override.strip():
+                cur.execute(
+                    """
+                    select
+                        s.id as booking_id,
+                        s.state,
+                        s.entry_time,
+                        s.exit_time,
+                        s.bay_id,
+                        m.number_plate
+                    from "Valet_vehicle_state" s
+                    left join "Valet_vehicle_meta" m
+                        on m.booking_id = s.id and m.res_id = s.res_id and m.outlet_id = s.outlet_id
+                    where s.id = %s and s.outlet_id = %s
+                    limit 1
+                    """,
+                    (booking_id, outlet_override),
+                )
+            else:
+                cur.execute(
+                    """
+                    select
+                        s.id as booking_id,
+                        s.state,
+                        s.entry_time,
+                        s.exit_time,
+                        s.bay_id,
+                        m.number_plate
+                    from "Valet_vehicle_state" s
+                    left join "Valet_vehicle_meta" m
+                        on m.booking_id = s.id and m.res_id = s.res_id and m.outlet_id = s.outlet_id
+                    where s.id = %s
+                    limit 1
+                    """,
+                    (booking_id,),
+                )
             row = cur.fetchone()
 
         if not row:
@@ -466,21 +526,34 @@ def get_valet_info_from_db(booking_id: str) -> dict:
         return {"error": "Database error occurred."}
 
 
-def update_valet_state_from_db(booking_id: str, state: int) -> dict:
+def update_valet_state_from_db(
+    booking_id: str, state: int, outlet_override: str | None = None
+) -> dict:
     """Updates valet state and adjusts bay capacity using Supabase Postgres."""
     try:
         conn = _get_conn()
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute(
-                    '''
-                    select id, state, bay_id, res_id, outlet_id
-                    from "Valet_vehicle_state"
-                    where id = %s
-                    limit 1
-                    ''',
-                    (booking_id,),
-                )
+                if outlet_override and outlet_override.strip():
+                    cur.execute(
+                        """
+                        select id, state, bay_id, res_id, outlet_id
+                        from "Valet_vehicle_state"
+                        where id = %s and outlet_id = %s
+                        limit 1
+                        """,
+                        (booking_id, outlet_override),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        select id, state, bay_id, res_id, outlet_id
+                        from "Valet_vehicle_state"
+                        where id = %s
+                        limit 1
+                        """,
+                        (booking_id,),
+                    )
                 active_record = cur.fetchone()
 
                 if not active_record:
@@ -504,13 +577,13 @@ def update_valet_state_from_db(booking_id: str, state: int) -> dict:
                     _adjust_bay_capacity_by_context(context, bay_id, -1)
 
                 cur.execute(
-                    '''
+                    """
                     update "Valet_vehicle_state"
                     set
                         state = %s,
                         exit_time = case when %s = 6 then now() else exit_time end
                     where id = %s and res_id = %s and outlet_id = %s
-                    ''',
+                    """,
                     (
                         next_state,
                         next_state,
@@ -522,11 +595,11 @@ def update_valet_state_from_db(booking_id: str, state: int) -> dict:
 
                 if next_state in (5, 6) and bay_id:
                     cur.execute(
-                        '''
+                        """
                         update "Valet_vehicle_state"
                         set bay_id = null
                         where id = %s and res_id = %s and outlet_id = %s
-                        ''',
+                        """,
                         (booking_id, context["res_id"], context["outlet_id"]),
                     )
 
@@ -540,21 +613,34 @@ def update_valet_state_from_db(booking_id: str, state: int) -> dict:
         return {"error": "Database error occurred."}
 
 
-def update_valet_bay_from_db(booking_id: str, bay_id: str) -> dict:
+def update_valet_bay_from_db(
+    booking_id: str, bay_id: str, outlet_override: str | None = None
+) -> dict:
     """Updates bay assignment for a valet record in Supabase Postgres."""
     try:
         conn = _get_conn()
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute(
-                    '''
-                    select id, state, bay_id, res_id, outlet_id
-                    from "Valet_vehicle_state"
-                    where id = %s
-                    limit 1
-                    ''',
-                    (booking_id,),
-                )
+                if outlet_override and outlet_override.strip():
+                    cur.execute(
+                        """
+                        select id, state, bay_id, res_id, outlet_id
+                        from "Valet_vehicle_state"
+                        where id = %s and outlet_id = %s
+                        limit 1
+                        """,
+                        (booking_id, outlet_override),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        select id, state, bay_id, res_id, outlet_id
+                        from "Valet_vehicle_state"
+                        where id = %s
+                        limit 1
+                        """,
+                        (booking_id,),
+                    )
                 active_record = cur.fetchone()
 
                 if not active_record:
@@ -591,11 +677,11 @@ def update_valet_bay_from_db(booking_id: str, bay_id: str) -> dict:
                     _adjust_bay_capacity_by_context(context, prev_bay, -1)
 
                 cur.execute(
-                    '''
+                    """
                     update "Valet_vehicle_state"
                     set bay_id = %s
                     where id = %s and res_id = %s and outlet_id = %s
-                    ''',
+                    """,
                     (next_bay, booking_id, context["res_id"], context["outlet_id"]),
                 )
 
@@ -609,15 +695,17 @@ def update_valet_bay_from_db(booking_id: str, bay_id: str) -> dict:
         return {"error": "Database error occurred."}
 
 
-def get_all_valet_records_from_db(restaurant_id: str) -> list[dict]:
+def get_all_valet_records_from_db(
+    restaurant_id: str, outlet_override: str | None = None
+) -> list[dict]:
     """Retrieves all valet records for a restaurant from Supabase Postgres."""
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         conn = _get_conn()
 
         with conn.cursor() as cur:
             cur.execute(
-                '''
+                """
                 select
                     s.id as booking_id,
                     s.state,
@@ -630,7 +718,7 @@ def get_all_valet_records_from_db(restaurant_id: str) -> list[dict]:
                     on m.booking_id = s.id and m.res_id = s.res_id and m.outlet_id = s.outlet_id
                 where s.res_id = %s and s.outlet_id = %s
                 order by s.entry_time desc nulls last
-                ''',
+                """,
                 (context["res_id"], context["outlet_id"]),
             )
             rows = cur.fetchall()
@@ -656,20 +744,22 @@ def get_all_valet_records_from_db(restaurant_id: str) -> list[dict]:
         return []
 
 
-def get_all_bays_from_db(restaurant_id: str) -> list[dict]:
+def get_all_bays_from_db(
+    restaurant_id: str, outlet_override: str | None = None
+) -> list[dict]:
     """Retrieves all bays for a restaurant from Supabase Postgres."""
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         conn = _get_conn()
 
         with conn.cursor() as cur:
             cur.execute(
-                '''
+                """
                 select id, bay_name, current_capacity, total_capacity
                 from "Parking_Bays"
                 where res_id = %s and outlet_id = %s
                 order by created_at asc
-                ''',
+                """,
                 (context["res_id"], context["outlet_id"]),
             )
             rows = cur.fetchall()
@@ -690,12 +780,17 @@ def get_all_bays_from_db(restaurant_id: str) -> list[dict]:
         return []
 
 
-def _adjust_bay_capacity(restaurant_id: str, bay_id: str | None, delta: int) -> None:
+def _adjust_bay_capacity(
+    restaurant_id: str,
+    bay_id: str | None,
+    delta: int,
+    outlet_override: str | None = None,
+) -> None:
     if not bay_id:
         return
 
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         resolved = _resolve_bay_id(context, bay_id)
         if not resolved:
             return
@@ -707,11 +802,14 @@ def _adjust_bay_capacity(restaurant_id: str, bay_id: str | None, delta: int) -> 
 
 
 def add_bay_in_db(
-    restaurant_id: str, bay_name: str, total_capacity: int | None = None
+    restaurant_id: str,
+    bay_name: str,
+    total_capacity: int | None = None,
+    outlet_override: str | None = None,
 ) -> dict:
     """Adds a new bay in Supabase Postgres."""
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         conn = _get_conn()
         normalized_name = bay_name.strip()
         cap = max(0, int(total_capacity) if total_capacity is not None else 0)
@@ -719,12 +817,12 @@ def add_bay_in_db(
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
-                    '''
+                    """
                     select id, bay_name, current_capacity, total_capacity
                     from "Parking_Bays"
                     where res_id = %s and outlet_id = %s and lower(bay_name) = lower(%s)
                     limit 1
-                    ''',
+                    """,
                     (context["res_id"], context["outlet_id"], normalized_name),
                 )
                 existing = cur.fetchone()
@@ -739,12 +837,12 @@ def add_bay_in_db(
 
                 new_id = str(uuid4())
                 cur.execute(
-                    '''
+                    """
                     insert into "Parking_Bays"
                         (id, created_at, bay_name, current_capacity, total_capacity, res_id, outlet_id)
                     values
                         (%s, now(), %s, 0, %s, %s, %s)
-                    ''',
+                    """,
                     (
                         new_id,
                         normalized_name,
@@ -772,27 +870,32 @@ def update_bay_in_db(
     bay_id: str | None,
     bay_name: str,
     total_capacity: int | None = None,
+    outlet_override: str | None = None,
 ) -> dict:
     """Updates an existing bay in Supabase Postgres."""
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         conn = _get_conn()
         normalized_name = bay_name.strip()
         cap = max(0, int(total_capacity) if total_capacity is not None else 0)
 
-        target_id = _resolve_bay_id(context, bay_id) if bay_id else _resolve_bay_id(context, bay_name)
+        target_id = (
+            _resolve_bay_id(context, bay_id)
+            if bay_id
+            else _resolve_bay_id(context, bay_name)
+        )
         if not target_id:
             return {"error": "Bay not found"}
 
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
-                    '''
+                    """
                     update "Parking_Bays"
                     set bay_name = %s, total_capacity = %s
                     where id = %s and res_id = %s and outlet_id = %s
                     returning id, bay_name, current_capacity, total_capacity
-                    ''',
+                    """,
                     (
                         normalized_name,
                         cap,
@@ -819,11 +922,14 @@ def update_bay_in_db(
 
 
 def delete_bay_in_db(
-    restaurant_id: str, bay_id: str | None = None, bay_name: str | None = None
+    restaurant_id: str,
+    bay_id: str | None = None,
+    bay_name: str | None = None,
+    outlet_override: str | None = None,
 ) -> dict:
     """Deletes a bay and related valet rows for that bay in Supabase Postgres."""
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         target = _resolve_bay_id(context, bay_id if bay_id else bay_name)
         if not target:
             return {"error": "Bay not found"}
@@ -833,19 +939,19 @@ def delete_bay_in_db(
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
-                    '''
+                    """
                     delete from "Valet_vehicle_state"
                     where res_id = %s and outlet_id = %s and bay_id = %s
-                    ''',
+                    """,
                     (context["res_id"], context["outlet_id"], target),
                 )
                 deleted_valet_count = cur.rowcount
 
                 cur.execute(
-                    '''
+                    """
                     delete from "Parking_Bays"
                     where id = %s and res_id = %s and outlet_id = %s
-                    ''',
+                    """,
                     (target, context["res_id"], context["outlet_id"]),
                 )
 
@@ -860,11 +966,14 @@ def delete_bay_in_db(
 
 
 def set_bay_current_in_db(
-    restaurant_id: str, bay_id: str, current_capacity: int
+    restaurant_id: str,
+    bay_id: str,
+    current_capacity: int,
+    outlet_override: str | None = None,
 ) -> dict:
     """Sets current bay capacity in Supabase Postgres."""
     try:
-        context = _resolve_restaurant_context(restaurant_id)
+        context = _resolve_restaurant_context(restaurant_id, outlet_override)
         target = _resolve_bay_id(context, bay_id)
         if not target:
             return {"error": "Bay not found"}
@@ -873,12 +982,12 @@ def set_bay_current_in_db(
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
-                    '''
+                    """
                     update "Parking_Bays"
                     set current_capacity = %s
                     where id = %s and res_id = %s and outlet_id = %s
                     returning id, bay_name, total_capacity, current_capacity
-                    ''',
+                    """,
                     (
                         max(0, int(current_capacity)),
                         target,

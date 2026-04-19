@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetRoles, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, GetRoles, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant } from "./realtime.js";
 import { createServer } from "http";
@@ -117,6 +117,16 @@ function normalizeRestaurantSlug(value) {
     return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 async function resolveRoleForRequest(req, restaurantId) {
+    // Allow an explicit role header to be used for service-to-service calls or when
+    // an employee id is not available (e.g. onboarding flows). This is intentionally
+    // permissive for local/dev convenience but still prefers a real employee id when present.
+    const headerRole = (Array.isArray(req.headers['x-user-role']) ? req.headers['x-user-role'][0] : req.headers['x-user-role']);
+    if (typeof headerRole === 'string' && headerRole.trim()) {
+        const lowered = headerRole.trim().toLowerCase();
+        if (lowered === 'admin' || lowered === 'employee' || lowered === 'valet' || lowered === 'waiter') {
+            return lowered;
+        }
+    }
     const employeeId = extractEmployeeId(req);
     if (!employeeId) {
         console.debug("resolveRoleForRequest: missing employeeId", { restaurantId });
@@ -126,6 +136,27 @@ async function resolveRoleForRequest(req, restaurantId) {
     return roleFromRestaurant ?? null;
 }
 async function enforceRoles(req, res, allowedRoles) {
+    const restaurantId = extractRestaurantId(req);
+    const outletId = extractOutletId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return null;
+    }
+    const role = await resolveRoleForRequest(req, restaurantId);
+    if (!role) {
+        res.status(401).json({
+            error: "Unauthorized",
+            details: "Missing or invalid employee identity",
+        });
+        return null;
+    }
+    if (!allowedRoles.includes(role)) {
+        res.status(403).json({ error: "Forbidden", requiredRoles: allowedRoles });
+        return null;
+    }
+    return { restaurantId, role, outletId };
+}
+async function enforceRolesIgnoreOutletID(req, res, allowedRoles) {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
         res.status(400).json({ error: "Missing restaurantId" });
@@ -145,6 +176,24 @@ async function enforceRoles(req, res, allowedRoles) {
     }
     return { restaurantId, role };
 }
+function extractOutletId(req) {
+    const headerValue = req.headers["x-outlet-id"];
+    const headerId = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    if (typeof headerId === "string" && headerId.trim().length > 0) {
+        return headerId.trim();
+    }
+    const queryValue = req.query.outletId;
+    const queryId = Array.isArray(queryValue) ? queryValue[0] : queryValue;
+    if (typeof queryId === "string" && queryId.trim().length > 0) {
+        return queryId.trim();
+    }
+    const body = req.body;
+    const bodyValue = body?.outletId;
+    if (typeof bodyValue === "string" && bodyValue.trim().length > 0) {
+        return bodyValue.trim();
+    }
+    throw new Error("Missing outletId");
+}
 const allowedOrigins = new Set([
     "http://localhost:9002",
     "http://localhost:3000",
@@ -158,7 +207,7 @@ app.use((req, res, next) => {
     if (origin && allowedOrigins.has(origin)) {
         res.header("Access-Control-Allow-Origin", origin);
     }
-    res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role");
+    res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id");
     res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     if (req.method === "OPTIONS") {
         res.sendStatus(204);
@@ -252,19 +301,19 @@ app.post("/auth/register-restaurant", validate, async (req, res) => {
 });
 app.post("/auth/employee-login", validate, async (req, res) => {
     const body = (req.body ?? {});
-    const employeeId = typeof body.employeeId === "string" ? body.employeeId.trim() : "";
+    const employeeUsername = typeof body.employeeUsername === "string" ? body.employeeUsername.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
     const restaurantIdRaw = typeof body.restaurantId === "string" ? body.restaurantId.trim() : "";
     const restaurantName = typeof body.restaurantName === "string" ? body.restaurantName.trim() : "";
-    if (!employeeId || !password || (!restaurantIdRaw && !restaurantName)) {
+    if (!employeeUsername || !password || !restaurantName) {
         res.status(400).json({
-            error: "employeeId, password, and restaurantName (or restaurantId) are required",
+            error: "employeeUsername, password, and restaurantName are required",
         });
         return;
     }
-    const restaurantId = restaurantIdRaw || normalizeRestaurantSlug(restaurantName);
+    const restaurantUsername = restaurantIdRaw || normalizeRestaurantSlug(restaurantName);
     try {
-        const user = await AuthenticateRestaurantEmployee(restaurantId, employeeId, password);
+        const user = await AuthenticateRestaurantEmployee(restaurantUsername, employeeUsername, password);
         if (!user) {
             res.status(401).json({ error: "Invalid employee ID or password." });
             return;
@@ -272,10 +321,15 @@ app.post("/auth/employee-login", validate, async (req, res) => {
         res.json({
             uid: user.employeeId,
             employeeId: user.employeeId,
-            name: user.name,
+            employeeUsername: user.employeeUsername ?? undefined,
             role: user.role,
+            role_all: user.role_all,
             restaurantId: user.restaurantId,
             restaurantName: user.restaurantName,
+            res_id: user.res_id,
+            outlet_id: user.outlet_id,
+            emp_Fname: user.emp_Fname,
+            emp_Lname: user.emp_Lname ?? null,
         });
     }
     catch (error) {
@@ -709,10 +763,10 @@ app.get("/valet-info", validate, async (req, res) => {
     }
     try {
         const [records, bays] = await Promise.all([
-            GetValetVehicleStates(auth.restaurantId),
-            GetParkingBays(auth.restaurantId),
+            GetValetVehicleStates(auth.restaurantId, auth.outletId),
+            GetParkingBays(auth.restaurantId, auth.outletId),
         ]);
-        const metaByBookingId = await GetValetVehicleMetaByBookingIds(auth.restaurantId, records.map((row) => row.booking_id));
+        const metaByBookingId = await GetValetVehicleMetaByBookingIds(auth.restaurantId, records.map((row) => row.booking_id), auth.outletId);
         const bayById = new Map((bays ?? []).map((bay) => [String(bay.Bay_id), bay.Bay_name]));
         const stateMap = {
             1: "Vehicle added",
@@ -773,6 +827,170 @@ app.patch("/booking/:id/status", validate, async (req, res) => {
         console.warn("emit booking:status_updated failed", err);
     }
     res.json({ success: true });
+});
+app.post("/bills", validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = (req.body ?? {});
+    const order_id = typeof body.order_id === 'string' ? body.order_id.trim() : '';
+    const total_amt = Number(body.total_amt ?? 0);
+    const tax_breakdown = body.tax_breakdown ?? undefined;
+    const emp_id = typeof body.emp_id === 'string' ? body.emp_id.trim() : null;
+    const status = typeof body.status === 'number' ? body.status : Number(body.status ?? 1);
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : null;
+    if (!order_id || !Number.isFinite(total_amt)) {
+        res.status(400).json({ error: 'Missing order_id or total_amt' });
+        return;
+    }
+    try {
+        const result = await AddBill(restaurantId, { order_id, total_amt, emp_id, status, reason, tax_breakdown });
+        res.status(201).json(result);
+    }
+    catch (error) {
+        console.error('add_bill_failed', error);
+        res.status(500).json({ error: String(error?.message ?? 'Unable to create bill') });
+    }
+});
+app.post('/bills/replace', validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId)
+        return res.status(400).json({ error: 'Missing restaurantId' });
+    const body = (req.body ?? {});
+    const old_order_id = typeof body.old_order_id === 'string' ? body.old_order_id.trim() : '';
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : null;
+    const new_order = body.new_order ?? null;
+    const new_bill = body.new_bill ?? null;
+    if (!old_order_id || !new_order || !new_bill) {
+        return res.status(400).json({ error: 'Missing required fields: old_order_id, new_order, new_bill' });
+    }
+    try {
+        const result = await ReplaceBill(restaurantId, { old_order_id, reason, new_order, new_bill });
+        if (!result)
+            return res.status(500).json({ error: 'Replace operation failed' });
+        // emit realtime events for UI updates
+        try {
+            emitRestaurant(restaurantId, 'order:replaced', { old_order_id, new_order_id: result.newOrderId, new_bill_id: result.newBillId });
+        }
+        catch (e) { }
+        return res.status(201).json(result);
+    }
+    catch (err) {
+        console.error('replace_bill_failed', err);
+        return res.status(500).json({ error: String(err?.message ?? 'Internal') });
+    }
+});
+app.get('/bills/order/:orderId', validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId)
+        return res.status(400).json({ error: 'Missing restaurantId' });
+    const orderId = String(req.params.orderId ?? '').trim();
+    if (!orderId)
+        return res.status(400).json({ error: 'Missing orderId' });
+    try {
+        const bill = await GetBillByOrder(restaurantId, orderId);
+        if (!bill)
+            return res.status(404).json({ error: 'Bill not found' });
+        return res.json(bill);
+    }
+    catch (err) {
+        console.error('get bill by order failed', err);
+        return res.status(500).json({ error: 'Internal' });
+    }
+});
+app.get('/restaurant/logo', validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId)
+        return res.status(400).json({ error: 'Missing restaurantId' });
+    try {
+        const logoBase64 = await GetRestaurantLogo(restaurantId);
+        if (!logoBase64)
+            return res.status(404).json({ error: 'Logo not found' });
+        return res.json({ logo_base64: logoBase64 });
+    }
+    catch (err) {
+        console.error('get restaurant logo failed', err);
+        return res.status(500).json({ error: 'Internal' });
+    }
+});
+app.get('/restaurant/logo/escpos', validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId)
+        return res.status(400).json({ error: 'Missing restaurantId' });
+    try {
+        const raw = await GetRestaurantLogoRaw(restaurantId);
+        if (!raw)
+            return res.status(404).json({ error: 'Logo not found' });
+        // dynamic import of sharp so server can still start without it if optional
+        let sharp;
+        try {
+            sharp = (await import('sharp')).default ?? (await import('sharp'));
+        }
+        catch (err) {
+            console.error('sharp not available', err);
+            return res.status(500).json({ error: 'Image processing unavailable' });
+        }
+        const img = sharp(raw).flatten({ background: '#ffffff' }).resize({ width: 384, withoutEnlargement: true }).threshold(128).raw();
+        const { data, info } = await img.toBuffer({ resolveWithObject: true });
+        const width = info.width;
+        const height = info.height;
+        const widthBytes = Math.ceil(width / 8);
+        const bytes = [];
+        for (let y = 0; y < height; y++) {
+            for (let xb = 0; xb < widthBytes; xb++) {
+                let byte = 0;
+                for (let bit = 0; bit < 8; bit++) {
+                    const x = xb * 8 + bit;
+                    const idx = y * width + x;
+                    const pixel = x < width ? data[idx] : 255;
+                    // in thresholded raw, 0=black, 255=white
+                    if (pixel === 0) {
+                        byte |= (1 << (7 - bit));
+                    }
+                }
+                bytes.push(byte);
+            }
+        }
+        const xL = widthBytes & 0xff;
+        const xH = (widthBytes >> 8) & 0xff;
+        const yL = height & 0xff;
+        const yH = (height >> 8) & 0xff;
+        // GS v 0 m xL xH yL yH d
+        const header = Buffer.from([0x1d, 0x76, 0x30, 0x00, xL, xH, yL, yH]);
+        const payload = Buffer.from(bytes);
+        const out = Buffer.concat([header, payload]);
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', String(out.length));
+        return res.send(out);
+    }
+    catch (err) {
+        console.error('get restaurant escpos failed', err);
+        return res.status(500).json({ error: 'Internal' });
+    }
+});
+app.patch('/bills/order/:orderId/status', validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: 'Missing restaurantId' });
+        return;
+    }
+    const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
+    const body = (req.body ?? {});
+    const status = typeof body.status === 'number' ? body.status : Number(body.status ?? 0);
+    if (!orderId || !Number.isFinite(status)) {
+        res.status(400).json({ error: 'Missing orderId or status' });
+        return;
+    }
+    try {
+        await UpdateBillStatusByOrder(restaurantId, orderId, status);
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('update_bill_status_failed', error);
+        res.status(500).json({ error: String(error?.message ?? 'Unable to update bill status') });
+    }
 });
 app.patch("/booking/:id/table", validate, async (req, res) => {
     const auth = await enforceRoles(req, res, ["admin", "valet"]);
@@ -1212,6 +1430,42 @@ app.put("/restaurant/profile", validate, async (req, res) => {
         res.status(500).json({ error: "Unable to update profile" });
     }
 });
+app.get('/outlets/default-tax', validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: 'Missing restaurantId' });
+        return;
+    }
+    try {
+        const tax = await GetOutletDefaultTax(restaurantId);
+        res.json({ default_tax: tax ?? {} });
+    }
+    catch (err) {
+        console.error('get_default_tax_failed', err);
+        res.status(500).json({ error: 'Unable to fetch default tax' });
+    }
+});
+app.patch('/outlets/default-tax', validate, async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: 'Missing restaurantId' });
+        return;
+    }
+    const body = req.body ?? {};
+    const defaultTax = body.default_tax;
+    if (!defaultTax || typeof defaultTax !== 'object') {
+        res.status(400).json({ error: 'default_tax object is required' });
+        return;
+    }
+    try {
+        await UpdateOutletDefaultTax(restaurantId, defaultTax);
+        res.json({ ok: true });
+    }
+    catch (err) {
+        console.error('update_default_tax_failed', err);
+        res.status(500).json({ error: 'Unable to update default tax' });
+    }
+});
 app.get("/roles", validate, async (req, res) => {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
@@ -1376,7 +1630,7 @@ app.get("/valet-bays", validate, async (req, res) => {
         return;
     }
     try {
-        const data = await GetParkingBays(auth.restaurantId);
+        const data = await GetParkingBays(auth.restaurantId, auth.outletId);
         res.json(data);
         return;
     }
@@ -1399,7 +1653,7 @@ app.post("/add-valet-bay", validate, async (req, res) => {
         return;
     }
     try {
-        const bay = await AddParkingBay(auth.restaurantId, bayName, Number.isFinite(totalCapacity) ? Number(totalCapacity) : 0);
+        const bay = await AddParkingBay(auth.restaurantId, bayName, Number.isFinite(totalCapacity) ? Number(totalCapacity) : 0, auth.outletId);
         const data = {
             message: "Bay added",
             ...bay,
@@ -1433,7 +1687,7 @@ app.post("/delete-valet-bay", validate, async (req, res) => {
         return;
     }
     try {
-        const deleted = await DeleteParkingBay(auth.restaurantId, bayId ?? null, bayName ?? null);
+        const deleted = await DeleteParkingBay(auth.restaurantId, bayId ?? null, bayName ?? null, auth.outletId);
         if (!deleted) {
             res.status(404).json({ error: "Bay not found" });
             return;
@@ -1471,7 +1725,7 @@ app.post("/update-valet-bay", validate, async (req, res) => {
         return;
     }
     try {
-        const updated = await UpdateParkingBay(auth.restaurantId, bayId ?? null, bayName, Number.isFinite(totalCapacity) ? Number(totalCapacity) : 0);
+        const updated = await UpdateParkingBay(auth.restaurantId, bayId ?? null, bayName, Number.isFinite(totalCapacity) ? Number(totalCapacity) : 0, auth.outletId);
         if (!updated) {
             res.status(404).json({ error: "Bay not found" });
             return;
@@ -1507,7 +1761,7 @@ app.post("/set-valet-bay-current", validate, async (req, res) => {
         return;
     }
     try {
-        const updated = await SetParkingBayCurrent(auth.restaurantId, bayId, Number(current));
+        const updated = await SetParkingBayCurrent(auth.restaurantId, bayId, Number(current), auth.outletId);
         if (!updated) {
             res.status(404).json({ error: "Bay not found" });
             return;
@@ -1572,8 +1826,8 @@ app.post("/create_valet_record", validate, async (req, res) => {
         return;
     }
     try {
-        const created = await CreateValetVehicleState(auth.restaurantId, entryTime, bayIdentifier);
-        const meta = await UpsertValetVehicleMeta(auth.restaurantId, created.booking_id, number_plate, customer_name);
+        const created = await CreateValetVehicleState(auth.restaurantId, entryTime, bayIdentifier, auth.outletId);
+        const meta = await UpsertValetVehicleMeta(auth.restaurantId, created.booking_id, number_plate, customer_name, auth.outletId);
         const data = {
             message: "New valet record created successfully.",
             booking_id: created.booking_id,
@@ -1605,12 +1859,12 @@ app.post("/get_valet_info", validate, async (req, res) => {
         return;
     }
     try {
-        const record = await GetValetVehicleState(auth.restaurantId, booking_id);
+        const record = await GetValetVehicleState(auth.restaurantId, booking_id, auth.outletId);
         if (!record) {
             res.status(404).json({ error: `No valet found with that booking ID - ${booking_id}.` });
             return;
         }
-        const metaByBookingId = await GetValetVehicleMetaByBookingIds(auth.restaurantId, [booking_id]);
+        const metaByBookingId = await GetValetVehicleMetaByBookingIds(auth.restaurantId, [booking_id], auth.outletId);
         const meta = metaByBookingId[booking_id];
         res.json({
             booking_id: record.booking_id,
@@ -1629,7 +1883,7 @@ app.post("/get_valet_info", validate, async (req, res) => {
         return;
     }
 });
-async function updateValetStateAndPublish(restaurantId, bookingId, state) {
+async function updateValetStateAndPublish(restaurantId, bookingId, state, outletId) {
     const stateNum = Number(state);
     if (!Number.isFinite(stateNum)) {
         throw Object.assign(new Error("Unable to update valet state"), {
@@ -1637,7 +1891,7 @@ async function updateValetStateAndPublish(restaurantId, bookingId, state) {
             payload: { error: "Invalid state" },
         });
     }
-    const updated = await UpdateValetVehicleState(restaurantId, bookingId, stateNum);
+    const updated = await UpdateValetVehicleState(restaurantId, bookingId, stateNum, outletId);
     if (!updated) {
         throw Object.assign(new Error("Unable to update valet state"), {
             status: 404,
@@ -1665,7 +1919,7 @@ app.post("/update_valet_state", validate, async (req, res) => {
         return;
     }
     try {
-        const data = await updateValetStateAndPublish(auth.restaurantId, booking_id, state);
+        const data = await updateValetStateAndPublish(auth.restaurantId, booking_id, state, auth.outletId);
         res.json(data);
         return;
     }
@@ -1698,7 +1952,7 @@ app.post("/update_valet_bay", validate, async (req, res) => {
         return;
     }
     try {
-        const updated = await UpdateValetVehicleBay(auth.restaurantId, booking_id, bay_id);
+        const updated = await UpdateValetVehicleBay(auth.restaurantId, booking_id, bay_id, auth.outletId);
         if (!updated) {
             res.status(404).json({ error: `No active valet record found for that booking ID - ${booking_id}.` });
             return;
@@ -1728,7 +1982,7 @@ app.post("/unassign-valet-bay", validate, async (req, res) => {
         return;
     }
     try {
-        const updated = await UpdateValetVehicleBay(auth.restaurantId, booking_id, null);
+        const updated = await UpdateValetVehicleBay(auth.restaurantId, booking_id, null, auth.outletId);
         if (!updated) {
             res.status(404).json({ error: `No active valet record found for that booking ID - ${booking_id}.` });
             return;
@@ -1877,7 +2131,8 @@ app.post("/feedback/valet-checkin", validate, async (req, res) => {
     }
     const normalizedPlate = numberPlate.replace(/\s+/g, "").toUpperCase();
     try {
-        const recordsResponse = await fetch("http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(restaurantId));
+        const outletId = extractOutletId(req);
+        const recordsResponse = await fetch("http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(restaurantId), { headers: outletId ? { "X-Outlet-Id": outletId } : undefined });
         const recordsPayload = (await recordsResponse.json().catch(() => null));
         if (!recordsResponse.ok) {
             res.status(502).json({
@@ -1922,7 +2177,7 @@ app.post("/feedback/valet-checkin", validate, async (req, res) => {
                 return;
             }
             try {
-                await updateValetStateAndPublish(restaurantId, bookingId, "3");
+                await updateValetStateAndPublish(restaurantId, bookingId, "3", outletId ?? undefined);
             }
             catch (error) {
                 const payload = error?.payload;
@@ -1960,7 +2215,7 @@ app.post("/feedback/submit", validate, async (req, res) => {
             res.status(400).json({ error: "Unknown restaurant" });
             return;
         }
-        const matched = users.find((u) => String(u.employeeId) === String(employeeId));
+        const matched = users.find((u) => String(u.employee_id) === String(employeeId));
         if (!matched) {
             res.status(403).json({ error: "Employee not found in restaurant" });
             return;
@@ -2037,7 +2292,7 @@ app.post("/feedback/submit", validate, async (req, res) => {
     }
 });
 app.get("/restaurant/users", validate, async (req, res) => {
-    const auth = await enforceRoles(req, res, ["admin", "employee"]);
+    const auth = await enforceRolesIgnoreOutletID(req, res, ["admin", "employee"]);
     if (!auth)
         return;
     try {
@@ -2047,6 +2302,48 @@ app.get("/restaurant/users", validate, async (req, res) => {
     catch (err) {
         console.error('get_restaurant_users_failed', err);
         res.status(500).json({ error: 'Unable to fetch restaurant users' });
+    }
+});
+app.post("/restaurant/users", validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin"]);
+    if (!auth)
+        return;
+    const body = req.body ?? {};
+    const empF = typeof body.emp_Fname === 'string' ? body.emp_Fname.trim() : (typeof body.firstName === 'string' ? body.firstName.trim() : '');
+    const empL = typeof body.emp_Lname === 'string' ? body.emp_Lname.trim() : (typeof body.lastName === 'string' ? body.lastName.trim() : null);
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const email = typeof body.email === 'string' ? body.email.trim() : null;
+    const role = typeof body.role === 'string' ? body.role : 'employee';
+    const password = body.password;
+    const ph = typeof body.ph === 'string' || typeof body.ph === 'number' ? String(body.ph) : undefined;
+    const add = typeof body.add === 'string' ? body.add : undefined;
+    try {
+        const created = await AddRestaurantUser(auth.restaurantId, auth.outletId, {
+            emp_Fname: empF,
+            emp_Lname: empL,
+            email,
+            role,
+            password,
+            employeeId: body.employeeId,
+            username,
+            ph,
+            add
+        });
+        if (!created) {
+            res.status(500).json({ error: 'Unable to create user' });
+            return;
+        }
+        try {
+            emitRestaurant(auth.restaurantId, 'restaurant:user:created', { user: created });
+        }
+        catch (e) {
+            console.warn('emit user created failed', e);
+        }
+        res.status(201).json({ success: true, user: created });
+    }
+    catch (err) {
+        console.error('create_restaurant_user_failed', err);
+        res.status(500).json({ error: 'Unable to create user' });
     }
 });
 app.get("/feedback", validate, async (req, res) => {
