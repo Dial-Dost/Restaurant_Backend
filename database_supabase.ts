@@ -3,12 +3,20 @@
 //   2. paid
 //   3. cancelled
 
+// Bill workflow metadata (stored on Bills)
+//   payment_method
+//   waiter_confirmed_at / waiter_confirmed_by_username
+//   admin_approved_at / admin_approved_by_username
+//   closed_at / closed_by_username
+
 // Status - order
 //   1. preparing
 //   2. served
 //   3. bill verification
 //   4. paid
 //   5. cancelled
+//   6. payment pending approval
+//   7. closed
 
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
@@ -213,8 +221,32 @@ export type OrderRecord = {
   taxes?: Array<{ id: string; name: string; percentage: number }>;
   applyServiceCharge: boolean;
   total: number;
-  status: "Preparing" | "Served" | "Bill Verification" | "Paid" | "Cancelled";
+  status:
+    | "Preparing"
+    | "Served"
+    | "Bill Verification"
+    | "Payment Pending Approval"
+    | "Paid"
+    | "Closed"
+    | "Cancelled";
+  payment_method?: PaymentMethod | null;
+  payment_waiter_confirmed_at?: string | null;
+  payment_waiter_confirmed_by?: string | null;
+  payment_admin_approved_at?: string | null;
+  payment_admin_approved_by?: string | null;
+  bill_closed_at?: string | null;
+  bill_closed_by?: string | null;
 };
+
+export type PaymentMethod =
+  | "Swiggy"
+  | "Dine Out"
+  | "Zomato Pay"
+  | "Eazydiner"
+  | "Cash"
+  | "Upi"
+  | "Card"
+  | "Online Transfer";
 
 export type TableAssignmentRecord = {
   id: string;
@@ -444,7 +476,14 @@ function parseMenuDescription(description: string | null): { price: number } {
 function toOrderStatusCode(status: string | undefined): number {
   const lowered = String(status ?? "preparing").trim().toLowerCase();
   if (lowered === "cancelled" || lowered === "canceled") return 5;
+  if (lowered === "closed") return 7;
   if (lowered === "paid") return 4;
+  if (
+    lowered === "payment pending approval"
+    || lowered === "payment_pending_approval"
+    || lowered === "pending approval"
+    || lowered === "pending_approval"
+  ) return 6;
   if (lowered === "bill verification" || lowered === "bill_verification" || lowered === "verification") return 3;
   if (lowered === "served") return 2;
   return 1; // Preparing
@@ -459,13 +498,33 @@ function fromOrderStatusCode(status: unknown): OrderRecord["status"] {
       return "Served";
     case 3:
       return "Bill Verification";
+    case 6:
+      return "Payment Pending Approval";
     case 4:
       return "Paid";
+    case 7:
+      return "Closed";
     case 5:
       return "Cancelled";
     default:
       return "Preparing";
   }
+}
+
+function normalizePaymentMethod(raw: unknown): PaymentMethod | null {
+  const normalized = String(raw ?? "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "swiggy") return "Swiggy";
+  if (normalized === "dine out" || normalized === "dineout") return "Dine Out";
+  if (normalized === "zomato pay" || normalized === "zomatopay") return "Zomato Pay";
+  if (normalized === "eazydiner" || normalized === "easy diner") return "Eazydiner";
+  if (normalized === "cash") return "Cash";
+  if (normalized === "upi") return "Upi";
+  if (normalized === "card") return "Card";
+  if (normalized === "online transfer" || normalized === "bank transfer" || normalized === "transfer") {
+    return "Online Transfer";
+  }
+  return null;
 }
 
 function encodeSlot(payload: SlotPayload): string {
@@ -2446,16 +2505,34 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
     food: unknown;
     status: unknown;
     table_name: string | null;
+    bill_status: number | null;
+    payment_method: string | null;
+    waiter_confirmed_at: Date | null;
+    waiter_confirmed_by_username: string | null;
+    admin_approved_at: Date | null;
+    admin_approved_by_username: string | null;
+    closed_at: Date | null;
+    closed_by_username: string | null;
   }>(
     `
       select
         o.id,
         o.food,
         o.status,
-        t.table_name
+        t.table_name,
+        b.status as bill_status,
+        b.payment_method,
+        b.waiter_confirmed_at,
+        b.waiter_confirmed_by_username,
+        b.admin_approved_at,
+        b.admin_approved_by_username,
+        b.closed_at,
+        b.closed_by_username
       from "Orders" o
       left join "Tables" t
         on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+      left join "Bills" b
+        on b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
       where o.res_id = $1 and o.outlet_id = $2
       order by o.created_at desc
     `,
@@ -2500,6 +2577,13 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
       applyServiceCharge: Boolean(payload.applyServiceCharge),
       total: total > 0 ? total : subtotal,
       status: finalStatus,
+      payment_method: normalizePaymentMethod(row.payment_method),
+      payment_waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
+      payment_waiter_confirmed_by: row.waiter_confirmed_by_username,
+      payment_admin_approved_at: row.admin_approved_at ? new Date(row.admin_approved_at).toISOString() : null,
+      payment_admin_approved_by: row.admin_approved_by_username,
+      bill_closed_at: row.closed_at ? new Date(row.closed_at).toISOString() : null,
+      bill_closed_by: row.closed_by_username,
     };
   });
 }
@@ -2594,6 +2678,7 @@ export async function AddBill(
   },
 ): Promise<{ id: string }> {
   const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
   const id = isUuid(String(bill.id ?? '')) ? String(bill.id) : randomUUID();
 
   // Try to resolve table_id from order
@@ -2608,9 +2693,18 @@ export async function AddBill(
   );
   const tableId = orderRows[0]?.table_id ?? null;
 
-  const empId = isUuid(String(bill.emp_id ?? '')) ? String(bill.emp_id) : null;
-  if (bill.emp_id && !empId) {
-    console.warn(`AddBill: provided emp_id is not a uuid, treating as null: ${String(bill.emp_id)}`);
+  let empId: string | null = null;
+  if (bill.emp_id) {
+    const rawEmployeeId = String(bill.emp_id).trim();
+    if (isUuid(rawEmployeeId)) {
+      empId = rawEmployeeId;
+    } else {
+      const resolved = await resolveEmployeeByUsername(context, rawEmployeeId);
+      empId = resolved?.id ?? null;
+    }
+  }
+  if (!empId) {
+    throw new Error("Unable to resolve employee for bill (emp_id)");
   }
 
   await runQuery(
@@ -2644,12 +2738,220 @@ export async function AddBill(
   return { id };
 }
 
+async function ensureBillWorkflowColumns(client?: PoolClient): Promise<void> {
+  await runQuery(
+    `
+      alter table "Bills"
+      add column if not exists payment_method text
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Bills"
+      add column if not exists waiter_confirmed_at timestamptz
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Bills"
+      add column if not exists waiter_confirmed_by_username text
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Bills"
+      add column if not exists admin_approved_at timestamptz
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Bills"
+      add column if not exists admin_approved_by_username text
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Bills"
+      add column if not exists closed_at timestamptz
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Bills"
+      add column if not exists closed_by_username text
+    `,
+    [],
+    client,
+  );
+}
+
+async function updateOrderWorkflowStatus(
+  context: RestaurantContext,
+  orderId: string,
+  status: OrderRecord["status"],
+  client?: PoolClient,
+): Promise<void> {
+  await runQuery(
+    `
+      update "Orders"
+      set status = $1,
+          food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
+      where id = $3 and res_id = $4 and outlet_id = $5
+    `,
+    [toOrderStatusCode(status), status, orderId, context.res_id, context.outlet_id],
+    client,
+  );
+}
+
+export async function ConfirmBillPaymentByWaiter(
+  restaurantId: string,
+  orderId: string,
+  waiterEmployeeId: string,
+  paymentMethodRaw: string,
+): Promise<{ success: true; payment_method: PaymentMethod }> {
+  return withTransaction(async (client) => {
+    await ensureBillWorkflowColumns(client);
+    const context = await requireRestaurantContext(restaurantId, client);
+    const paymentMethod = normalizePaymentMethod(paymentMethodRaw);
+    if (!paymentMethod) {
+      throw new Error("Invalid payment method");
+    }
+
+    const waiter = await resolveEmployeeByUsername(context, waiterEmployeeId, client);
+    if (!waiter) {
+      throw new Error("Waiter not found");
+    }
+
+    const updated = await runQuery<{ id: string }>(
+      `
+        update "Bills"
+        set payment_method = $1,
+            waiter_confirmed_at = now(),
+            waiter_confirmed_by_username = $2,
+            admin_approved_at = null,
+            admin_approved_by_username = null,
+            closed_at = null,
+            closed_by_username = null,
+            status = 1
+        where
+          order_id = $3
+          and res_id = $4
+          and outlet_id = $5
+          and status <> 3
+        returning id
+      `,
+      [paymentMethod, waiter.username, orderId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    if (!updated[0]) {
+      throw new Error("Bill not found or not eligible for payment confirmation");
+    }
+
+    await updateOrderWorkflowStatus(context, orderId, "Payment Pending Approval", client);
+    return { success: true, payment_method: paymentMethod };
+  });
+}
+
+export async function ApproveBillPaymentByAdmin(
+  restaurantId: string,
+  orderId: string,
+  adminEmployeeId: string,
+): Promise<{ success: true }> {
+  return withTransaction(async (client) => {
+    await ensureBillWorkflowColumns(client);
+    const context = await requireRestaurantContext(restaurantId, client);
+    const admin = await resolveEmployeeByUsername(context, adminEmployeeId, client);
+    if (!admin) {
+      throw new Error("Admin not found");
+    }
+
+    const updated = await runQuery<{ id: string }>(
+      `
+        update "Bills"
+        set admin_approved_at = now(),
+            admin_approved_by_username = $1,
+            status = 2
+        where
+          order_id = $2
+          and res_id = $3
+          and outlet_id = $4
+          and waiter_confirmed_at is not null
+          and status <> 3
+        returning id
+      `,
+      [admin.username, orderId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    if (!updated[0]) {
+      throw new Error("Bill is not ready for admin approval");
+    }
+
+    await updateOrderWorkflowStatus(context, orderId, "Paid", client);
+    return { success: true };
+  });
+}
+
+export async function CloseBillByOrder(
+  restaurantId: string,
+  orderId: string,
+  adminEmployeeId: string,
+): Promise<{ success: true }> {
+  return withTransaction(async (client) => {
+    await ensureBillWorkflowColumns(client);
+    const context = await requireRestaurantContext(restaurantId, client);
+    const admin = await resolveEmployeeByUsername(context, adminEmployeeId, client);
+    if (!admin) {
+      throw new Error("Admin not found");
+    }
+
+    const updated = await runQuery<{ id: string }>(
+      `
+        update "Bills"
+        set closed_at = now(),
+            closed_by_username = $1
+        where
+          order_id = $2
+          and res_id = $3
+          and outlet_id = $4
+          and admin_approved_at is not null
+          and status = 2
+          and closed_at is null
+        returning id
+      `,
+      [admin.username, orderId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    if (!updated[0]) {
+      throw new Error("Bill is not ready to be closed");
+    }
+
+    await updateOrderWorkflowStatus(context, orderId, "Closed", client);
+    return { success: true };
+  });
+}
+
 export async function UpdateBillStatusByOrder(
   restaurantId: string,
   orderId: string,
   status: number,
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
   await runQuery(
     `
       update "Bills"
@@ -2751,7 +3053,19 @@ export async function ReplaceBill(
 
     // create new bill row
     const newBillId = randomUUID();
-    const empId = isUuid(String(payload.new_bill.emp_id ?? '')) ? String(payload.new_bill.emp_id) : null;
+    let empId: string | null = null;
+    if (payload.new_bill.emp_id) {
+      const rawEmployeeId = String(payload.new_bill.emp_id).trim();
+      if (isUuid(rawEmployeeId)) {
+        empId = rawEmployeeId;
+      } else {
+        const resolved = await resolveEmployeeByUsername(context, rawEmployeeId, client);
+        empId = resolved?.id ?? null;
+      }
+    }
+    if (!empId) {
+      throw new Error("Unable to resolve employee for replacement bill (emp_id)");
+    }
 
     await runQuery(
       `
@@ -3490,22 +3804,51 @@ export async function GetRestaurantLogo(restaurantId: string): Promise<string | 
 
 export async function GetBillByOrder(restaurantId: string, orderId: string) {
   const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
   const rows = await runQuery<{
     id: string;
     status: number;
     total_amt: number;
     emp_id: string | null;
     tax_breakdown: any;
+    payment_method: string | null;
+    waiter_confirmed_at: Date | null;
+    waiter_confirmed_by_username: string | null;
+    admin_approved_at: Date | null;
+    admin_approved_by_username: string | null;
+    closed_at: Date | null;
+    closed_by_username: string | null;
   }>(
     `
-      select id, status, total_amt, emp_id, tax_breakdown
+      select
+        id,
+        status,
+        total_amt,
+        emp_id,
+        tax_breakdown,
+        payment_method,
+        waiter_confirmed_at,
+        waiter_confirmed_by_username,
+        admin_approved_at,
+        admin_approved_by_username,
+        closed_at,
+        closed_by_username
       from "Bills"
       where order_id = $1 and res_id = $2 and outlet_id = $3
       limit 1
     `,
     [orderId, context.res_id, context.outlet_id],
   );
-  return rows[0] ?? null;
+  const row = rows[0];
+  if (!row) return null;
+
+  return {
+    ...row,
+    payment_method: normalizePaymentMethod(row.payment_method),
+    waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
+    admin_approved_at: row.admin_approved_at ? new Date(row.admin_approved_at).toISOString() : null,
+    closed_at: row.closed_at ? new Date(row.closed_at).toISOString() : null,
+  };
 }
 
 export async function GetRestaurantLogoRaw(restaurantId: string): Promise<Buffer | null> {
