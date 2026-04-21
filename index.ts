@@ -48,6 +48,9 @@ import {
 	AddBill,
 	ReplaceBill,
 	UpdateBillStatusByOrder,
+	ConfirmBillPaymentByWaiter,
+	ApproveBillPaymentByAdmin,
+	CloseBillByOrder,
 	GetRoles,
 	GetActions,
 	ValidationError,
@@ -1238,6 +1241,99 @@ app.patch('/bills/order/:orderId/status', validate, async (req: Request, res: Re
 	} catch (error: any) {
 		console.error('update_bill_status_failed', error);
 		res.status(500).json({ error: String(error?.message ?? 'Unable to update bill status') });
+	}
+});
+
+app.post('/bills/order/:orderId/waiter-confirm-payment', validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["waiter"]);
+	if (!auth) {
+		return;
+	}
+
+	const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
+	const paymentMethod = typeof req.body?.payment_method === 'string' ? req.body.payment_method.trim() : '';
+	const waiterEmployeeId = extractEmployeeId(req);
+
+	if (!orderId || !paymentMethod || !waiterEmployeeId) {
+		res.status(400).json({ error: 'Missing orderId, payment_method, or employee identity' });
+		return;
+	}
+
+	try {
+		const result = await ConfirmBillPaymentByWaiter(auth.restaurantId, orderId, waiterEmployeeId, paymentMethod);
+		try {
+			emitRestaurant(auth.restaurantId, 'bill:waiter_confirmed_payment', {
+				order_id: orderId,
+				payment_method: result.payment_method,
+				waiter: waiterEmployeeId,
+			});
+		} catch {
+			// ignore realtime failures
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error('waiter_confirm_bill_payment_failed', error);
+		res.status(400).json({ error: String(error?.message ?? 'Unable to confirm payment') });
+	}
+});
+
+app.post('/bills/order/:orderId/admin-approve-payment', validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin"]);
+	if (!auth) {
+		return;
+	}
+
+	const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
+	const adminEmployeeId = extractEmployeeId(req);
+	if (!orderId || !adminEmployeeId) {
+		res.status(400).json({ error: 'Missing orderId or admin identity' });
+		return;
+	}
+
+	try {
+		const result = await ApproveBillPaymentByAdmin(auth.restaurantId, orderId, adminEmployeeId);
+		try {
+			emitRestaurant(auth.restaurantId, 'bill:admin_approved_payment', {
+				order_id: orderId,
+				admin: adminEmployeeId,
+			});
+		} catch {
+			// ignore realtime failures
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error('admin_approve_bill_payment_failed', error);
+		res.status(400).json({ error: String(error?.message ?? 'Unable to approve payment') });
+	}
+});
+
+app.post('/bills/order/:orderId/close', validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin"]);
+	if (!auth) {
+		return;
+	}
+
+	const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
+	const adminEmployeeId = extractEmployeeId(req);
+	if (!orderId || !adminEmployeeId) {
+		res.status(400).json({ error: 'Missing orderId or admin identity' });
+		return;
+	}
+
+	try {
+		const result = await CloseBillByOrder(auth.restaurantId, orderId, adminEmployeeId);
+		try {
+			emitRestaurant(auth.restaurantId, 'bill:closed', {
+				order_id: orderId,
+				admin: adminEmployeeId,
+			});
+		} catch {
+			// ignore realtime failures
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error('close_bill_failed', error);
+		res.status(400).json({ error: String(error?.message ?? 'Unable to close bill') });
 	}
 });
 

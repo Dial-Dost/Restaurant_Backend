@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, GetRoles, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant } from "./realtime.js";
 import { createServer } from "http";
@@ -990,6 +990,95 @@ app.patch('/bills/order/:orderId/status', validate, async (req, res) => {
     catch (error) {
         console.error('update_bill_status_failed', error);
         res.status(500).json({ error: String(error?.message ?? 'Unable to update bill status') });
+    }
+});
+app.post('/bills/order/:orderId/waiter-confirm-payment', validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["waiter"]);
+    if (!auth) {
+        return;
+    }
+    const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
+    const paymentMethod = typeof req.body?.payment_method === 'string' ? req.body.payment_method.trim() : '';
+    const waiterEmployeeId = extractEmployeeId(req);
+    if (!orderId || !paymentMethod || !waiterEmployeeId) {
+        res.status(400).json({ error: 'Missing orderId, payment_method, or employee identity' });
+        return;
+    }
+    try {
+        const result = await ConfirmBillPaymentByWaiter(auth.restaurantId, orderId, waiterEmployeeId, paymentMethod);
+        try {
+            emitRestaurant(auth.restaurantId, 'bill:waiter_confirmed_payment', {
+                order_id: orderId,
+                payment_method: result.payment_method,
+                waiter: waiterEmployeeId,
+            });
+        }
+        catch {
+            // ignore realtime failures
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error('waiter_confirm_bill_payment_failed', error);
+        res.status(400).json({ error: String(error?.message ?? 'Unable to confirm payment') });
+    }
+});
+app.post('/bills/order/:orderId/admin-approve-payment', validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin"]);
+    if (!auth) {
+        return;
+    }
+    const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
+    const adminEmployeeId = extractEmployeeId(req);
+    if (!orderId || !adminEmployeeId) {
+        res.status(400).json({ error: 'Missing orderId or admin identity' });
+        return;
+    }
+    try {
+        const result = await ApproveBillPaymentByAdmin(auth.restaurantId, orderId, adminEmployeeId);
+        try {
+            emitRestaurant(auth.restaurantId, 'bill:admin_approved_payment', {
+                order_id: orderId,
+                admin: adminEmployeeId,
+            });
+        }
+        catch {
+            // ignore realtime failures
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error('admin_approve_bill_payment_failed', error);
+        res.status(400).json({ error: String(error?.message ?? 'Unable to approve payment') });
+    }
+});
+app.post('/bills/order/:orderId/close', validate, async (req, res) => {
+    const auth = await enforceRoles(req, res, ["admin"]);
+    if (!auth) {
+        return;
+    }
+    const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
+    const adminEmployeeId = extractEmployeeId(req);
+    if (!orderId || !adminEmployeeId) {
+        res.status(400).json({ error: 'Missing orderId or admin identity' });
+        return;
+    }
+    try {
+        const result = await CloseBillByOrder(auth.restaurantId, orderId, adminEmployeeId);
+        try {
+            emitRestaurant(auth.restaurantId, 'bill:closed', {
+                order_id: orderId,
+                admin: adminEmployeeId,
+            });
+        }
+        catch {
+            // ignore realtime failures
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error('close_bill_failed', error);
+        res.status(400).json({ error: String(error?.message ?? 'Unable to close bill') });
     }
 });
 app.patch("/booking/:id/table", validate, async (req, res) => {
