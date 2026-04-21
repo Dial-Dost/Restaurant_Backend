@@ -24,9 +24,9 @@ import {
 	AddFeedbackEntry,
 	GetFeedbackEntries,
 	GetFeedbackSummary,
-    GetRestaurantUsers,
+	GetRestaurantUsers,
 	AddRestaurantUser,
-    CheckDatabaseHealth,
+	CheckDatabaseHealth,
 	GetInventoryItems,
 	UpsertInventoryItem,
 	DeleteInventoryItem,
@@ -46,9 +46,11 @@ import {
 	GetBillByOrder,
 	UpdateOutletDefaultTax,
 	AddBill,
-    ReplaceBill,
+	ReplaceBill,
 	UpdateBillStatusByOrder,
 	GetRoles,
+	GetActions,
+	ValidationError,
 	CreateRole,
 	DeleteRole,
 	AssignRoleToEmployee,
@@ -93,6 +95,11 @@ function validate(req: Request, res: Response, next: NextFunction) {
 	// return res.status(400).json({ error: "Auth failed" });
 }
 
+const CORE_ROLES = {
+	admin: ["*"],
+	employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
+	valet: ["e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7", "faf2745b-580c-4529-bbe1-033200cbcf67"],
+};
 
 
 type AppRole = "admin" | "employee" | "valet" | "waiter";
@@ -265,7 +272,7 @@ async function enforceRolesIgnoreOutletID(
 	req: Request,
 	res: Response,
 	allowedRoles: readonly AppRole[],
-): Promise<{ restaurantId: string; role: AppRole;} | null> {
+): Promise<{ restaurantId: string; role: AppRole; } | null> {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -286,7 +293,7 @@ async function enforceRolesIgnoreOutletID(
 		return null;
 	}
 
-	return { restaurantId, role};
+	return { restaurantId, role };
 }
 
 function extractOutletId(req: Request): string {
@@ -327,7 +334,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 	}
 	res.header(
 		"Access-Control-Allow-Headers",
-		"Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id",
+		"Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id,X-Action-List",
 	);
 	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 	if (req.method === "OPTIONS") {
@@ -339,6 +346,16 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.get('/core-roles', validate, async (req: Request, res: Response) => {
+	try {
+		const rows = Object.keys(CORE_ROLES).map((role) => ({ role, actions: CORE_ROLES[role as keyof typeof CORE_ROLES] }));
+		res.json(rows);
+	} catch (err: any) {
+		console.error('error_fetching_core_roles', err);
+		res.status(500).json({ error: 'Unable to fetch core roles' });
+	}
+});
 
 // Lightweight health endpoint for readiness/liveness checks
 app.get("/", (_req: Request, res: Response) => {
@@ -596,15 +613,15 @@ async function GetCustomerIdOrCreateCustomer(
 }
 
 /*
-    Needs request body as
-    {
-       "customer": {
-           "name": "Example",
-           "number": "+91 9923523232", // try keeping all in the same format whatever the format is
-           "email": "k@gmail.com" // Optional
-       }
-    }
-    returns the customer_id if you want to store it somewhere
+	Needs request body as
+	{
+	   "customer": {
+		   "name": "Example",
+		   "number": "+91 9923523232", // try keeping all in the same format whatever the format is
+		   "email": "k@gmail.com" // Optional
+	   }
+	}
+	returns the customer_id if you want to store it somewhere
 */
 
 app.post("/add-customer", validate, async (req: Request, res: Response) => {
@@ -631,14 +648,14 @@ app.post("/add-customer", validate, async (req: Request, res: Response) => {
 });
 
 /*
-    Needs request body as
-    {
-       "table": {
-           "name": "T1",
-           "capacity": 4 // Optional
-       }
-    }
-    returns the table_name if you want to store it somewhere
+	Needs request body as
+	{
+	   "table": {
+		   "name": "T1",
+		   "capacity": 4 // Optional
+	   }
+	}
+	returns the table_name if you want to store it somewhere
 */
 app.post("/add-table", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -711,19 +728,19 @@ app.delete("/table/:name", validate, async (req: Request, res: Response) => {
 /*
 Needs request body as
 {
-    // creates customer if the name+number does not exist
-    "customer": {
-       "name": "Jhon",
-       "number": "9972955566",
-       "email": "example@gmail.com" //optional
+	// creates customer if the name+number does not exist
+	"customer": {
+	   "name": "Jhon",
+	   "number": "9972955566",
+	   "email": "example@gmail.com" //optional
    },
    // Table must exist
    "booking": {
-        "table_name": "T1",
-        "date": "YYYY-MM-DDThh:mm:ssTZD"
-        "duration": "30" // in minutes
-        "number_of_people": "3"
-        "source": "EasyDiner" //Optional
+		"table_name": "T1",
+		"date": "YYYY-MM-DDThh:mm:ssTZD"
+		"duration": "30" // in minutes
+		"number_of_people": "3"
+		"source": "EasyDiner" //Optional
    }
 }
 returns the booking id
@@ -861,41 +878,41 @@ function FoldedTables(table: any[]): any[][] {
 /*
 Returns tables in a 2d array in ascending order of capacity.
 [
-    [
-        {
-            "table_name": "T1",
-            "capacity": 1,
-            "booked": true
-        },
-        {
-            "table_name": "T2",
-            "capacity": 1
-            "booked": true
-        },
-    ],
-    [
-        {
-            "table_name": "T6",
-            "capacity": 3
-            "booked": true
-        },
-        {
-            "table_name": "T7",
-            "capacity": 3
-            "booked": true
-        }
-    ],
-    [
-        {
-            "table_name": "T10",
-            "capacity": 6
-            "booked": true
-        }
-    ]
+	[
+		{
+			"table_name": "T1",
+			"capacity": 1,
+			"booked": true
+		},
+		{
+			"table_name": "T2",
+			"capacity": 1
+			"booked": true
+		},
+	],
+	[
+		{
+			"table_name": "T6",
+			"capacity": 3
+			"booked": true
+		},
+		{
+			"table_name": "T7",
+			"capacity": 3
+			"booked": true
+		}
+	],
+	[
+		{
+			"table_name": "T10",
+			"capacity": 6
+			"booked": true
+		}
+	]
 ]
 */
 
-	app.get("/get-tables", validate, async (req: Request, res: Response) => {
+app.get("/get-tables", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -930,20 +947,20 @@ Gets all bookings that have not yet completed
 If needed can be modified to get bookings after a certain time very easily
 Returns in this format
 [
-    {
-        "booking_id": 1, //database stuff
-        "customer_id": 1, //database stuff
-        "customer_name": "Jhon", //name
-        "table_name": "T3",
-        "booking_date_time": "2025-08-21T23:30:34.036Z", //time of booking ISO string
-        "duration_mins": 60,
-        "number_of_people": 3,
-        "source": null // source of the booking
-        "active": true/false //whether or not the booking is currently happening
-    }
+	{
+		"booking_id": 1, //database stuff
+		"customer_id": 1, //database stuff
+		"customer_name": "Jhon", //name
+		"table_name": "T3",
+		"booking_date_time": "2025-08-21T23:30:34.036Z", //time of booking ISO string
+		"duration_mins": 60,
+		"number_of_people": 3,
+		"source": null // source of the booking
+		"active": true/false //whether or not the booking is currently happening
+	}
 ]
  */
-	app.get("/get-bookings", validate, async (req: Request, res: Response) => {
+app.get("/get-bookings", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1005,15 +1022,15 @@ app.get("/valet-info", validate, async (req: Request, res: Response) => {
 		const bookings = records.map((row) => {
 			const meta = metaByBookingId[row.booking_id];
 			return {
-			booking_id: row.booking_id,
-			customer_name: meta?.customer_name ?? undefined,
-			bay_id: row.bay_id,
-			bay_name: row.bay_id ? (bayById.get(String(row.bay_id)) ?? null) : null,
-			booking_date_time: row.entry_time ?? undefined,
-			exit_date_time: row.exit_time ?? undefined,
-			status: stateMap[row.state] ?? "Vehicle added",
-			active: row.state !== 6,
-			number_plate: meta?.number_plate ?? undefined,
+				booking_id: row.booking_id,
+				customer_name: meta?.customer_name ?? undefined,
+				bay_id: row.bay_id,
+				bay_name: row.bay_id ? (bayById.get(String(row.bay_id)) ?? null) : null,
+				booking_date_time: row.entry_time ?? undefined,
+				exit_date_time: row.exit_time ?? undefined,
+				status: stateMap[row.state] ?? "Vehicle added",
+				active: row.state !== 6,
+				number_plate: meta?.number_plate ?? undefined,
 			};
 		});
 
@@ -1288,15 +1305,15 @@ app.delete("/booking/:id", validate, async (req: Request, res: Response) => {
 });
 
 /*
-    Returns all customer data
-    [
-        {
-            "customer_id": 1,
-            "name": "Dodo",
-            "booking_count": 5,
-            "has_booking": true // Does the customer have an active booking
-        }
-    ]
+	Returns all customer data
+	[
+		{
+			"customer_id": 1,
+			"name": "Dodo",
+			"booking_count": 5,
+			"has_booking": true // Does the customer have an active booking
+		}
+	]
 */
 app.get("/get-customers", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -1324,16 +1341,16 @@ app.get("/get-customers", validate, async (req: Request, res: Response) => {
 });
 
 /*
-    returns the count of bookings in a range
-    requests body must be like this
-    {
-        start: 1004038434 // anything that can be parsed by Date()
-        end: 1004038434 // anything that can be parsed by Date()
-    }
-    Date.parse documentation
-    https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/parse
-    for the best results just send ms since epoch
-    returns the number of bookings in that range
+	returns the count of bookings in a range
+	requests body must be like this
+	{
+		start: 1004038434 // anything that can be parsed by Date()
+		end: 1004038434 // anything that can be parsed by Date()
+	}
+	Date.parse documentation
+	https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/parse
+	for the best results just send ms since epoch
+	returns the number of bookings in that range
 */
 app.get("/get-withen-range", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -1770,6 +1787,16 @@ app.get("/roles", validate, async (req: Request, res: Response) => {
 	}
 });
 
+app.get("/actions", validate, async (req: Request, res: Response) => {
+	try {
+		const actions = await GetActions();
+		res.json(actions);
+	} catch (err) {
+		console.error('get_actions_failed', err);
+		res.status(500).json({ error: 'Unable to fetch actions' });
+	}
+});
+
 app.post("/roles", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
@@ -1787,6 +1814,10 @@ app.post("/roles", validate, async (req: Request, res: Response) => {
 		res.status(201).json(role);
 	} catch (error: any) {
 		console.error("create_role_failed", error);
+		if (error && error.name === 'ValidationError') {
+			// structured response for invalid action ids
+			return res.status(400).json({ error: String(error.message), invalidActionIds: error.invalidActionIds ?? [] });
+		}
 		res.status(400).json({ error: String(error?.message ?? "Unable to create role") });
 	}
 });
@@ -2370,7 +2401,7 @@ app.post("/get_main_feedback_question", validate, async (req: Request, res: Resp
 		res.status(400).json({ error: "Missing category" });
 		return;
 	}
-	if(category < 1 || category > 7) {
+	if (category < 1 || category > 7) {
 		res.status(400).json({ error: "Invalid category" });
 		return;
 	}
@@ -2406,11 +2437,11 @@ app.post("/get_follow_up_question", validate, async (req: Request, res: Response
 		res.status(400).json({ error: "Missing category or rate" });
 		return;
 	}
-	if(category < 1 || category > 7) {
+	if (category < 1 || category > 7) {
 		res.status(400).json({ error: "Invalid category" });
 		return;
 	}
-	if(rate < 1 || rate > 5) {
+	if (rate < 1 || rate > 5) {
 		res.status(400).json({ error: "Invalid rate" });
 		return;
 	}
@@ -2470,13 +2501,13 @@ app.post("/feedback/dynamic-follow-up", validate, async (req: Request, res: Resp
 			+ encodeURIComponent(rating),
 		);
 
-		const proxyData = (await proxyResponse. json()) as Record<string, unknown>;
+		const proxyData = (await proxyResponse.json()) as Record<string, unknown>;
 		if (!proxyResponse.ok) {
 			res.status(proxyResponse.status).json(proxyData);
 			return;
 		}
 
-		const aiPrompt = typeof proxyData.feedback === "string" ? proxyData. feedback. trim() : "";		
+		const aiPrompt = typeof proxyData.feedback === "string" ? proxyData.feedback.trim() : "";
 		const normalizedAiPrompt = normalizeFollowUpPromptForCategory(aiPrompt, categoryLabel.toLowerCase(), rating);
 		const contextualFallback =
 			mainQuestion && firstFollowUpQuestion
@@ -2666,7 +2697,7 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 				? new Date(visitDateRaw)
 				: null;
 
-		const saved = await AddFeedbackEntry(restaurantId, employeeId,{
+		const saved = await AddFeedbackEntry(restaurantId, employeeId, {
 			customer_name:
 				typeof body?.customer_name === "string" ? body.customer_name : null,
 			visit_date: visitDate && !Number.isNaN(visitDate.getTime()) ? visitDate : null,
@@ -2889,17 +2920,17 @@ app.get("/feedback/stats", validate, async (req: Request, res: Response) => {
 				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
 				for (let idx = 0; idx < weeks.length; idx++) {
 					const ws = weeks[idx]!;
-					const wsMs = Date.UTC(Number(ws.start.slice(0,4)), Number(ws.start.slice(5,7)) - 1, Number(ws.start.slice(8,10)));
-					const weMs = Date.UTC(Number(ws.end.slice(0,4)), Number(ws.end.slice(5,7)) - 1, Number(ws.end.slice(8,10)));
+					const wsMs = Date.UTC(Number(ws.start.slice(0, 4)), Number(ws.start.slice(5, 7)) - 1, Number(ws.start.slice(8, 10)));
+					const weMs = Date.UTC(Number(ws.end.slice(0, 4)), Number(ws.end.slice(5, 7)) - 1, Number(ws.end.slice(8, 10)));
 					if (t >= wsMs && t < weMs) { weeks[idx]!.count += 1; break; }
 				}
 			}
-			return res.json({ mode: "monthly", month: `${year}-${(month+1).toString().padStart(2,'0')}`, start: weeks[0]?.start ?? monthStart.toISOString().slice(0,10), weeks });
+			return res.json({ mode: "monthly", month: `${year}-${(month + 1).toString().padStart(2, '0')}`, start: weeks[0]?.start ?? monthStart.toISOString().slice(0, 10), weeks });
 		}
 
 		if (mode === "yearly") {
 			const yearParam = Number(req.query.year ?? new Date().getUTCFullYear());
-			const months = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, label: ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][i], count: 0 }));
+			const months = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, label: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][i], count: 0 }));
 			for (const r of rows) {
 				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
 				const s = new Date(raw);

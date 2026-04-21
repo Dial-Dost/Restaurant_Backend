@@ -532,14 +532,14 @@ async function runQuery<TRow extends QueryResultRow = QueryResultRow>(
   params: unknown[] = [],
   client?: PoolClient,
 ): Promise<TRow[]> {
-  const runner = client ?? ( isipv4Fallback ? ipv4pool : pool );
+  const runner = client ?? (isipv4Fallback ? ipv4pool : pool);
   const result = await runner.query<TRow>(sql, params);
   return result.rows;
 }
 
 async function withTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
   let client;
-  try{
+  try {
     client = await pool.connect();
     isipv4Fallback = false;
   }
@@ -2466,12 +2466,12 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
     const payload = parseJsonObject(row.food) ?? {};
     const items = Array.isArray(payload.items)
       ? payload.items.map((entry: any) => ({
-          id: String(entry.id ?? randomUUID()),
-          name: String(entry.name ?? "Unknown"),
-          quantity: Math.max(1, Math.round(parseNumeric(entry.quantity))),
-          price: parseNumeric(entry.price),
-          orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
-        }))
+        id: String(entry.id ?? randomUUID()),
+        name: String(entry.name ?? "Unknown"),
+        quantity: Math.max(1, Math.round(parseNumeric(entry.quantity))),
+        price: parseNumeric(entry.price),
+        orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
+      }))
       : [];
 
     const subtotal = parseNumeric(payload.subtotal);
@@ -2492,10 +2492,10 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
         : undefined,
       taxes: Array.isArray(payload.taxes)
         ? payload.taxes.map((tax: any) => ({
-            id: String(tax.id ?? randomUUID()),
-            name: String(tax.name ?? "Tax"),
-            percentage: parseNumeric(tax.percentage),
-          }))
+          id: String(tax.id ?? randomUUID()),
+          name: String(tax.name ?? "Tax"),
+          percentage: parseNumeric(tax.percentage),
+        }))
         : undefined,
       applyServiceCharge: Boolean(payload.applyServiceCharge),
       total: total > 0 ? total : subtotal,
@@ -3201,10 +3201,10 @@ export async function GetMonthlyApcInsights(
 
   const scopedOrders = employeeFilter
     ? precomputedOrders.filter((order) =>
-        order.assigned_employee_id
-          ? order.assigned_employee_id.toLowerCase() === employeeFilter
-          : false,
-      )
+      order.assigned_employee_id
+        ? order.assigned_employee_id.toLowerCase() === employeeFilter
+        : false,
+    )
     : precomputedOrders;
 
   // apply non-cancelled filter to scopedOrders for revenue calculations
@@ -3563,6 +3563,41 @@ export async function GetRoles(restaurantId: string): Promise<RoleRecord[]> {
   }));
 }
 
+export type ActionRecord = {
+  id: string;
+  action_name: string;
+  action_desc?: string | null;
+  group?: string | null;
+};
+
+export class ValidationError extends Error {
+  public invalidActionIds: string[];
+  constructor(message: string, invalidActionIds: string[] = []) {
+    super(message);
+    this.name = 'ValidationError';
+    this.invalidActionIds = invalidActionIds;
+  }
+}
+
+export async function GetActions(): Promise<ActionRecord[]> {
+  // Actions are global (not scoped per restaurant). Return id, name, desc and group.
+  const rows = await runQuery<{
+    id: string;
+    action_name: string;
+    action_desc: string | null;
+    group: string | null;
+  }>(
+    `
+      select id, action_name, action_desc, "group"
+      from "Actions"
+      order by coalesce("group", ''), action_name
+    `,
+    [],
+  );
+
+  return rows.map((r) => ({ id: r.id, action_name: r.action_name, action_desc: r.action_desc ?? null, group: r.group ?? null }));
+}
+
 export async function CreateRole(
   restaurantId: string,
   role_name: string,
@@ -3585,8 +3620,24 @@ export async function CreateRole(
   );
 
   const normalizedActions = Array.from(
-    new Set(actions_performable.map((entry) => entry.trim()).filter(Boolean)),
+    new Set(actions_performable.map((entry) => String(entry).trim()).filter(Boolean)),
   );
+  // Validate that provided action IDs exist in the Actions table.
+  if (normalizedActions.length > 0) {
+    const found = await runQuery<{ id: string }>(
+      `
+        select id
+        from "Actions"
+        where id::text = any($1::text[])
+      `,
+      [normalizedActions],
+    );
+    const foundIds = new Set(found.map((r) => r.id));
+    const invalid = normalizedActions.filter((id) => !foundIds.has(id));
+    if (invalid.length > 0) {
+      throw new ValidationError(`Invalid action ids: ${invalid.join(",")}`, invalid);
+    }
+  }
 
   const row = existing[0];
   if (row) {

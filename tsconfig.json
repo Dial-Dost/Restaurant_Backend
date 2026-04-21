@@ -29,6 +29,9 @@
     "forceConsistentCasingInFileNames": true,
     "types": [
       "node"
-    ]
+    ],
+
+    // for decorators
+    "useDecorators": true
   }
 }
