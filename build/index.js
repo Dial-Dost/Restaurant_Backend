@@ -1,8 +1,8 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, GetActions, ValidationError, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
-import { initRealtime, emitRestaurant } from "./realtime.js";
+import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
 const app = express();
 const port = 3000;
@@ -15,6 +15,11 @@ function validate(req, res, next) {
     next();
     // return res.status(400).json({ error: "Auth failed" });
 }
+const CORE_ROLES = {
+    admin: ["*"],
+    employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
+    valet: ["e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7", "faf2745b-580c-4529-bbe1-033200cbcf67"],
+};
 function normalizeRole(rawRole) {
     if (typeof rawRole !== "string") {
         return null;
@@ -207,7 +212,7 @@ app.use((req, res, next) => {
     if (origin && allowedOrigins.has(origin)) {
         res.header("Access-Control-Allow-Origin", origin);
     }
-    res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id");
+    res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id,X-Action-List");
     res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     if (req.method === "OPTIONS") {
         res.sendStatus(204);
@@ -217,6 +222,16 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.get('/core-roles', validate, async (req, res) => {
+    try {
+        const rows = Object.keys(CORE_ROLES).map((role) => ({ role, actions: CORE_ROLES[role] }));
+        res.json(rows);
+    }
+    catch (err) {
+        console.error('error_fetching_core_roles', err);
+        res.status(500).json({ error: 'Unable to fetch core roles' });
+    }
+});
 // Lightweight health endpoint for readiness/liveness checks
 app.get("/", (_req, res) => {
     res.json({
@@ -1494,6 +1509,40 @@ app.get("/restaurant/profile", validate, async (req, res) => {
         res.status(500).json({ error: "Unable to fetch profile" });
     }
 });
+// Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
+app.post('/publish/bill', validate, async (req, res) => {
+    const body = (req.body ?? {});
+    const restaurantId = typeof body.restaurantId === 'string' ? body.restaurantId.trim() : (typeof req.headers['x-restaurant-id'] === 'string' ? req.headers['x-restaurant-id'] : null);
+    const outletId = typeof body.outletId === 'string' ? body.outletId.trim() : (typeof req.headers['x-outlet-id'] === 'string' ? req.headers['x-outlet-id'] : null);
+    const billId = typeof body.billId === 'string' ? body.billId.trim() : '';
+    const escBase64 = typeof body.escBase64 === 'string' ? body.escBase64 : (typeof body.esc === 'string' ? body.esc : null);
+    console.log(body);
+    if (!restaurantId || !outletId || !billId || !escBase64) {
+        res.status(400).json({ error: 'restaurantId, outletId, billId and escBase64 are required' });
+        return;
+    }
+    try {
+        // verify restaurant and outlet
+        const profile = await GetRestaurantProfile(restaurantId);
+        if (!profile) {
+            res.status(404).json({ error: 'Invalid restaurantId' });
+            return;
+        }
+        if (!profile.outlet_id || String(profile.outlet_id) !== String(outletId)) {
+            // If outlet doesn't match profile, still allow if the outletId is non-empty — we cannot enumerate all outlets here easily.
+            // For strict verification, you can implement lookup against Outlets table. For now, reject if mismatch with default outlet from profile.
+            res.status(400).json({ error: 'Invalid outletId for the restaurant' });
+            return;
+        }
+        // Emit to outlet-specific room; send billId and base64 payload
+        emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+        res.json({ success: true });
+    }
+    catch (err) {
+        console.error('publish_bill_failed', err);
+        res.status(500).json({ error: 'Unable to publish bill' });
+    }
+});
 app.put("/restaurant/profile", validate, async (req, res) => {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
@@ -1570,6 +1619,16 @@ app.get("/roles", validate, async (req, res) => {
         res.status(500).json({ error: "Unable to fetch roles" });
     }
 });
+app.get("/actions", validate, async (req, res) => {
+    try {
+        const actions = await GetActions();
+        res.json(actions);
+    }
+    catch (err) {
+        console.error('get_actions_failed', err);
+        res.status(500).json({ error: 'Unable to fetch actions' });
+    }
+});
 app.post("/roles", validate, async (req, res) => {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
@@ -1586,6 +1645,10 @@ app.post("/roles", validate, async (req, res) => {
     }
     catch (error) {
         console.error("create_role_failed", error);
+        if (error && error.name === 'ValidationError') {
+            // structured response for invalid action ids
+            return res.status(400).json({ error: String(error.message), invalidActionIds: error.invalidActionIds ?? [] });
+        }
         res.status(400).json({ error: String(error?.message ?? "Unable to create role") });
     }
 });

@@ -5,8 +5,11 @@ node_modules/
 .env*
 **/*.db
 package-lock.json
+.vscode/
 
 build/
+bin/
+obj/
 
 # Python-generated files
 __pycache__/
@@ -19,3 +22,5 @@ wheels/
 .env
 *.log
 uv.lock
+
+Restaurant_Backend.sln

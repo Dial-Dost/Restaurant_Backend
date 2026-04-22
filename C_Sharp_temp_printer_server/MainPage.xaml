@@ -1,0 +1,89 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="C_Sharp_temp_printer_server.MainPage">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="20" Spacing="12">
+            <Label Text="Printer Agent" FontSize="28" HorizontalOptions="Center" />
+            <ActivityIndicator x:Name="LoadingIndicator" IsVisible="False" IsRunning="False" HorizontalOptions="Center" />
+
+            <!-- Restaurant login -->
+            <Border Stroke="Gray" StrokeThickness="1" Padding="10" x:Name="RestaurantScene">
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="1) Restaurant" FontAttributes="Bold" />
+                    <Entry x:Name="RestaurantEntry" Placeholder="Restaurant username / id" />
+                    <Button x:Name="VerifyRestaurantBtn" Text="Verify Restaurant" Clicked="OnVerifyRestaurant" />
+                    <Label x:Name="RestaurantStatus" Text="Not verified" TextColor="Gray" />
+                </VerticalStackLayout>
+            </Border>
+
+            <!-- Employee login -->
+            <Border Stroke="Gray" StrokeThickness="1" Padding="10" x:Name="EmployeeScene" IsVisible="False">
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="2) Employee Login" FontAttributes="Bold" />
+                    <Entry x:Name="EmployeeEntry" Placeholder="Employee username" />
+                    <Entry x:Name="PasswordEntry" Placeholder="Password" IsPassword="True" />
+                    <HorizontalStackLayout Spacing="8">
+                        <Button x:Name="EmployeeLoginBtn" Text="Sign In" Clicked="OnEmployeeLogin" />
+                        <Button x:Name="LogoutBtn_Emp" Text="Logout" Clicked="OnLogoutClicked" />
+                    </HorizontalStackLayout>
+                    <Label x:Name="EmployeeStatus" Text="Not signed in" TextColor="Gray" />
+                </VerticalStackLayout>
+            </Border>
+
+            <!-- Printers and queue -->
+            <Border Stroke="Gray" StrokeThickness="1" Padding="10" x:Name="PrinterScene" IsVisible="False">
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="3) Printers" FontAttributes="Bold" />
+                    <HorizontalStackLayout Spacing="8">
+                        <Button x:Name="DiscoverPrintersBtn" Text="Discover Printers" Clicked="OnDiscoverPrinters" />
+                        <Button x:Name="LogoutBtn_Printer" Text="Logout" Clicked="OnLogoutClicked" />
+                    </HorizontalStackLayout>
+                    <Picker x:Name="PrinterPicker" Title="Select default printer" />
+                    <Button x:Name="SetDefaultPrinterBtn" Text="Set Default Printer" Clicked="OnSetDefaultPrinter" />
+                    <Label x:Name="PrinterStatus" Text="No default printer selected" TextColor="Gray" />
+                </VerticalStackLayout>
+            </Border>
+
+            <!-- Queue (visible only in Printer scene) -->
+            <Border Stroke="Gray" StrokeThickness="1" Padding="10" x:Name="QueueScene" IsVisible="False">
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="Print Queue" FontAttributes="Bold" />
+                    <CollectionView x:Name="QueueList" HeightRequest="160" SelectionMode="Single" SelectionChanged="OnQueueSelectionChanged">
+                        <CollectionView.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Padding="6">
+                                    <Label Text="{Binding Display}" />
+                                </Grid>
+                            </DataTemplate>
+                        </CollectionView.ItemTemplate>
+                    </CollectionView>
+
+                    <HorizontalStackLayout Spacing="8" HorizontalOptions="Center">
+                        <Button x:Name="RetryBtn" Text="Retry Selected" Clicked="OnRetrySelected" />
+                        <Button x:Name="RemoveBtn" Text="Remove Selected" Clicked="OnRemoveSelected" />
+                        <Button x:Name="ClearBtn" Text="Clear Queue" Clicked="OnClearQueue" />
+                        <Button x:Name="PauseBtn" Text="Pause" Clicked="OnPauseResume" />
+                    </HorizontalStackLayout>
+                </VerticalStackLayout>
+            </Border>
+
+            <Border Stroke="Gray" StrokeThickness="1" Padding="10">
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="Logs" FontAttributes="Bold" />
+                    <CollectionView x:Name="LogsList" HeightRequest="120">
+                        <CollectionView.ItemTemplate>
+                            <DataTemplate>
+                                <Label Text="{Binding}" LineBreakMode="TailTruncation" />
+                            </DataTemplate>
+                        </CollectionView.ItemTemplate>
+                    </CollectionView>
+                </VerticalStackLayout>
+            </Border>
+
+            <Label x:Name="ConnectionStatus" Text="Not connected" TextColor="Gray" HorizontalOptions="Center" />
+        </VerticalStackLayout>
+    </ScrollView>
+
+</ContentPage>
