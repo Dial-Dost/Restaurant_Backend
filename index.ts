@@ -82,7 +82,7 @@ import {
 	createReservationForRequest,
 	getRestaurantKnowledgeSnapshot,
 } from "./realtime_reception_agent.js";
-import { initRealtime, emitRestaurant } from "./realtime.js";
+import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
 const app = express();
 const port = 3000;
@@ -1796,6 +1796,50 @@ app.get("/restaurant/profile", validate, async (req: Request, res: Response) => 
 	} catch (error) {
 		console.error("get_restaurant_profile_failed", error);
 		res.status(500).json({ error: "Unable to fetch profile" });
+	}
+});
+
+// Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
+app.post('/publish/bill', validate, async (req: Request, res: Response) => {
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const restaurantId = typeof body.restaurantId === 'string' ? body.restaurantId.trim() : (typeof req.headers['x-restaurant-id'] === 'string' ? req.headers['x-restaurant-id'] : null);
+	const outletId = typeof body.outletId === 'string' ? body.outletId.trim() : (typeof req.headers['x-outlet-id'] === 'string' ? req.headers['x-outlet-id'] : null);
+	const billId = typeof body.billId === 'string' ? body.billId.trim() : '';
+	const escBase64 = typeof body.escBase64 === 'string' ? body.escBase64 : (typeof body.esc === 'string' ? body.esc : null);
+
+	if (!restaurantId || !outletId || !billId || !escBase64) {
+		res.status(400).json({ error: 'restaurantId, outletId, billId and escBase64 are required' });
+		return;
+	}
+
+	try {
+		// verify restaurant and outlet
+		const profile = await GetRestaurantProfile(restaurantId);
+		if (!profile) {
+			res.status(404).json({ error: 'Invalid restaurantId' });
+			return;
+		}
+
+		if (!profile.outlet_id || String(profile.outlet_id) !== String(outletId)) {
+			// If outlet doesn't match profile, still allow if the outletId is non-empty — we cannot enumerate all outlets here easily.
+			// For strict verification, you can implement lookup against Outlets table. For now, reject if mismatch with default outlet from profile.
+			res.status(400).json({ error: 'Invalid outletId for the restaurant' });
+			return;
+		}
+
+		// Emit to outlet-specific room; send billId and base64 payload
+		emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+		// // Also emit to the restaurant username/slug room if available (some clients join by slug)
+		// try {
+		// 	const slug = (profile as any)?.restaurant_username;
+		// 	if (slug && typeof slug === 'string' && slug.trim()) {
+		// 		emitOutlet(slug, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+		// 	}
+		// } catch (err) { }
+		res.json({ success: true });
+	} catch (err) {
+		console.error('publish_bill_failed', err);
+		res.status(500).json({ error: 'Unable to publish bill' });
 	}
 });
 

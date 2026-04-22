@@ -44,6 +44,34 @@ export async function initRealtime(httpServer: HttpServer) {
     socket.on("leave", (rid: string) => {
       if (rid && typeof rid === "string") socket.leave(`restaurant:${rid}`);
     });
+
+    // join a specific outlet room - payload: { restaurantId, outletId }
+    socket.on("joinOutlet", (payload: any) => {
+      try {
+        if (!payload) return;
+        const r = typeof payload.restaurantId === 'string' ? payload.restaurantId : null;
+        const o = typeof payload.outletId === 'string' ? payload.outletId : null;
+        if (r && o) socket.join(`restaurant:${r}:outlet:${o}`);
+        // acknowledge join back to client for debugging/confirmation
+        try {
+          if (r && o) {
+            socket.emit('joinedOutlet', { restaurantId: r, outletId: o });
+            console.log(`Socket ${socket.id} joined restaurant:${r}:outlet:${o}`);
+          }
+        } catch (err) { }
+      } catch (err) {
+        // ignore
+      }
+    });
+
+    socket.on("leaveOutlet", (payload: any) => {
+      try {
+        if (!payload) return;
+        const r = typeof payload.restaurantId === 'string' ? payload.restaurantId : null;
+        const o = typeof payload.outletId === 'string' ? payload.outletId : null;
+        if (r && o) socket.leave(`restaurant:${r}:outlet:${o}`);
+      } catch (err) { }
+    });
   });
 
   console.log("Realtime Socket.IO initialized");
@@ -52,9 +80,30 @@ export async function initRealtime(httpServer: HttpServer) {
 export function emitRestaurant(restaurantId: string, event: string, payload: unknown) {
   if (!io) return;
   try {
-    io.to(`restaurant:${restaurantId}`).emit(event, payload);
+    const room = `restaurant:${restaurantId}`;
+    console.log(`emitRestaurant -> ${room} event:${event} payload:`, payload);
+    io.to(room).emit(event, payload);
+    // log number of sockets in room for debugging
+    try {
+      io.in(room).allSockets().then(sockets => console.log(`emitRestaurant: ${sockets.size} socket(s) in ${room}`)).catch(() => { });
+    } catch (e) { }
   } catch (err) {
     console.error("emitRestaurant failed", err);
+  }
+}
+
+export function emitOutlet(restaurantId: string, outletId: string, event: string, payload: unknown) {
+  if (!io) return;
+  try {
+    const room = `restaurant:${restaurantId}:outlet:${outletId}`;
+    console.log(`emitOutlet -> ${room} event:${event}`); // payload:`, payload
+    io.to(room).emit(event, payload);
+    // log number of sockets in room for debugging
+    try {
+      io.in(room).allSockets().then(sockets => console.log(`emitOutlet: ${sockets.size} socket(s) in ${room}`)).catch(() => { });
+    } catch (e) { }
+  } catch (err) {
+    console.error("emitOutlet failed", err);
   }
 }
 
