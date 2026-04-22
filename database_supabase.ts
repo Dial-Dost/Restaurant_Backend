@@ -20,6 +20,7 @@
 
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
+import { downloadFile } from "./storage_bucket_supabase.js";
 
 const connectionString =
   process.env.SUPABASE_DIRECT_URL ??
@@ -49,9 +50,12 @@ let isipv4Fallback = false;
 type RestaurantContext = {
   inputId: string;
   res_id: string;
-  outlet_id: string;
   restaurant_slug: string;
   restaurant_name: string;
+  restaurant_main_office_add: string | null;
+  restaurant_logo_url: string | null;
+
+  outlet_id: string;
 };
 
 type SlotPayload = {
@@ -222,13 +226,13 @@ export type OrderRecord = {
   applyServiceCharge: boolean;
   total: number;
   status:
-    | "Preparing"
-    | "Served"
-    | "Bill Verification"
-    | "Payment Pending Approval"
-    | "Paid"
-    | "Closed"
-    | "Cancelled";
+  | "Preparing"
+  | "Served"
+  | "Bill Verification"
+  | "Payment Pending Approval"
+  | "Paid"
+  | "Closed"
+  | "Cancelled";
   payment_method?: PaymentMethod | null;
   payment_waiter_confirmed_at?: string | null;
   payment_waiter_confirmed_by?: string | null;
@@ -301,11 +305,19 @@ type ApcInsightOptions = {
 };
 
 export type RestaurantProfileRecord = {
-  name: string;
-  address: string;
-  phone: string;
+  res_id: string;
+  restaurant_username: string;
+  restaurant_main_office_add: string | null;
+  restaurant_logo_url: string | null;
+
+  outlet_id: string;
+  outlet_name: string;
+
+  restaurant_name: string;
+  outlet_add: string;
+  outlet_phone: string;
   email: string;
-  hours: string;
+  outlet_hours: string;
 };
 
 export type RoleRecord = {
@@ -423,12 +435,21 @@ function parseJsonObject(value: unknown): Record<string, unknown> | null {
 
 function parseEmployeeRoles(raw: unknown): EmployeeRolesPayload {
   const parsed = parseJsonObject(raw);
-  const primaryRaw = String(parsed?.primary ?? "employee").trim().toLowerCase() || "employee";
-  const allRaw = Array.isArray(parsed?.all)
-    ? parsed!.all.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean)
-    : [];
+  // primary should always be a core role name (admin/employee/valet/waiter)
+  let primaryRaw = String(parsed?.primary ?? "employee").trim();
+  if (isUuid(primaryRaw)) {
+    // legacy or invalid value: fall back to employee
+    primaryRaw = "employee";
+  } else {
+    primaryRaw = primaryRaw.toLowerCase() || "employee";
+  }
 
-  const all = Array.from(new Set([primaryRaw, ...allRaw]));
+  const allRaw = Array.isArray(parsed?.all) ? parsed!.all.map((entry) => String(entry).trim()).filter(Boolean) : [];
+
+  // Normalize entries: if an entry is a UUID, keep as-is (custom role id), otherwise lowercase core role name
+  const normalizedAll = allRaw.map((entry) => (isUuid(entry) ? entry : entry.toLowerCase()));
+
+  const all = Array.from(new Set([primaryRaw, ...normalizedAll]));
   return {
     primary: primaryRaw,
     all: all.length > 0 ? all : ["employee"],
@@ -636,13 +657,17 @@ async function resolveRestaurantContext(
       outlet_id: string | null;
       restaurant_slug: string;
       restaurant_name: string;
+      restaurant_main_office_add: string | null;
+      restaurant_logo_url: string | null;
     }>(
       `
         select
           r.id as res_id,
           o.id as outlet_id,
           r.res_username as restaurant_slug,
-          r.res_name as restaurant_name
+          r.res_name as restaurant_name,
+          r.main_office_add as restaurant_main_office_add,
+          r.logo as restaurant_logo_url,
         from "Restaurant" r
         left join "Outlets" o on o.res_id = r.id
         where
@@ -665,6 +690,8 @@ async function resolveRestaurantContext(
       outlet_id: row.outlet_id,
       restaurant_slug: row.restaurant_slug,
       restaurant_name: row.restaurant_name,
+      restaurant_main_office_add: row.restaurant_main_office_add,
+      restaurant_logo_url: row.restaurant_logo_url,
     };
   }
 
@@ -673,13 +700,17 @@ async function resolveRestaurantContext(
     outlet_id: string | null;
     restaurant_slug: string;
     restaurant_name: string;
+    restaurant_main_office_add: string | null;
+    restaurant_logo_url: string | null;
   }>(
     `
       select
         r.id as res_id,
         o.id as outlet_id,
         r.res_username as restaurant_slug,
-        r.res_name as restaurant_name
+        r.res_name as restaurant_name,
+        r.main_office_add as restaurant_main_office_add,
+        r.logo as restaurant_logo_url
       from "Restaurant" r
       left join "Outlets" o on o.res_id = r.id
       where
@@ -704,6 +735,8 @@ async function resolveRestaurantContext(
     outlet_id: row.outlet_id,
     restaurant_slug: row.restaurant_slug,
     restaurant_name: row.restaurant_name,
+    restaurant_main_office_add: row.restaurant_main_office_add,
+    restaurant_logo_url: row.restaurant_logo_url,
   };
 }
 
@@ -3691,14 +3724,23 @@ export async function GetRestaurantProfile(
   const outlet = outletRows[0];
 
   return {
-    name: outlet?.outlet_name ?? context.restaurant_name,
-    address: employee?.address ?? outlet?.outlet_add ?? "",
-    phone: employee?.phone ?? outlet?.outlet_phone ?? "",
+    restaurant_name: context.restaurant_name,
+    outlet_add: outlet?.outlet_add ?? "",
+    outlet_phone: outlet?.outlet_phone ?? "",
     email: employee?.email ?? "",
-    hours: outlet?.outlet_hours ?? "",
+    outlet_hours: outlet?.outlet_hours ?? "",
+
+    res_id: context.res_id,
+    restaurant_username: context.restaurant_slug,
+    restaurant_main_office_add: context.restaurant_main_office_add,
+    restaurant_logo_url: context.restaurant_logo_url,
+
+    outlet_id: context.outlet_id,
+    outlet_name: outlet?.outlet_name ?? "",
   };
 }
 
+//Important: Need to fix this function according to the new RestaurantProfileRecord class
 export async function UpdateRestaurantProfile(
   restaurantId: string,
   profile: RestaurantProfileRecord,
@@ -3715,7 +3757,7 @@ export async function UpdateRestaurantProfile(
           main_office_add = $3
         where id = $1
       `,
-      [context.res_id, profile.name.trim(), profile.address.trim() || null],
+      [context.res_id, profile.restaurant_name.trim(), profile.outlet_add.trim() || null],
       client,
     );
 
@@ -3732,10 +3774,10 @@ export async function UpdateRestaurantProfile(
       [
         context.outlet_id,
         context.res_id,
-        profile.name.trim(),
-        profile.address.trim(),
-        normalizePhone(profile.phone) || null,
-        profile.hours.trim() || null,
+        profile.restaurant_name.trim(),
+        profile.outlet_add.trim(),
+        normalizePhone(profile.outlet_phone) || null,
+        profile.outlet_hours.trim() || null,
       ],
       client,
     );
@@ -3756,8 +3798,8 @@ export async function UpdateRestaurantProfile(
           context.res_id,
           context.outlet_id,
           profile.email.trim() || null,
-          normalizePhone(profile.phone) || null,
-          profile.address.trim() || null,
+          normalizePhone(profile.outlet_phone) || null,
+          profile.outlet_add.trim() || null,
         ],
         client,
       );
@@ -3787,10 +3829,10 @@ export async function GetOutletDefaultTax(restaurantId: string): Promise<Record<
 export async function GetRestaurantLogo(restaurantId: string): Promise<string | null> {
   const context = await requireRestaurantContext(restaurantId);
   const rows = await runQuery<{
-    logo_base64: string | null;
+    logo_url: string | null;
   }>(
     `
-      select encode(r.logo, 'base64') as logo_base64
+      select r.logo as logo_url
       from "Restaurant" r
       where r.id = $1
       limit 1
@@ -3798,8 +3840,15 @@ export async function GetRestaurantLogo(restaurantId: string): Promise<string | 
     [context.res_id],
   );
   const row = rows[0];
-  if (!row || !row.logo_base64) return null;
-  return row.logo_base64;
+  if (!row || !row.logo_url) return null;
+  const logo_base64 = await downloadFile(row.logo_url)
+    .then(async (blob) => {
+      if (!blob) return null;
+      const arrayBuffer = await blob.arrayBuffer();
+      return Buffer.from(arrayBuffer).toString("base64");
+    })
+    .catch(() => null);
+  return logo_base64;
 }
 
 export async function GetBillByOrder(restaurantId: string, orderId: string) {
@@ -4046,25 +4095,37 @@ export async function AssignRoleToEmployee(
   roleName: string,
 ): Promise<void> {
   const context = await requireRestaurantContext(restaurantId);
-  const normalizedRole = roleName.trim().toLowerCase();
-  if (!normalizedRole) {
+  const raw = String(roleName ?? "").trim();
+  if (!raw) {
     throw new Error("Role is required");
   }
 
   await withTransaction(async (client) => {
-    if (!["admin", "employee", "valet", "waiter"].includes(normalizedRole)) {
-      const roleRows = await runQuery<{ id: string }>(
-        `
-          select id
-          from "Roles"
-          where res_id = $1 and lower(role_name) = lower($2)
-          limit 1
-        `,
-        [context.res_id, normalizedRole],
+    // If the incoming value is a UUID, treat it as a custom role id.
+    let entryToAdd: string;
+    if (isUuid(raw)) {
+      const roleRows = await runQuery<{ id: string; role_name: string }>(
+        `select id, role_name from "Roles" where id = $1 and res_id = $2 limit 1`,
+        [raw, context.res_id],
         client,
       );
-      if (!roleRows[0]) {
-        throw new Error("Role does not exist");
+      if (!roleRows[0]) throw new Error("Role does not exist");
+      entryToAdd = roleRows[0].id; // store id for custom role
+    } else {
+      const normalizedRole = raw.toLowerCase();
+      if (["admin", "employee", "valet", "waiter"].includes(normalizedRole)) {
+        entryToAdd = normalizedRole; // core role name
+      } else {
+        // lookup custom role by name and store its id
+        const roleRows = await runQuery<{ id: string }>(
+          `select id from "Roles" where res_id = $1 and lower(role_name) = lower($2) limit 1`,
+          [context.res_id, normalizedRole],
+          client,
+        );
+        if (!roleRows[0]) {
+          throw new Error("Role does not exist");
+        }
+        entryToAdd = roleRows[0].id;
       }
     }
 
@@ -4074,7 +4135,7 @@ export async function AssignRoleToEmployee(
     }
 
     const roles = parseEmployeeRoles(employee.emp_roles);
-    const nextAll = Array.from(new Set([...roles.all, normalizedRole]));
+    const nextAll = Array.from(new Set([...roles.all, entryToAdd]));
     const nextPrimary = roles.primary || "employee";
 
     await runQuery(
@@ -4100,10 +4161,8 @@ export async function RemoveRoleFromEmployee(
   roleName: string,
 ): Promise<void> {
   const context = await requireRestaurantContext(restaurantId);
-  const normalizedRole = roleName.trim().toLowerCase();
-  if (!normalizedRole) {
-    throw new Error("Role is required");
-  }
+  const raw = String(roleName ?? "").trim();
+  if (!raw) throw new Error("Role is required");
 
   await withTransaction(async (client) => {
     const employee = await getEmployeeRoleRow(context, employeeId, client);
@@ -4112,9 +4171,28 @@ export async function RemoveRoleFromEmployee(
     }
 
     const roles = parseEmployeeRoles(employee.emp_roles);
-    const nextAll = roles.all.filter((role) => role !== normalizedRole);
-    const nextPrimary = roles.primary === normalizedRole
-      ? (nextAll.find((role) => role === "admin" || role === "employee" || role === "valet" || role === "waiter") ?? "employee")
+    let nextAll: string[];
+    if (isUuid(raw)) {
+      // remove by id
+      nextAll = roles.all.filter((entry) => entry !== raw);
+    } else {
+      const normalizedRole = raw.toLowerCase();
+      if (["admin", "employee", "valet", "waiter"].includes(normalizedRole)) {
+        nextAll = roles.all.filter((entry) => entry !== normalizedRole);
+      } else {
+        // custom role name: try to resolve to id and remove id; also remove legacy name if present
+        const roleRows = await runQuery<{ id: string }>(
+          `select id from "Roles" where res_id = $1 and lower(role_name) = lower($2) limit 1`,
+          [context.res_id, normalizedRole],
+          client,
+        );
+        const roleId = roleRows[0]?.id ?? null;
+        nextAll = roles.all.filter((entry) => entry !== normalizedRole && entry !== roleId);
+      }
+    }
+
+    const nextPrimary = roles.primary === raw || roles.primary === raw.toLowerCase()
+      ? (nextAll.find((r) => ["admin", "employee", "valet", "waiter"].includes(r)) ?? "employee")
       : roles.primary;
 
     const normalizedAll = Array.from(new Set([nextPrimary, ...nextAll]));
@@ -4183,12 +4261,13 @@ export async function DeleteRole(
 
     for (const employee of employees) {
       const parsed = parseEmployeeRoles(employee.emp_roles);
-      if (!parsed.all.includes(role.role_name)) {
+      // Employee entries might contain role ids (custom roles) or role names (core roles or legacy). Remove both where applicable.
+      if (!parsed.all.includes(role.id) && !parsed.all.includes(role.role_name)) {
         continue;
       }
 
-      const all = parsed.all.filter((entry) => entry !== role.role_name);
-      const primary = parsed.primary === role.role_name
+      const all = parsed.all.filter((entry) => entry !== role.role_name && entry !== role.id);
+      const primary = parsed.primary === role.role_name || parsed.primary === role.id
         ? (all.find((entry) => ["admin", "employee", "valet", "waiter"].includes(entry)) ?? "employee")
         : parsed.primary;
       const normalizedAll = Array.from(new Set([primary, ...all]));

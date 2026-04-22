@@ -32,6 +32,6 @@
     ],
 
     // for decorators
-    "useDecorators": true
+    // "useDecorators": true
   }
 }
