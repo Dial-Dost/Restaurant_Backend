@@ -215,6 +215,9 @@ export type OrderRecord = {
   id: string;
   table: string;
   customer: string;
+  taken_by_employee_id?: string | null;
+  taken_by_employee_name?: string | null;
+  taken_by_employee_role?: string | null;
   items: OrderItemRecord[];
   subtotal: number;
   serviceChargePercentage?: number;
@@ -2562,6 +2565,18 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
       id: row.id,
       table: String(payload.table ?? row.table_name ?? ""),
       customer: String(payload.customer ?? "Guest"),
+      taken_by_employee_id:
+        typeof payload.taken_by_employee_id === "string" && payload.taken_by_employee_id.trim().length > 0
+          ? payload.taken_by_employee_id.trim()
+          : null,
+      taken_by_employee_name:
+        typeof payload.taken_by_employee_name === "string" && payload.taken_by_employee_name.trim().length > 0
+          ? payload.taken_by_employee_name.trim()
+          : null,
+      taken_by_employee_role:
+        typeof payload.taken_by_employee_role === "string" && payload.taken_by_employee_role.trim().length > 0
+          ? payload.taken_by_employee_role.trim()
+          : null,
       items,
       subtotal,
       serviceChargePercentage: Number.isFinite(parseNumeric(payload.serviceChargePercentage))
@@ -2632,11 +2647,41 @@ export async function AddOrder(
   }
 
   const id = isUuid(String(order.id ?? "")) ? String(order.id) : randomUUID();
+  const existingOrderRows = await runQuery<{ food: unknown }>(
+    `
+      select food
+      from "Orders"
+      where id = $1 and res_id = $2 and outlet_id = $3
+      limit 1
+    `,
+    [id, context.res_id, context.outlet_id],
+  );
+  const existingPayload = parseJsonObject(existingOrderRows[0]?.food) ?? {};
+
+  const takenByEmployeeIdRaw = String(
+    (order as Record<string, unknown>).taken_by_employee_id
+      ?? existingPayload.taken_by_employee_id
+      ?? "",
+  ).trim();
+  const takenByEmployeeNameRaw = String(
+    (order as Record<string, unknown>).taken_by_employee_name
+      ?? existingPayload.taken_by_employee_name
+      ?? "",
+  ).trim();
+  const takenByEmployeeRoleRaw = String(
+    (order as Record<string, unknown>).taken_by_employee_role
+      ?? existingPayload.taken_by_employee_role
+      ?? "",
+  ).trim();
+
   const statusCode = toOrderStatusCode(String(order.status ?? "Preparing"));
   const payload = {
     id,
     table: tableName,
     customer: customerName || "Guest",
+    taken_by_employee_id: takenByEmployeeIdRaw || null,
+    taken_by_employee_name: takenByEmployeeNameRaw || null,
+    taken_by_employee_role: takenByEmployeeRoleRaw || null,
     items: Array.isArray(order.items) ? order.items : [],
     subtotal: parseNumeric(order.subtotal),
     serviceChargePercentage: parseNumeric(order.serviceChargePercentage),
@@ -2928,7 +2973,7 @@ export async function CloseBillByOrder(
           and res_id = $3
           and outlet_id = $4
           and admin_approved_at is not null
-          and status = 2
+          and status <> 3
           and closed_at is null
         returning id
       `,
@@ -2971,6 +3016,9 @@ export async function ReplaceBill(
     new_order: {
       table: string;
       customer: string;
+      taken_by_employee_id?: string | null;
+      taken_by_employee_name?: string | null;
+      taken_by_employee_role?: string | null;
       items: OrderItemRecord[];
       subtotal: number;
       serviceChargePercentage?: number | null;
@@ -3025,6 +3073,9 @@ export async function ReplaceBill(
       id: newOrderId,
       table: String(payload.new_order.table ?? ''),
       customer: String(payload.new_order.customer ?? 'Guest'),
+      taken_by_employee_id: String(payload.new_order.taken_by_employee_id ?? '').trim() || null,
+      taken_by_employee_name: String(payload.new_order.taken_by_employee_name ?? '').trim() || null,
+      taken_by_employee_role: String(payload.new_order.taken_by_employee_role ?? '').trim() || null,
       items: Array.isArray(payload.new_order.items) ? payload.new_order.items : [],
       subtotal: parseNumeric(payload.new_order.subtotal ?? 0),
       serviceChargePercentage: parseNumeric(payload.new_order.serviceChargePercentage ?? 0),
@@ -3319,8 +3370,6 @@ export async function GetMonthlyApcInsights(
   monthStartInput?: Date | ApcInsightOptions,
 ): Promise<MonthlyApcInsight> {
   const context = await requireRestaurantContext(restaurantId);
-  await ensureTableAssignmentsTable();
-
   const now = new Date();
   const options: ApcInsightOptions =
     monthStartInput instanceof Date
@@ -3367,12 +3416,26 @@ export async function GetMonthlyApcInsights(
     table_name: string | null;
     food: unknown;
     status: unknown;
+    bill_status: number | null;
+    admin_approved_at: Date | null;
+    waiter_confirmed_by_username: string | null;
   }>(
     `
-      select o.id, o.created_at, o.table_id, t.table_name, o.food, o.status
+      select
+        o.id,
+        o.created_at,
+        o.table_id,
+        t.table_name,
+        o.food,
+        o.status,
+        b.status as bill_status,
+        b.admin_approved_at,
+        b.waiter_confirmed_by_username
       from "Orders" o
       left join "Tables" t
         on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+      left join "Bills" b
+        on b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
       where
         o.res_id = $1 and o.outlet_id = $2
         and o.created_at >= $3 and o.created_at < $4
@@ -3399,32 +3462,6 @@ export async function GetMonthlyApcInsights(
     [context.res_id, context.outlet_id, monthStart.toISOString(), monthEnd.toISOString()],
   );
 
-  const assignmentRows = await runQuery<{
-    table_id: string;
-    table_name: string;
-    employee_username: string | null;
-    employee_name: string;
-    employee_role: string | null;
-  }>(
-    `
-      select
-        ta.table_id,
-        t.table_name,
-        l.emp_username as employee_username,
-        trim(e."emp_Fname" || ' ' || e."emp_Lname") as employee_name,
-        e.emp_roles->>'primary' as employee_role
-      from "Table_assignments" ta
-      join "Tables" t
-        on t.id = ta.table_id and t.res_id = ta.res_id and t.outlet_id = ta.outlet_id
-      join "Employees" e
-        on e.id = ta.employee_id and e.res_id = ta.res_id and e.outlet_id = ta.outlet_id
-      left join "Login" l
-        on l.emp_id = e.id and l.res_id = e.res_id and l.outlet_id = e.outlet_id
-      where ta.res_id = $1 and ta.outlet_id = $2
-    `,
-    [context.res_id, context.outlet_id],
-  );
-
   const bookingsByTable = new Map<string, Array<{
     start: Date;
     end: Date;
@@ -3443,22 +3480,6 @@ export async function GetMonthlyApcInsights(
     const current = bookingsByTable.get(row.table_id) ?? [];
     current.push({ start, end, people });
     bookingsByTable.set(row.table_id, current);
-  }
-
-  const assignmentByTableId = new Map<string, {
-    employee_id: string | null;
-    employee_name: string | null;
-    employee_role: string | null;
-    table_name: string;
-  }>();
-
-  for (const row of assignmentRows) {
-    assignmentByTableId.set(row.table_id, {
-      employee_id: row.employee_username,
-      employee_name: row.employee_name || row.employee_username || null,
-      employee_role: row.employee_role ?? "employee",
-      table_name: row.table_name,
-    });
   }
 
   const precomputedOrders = orderRows.map((row) => {
@@ -3495,23 +3516,34 @@ export async function GetMonthlyApcInsights(
       people = bestScore <= 6 * 60 * 60 * 1000 ? Math.max(1, bestPeople) : 1;
     }
 
-    const assignment = assignmentByTableId.get(row.table_id);
+    const payloadStatusRaw = String(payload.status ?? "").trim();
+    const payloadStatus = payloadStatusRaw.length > 0 ? (payloadStatusRaw as OrderRecord["status"]) : undefined;
+    const finalStatus = fromOrderStatusCode(row.status) || payloadStatus || "Preparing";
+
+    const waiterIdFromPayload = String(payload.taken_by_employee_id ?? "").trim();
+    const waiterNameFromPayload = String(payload.taken_by_employee_name ?? "").trim();
+    const waiterRoleFromPayload = String(payload.taken_by_employee_role ?? "").trim();
+    const waiterFromBill = String(row.waiter_confirmed_by_username ?? "").trim();
+
+    const isPaid =
+      Number(row.bill_status ?? 0) === 2
+      || Boolean(row.admin_approved_at)
+      || finalStatus === "Paid"
+      || finalStatus === "Closed";
+
     return {
       order_id: row.id,
       table_name: row.table_name ?? String(payload.table ?? ""),
       created_at: createdAt.toISOString(),
       total: round2(total),
       people_count: people,
-      assigned_employee_id: assignment?.employee_id ?? null,
-      assigned_employee_name: assignment?.employee_name ?? null,
-      assigned_employee_role: assignment?.employee_role ?? null,
-      // derive status from row.status (authoritative) or payload.status as fallback
-      status: fromOrderStatusCode(row.status) || ((String(payload.status ?? "").trim() as OrderApcInsight["order_id"]) && String(payload.status)) || 'Preparing',
+      assigned_employee_id: waiterIdFromPayload || waiterFromBill || null,
+      assigned_employee_name: waiterNameFromPayload || waiterFromBill || null,
+      assigned_employee_role: waiterRoleFromPayload || "waiter",
+      status: finalStatus,
+      is_paid: isPaid,
     };
   });
-
-  // Exclude cancelled orders from revenue/covers calculations
-  const nonCancelled = precomputedOrders.filter(o => String(o.status).toLowerCase() !== 'cancelled');
 
   const scopedOrders = employeeFilter
     ? precomputedOrders.filter((order) =>
@@ -3521,8 +3553,10 @@ export async function GetMonthlyApcInsights(
       )
     : precomputedOrders;
 
-  // apply non-cancelled filter to scopedOrders for revenue calculations
-  const effectiveOrders = scopedOrders.filter(o => String(o.status).toLowerCase() !== 'cancelled');
+  // APC is credited only for paid/closed bills and excludes cancelled orders.
+  const effectiveOrders = scopedOrders.filter(
+    (o) => o.is_paid && String(o.status).toLowerCase() !== "cancelled",
+  );
 
   const totalRevenue = round2(effectiveOrders.reduce((sum, order) => sum + order.total, 0));
   const totalCovers = effectiveOrders.reduce((sum, order) => sum + order.people_count, 0);
@@ -3552,28 +3586,21 @@ export async function GetMonthlyApcInsights(
     revenue: number;
   }>();
 
-  for (const assignment of assignmentRows) {
-    if (!assignment.employee_username) continue;
-    if (employeeFilter && assignment.employee_username.toLowerCase() !== employeeFilter) continue;
-    const existing = employeeAccumulator.get(assignment.employee_username) ?? {
-      employee_name: assignment.employee_name || assignment.employee_username,
-      employee_role: assignment.employee_role ?? "employee",
+  for (const order of effectiveOrders) {
+    if (!order.assigned_employee_id) continue;
+    const existing = employeeAccumulator.get(order.assigned_employee_id) ?? {
+      employee_name: order.assigned_employee_name || order.assigned_employee_id,
+      employee_role: order.assigned_employee_role || "waiter",
       assigned_tables: new Set<string>(),
       orders_count: 0,
       covers_count: 0,
       revenue: 0,
     };
-    existing.assigned_tables.add(assignment.table_name);
-    employeeAccumulator.set(assignment.employee_username, existing);
-  }
-
-  for (const order of orders) {
-    if (!order.assigned_employee_id) continue;
-    const existing = employeeAccumulator.get(order.assigned_employee_id);
-    if (!existing) continue;
+    existing.assigned_tables.add(order.table_name);
     existing.orders_count += 1;
     existing.covers_count += order.people_count;
     existing.revenue += order.total;
+    employeeAccumulator.set(order.assigned_employee_id, existing);
   }
 
   const employee_incentives: EmployeeApcIncentive[] = Array.from(employeeAccumulator.entries())
