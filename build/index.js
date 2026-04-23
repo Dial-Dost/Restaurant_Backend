@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, GetActions, ValidationError, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, } from "./database_supabase.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, GetActions, ValidationError, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, CORE_ROLES, } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
@@ -15,11 +15,15 @@ function validate(req, res, next) {
     next();
     // return res.status(400).json({ error: "Auth failed" });
 }
-const CORE_ROLES = {
-    admin: ["*"],
-    employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
-    valet: ["e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7", "faf2745b-580c-4529-bbe1-033200cbcf67"],
-};
+function validateAction(expectedUUID) {
+    return (req, res, next) => {
+        const reqUserActionList = extractActionList(req);
+        if (!reqUserActionList.includes(expectedUUID) && !reqUserActionList.includes("*")) {
+            return res.status(403).json({ error: "Action not permitted" });
+        }
+        next();
+    };
+}
 function normalizeRole(rawRole) {
     if (typeof rawRole !== "string") {
         return null;
@@ -117,6 +121,16 @@ function extractEmployeeId(req) {
         return bodyValue.trim();
     }
     return null;
+}
+function extractActionList(req) {
+    const headerValue = req.headers["x-action-list"];
+    if (!headerValue) {
+        throw new Error("Missing X-Action-List header");
+    }
+    if (Array.isArray(headerValue)) {
+        return headerValue;
+    }
+    return headerValue.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 }
 function normalizeRestaurantSlug(value) {
     return value.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -339,12 +353,13 @@ app.post("/auth/employee-login", validate, async (req, res) => {
             employeeUsername: user.employeeUsername ?? undefined,
             role: user.role,
             role_all: user.role_all,
-            restaurantId: user.restaurantId,
+            restaurantUsername: user.restaurantUsername,
             restaurantName: user.restaurantName,
             res_id: user.res_id,
             outlet_id: user.outlet_id,
             emp_Fname: user.emp_Fname,
             emp_Lname: user.emp_Lname ?? null,
+            actions_set: Array.from(user.actions_set),
         });
     }
     catch (error) {
@@ -1516,7 +1531,6 @@ app.post('/publish/bill', validate, async (req, res) => {
     const outletId = typeof body.outletId === 'string' ? body.outletId.trim() : (typeof req.headers['x-outlet-id'] === 'string' ? req.headers['x-outlet-id'] : null);
     const billId = typeof body.billId === 'string' ? body.billId.trim() : '';
     const escBase64 = typeof body.escBase64 === 'string' ? body.escBase64 : (typeof body.esc === 'string' ? body.esc : null);
-    console.log(body);
     if (!restaurantId || !outletId || !billId || !escBase64) {
         res.status(400).json({ error: 'restaurantId, outletId, billId and escBase64 are required' });
         return;
@@ -1536,6 +1550,13 @@ app.post('/publish/bill', validate, async (req, res) => {
         }
         // Emit to outlet-specific room; send billId and base64 payload
         emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+        // // Also emit to the restaurant username/slug room if available (some clients join by slug)
+        // try {
+        // 	const slug = (profile as any)?.restaurant_username;
+        // 	if (slug && typeof slug === 'string' && slug.trim()) {
+        // 		emitOutlet(slug, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+        // 	}
+        // } catch (err) { }
         res.json({ success: true });
     }
     catch (err) {
@@ -1619,7 +1640,7 @@ app.get("/roles", validate, async (req, res) => {
         res.status(500).json({ error: "Unable to fetch roles" });
     }
 });
-app.get("/actions", validate, async (req, res) => {
+app.get("/actions", validateAction("2b6f7948-0b27-41a9-9727-c04ccc9f4db1"), async (req, res) => {
     try {
         const actions = await GetActions();
         res.json(actions);

@@ -99,8 +99,7 @@ function validate(req: Request, res: Response, next: NextFunction) {
 	// return res.status(400).json({ error: "Auth failed" });
 }
 
-function validateAction(expectedUUID: string)
-{
+function validateAction(expectedUUID: string) {
 	return (req: Request, res: Response, next: NextFunction) => {
 		const reqUserActionList = extractActionList(req);
 		if (!reqUserActionList.includes(expectedUUID) && !reqUserActionList.includes("*")) {
