@@ -1262,7 +1262,7 @@ app.patch('/bills/order/:orderId/status', validate, async (req: Request, res: Re
 });
 
 app.post('/bills/order/:orderId/waiter-confirm-payment', validate, async (req: Request, res: Response) => {
-	const auth = await enforceRoles(req, res, ["waiter"]);
+	const auth = await enforceRoles(req, res, ["waiter", "admin"]);
 	if (!auth) {
 		return;
 	}

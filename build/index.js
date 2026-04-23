@@ -1008,7 +1008,7 @@ app.patch('/bills/order/:orderId/status', validate, async (req, res) => {
     }
 });
 app.post('/bills/order/:orderId/waiter-confirm-payment', validate, async (req, res) => {
-    const auth = await enforceRoles(req, res, ["waiter"]);
+    const auth = await enforceRoles(req, res, ["waiter", "admin"]);
     if (!auth) {
         return;
     }
