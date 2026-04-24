@@ -4017,7 +4017,7 @@ export async function GetActions(): Promise<ActionRecord[]> {
     `
       select id, action_name, action_desc, "group"
       from "Actions"
-      order by coalesce("group", 'Test'), action_name
+      order by coalesce("group", ''), action_name
     `,
     [],
   );
