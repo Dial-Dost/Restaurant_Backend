@@ -74,6 +74,7 @@ import {
 	GetValetVehicleMetaByBookingIds,
 	UpsertValetVehicleMeta,
 	AuthenticateRestaurantEmployee,
+	CORE_ROLES,
 } from "./database_supabase.js";
 import {
 	OPENAI_REALTIME_MODEL,
@@ -98,11 +99,15 @@ function validate(req: Request, res: Response, next: NextFunction) {
 	// return res.status(400).json({ error: "Auth failed" });
 }
 
-const CORE_ROLES = {
-	admin: ["*"],
-	employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
-	valet: ["e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7", "faf2745b-580c-4529-bbe1-033200cbcf67"],
-};
+function validateAction(expectedUUID: string) {
+	return (req: Request, res: Response, next: NextFunction) => {
+		const reqUserActionList = extractActionList(req);
+		if (!reqUserActionList.includes(expectedUUID) && !reqUserActionList.includes("*")) {
+			return res.status(403).json({ error: "Action not permitted" });
+		}
+		next();
+	};
+}
 
 
 type AppRole = "admin" | "employee" | "valet" | "waiter";
@@ -214,6 +219,17 @@ function extractEmployeeId(req: Request): string | null {
 	}
 
 	return null;
+}
+
+function extractActionList(req: Request): string[] {
+	const headerValue: string | string[] | undefined = req.headers["x-action-list"];
+	if (!headerValue) {
+		throw new Error("Missing X-Action-List header");
+	}
+	if (Array.isArray(headerValue)) {
+		return headerValue;
+	}
+	return headerValue.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
 function normalizeRestaurantSlug(value: string): string {
@@ -469,19 +485,19 @@ app.post("/auth/employee-login", validate, async (req: Request, res: Response) =
 			res.status(401).json({ error: "Invalid employee ID or password." });
 			return;
 		}
-
 		res.json({
 			uid: user.employeeId,
 			employeeId: user.employeeId,
 			employeeUsername: user.employeeUsername ?? undefined,
 			role: user.role,
 			role_all: user.role_all,
-			restaurantId: user.restaurantId,
+			restaurantUsername: user.restaurantUsername,
 			restaurantName: user.restaurantName,
 			res_id: user.res_id,
 			outlet_id: user.outlet_id,
 			emp_Fname: user.emp_Fname,
 			emp_Lname: user.emp_Lname ?? null,
+			actions_set: Array.from(user.actions_set),
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -1927,7 +1943,8 @@ app.get("/roles", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/actions", validate, async (req: Request, res: Response) => {
+app.get("/actions", validateAction("2b6f7948-0b27-41a9-9727-c04ccc9f4db1"), async (req: Request, res: Response) => {
+
 	try {
 		const actions = await GetActions();
 		res.json(actions);

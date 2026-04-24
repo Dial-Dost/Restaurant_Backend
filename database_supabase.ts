@@ -22,6 +22,14 @@ import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { downloadFile } from "./storage_bucket_supabase.js";
 
+export const CORE_ROLES = {
+  admin: ["*"],
+  employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
+  valet: ["e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7", "faf2745b-580c-4529-bbe1-033200cbcf67"],
+};
+
+type CoreRoleKey = keyof typeof CORE_ROLES
+
 const connectionString =
   process.env.SUPABASE_DIRECT_URL ??
   process.env.DATABASE_URL ??
@@ -670,7 +678,7 @@ async function resolveRestaurantContext(
           r.res_username as restaurant_slug,
           r.res_name as restaurant_name,
           r.main_office_add as restaurant_main_office_add,
-          r.logo as restaurant_logo_url,
+          r.logo as restaurant_logo_url
         from "Restaurant" r
         left join "Outlets" o on o.res_id = r.id
         where
@@ -4009,7 +4017,7 @@ export async function GetActions(): Promise<ActionRecord[]> {
     `
       select id, action_name, action_desc, "group"
       from "Actions"
-      order by coalesce("group"::text, ''), action_name
+      order by coalesce("group", 'Test'), action_name
     `,
     [],
   );
@@ -4576,12 +4584,13 @@ export type EmployeeLoginResult = {
   employeeUsername: string; // login username
   role: "admin" | "employee" | "valet" | "waiter";
   role_all: string[];
-  restaurantId: string;
+  restaurantUsername: string;
   restaurantName: string;
   res_id: string;
   outlet_id: string;
   emp_Fname: string;
   emp_Lname: string | null;
+  actions_set: Set<string>;
 };
 
 export async function AuthenticateRestaurantEmployee(
@@ -4599,7 +4608,7 @@ export async function AuthenticateRestaurantEmployee(
     emp_fname: string | null;
     emp_lname: string | null;
     role_primary: string | null;
-    emp_roles: unknown;
+    emp_roles: Record<string, string[]>;
     res_id: string;
     outlet_id: string;
   }>(
@@ -4629,17 +4638,41 @@ export async function AuthenticateRestaurantEmployee(
   const row = rows[0];
   if (!row) return null;
 
+  const coreRoleName = Object.keys(CORE_ROLES);
+  let actionSet = new Set<string>();
+  const promises = (row.emp_roles['all'] ?? []).map(async role => {
+    if (coreRoleName.includes(role)) {
+      CORE_ROLES[role as CoreRoleKey].forEach(action => actionSet.add(action));
+    } else {
+      const actionRows = await runQuery<{ actions_performable: string[] }>(
+        `select actions_performable from "Roles" where id = $1 and res_id = $2 limit 1`,
+        [role, context.res_id],
+      );
+      if (actionRows[0]) {
+        actionRows[0].actions_performable.forEach(action => actionSet.add(action));
+      }
+    }
+  });
+
+  await Promise.all(promises);
+
+  if (actionSet.size === 0) {
+    // Default to employee permissions if no roles or actions found
+    CORE_ROLES.employee.forEach(action => actionSet.add(action));
+  }
+
   return {
     employeeId: row.emp_id,
     employeeUsername: row.emp_username,
     role: toRole(row.role_primary),
     role_all: parseEmployeeRoles(row.emp_roles).all,
-    restaurantId: context.restaurant_slug,
+    restaurantUsername: context.restaurant_slug,
     restaurantName: context.restaurant_name,
     res_id: row.res_id,
     outlet_id: row.outlet_id,
     emp_Fname: String(row.emp_fname ?? row.emp_username ?? "").trim(),
     emp_Lname: row.emp_lname ?? null,
+    actions_set: actionSet,
   };
 }
 
