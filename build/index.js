@@ -1516,7 +1516,6 @@ app.post('/publish/bill', validate, async (req, res) => {
     const outletId = typeof body.outletId === 'string' ? body.outletId.trim() : (typeof req.headers['x-outlet-id'] === 'string' ? req.headers['x-outlet-id'] : null);
     const billId = typeof body.billId === 'string' ? body.billId.trim() : '';
     const escBase64 = typeof body.escBase64 === 'string' ? body.escBase64 : (typeof body.esc === 'string' ? body.esc : null);
-    console.log(body);
     if (!restaurantId || !outletId || !billId || !escBase64) {
         res.status(400).json({ error: 'restaurantId, outletId, billId and escBase64 are required' });
         return;
@@ -1536,6 +1535,13 @@ app.post('/publish/bill', validate, async (req, res) => {
         }
         // Emit to outlet-specific room; send billId and base64 payload
         emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+        // // Also emit to the restaurant username/slug room if available (some clients join by slug)
+        // try {
+        // 	const slug = (profile as any)?.restaurant_username;
+        // 	if (slug && typeof slug === 'string' && slug.trim()) {
+        // 		emitOutlet(slug, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+        // 	}
+        // } catch (err) { }
         res.json({ success: true });
     }
     catch (err) {

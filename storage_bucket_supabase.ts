@@ -1,9 +1,23 @@
 import { createClient } from "@supabase/supabase-js";
 
-const supabase = createClient(
-    process.env.SUPABASE_PROJECT_URL!,
-    process.env.SUPABASE_DEFAULT_API_KEY!
-);
+let hasWarnedMissingConfig = false;
+
+const getSupabaseStorageClient = () => {
+    const url = process.env.SUPABASE_PROJECT_URL;
+    const key = process.env.SUPABASE_DEFAULT_API_KEY;
+
+    if (!url || !key) {
+        if (!hasWarnedMissingConfig) {
+            hasWarnedMissingConfig = true;
+            console.warn(
+                "Supabase storage is disabled: missing SUPABASE_PROJECT_URL or SUPABASE_DEFAULT_API_KEY."
+            );
+        }
+        return null;
+    }
+
+    return createClient(url, key);
+};
 
 // const { data, error } = await supabase.storage
 //     .from("logos")
@@ -18,6 +32,11 @@ const supabase = createClient(
 
 
 export async function downloadFile(url: string): Promise<Blob | null> {
+    const supabase = getSupabaseStorageClient();
+    if (!supabase) {
+        return null;
+    }
+
     const bucket = url.split('/')[0];
     const path = url.split('/').slice(1).join('/');
 
