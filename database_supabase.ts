@@ -245,6 +245,7 @@ export type OrderRecord = {
   | "Closed"
   | "Cancelled";
   payment_method?: PaymentMethod | null;
+  payment_proof_screenshot_url?: string | null;
   payment_waiter_confirmed_at?: string | null;
   payment_waiter_confirmed_by?: string | null;
   payment_admin_approved_at?: string | null;
@@ -2551,6 +2552,7 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
     table_name: string | null;
     bill_status: number | null;
     payment_method: string | null;
+    payment_proof_screenshot_url: string | null;
     waiter_confirmed_at: Date | null;
     waiter_confirmed_by_username: string | null;
     admin_approved_at: Date | null;
@@ -2566,6 +2568,7 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
         t.table_name,
         b.status as bill_status,
         b.payment_method,
+        b.payment_proof_screenshot_url,
         b.waiter_confirmed_at,
         b.waiter_confirmed_by_username,
         b.admin_approved_at,
@@ -2634,6 +2637,8 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
       total: total > 0 ? total : subtotal,
       status: finalStatus,
       payment_method: normalizePaymentMethod(row.payment_method),
+      payment_proof_screenshot_url:
+        typeof row.payment_proof_screenshot_url === "string" ? row.payment_proof_screenshot_url : null,
       payment_waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
       payment_waiter_confirmed_by: row.waiter_confirmed_by_username,
       payment_admin_approved_at: row.admin_approved_at ? new Date(row.admin_approved_at).toISOString() : null,
@@ -2852,6 +2857,14 @@ async function ensureBillWorkflowColumns(client?: PoolClient): Promise<void> {
   await runQuery(
     `
       alter table "Bills"
+      add column if not exists payment_proof_screenshot_url text
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Bills"
       add column if not exists admin_approved_at timestamptz
     `,
     [],
@@ -2906,6 +2919,7 @@ export async function ConfirmBillPaymentByWaiter(
   orderId: string,
   waiterEmployeeId: string,
   paymentMethodRaw: string,
+  paymentProofScreenshotUrlRaw?: string | null,
 ): Promise<{ success: true; payment_method: PaymentMethod }> {
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
@@ -2913,6 +2927,13 @@ export async function ConfirmBillPaymentByWaiter(
     const paymentMethod = normalizePaymentMethod(paymentMethodRaw);
     if (!paymentMethod) {
       throw new Error("Invalid payment method");
+    }
+
+    const requiresProof = paymentMethod === "Swiggy" || paymentMethod === "Zomato Pay";
+    const paymentProofScreenshotUrl =
+      typeof paymentProofScreenshotUrlRaw === "string" ? paymentProofScreenshotUrlRaw.trim() : "";
+    if (requiresProof && !paymentProofScreenshotUrl) {
+      throw new Error("Payment proof screenshot is required for Swiggy or Zomato Pay");
     }
 
     const waiter = await resolveEmployeeByUsername(context, waiterEmployeeId, client);
@@ -2924,21 +2945,29 @@ export async function ConfirmBillPaymentByWaiter(
       `
         update "Bills"
         set payment_method = $1,
+            payment_proof_screenshot_url = $2,
             waiter_confirmed_at = now(),
-            waiter_confirmed_by_username = $2,
+            waiter_confirmed_by_username = $3,
             admin_approved_at = null,
             admin_approved_by_username = null,
             closed_at = null,
             closed_by_username = null,
             status = 1
         where
-          order_id = $3
-          and res_id = $4
-          and outlet_id = $5
+          order_id = $4
+          and res_id = $5
+          and outlet_id = $6
           and status <> 3
         returning id
       `,
-      [paymentMethod, waiter.username, orderId, context.res_id, context.outlet_id],
+      [
+        paymentMethod,
+        paymentProofScreenshotUrl || null,
+        waiter.username,
+        orderId,
+        context.res_id,
+        context.outlet_id,
+      ],
       client,
     );
 
@@ -2962,6 +2991,32 @@ export async function ApproveBillPaymentByAdmin(
     const admin = await resolveEmployeeByUsername(context, adminEmployeeId, client);
     if (!admin) {
       throw new Error("Admin not found");
+    }
+
+    const billRows = await runQuery<{
+      payment_method: string | null;
+      payment_proof_screenshot_url: string | null;
+    }>(
+      `
+        select payment_method, payment_proof_screenshot_url
+        from "Bills"
+        where order_id = $1 and res_id = $2 and outlet_id = $3
+        limit 1
+      `,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+    const bill = billRows[0];
+    if (!bill) {
+      throw new Error("Bill not found");
+    }
+
+    const billPaymentMethod = normalizePaymentMethod(bill.payment_method);
+    const requiresProof = billPaymentMethod === "Swiggy" || billPaymentMethod === "Zomato Pay";
+    const hasProof =
+      typeof bill.payment_proof_screenshot_url === "string" && bill.payment_proof_screenshot_url.trim().length > 0;
+    if (requiresProof && !hasProof) {
+      throw new Error("Payment proof screenshot is required before admin approval for Swiggy or Zomato Pay");
     }
 
     const updated = await runQuery<{ id: string }>(
@@ -3896,6 +3951,7 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
     emp_id: string | null;
     tax_breakdown: any;
     payment_method: string | null;
+    payment_proof_screenshot_url: string | null;
     waiter_confirmed_at: Date | null;
     waiter_confirmed_by_username: string | null;
     admin_approved_at: Date | null;
@@ -3911,6 +3967,7 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
         emp_id,
         tax_breakdown,
         payment_method,
+        payment_proof_screenshot_url,
         waiter_confirmed_at,
         waiter_confirmed_by_username,
         admin_approved_at,
@@ -3929,6 +3986,8 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
   return {
     ...row,
     payment_method: normalizePaymentMethod(row.payment_method),
+    payment_proof_screenshot_url:
+      typeof row.payment_proof_screenshot_url === "string" ? row.payment_proof_screenshot_url : null,
     waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
     admin_approved_at: row.admin_approved_at ? new Date(row.admin_approved_at).toISOString() : null,
     closed_at: row.closed_at ? new Date(row.closed_at).toISOString() : null,
@@ -4591,6 +4650,7 @@ export type EmployeeLoginResult = {
   emp_Fname: string;
   emp_Lname: string | null;
   actions_set: Set<string>;
+  action_names: string[];
 };
 
 export async function AuthenticateRestaurantEmployee(
@@ -4661,6 +4721,21 @@ export async function AuthenticateRestaurantEmployee(
     CORE_ROLES.employee.forEach(action => actionSet.add(action));
   }
 
+  const actionIds = Array.from(actionSet);
+  const actionNameRows = actionIds.length > 0
+    ? await runQuery<{ action_name: string }>(
+      `
+        select action_name
+        from "Actions"
+        where id = any($1::uuid[])
+      `,
+      [actionIds],
+    )
+    : [];
+  const action_names = actionNameRows
+    .map((row) => String(row.action_name ?? "").trim())
+    .filter((name) => name.length > 0);
+
   return {
     employeeId: row.emp_id,
     employeeUsername: row.emp_username,
@@ -4673,6 +4748,7 @@ export async function AuthenticateRestaurantEmployee(
     emp_Fname: String(row.emp_fname ?? row.emp_username ?? "").trim(),
     emp_Lname: row.emp_lname ?? null,
     actions_set: actionSet,
+    action_names,
   };
 }
 

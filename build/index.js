@@ -360,6 +360,7 @@ app.post("/auth/employee-login", validate, async (req, res) => {
             emp_Fname: user.emp_Fname,
             emp_Lname: user.emp_Lname ?? null,
             actions_set: Array.from(user.actions_set),
+            action_names: user.action_names,
         });
     }
     catch (error) {
@@ -1029,13 +1030,16 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validate, async (req, r
     }
     const orderId = typeof req.params.orderId === 'string' ? req.params.orderId.trim() : '';
     const paymentMethod = typeof req.body?.payment_method === 'string' ? req.body.payment_method.trim() : '';
+    const paymentProofScreenshotUrl = typeof req.body?.payment_proof_screenshot_url === 'string'
+        ? req.body.payment_proof_screenshot_url.trim()
+        : '';
     const waiterEmployeeId = extractEmployeeId(req);
     if (!orderId || !paymentMethod || !waiterEmployeeId) {
         res.status(400).json({ error: 'Missing orderId, payment_method, or employee identity' });
         return;
     }
     try {
-        const result = await ConfirmBillPaymentByWaiter(auth.restaurantId, orderId, waiterEmployeeId, paymentMethod);
+        const result = await ConfirmBillPaymentByWaiter(auth.restaurantId, orderId, waiterEmployeeId, paymentMethod, paymentProofScreenshotUrl || null);
         try {
             emitRestaurant(auth.restaurantId, 'bill:waiter_confirmed_payment', {
                 order_id: orderId,
