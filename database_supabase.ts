@@ -850,6 +850,17 @@ async function findEmployeeIdByUsername(
   return employeeUuid;
 }
 
+export async function getRestaurantIdFromUsername(res_username: string): Promise<string | null> {
+  return withTransaction(async (client) => {
+      const existingId = await runQuery<{ res_id: string }>(
+      `select id::text as res_id from "Restaurant" where lower(res_username) = lower($1) or id::text = $1 limit 1`,
+      [res_username],
+      client,
+    );
+    return existingId[0]?.res_id ?? null;
+  });
+}
+
 export async function AddRestaurantUser(
   restaurantId: string,
   outletId: string | null,
