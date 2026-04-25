@@ -851,6 +851,17 @@ async function findEmployeeIdByUsername(
   return employeeUuid;
 }
 
+export async function getRestaurantIdFromUsername(res_username: string): Promise<string | null> {
+  return withTransaction(async (client) => {
+      const existingId = await runQuery<{ res_id: string }>(
+      `select id::text as res_id from "Restaurant" where lower(res_username) = lower($1) or id::text = $1 limit 1`,
+      [res_username],
+      client,
+    );
+    return existingId[0]?.res_id ?? null;
+  });
+}
+
 export async function AddRestaurantUser(
   restaurantId: string,
   outletId: string | null,
@@ -2706,18 +2717,18 @@ export async function AddOrder(
 
   const takenByEmployeeIdRaw = String(
     (order as Record<string, unknown>).taken_by_employee_id
-      ?? existingPayload.taken_by_employee_id
-      ?? "",
+    ?? existingPayload.taken_by_employee_id
+    ?? "",
   ).trim();
   const takenByEmployeeNameRaw = String(
     (order as Record<string, unknown>).taken_by_employee_name
-      ?? existingPayload.taken_by_employee_name
-      ?? "",
+    ?? existingPayload.taken_by_employee_name
+    ?? "",
   ).trim();
   const takenByEmployeeRoleRaw = String(
     (order as Record<string, unknown>).taken_by_employee_role
-      ?? existingPayload.taken_by_employee_role
-      ?? "",
+    ?? existingPayload.taken_by_employee_role
+    ?? "",
   ).trim();
 
   const statusCode = toOrderStatusCode(String(order.status ?? "Preparing"));
@@ -4076,7 +4087,7 @@ export async function GetActions(): Promise<ActionRecord[]> {
     `
       select id, action_name, action_desc, "group"
       from "Actions"
-      order by coalesce("group", ''), action_name
+      order by coalesce("group", 'Test'), action_name
     `,
     [],
   );
@@ -4636,6 +4647,25 @@ export async function GetRestaurantUsers(
     role: toRole(row.role_primary),
     role_all: parseEmployeeRoles(row.emp_roles).all,
   }));
+}
+
+export async function DeleteRestaurantUser(
+  restaurantId: string,
+  employeeId: string,
+  outletId: string
+): Promise<boolean> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client, outletId);
+
+    // remove employee record
+    await runQuery(
+      `delete from "Employees" where res_id = $1 and outlet_id = $2 and id = $3`,
+      [context.res_id, context.outlet_id, employeeId],
+      client,
+    );
+
+    return true;
+  });
 }
 
 export type EmployeeLoginResult = {

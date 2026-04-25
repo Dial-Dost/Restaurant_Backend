@@ -26,6 +26,7 @@ import {
 	GetFeedbackSummary,
 	GetRestaurantUsers,
 	AddRestaurantUser,
+	DeleteRestaurantUser,
 	CheckDatabaseHealth,
 	GetInventoryItems,
 	UpsertInventoryItem,
@@ -75,6 +76,7 @@ import {
 	UpsertValetVehicleMeta,
 	AuthenticateRestaurantEmployee,
 	CORE_ROLES,
+	getRestaurantIdFromUsername
 } from "./database_supabase.js";
 import {
 	OPENAI_REALTIME_MODEL,
@@ -86,7 +88,7 @@ import {
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
 const app = express();
-const port = 3000;
+const port = 3001;
 
 function log(req: Request, res: Response, next: NextFunction) {
 	console.log(req);
@@ -199,6 +201,28 @@ function extractRestaurantId(req: Request): string | null {
 	return null;
 }
 
+function extractRestaurantUsername(req: Request): string | null {
+	const headerValue = req.headers["x-restaurant-username"];
+	const headerId = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+	if (typeof headerId === "string" && headerId.trim().length > 0) {
+		return headerId.trim();
+	}
+
+	const queryValue = req.query.restaurantUsername;
+	const queryId = Array.isArray(queryValue) ? queryValue[0] : queryValue;
+	if (typeof queryId === "string" && queryId.trim().length > 0) {
+		return queryId.trim();
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const bodyValue = body?.restaurantUsername;
+	if (typeof bodyValue === "string" && bodyValue.trim().length > 0) {
+		return bodyValue.trim();
+	}
+
+	return null;
+}
+
 function extractEmployeeId(req: Request): string | null {
 	const headerValue = req.headers["x-employee-id"];
 	const headerId = Array.isArray(headerValue) ? headerValue[0] : headerValue;
@@ -224,7 +248,7 @@ function extractEmployeeId(req: Request): string | null {
 function extractActionList(req: Request): string[] {
 	const headerValue: string | string[] | undefined = req.headers["x-action-list"];
 	if (!headerValue) {
-		throw new Error("Missing X-Action-List header");
+		throw new Error("Missing X-Action-List header by : " + req.url + "got headers: " + JSON.stringify(req.headers));
 	}
 	if (Array.isArray(headerValue)) {
 		return headerValue;
@@ -353,7 +377,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 	}
 	res.header(
 		"Access-Control-Allow-Headers",
-		"Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id,X-Action-List",
+		"Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id,X-Action-List,X-Restaurant-Username",
 	);
 	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 	if (req.method === "OPTIONS") {
@@ -366,7 +390,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/core-roles', validate, async (req: Request, res: Response) => {
+app.get('/core-roles', validateAction("17ba6407-b703-4403-ab59-13235966053f"), async (req: Request, res: Response) => {
 	try {
 		const rows = Object.keys(CORE_ROLES).map((role) => ({ role, actions: CORE_ROLES[role as keyof typeof CORE_ROLES] }));
 		res.json(rows);
@@ -644,7 +668,7 @@ async function GetCustomerIdOrCreateCustomer(
 	returns the customer_id if you want to store it somewhere
 */
 
-app.post("/add-customer", validate, async (req: Request, res: Response) => {
+app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -677,7 +701,7 @@ app.post("/add-customer", validate, async (req: Request, res: Response) => {
 	}
 	returns the table_name if you want to store it somewhere
 */
-app.post("/add-table", validate, async (req: Request, res: Response) => {
+app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -716,7 +740,7 @@ app.post("/add-table", validate, async (req: Request, res: Response) => {
 	res.send(table_name);
 });
 
-app.delete("/table/:name", validate, async (req: Request, res: Response) => {
+app.delete("/table/:name", validateAction("5777c4aa-29df-4ea1-9c45-c1038d25f746"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -932,7 +956,7 @@ Returns tables in a 2d array in ascending order of capacity.
 ]
 */
 
-app.get("/get-tables", validate, async (req: Request, res: Response) => {
+app.get("/get-tables", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1012,7 +1036,7 @@ app.get("/get-bookings", validate, async (req: Request, res: Response) => {
 	);
 });
 
-app.get("/valet-info", validate, async (req: Request, res: Response) => {
+app.get("/valet-info", validateAction("9e37297d-408b-446d-a51b-7892ad216b7d"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -1098,7 +1122,7 @@ app.patch("/booking/:id/status", validate, async (req: Request, res: Response) =
 	res.json({ success: true });
 });
 
-app.post("/bills", validate, async (req: Request, res: Response) => {
+app.post("/bills", validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1127,7 +1151,7 @@ app.post("/bills", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post('/bills/replace', validate, async (req: Request, res: Response) => {
+app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId' });
 
@@ -1153,7 +1177,7 @@ app.post('/bills/replace', validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get('/bills/order/:orderId', validate, async (req: Request, res: Response) => {
+app.get('/bills/order/:orderId', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId' });
 	const orderId = String(req.params.orderId ?? '').trim();
@@ -1237,7 +1261,7 @@ app.get('/restaurant/logo/escpos', validate, async (req: Request, res: Response)
 	}
 });
 
-app.patch('/bills/order/:orderId/status', validate, async (req: Request, res: Response) => {
+app.patch('/bills/order/:orderId/status', validateAction("07e364cc-f40d-46f3-b691-0f719dd38e0f"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: 'Missing restaurantId' });
@@ -1261,7 +1285,7 @@ app.patch('/bills/order/:orderId/status', validate, async (req: Request, res: Re
 	}
 });
 
-app.post('/bills/order/:orderId/waiter-confirm-payment', validate, async (req: Request, res: Response) => {
+app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["waiter", "admin"]);
 	if (!auth) {
 		return;
@@ -1304,7 +1328,7 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validate, async (req: R
 	}
 });
 
-app.post('/bills/order/:orderId/admin-approve-payment', validate, async (req: Request, res: Response) => {
+app.post('/bills/order/:orderId/admin-approve-payment', validateAction("fc57d407-4bba-442c-97a2-9e6f3c57f288"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
 	if (!auth) {
 		return;
@@ -1334,7 +1358,7 @@ app.post('/bills/order/:orderId/admin-approve-payment', validate, async (req: Re
 	}
 });
 
-app.post('/bills/order/:orderId/close', validate, async (req: Request, res: Response) => {
+app.post('/bills/order/:orderId/close', validateAction("a953d044-31ba-4e31-b96f-99304fe43dfa"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
 	if (!auth) {
 		return;
@@ -1364,7 +1388,7 @@ app.post('/bills/order/:orderId/close', validate, async (req: Request, res: Resp
 	}
 });
 
-app.patch("/booking/:id/table", validate, async (req: Request, res: Response) => {
+app.patch("/booking/:id/table", validateAction("c7699d46-0e2f-4448-b325-8ca490a5296b"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -1398,7 +1422,7 @@ app.patch("/booking/:id/table", validate, async (req: Request, res: Response) =>
 });
 
 
-app.delete("/booking/:id", validate, async (req: Request, res: Response) => {
+app.delete("/booking/:id", validateAction("1f176202-d5e7-4bb0-802c-275a42425394"), async (req: Request, res: Response) => {
 	const bookingIdParam = req.params.id;
 	const bookingId = typeof bookingIdParam === "string" ? bookingIdParam.trim() : "";
 	if (!bookingId) {
@@ -1438,7 +1462,7 @@ app.delete("/booking/:id", validate, async (req: Request, res: Response) => {
 		}
 	]
 */
-app.get("/get-customers", validate, async (req: Request, res: Response) => {
+app.get("/get-customers", validateAction("3c530903-324c-4bbe-802b-849763518920"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1475,7 +1499,7 @@ app.get("/get-customers", validate, async (req: Request, res: Response) => {
 	for the best results just send ms since epoch
 	returns the number of bookings in that range
 */
-app.get("/get-withen-range", validate, async (req: Request, res: Response) => {
+app.get("/get-withen-range", validateAction("0a98cf2b-8b42-47a7-a523-b7bb73cb870e"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).send({ Error: "Missing restaurantId" });
@@ -1503,7 +1527,7 @@ app.get("/get-withen-range", validate, async (req: Request, res: Response) => {
 	res.send(count);
 });
 
-app.get("/audit-logs", validate, async (req: Request, res: Response) => {
+app.get("/audit-logs", validateAction("91b24293-7b88-4fe4-8cf5-deb6faaba4f5"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1521,7 +1545,7 @@ app.get("/audit-logs", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/audit-logs", validate, async (req: Request, res: Response) => {
+app.post("/audit-logs", validateAction("722e1023-99f8-4905-ab51-97404694eab6"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1554,7 +1578,7 @@ app.post("/audit-logs", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/inventory", validate, async (req: Request, res: Response) => {
+app.get("/inventory", validateAction("77e41c84-ebf4-4542-a75b-c9e72e03b570"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1570,7 +1594,7 @@ app.get("/inventory", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/inventory", validate, async (req: Request, res: Response) => {
+app.post("/inventory", validateAction("dfe2cde8-c159-4685-b015-ec7b0d4386eb"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1600,7 +1624,7 @@ app.post("/inventory", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.delete("/inventory/:id", validate, async (req: Request, res: Response) => {
+app.delete("/inventory/:id", validateAction("add0a9ec-a563-4903-9a24-d2e0b46361a5"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1627,7 +1651,7 @@ app.delete("/inventory/:id", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/menu", validate, async (req: Request, res: Response) => {
+app.get("/menu", validateAction("f4177b38-77fa-4d8c-9fbd-c4f06bf28610"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1643,7 +1667,7 @@ app.get("/menu", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/menu/categories", validate, async (req: Request, res: Response) => {
+app.get("/menu/categories", validateAction("f4177b38-77fa-4d8c-9fbd-c4f06bf28610"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1659,7 +1683,7 @@ app.get("/menu/categories", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/menu", validate, async (req: Request, res: Response) => {
+app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1686,7 +1710,7 @@ app.post("/menu", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.put("/menu", validate, async (req: Request, res: Response) => {
+app.put("/menu", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1716,7 +1740,7 @@ app.put("/menu", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/menu/categories", validate, async (req: Request, res: Response) => {
+app.post("/menu/categories", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1738,7 +1762,7 @@ app.post("/menu/categories", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/orders", validate, async (req: Request, res: Response) => {
+app.get("/orders", validateAction("b7f78d0f-323d-4622-8d05-aa2f82d54b2e"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1754,7 +1778,7 @@ app.get("/orders", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/orders", validate, async (req: Request, res: Response) => {
+app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1770,7 +1794,7 @@ app.post("/orders", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/orders/apc", validate, async (req: Request, res: Response) => {
+app.get("/orders/apc", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1826,8 +1850,24 @@ app.get("/restaurant/profile", validate, async (req: Request, res: Response) => 
 	}
 });
 
+app.get("/auth/restaurant-login", validate, async (req: Request, res: Response) => {
+	const restaurantUsername = extractRestaurantUsername(req);
+	if (!restaurantUsername) {
+		res.status(400).json({ error: "Missing restaurant Username" });
+		return;
+	}
+
+	const resId = await getRestaurantIdFromUsername(restaurantUsername);
+	if (!resId) {
+		res.status(404).json({ error: "Restaurant not found" });
+		return;
+	}
+	res.json({ res_id: resId });
+
+});
+
 // Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
-app.post('/publish/bill', validate, async (req: Request, res: Response) => {
+app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9"), async (req: Request, res: Response) => {
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const restaurantId = typeof body.restaurantId === 'string' ? body.restaurantId.trim() : (typeof req.headers['x-restaurant-id'] === 'string' ? req.headers['x-restaurant-id'] : null);
 	const outletId = typeof body.outletId === 'string' ? body.outletId.trim() : (typeof req.headers['x-outlet-id'] === 'string' ? req.headers['x-outlet-id'] : null);
@@ -1856,13 +1896,6 @@ app.post('/publish/bill', validate, async (req: Request, res: Response) => {
 
 		// Emit to outlet-specific room; send billId and base64 payload
 		emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
-		// // Also emit to the restaurant username/slug room if available (some clients join by slug)
-		// try {
-		// 	const slug = (profile as any)?.restaurant_username;
-		// 	if (slug && typeof slug === 'string' && slug.trim()) {
-		// 		emitOutlet(slug, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
-		// 	}
-		// } catch (err) { }
 		res.json({ success: true });
 	} catch (err) {
 		console.error('publish_bill_failed', err);
@@ -1870,7 +1903,7 @@ app.post('/publish/bill', validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.put("/restaurant/profile", validate, async (req: Request, res: Response) => {
+app.put("/restaurant/profile", validateAction("60d14e9c-45cc-4dc2-b017-56058cc3ae33"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1899,7 +1932,7 @@ app.put("/restaurant/profile", validate, async (req: Request, res: Response) => 
 	}
 });
 
-app.get('/outlets/default-tax', validate, async (req: Request, res: Response) => {
+app.get('/outlets/default-tax', validateAction("d9b3f882-d3cf-46bc-b9ce-4218e8a5c29d"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: 'Missing restaurantId' });
@@ -1915,7 +1948,7 @@ app.get('/outlets/default-tax', validate, async (req: Request, res: Response) =>
 	}
 });
 
-app.patch('/outlets/default-tax', validate, async (req: Request, res: Response) => {
+app.patch('/outlets/default-tax', validateAction("28fa21cc-0dba-4a0f-bf6f-387089f47bbf"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: 'Missing restaurantId' });
@@ -1938,7 +1971,7 @@ app.patch('/outlets/default-tax', validate, async (req: Request, res: Response) 
 	}
 });
 
-app.get("/roles", validate, async (req: Request, res: Response) => {
+app.get("/roles", validateAction("17ba6407-b703-4403-ab59-13235966053f"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1965,7 +1998,7 @@ app.get("/actions", validateAction("2b6f7948-0b27-41a9-9727-c04ccc9f4db1"), asyn
 	}
 });
 
-app.post("/roles", validate, async (req: Request, res: Response) => {
+app.post("/roles", validateAction("c0135d18-68b4-45e9-9b51-849158df6efd"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -1990,7 +2023,7 @@ app.post("/roles", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.delete("/roles/:id", validate, async (req: Request, res: Response) => {
+app.delete("/roles/:id", validateAction("53d0927d-00f4-48cc-a40c-51edb09826d8"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -2016,7 +2049,7 @@ app.delete("/roles/:id", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/roles/assign", validate, async (req: Request, res: Response) => {
+app.post("/roles/assign", validateAction("4bf54bd9-9124-46c0-a7cc-011ea4c4e172"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -2039,7 +2072,7 @@ app.post("/roles/assign", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/roles/remove", validate, async (req: Request, res: Response) => {
+app.post("/roles/remove", validateAction("9acc9097-4803-4be0-bb6d-fc2c5de57cf5"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -2062,7 +2095,7 @@ app.post("/roles/remove", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/table-assignments", validate, async (req: Request, res: Response) => {
+app.get("/table-assignments", validateAction("f88657ce-0d67-4cd6-aae1-765dec10cd98"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
 	if (!auth) {
 		return;
@@ -2077,7 +2110,7 @@ app.get("/table-assignments", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/table-assignments/assign", validate, async (req: Request, res: Response) => {
+app.post("/table-assignments/assign", validateAction("faf2745b-580c-4529-bbe1-033200cbcf67"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
 	if (!auth) {
 		return;
@@ -2099,7 +2132,7 @@ app.post("/table-assignments/assign", validate, async (req: Request, res: Respon
 	}
 });
 
-app.post("/table-assignments/unassign", validate, async (req: Request, res: Response) => {
+app.post("/table-assignments/unassign", validateAction("e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
 	if (!auth) {
 		return;
@@ -2127,7 +2160,7 @@ app.post("/table-assignments/unassign", validate, async (req: Request, res: Resp
 
 
 // Rtamanyu's integration
-app.get("/valet-bays", validate, async (req: Request, res: Response) => {
+app.get("/valet-bays", validateAction("9e37297d-408b-446d-a51b-7892ad216b7d"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -2144,7 +2177,7 @@ app.get("/valet-bays", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/add-valet-bay", validate, async (req: Request, res: Response) => {
+app.post("/add-valet-bay", validateAction("ae8ce7c0-1e06-4722-8a06-817267eec785"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -2185,7 +2218,7 @@ app.post("/add-valet-bay", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/delete-valet-bay", validate, async (req: Request, res: Response) => {
+app.post("/delete-valet-bay", validateAction("6e9be65f-4081-4b86-8ba0-0592ee26f7f2"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -2225,7 +2258,7 @@ app.post("/delete-valet-bay", validate, async (req: Request, res: Response) => {
 });
 
 
-app.post("/update-valet-bay", validate, async (req: Request, res: Response) => {
+app.post("/update-valet-bay", validateAction("2caeab74-5941-424d-9c3a-5c68ef0186e1"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) return;
 
@@ -2271,7 +2304,7 @@ app.post("/update-valet-bay", validate, async (req: Request, res: Response) => {
 });
 
 
-app.post("/set-valet-bay-current", validate, async (req: Request, res: Response) => {
+app.post("/set-valet-bay-current", validateAction("2ff51c3d-f18c-406c-9f49-7c54f468c835"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) return;
 
@@ -2310,7 +2343,7 @@ app.post("/set-valet-bay-current", validate, async (req: Request, res: Response)
 	}
 });
 
-app.post("/create_valet_record", validate, async (req: Request, res: Response) => {
+app.post("/create_valet_record", validateAction("892b50f3-51fc-4099-8f31-01e8dd8c3d44"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -2385,7 +2418,7 @@ app.post("/create_valet_record", validate, async (req: Request, res: Response) =
 	}
 });
 
-app.post("/get_valet_info", validate, async (req: Request, res: Response) => {
+app.post("/get_valet_info", validateAction("9e37297d-408b-446d-a51b-7892ad216b7d"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -2456,7 +2489,7 @@ async function updateValetStateAndPublish(
 }
 
 
-app.post("/update_valet_state", validate, async (req: Request, res: Response) => {
+app.post("/update_valet_state", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -2489,7 +2522,7 @@ app.post("/update_valet_state", validate, async (req: Request, res: Response) =>
 	}
 });
 
-app.post("/update_valet_bay", validate, async (req: Request, res: Response) => {
+app.post("/update_valet_bay", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {
 		return;
@@ -2525,7 +2558,7 @@ app.post("/update_valet_bay", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/unassign-valet-bay", validate, async (req: Request, res: Response) => {
+app.post("/unassign-valet-bay", validateAction("5ef876a7-eb92-4602-b4d3-5590ce379540"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) return;
 
@@ -2897,7 +2930,7 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/restaurant/users", validate, async (req: Request, res: Response) => {
+app.get("/restaurant/users", validateAction("92cb8236-1039-4b47-a66f-6c7c8b0144ae"), async (req: Request, res: Response) => {
 	const auth = await enforceRolesIgnoreOutletID(req, res, ["admin", "employee"]);
 	if (!auth) return;
 
@@ -2910,7 +2943,7 @@ app.get("/restaurant/users", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.post("/restaurant/users", validate, async (req: Request, res: Response) => {
+app.post("/restaurant/users", validateAction("58fdfca7-7a97-439b-aeb2-00e4395a9a30"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
 	if (!auth) return;
 
@@ -2951,7 +2984,36 @@ app.post("/restaurant/users", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/feedback", validate, async (req: Request, res: Response) => {
+app.delete("/restaurant/users", validateAction("a978f15d-1043-417a-b07b-05f6bddad875"), async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin"]);
+	if (!auth) return;
+
+	const outletId = extractOutletId(req);
+
+	const body = req.body ?? {};
+	const employeeId = typeof body.employeeId === 'string' ? body.employeeId.trim() : '';
+	if (!employeeId) {
+		res.status(400).json({ error: 'Missing employeeId' });
+		return;
+	}
+
+	try {
+		const ok = await DeleteRestaurantUser(auth.restaurantId, employeeId, outletId);
+		if (!ok) {
+			res.status(500).json({ error: 'Unable to delete user' });
+			return;
+		}
+
+		try { emitRestaurant(auth.restaurantId, 'restaurant:user:deleted', { employeeId }); } catch (e) { /* ignore emit errors */ }
+
+		res.json({ success: true });
+	} catch (error) {
+		console.error('delete_restaurant_user_failed', error);
+		res.status(500).json({ error: 'Unable to delete user' });
+	}
+});
+
+app.get("/feedback", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
 	if (!auth) {
 		return;
@@ -2970,7 +3032,7 @@ app.get("/feedback", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/feedback/summary", validate, async (req: Request, res: Response) => {
+app.get("/feedback/summary", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
 	if (!auth) {
 		return;
@@ -2985,7 +3047,7 @@ app.get("/feedback/summary", validate, async (req: Request, res: Response) => {
 	}
 });
 
-app.get("/feedback/stats", validate, async (req: Request, res: Response) => {
+app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
 	if (!auth) return;
 
