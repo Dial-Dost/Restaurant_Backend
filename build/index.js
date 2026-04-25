@@ -5,7 +5,7 @@ import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSess
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
 const app = express();
-const port = 3000;
+const port = 3001;
 function log(req, res, next) {
     console.log(req);
     next();

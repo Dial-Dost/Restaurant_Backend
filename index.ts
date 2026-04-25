@@ -26,6 +26,7 @@ import {
 	GetFeedbackSummary,
 	GetRestaurantUsers,
 	AddRestaurantUser,
+	DeleteRestaurantUser,
 	CheckDatabaseHealth,
 	GetInventoryItems,
 	UpsertInventoryItem,
@@ -86,7 +87,7 @@ import {
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
 const app = express();
-const port = 3000;
+const port = 3001;
 
 function log(req: Request, res: Response, next: NextFunction) {
 	console.log(req);
@@ -2937,6 +2938,35 @@ app.post("/restaurant/users", validate, async (req: Request, res: Response) => {
 	} catch (err) {
 		console.error('create_restaurant_user_failed', err);
 		res.status(500).json({ error: 'Unable to create user' });
+	}
+});
+
+app.delete("/restaurant/users", validate, async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin"]);
+	if (!auth) return;
+
+	const outletId = extractOutletId(req);
+
+	const body = req.body ?? {};
+	const employeeId = typeof body.employeeId === 'string' ? body.employeeId.trim() : '';
+	if (!employeeId) {
+		res.status(400).json({ error: 'Missing employeeId' });
+		return;
+	}
+
+	try {
+		const ok = await DeleteRestaurantUser(auth.restaurantId, employeeId, outletId);
+		if (!ok) {
+			res.status(500).json({ error: 'Unable to delete user' });
+			return;
+		}
+
+		try { emitRestaurant(auth.restaurantId, 'restaurant:user:deleted', { employeeId }); } catch (e) { /* ignore emit errors */ }
+
+		res.json({ success: true });
+	} catch (error) {
+		console.error('delete_restaurant_user_failed', error);
+		res.status(500).json({ error: 'Unable to delete user' });
 	}
 });
 
