@@ -29,4 +29,4 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    command: ["npm","run","start"]
+    command: [ "npm", "run", "start" ]
