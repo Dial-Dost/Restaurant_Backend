@@ -4750,8 +4750,10 @@ export async function AuthenticateRestaurantEmployee(
     // Default to employee permissions if no roles or actions found
     CORE_ROLES.employee.forEach(action => actionSet.add(action));
   }
+  // console.log(actionSet);
 
-  const actionIds = Array.from(actionSet);
+
+  const actionIds = Array.from(actionSet).filter((id) => isUuid(id));
   const actionNameRows = actionIds.length > 0
     ? await runQuery<{ action_name: string }>(
       `
