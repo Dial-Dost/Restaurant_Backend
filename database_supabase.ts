@@ -2556,6 +2556,7 @@ export async function EnsureMenuCategory(
 
 export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
   const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
   const rows = await runQuery<{
     id: string;
     food: unknown;
