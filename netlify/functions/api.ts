@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+// import express, { Request, Response } from 'express';
 import serverless from 'serverless-http';
 import { app as createApp } from '../../index.js'; // your main express app
 
