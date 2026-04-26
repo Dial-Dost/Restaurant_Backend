@@ -1,0 +1,34 @@
+# Node
+node_modules
+npm-debug.log
+package-lock.json
+
+# TypeScript build output
+build
+dist
+C_Sharp_temp_printer_server
+
+# Python
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+\.pytest_cache
+
+# OS / editor
+.DS_Store
+.vscode
+.idea
+
+# Git
+.git
+.github
+
+# Env files
+.env
+.env.*
+
+# Docker
+Dockerfile*

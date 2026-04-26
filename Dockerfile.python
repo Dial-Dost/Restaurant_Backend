@@ -1,0 +1,28 @@
+FROM python:3.14-slim
+
+# The official and recommended way to install uv in Docker
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential libpq-dev gcc curl pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml README.md /app/
+COPY Python_servers /app/Python_servers
+COPY scripts /app/scripts
+COPY . /app
+
+# Create the venv and install dependencies
+RUN uv venv .venv && \
+    uv pip install --python .venv --upgrade pip setuptools wheel && \
+    uv sync --no-dev
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH="/app/Python_servers"
+
+# Railway (and most cloud providers) dynamically assigns a port via the $PORT environment variable.
+# We change the CMD to shell form so it can read the $PORT variable, defaulting to 8000 if not set.
+CMD uvicorn Python_servers.main:app --host 0.0.0.0 --port ${PORT:-8000}

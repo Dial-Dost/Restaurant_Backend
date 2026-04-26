@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  python:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: restaurant_python
+    environment:
+      - PY_SERVER_PORT=8000
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    env_file:
+      - .env
+
+  node:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    container_name: restaurant_node
+    depends_on:
+      - python
+    environment:
+      - PY_SERVER_URL=http://python:8000
+      - PY_SERVER_PORT=8000
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["npm","run","start"]

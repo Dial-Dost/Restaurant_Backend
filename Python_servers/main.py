@@ -282,7 +282,9 @@ async def set_bay_current(restaurant_id: str, body: dict, request: Request):
 
 
 def main():
-    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PY_SERVER_PORT", 8000)))
+    host = os.getenv("PY_SERVER_HOST", "0.0.0.0")
+    port = int(os.getenv("PY_SERVER_PORT", 8000))
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

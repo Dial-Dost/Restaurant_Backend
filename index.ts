@@ -90,6 +90,10 @@ import { createServer } from "http";
 const app = express();
 const port = 3001;
 
+// Python feedback service URL. Use container host (PY_SERVER_URL) when set,
+// otherwise fall back to localhost with optional port override.
+const PY_SERVER_URL = process.env.PY_SERVER_URL ?? `http://127.0.0.1:${process.env.PY_SERVER_PORT ?? "8000"}`;
+
 function log(req: Request, res: Response, next: NextFunction) {
 	console.log(req);
 	next();
@@ -2608,7 +2612,7 @@ app.post("/get_main_feedback_question", validate, async (req: Request, res: Resp
 	}
 	try {
 		const response = await fetch(
-			"http://127.0.0.1:8000/get_main_feedback_question/" + encodeURIComponent(category),
+			`${PY_SERVER_URL}/get_main_feedback_question/${encodeURIComponent(category)}`,
 		);
 		const data = await response.json();
 		if (!response.ok) {
@@ -2649,7 +2653,7 @@ app.post("/get_follow_up_question", validate, async (req: Request, res: Response
 
 	try {
 		const response = await fetch(
-			"http://127.0.0.1:8000/get_follow_up_question/" + encodeURIComponent(category) + "/" + encodeURIComponent(rate),
+			`${PY_SERVER_URL}/get_follow_up_question/${encodeURIComponent(category)}/${encodeURIComponent(rate)}`,
 		);
 		const payload = await response.json();
 		const data = (payload ?? {}) as Record<string, unknown>;
@@ -2696,10 +2700,7 @@ app.post("/feedback/dynamic-follow-up", validate, async (req: Request, res: Resp
 
 	try {
 		const proxyResponse = await fetch(
-			"http://127.0.0.1:8000/get_follow_up_question/"
-			+ encodeURIComponent(categoryLabel)
-			+ "/"
-			+ encodeURIComponent(rating),
+			`${PY_SERVER_URL}/get_follow_up_question/${encodeURIComponent(categoryLabel)}/${encodeURIComponent(rating)}`,
 		);
 
 		const proxyData = (await proxyResponse.json()) as Record<string, unknown>;
@@ -2741,7 +2742,7 @@ app.post("/feedback/valet-checkin", validate, async (req: Request, res: Response
 	try {
 		const outletId = extractOutletId(req);
 		const recordsResponse = await fetch(
-			"http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(restaurantId),
+			`${PY_SERVER_URL}/get_all_valet_records/${encodeURIComponent(restaurantId)}`,
 			{ headers: outletId ? { "X-Outlet-Id": outletId } : undefined },
 		);
 

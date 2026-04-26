@@ -1,0 +1,23 @@
+FROM node:20-bullseye
+
+# Install build tools for native modules if needed
+RUN apt-get update && apt-get install -y build-essential python3 make g++ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy package files first for efficient caching
+COPY package.json package-lock.json* tsconfig.build.json tsconfig.json ./
+
+# Install dependencies (including dev deps needed for build)
+RUN npm install
+
+# Copy source
+COPY . .
+
+# Build TypeScript to ./build
+RUN npm run build
+
+EXPOSE 3001
+
+# Run the compiled Node server
+CMD ["npm", "run", "start"]
