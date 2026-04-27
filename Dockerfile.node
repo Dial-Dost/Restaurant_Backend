@@ -1,23 +1,49 @@
-FROM node:20-bullseye
-
-# Install build tools for native modules if needed
-RUN apt-get update && apt-get install -y build-essential python3 make g++ && rm -rf /var/lib/apt/lists/*
-
+# Stage 1: Build
+# Switched to Node 22 (Latest LTS) so packages like Sharp can use pre-built binaries
+FROM node:25-bookworm-slim AS builder
 WORKDIR /app
 
-# Copy package files first for efficient caching
+# Install build tools and libvips for Sharp
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3 \
+    make \
+    g++ \
+    libvips-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy package files first for caching
+# The asterisk means package-lock.json is optional
 COPY package.json package-lock.json* tsconfig.build.json tsconfig.json ./
 
-# Install dependencies (including dev deps needed for build)
+# Install ALL dependencies using npm install (fallback-safe if lockfile is missing)
 RUN npm install
 
-# Copy source
+# Copy source and build the TypeScript code
 COPY . .
-
-# Build TypeScript to ./build
 RUN npm run build
 
-EXPOSE 3001
+# CRITICAL FIX: Use npm prune to remove devDependencies instead of npm ci
+# This reads the package.json and removes anything not needed for production,
+# leaving only production packages in the node_modules folder.
+RUN npm prune --omit=dev
 
-# Run the compiled Node server
-CMD ["npm", "run", "start"]
+# Stage 2: Runtime
+FROM node:25-bookworm-slim
+WORKDIR /app
+
+# Install only the runtime libraries needed for Sharp (libvips instead of libvips-dev)
+RUN apt-get update && apt-get install -y libvips && rm -rf /var/lib/apt/lists/*
+
+# Copy package.json (in case your app needs to read its own version/name)
+COPY package.json ./
+
+# Copy the pruned production node_modules from the builder stage
+COPY --from=builder /app/node_modules ./node_modules
+
+# Copy the compiled TypeScript code from the builder stage
+COPY --from=builder /app/build ./build
+
+# Railway assigns ports dynamically, ensure your Node code listens to `process.env.PORT`
+EXPOSE 3001
+CMD ["node", "build/index.js"]

@@ -88,7 +88,7 @@ import {
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3001;
 
 // Python feedback service URL. Use container host (PY_SERVER_URL) when set,
 // otherwise fall back to localhost with optional port override.
