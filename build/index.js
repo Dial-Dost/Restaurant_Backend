@@ -5,7 +5,10 @@ import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSess
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3001;
+// Python feedback service URL. Use container host (PY_SERVER_URL) when set,
+// otherwise fall back to localhost with optional port override.
+const PY_SERVER_URL = process.env.PY_SERVER_URL ?? `http://127.0.0.1:${process.env.PY_SERVER_PORT ?? "8000"}`;
 function log(req, res, next) {
     console.log(req);
     next();
@@ -252,8 +255,8 @@ app.use((req, res, next) => {
     }
     next();
 });
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "8mb" }));
+app.use(express.urlencoded({ extended: true, limit: "8mb" }));
 app.get('/core-roles', validateAction("17ba6407-b703-4403-ab59-13235966053f"), async (req, res) => {
     try {
         const rows = Object.keys(CORE_ROLES).map((role) => ({ role, actions: CORE_ROLES[role] }));
@@ -1287,6 +1290,7 @@ app.post("/audit-logs", validateAction("722e1023-99f8-4905-ab51-97404694eab6"), 
     try {
         await AddAuditLogEntry(restaurantId, {
             employee,
+            employeeId: employeeFromHeader || employeeIdFromBody || null,
             action,
             details: details || null,
         });
@@ -2219,7 +2223,7 @@ app.post("/get_main_feedback_question", validate, async (req, res) => {
         return;
     }
     try {
-        const response = await fetch("http://127.0.0.1:8000/get_main_feedback_question/" + encodeURIComponent(category));
+        const response = await fetch(`${PY_SERVER_URL}/get_main_feedback_question/${encodeURIComponent(category)}`);
         const data = await response.json();
         if (!response.ok) {
             res.status(response.status).json(data);
@@ -2256,7 +2260,7 @@ app.post("/get_follow_up_question", validate, async (req, res) => {
         return;
     }
     try {
-        const response = await fetch("http://127.0.0.1:8000/get_follow_up_question/" + encodeURIComponent(category) + "/" + encodeURIComponent(rate));
+        const response = await fetch(`${PY_SERVER_URL}/get_follow_up_question/${encodeURIComponent(category)}/${encodeURIComponent(rate)}`);
         const payload = await response.json();
         const data = (payload ?? {});
         if (!response.ok) {
@@ -2296,10 +2300,7 @@ app.post("/feedback/dynamic-follow-up", validate, async (req, res) => {
         return;
     }
     try {
-        const proxyResponse = await fetch("http://127.0.0.1:8000/get_follow_up_question/"
-            + encodeURIComponent(categoryLabel)
-            + "/"
-            + encodeURIComponent(rating));
+        const proxyResponse = await fetch(`${PY_SERVER_URL}/get_follow_up_question/${encodeURIComponent(categoryLabel)}/${encodeURIComponent(rating)}`);
         const proxyData = (await proxyResponse.json());
         if (!proxyResponse.ok) {
             res.status(proxyResponse.status).json(proxyData);
@@ -2333,7 +2334,7 @@ app.post("/feedback/valet-checkin", validate, async (req, res) => {
     const normalizedPlate = numberPlate.replace(/\s+/g, "").toUpperCase();
     try {
         const outletId = extractOutletId(req);
-        const recordsResponse = await fetch("http://127.0.0.1:8000/get_all_valet_records/" + encodeURIComponent(restaurantId), { headers: outletId ? { "X-Outlet-Id": outletId } : undefined });
+        const recordsResponse = await fetch(`${PY_SERVER_URL}/get_all_valet_records/${encodeURIComponent(restaurantId)}`, { headers: outletId ? { "X-Outlet-Id": outletId } : undefined });
         const recordsPayload = (await recordsResponse.json().catch(() => null));
         if (!recordsResponse.ok) {
             res.status(502).json({
