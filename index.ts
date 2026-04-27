@@ -391,8 +391,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 	next();
 });
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "8mb" }));
+app.use(express.urlencoded({ extended: true, limit: "8mb" }));
 
 app.get('/core-roles', validateAction("17ba6407-b703-4403-ab59-13235966053f"), async (req: Request, res: Response) => {
 	try {
@@ -1572,6 +1572,7 @@ app.post("/audit-logs", validateAction("722e1023-99f8-4905-ab51-97404694eab6"), 
 	try {
 		await AddAuditLogEntry(restaurantId, {
 			employee,
+			employeeId: employeeFromHeader || employeeIdFromBody || null,
 			action,
 			details: details || null,
 		});

@@ -221,6 +221,7 @@ export type OrderItemRecord = {
   quantity: number;
   price: number;
   orderedAt: string;
+  note?: string | null;
 };
 
 export type OrderRecord = {
@@ -2176,17 +2177,23 @@ export async function GetBookingsInRange(
 
 export async function AddAuditLogEntry(
   restaurantId: string,
-  entry: { employee: string; action: string; details?: string | null },
+  entry: { employee: string; employeeId?: string | null; action: string; details?: string | null },
 ): Promise<void> {
   const context = await requireRestaurantContext(restaurantId);
 
   await withTransaction(async (client) => {
-    const employeeId = await findEmployeeIdByUsername(
-      context,
-      entry.employee,
-      entry.employee,
-      client,
-    );
+    const actorIdentity = String(entry.employeeId ?? entry.employee ?? "").trim();
+    if (!actorIdentity) {
+      throw new Error("Missing employee identity for audit log entry");
+    }
+
+    const resolvedEmployee = await resolveEmployeeByUsername(context, actorIdentity, client);
+    if (!resolvedEmployee) {
+      throw new Error(
+        `Employee '${actorIdentity}' not found in restaurant '${context.restaurant_name}', '${context.res_id}'`,
+      );
+    }
+
     const actionId = await findOrCreateActionId(entry.action, client);
 
     await runQuery(
@@ -2200,7 +2207,7 @@ export async function AddAuditLogEntry(
         randomUUID(),
         context.res_id,
         context.outlet_id,
-        employeeId,
+        resolvedEmployee.id,
         actionId,
         entry.details ?? null,
       ],
@@ -2590,8 +2597,22 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
       from "Orders" o
       left join "Tables" t
         on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
-      left join "Bills" b
-        on b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
+      left join lateral (
+        select
+          b.status,
+          b.payment_method,
+          b.payment_proof_screenshot_url,
+          b.waiter_confirmed_at,
+          b.waiter_confirmed_by_username,
+          b.admin_approved_at,
+          b.admin_approved_by_username,
+          b.closed_at,
+          b.closed_by_username
+        from "Bills" b
+        where b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
+        order by b.created_at desc, b.id desc
+        limit 1
+      ) b on true
       where o.res_id = $1 and o.outlet_id = $2
       order by o.created_at desc
     `,
@@ -2607,6 +2628,7 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
         quantity: Math.max(1, Math.round(parseNumeric(entry.quantity))),
         price: parseNumeric(entry.price),
         orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
+        note: typeof entry.note === "string" && entry.note.trim().length > 0 ? entry.note.trim() : null,
       }))
       : [];
 
@@ -3344,7 +3366,10 @@ async function resolveEmployeeByUsername(
       where
         l.res_id = $1
         and l.outlet_id = $2
-        and lower(l.emp_username) = lower($3)
+        and (
+          lower(l.emp_username) = lower($3)
+          or e.id::text = $3
+        )
       limit 1
     `,
     [context.res_id, context.outlet_id, employeeId.trim()],
