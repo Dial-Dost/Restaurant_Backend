@@ -39,6 +39,7 @@ import {
 	SaveMenuItems,
 	GetOrders,
 	AddOrder,
+	DeleteOrder,
 	GetMonthlyApcInsights,
 	GetRestaurantProfile,
 	UpdateRestaurantProfile,
@@ -1824,6 +1825,32 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), asyn
 	} catch (error: any) {
 		console.error("add_order_failed", error);
 		res.status(400).json({ error: String(error?.message ?? "Unable to add order") });
+	}
+});
+
+app.delete("/orders/:id", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const orderId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+	if (!orderId) {
+		res.status(400).json({ error: "Invalid order id" });
+		return;
+	}
+
+	try {
+		const deleted = await DeleteOrder(restaurantId, orderId);
+		if (!deleted) {
+			res.status(404).json({ error: "Order not found" });
+			return;
+		}
+		res.status(204).send();
+	} catch (error: any) {
+		console.error("delete_order_failed", error);
+		res.status(400).json({ error: String(error?.message ?? "Unable to delete order") });
 	}
 });
 

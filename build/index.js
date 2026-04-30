@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, DeleteRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, DeleteMenuCategory, SaveMenuItems, GetOrders, AddOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, GetActions, ValidationError, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, CORE_ROLES, getRestaurantIdFromUsername } from "./database_supabase.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, DeleteRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, DeleteMenuCategory, SaveMenuItems, GetOrders, AddOrder, DeleteOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, GetActions, ValidationError, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, CORE_ROLES, getRestaurantIdFromUsername } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
@@ -1522,6 +1522,30 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), asyn
     catch (error) {
         console.error("add_order_failed", error);
         res.status(400).json({ error: String(error?.message ?? "Unable to add order") });
+    }
+});
+app.delete("/orders/:id", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const orderId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    if (!orderId) {
+        res.status(400).json({ error: "Invalid order id" });
+        return;
+    }
+    try {
+        const deleted = await DeleteOrder(restaurantId, orderId);
+        if (!deleted) {
+            res.status(404).json({ error: "Order not found" });
+            return;
+        }
+        res.status(204).send();
+    }
+    catch (error) {
+        console.error("delete_order_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to delete order") });
     }
 });
 app.get("/orders/apc", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req, res) => {

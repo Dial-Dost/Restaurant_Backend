@@ -8,9 +8,16 @@ export let io: Server | null = null;
 export async function initRealtime(httpServer: HttpServer) {
   io = new Server(httpServer, {
     cors: {
-      origin: true,
-      methods: ["GET", "POST"],
+      origin: (origin, callback) => {
+        // Allow all origins in development and production
+        callback(null, true);
+      },
+      methods: ["GET", "POST", "OPTIONS"],
+      credentials: true,
     },
+    transports: ["websocket", "polling"],
+    pingInterval: 30000,
+    pingTimeout: 60000,
   });
 
   // Optional Redis adapter for multi-process scaling

@@ -2856,6 +2856,22 @@ export async function AddOrder(
   return { id };
 }
 
+export async function DeleteOrder(
+  restaurantId: string,
+  orderId: string,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ id: string }>(
+    `
+      delete from "Orders"
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id
+    `,
+    [orderId.trim(), context.res_id, context.outlet_id],
+  );
+  return rows.length > 0;
+}
+
 export async function AddBill(
   restaurantId: string,
   bill: {
