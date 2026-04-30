@@ -1901,6 +1901,7 @@ app.get("/auth/restaurant-login", validate, async (req: Request, res: Response) 
 
 // Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
 app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9"), async (req: Request, res: Response) => {
+	console.log('Received request to publish bill');
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const restaurantId = typeof body.restaurantId === 'string' ? body.restaurantId.trim() : (typeof req.headers['x-restaurant-id'] === 'string' ? req.headers['x-restaurant-id'] : null);
 	const outletId = typeof body.outletId === 'string' ? body.outletId.trim() : (typeof req.headers['x-outlet-id'] === 'string' ? req.headers['x-outlet-id'] : null);
