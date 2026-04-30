@@ -244,7 +244,7 @@ const allowedOrigins = new Set([
 ]);
 app.use((req, res, next) => {
     const origin = req.headers.origin;
-    if (origin && allowedOrigins.has(origin)) {
+    if (origin && (allowedOrigins.has(origin) || origin.endsWith('.up.railway.app'))) {
         res.header("Access-Control-Allow-Origin", origin);
     }
     res.header("Access-Control-Allow-Headers", "Content-Type,X-Restaurant-Id,X-Employee-Id,X-User-Role,X-Outlet-Id,X-Action-List,X-Restaurant-Username");
@@ -1590,6 +1590,7 @@ app.get("/auth/restaurant-login", validate, async (req, res) => {
 });
 // Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
 app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9"), async (req, res) => {
+    console.log('Received request to publish bill');
     const body = (req.body ?? {});
     const restaurantId = typeof body.restaurantId === 'string' ? body.restaurantId.trim() : (typeof req.headers['x-restaurant-id'] === 'string' ? req.headers['x-restaurant-id'] : null);
     const outletId = typeof body.outletId === 'string' ? body.outletId.trim() : (typeof req.headers['x-outlet-id'] === 'string' ? req.headers['x-outlet-id'] : null);
