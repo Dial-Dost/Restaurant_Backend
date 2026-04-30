@@ -75,7 +75,7 @@ public partial class MainPage : ContentPage
 	protected override async void OnAppearing()
 	{
 		base.OnAppearing();
-		var backend = await ReadBackendUrlFromAssets() ?? "http://localhost:3000";
+		var backend = await ReadBackendUrlFromAssets() ?? "http://localhost:3001";
 		_http.BaseAddress = new Uri(backend);
 		ConnectionStatus.Text = $"Backend: {backend}";
 		Log($"Backend set to {backend}");
@@ -551,14 +551,14 @@ public partial class MainPage : ContentPage
 // Raw printing helper for Windows (P/Invoke to Winspool)
 internal static class RawPrinterHelper
 {
-	[System.Runtime.InteropServices.DllImport("winspool.Drv", EntryPoint = "OpenPrinterA", SetLastError = true)]
+	[System.Runtime.InteropServices.DllImport("winspool.Drv", EntryPoint = "OpenPrinterA", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Ansi)]
 	private static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);
 
 	[System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError = true)]
 	private static extern bool ClosePrinter(IntPtr hPrinter);
 
-	[System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError = true)]
-	private static extern bool StartDocPrinter(IntPtr hPrinter, int level, IntPtr di);
+	[System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Ansi)]
+	private static extern bool StartDocPrinter(IntPtr hPrinter, int level, [System.Runtime.InteropServices.In] DOCINFOA di);
 
 	[System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError = true)]
 	private static extern bool EndDocPrinter(IntPtr hPrinter);
@@ -572,6 +572,17 @@ internal static class RawPrinterHelper
 	[System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError = true)]
 	private static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
 
+	[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Ansi)]
+	private class DOCINFOA
+	{
+		[System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPStr)]
+		public string pDocName;
+		[System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPStr)]
+		public string pOutputFile;
+		[System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPStr)]
+		public string pDataType;
+	}
+
 	public static bool SendBytesToPrinter(string printerName, byte[] bytes)
 	{
 		IntPtr pBytes = IntPtr.Zero;
@@ -579,15 +590,29 @@ internal static class RawPrinterHelper
 		try
 		{
 			if (!OpenPrinter(printerName, out hPrinter, IntPtr.Zero)) return false;
+
 			int dwWritten = 0;
 			pBytes = System.Runtime.InteropServices.Marshal.AllocCoTaskMem(bytes.Length);
 			System.Runtime.InteropServices.Marshal.Copy(bytes, 0, pBytes, bytes.Length);
-			bool started = StartDocPrinter(hPrinter, 1, IntPtr.Zero);
-			StartPagePrinter(hPrinter);
-			WritePrinter(hPrinter, pBytes, bytes.Length, out dwWritten);
+
+			var di = new DOCINFOA { pDocName = "RawDocument", pOutputFile = null, pDataType = "RAW" };
+			if (!StartDocPrinter(hPrinter, 1, di))
+			{
+				return false;
+			}
+
+			if (!StartPagePrinter(hPrinter))
+			{
+				EndDocPrinter(hPrinter);
+				return false;
+			}
+
+			bool success = WritePrinter(hPrinter, pBytes, bytes.Length, out dwWritten);
+
 			EndPagePrinter(hPrinter);
 			EndDocPrinter(hPrinter);
-			return true;
+
+			return success && dwWritten == bytes.Length;
 		}
 		finally
 		{
