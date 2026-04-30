@@ -2561,6 +2561,72 @@ export async function EnsureMenuCategory(
   });
 }
 
+export async function DeleteMenuCategory(
+  restaurantId: string,
+  categoryName: string,
+): Promise<{ deletedItems: number }> {
+  const normalizedCategory = categoryName.trim();
+  if (!normalizedCategory) {
+    return { deletedItems: 0 };
+  }
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const categoryRows = await runQuery<{ id: string }>(
+      `
+        select id
+        from "Menue_sub_cat"
+        where res_id = $1 and outlet_id = $2 and lower(name) = lower($3)
+      `,
+      [context.res_id, context.outlet_id, normalizedCategory],
+      client,
+    );
+
+    if (categoryRows.length === 0) {
+      return { deletedItems: 0 };
+    }
+
+    const subCategoryIds = categoryRows.map((row) => row.id);
+    const deletedMenuRows = await runQuery<{ id: string }>(
+      `
+        delete from "Menu"
+        where res_id = $1 and outlet_id = $2 and sub_cat_id = any($3::uuid[])
+        returning id
+      `,
+      [context.res_id, context.outlet_id, subCategoryIds],
+      client,
+    );
+
+    await runQuery(
+      `
+        delete from "Menue_sub_cat"
+        where res_id = $1 and outlet_id = $2 and id = any($3::uuid[])
+      `,
+      [context.res_id, context.outlet_id, subCategoryIds],
+      client,
+    );
+
+    await runQuery(
+      `
+        delete from "Menue_main_cat" mm
+        where mm.res_id = $1
+          and mm.outlet_id = $2
+          and not exists (
+            select 1
+            from "Menue_sub_cat" ms
+            where ms.res_id = mm.res_id
+              and ms.outlet_id = mm.outlet_id
+              and ms.main_cat_id = mm.id
+          )
+      `,
+      [context.res_id, context.outlet_id],
+      client,
+    );
+
+    return { deletedItems: deletedMenuRows.length };
+  });
+}
+
 export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBillWorkflowColumns();

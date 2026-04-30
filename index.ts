@@ -35,6 +35,7 @@ import {
 	GetMenuCategories,
 	UpsertMenuItem,
 	EnsureMenuCategory,
+	DeleteMenuCategory,
 	SaveMenuItems,
 	GetOrders,
 	AddOrder,
@@ -1764,6 +1765,33 @@ app.post("/menu/categories", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed
 	} catch (error) {
 		console.error("ensure_menu_category_failed", error);
 		res.status(500).json({ error: "Unable to save category" });
+	}
+});
+
+app.delete("/menu/categories", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const categoryRaw = typeof req.query?.category === "string"
+		? req.query.category
+		: typeof req.body?.category === "string"
+			? req.body.category
+			: "";
+	const category = categoryRaw.trim();
+	if (!category) {
+		res.status(400).json({ error: "category is required" });
+		return;
+	}
+
+	try {
+		const result = await DeleteMenuCategory(restaurantId, category);
+		res.json({ success: true, deletedItems: result.deletedItems });
+	} catch (error) {
+		console.error("delete_menu_category_failed", error);
+		res.status(500).json({ error: "Unable to delete category" });
 	}
 });
 
