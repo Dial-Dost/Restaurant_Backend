@@ -377,7 +377,7 @@ const allowedOrigins = new Set([
 
 app.use((req: Request, res: Response, next: NextFunction) => {
 	const origin = req.headers.origin;
-	if (origin && allowedOrigins.has(origin)) {
+	if (origin && (allowedOrigins.has(origin) || origin.endsWith('.up.railway.app'))) {
 		res.header("Access-Control-Allow-Origin", origin);
 	}
 	res.header(
