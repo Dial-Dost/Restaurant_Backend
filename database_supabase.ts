@@ -2884,7 +2884,7 @@ export async function AddBill(
     total_amt: number;
     tax_breakdown?: any;
   },
-): Promise<{ id: string, bill_no: number }> {
+): Promise<{ id: string}> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBillWorkflowColumns();
   const id = isUuid(String(bill.id ?? '')) ? String(bill.id) : randomUUID();
@@ -2944,18 +2944,7 @@ export async function AddBill(
     ],
   );
 
-  const bill_row = await runQuery<{ bill_no: number }>(
-    `
-      select bill_no
-      from "Bills"
-      where id = $1 and res_id = $2 and outlet_id = $3
-    `,
-    [id, context.res_id, context.outlet_id],
-  );
-
-  const bill_no = bill_row[0].bill_no;
-
-  return { id, bill_no };
+  return { id };
 }
 
 async function ensureBillWorkflowColumns(client?: PoolClient): Promise<void> {
