@@ -25,7 +25,7 @@ import { downloadFile } from "./storage_bucket_supabase.js";
 export const CORE_ROLES = {
   admin: ["*"],
   employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
-  valet: ["e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7", "faf2745b-580c-4529-bbe1-033200cbcf67"],
+  valet: ["ae8ce7c0-1e06-4722-8a06-817267eec785", "6e9be65f-4081-4b86-8ba0-0592ee26f7f2", "2caeab74-5941-424d-9c3a-5c68ef0186e1", "2ff51c3d-f18c-406c-9f49-7c54f468c835", "892b50f3-51fc-4099-8f31-01e8dd8c3d44", "9e37297d-408b-446d-a51b-7892ad216b7d", "b8e02c25-b91c-427c-b462-8df009ede055", "b8e02c25-b91c-427c-b462-8df009ede055", "5ef876a7-eb92-4602-b4d3-5590ce379540", "9e37297d-408b-446d-a51b-7892ad216b7d", "9e37297d-408b-446d-a51b-7892ad216b7d"],
 };
 
 type CoreRoleKey = keyof typeof CORE_ROLES

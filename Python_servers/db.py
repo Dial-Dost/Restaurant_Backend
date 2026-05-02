@@ -87,7 +87,7 @@ def _get_conn():
         cur.execute("select 1")
     info("Connected to Supabase Postgres successfully.")
 
-    _ensure_feedback_questions_table(_pg_conn)
+    # _ensure_feedback_questions_table(_pg_conn)
     _ensure_valet_vehicle_meta_table(_pg_conn)
     return _pg_conn
 

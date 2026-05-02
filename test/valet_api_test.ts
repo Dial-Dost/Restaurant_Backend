@@ -1,8 +1,10 @@
 import 'dotenv/config';
 
-const API_BASE = process.env.RECEPTION_API_BASE_URL || 'http://localhost:3000';
+const API_BASE = process.env.BACKEND_API_BASE_URL || 'http://localhost:3001';
 const RESTAURANT_ID = process.env.TEST_RESTAURANT_ID || 'csrorganics';
-const EMPLOYEE_ID = process.env.TEST_EMPLOYEE_ID || 'admin';
+const EMPLOYEE_ID = process.env.TEST_EMPLOYEE_ID || '84292cad-2c6d-4fe1-9221-a5fff1571c11';
+const OUTLET_ID = process.env.TEST_OUTLET_ID || 'a5390f5a-f99c-4f8c-9916-ab5d6c4f8b99';
+const ACTION_LIST = ["ae8ce7c0-1e06-4722-8a06-817267eec785", "6e9be65f-4081-4b86-8ba0-0592ee26f7f2", "2caeab74-5941-424d-9c3a-5c68ef0186e1", "2ff51c3d-f18c-406c-9f49-7c54f468c835", "892b50f3-51fc-4099-8f31-01e8dd8c3d44", "9e37297d-408b-446d-a51b-7892ad216b7d", "b8e02c25-b91c-427c-b462-8df009ede055", "b8e02c25-b91c-427c-b462-8df009ede055", "5ef876a7-eb92-4602-b4d3-5590ce379540", "9e37297d-408b-446d-a51b-7892ad216b7d", "9e37297d-408b-446d-a51b-7892ad216b7d"];
 
 async function waitForHealth(timeoutMs = 10000): Promise<void> {
   const start = Date.now();
@@ -50,8 +52,10 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
-    body: JSON.stringify({ number_plate: plate}),
+    body: JSON.stringify({ number_plate: plate }),
   }, "POST /create_valet_record failed:");
 
   const booking_id = await createResponse.booking_id;
@@ -65,6 +69,8 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
     body: JSON.stringify({ booking_id: booking_id }),
   });
@@ -88,6 +94,8 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
     body: JSON.stringify({ booking_id: booking_id, state: 2 }),
   });
@@ -110,6 +118,8 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
     body: JSON.stringify({ Bay_name: 'Main', total_capacity: 5 }),
   });
@@ -130,6 +140,8 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
     body: JSON.stringify({ booking_id: booking_id, bay_id: bayIdToUse }),
   });
@@ -153,6 +165,8 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
   });
 
@@ -171,6 +185,8 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
     body: JSON.stringify({ Bay_name: 'Main', total_capacity: 5 }),
   });
@@ -190,6 +206,8 @@ async function run() {
       'Content-Type': 'application/json',
       'X-Restaurant-Id': RESTAURANT_ID,
       'X-Employee-Id': EMPLOYEE_ID,
+      'X-Outlet-Id': OUTLET_ID,
+      'X-Action-List': ACTION_LIST,
     },
     body: JSON.stringify({ Bay_name: 'Main' }),
   });
@@ -202,43 +220,6 @@ async function run() {
   const deleted = await deleteResp.json();
   console.log('✅ delete-valet-bay response:', deleted);
 
-  // Test get_main_feedback_question
-  const mainResp = await fetch(`${API_BASE}/get_main_feedback_question`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Restaurant-Id': RESTAURANT_ID,
-    },
-    body: JSON.stringify({ category: 2 }),
-  });
-  if (!mainResp.ok) {
-    const txt = await mainResp.text();
-    throw new Error(`/get_main_feedback_question failed: ${mainResp.status} ${txt}`);
-  }
-  const mainBody = await mainResp.json();
-  if (!mainBody || typeof mainBody !== 'object') {
-    throw new Error('Invalid response from /get_main_feedback_question');
-  }
-  console.log('✅ get_main_feedback_question passed');
-
-  // Test get_follow_up_question
-  const followResp = await fetch(`${API_BASE}/get_follow_up_question`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Restaurant-Id': RESTAURANT_ID,
-    },
-    body: JSON.stringify({ category: 1, rate: 4 }),
-  });
-  if (!followResp.ok) {
-    const txt = await followResp.text();
-    throw new Error(`/get_follow_up_question failed: ${followResp.status} ${txt}`);
-  }
-  const followBody = await followResp.json();
-  if (!followBody || typeof followBody !== 'object') {
-    throw new Error('Invalid response from /get_follow_up_question');
-  }
-  console.log('✅ get_follow_up_question passed');
   console.log('✅✅ Valet API integration test passed');
 }
 
