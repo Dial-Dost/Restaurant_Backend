@@ -94,23 +94,29 @@ def _get_conn():
 
 def _ensure_feedback_questions_table(conn):
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            create table if not exists feedback_questions (
-                id uuid primary key,
-                category text not null,
-                question text not null,
-                tokens integer not null default 0,
-                created_at timestamptz not null default now()
+        try:
+            cur.execute(
+                """
+                create table if not exists feedback_questions (
+                    id uuid primary key,
+                    category text not null,
+                    question text not null,
+                    tokens integer not null default 0,
+                    created_at timestamptz not null default now()
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            create index if not exists idx_feedback_questions_category_created
-            on feedback_questions (category, created_at)
-            """
-        )
+        except psycopg.errors.QueryCanceled:
+            print("Assuming feedback_questions table already exists due to timeout (happens when it exists but being accesed by the production app)")
+        try:
+            cur.execute(
+                """
+                create index if not exists idx_feedback_questions_category_created
+                on feedback_questions (category, created_at)
+                """
+            )
+        except psycopg.errors.QueryCanceled:
+            print("Assuming feedback_questions index already exists due to timeout (happens when it exists but being accesed by the production app)")
     conn.commit()
 
 

@@ -2872,6 +2872,7 @@ export async function DeleteOrder(
   return rows.length > 0;
 }
 
+// important: convert the whole proceess to atomic
 export async function AddBill(
   restaurantId: string,
   bill: {
@@ -2883,7 +2884,7 @@ export async function AddBill(
     total_amt: number;
     tax_breakdown?: any;
   },
-): Promise<{ id: string }> {
+): Promise<{ id: string, bill_no: number }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBillWorkflowColumns();
   const id = isUuid(String(bill.id ?? '')) ? String(bill.id) : randomUUID();
@@ -2917,16 +2918,17 @@ export async function AddBill(
   await runQuery(
     `
       insert into "Bills"
-        (id, created_at, res_id, outlet_id, table_id, emp_id, status, reason, order_id, total_amt, tax_breakdown)
+        (id, created_at, res_id, outlet_id, table_id, emp_id, status, reason, order_id, total_amt, tax_breakdown, bill_no)
       values
-        ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, 1)
       on conflict (id, res_id, outlet_id)
       do update set
         emp_id = excluded.emp_id,
         status = excluded.status,
         reason = excluded.reason,
         total_amt = excluded.total_amt,
-        tax_breakdown = excluded.tax_breakdown
+        tax_breakdown = excluded.tax_breakdown,
+        bill_no = "Bills".bill_no -- preserve original bill_no on updates
     `,
     [
       id,
@@ -2942,7 +2944,18 @@ export async function AddBill(
     ],
   );
 
-  return { id };
+  const bill_row = await runQuery<{ bill_no: number }>(
+    `
+      select bill_no
+      from "Bills"
+      where id = $1 and res_id = $2 and outlet_id = $3
+    `,
+    [id, context.res_id, context.outlet_id],
+  );
+
+  const bill_no = bill_row[0].bill_no;
+
+  return { id, bill_no };
 }
 
 async function ensureBillWorkflowColumns(client?: PoolClient): Promise<void> {
@@ -4077,6 +4090,7 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
     admin_approved_by_username: string | null;
     closed_at: Date | null;
     closed_by_username: string | null;
+    bill_no: number;
   }>(
     `
       select
@@ -4092,7 +4106,8 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
         admin_approved_at,
         admin_approved_by_username,
         closed_at,
-        closed_by_username
+        closed_by_username,
+        bill_no
       from "Bills"
       where order_id = $1 and res_id = $2 and outlet_id = $3
       limit 1
@@ -4110,6 +4125,7 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
     waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
     admin_approved_at: row.admin_approved_at ? new Date(row.admin_approved_at).toISOString() : null,
     closed_at: row.closed_at ? new Date(row.closed_at).toISOString() : null,
+    bill_no: row.bill_no,
   };
 }
 
