@@ -1,5 +1,5 @@
 import 'dotenv/config';
-const API_BASE = process.env.RECEPTION_API_BASE_URL || 'http://localhost:3000';
+const API_BASE = process.env.BACKEND_API_BASE_URL || 'http://localhost:3001';
 const RESTAURANT_ID = process.env.RESTAURANT_ID || 'csrorganics';
 
 async function waitForHealth(timeoutMs = 10000): Promise<void> {
@@ -11,7 +11,7 @@ async function waitForHealth(timeoutMs = 10000): Promise<void> {
         const j = (await r.json().catch(() => ({}))) as any;
         if (!j.mongo || j.mongo.ok === true) return;
       }
-    } catch {}
+    } catch { }
     await new Promise(r => setTimeout(r, 250));
   }
   throw new Error('health timeout');
@@ -52,7 +52,7 @@ async function run() {
 
   // Cleanup
   await Promise.all(
-    created.map(id => fetch(`${API_BASE}/booking/${id}`, { method: 'DELETE', headers: { 'X-Restaurant-Id': RESTAURANT_ID } }).catch(()=>{}))
+    created.map(id => fetch(`${API_BASE}/booking/${id}`, { method: 'DELETE', headers: { 'X-Restaurant-Id': RESTAURANT_ID } }).catch(() => { }))
   );
 
   console.log('✅ Capacity threshold test passed. Bookings created before 409:', created.length);

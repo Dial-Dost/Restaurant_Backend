@@ -1,6 +1,6 @@
 import 'dotenv/config';
 
-const API_BASE = process.env.RECEPTION_API_BASE_URL || 'http://localhost:3000';
+const API_BASE = process.env.BACKEND_API_BASE_URL || 'http://localhost:3001';
 const RESTAURANT_ID = process.env.RESTAURANT_ID || 'csrorganics';
 
 async function waitForHealth(timeoutMs = 10000): Promise<void> {
@@ -74,7 +74,7 @@ async function run() {
   await fetch(`${API_BASE}/booking/${postJson.booking_id}`, {
     method: 'DELETE',
     headers: { 'X-Restaurant-Id': RESTAURANT_ID },
-  }).catch(() => {});
+  }).catch(() => { });
 
   console.log('✅ Integration round-trip passed:', postJson.booking_id);
 }
