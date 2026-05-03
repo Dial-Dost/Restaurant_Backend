@@ -21,6 +21,7 @@
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { downloadFile } from "./storage_bucket_supabase.js";
+import { ca } from "zod/v4/locales";
 
 export const CORE_ROLES = {
   admin: ["*"],
@@ -36,6 +37,19 @@ export const CORE_ROLES = {
     "5ef876a7-eb92-4602-b4d3-5590ce379540",
   ],
 };
+
+export enum Audit_log_category {
+  General = "General",
+  Bill = "Bill",
+  Orders = "Orders",
+  Valet = "Valet",
+  Inventory = "Inventory",
+  Tables = "Tables",
+  Roles = "Roles",
+  Customer = "Customer",
+  Bookings = "Bookings",
+  Menu = "Menu"
+}
 
 type CoreRoleKey = keyof typeof CORE_ROLES
 
@@ -2184,46 +2198,133 @@ export async function GetBookingsInRange(
   }
 }
 
+export async function GetEmployeeDetailsFromEmpID(employeeID: string): Promise<RestaurantUser> 
+{
+  const rows = await runQuery<{
+    res_id: string,
+    outlet_id: string,
+    emp_Fname: string,
+    emp_Lname?: string | null,
+    emp_roles: Record<string, any>,
+  }>(
+    `
+    select res_id, outlet_id, "emp_Fname", "emp_Lname", emp_roles from "Employees" where id = $1 limit 1
+    `,
+    [employeeID]
+  );
+
+  const login_rows = await runQuery<{
+    emp_username: string,
+    password: string,
+  }>(
+    `
+      select emp_username, emp_pass from "Login" where emp_id = $1 limit 1
+    `,
+    [employeeID]
+   );
+  
+  if (login_rows.length === 0 || !login_rows[0]) {
+    throw new Error("Login details not found for employee");
+  }
+
+  if(rows.length === 0) {
+    throw new Error("Employee not found");
+  }
+  const row = rows[0];
+  if (!row) {
+    throw new Error("Employee not found");
+  }
+  const role = row.emp_roles  ? typeof row.emp_roles === "object"    ? row.emp_roles
+    : JSON.parse(row.emp_roles)
+  : {};
+  return {
+    id: employeeID,
+    res_id: row.res_id,
+    outlet_id: row.outlet_id,
+    employee_id: employeeID,
+    employee_Username: login_rows[0].emp_username,
+    emp_Fname: row.emp_Fname,
+    emp_Lname: row.emp_Lname,
+    password: login_rows[0].password,
+    role: role["primary"],
+    role_all: role["all"] || []
+  };
+}
+
 export async function AddAuditLogEntry(
   restaurantId: string,
-  entry: { employee: string; employeeId?: string | null; action: string; details?: string | null },
-): Promise<void> {
-  const context = await requireRestaurantContext(restaurantId);
-
+  OutletId: string,
+  employeeId: string,
+  actionId: string,
+  details: string,
+  category: Audit_log_category,
+  additional_details?: Record<string, any>
+): Promise<boolean>
+{
   await withTransaction(async (client) => {
-    const actorIdentity = String(entry.employeeId ?? entry.employee ?? "").trim();
-    if (!actorIdentity) {
-      throw new Error("Missing employee identity for audit log entry");
-    }
-
-    const resolvedEmployee = await resolveEmployeeByUsername(context, actorIdentity, client);
-    if (!resolvedEmployee) {
-      throw new Error(
-        `Employee '${actorIdentity}' not found in restaurant '${context.restaurant_name}', '${context.res_id}'`,
-      );
-    }
-
-    const actionId = await findOrCreateActionId(entry.action, client);
-
     await runQuery(
       `
-        insert into "Audit_logs"
-          (id, created_at, res_id, outlet_id, employee_id, action_id, reason)
+      insert into "Audit_logs"
+          (id, created_at, res_id, outlet_id, employee_id, action_id, reason, category, additional_details)
         values
-          ($1, now(), $2, $3, $4, $5, $6)
+          ($1, now(), $2, $3, $4, $5, $6, $7, $8)
       `,
       [
         randomUUID(),
-        context.res_id,
-        context.outlet_id,
-        resolvedEmployee.id,
+        restaurantId,
+        OutletId,
+        employeeId,
         actionId,
-        entry.details ?? null,
-      ],
-      client,
-    );
-  });
+        details,
+        category,
+        additional_details ? additional_details : null
+      ]
+    )
+  })
+  return true;
 }
+
+// export async function AddAuditLogEntryLegacy(
+//   restaurantId: string,
+//   entry: { employee: string; employeeId?: string | null; action: string; category: Audit_log_category; details?: string | null },
+// ): Promise<void> {
+//   const context = await requireRestaurantContext(restaurantId);
+
+//   await withTransaction(async (client) => {
+//     const actorIdentity = String(entry.employeeId ?? entry.employee ?? "").trim();
+//     if (!actorIdentity) {
+//       throw new Error("Missing employee identity for audit log entry");
+//     }
+
+//     const resolvedEmployee = await resolveEmployeeByUsername(context, actorIdentity, client);
+//     if (!resolvedEmployee) {
+//       throw new Error(
+//         `Employee '${actorIdentity}' not found in restaurant '${context.restaurant_name}', '${context.res_id}'`,
+//       );
+//     }
+
+//     const actionId = await findOrCreateActionId(entry.action, client);
+
+//     await runQuery(
+//       `
+//         insert into "Audit_logs"
+//           (id, created_at, res_id, outlet_id, employee_id, action_id, reason, category)
+//         values
+//           ($1, now(), $2, $3, $4, $5, $6, $7)
+//       `,
+//       [
+//         randomUUID(),
+//         context.res_id,
+//         context.outlet_id,
+//         resolvedEmployee.id,
+//         actionId,
+//         entry.details ?? null,
+//         entry.category,
+//       ],
+//       client,
+//     );
+//   });
+// }
 
 export async function GetAuditLogs(
   restaurantId: string,
