@@ -26,14 +26,14 @@ export const CORE_ROLES = {
   admin: ["*"],
   employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
   valet: [
-    "ae8ce7c0-1e06-4722-8a06-817267eec785", 
-    "6e9be65f-4081-4b86-8ba0-0592ee26f7f2", 
-    "2caeab74-5941-424d-9c3a-5c68ef0186e1", 
-    "2ff51c3d-f18c-406c-9f49-7c54f468c835", 
-    "892b50f3-51fc-4099-8f31-01e8dd8c3d44", 
-    "9e37297d-408b-446d-a51b-7892ad216b7d", 
-    "b8e02c25-b91c-427c-b462-8df009ede055", 
-    "5ef876a7-eb92-4602-b4d3-5590ce379540", 
+    "ae8ce7c0-1e06-4722-8a06-817267eec785",
+    "6e9be65f-4081-4b86-8ba0-0592ee26f7f2",
+    "2caeab74-5941-424d-9c3a-5c68ef0186e1",
+    "2ff51c3d-f18c-406c-9f49-7c54f468c835",
+    "892b50f3-51fc-4099-8f31-01e8dd8c3d44",
+    "9e37297d-408b-446d-a51b-7892ad216b7d",
+    "b8e02c25-b91c-427c-b462-8df009ede055",
+    "5ef876a7-eb92-4602-b4d3-5590ce379540",
   ],
 };
 
@@ -863,7 +863,7 @@ async function findEmployeeIdByUsername(
 
 export async function getRestaurantIdFromUsername(res_username: string): Promise<string | null> {
   return withTransaction(async (client) => {
-      const existingId = await runQuery<{ res_id: string }>(
+    const existingId = await runQuery<{ res_id: string }>(
       `select id::text as res_id from "Restaurant" where lower(res_username) = lower($1) or id::text = $1 limit 1`,
       [res_username],
       client,
@@ -2893,7 +2893,7 @@ export async function AddBill(
     total_amt: number;
     tax_breakdown?: any;
   },
-): Promise<{ id: string}> {
+): Promise<{ id: string }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBillWorkflowColumns();
   const id = isUuid(String(bill.id ?? '')) ? String(bill.id) : randomUUID();
@@ -3262,38 +3262,17 @@ export async function ReplaceBill(
     if (!oldOrderId) throw new Error('Missing old_order_id');
 
     // locate existing bill (if any)
-    const existing = await runQuery<{ id: string }>(
-      `select id from "Bills" where order_id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    // try to locate existing bill and update in-place
+    const existing = await runQuery<{ id: string; emp_id: string | null; table_id: string | null }>(
+      `select id, emp_id, table_id from "Bills" where order_id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
       [oldOrderId, context.res_id, context.outlet_id],
       client,
     );
-    const oldBillId = existing[0]?.id ?? null;
+    const oldBillRow = existing[0] ?? null;
 
-    // mark old bill cancelled and record reason
-    if (oldBillId) {
-      await runQuery(
-        `update "Bills" set status = $1, reason = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
-        [5, payload.reason ?? null, oldBillId, context.res_id, context.outlet_id],
-        client,
-      );
-    }
-
-    // mark old order cancelled and update embedded JSON status to keep read model consistent
-    await runQuery(
-      `
-      update "Orders"
-      set status = $1,
-          food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
-      where id = $3 and res_id = $4 and outlet_id = $5
-    `,
-      [5, 'Cancelled', oldOrderId, context.res_id, context.outlet_id],
-      client,
-    );
-
-    // create new order id
-    const newOrderId = randomUUID();
+    // prepare new order payload (we will update the existing order's embedded JSON)
     const newOrderPayload = {
-      id: newOrderId,
+      id: oldOrderId,
       table: String(payload.new_order.table ?? ''),
       customer: String(payload.new_order.customer ?? 'Guest'),
       taken_by_employee_id: String(payload.new_order.taken_by_employee_id ?? '').trim() || null,
@@ -3308,25 +3287,19 @@ export async function ReplaceBill(
       status: 'Bill Verification',
     };
 
-    // resolve table id
-    const tableRows = await runQuery<{ id: string }>(
-      `select id from "Tables" where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3) limit 1`,
-      [context.res_id, context.outlet_id, newOrderPayload.table],
-      client,
-    );
-    const tableId = tableRows[0]?.id ?? null;
+    // resolve table id (prefer resolving from new payload, fallback to existing bill table)
+    let tableId: string | null = null;
+    if (newOrderPayload.table) {
+      const tableRows = await runQuery<{ id: string }>(
+        `select id from "Tables" where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3) limit 1`,
+        [context.res_id, context.outlet_id, newOrderPayload.table],
+        client,
+      );
+      tableId = tableRows[0]?.id ?? null;
+    }
+    if (!tableId && oldBillRow) tableId = oldBillRow.table_id ?? null;
 
-    await runQuery(
-      `
-      insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, cust_id)
-      values ($1, now(), $2, $3, $4::json, $5, $6, null)
-    `,
-      [newOrderId, context.res_id, context.outlet_id, JSON.stringify(newOrderPayload), tableId, toOrderStatusCode('Bill Verification')],
-      client,
-    );
-
-    // create new bill row
-    const newBillId = randomUUID();
+    // resolve employee id for bill update. prefer provided, fall back to existing bill emp_id
     let empId: string | null = null;
     if (payload.new_bill.emp_id) {
       const rawEmployeeId = String(payload.new_bill.emp_id).trim();
@@ -3337,6 +3310,66 @@ export async function ReplaceBill(
         empId = resolved?.id ?? null;
       }
     }
+
+    if (oldBillRow && !oldBillRow.id) {
+      // unreachable but defensive
+    }
+
+    if (oldBillRow) {
+      // update existing order row's embedded food JSON and status
+      await runQuery(
+        `
+        update "Orders"
+        set food = $1::json,
+            table_id = $2,
+            status = $3
+        where id = $4 and res_id = $5 and outlet_id = $6
+      `,
+        [JSON.stringify(newOrderPayload), tableId, toOrderStatusCode('Bill Verification'), oldOrderId, context.res_id, context.outlet_id],
+        client,
+      );
+
+      // if empId not resolved, keep existing emp_id
+      if (!empId) empId = oldBillRow.emp_id ?? null;
+
+      // update existing bill row in-place
+      await runQuery(
+        `update "Bills" set total_amt = $1, tax_breakdown = $2, emp_id = $3, reason = $4, table_id = $5 where id = $6 and res_id = $7 and outlet_id = $8`,
+        [
+          payload.new_bill.total_amt ?? 0,
+          payload.new_bill.tax_breakdown ? JSON.stringify(payload.new_bill.tax_breakdown) : null,
+          empId,
+          payload.reason ?? null,
+          tableId,
+          oldBillRow.id,
+          context.res_id,
+          context.outlet_id,
+        ],
+        client,
+      );
+
+      return { newOrderId: oldOrderId, newBillId: oldBillRow.id };
+    }
+
+    // if no existing bill found, fall back to creating a new order+bill (legacy behavior)
+    const newOrderId = randomUUID();
+    const tableRows = await runQuery<{ id: string }>(
+      `select id from "Tables" where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3) limit 1`,
+      [context.res_id, context.outlet_id, newOrderPayload.table],
+      client,
+    );
+    const resolvedTableId = tableRows[0]?.id ?? null;
+
+    await runQuery(
+      `
+      insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, cust_id)
+      values ($1, now(), $2, $3, $4::json, $5, $6, null)
+    `,
+      [newOrderId, context.res_id, context.outlet_id, JSON.stringify({ ...newOrderPayload, id: newOrderId }), resolvedTableId, toOrderStatusCode('Bill Verification')],
+      client,
+    );
+
+    const newBillId = randomUUID();
     if (!empId) {
       throw new Error("Unable to resolve employee for replacement bill (emp_id)");
     }
@@ -3350,7 +3383,7 @@ export async function ReplaceBill(
         newBillId,
         context.res_id,
         context.outlet_id,
-        tableId,
+        resolvedTableId,
         empId,
         payload.new_bill.status ?? 1,
         null,

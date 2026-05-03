@@ -1167,16 +1167,27 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 	const new_order = body.new_order ?? null;
 	const new_bill = body.new_bill ?? null;
 
-	if (!old_order_id || !new_order || !new_bill) {
-		return res.status(400).json({ error: 'Missing required fields: old_order_id, new_order, new_bill' });
+	if (!old_order_id) {
+		return res.status(400).json({ error: 'Missing required field: old_order_id' });
+	}
+
+	if (!new_order && !new_bill) {
+		return res.status(400).json({ error: 'At least one of new_order or new_bill is required' });
 	}
 
 	try {
 		const result = await ReplaceBill(restaurantId, { old_order_id, reason, new_order, new_bill });
 		if (!result) return res.status(500).json({ error: 'Replace operation failed' });
-		// emit realtime events for UI updates
-		try { emitRestaurant(restaurantId, 'order:replaced', { old_order_id, new_order_id: result.newOrderId, new_bill_id: result.newBillId }); } catch (e) { }
-		return res.status(201).json(result);
+		// emit realtime events for UI updates — use order:updated for in-place changes
+		try {
+			const payloadForEmit = {
+				order_id: old_order_id,
+				bill_id: result.newBillId,
+				new_order_id: result.newOrderId,
+			};
+			emitRestaurant(restaurantId, 'order:updated', payloadForEmit);
+		} catch (e) { }
+		return res.status(200).json(result);
 	} catch (err: any) {
 		console.error('replace_bill_failed', err);
 		return res.status(500).json({ error: String(err?.message ?? 'Internal') });
