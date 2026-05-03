@@ -118,7 +118,7 @@ function validateAction(expectedUUID: string) {
 }
 
 
-type AppRole = "admin" | "employee" | "valet" | "waiter";
+type AppRole = "admin" | "employee" | "valet" | "waiter" | "cashier" | "captain" | "manager";
 
 function normalizeRole(rawRole: unknown): AppRole | null {
 	if (typeof rawRole !== "string") {
@@ -126,7 +126,7 @@ function normalizeRole(rawRole: unknown): AppRole | null {
 	}
 
 	const lowered = rawRole.trim().toLowerCase();
-	if (lowered === "admin" || lowered === "employee" || lowered === "valet" || lowered === "waiter") {
+	if (lowered === "admin" || lowered === "employee" || lowered === "valet" || lowered === "waiter" || lowered === "cashier" || lowered === "captain" || lowered === "manager") {
 		return lowered;
 	}
 
@@ -273,7 +273,7 @@ async function resolveRoleForRequest(req: Request, restaurantId: string): Promis
 	const headerRole = (Array.isArray(req.headers['x-user-role']) ? req.headers['x-user-role'][0] : req.headers['x-user-role']) as string | undefined;
 	if (typeof headerRole === 'string' && headerRole.trim()) {
 		const lowered = headerRole.trim().toLowerCase();
-		if (lowered === 'admin' || lowered === 'employee' || lowered === 'valet' || lowered === 'waiter') {
+		if (lowered === 'admin' || lowered === 'employee' || lowered === 'valet' || lowered === 'waiter' || lowered === 'cashier' || lowered === 'captain' || lowered === 'manager') {
 			return lowered as AppRole;
 		}
 	}
@@ -2906,7 +2906,7 @@ app.post("/feedback/submit", validate, async (req: Request, res: Response) => {
 			return;
 		}
 		const role = (matched.role ?? "").toString().trim().toLowerCase();
-		const allowedRoles = new Set(["admin", "employee", "valet", "waiter"]);
+		const allowedRoles = new Set(["admin", "employee", "valet", "waiter", "cashier", "captain", "manager"]);
 		if (!allowedRoles.has(role)) {
 			res.status(403).json({ error: "Employee role not allowed", actualRole: matched.role ?? null });
 			return;

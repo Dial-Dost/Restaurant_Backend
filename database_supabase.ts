@@ -26,6 +26,9 @@ export const CORE_ROLES = {
   admin: ["*"],
   employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
   valet: ["e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7", "faf2745b-580c-4529-bbe1-033200cbcf67"],
+  cashier: ["9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "2393edd7-cdd9-439c-9ff3-d563d5216967", "fc57d407-4bba-442c-97a2-9e6f3c57f288", "a953d044-31ba-4e31-b96f-99304fe43dfa", "4ad474d4-5230-449c-874f-6a238b833bca"],
+  captain: ["4ad474d4-5230-449c-874f-6a238b833bca", "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "c7699d46-0e2f-4448-b325-8ca490a5296b"],
+  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd"],
 };
 
 type CoreRoleKey = keyof typeof CORE_ROLES
@@ -85,7 +88,7 @@ type RestaurantUser = {
   emp_Lname?: string | null,
   // name: string;
   password: string;
-  role: "admin" | "employee" | "valet" | "waiter";
+  role: "admin" | "employee" | "valet" | "waiter" | "cashier" | "captain" | "manager";
   role_all?: string[];
 };
 
@@ -120,7 +123,7 @@ export type FeedbackEntry = {
   employeeId: string; // uuid of Employees.id
   employeeUsername: string; // login username
   name: string;
-  role: "admin" | "employee" | "valet" | "waiter";
+  role: "admin" | "employee" | "valet" | "waiter" | "cashier" | "captain" | "manager";
   role_all: string[];
   restaurantId: string;
   restaurantName: string;
@@ -422,7 +425,7 @@ function clampRating(value: number): number {
 
 function toRole(raw: unknown): RestaurantUser["role"] {
   const role = String(raw ?? "").trim().toLowerCase();
-  if (role === "admin" || role === "employee" || role === "valet" || role === "waiter") {
+  if (role === "admin" || role === "employee" || role === "valet" || role === "waiter" || role === "cashier" || role === "captain" || role === "manager") {
     return role;
   }
   return "employee";
@@ -3768,9 +3771,10 @@ export async function GetMonthlyApcInsights(
     )
     : precomputedOrders;
 
-  // APC is credited only for paid/closed bills and excludes cancelled orders.
+  // APC is computed for all non-cancelled orders (Preparing, Served, Paid, Closed, etc.).
+  // This allows APC visibility at every order status stage rather than only after payment.
   const effectiveOrders = scopedOrders.filter(
-    (o) => o.is_paid && String(o.status).toLowerCase() !== "cancelled",
+    (o) => String(o.status).toLowerCase() !== "cancelled",
   );
 
   const totalRevenue = round2(effectiveOrders.reduce((sum, order) => sum + order.total, 0));
@@ -4326,7 +4330,7 @@ export async function AssignRoleToEmployee(
       entryToAdd = roleRows[0].id; // store id for custom role
     } else {
       const normalizedRole = raw.toLowerCase();
-      if (["admin", "employee", "valet", "waiter"].includes(normalizedRole)) {
+      if (["admin", "employee", "valet", "waiter", "cashier", "captain", "manager"].includes(normalizedRole)) {
         entryToAdd = normalizedRole; // core role name
       } else {
         // lookup custom role by name and store its id
@@ -4779,7 +4783,7 @@ export async function DeleteRestaurantUser(
 export type EmployeeLoginResult = {
   employeeId: string; // uuid of Employees.id
   employeeUsername: string; // login username
-  role: "admin" | "employee" | "valet" | "waiter";
+  role: "admin" | "employee" | "valet" | "waiter" | "cashier" | "captain" | "manager";
   role_all: string[];
   restaurantUsername: string;
   restaurantName: string;
