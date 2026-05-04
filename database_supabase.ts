@@ -27,13 +27,13 @@ export const CORE_ROLES = {
   admin: ["*"],
   employee: ["0a98cf2b-8b42-47a7-a523-b7bb73cb870e", "1f176202-d5e7-4bb0-802c-275a42425394", "3ec33182-ceb4-4d07-ac7e-84214adcf104"],
   valet: [
-    "ae8ce7c0-1e06-4722-8a06-817267eec785", 
-    "6e9be65f-4081-4b86-8ba0-0592ee26f7f2", 
-    "2caeab74-5941-424d-9c3a-5c68ef0186e1", 
-    "2ff51c3d-f18c-406c-9f49-7c54f468c835", 
-    "892b50f3-51fc-4099-8f31-01e8dd8c3d44", 
-    "9e37297d-408b-446d-a51b-7892ad216b7d", 
-    "b8e02c25-b91c-427c-b462-8df009ede055",  
+    "ae8ce7c0-1e06-4722-8a06-817267eec785",
+    "6e9be65f-4081-4b86-8ba0-0592ee26f7f2",
+    "2caeab74-5941-424d-9c3a-5c68ef0186e1",
+    "2ff51c3d-f18c-406c-9f49-7c54f468c835",
+    "892b50f3-51fc-4099-8f31-01e8dd8c3d44",
+    "9e37297d-408b-446d-a51b-7892ad216b7d",
+    "b8e02c25-b91c-427c-b462-8df009ede055",
     "5ef876a7-eb92-4602-b4d3-5590ce379540",
   ],
   cashier: ["9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "2393edd7-cdd9-439c-9ff3-d563d5216967", "fc57d407-4bba-442c-97a2-9e6f3c57f288", "a953d044-31ba-4e31-b96f-99304fe43dfa", "4ad474d4-5230-449c-874f-6a238b833bca"],
@@ -1091,13 +1091,22 @@ async function ensureTableOccupancyColumns(client?: PoolClient): Promise<void> {
     [],
     client,
   );
+  await runQuery(
+    `
+      alter table "Tables"
+      add column if not exists linked_order_id text default null
+    `,
+    [],
+    client,
+  );
 }
 
 export async function OccupyTable(
   restaurantId: string,
   table_name: string,
   num_covers: number = 1,
-): Promise<{ table_id: string; is_occupied: boolean; num_covers: number }> {
+  linkedOrderId?: string | null,
+): Promise<{ table_id: string; is_occupied: boolean; num_covers: number; linked_order_id?: string | null }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
 
@@ -1126,14 +1135,14 @@ export async function OccupyTable(
 
   const tableId = rows[0].id;
 
-  const updatedRows = await runQuery<{ is_occupied: boolean; num_covers: number }>(
+  const updatedRows = await runQuery<{ is_occupied: boolean; num_covers: number; linked_order_id: string | null }>(
     `
       update "Tables"
-      set is_occupied = true, num_covers = $4
+      set is_occupied = true, num_covers = $4, linked_order_id = $5
       where id = $1 and res_id = $2 and outlet_id = $3
-      returning is_occupied, num_covers
+      returning is_occupied, num_covers, linked_order_id
     `,
-    [tableId, context.res_id, context.outlet_id, Math.max(1, Math.round(num_covers))],
+    [tableId, context.res_id, context.outlet_id, Math.max(1, Math.round(num_covers)), linkedOrderId ?? null],
   );
 
   const result = updatedRows[0];
@@ -1141,6 +1150,7 @@ export async function OccupyTable(
     table_id: tableId,
     is_occupied: result?.is_occupied ?? true,
     num_covers: result?.num_covers ?? num_covers,
+    linked_order_id: result?.linked_order_id ?? null,
   };
 }
 
@@ -1225,7 +1235,7 @@ export async function ReleaseTable(
   const updatedRows = await runQuery<{ is_occupied: boolean }>(
     `
       update "Tables"
-      set is_occupied = false, num_covers = 1
+      set is_occupied = false, num_covers = 1, linked_order_id = null
       where id = $1 and res_id = $2 and outlet_id = $3
       returning is_occupied
     `,
@@ -1242,7 +1252,7 @@ export async function ReleaseTable(
 export async function GetTableStatus(
   restaurantId: string,
   table_name: string,
-): Promise<{ table_id: string; table_name: string; capacity: number | null; is_occupied: boolean; num_covers: number } | null> {
+): Promise<{ table_id: string; table_name: string; capacity: number | null; is_occupied: boolean; num_covers: number; linked_order_id: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
 
@@ -1257,9 +1267,10 @@ export async function GetTableStatus(
     capacity: unknown;
     is_occupied: boolean;
     num_covers: number;
+    linked_order_id: string | null;
   }>(
     `
-      select id, table_name, capacity, is_occupied, num_covers
+      select id, table_name, capacity, is_occupied, num_covers, linked_order_id
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
       limit 1
@@ -1278,6 +1289,7 @@ export async function GetTableStatus(
     capacity: parseNumeric(row.capacity),
     is_occupied: row.is_occupied ?? false,
     num_covers: row.num_covers ?? 1,
+    linked_order_id: row.linked_order_id ?? null,
   };
 }
 
@@ -2477,8 +2489,7 @@ export async function GetBookingsInRange(
   }
 }
 
-export async function GetEmployeeDetailsFromEmpID(employeeID: string): Promise<RestaurantUser> 
-{
+export async function GetEmployeeDetailsFromEmpID(employeeID: string): Promise<RestaurantUser> {
   const rows = await runQuery<{
     res_id: string,
     outlet_id: string,
@@ -2500,22 +2511,22 @@ export async function GetEmployeeDetailsFromEmpID(employeeID: string): Promise<R
       select emp_username, emp_pass from "Login" where emp_id = $1 limit 1
     `,
     [employeeID]
-   );
-  
+  );
+
   if (login_rows.length === 0 || !login_rows[0]) {
     throw new Error("Login details not found for employee");
   }
 
-  if(rows.length === 0) {
+  if (rows.length === 0) {
     throw new Error("Employee not found");
   }
   const row = rows[0];
   if (!row) {
     throw new Error("Employee not found");
   }
-  const role = row.emp_roles  ? typeof row.emp_roles === "object"    ? row.emp_roles
+  const role = row.emp_roles ? typeof row.emp_roles === "object" ? row.emp_roles
     : JSON.parse(row.emp_roles)
-  : {};
+    : {};
   return {
     id: employeeID,
     res_id: row.res_id,
@@ -2538,8 +2549,7 @@ export async function AddAuditLogEntry(
   details: string,
   category: Audit_log_category,
   additional_details?: Record<string, any>
-): Promise<boolean>
-{
+): Promise<boolean> {
   await withTransaction(async (client) => {
     await runQuery(
       `
@@ -3076,16 +3086,42 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
 
   return rows.map((row) => {
     const payload = parseJsonObject(row.food) ?? {};
-    const items = Array.isArray(payload.items)
-      ? payload.items.map((entry: any) => ({
+    // payload may contain a tuple-form items_split or legacy items array
+    let items: OrderItemRecord[] = [];
+    let items_split: any[] | undefined = undefined;
+    if (Array.isArray(payload.items_split) && payload.items_split.length > 0) {
+      items_split = payload.items_split;
+      items = (payload.items_split as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []).map((entry: any) => ({
         id: String(entry.id ?? randomUUID()),
         name: String(entry.name ?? "Unknown"),
         quantity: Math.max(1, Math.round(parseNumeric(entry.quantity))),
         price: parseNumeric(entry.price),
         orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
         note: typeof entry.note === "string" && entry.note.trim().length > 0 ? entry.note.trim() : null,
-      }))
-      : [];
+      }));
+    } else if (Array.isArray(payload.items)) {
+      // detect tuple form in payload.items for backward compatibility
+      if (payload.items.length > 0 && Array.isArray(payload.items[0]) && typeof payload.items[0][0] === 'string' && Array.isArray(payload.items[0][1])) {
+        items_split = payload.items;
+        items = (payload.items as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []).map((entry: any) => ({
+          id: String(entry.id ?? randomUUID()),
+          name: String(entry.name ?? "Unknown"),
+          quantity: Math.max(1, Math.round(parseNumeric(entry.quantity))),
+          price: parseNumeric(entry.price),
+          orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
+          note: typeof entry.note === "string" && entry.note.trim().length > 0 ? entry.note.trim() : null,
+        }));
+      } else {
+        items = payload.items.map((entry: any) => ({
+          id: String(entry.id ?? randomUUID()),
+          name: String(entry.name ?? "Unknown"),
+          quantity: Math.max(1, Math.round(parseNumeric(entry.quantity))),
+          price: parseNumeric(entry.price),
+          orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
+          note: typeof entry.note === "string" && entry.note.trim().length > 0 ? entry.note.trim() : null,
+        }));
+      }
+    }
 
     const subtotal = parseNumeric(payload.subtotal);
     const total = parseNumeric(payload.total);
@@ -3094,7 +3130,7 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
     const statusFromPayload = (String(payload.status ?? "").trim() as OrderRecord["status"]) || undefined;
     const finalStatus = statusFromRow || statusFromPayload || 'Preparing';
 
-    return {
+    const resultObj: any = {
       id: row.id,
       table: String(payload.table ?? row.table_name ?? ""),
       customer: String(payload.customer ?? "Guest"),
@@ -3135,7 +3171,61 @@ export async function GetOrders(restaurantId: string): Promise<OrderRecord[]> {
       bill_closed_at: row.closed_at ? new Date(row.closed_at).toISOString() : null,
       bill_closed_by: row.closed_by_username,
     };
+
+    // include flattened and split representations if available
+    if (items_split) {
+      resultObj.items_split = items_split;
+      resultObj.items_flattened = items;
+    } else {
+      // if no split available, still provide flattened
+      resultObj.items_flattened = items;
+    }
+
+    return resultObj;
   });
+}
+
+export async function UpdateOrderItemsSplit(
+  restaurantId: string,
+  orderId: string,
+  items_split: any[],
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!Array.isArray(items_split)) throw new Error('items_split must be an array');
+  console.log('[debug] UpdateOrderItemsSplit: received', { restaurantId, orderId, tuples: items_split.map((t) => [t?.[0], Array.isArray(t?.[1]) ? (t[1] as any[]).length : 0]) });
+
+  // build flattened items
+  const flattened = (items_split as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []);
+
+  // fetch existing order to preserve other fields
+  const existing = await runQuery<{ food: unknown }>(
+    `select food from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [orderId, context.res_id, context.outlet_id],
+  );
+  if (!existing[0]) throw new Error('Order not found');
+
+  const payload = parseJsonObject(existing[0].food) ?? {};
+  // determine order status: if any Preparing tuple contains one or more items -> Preparing, else Served
+  const hasPreparingItems = Array.isArray(items_split) && (items_split as any[]).some((t) => {
+    const label = String(t?.[0] ?? "").toLowerCase();
+    const list = Array.isArray(t?.[1]) ? t[1] : [];
+    return label.includes('prepar') && list.length > 0;
+  });
+  const newStatus = hasPreparingItems ? 'Preparing' : 'Served';
+
+  console.log('[debug] UpdateOrderItemsSplit: computed', { restaurantId, orderId, flattenedCount: flattened.length, hasPreparingItems, newStatus });
+
+  // include status in the food JSON payload so UI can read textual status
+  const newPayload = { ...payload, items: flattened, items_split, status: newStatus };
+  // update both the JSON food column and the numeric status column
+  console.log('[debug] UpdateOrderItemsSplit: updating DB', { orderId, statusCode: toOrderStatusCode(newStatus), payloadItems: Math.max(0, Array.isArray(newPayload.items) ? newPayload.items.length : 0) });
+  await runQuery(
+    `update "Orders" set food = $1::json, status = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
+    [JSON.stringify(newPayload), toOrderStatusCode(newStatus), orderId, context.res_id, context.outlet_id],
+  );
+  console.log('[debug] UpdateOrderItemsSplit: DB update complete', { orderId });
+
+  return true;
 }
 
 export async function AddOrder(
@@ -3198,6 +3288,7 @@ export async function AddOrder(
   );
   const existingPayload = parseJsonObject(existingOrderRows[0]?.food) ?? {};
 
+
   const takenByEmployeeIdRaw = String(
     (order as Record<string, unknown>).taken_by_employee_id
     ?? existingPayload.taken_by_employee_id
@@ -3214,15 +3305,141 @@ export async function AddOrder(
     ?? "",
   ).trim();
 
-  const statusCode = toOrderStatusCode(String(order.status ?? "Preparing"));
-  const payload = {
+  let statusCode = toOrderStatusCode(String(order.status ?? "Preparing"));
+  // Support two shapes for items:
+  // 1) legacy: items = [ { id, name, quantity, price, orderedAt, note? }, ... ]
+  // 2) split: items = [ ["Served", [ ... ]], ["Preparing", [ ... ]] ]
+  let itemsForStore: unknown[] = [];
+  let itemsSplitForStore: unknown = undefined;
+  if (Array.isArray(order.items) && order.items.length > 0 && Array.isArray(order.items[0]) && typeof (order.items[0] as any)[0] === 'string' && Array.isArray((order.items[0] as any)[1])) {
+    // tuple format
+    itemsSplitForStore = order.items;
+    itemsForStore = (order.items as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []);
+  } else {
+    itemsForStore = Array.isArray(order.items) ? order.items : [];
+  }
+
+  // If this is an update to an existing order (upsert) and caller provided a legacy items array,
+  // merge incoming items with existing items_split (or existing items) so that:
+  // - newly added items are appended to the Preparing tuple
+  // - existing items keep their previous Served/Preparing assignment
+  // - if incoming quantity for an existing item is larger than previous, the delta is added as a new Preparing item
+  if (existingOrderRows[0]) {
+    try {
+      const existingItems: any[] = Array.isArray(existingPayload.items_split) && existingPayload.items_split.length > 0
+        ? (existingPayload.items_split as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : [])
+        : Array.isArray(existingPayload.items) ? existingPayload.items : [];
+
+      const existingById = new Map<string, any>();
+      for (const it of existingItems) {
+        const idStr = String(it?.id ?? "");
+        if (idStr) existingById.set(idStr, { ...it });
+      }
+
+      // incoming items (from the request) as parsed earlier into itemsForStore
+      const incoming = Array.isArray(itemsForStore) ? (itemsForStore as any[]) : [];
+
+      const preparedNewItems: any[] = [];
+
+      // build merged flattened map: start from existing, then apply incoming quantities
+      const mergedById = new Map<string, any>();
+      for (const [id, it] of existingById.entries()) {
+        mergedById.set(id, { ...it });
+      }
+
+      for (const inc of incoming) {
+        const incId = String(inc?.id ?? "");
+        const incQty = Number(inc?.quantity ?? 1) || 1;
+        if (incId && mergedById.has(incId)) {
+          const prev = mergedById.get(incId);
+          const prevQty = Number(prev.quantity ?? 0) || 0;
+          if (incQty > prevQty) {
+            const delta = incQty - prevQty;
+            // keep merged quantity as the incoming total
+            mergedById.set(incId, { ...prev, quantity: incQty });
+            // create a distinct new item representing the added quantity and append to Preparing
+            preparedNewItems.push({ ...inc, id: randomUUID(), quantity: delta });
+          } else {
+            // incoming does not increase quantity -> keep prev or update to incoming
+            mergedById.set(incId, { ...prev, quantity: incQty });
+          }
+        } else {
+          // entirely new item -> ensure it has a unique id and mark as new (Preparing)
+          const newId = incId || randomUUID();
+          mergedById.set(newId, { ...inc, id: newId });
+          preparedNewItems.push({ ...inc, id: newId });
+        }
+      }
+
+      // final flattened array
+      const mergedFlattened = Array.from(mergedById.values()).map((it) => ({ ...it }));
+
+      // start from existing tuples if present else synthesize default Served/Preparing
+      const rawSplit = Array.isArray(existingPayload.items_split) && existingPayload.items_split.length > 0
+        ? JSON.parse(JSON.stringify(existingPayload.items_split)) as any[]
+        : [["Served", mergedFlattened], ["Preparing", []]] as any[];
+
+      // normalize and dedupe existing tuples (preserve first occurrence)
+      const seen = new Set<string>();
+      const normalized: any[] = [];
+      for (const tup of rawSplit) {
+        const label = String(tup?.[0] ?? "").trim() || "";
+        const arr = Array.isArray(tup?.[1]) ? tup[1] : [];
+        const filtered: any[] = [];
+        for (const it of arr) {
+          const id = String(it?.id ?? "");
+          if (!id) continue;
+          if (seen.has(id)) continue;
+          seen.add(id);
+          // prefer merged quantity if available
+          const merged = mergedById.get(id);
+          filtered.push(merged ? { ...merged } : { ...it });
+        }
+        normalized.push([label, filtered]);
+      }
+
+      // ensure Preparing tuple exists
+      let preparingIndex = normalized.findIndex((t: any) => String(t?.[0] ?? "").toLowerCase().includes('prepar'));
+      if (preparingIndex === -1) {
+        normalized.push(["Preparing", []]);
+        preparingIndex = normalized.length - 1;
+      }
+
+      // append new prepared items (these represent newly added quantities)
+      normalized[preparingIndex][1] = normalized[preparingIndex][1] || [];
+      for (const it of preparedNewItems) {
+        // avoid duplicates
+        const id = String(it.id ?? "");
+        if (!seen.has(id)) {
+          seen.add(id);
+          normalized[preparingIndex][1].push(it);
+        }
+      }
+
+      // set itemsSplitForStore and itemsForStore to merged values for storage
+      itemsSplitForStore = normalized;
+      itemsForStore = mergedFlattened;
+
+      // if any new items were added, ensure status becomes Preparing
+      if (preparedNewItems.length > 0) {
+        // override status so the order shows Preparing
+        (order as any).status = 'Preparing';
+        statusCode = toOrderStatusCode('Preparing');
+      }
+    } catch (err) {
+      // non-fatal: fall back to original behavior
+      console.warn('merge_incoming_items_failed', err);
+    }
+  }
+
+  const payload: any = {
     id,
     table: tableName,
     customer: customerName || "Guest",
     taken_by_employee_id: takenByEmployeeIdRaw || null,
     taken_by_employee_name: takenByEmployeeNameRaw || null,
     taken_by_employee_role: takenByEmployeeRoleRaw || null,
-    items: Array.isArray(order.items) ? order.items : [],
+    items: itemsForStore,
     subtotal: parseNumeric(order.subtotal),
     serviceChargePercentage: parseNumeric(order.serviceChargePercentage),
     taxes: Array.isArray(order.taxes) ? order.taxes : [],
@@ -3230,6 +3447,7 @@ export async function AddOrder(
     total: parseNumeric(order.total),
     status: String(order.status ?? "Preparing"),
   };
+  if (itemsSplitForStore !== undefined) payload.items_split = itemsSplitForStore;
 
   await runQuery(
     `
@@ -3247,6 +3465,20 @@ export async function AddOrder(
     [id, context.res_id, context.outlet_id, JSON.stringify(payload), table.id, statusCode, customerId],
   );
 
+  // Ensure the Tables.row linked_order_id is updated to point to this order
+  try {
+    await runQuery(
+      `
+        update "Tables"
+        set linked_order_id = $1
+        where id = $2 and res_id = $3 and outlet_id = $4
+      `,
+      [id, table.id, context.res_id, context.outlet_id],
+    );
+  } catch (err) {
+    console.warn('failed to update Tables.linked_order_id for order', id, err);
+  }
+
   return { id };
 }
 
@@ -3255,15 +3487,32 @@ export async function DeleteOrder(
   orderId: string,
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
-  const rows = await runQuery<{ id: string }>(
-    `
-      delete from "Orders"
-      where id = $1 and res_id = $2 and outlet_id = $3
-      returning id
-    `,
-    [orderId.trim(), context.res_id, context.outlet_id],
-  );
-  return rows.length > 0;
+  withTransaction(async (client) => {
+    const rows = await runQuery<{ id: string }>(
+      `
+        delete from "Orders"
+        where id = $1 and res_id = $2 and outlet_id = $3
+        returning id
+      `,
+      [orderId.trim(), context.res_id, context.outlet_id],
+      client,
+    );
+
+    if (rows.length === 0) return false;
+
+    await runQuery<{}>(
+      `
+        update "Tables"
+        set linked_order_id = null
+        where linked_order_id = $1 and res_id = $2 and outlet_id = $3
+      `,
+      [orderId.trim(), context.res_id, context.outlet_id],
+      client,
+    )
+
+    return rows.length > 0;
+  });
+  return false;
 }
 
 // important: convert the whole proceess to atomic
@@ -4320,7 +4569,7 @@ export async function GetMonthlyApcInsights(
 
     // Prioritize num_covers from table, then payload, then booking lookup
     let people = Math.max(1, row.num_covers);
-    
+
     if (payloadPeopleRaw > 0) {
       people = Math.max(1, Math.round(payloadPeopleRaw));
     } else if (!(payloadPeopleRaw > 0)) {

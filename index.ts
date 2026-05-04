@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomUUID } from 'crypto';
 import type { NextFunction, Request, Response } from "express";
 import express from "express";
 import {
@@ -48,6 +49,7 @@ import {
 	GetOrders,
 	AddOrder,
 	DeleteOrder,
+	UpdateOrderItemsSplit,
 	GetMonthlyApcInsights,
 	GetRestaurantProfile,
 	UpdateRestaurantProfile,
@@ -829,6 +831,7 @@ app.post("/occupy-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085")
 	const body = req.body as Record<string, unknown> | undefined;
 	const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
 	const numCovers = typeof body?.num_covers === 'number' ? body.num_covers : 1;
+	const orderId = typeof body?.order_id === 'string' ? body.order_id.trim() : undefined;
 
 	if (!tableName) {
 		res.status(400).json({ error: "table_name is required" });
@@ -836,7 +839,7 @@ app.post("/occupy-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085")
 	}
 
 	try {
-		const result = await OccupyTable(restaurantId, tableName, numCovers);
+		const result = await OccupyTable(restaurantId, tableName, numCovers, orderId ?? null);
 		try {
 			await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Occupied table ${tableName} with ${numCovers} covers`, Audit_log_category.Tables, { table_name: tableName, num_covers: numCovers });
 		} catch (err) {
@@ -1333,10 +1336,10 @@ app.patch("/booking/:id/status", validateAction("fdeecab6-7c3a-4239-b87c-99a96f5
 		console.warn("emit booking:status_updated failed", err);
 	}
 
-	try{
+	try {
 		await log_audit(req, "fdeecab6-7c3a-4239-b87c-99a96f50c551", `Updated booking status to ${status} for booking ${bookingId}`, Audit_log_category.Bookings, { booking_id: bookingId, status });
 	}
-	catch(err){
+	catch (err) {
 		console.warn("log_audit booking-status-update failed", err);
 	}
 
@@ -1524,12 +1527,28 @@ app.patch('/bills/order/:orderId/status', validateAction("07e364cc-f40d-46f3-b69
 	}
 
 	try {
-		await UpdateBillStatusByOrder(restaurantId, orderId, status);
-		try {
-			await log_audit(req, "07e364cc-f40d-46f3-b691-0f719dd38e0f", `Updated bill status for order ${orderId} to ${status}`, Audit_log_category.Bill, { order_id: orderId, status });
-		} catch (err) {
-			console.warn('log_audit update-bill-status failed', err);
+		// If items_split is provided, update per-item statuses on the order
+		if (Array.isArray(body.items_split)) {
+			try {
+				await UpdateOrderItemsSplit(restaurantId, orderId, body.items_split as any[]);
+				await log_audit(req, "07e364cc-f40d-46f3-b691-0f719dd38e0f", `Updated per-item statuses for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId });
+			} catch (err) {
+				console.error('update_order_items_split_failed', err);
+				res.status(500).json({ error: String((err as any)?.message ?? 'Unable to update order items') });
+				return;
+			}
 		}
+
+		// If numeric status provided, still update bill status
+		if (Number.isFinite(status)) {
+			await UpdateBillStatusByOrder(restaurantId, orderId, status);
+			try {
+				await log_audit(req, "07e364cc-f40d-46f3-b691-0f719dd38e0f", `Updated bill status for order ${orderId} to ${status}`, Audit_log_category.Bill, { order_id: orderId, status });
+			} catch (err) {
+				console.warn('log_audit update-bill-status failed', err);
+			}
+		}
+
 		res.json({ success: true });
 	} catch (error: any) {
 		console.error('update_bill_status_failed', error);
@@ -2127,6 +2146,93 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), asyn
 	} catch (error: any) {
 		console.error("add_order_failed", error);
 		res.status(400).json({ error: String(error?.message ?? "Unable to add order") });
+	}
+});
+
+// Add single item to existing order (adds to Preparing section and logs audit)
+app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: 'Missing restaurantId' }); return; }
+	const orderId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+	if (!orderId) { res.status(400).json({ error: 'Missing order id' }); return; }
+	const item = req.body ?? {};
+	try {
+		// fetch existing order
+		const existing = await GetOrders(restaurantId);
+		const order = existing.find(o => o.id === orderId);
+		if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
+
+		// build items_split if missing; clone to avoid mutating source
+		const rawSplit = Array.isArray((order as any).items_split) ? JSON.parse(JSON.stringify((order as any).items_split)) as any[] : [["Served", []], ["Preparing", []]];
+		// normalize tuples: ensure each tuple is [label, array] and dedupe items across tuples (preserve first occurrence)
+		const seenIds = new Set<string>();
+		const normalizedSplit: any[] = [];
+		for (const tup of rawSplit) {
+			const label = String(tup?.[0] ?? "").trim() || "";
+			const arr = Array.isArray(tup?.[1]) ? tup[1] : [];
+			const filtered: any[] = [];
+			for (const it of arr) {
+				const id = String((it && it.id) ?? "");
+				if (!id) continue;
+				if (seenIds.has(id)) continue;
+				seenIds.add(id);
+				filtered.push(it);
+			}
+			normalizedSplit.push([label, filtered]);
+		}
+
+		// ensure we have a Preparing tuple to add the new item into
+		let preparingIndex = normalizedSplit.findIndex((t: any) => String(t?.[0] ?? "").toLowerCase().includes('prepar'));
+		const newItem = { id: String(item.id ?? randomUUID()), name: String(item.name ?? 'Unknown'), quantity: Number(item.quantity ?? 1), price: Number(item.price ?? 0), orderedAt: String(item.orderedAt ?? new Date().toISOString()), note: item.note ?? null };
+		if (preparingIndex === -1) {
+			normalizedSplit.push(["Preparing", [newItem]]);
+		} else {
+			normalizedSplit[preparingIndex][1] = normalizedSplit[preparingIndex][1] || [];
+			normalizedSplit[preparingIndex][1].push(newItem);
+		}
+
+		const split = normalizedSplit;
+
+		await UpdateOrderItemsSplit(restaurantId, orderId, split as any[]);
+		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Added item ${newItem.id} to order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, item: newItem }); } catch (err) { console.warn('log_audit add-order-item failed', err); }
+
+		res.status(201).json({ success: true, item: newItem });
+	} catch (err: any) {
+		console.error('add_order_item_failed', err);
+		res.status(500).json({ error: String(err?.message ?? 'Unable to add item') });
+	}
+});
+
+// Delete single item from order
+app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: 'Missing restaurantId' }); return; }
+	const orderId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+	const itemId = typeof req.params.itemId === 'string' ? req.params.itemId.trim() : '';
+	if (!orderId || !itemId) { res.status(400).json({ error: 'Missing order id or item id' }); return; }
+	try {
+		const existing = await GetOrders(restaurantId);
+		const order = existing.find(o => o.id === orderId);
+		if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
+
+		const split = (order as any).items_split ?? [["Served", []], ["Preparing", []]];
+		// remove item from both sections
+		for (const tuple of split) {
+			if (Array.isArray(tuple[1])) {
+				const before = (tuple[1] as any[]).length;
+				tuple[1] = (tuple[1] as any[]).filter((it) => String(it.id) !== itemId);
+				const after = (tuple[1] as any[]).length;
+				if (after !== before) break;
+			}
+		}
+
+		await UpdateOrderItemsSplit(restaurantId, orderId, split as any[]);
+		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Deleted item ${itemId} from order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, deleted_item_id: itemId }); } catch (err) { console.warn('log_audit delete-order-item failed', err); }
+
+		res.json({ success: true });
+	} catch (err: any) {
+		console.error('delete_order_item_failed', err);
+		res.status(500).json({ error: String(err?.message ?? 'Unable to delete item') });
 	}
 });
 
