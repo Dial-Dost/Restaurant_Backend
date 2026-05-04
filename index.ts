@@ -8,6 +8,11 @@ import {
 	AddEmailToCustomer,
 	AddTable,
 	RemoveTable,
+	OccupyTable,
+	UpdateTableCovers,
+	ReleaseTable,
+	GetTableStatus,
+	GetBillForTable,
 	GetBookingsAfterTime,
 	HasActiveBooking,
 	GetCustomerAndBookings,
@@ -811,6 +816,154 @@ app.delete("/table/:name", validateAction("5777c4aa-29df-4ea1-9c45-c1038d25f746"
 	}
 
 	res.status(204).send();
+});
+
+// Occupy a table (mark as occupied and set number of covers)
+app.post("/occupy-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
+	const numCovers = typeof body?.num_covers === 'number' ? body.num_covers : 1;
+
+	if (!tableName) {
+		res.status(400).json({ error: "table_name is required" });
+		return;
+	}
+
+	try {
+		const result = await OccupyTable(restaurantId, tableName, numCovers);
+		try {
+			await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Occupied table ${tableName} with ${numCovers} covers`, Audit_log_category.Tables, { table_name: tableName, num_covers: numCovers });
+		} catch (err) {
+			console.warn('log_audit occupy-table failed', err);
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error("occupy_table_failed", error);
+		res.status(400).json({ error: String(error?.message ?? "Unable to occupy table") });
+	}
+});
+
+// Update number of covers at a table
+app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
+	const numCovers = typeof body?.num_covers === 'number' ? body.num_covers : 1;
+
+	if (!tableName) {
+		res.status(400).json({ error: "table_name is required" });
+		return;
+	}
+
+	try {
+		const result = await UpdateTableCovers(restaurantId, tableName, numCovers);
+		try {
+			await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Updated table ${tableName} covers to ${numCovers}`, Audit_log_category.Tables, { table_name: tableName, num_covers: numCovers });
+		} catch (err) {
+			console.warn('log_audit table-covers failed', err);
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error("table_covers_failed", error);
+		res.status(400).json({ error: String(error?.message ?? "Unable to update table covers") });
+	}
+});
+
+// Release/unoccupy a table
+app.post("/release-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
+
+	if (!tableName) {
+		res.status(400).json({ error: "table_name is required" });
+		return;
+	}
+
+	try {
+		const result = await ReleaseTable(restaurantId, tableName);
+		try {
+			await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Released table ${tableName}`, Audit_log_category.Tables, { table_name: tableName });
+		} catch (err) {
+			console.warn('log_audit release-table failed', err);
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error("release_table_failed", error);
+		res.status(400).json({ error: String(error?.message ?? "Unable to release table") });
+	}
+});
+
+// Get table status
+app.get("/table-status", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const tableName = typeof req.query.table_name === 'string' ? req.query.table_name.trim() : '';
+
+	if (!tableName) {
+		res.status(400).json({ error: "table_name query parameter is required" });
+		return;
+	}
+
+	try {
+		const result = await GetTableStatus(restaurantId, tableName);
+		if (!result) {
+			res.status(404).json({ error: "Table not found" });
+			return;
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error("get_table_status_failed", error);
+		res.status(400).json({ error: String(error?.message ?? "Unable to get table status") });
+	}
+});
+
+// Get bill for a table (returns the current open bill and all associated orders)
+app.get("/bill-for-table", validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const tableName = typeof req.query.table_name === 'string' ? req.query.table_name.trim() : '';
+
+	if (!tableName) {
+		res.status(400).json({ error: "table_name query parameter is required" });
+		return;
+	}
+
+	try {
+		const result = await GetBillForTable(restaurantId, tableName);
+		if (!result) {
+			res.status(404).json({ error: "No open bill found for this table" });
+			return;
+		}
+		res.json(result);
+	} catch (error: any) {
+		console.error("get_bill_for_table_failed", error);
+		res.status(400).json({ error: String(error?.message ?? "Unable to get bill for table") });
+	}
 });
 
 /*

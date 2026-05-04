@@ -1065,6 +1065,282 @@ export async function RemoveTable(
   return rows.length > 0;
 }
 
+async function ensureTableOccupancyColumns(client?: PoolClient): Promise<void> {
+  await runQuery(
+    `
+      alter table "Tables"
+      add column if not exists is_occupied boolean default false
+    `,
+    [],
+    client,
+  );
+  await runQuery(
+    `
+      alter table "Tables"
+      add column if not exists num_covers integer default 1
+    `,
+    [],
+    client,
+  );
+}
+
+export async function OccupyTable(
+  restaurantId: string,
+  table_name: string,
+  num_covers: number = 1,
+): Promise<{ table_id: string; is_occupied: boolean; num_covers: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+
+  const normalized = table_name.trim();
+  if (!normalized) {
+    throw new Error("Table name is required");
+  }
+
+  if (num_covers < 1) {
+    throw new Error("Number of covers must be at least 1");
+  }
+
+  const rows = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+  );
+
+  if (!rows[0]) {
+    throw new Error("Table not found");
+  }
+
+  const tableId = rows[0].id;
+
+  const updatedRows = await runQuery<{ is_occupied: boolean; num_covers: number }>(
+    `
+      update "Tables"
+      set is_occupied = true, num_covers = $4
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning is_occupied, num_covers
+    `,
+    [tableId, context.res_id, context.outlet_id, Math.max(1, Math.round(num_covers))],
+  );
+
+  const result = updatedRows[0];
+  return {
+    table_id: tableId,
+    is_occupied: result?.is_occupied ?? true,
+    num_covers: result?.num_covers ?? num_covers,
+  };
+}
+
+export async function UpdateTableCovers(
+  restaurantId: string,
+  table_name: string,
+  num_covers: number,
+): Promise<{ table_id: string; num_covers: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+
+  const normalized = table_name.trim();
+  if (!normalized) {
+    throw new Error("Table name is required");
+  }
+
+  if (num_covers < 1) {
+    throw new Error("Number of covers must be at least 1");
+  }
+
+  const rows = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+  );
+
+  if (!rows[0]) {
+    throw new Error("Table not found");
+  }
+
+  const tableId = rows[0].id;
+
+  const updatedRows = await runQuery<{ num_covers: number }>(
+    `
+      update "Tables"
+      set num_covers = $4
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning num_covers
+    `,
+    [tableId, context.res_id, context.outlet_id, Math.max(1, Math.round(num_covers))],
+  );
+
+  const result = updatedRows[0];
+  return {
+    table_id: tableId,
+    num_covers: result?.num_covers ?? num_covers,
+  };
+}
+
+export async function ReleaseTable(
+  restaurantId: string,
+  table_name: string,
+): Promise<{ table_id: string; is_occupied: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+
+  const normalized = table_name.trim();
+  if (!normalized) {
+    throw new Error("Table name is required");
+  }
+
+  const rows = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+  );
+
+  if (!rows[0]) {
+    throw new Error("Table not found");
+  }
+
+  const tableId = rows[0].id;
+
+  const updatedRows = await runQuery<{ is_occupied: boolean }>(
+    `
+      update "Tables"
+      set is_occupied = false, num_covers = 1
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning is_occupied
+    `,
+    [tableId, context.res_id, context.outlet_id],
+  );
+
+  const result = updatedRows[0];
+  return {
+    table_id: tableId,
+    is_occupied: result?.is_occupied ?? false,
+  };
+}
+
+export async function GetTableStatus(
+  restaurantId: string,
+  table_name: string,
+): Promise<{ table_id: string; table_name: string; capacity: number | null; is_occupied: boolean; num_covers: number } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+
+  const normalized = table_name.trim();
+  if (!normalized) {
+    throw new Error("Table name is required");
+  }
+
+  const rows = await runQuery<{
+    id: string;
+    table_name: string;
+    capacity: unknown;
+    is_occupied: boolean;
+    num_covers: number;
+  }>(
+    `
+      select id, table_name, capacity, is_occupied, num_covers
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+  );
+
+  if (!rows[0]) {
+    return null;
+  }
+
+  const row = rows[0];
+  return {
+    table_id: row.id,
+    table_name: row.table_name,
+    capacity: parseNumeric(row.capacity),
+    is_occupied: row.is_occupied ?? false,
+    num_covers: row.num_covers ?? 1,
+  };
+}
+
+export async function GetBillForTable(
+  restaurantId: string,
+  table_name: string,
+): Promise<{ bill_id: string; table_id: string; total_amt: number; order_ids: string[] } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+
+  const normalized = table_name.trim();
+  if (!normalized) {
+    throw new Error("Table name is required");
+  }
+
+  const tableRows = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+  );
+
+  if (!tableRows[0]) {
+    throw new Error("Table not found");
+  }
+
+  const tableId = tableRows[0].id;
+
+  // Get the most recent open bill for this table (not yet closed/paid)
+  const billRows = await runQuery<{
+    id: string;
+    total_amt: number;
+  }>(
+    `
+      select b.id, b.total_amt
+      from "Bills" b
+      where b.table_id = $1 and b.res_id = $2 and b.outlet_id = $3
+        and b.status != 3 and b.closed_at is null
+      order by b.created_at desc
+      limit 1
+    `,
+    [tableId, context.res_id, context.outlet_id],
+  );
+
+  if (!billRows[0]) {
+    return null;
+  }
+
+  const billId = billRows[0].id;
+
+  // Get all orders linked to this bill's table
+  const orderRows = await runQuery<{ id: string }>(
+    `
+      select id
+      from "Orders"
+      where res_id = $1 and outlet_id = $2 and table_id = $3
+      order by created_at asc
+    `,
+    [context.res_id, context.outlet_id, tableId],
+  );
+
+  return {
+    bill_id: billId,
+    table_id: tableId,
+    total_amt: billRows[0].total_amt,
+    order_ids: orderRows.map((row) => row.id),
+  };
+}
+
 export async function AddBooking(
   restaurantId: string,
   customer_id: string,
@@ -2858,14 +3134,15 @@ export async function AddOrder(
   order: Partial<OrderRecord>,
 ): Promise<{ id: string }> {
   const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
   const tableName = String(order.table ?? "").trim();
   if (!tableName) {
     throw new Error("Order table is required");
   }
 
-  const tableRows = await runQuery<{ id: string }>(
+  const tableRows = await runQuery<{ id: string; is_occupied: boolean }>(
     `
-      select id
+      select id, coalesce(is_occupied, false) as is_occupied
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
       limit 1
@@ -2875,6 +3152,10 @@ export async function AddOrder(
   const table = tableRows[0];
   if (!table) {
     throw new Error("Table not found for order");
+  }
+
+  if (!table.is_occupied) {
+    throw new Error("Cannot add order to unoccupied table. Please occupy the table first.");
   }
 
   let customerId: string | null = null;
@@ -3005,6 +3286,21 @@ export async function AddBill(
   );
   const tableId = orderRows[0]?.table_id ?? null;
 
+  const activeBillRows = tableId
+    ? await runQuery<{ id: string; total_amt: number }>(
+      `
+        select id, total_amt
+        from "Bills"
+        where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null
+        order by created_at desc
+        limit 1
+      `,
+      [tableId, context.res_id, context.outlet_id],
+    )
+    : [];
+
+  const activeBill = activeBillRows[0] ?? null;
+
   let empId: string | null = null;
   if (bill.emp_id) {
     const rawEmployeeId = String(bill.emp_id).trim();
@@ -3017,6 +3313,32 @@ export async function AddBill(
   }
   if (!empId) {
     throw new Error("Unable to resolve employee for bill (emp_id)");
+  }
+
+  if (activeBill) {
+    await runQuery(
+      `
+        update "Bills"
+        set total_amt = $1,
+            emp_id = $2,
+            status = $3,
+            reason = $4,
+            tax_breakdown = $5
+        where id = $6 and res_id = $7 and outlet_id = $8
+      `,
+      [
+        round2(Number(activeBill.total_amt ?? 0) + Number(bill.total_amt ?? 0)),
+        empId,
+        bill.status,
+        bill.reason ?? null,
+        bill.tax_breakdown ? JSON.stringify(bill.tax_breakdown) : null,
+        activeBill.id,
+        context.res_id,
+        context.outlet_id,
+      ],
+    );
+
+    return { id: activeBill.id };
   }
 
   await runQuery(
@@ -3124,6 +3446,32 @@ async function updateOrderWorkflowStatus(
   status: OrderRecord["status"],
   client?: PoolClient,
 ): Promise<void> {
+  const orderRows = await runQuery<{ table_id: string | null }>(
+    `
+      select table_id
+      from "Orders"
+      where id = $1 and res_id = $2 and outlet_id = $3
+      limit 1
+    `,
+    [orderId, context.res_id, context.outlet_id],
+    client,
+  );
+
+  const tableId = orderRows[0]?.table_id ?? null;
+  if (tableId) {
+    await runQuery(
+      `
+        update "Orders"
+        set status = $1,
+            food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
+        where table_id = $3 and res_id = $4 and outlet_id = $5
+      `,
+      [toOrderStatusCode(status), status, tableId, context.res_id, context.outlet_id],
+      client,
+    );
+    return;
+  }
+
   await runQuery(
     `
       update "Orders"
@@ -3163,6 +3511,37 @@ export async function ConfirmBillPaymentByWaiter(
       throw new Error("Waiter not found");
     }
 
+    const orderRows = await runQuery<{ table_id: string | null }>(
+      `
+        select table_id
+        from "Orders"
+        where id = $1 and res_id = $2 and outlet_id = $3
+        limit 1
+      `,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+    const tableId = orderRows[0]?.table_id ?? null;
+    if (!tableId) {
+      throw new Error("Order table not found");
+    }
+
+    const billRows = await runQuery<{ id: string }>(
+      `
+        select id
+        from "Bills"
+        where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null
+        order by created_at desc
+        limit 1
+      `,
+      [tableId, context.res_id, context.outlet_id],
+      client,
+    );
+    const billId = billRows[0]?.id;
+    if (!billId) {
+      throw new Error("Bill not found or not eligible for payment confirmation");
+    }
+
     const updated = await runQuery<{ id: string }>(
       `
         update "Bills"
@@ -3176,7 +3555,7 @@ export async function ConfirmBillPaymentByWaiter(
             closed_by_username = null,
             status = 1
         where
-          order_id = $4
+          id = $4
           and res_id = $5
           and outlet_id = $6
           and status <> 3
@@ -3186,7 +3565,7 @@ export async function ConfirmBillPaymentByWaiter(
         paymentMethod,
         paymentProofScreenshotUrl || null,
         waiter.username,
-        orderId,
+        billId,
         context.res_id,
         context.outlet_id,
       ],
@@ -3215,6 +3594,21 @@ export async function ApproveBillPaymentByAdmin(
       throw new Error("Admin not found");
     }
 
+    const orderRows = await runQuery<{ table_id: string | null }>(
+      `
+        select table_id
+        from "Orders"
+        where id = $1 and res_id = $2 and outlet_id = $3
+        limit 1
+      `,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+    const tableId = orderRows[0]?.table_id ?? null;
+    if (!tableId) {
+      throw new Error("Order table not found");
+    }
+
     const billRows = await runQuery<{
       payment_method: string | null;
       payment_proof_screenshot_url: string | null;
@@ -3222,10 +3616,11 @@ export async function ApproveBillPaymentByAdmin(
       `
         select payment_method, payment_proof_screenshot_url
         from "Bills"
-        where order_id = $1 and res_id = $2 and outlet_id = $3
+        where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null
+        order by created_at desc
         limit 1
       `,
-      [orderId, context.res_id, context.outlet_id],
+      [tableId, context.res_id, context.outlet_id],
       client,
     );
     const bill = billRows[0];
@@ -3248,14 +3643,14 @@ export async function ApproveBillPaymentByAdmin(
             admin_approved_by_username = $1,
             status = 2
         where
-          order_id = $2
+          table_id = $2
           and res_id = $3
           and outlet_id = $4
           and waiter_confirmed_at is not null
           and status <> 3
         returning id
       `,
-      [admin.username, orderId, context.res_id, context.outlet_id],
+      [admin.username, tableId, context.res_id, context.outlet_id],
       client,
     );
 
@@ -3275,35 +3670,100 @@ export async function CloseBillByOrder(
 ): Promise<{ success: true }> {
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
+    await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
     const admin = await resolveEmployeeByUsername(context, adminEmployeeId, client);
     if (!admin) {
       throw new Error("Admin not found");
     }
 
+    const orderRows = await runQuery<{ table_id: string | null }>(
+      `
+        select table_id
+        from "Orders"
+        where id = $1 and res_id = $2 and outlet_id = $3
+        limit 1
+      `,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    const tableId = orderRows[0]?.table_id ?? null;
+    if (!tableId) {
+      throw new Error("Bill is not ready to be closed");
+    }
+
+    // Get the active table bill instead of a single order bill
+    const billRows = await runQuery<{ id: string; table_id: string | null }>(
+      `
+        select id, table_id
+        from "Bills"
+        where
+          table_id = $1
+          and res_id = $2
+          and outlet_id = $3
+          and admin_approved_at is not null
+          and status <> 3
+          and closed_at is null
+        order by created_at desc
+        limit 1
+      `,
+      [tableId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    if (!billRows[0]) {
+      throw new Error("Bill is not ready to be closed");
+    }
+
+    const billId = billRows[0].id;
+    const billTableId = billRows[0].table_id;
+
     const updated = await runQuery<{ id: string }>(
       `
         update "Bills"
         set closed_at = now(),
             closed_by_username = $1
-        where
-          order_id = $2
-          and res_id = $3
-          and outlet_id = $4
-          and admin_approved_at is not null
-          and status <> 3
-          and closed_at is null
+        where id = $2
         returning id
       `,
-      [admin.username, orderId, context.res_id, context.outlet_id],
+      [admin.username, billId],
       client,
     );
 
     if (!updated[0]) {
-      throw new Error("Bill is not ready to be closed");
+      throw new Error("Failed to close bill");
     }
 
     await updateOrderWorkflowStatus(context, orderId, "Closed", client);
+
+    // Release the table if it exists
+    if (billTableId) {
+      const tableRows = await runQuery<{ table_name: string }>(
+        `
+          select table_name
+          from "Tables"
+          where id = $1 and res_id = $2 and outlet_id = $3
+          limit 1
+        `,
+        [billTableId, context.res_id, context.outlet_id],
+        client,
+      );
+
+      if (tableRows[0]) {
+        const tableName = tableRows[0].table_name;
+        await runQuery(
+          `
+            update "Tables"
+            set is_occupied = false, num_covers = 1
+            where id = $1 and res_id = $2 and outlet_id = $3
+          `,
+          [billTableId, context.res_id, context.outlet_id],
+          client,
+        );
+      }
+    }
+
     return { success: true };
   });
 }
@@ -3768,6 +4228,7 @@ export async function GetMonthlyApcInsights(
     created_at: Date | string;
     table_id: string;
     table_name: string | null;
+    num_covers: number;
     food: unknown;
     status: unknown;
     bill_status: number | null;
@@ -3780,6 +4241,7 @@ export async function GetMonthlyApcInsights(
         o.created_at,
         o.table_id,
         t.table_name,
+        coalesce(t.num_covers, 1) as num_covers,
         o.food,
         o.status,
         b.status as bill_status,
@@ -3789,7 +4251,8 @@ export async function GetMonthlyApcInsights(
       left join "Tables" t
         on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
       left join "Bills" b
-        on b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
+        on (b.order_id = o.id or (b.table_id = o.table_id and b.closed_at is null))
+        and b.res_id = o.res_id and b.outlet_id = o.outlet_id
       where
         o.res_id = $1 and o.outlet_id = $2
         and o.created_at >= $3 and o.created_at < $4
@@ -3846,8 +4309,12 @@ export async function GetMonthlyApcInsights(
       (payload.people_count as unknown) ?? (payload.number_of_people as unknown),
     );
 
-    let people = payloadPeopleRaw > 0 ? Math.max(1, Math.round(payloadPeopleRaw)) : 1;
-    if (!(payloadPeopleRaw > 0)) {
+    // Prioritize num_covers from table, then payload, then booking lookup
+    let people = Math.max(1, row.num_covers);
+    
+    if (payloadPeopleRaw > 0) {
+      people = Math.max(1, Math.round(payloadPeopleRaw));
+    } else if (!(payloadPeopleRaw > 0)) {
       const candidates = bookingsByTable.get(row.table_id) ?? [];
       let bestScore = Number.POSITIVE_INFINITY;
       let bestPeople = 1;
@@ -3866,8 +4333,8 @@ export async function GetMonthlyApcInsights(
         }
       }
 
-      // Accept nearest same-table booking if within 6 hours; otherwise fallback to 1 cover.
-      people = bestScore <= 6 * 60 * 60 * 1000 ? Math.max(1, bestPeople) : 1;
+      // Accept nearest same-table booking if within 6 hours; otherwise use table num_covers
+      people = bestScore <= 6 * 60 * 60 * 1000 ? Math.max(1, bestPeople) : Math.max(1, row.num_covers);
     }
 
     const payloadStatusRaw = String(payload.status ?? "").trim();
@@ -4203,6 +4670,16 @@ export async function GetRestaurantLogo(restaurantId: string): Promise<string | 
 export async function GetBillByOrder(restaurantId: string, orderId: string) {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBillWorkflowColumns();
+  const orderRows = await runQuery<{ table_id: string | null }>(
+    `
+      select table_id
+      from "Orders"
+      where id = $1 and res_id = $2 and outlet_id = $3
+      limit 1
+    `,
+    [orderId, context.res_id, context.outlet_id],
+  );
+  const tableId = orderRows[0]?.table_id ?? null;
   const rows = await runQuery<{
     id: string;
     status: number;
@@ -4236,10 +4713,14 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
         closed_by_username,
         bill_no
       from "Bills"
-      where order_id = $1 and res_id = $2 and outlet_id = $3
+      where (
+        order_id = $1
+        or table_id = $4
+      ) and res_id = $2 and outlet_id = $3 and closed_at is null
+      order by created_at desc
       limit 1
     `,
-    [orderId, context.res_id, context.outlet_id],
+    [orderId, context.res_id, context.outlet_id, tableId],
   );
   const row = rows[0];
   if (!row) return null;

@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from "express";
-import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, DeleteRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, DeleteMenuCategory, SaveMenuItems, GetOrders, AddOrder, DeleteOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, GetActions, ValidationError, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, CORE_ROLES, getRestaurantIdFromUsername } from "./database_supabase.js";
+import { AddBooking, GetBookingsInRange, AddCustomer, AddEmailToCustomer, AddTable, RemoveTable, OccupyTable, UpdateTableCovers, ReleaseTable, GetTableStatus, GetBillForTable, GetBookingsAfterTime, HasActiveBooking, GetCustomerAndBookings, GetCustomerId, GetTables, UpdateBookingStatus, DeleteBooking, AssignTableToBooking, 
+// AddAuditLogEntryLegacy,
+Audit_log_category, GetEmployeeDetailsFromEmpID, AddAuditLogEntry, GetAuditLogs, GetRestaurantUserRole, EnsureRestaurantSeed, AllocateBestTable, AddFeedbackEntry, GetFeedbackEntries, GetFeedbackSummary, GetRestaurantUsers, AddRestaurantUser, DeleteRestaurantUser, CheckDatabaseHealth, GetInventoryItems, UpsertInventoryItem, DeleteInventoryItem, GetMenuItems, GetMenuCategories, UpsertMenuItem, EnsureMenuCategory, DeleteMenuCategory, SaveMenuItems, GetOrders, AddOrder, DeleteOrder, GetMonthlyApcInsights, GetRestaurantProfile, UpdateRestaurantProfile, GetOutletDefaultTax, GetRestaurantLogo, GetRestaurantLogoRaw, GetBillByOrder, UpdateOutletDefaultTax, AddBill, ReplaceBill, UpdateBillStatusByOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, CloseBillByOrder, GetRoles, GetActions, ValidationError, CreateRole, DeleteRole, AssignRoleToEmployee, RemoveRoleFromEmployee, GetTableAssignments, AssignTableToEmployee, UnassignTableEmployee, GetParkingBays, AddParkingBay, UpdateParkingBay, DeleteParkingBay, SetParkingBayCurrent, GetValetVehicleStates, CreateValetVehicleState, GetValetVehicleState, UpdateValetVehicleState, UpdateValetVehicleBay, GetValetVehicleMetaByBookingIds, UpsertValetVehicleMeta, AuthenticateRestaurantEmployee, CORE_ROLES, getRestaurantIdFromUsername } from "./database_supabase.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, createReceptionSession, createReservationForRequest, getRestaurantKnowledgeSnapshot, } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant, emitOutlet } from "./realtime.js";
 import { createServer } from "http";
@@ -27,12 +29,21 @@ function validateAction(expectedUUID) {
         next();
     };
 }
+async function log_audit(req, action_id, action_description, category, additional_details) {
+    const employeeID = extractEmployeeId(req);
+    if (!employeeID)
+        throw new Error("Cannot log audit entry without employee ID");
+    const emp_dets = await GetEmployeeDetailsFromEmpID(employeeID);
+    if (!emp_dets)
+        throw new Error("Employee details not found for ID");
+    await AddAuditLogEntry(emp_dets.res_id, emp_dets.outlet_id, employeeID, action_id, action_description, category, additional_details);
+}
 function normalizeRole(rawRole) {
     if (typeof rawRole !== "string") {
         return null;
     }
     const lowered = rawRole.trim().toLowerCase();
-    if (lowered === "admin" || lowered === "employee" || lowered === "valet" || lowered === "waiter") {
+    if (lowered === "admin" || lowered === "employee" || lowered === "valet" || lowered === "waiter" || lowered === "cashier" || lowered === "captain" || lowered === "manager") {
         return lowered;
     }
     return null;
@@ -163,7 +174,7 @@ async function resolveRoleForRequest(req, restaurantId) {
     const headerRole = (Array.isArray(req.headers['x-user-role']) ? req.headers['x-user-role'][0] : req.headers['x-user-role']);
     if (typeof headerRole === 'string' && headerRole.trim()) {
         const lowered = headerRole.trim().toLowerCase();
-        if (lowered === 'admin' || lowered === 'employee' || lowered === 'valet' || lowered === 'waiter') {
+        if (lowered === 'admin' || lowered === 'employee' || lowered === 'valet' || lowered === 'waiter' || lowered === 'cashier' || lowered === 'captain' || lowered === 'manager') {
             return lowered;
         }
     }
@@ -259,6 +270,7 @@ app.use(express.json({ limit: "8mb" }));
 app.use(express.urlencoded({ extended: true, limit: "8mb" }));
 app.get('/core-roles', validateAction("17ba6407-b703-4403-ab59-13235966053f"), async (req, res) => {
     try {
+        await log_audit(req, "17ba6407-b703-4403-ab59-13235966053f", "Fetched core roles", Audit_log_category.Roles);
         const rows = Object.keys(CORE_ROLES).map((role) => ({ role, actions: CORE_ROLES[role] }));
         res.json(rows);
     }
@@ -516,6 +528,12 @@ app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd")
         return;
     }
     let cust_id = await GetCustomerIdOrCreateCustomer(restaurantId, customer.name, customer.number, customer.email);
+    try {
+        await log_audit(req, "daf1d71f-2b37-4cd1-b951-28fece7719cd", `Created or linked customer ${customer.name}`, Audit_log_category.Customer, { customer_id: cust_id });
+    }
+    catch (err) {
+        console.warn('log_audit add-customer failed', err);
+    }
     res.send(cust_id);
 });
 /*
@@ -558,6 +576,12 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
     catch (err) {
         console.warn("emit table:added failed", err);
     }
+    try {
+        await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Added table ${table_name}`, Audit_log_category.Tables, { capacity: table.capacity });
+    }
+    catch (err) {
+        console.warn('log_audit add-table failed', err);
+    }
     res.send(table_name);
 });
 app.delete("/table/:name", validateAction("5777c4aa-29df-4ea1-9c45-c1038d25f746"), async (req, res) => {
@@ -583,7 +607,149 @@ app.delete("/table/:name", validateAction("5777c4aa-29df-4ea1-9c45-c1038d25f746"
     catch (err) {
         console.warn("emit table:deleted failed", err);
     }
+    try {
+        await log_audit(req, "5777c4aa-29df-4ea1-9c45-c1038d25f746", `Removed table ${tableName}`, Audit_log_category.Tables, { table_name: tableName });
+    }
+    catch (err) {
+        console.warn('log_audit delete-table failed', err);
+    }
     res.status(204).send();
+});
+// Occupy a table (mark as occupied and set number of covers)
+app.post("/occupy-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
+    const numCovers = typeof body?.num_covers === 'number' ? body.num_covers : 1;
+    if (!tableName) {
+        res.status(400).json({ error: "table_name is required" });
+        return;
+    }
+    try {
+        const result = await OccupyTable(restaurantId, tableName, numCovers);
+        try {
+            await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Occupied table ${tableName} with ${numCovers} covers`, Audit_log_category.Tables, { table_name: tableName, num_covers: numCovers });
+        }
+        catch (err) {
+            console.warn('log_audit occupy-table failed', err);
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error("occupy_table_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to occupy table") });
+    }
+});
+// Update number of covers at a table
+app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
+    const numCovers = typeof body?.num_covers === 'number' ? body.num_covers : 1;
+    if (!tableName) {
+        res.status(400).json({ error: "table_name is required" });
+        return;
+    }
+    try {
+        const result = await UpdateTableCovers(restaurantId, tableName, numCovers);
+        try {
+            await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Updated table ${tableName} covers to ${numCovers}`, Audit_log_category.Tables, { table_name: tableName, num_covers: numCovers });
+        }
+        catch (err) {
+            console.warn('log_audit table-covers failed', err);
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error("table_covers_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to update table covers") });
+    }
+});
+// Release/unoccupy a table
+app.post("/release-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const body = req.body;
+    const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
+    if (!tableName) {
+        res.status(400).json({ error: "table_name is required" });
+        return;
+    }
+    try {
+        const result = await ReleaseTable(restaurantId, tableName);
+        try {
+            await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Released table ${tableName}`, Audit_log_category.Tables, { table_name: tableName });
+        }
+        catch (err) {
+            console.warn('log_audit release-table failed', err);
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error("release_table_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to release table") });
+    }
+});
+// Get table status
+app.get("/table-status", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const tableName = typeof req.query.table_name === 'string' ? req.query.table_name.trim() : '';
+    if (!tableName) {
+        res.status(400).json({ error: "table_name query parameter is required" });
+        return;
+    }
+    try {
+        const result = await GetTableStatus(restaurantId, tableName);
+        if (!result) {
+            res.status(404).json({ error: "Table not found" });
+            return;
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error("get_table_status_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to get table status") });
+    }
+});
+// Get bill for a table (returns the current open bill and all associated orders)
+app.get("/bill-for-table", validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req, res) => {
+    const restaurantId = extractRestaurantId(req);
+    if (!restaurantId) {
+        res.status(400).json({ error: "Missing restaurantId" });
+        return;
+    }
+    const tableName = typeof req.query.table_name === 'string' ? req.query.table_name.trim() : '';
+    if (!tableName) {
+        res.status(400).json({ error: "table_name query parameter is required" });
+        return;
+    }
+    try {
+        const result = await GetBillForTable(restaurantId, tableName);
+        if (!result) {
+            res.status(404).json({ error: "No open bill found for this table" });
+            return;
+        }
+        res.json(result);
+    }
+    catch (error) {
+        console.error("get_bill_for_table_failed", error);
+        res.status(400).json({ error: String(error?.message ?? "Unable to get bill for table") });
+    }
 });
 /*
 Needs request body as
@@ -605,7 +771,7 @@ Needs request body as
 }
 returns the booking id
 */
-app.post("/add-booking", validate, async (req, res) => {
+app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"), async (req, res) => {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
         res.status(400).json({ error: "Missing restaurantId" });
@@ -676,6 +842,12 @@ app.post("/add-booking", validate, async (req, res) => {
     }
     catch (err) {
         console.warn("emit booking:created failed", err);
+    }
+    try {
+        await log_audit(req, "3ec33182-ceb4-4d07-ac7e-84214adcf104", `Created booking for customer ${customer.name} at ${booking_request.date}`, Audit_log_category.Bookings, { booking_id, table_name: tableName });
+    }
+    catch (err) {
+        console.warn('log_audit add-booking failed', err);
     }
     res.json({ booking_id, table_name: tableName });
 });
@@ -748,6 +920,12 @@ app.get("/get-tables", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), a
     const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
     try {
         const tables = await GetTables(restaurantId, requestedTime);
+        try {
+            await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Fetched tables`, Audit_log_category.Tables);
+        }
+        catch (err) {
+            console.warn('log_audit get-tables failed', err);
+        }
         res.send(tables ?? []);
     }
     catch (e) {
@@ -842,6 +1020,12 @@ app.get("/valet-info", validateAction("9e37297d-408b-446d-a51b-7892ad216b7d"), a
                 number_plate: meta?.number_plate ?? undefined,
             };
         });
+        try {
+            await log_audit(req, "9e37297d-408b-446d-a51b-7892ad216b7d", `Viewed valet info`, Audit_log_category.Valet, { outletId: auth.outletId });
+        }
+        catch (err) {
+            console.warn('log_audit valet-info failed', err);
+        }
         res.json({
             role: auth.role,
             generated_at: new Date().toISOString(),
@@ -855,7 +1039,7 @@ app.get("/valet-info", validateAction("9e37297d-408b-446d-a51b-7892ad216b7d"), a
     }
 });
 // (debug endpoint removed)
-app.patch("/booking/:id/status", validate, async (req, res) => {
+app.patch("/booking/:id/status", validateAction("fdeecab6-7c3a-4239-b87c-99a96f50c551"), async (req, res) => {
     const auth = await enforceRoles(req, res, ["admin", "valet"]);
     if (!auth) {
         return;
@@ -878,6 +1062,12 @@ app.patch("/booking/:id/status", validate, async (req, res) => {
     catch (err) {
         console.warn("emit booking:status_updated failed", err);
     }
+    try {
+        await log_audit(req, "fdeecab6-7c3a-4239-b87c-99a96f50c551", `Updated booking status to ${status} for booking ${bookingId}`, Audit_log_category.Bookings, { booking_id: bookingId, status });
+    }
+    catch (err) {
+        console.warn("log_audit booking-status-update failed", err);
+    }
     res.json({ success: true });
 });
 app.post("/bills", validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f"), async (req, res) => {
@@ -899,6 +1089,12 @@ app.post("/bills", validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f"), async
     }
     try {
         const result = await AddBill(restaurantId, { order_id, total_amt, emp_id, status, reason, tax_breakdown });
+        try {
+            await log_audit(req, "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", `Created bill for order ${order_id}`, Audit_log_category.Bill, { order_id });
+        }
+        catch (err) {
+            console.warn('log_audit add-bill failed', err);
+        }
         res.status(201).json(result);
     }
     catch (error) {
@@ -915,19 +1111,33 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
     const reason = typeof body.reason === 'string' ? body.reason.trim() : null;
     const new_order = body.new_order ?? null;
     const new_bill = body.new_bill ?? null;
-    if (!old_order_id || !new_order || !new_bill) {
-        return res.status(400).json({ error: 'Missing required fields: old_order_id, new_order, new_bill' });
+    if (!old_order_id) {
+        return res.status(400).json({ error: 'Missing required field: old_order_id' });
+    }
+    if (!new_order && !new_bill) {
+        return res.status(400).json({ error: 'At least one of new_order or new_bill is required' });
     }
     try {
         const result = await ReplaceBill(restaurantId, { old_order_id, reason, new_order, new_bill });
         if (!result)
             return res.status(500).json({ error: 'Replace operation failed' });
-        // emit realtime events for UI updates
+        // emit realtime events for UI updates — use order:updated for in-place changes
         try {
-            emitRestaurant(restaurantId, 'order:replaced', { old_order_id, new_order_id: result.newOrderId, new_bill_id: result.newBillId });
+            const payloadForEmit = {
+                order_id: old_order_id,
+                bill_id: result.newBillId,
+                new_order_id: result.newOrderId,
+            };
+            emitRestaurant(restaurantId, 'order:updated', payloadForEmit);
         }
         catch (e) { }
-        return res.status(201).json(result);
+        try {
+            await log_audit(req, "383cc261-7e5c-4745-b16f-06a41e2ae047", `Replaced bill for order ${old_order_id}`, Audit_log_category.Bill, { old_order_id, newBillId: result.newBillId });
+        }
+        catch (err) {
+            console.warn('log_audit replace-bill failed', err);
+        }
+        return res.status(200).json(result);
     }
     catch (err) {
         console.error('replace_bill_failed', err);
@@ -945,6 +1155,12 @@ app.get('/bills/order/:orderId', validateAction("98b10bde-802d-4a5b-a726-53a8264
         const bill = await GetBillByOrder(restaurantId, orderId);
         if (!bill)
             return res.status(404).json({ error: 'Bill not found' });
+        try {
+            await log_audit(req, "98b10bde-802d-4a5b-a726-53a826424f79", `Viewed bill for order ${orderId}`, Audit_log_category.Bill, { bill_id: bill.id ?? null, order_id: orderId });
+        }
+        catch (err) {
+            console.warn('log_audit get-bill-by-order failed', err);
+        }
         return res.json(bill);
     }
     catch (err) {
@@ -1037,6 +1253,12 @@ app.patch('/bills/order/:orderId/status', validateAction("07e364cc-f40d-46f3-b69
     }
     try {
         await UpdateBillStatusByOrder(restaurantId, orderId, status);
+        try {
+            await log_audit(req, "07e364cc-f40d-46f3-b691-0f719dd38e0f", `Updated bill status for order ${orderId} to ${status}`, Audit_log_category.Bill, { order_id: orderId, status });
+        }
+        catch (err) {
+            console.warn('log_audit update-bill-status failed', err);
+        }
         res.json({ success: true });
     }
     catch (error) {
@@ -1071,6 +1293,12 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
         catch {
             // ignore realtime failures
         }
+        try {
+            await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", `Waiter confirmed payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, waiter: waiterEmployeeId, payment_method: result.payment_method });
+        }
+        catch (err) {
+            console.warn('log_audit waiter-confirm-payment failed', err);
+        }
         res.json(result);
     }
     catch (error) {
@@ -1100,6 +1328,12 @@ app.post('/bills/order/:orderId/admin-approve-payment', validateAction("fc57d407
         catch {
             // ignore realtime failures
         }
+        try {
+            await log_audit(req, "fc57d407-4bba-442c-97a2-9e6f3c57f288", `Admin approved payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, admin: adminEmployeeId });
+        }
+        catch (err) {
+            console.warn('log_audit admin-approve-payment failed', err);
+        }
         res.json(result);
     }
     catch (error) {
@@ -1128,6 +1362,12 @@ app.post('/bills/order/:orderId/close', validateAction("a953d044-31ba-4e31-b96f-
         }
         catch {
             // ignore realtime failures
+        }
+        try {
+            await log_audit(req, "a953d044-31ba-4e31-b96f-99304fe43dfa", `Closed bill for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, admin: adminEmployeeId });
+        }
+        catch (err) {
+            console.warn('log_audit close-bill failed', err);
         }
         res.json(result);
     }
@@ -1162,6 +1402,12 @@ app.patch("/booking/:id/table", validateAction("c7699d46-0e2f-4448-b325-8ca490a5
         res.status(400).json({ error: "Unable to assign table" });
         return;
     }
+    try {
+        await log_audit(req, "c7699d46-0e2f-4448-b325-8ca490a5296b", `Assigned table ${tableName ?? 'null'} to booking ${bookingId}`, Audit_log_category.Bookings, { booking_id: bookingId, table_name: tableName });
+    }
+    catch (err) {
+        console.warn('log_audit assign-table-to-booking failed', err);
+    }
     res.json({ success: true });
 });
 app.delete("/booking/:id", validateAction("1f176202-d5e7-4bb0-802c-275a42425394"), async (req, res) => {
@@ -1186,6 +1432,12 @@ app.delete("/booking/:id", validateAction("1f176202-d5e7-4bb0-802c-275a42425394"
     }
     catch (err) {
         console.warn("emit booking:deleted failed", err);
+    }
+    try {
+        await log_audit(req, "1f176202-d5e7-4bb0-802c-275a42425394", `Canceled booking ${bookingId}`, Audit_log_category.Bookings, { booking_id: bookingId });
+    }
+    catch (err) {
+        console.warn('log_audit delete-booking failed', err);
     }
     res.status(204).send();
 });
@@ -1218,6 +1470,12 @@ app.get("/get-customers", validateAction("3c530903-324c-4bbe-802b-849763518920")
         ...customer,
         has_booking: await HasActiveBooking(restaurantId, customer.customer_id),
     })));
+    try {
+        await log_audit(req, "3c530903-324c-4bbe-802b-849763518920", `Fetched customers list`, Audit_log_category.Customer);
+    }
+    catch (err) {
+        console.warn('log_audit get-customers failed', err);
+    }
     res.send(customersWithStatus);
 });
 /*
@@ -1252,6 +1510,12 @@ app.get("/get-withen-range", validateAction("0a98cf2b-8b42-47a7-a523-b7bb73cb870
     if (count == null) {
         res.status(400).send({ Error: "Oops something went wrong" });
     }
+    try {
+        await log_audit(req, "0a98cf2b-8b42-47a7-a523-b7bb73cb870e", `Fetched bookings count in range`, Audit_log_category.Bookings, { start: start.toISOString(), end: end.toISOString(), count });
+    }
+    catch (err) {
+        console.warn('log_audit get-withen-range failed', err);
+    }
     res.send(count);
 });
 app.get("/audit-logs", validateAction("91b24293-7b88-4fe4-8cf5-deb6faaba4f5"), async (req, res) => {
@@ -1264,43 +1528,53 @@ app.get("/audit-logs", validateAction("91b24293-7b88-4fe4-8cf5-deb6faaba4f5"), a
     const limit = limitParam ? Number.parseInt(String(limitParam), 10) : 100;
     try {
         const logs = await GetAuditLogs(restaurantId, Number.isFinite(limit) ? limit : 100);
+        // try {
+        // 	await log_audit(req, "91b24293-7b88-4fe4-8cf5-deb6faaba4f5", `Fetched audit logs`, Audit_log_category.General, { limit });
+        // } catch (err) {
+        // 	console.warn('log_audit get-audit-logs failed', err);
+        // }
         res.json(logs);
     }
     catch (error) {
         res.status(500).json({ error: "Unable to fetch audit logs" });
     }
 });
-app.post("/audit-logs", validateAction("722e1023-99f8-4905-ab51-97404694eab6"), async (req, res) => {
-    const restaurantId = extractRestaurantId(req);
-    if (!restaurantId) {
-        res.status(400).json({ error: "Missing restaurantId" });
-        return;
-    }
-    const body = (req.body ?? {});
-    const employeeFromHeader = extractEmployeeId(req)?.trim() ?? "";
-    const employeeFromBody = typeof body.employee === "string" ? body.employee.trim() : "";
-    const employeeIdFromBody = typeof body.employee_id === "string" ? body.employee_id.trim() : "";
-    const employee = employeeFromHeader || employeeIdFromBody || employeeFromBody;
-    const action = typeof body.action === "string" ? body.action.trim() : "";
-    const details = typeof body.details === "string" ? body.details.trim() : "";
-    if (!employee || !action) {
-        res.status(400).json({ error: "Missing employee or action" });
-        return;
-    }
-    try {
-        await AddAuditLogEntry(restaurantId, {
-            employee,
-            employeeId: employeeFromHeader || employeeIdFromBody || null,
-            action,
-            details: details || null,
-        });
-        res.status(201).json({ success: true });
-    }
-    catch (error) {
-        console.error("add_audit_log_failed", error);
-        res.status(500).json({ error: "Unable to record audit log" });
-    }
-});
+// app.post("/audit-logs", validateAction("722e1023-99f8-4905-ab51-97404694eab6"), async (req: Request, res: Response) => {
+// 	const restaurantId = extractRestaurantId(req);
+// 	if (!restaurantId) {
+// 		res.status(400).json({ error: "Missing restaurantId" });
+// 		return;
+// 	}
+// 	const body = (req.body ?? {}) as Record<string, unknown>;
+// 	const employeeFromHeader = extractEmployeeId(req)?.trim() ?? "";
+// 	const employeeFromBody = typeof body.employee === "string" ? body.employee.trim() : "";
+// 	const employeeIdFromBody = typeof body.employee_id === "string" ? body.employee_id.trim() : "";
+// 	const employee = employeeFromHeader || employeeIdFromBody || employeeFromBody;
+// 	const action = typeof body.action === "string" ? body.action.trim() : "";
+// 	const details = typeof body.details === "string" ? body.details.trim() : "";
+// 	if (!employee || !action) {
+// 		res.status(400).json({ error: "Missing employee or action" });
+// 		return;
+// 	}
+// 	try {
+// 		await AddAuditLogEntryLegacy(restaurantId, {
+// 			employee,
+// 			employeeId: employeeFromHeader || employeeIdFromBody || null,
+// 			action,
+// 			details: details || null,
+// 			category: Audit_log_category.General
+// 		});
+// 		try {
+// 			await log_audit(req, "722e1023-99f8-4905-ab51-97404694eab6", `Recorded audit-log entry ${action}`, Audit_log_category.General, { employee });
+// 		} catch (err) {
+// 			console.warn('log_audit post-audit-logs failed', err);
+// 		}
+// 		res.status(201).json({ success: true });
+// 	} catch (error) {
+// 		console.error("add_audit_log_failed", error);
+// 		res.status(500).json({ error: "Unable to record audit log" });
+// 	}
+// });
 app.get("/inventory", validateAction("77e41c84-ebf4-4542-a75b-c9e72e03b570"), async (req, res) => {
     const restaurantId = extractRestaurantId(req);
     if (!restaurantId) {
@@ -1309,6 +1583,12 @@ app.get("/inventory", validateAction("77e41c84-ebf4-4542-a75b-c9e72e03b570"), as
     }
     try {
         const items = await GetInventoryItems(restaurantId);
+        try {
+            await log_audit(req, "77e41c84-ebf4-4542-a75b-c9e72e03b570", `Fetched inventory items`, Audit_log_category.Inventory, { count: Array.isArray(items) ? items.length : undefined });
+        }
+        catch (err) {
+            console.warn('log_audit get-inventory failed', err);
+        }
         res.json(items);
     }
     catch (error) {
@@ -1337,6 +1617,7 @@ app.post("/inventory", validateAction("dfe2cde8-c159-4685-b015-ec7b0d4386eb"), a
             stock,
             unit: typeof body.unit === "string" ? body.unit : undefined,
         });
+        await log_audit(req, "dfe2cde8-c159-4685-b015-ec7b0d4386eb", `Upserted inventory item ${name} with stock ${stock}`, Audit_log_category.Inventory);
         res.status(201).json(result);
     }
     catch (error) {
@@ -2473,7 +2754,7 @@ app.post("/feedback/submit", validate, async (req, res) => {
             return;
         }
         const role = (matched.role ?? "").toString().trim().toLowerCase();
-        const allowedRoles = new Set(["admin", "employee", "valet", "waiter"]);
+        const allowedRoles = new Set(["admin", "employee", "valet", "waiter", "cashier", "captain", "manager"]);
         if (!allowedRoles.has(role)) {
             res.status(403).json({ error: "Employee role not allowed", actualRole: matched.role ?? null });
             return;
