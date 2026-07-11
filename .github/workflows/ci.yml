@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: restaurant
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/restaurant
+      SUPABASE_DIRECT_URL: postgres://postgres:postgres@localhost:5432/restaurant
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/restaurant
+      REDIS_URL: redis://localhost:6379
+      QR_SIGNING_SECRET: ci-test-secret
+      ALLOW_DEV_QR_SECRET: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run build
+
+      - name: Unit tests
+        run: npx jest --runInBand --passWithNoTests
+
+      # Migration chain + tenant-isolation regression. `000_base_schema.sql` now
+      # bootstraps the base tables on the ephemeral Postgres, so the full chain
+      # (000 → roles → fail-closed RLS → platform/billing) must apply cleanly —
+      # this is the blocking gate against a broken migration reaching deploy.
+      # (test:isolation needs a live backend + two seeded tenants via TEST_A/B_*
+      # env; absent those it skips, so here it asserts the migrations apply.)
+      - name: Migrations + tenant isolation
+        run: |
+          npm run migrate
+          npm run test:isolation
+
+      # End-to-end money/flow tests against the real ephemeral Postgres (seeds a
+      # throwaway restaurant; the test refuses any non-local DB). Covers the atomic
+      # waitlist seat (transaction + double-seat/occupied-table guards).
+      - name: Integration tests (real Postgres)
+        run: npm run test:integration

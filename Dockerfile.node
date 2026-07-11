@@ -1,10 +1,15 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
 # Stage 1: Build
-# Switched to Node 22 (Latest LTS) so packages like Sharp can use pre-built binaries
-FROM node:25-bookworm-slim AS builder
+# Pinned to Node 22 (current LTS, "Jod") on Debian Bookworm slim so native
+# packages like Sharp can use pre-built binaries against a stable glibc.
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS builder
 WORKDIR /app
 
-# Install build tools and libvips for Sharp
-RUN apt-get update && apt-get install -y \
+# Install build tools and libvips for Sharp (native image processing)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3 \
     make \
@@ -12,38 +17,73 @@ RUN apt-get update && apt-get install -y \
     libvips-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy package files first for caching
-# The asterisk means package-lock.json is optional
+# Copy package files first for layer caching.
+# The asterisk means package-lock.json is optional.
 COPY package.json package-lock.json* tsconfig.build.json tsconfig.json ./
 
-# Install ALL dependencies using npm install (fallback-safe if lockfile is missing)
+# Install ALL dependencies (incl. devDependencies needed for the build).
+# npm install is fallback-safe when the lockfile is absent.
 RUN npm install
 
-# Copy source and build the TypeScript code
+# Copy source and build the TypeScript code (tsc -> build/index.js)
 COPY . .
 RUN npm run build
 
-# CRITICAL FIX: Use npm prune to remove devDependencies instead of npm ci
-# This reads the package.json and removes anything not needed for production,
-# leaving only production packages in the node_modules folder.
+# Remove devDependencies, leaving only production packages in node_modules.
 RUN npm prune --omit=dev
 
+# ---------------------------------------------------------------------------
 # Stage 2: Runtime
-FROM node:25-bookworm-slim
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm-slim
 WORKDIR /app
 
-# Install only the runtime libraries needed for Sharp (libvips instead of libvips-dev)
-RUN apt-get update && apt-get install -y libvips && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production
 
-# Copy package.json (in case your app needs to read its own version/name)
-COPY package.json ./
+# Runtime libs: libvips for Sharp, curl for the container HEALTHCHECK.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvips \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the pruned production node_modules from the builder stage
-COPY --from=builder /app/node_modules ./node_modules
+# "npm run migrate" executes scripts/migrate.ts via tsx at deploy time. tsx is a
+# devDependency and is stripped from node_modules by "npm prune --omit=dev", so
+# install it globally (pinned to match package.json) for the migration step.
+RUN npm install -g tsx@4.19.2
 
-# Copy the compiled TypeScript code from the builder stage
-COPY --from=builder /app/build ./build
+# package.json (lets the app read its own version, and provides the npm scripts).
+COPY --chown=node:node package.json package-lock.json* tsconfig.json ./
 
-# Railway assigns ports dynamically, ensure your Node code listens to `process.env.PORT`
+# Pruned production node_modules from the builder stage.
+COPY --chown=node:node --from=builder /app/node_modules ./node_modules
+
+# Compiled JS output (build/index.js).
+COPY --chown=node:node --from=builder /app/build ./build
+
+# Migration runner source + SQL files. migrate.ts resolves ../migrations
+# relative to scripts/, so both directories must be present at runtime and
+# must sit next to each other (scripts/ and migrations/ under /app).
+COPY --chown=node:node --from=builder /app/scripts ./scripts
+COPY --chown=node:node --from=builder /app/migrations ./migrations
+
+# Drop privileges: the official node image ships a non-root "node" user (uid 1000).
+USER node
+
+# Railway assigns the port dynamically; the Node code listens on process.env.PORT
+# (default 3001). Keep EXPOSE in sync with that default.
 EXPOSE 3001
+
+# Healthcheck hits the app's /health endpoint, which returns 503 when the DB is
+# unreachable so the orchestrator stops routing traffic to a broken instance.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-3001}/health" || exit 1
+
+# Start the server directly so `node` is PID 1 and receives SIGTERM from the
+# orchestrator, driving the app graceful-shutdown handler (npm would swallow it).
+# Run migrations as a RELEASE/pre-deploy step (`npm run migrate`, once per deploy
+# as the OWNER) rather than per-replica here. Single-box: use `npm run start:prod`.
+#
+# Alternatively on Railway, set a release/pre-deploy command of
+# "npm run migrate" and keep the start command as "npm start"; either path
+# guarantees migrations land before the server accepts requests.
 CMD ["node", "build/index.js"]

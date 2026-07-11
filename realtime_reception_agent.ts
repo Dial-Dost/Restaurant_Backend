@@ -72,24 +72,74 @@ type RestaurantKnowledge = {
   infoContext: string;
   openingTime: string;
   closingTime: string;
+  timezone: string;
 };
+
+// Validate an IANA zone id; fall back to Asia/Kolkata for empty/invalid input.
+function sanitizeTimezone(raw: unknown): string {
+  const tz = typeof raw === "string" ? raw.trim() : "";
+  if (!tz) return "Asia/Kolkata";
+  try {
+    new Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return tz;
+  } catch {
+    return "Asia/Kolkata";
+  }
+}
+
+// Interpret Y-M-D h:mi as wall-clock time in `tz` and return the UTC instant
+// (library-free, DST-safe). Mirrors zonedWallToUtc in database_supabase.ts.
+function zonedWallToUtc(Y: number, M: number, D: number, h: number, mi: number, tz: string): Date {
+  const utc = Date.UTC(Y, M - 1, D, h, mi);
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const p = new Map<string, string>(dtf.formatToParts(new Date(utc)).map((x) => [x.type, x.value]));
+  const g = (t: string) => Number(p.get(t) ?? 0);
+  const asUTC = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), g("second"));
+  const off = asUTC - utc;
+  return new Date(utc - off);
+}
+
+// Wall-clock minutes-from-midnight of an instant AS SEEN in `tz` (so the
+// operating-hours check stays correct on a non-local server).
+function wallMinutesInZone(date: Date, tz: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hourCycle: "h23",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(date);
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+  return get("hour") * 60 + get("minute");
+}
 
 const fallbackRestaurantKnowledge: RestaurantKnowledge = {
   infoEntries: [],
   infoContext: "Restaurant knowledge file is unavailable.",
   openingTime: "12:00 PM",
   closingTime: "11:00 PM",
+  timezone: "Asia/Kolkata",
 };
 
 function loadRestaurantKnowledge(): RestaurantKnowledge {
   const openingTime = process.env.RECEPTION_OPENING_TIME?.trim() || fallbackRestaurantKnowledge.openingTime;
   const closingTime = process.env.RECEPTION_CLOSING_TIME?.trim() || fallbackRestaurantKnowledge.closingTime;
+  const timezone = sanitizeTimezone(process.env.RECEPTION_TIMEZONE);
 
   return {
     infoEntries: [],
     infoContext: "",
     openingTime,
     closingTime,
+    timezone,
   };
 }
 
@@ -101,6 +151,7 @@ export function getRestaurantKnowledgeSnapshot(): RestaurantKnowledge {
     infoContext: restaurantKnowledge.infoContext,
     openingTime: restaurantKnowledge.openingTime,
     closingTime: restaurantKnowledge.closingTime,
+    timezone: restaurantKnowledge.timezone,
   };
 }
 
@@ -158,14 +209,19 @@ function parseTimeString(value: string): string {
     .padStart(2, "0")}`;
 }
 
-function toReservationDateTime(dateIso: string, timeValue: string): Date {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso.trim())) {
+function toReservationDateTime(dateIso: string, timeValue: string, tz: string): Date {
+  const trimmed = dateIso.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
     throw new Error(
       `Reservation date must be provided as YYYY-MM-DD. Received: ${dateIso}`,
     );
   }
-  const time24 = parseTimeString(timeValue);
-  const combined = new Date(`${dateIso}T${time24}:00`);
+  const time24 = parseTimeString(timeValue); // "HH:MM" (24-hour)
+  // The guest states a wall-clock date+time; interpret it in the restaurant's
+  // timezone so the stored instant is correct regardless of the server's zone.
+  const [Y, M, D] = trimmed.split("-").map(Number);
+  const [hh, mi] = time24.split(":").map(Number);
+  const combined = zonedWallToUtc(Y as number, M as number, D as number, hh as number, mi as number, sanitizeTimezone(tz));
   if (Number.isNaN(combined.getTime())) {
     throw new Error(`Unable to interpret reservation slot ${dateIso} ${timeValue}`);
   }
@@ -207,7 +263,7 @@ class ReservationService {
     if (this.openingMinutes === null || this.closingMinutes === null) {
       return true;
     }
-    const minutes = slot.getHours() * 60 + slot.getMinutes();
+    const minutes = wallMinutesInZone(slot, this.info.timezone);
     if (this.closingMinutes < this.openingMinutes) {
       return minutes >= this.openingMinutes || minutes < this.closingMinutes;
     }
@@ -218,7 +274,7 @@ class ReservationService {
     request: Pick<ReservationPayload, "partySize" | "reservationDate" | "reservationTime">,
   ): Promise<AvailabilityResult> {
     try {
-      const slot = toReservationDateTime(request.reservationDate, request.reservationTime);
+      const slot = toReservationDateTime(request.reservationDate, request.reservationTime, this.info.timezone);
       if (!this.isWithinOperatingHours(slot)) {
         return {
           status: "validation",
@@ -371,7 +427,7 @@ class ReservationService {
 
   async createReservation(payload: ReservationPayload): Promise<ReservationResult> {
     try {
-      const slot = toReservationDateTime(payload.reservationDate, payload.reservationTime);
+      const slot = toReservationDateTime(payload.reservationDate, payload.reservationTime, this.info.timezone);
       if (!this.isWithinOperatingHours(slot)) {
         return {
           status: "failed",

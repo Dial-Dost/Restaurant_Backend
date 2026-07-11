@@ -58,6 +58,15 @@ public partial class MainPage : ContentPage
 
 	private readonly HttpClient _http = new HttpClient();
 	private SocketIO? _socket;
+	// Session token from /auth/employee-login. The backend authenticates the
+	// realtime socket from this token (it derives the tenant from the session and
+	// ignores a client-supplied restaurantId), so without it the socket joins no
+	// rooms and never receives bill:print events.
+	private string? _token;
+	// Keeps the Redis session warm. The agent stays connected and makes no other
+	// authenticated HTTP calls, so without a periodic touch the 12h sliding session
+	// expires and a later socket reconnect silently joins no rooms (never prints).
+	private CancellationTokenSource? _keepAliveCts;
 	private readonly ConcurrentQueue<PrintJob> _queue = new ConcurrentQueue<PrintJob>();
 	private readonly ObservableCollection<PrintJob> _pendingList = new ObservableCollection<PrintJob>();
 	private readonly ObservableCollection<string> _logs = new ObservableCollection<string>();
@@ -211,12 +220,28 @@ public partial class MainPage : ContentPage
 			var emp_id = doc.GetProperty("employeeId").GetString();
 			var res_name = doc.GetProperty("restaurantName").GetString();
 			var res_username = doc.GetProperty("employeeUsername").GetString();
+			// The session token authenticates the realtime socket below.
+			var token = doc.TryGetProperty("token", out var tk) ? tk.GetString() : null;
+			_token = token;
+
+			// Without a token the realtime socket can't authenticate (the backend
+			// joins no rooms and never delivers bill:print), so fail loudly here
+			// instead of silently appearing connected but never printing.
+			if (string.IsNullOrEmpty(token))
+			{
+				EmployeeStatus.Text = "Login failed (no session token)";
+				EmployeeStatus.TextColor = Colors.Red;
+				Log("Login response had no token; cannot connect to realtime / printing will not work.");
+				await ShowToastAsync("Login failed (no token)");
+				return;
+			}
 
 			Preferences.Default.Set("res_id", res_id ?? "");
 			Preferences.Default.Set("outlet_id", outlet_id ?? "");
 			Preferences.Default.Set("emp_id", emp_id ?? "");
 			Preferences.Default.Set("res_name", res_name ?? "");
 			Preferences.Default.Set("res_username", res_username ?? "");
+			Preferences.Default.Set("token", token ?? "");
 
 			EmployeeStatus.Text = $"Signed in: {res_username}";
 			EmployeeStatus.TextColor = Colors.Green;
@@ -225,6 +250,7 @@ public partial class MainPage : ContentPage
 
 			Log($"Connecting realtime for restaurant {res_id} outlet {outlet_id}");
 			await ConnectSocketAndSubscribe(res_id ?? string.Empty, outlet_id ?? string.Empty);
+			StartSessionKeepAlive();
 			ShowScene(Scene.Printer);
 		}
 		catch (Exception ex)
@@ -240,8 +266,11 @@ public partial class MainPage : ContentPage
 		{
 
 			// Create socket using server base address (Uri).
-			// Provide auth with restaurant GUID so server-side handshake joins the correct restaurant:<resId> room.
-			_socket = new SocketIO(_http.BaseAddress!, new SocketIOOptions { Auth = new { restaurantId = resId } });
+			// The backend authenticates the handshake from the session TOKEN (it
+			// derives the tenant from the session and ignores a client-supplied
+			// restaurantId). Without the token the server joins no rooms and the
+			// printer never receives bill:print. restaurantId is kept for logging.
+			_socket = new SocketIO(_http.BaseAddress!, new SocketIOOptions { Auth = new { token = _token, restaurantId = resId } });
 
 			// When underlying client connects, join the outlet room
 			_socket.OnConnected += async (s, e) =>
@@ -328,6 +357,33 @@ public partial class MainPage : ContentPage
 			Log("Socket Error: " + ex.Message);
 			await ShowToastAsync("Socket Error");
 		}
+	}
+
+	// Periodically touch an authenticated endpoint so the backend refreshes the
+	// session TTL (refreshTtl runs in requireAuth), keeping the realtime session
+	// valid across long idle periods and reconnects.
+	private void StartSessionKeepAlive()
+	{
+		_keepAliveCts?.Cancel();
+		_keepAliveCts = new CancellationTokenSource();
+		var ct = _keepAliveCts.Token;
+		_ = Task.Run(async () =>
+		{
+			while (!ct.IsCancellationRequested)
+			{
+				try { await Task.Delay(TimeSpan.FromMinutes(25), ct); }
+				catch { break; }
+				if (ct.IsCancellationRequested || string.IsNullOrEmpty(_token)) continue;
+				try
+				{
+					var req = new HttpRequestMessage(HttpMethod.Get, "/auth/me");
+					req.Headers.Add("Authorization", $"Bearer {_token}");
+					var resp = await _http.SendAsync(req, ct);
+					Log(resp.IsSuccessStatusCode ? "Session kept alive" : $"Keep-alive failed: {(int)resp.StatusCode}");
+				}
+				catch (Exception ex) { Log("Keep-alive error: " + ex.Message); }
+			}
+		}, ct);
 	}
 
 	private void StartPrinterLoopIfNeeded()
@@ -478,6 +534,8 @@ public partial class MainPage : ContentPage
 	{
 		try
 		{
+			_keepAliveCts?.Cancel();
+			_keepAliveCts = null;
 			if (_socket != null)
 			{
 				try { await _socket.DisconnectAsync(); } catch { }

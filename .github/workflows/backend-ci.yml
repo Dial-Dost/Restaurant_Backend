@@ -42,6 +42,7 @@ jobs:
           echo "SUPABASE_IPV4_URL=${{ secrets.SUPABASE_IPV4_URL }}" >> .env
           echo "SUPABASE_DEFAULT_API_KEY=${{ secrets.SUPABASE_DEFAULT_API_KEY }}" >> .env
           echo "SUPABASE_PROJECT_URL=${{ secrets.SUPABASE_PROJECT_URL }}" >> .env
+          echo "QR_SIGNING_SECRET=ci-only-non-secret-qr-key-for-tests" >> .env
 
       - name: Set up Docker Compose
         run: docker compose up -d --build

@@ -1,28 +1,51 @@
-FROM python:3.14-slim
+# syntax=docker/dockerfile:1
 
-# The official and recommended way to install uv in Docker
+# Pinned to a RELEASED CPython (3.12) on Debian slim.
+# NOTE: pyproject.toml currently declares requires-python = ">=3.14". 3.14 is
+# not a released base image, and that constraint will make `uv sync` reject a
+# 3.12 interpreter. Relax pyproject to ">=3.12" (outside this Dockerfile's
+# scope to edit) so this image builds. UV_PYTHON below pins the interpreter uv
+# uses for the venv.
+FROM python:3.12-slim
+
+# The official and recommended way to install uv in Docker.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential libpq-dev gcc curl pkg-config libssl-dev && \
+    apt-get install -y --no-install-recommends \
+        build-essential libpq-dev gcc curl pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
+# Create a dedicated non-root user up front and own /app.
+RUN useradd --create-home --uid 1000 appuser
 WORKDIR /app
 
-COPY pyproject.toml README.md /app/
-COPY Python_servers /app/Python_servers
-COPY scripts /app/scripts
-COPY . /app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="/app/Python_servers" \
+    PATH="/app/.venv/bin:$PATH" \
+    UV_PYTHON="python3.12"
 
-# Create the venv and install dependencies
+# Project metadata first for layer caching, then the actual source.
+# Explicit copies instead of "COPY . /app" so the image only carries the
+# Python service (no Node build, tests, or migration SQL).
+COPY --chown=appuser:appuser pyproject.toml README.md ./
+COPY --chown=appuser:appuser Python_servers ./Python_servers
+
+# Create the venv and install dependencies (no dev group).
 RUN uv venv .venv && \
     uv pip install --python .venv --upgrade pip setuptools wheel && \
-    uv sync --no-dev
+    uv sync --no-dev && \
+    chown -R appuser:appuser /app
 
-ENV PATH="/app/.venv/bin:$PATH"
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH="/app/Python_servers"
+USER appuser
 
-# Railway (and most cloud providers) dynamically assigns a port via the $PORT environment variable.
-# We change the CMD to shell form so it can read the $PORT variable, defaulting to 8000 if not set.
+# FastAPI exposes GET / (returns 200) — use it for the container HEALTHCHECK.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/" || exit 1
+
+EXPOSE 8000
+
+# Railway (and most cloud providers) assign $PORT dynamically. Shell form so the
+# variable is expanded at runtime, defaulting to 8000 when unset.
 CMD uvicorn Python_servers.main:app --host 0.0.0.0 --port ${PORT:-8000}

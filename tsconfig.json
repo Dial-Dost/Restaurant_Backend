@@ -33,5 +33,9 @@
 
     // for decorators
     // "useDecorators": true
-  }
+  },
+  // jest-tests are compiled by ts-jest with tsconfig.jest.json (CommonJS/Node
+  // resolution, where extensionless relative imports are valid). Exclude them from
+  // the app's NodeNext typecheck, which would otherwise demand .js extensions.
+  "exclude": ["node_modules", "build", "jest-tests"]
 }

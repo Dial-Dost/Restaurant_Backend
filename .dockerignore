@@ -1,9 +1,9 @@
 # Node
 node_modules
 npm-debug.log
-package-lock.json
+yarn-error.log
 
-# TypeScript build output
+# TypeScript build output (rebuilt inside the image)
 build
 dist
 C_Sharp_temp_printer_server
@@ -15,20 +15,32 @@ __pycache__
 *.pyc
 *.pyo
 *.pyd
-\.pytest_cache
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Tests / test artifacts
+test
+jest-tests
+coverage
+*.log
 
 # OS / editor
 .DS_Store
 .vscode
 .idea
 
-# Git
+# Git / CI
 .git
+.gitignore
 .github
 
-# Env files
+# Env files (NEVER ship secrets into an image layer)
 .env
 .env.*
+!.env.example
 
 # Docker
 Dockerfile*
+docker-compose*.yml
+.dockerignore

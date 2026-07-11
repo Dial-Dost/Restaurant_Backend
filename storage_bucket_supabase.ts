@@ -53,3 +53,42 @@ export async function downloadFile(url: string): Promise<Blob | null> {
 
     return data;
 }
+
+// Upload a base64 image to a public bucket and return its public URL.
+export async function uploadImage(
+    base64: string,
+    contentType: string,
+    bucket: string,
+    prefix: string,
+): Promise<string | null> {
+    const supabase = getSupabaseStorageClient();
+    if (!supabase) {
+        return null;
+    }
+    const cleaned = base64.includes(',') ? (base64.split(',').pop() ?? base64) : base64;
+    let buffer: Buffer;
+    try {
+        buffer = Buffer.from(cleaned, 'base64');
+    } catch {
+        return null;
+    }
+    const ext = contentType.toLowerCase().includes('png') ? 'png' : 'jpg';
+    const path = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error } = await supabase.storage.from(bucket).upload(path, buffer, { contentType, upsert: false });
+    if (error) {
+        console.error('upload_image_failed', { bucket, error });
+        return null;
+    }
+    const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+    return data?.publicUrl ?? null;
+}
+
+// Customer payment screenshot → public "payment-proofs" bucket (staff review).
+export async function uploadScreenshot(base64: string, contentType: string): Promise<string | null> {
+    return uploadImage(base64, contentType, 'payment-proofs', 'proof');
+}
+
+// Menu item photo → public "menu-images" bucket (shown to customers).
+export async function uploadMenuImage(base64: string, contentType: string): Promise<string | null> {
+    return uploadImage(base64, contentType, 'menu-images', 'menu');
+}

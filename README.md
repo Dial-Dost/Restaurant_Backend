@@ -105,6 +105,5 @@ The workflow automatically waits for `/health`; ensure the Postgres user has per
 ## Repository Hygiene
 
 - Run `npm run lint` (if you add ESLint) before opening PRs.
-- Keep `schema.ts` in sync with any Postgres schema changes.
 - When altering restaurant seed data, update `EnsureRestaurantSeed` plus downstream fixtures.
 - Always add/refresh unit or integration scripts for new booking edge cases to keep regression coverage high.
