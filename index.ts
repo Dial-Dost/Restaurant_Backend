@@ -17,6 +17,7 @@ import {
 	UpdateTableCovers,
 	ReleaseTable,
 	GetTableStatus,
+	VerifyTableOtp,
 	GetBillForTable,
 	computeBillCharges,
 	RemoveBillItem,
@@ -134,6 +135,7 @@ import {
 	EnsureMenuCategory,
 	DeleteMenuCategory,
 	SaveMenuItems,
+	UpdateMenuItemPrice,
 	RenameMenuStation,
 	RenameInventoryCategory,
 	GetOrders,
@@ -223,6 +225,7 @@ import {
 	GetValetVehicleMetaByBookingIds,
 	UpsertValetVehicleMeta,
 	AuthenticateRestaurantEmployee,
+	GetRestaurantOutletsPublic,
 	CORE_ROLES,
 	getRestaurantIdFromUsername,
 	openTenantConnection,
@@ -234,6 +237,7 @@ import {
 	GetRestaurantPlan,
 	closePools,
 	verifyTenantRlsAtBoot,
+	ensureFeaturePermissionActions,
 	JoinWaitlist,
 	GetWaitlistEntryByToken,
 	SetWaitlistPreorder,
@@ -693,6 +697,34 @@ async function enforceAdmin(
 	return { restaurantId: auth.res_id, outletId: extractOutletId(req) };
 }
 
+// Stable Action UUIDs for the feature-permission gates below. Seeded into the
+// global "Actions" table by ensureFeaturePermissionActions() at boot, so each
+// auto-appears as a grantable checkbox (grouped) in both role-creation UIs.
+// Admin ("*") always passes these; a custom role passes only if granted the UUID.
+const PERM_CAMPAIGNS = "3f9a1c72-6b04-4e19-9d2a-8c5e7f01a4b3"; // Manage Campaigns (Customer)
+const PERM_COUPONS = "7c1e4d90-2a6b-4f83-b5c1-9e0d6a2f3418"; // Manage Coupons & Vouchers (Customer)
+const PERM_MESSAGING = "5b8d2f16-4c93-47a0-a1e6-3d7f9b0c5e24"; // Guest Messaging (Customer)
+const PERM_DISCOUNTS = "9a3c6e81-7d40-4b52-8f19-2c6b4a0e7d35"; // Approve Discounts (Bills)
+const PERM_ATTENDANCE = "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047"; // Review Attendance (Restaurant Specific)
+const PERM_SETTINGS = "6d0f3a94-8b21-4c67-9e53-1a4d7b2f8c60"; // Manage Restaurant Settings (Restaurant Specific)
+const PERM_BRANDING = "4a1c8e73-5f60-49b2-a3d8-7c2e0b6f9153"; // Manage Branding (Restaurant Specific)
+const PERM_BILLING = "1c6e9b34-7a52-4f80-9d13-3b8c5a0e6f27"; // Manage Subscription & Billing (Restaurant Specific)
+const PERM_PASSWORDS = "0b4d7f92-6c81-43a5-b7e0-2f9a1c8d5e36"; // Manage User Passwords (Roles)
+
+// Permission gate for a specific granted Action. Admin (actions include "*")
+// always passes; any role granted this action UUID passes; everyone else 403.
+// Same return shape as enforceAdmin so it's a drop-in swap in handler bodies.
+async function enforcePermission(req: Request, res: Response, actionId: string): Promise<{ restaurantId: string; outletId: string } | null> {
+	const auth = req.auth;
+	if (!auth) { res.status(401).json({ error: "Unauthorized", details: "Missing session" }); return null; }
+	const actions = auth.actions ?? [];
+	if (!actions.includes(actionId) && !actions.includes("*")) {
+		res.status(403).json({ error: "Forbidden", details: "You do not have permission for this action" });
+		return null;
+	}
+	return { restaurantId: auth.res_id, outletId: extractOutletId(req) };
+}
+
 // Non-responding admin check (for guards that decide their own error).
 function callerIsAdmin(req: Request): boolean {
 	const auth = req.auth;
@@ -966,6 +998,7 @@ const PUBLIC_PATHS = new Set<string>([
 	// version numbers + download URLs, no tenant data).
 	"/app/version",
 	"/auth/register-restaurant",
+	"/auth/outlets",
 	"/auth/employee-login",
 	"/auth/restaurant-login",
 	"/auth/logout",
@@ -1050,7 +1083,7 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				GetMenuItems(slug),
 				GetMenuCategories(slug),
 				GetRestaurantProfile(slug),
-				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true })),
+				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "pill" } })),
 			]);
 			return {
 				restaurant_name: profile?.restaurant_name ?? slug,
@@ -1061,6 +1094,12 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				currency: branding.currency,
 				payment_methods: branding.payment_methods,
 				queue_show_menu: branding.queue_show_menu,
+				// Guest QR order page reads this to know whether to prompt for the
+				// per-table OTP before letting the guest place an order.
+				require_table_otp: branding.require_table_otp === true,
+				// Rich customer-page customization (font/colors/header/button style),
+				// resolved with sane defaults so the page can theme itself fully.
+				brand_config: branding.brand_config,
 				categories,
 				items,
 			};
@@ -1110,6 +1149,34 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 	if (items.length === 0) {
 		res.status(400).json({ error: "At least one item is required" });
 		return;
+	}
+
+	// OTP gate: when the tenant requires a per-table code, the guest must present
+	// the 4-digit OTP staff read off the floor grid before any order is accepted.
+	// When the setting is OFF, VerifyTableOtp returns ok:true and this is a no-op.
+	const providedOtp = typeof body.otp === "string" ? body.otp.trim() : "";
+	try {
+		const gate = await withTenant(
+			{ res_id: resId, outlet_id: "", employeeId: "", role: "" },
+			() => VerifyTableOtp(slug, tableName, providedOtp),
+		);
+		if (!gate.ok) {
+			// Distinguish "you typed the wrong code" (otp_wrong) from "you haven't
+			// entered one yet / the table isn't seated" (otp_required) so the guest
+			// UI can prompt correctly. VerifyTableOtp folds an empty code into
+			// reason:"wrong", so key the code off whether an OTP was actually sent.
+			const wrongCode = gate.reason === "wrong" && providedOtp.length > 0;
+			res.status(403).json(
+				wrongCode
+					? { error: "That table OTP is incorrect. Please check the code shown by staff.", code: "otp_wrong" }
+					: { error: "Enter the table OTP shown by staff before ordering.", code: "otp_required" },
+			);
+			return;
+		}
+	} catch (err) {
+		// A transient failure verifying the OTP shouldn't hard-block ordering —
+		// AddOrder still refuses unoccupied tables, which is the real guard.
+		logger.warn({ err: (err as any)?.message ?? err }, "qr_order_otp_gate_error (failing open)");
 	}
 
 	// Server-computed total — never trust a client-sent total for billing.
@@ -1170,6 +1237,34 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 	} catch (err: any) {
 		logger.error({ err }, "qr_order_failed");
 		res.status(400).json({ error: safeClientError(err, "Unable to place order") });
+	}
+});
+
+// Public: verify a per-table OTP for the guest QR flow (resolve the table via the
+// signed ?t= token, exactly like the other /qr/:slug/* routes). Rate-limited to a
+// few tries/min so the 4-digit code can't be brute-forced. Response shape:
+//   { ok:true, required:false }            — gate OFF (no code needed)
+//   { ok:false, reason:"not_seated" }      — gate ON, table not occupied yet
+//   { ok:false, reason:"wrong" }           — gate ON, code missing/incorrect
+//   { ok:true, required:true }             — gate ON, code accepted
+app.post("/qr/:slug/verify-otp", rateLimit("qr_verify_otp", 10, 60_000), async (req: Request, res: Response) => {
+	const slug = String(req.params.slug ?? "").trim();
+	let resId: string | null = null;
+	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const tableName = resolveQrTable(resId, body);
+	if (!tableName) { res.status(403).json({ error: "Invalid table code. Please re-scan the QR at your table." }); return; }
+	const otp = typeof body.otp === "string" ? body.otp : "";
+	try {
+		const result = await withTenant(
+			{ res_id: resId, outlet_id: "", employeeId: "", role: "" },
+			() => VerifyTableOtp(slug, tableName, otp),
+		);
+		res.json(result);
+	} catch (err) {
+		logger.error({ err }, "qr_verify_otp_failed");
+		res.status(500).json({ error: "Unable to verify code" });
 	}
 });
 
@@ -2145,12 +2240,36 @@ app.post("/auth/register-restaurant", rateLimit("register", 5, 60_000), validate
 	}
 });
 
+// Pre-auth outlet picker: the login screen calls this to list a restaurant's
+// outlets so the user can choose WHICH outlet to sign into (employee identity is
+// per-outlet — the same username may name different people in different outlets).
+// PUBLIC + rate-limited. Never reveals whether a restaurant exists: an unknown
+// slug/id returns {outlets:[]} with 200. Returns outlet ids + names ONLY.
+app.get("/auth/outlets", rateLimit("auth-outlets", 30, 60_000), async (req: Request, res: Response) => {
+	const raw = typeof req.query.restaurant === "string" ? req.query.restaurant.trim() : "";
+	if (!raw) {
+		res.json({ outlets: [] });
+		return;
+	}
+	try {
+		const outlets = await GetRestaurantOutletsPublic(raw);
+		res.json({ outlets });
+	} catch (error) {
+		// Fail closed but shaped — don't leak existence (or errors) via a non-200.
+		logger.error({ err: error }, "auth_outlets_failed");
+		res.json({ outlets: [] });
+	}
+});
+
 app.post("/auth/employee-login", rateLimit("login", 15, 60_000), validate, async (req: Request, res: Response) => {
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const employeeUsername = typeof body.employeeUsername === "string" ? body.employeeUsername.trim() : "";
 	const password = typeof body.password === "string" ? body.password : "";
 	const restaurantIdRaw = typeof body.restaurantId === "string" ? body.restaurantId.trim() : "";
 	const restaurantName = typeof body.restaurantName === "string" ? body.restaurantName.trim() : "";
+	// Optional: the outlet the user chose in the pre-auth picker. Omitted/empty →
+	// defaults to the restaurant's first outlet (single-outlet + old clients work).
+	const outletId = typeof body.outletId === "string" ? body.outletId.trim() : "";
 
 	if (!employeeUsername || !password || !restaurantName) {
 		res.status(400).json({
@@ -2162,7 +2281,7 @@ app.post("/auth/employee-login", rateLimit("login", 15, 60_000), validate, async
 	const restaurantUsername = restaurantIdRaw || normalizeRestaurantSlug(restaurantName);
 
 	try {
-		const user = await AuthenticateRestaurantEmployee(restaurantUsername, employeeUsername, password);
+		const user = await AuthenticateRestaurantEmployee(restaurantUsername, employeeUsername, password, outletId || undefined);
 		if (!user) {
 			res.status(401).json({ error: "Invalid employee ID or password." });
 			return;
@@ -4093,7 +4212,7 @@ app.post("/menu/upload-image", validateAction("88a87943-8f0b-43e2-b85e-192fdc901
 // Set the restaurant's customer-facing branding (logo + theme color). Accepts a
 // logo as a hosted URL or base64 (uploaded server-side).
 app.post("/restaurant/branding", validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_BRANDING))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -4102,12 +4221,16 @@ app.post("/restaurant/branding", validate, async (req: Request, res: Response) =
 		? body.theme_color
 		: undefined;
 	const queueShowMenu = typeof body.queue_show_menu === "boolean" ? body.queue_show_menu : undefined;
+	// Rich customer-page customization object (font/colors/header/button style).
+	// Passed through as-is — SetBranding sanitizes it (invalid keys dropped) and
+	// merges it onto the stored config (keys omitted here keep their value).
+	const brandConfig = body.brand_config && typeof body.brand_config === "object" ? body.brand_config : undefined;
 	try {
 		if (!logoUrl && typeof body.logo_base64 === "string" && body.logo_base64.length > 0) {
 			const url = await uploadMenuImage(body.logo_base64, typeof body.content_type === "string" ? body.content_type : "image/png");
 			if (url) logoUrl = url;
 		}
-		const result = await SetBranding(restaurantId, { logo_url: logoUrl ?? null, theme_color: themeColor ?? null, queue_show_menu: queueShowMenu });
+		const result = await SetBranding(restaurantId, { logo_url: logoUrl ?? null, theme_color: themeColor ?? null, queue_show_menu: queueShowMenu, brand_config: brandConfig });
 		try { await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33", `Updated customer-page branding`, Audit_log_category.General, { theme_color: result.theme_color, logo: !!result.logo_url }); } catch (err) { logger.warn({ err }, "log_audit branding failed"); }
 		res.json(result);
 	} catch (err: any) {
@@ -4126,7 +4249,7 @@ app.get("/restaurant/settings", validate, async (req: Request, res: Response) =>
 
 app.post("/restaurant/settings", validate, async (req: Request, res: Response) => {
 	// Settings hold payment keys, taxes and operational toggles — admin-only.
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_SETTINGS))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -4160,6 +4283,7 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 			kitchen_sections: Array.isArray(body.kitchen_sections) ? body.kitchen_sections : undefined,
 			inventory_categories: Array.isArray(body.inventory_categories) ? body.inventory_categories : undefined,
 			timezone: typeof body.timezone === "string" ? body.timezone : undefined,
+			require_table_otp: typeof body.require_table_otp === "boolean" ? body.require_table_otp : undefined,
 		});
 		try { await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33", `Updated restaurant settings`, Audit_log_category.General, { auto_push_orders: result.auto_push_orders, currency: result.currency }); } catch (err) { logger.warn({ err }, "log_audit settings failed"); }
 		res.json(result);
@@ -4174,7 +4298,7 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 // their sent/failed/skipped status — surfaced on the web bookings page so the
 // owner can see whether guests are actually receiving messages.
 app.get("/messages", validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_MESSAGING))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try { res.json(await GetOutboundMessages(restaurantId, clampLimit(req.query.limit, 50, 200))); }
@@ -4184,7 +4308,7 @@ app.get("/messages", validate, async (req: Request, res: Response) => {
 // Run the booking-reminder pass for this tenant now (the same function the
 // 30-min timer calls) — lets an admin nudge reminders without waiting a tick.
 app.post("/messages/run-reminders", validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_MESSAGING))) return;
 	const resId = req.auth?.res_id;
 	if (!resId) { res.status(400).json({ error: "Missing restaurant context" }); return; }
 	try { res.json({ success: true, sent: await sendDueBookingReminders(resId) }); }
@@ -4243,7 +4367,7 @@ app.get("/qr/:slug/branding", async (req: Request, res: Response) => {
 			async () => {
 				const [profile, branding] = await Promise.all([
 					GetRestaurantProfile(slug),
-					GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, timezone: "Asia/Kolkata" })),
+					GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, timezone: "Asia/Kolkata", require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "pill" } })),
 				]);
 				return { restaurant_name: profile?.restaurant_name ?? slug, ...branding };
 			},
@@ -4293,6 +4417,38 @@ app.put("/menu", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (
 	} catch (error) {
 		logger.error({ err: error }, "save_menu_failed");
 		res.status(500).json({ error: "Unable to save menu" });
+	}
+});
+
+// Update ONLY a menu item's price (the menu-insights "apply suggestion" flow).
+// Same Edit Menu gate as PUT /menu, but never touches any other field of the
+// item — clients applying a price suggestion MUST use this, not PUT /menu.
+app.patch("/menu/:id/price", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+	const itemId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+	const price = Number((req.body ?? {}).price ?? NaN);
+	if (!itemId) {
+		res.status(400).json({ error: "Missing menu item id" });
+		return;
+	}
+	if (!Number.isFinite(price) || price <= 0) {
+		res.status(400).json({ error: "price must be a positive number" });
+		return;
+	}
+	try {
+		const result = await UpdateMenuItemPrice(restaurantId, itemId, price);
+		try {
+			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Updated price of ${result.name} to ${result.price}`, Audit_log_category.Menu, { id: result.id, price: result.price });
+		} catch (err) { logger.warn({ err }, "log_audit menu-price failed"); }
+		res.json({ success: true, ...result });
+	} catch (error: any) {
+		logger.error({ err: error }, "update_menu_price_failed");
+		const msg = String(error?.message ?? "Unable to update price");
+		res.status(/not found/i.test(msg) ? 404 : 400).json({ error: msg });
 	}
 });
 
@@ -4703,7 +4859,7 @@ app.get("/analytics/history", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f
 
 // Marketing campaigns (admin): create/delete; ROI is computed by /analytics/advanced.
 app.post("/campaigns", async (req: Request, res: Response) => {
-	const auth = await enforceAdmin(req, res);
+	const auth = await enforcePermission(req, res, PERM_CAMPAIGNS);
 	if (!auth) return;
 	const b = (req.body ?? {}) as Record<string, unknown>;
 	try {
@@ -4720,7 +4876,7 @@ app.post("/campaigns", async (req: Request, res: Response) => {
 });
 
 app.delete("/campaigns/:id", async (req: Request, res: Response) => {
-	const auth = await enforceAdmin(req, res);
+	const auth = await enforcePermission(req, res, PERM_CAMPAIGNS);
 	if (!auth) return;
 	try {
 		await DeleteCampaign(auth.restaurantId, String(req.params.id));
@@ -5032,7 +5188,7 @@ const PLATFORM_RAZORPAY_KEY_SECRET = process.env.PLATFORM_RAZORPAY_KEY_SECRET ||
 const platformRazorpayReady = Boolean(PLATFORM_RAZORPAY_KEY_ID && PLATFORM_RAZORPAY_KEY_SECRET);
 
 app.get("/billing", async (req: Request, res: Response) => {
-	const auth = await enforceAdmin(req, res);
+	const auth = await enforcePermission(req, res, PERM_BILLING);
 	if (!auth) return;
 	if (!billingConfigured()) {
 		res.json({ configured: false, online_pay: false, subscription: null, plan: null, pending_plan: null, plans: [], invoices: [] });
@@ -5045,7 +5201,7 @@ app.get("/billing", async (req: Request, res: Response) => {
 });
 
 app.post("/billing/change-plan", async (req: Request, res: Response) => {
-	const auth = await enforceAdmin(req, res);
+	const auth = await enforcePermission(req, res, PERM_BILLING);
 	if (!auth) return;
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const planId = typeof body.plan_id === "string" ? body.plan_id.trim() : "";
@@ -5057,7 +5213,7 @@ app.post("/billing/change-plan", async (req: Request, res: Response) => {
 });
 
 app.post("/billing/pay/create", async (req: Request, res: Response) => {
-	const auth = await enforceAdmin(req, res);
+	const auth = await enforcePermission(req, res, PERM_BILLING);
 	if (!auth) return;
 	if (!platformRazorpayReady) { res.status(503).json({ error: "Online payment isn't set up. Your provider will confirm the payment manually." }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -5084,7 +5240,7 @@ app.post("/billing/pay/create", async (req: Request, res: Response) => {
 });
 
 app.post("/billing/pay/verify", async (req: Request, res: Response) => {
-	const auth = await enforceAdmin(req, res);
+	const auth = await enforcePermission(req, res, PERM_BILLING);
 	if (!auth) return;
 	if (!platformRazorpayReady) { res.status(503).json({ error: "Online payment isn't set up." }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -5333,7 +5489,7 @@ app.get("/analytics/operations", validateAction("df75119b-e5f1-4f38-aba5-78a1cf1
 // approval time.
 const ATTENDANCE_REVIEW_ACTION = "e7a41c3b-5a20-4f6e-9d38-6c2b9a51f0aa";
 async function handleAttendanceReview(req: Request, res: Response, approve: boolean): Promise<void> {
-	const admin = await enforceAdmin(req, res);
+	const admin = await enforcePermission(req, res, PERM_ATTENDANCE);
 	if (!admin) return;
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	if (!id) { res.status(400).json({ error: "Missing id" }); return; }
@@ -5381,7 +5537,7 @@ app.get("/attendance/me", validate, async (req: Request, res: Response) => {
 });
 
 app.get("/attendance", validate, async (req: Request, res: Response) => {
-	const auth = await enforceRoles(req, res, ["admin", "manager"]);
+	const auth = await enforcePermission(req, res, PERM_ATTENDANCE);
 	if (!auth) return;
 	const from = typeof req.query.from === "string" ? req.query.from : undefined;
 	const to = typeof req.query.to === "string" ? req.query.to : undefined;
@@ -5665,7 +5821,7 @@ app.post('/bills/discount', validateAction("4ad474d4-5230-449c-874f-6a238b833bca
 
 // --- Discount approval queue (admin) -----------------------------------------
 app.get('/discount-requests', validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_DISCOUNTS))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const status = typeof req.query.status === "string" ? req.query.status : undefined;
@@ -5677,7 +5833,7 @@ app.get('/discount-requests', validate, async (req: Request, res: Response) => {
 // discount uses; reject leaves the bill untouched. Both are audit-logged.
 for (const decision of ["approve", "reject"] as const) {
 	app.post(`/discount-requests/:id/${decision}`, validate, async (req: Request, res: Response) => {
-		if (!(await enforceAdmin(req, res))) return;
+		if (!(await enforcePermission(req, res, PERM_DISCOUNTS))) return;
 		const restaurantId = extractRestaurantId(req);
 		if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 		const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
@@ -5701,7 +5857,7 @@ for (const decision of ["approve", "reject"] as const) {
 
 // --- Coupons (admin-managed promo codes) ------------------------------------
 app.get('/coupons', validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try { res.json({ coupons: await GetCoupons(restaurantId) }); }
@@ -5709,7 +5865,7 @@ app.get('/coupons', validate, async (req: Request, res: Response) => {
 });
 
 app.post('/coupons', validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const b = (req.body ?? {}) as Record<string, unknown>;
@@ -5721,7 +5877,7 @@ app.post('/coupons', validate, async (req: Request, res: Response) => {
 });
 
 app.delete('/coupons/:id', validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
@@ -5732,7 +5888,7 @@ app.delete('/coupons/:id', validate, async (req: Request, res: Response) => {
 // Issue a gift voucher (admin). Redemption happens through the normal coupon
 // paths (/bills/apply-coupon, /qr/:slug/coupon) — staff just enter the code.
 app.post('/vouchers', validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -7614,16 +7770,31 @@ app.delete("/restaurant/users", validateAction("a978f15d-1043-417a-b07b-05f6bdda
 // Admin sets/resets a user's password (directly, or to fulfil a forgot-password
 // request). A non-superadmin admin cannot reset the superadmin's password.
 app.post("/restaurant/users/password", async (req: Request, res: Response) => {
-	const admin = await enforceAdmin(req, res);
+	const admin = await enforcePermission(req, res, PERM_PASSWORDS);
 	if (!admin) return;
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const employeeId = typeof body.employeeId === "string" ? body.employeeId.trim() : "";
 	const password = typeof body.password === "string" ? body.password : "";
 	if (!employeeId || !password) { res.status(400).json({ error: "employeeId and password are required" }); return; }
 	try {
+		// Owner id resolved restaurant-wide (stable across outlets — the owner may
+		// not be a user of the currently-viewed outlet); the outlet-scoped list
+		// still drives the target-is-admin escalation guard below.
+		const users = await GetRestaurantUsers(admin.restaurantId);
 		const superId = await GetSuperadminEmployeeId(admin.restaurantId);
+		const target = users.find((u) => u.employee_id === employeeId);
+		const targetIsAdmin = !!target && (target.role === "admin" || (target.role_all ?? []).includes("admin") || target.is_superadmin === true);
+
 		if (superId && employeeId === superId && req.auth?.employeeId !== superId) {
 			res.status(403).json({ error: "Only the superadmin can reset the superadmin's password." });
+			return;
+		}
+		// Escalation guard: a non-admin caller (e.g. a custom role merely granted
+		// "Manage User Passwords") must not be able to reset an ADMIN's password —
+		// that would be a back door to full admin. Admins (actions include "*") are
+		// unaffected and can still reset regular staff and fellow admins.
+		if (targetIsAdmin && !callerIsAdmin(req)) {
+			res.status(403).json({ error: "Only an admin can reset an admin's password." });
 			return;
 		}
 		await SetUserPassword(admin.restaurantId, employeeId, password);
@@ -7637,7 +7808,7 @@ app.post("/restaurant/users/password", async (req: Request, res: Response) => {
 
 // Admin: list pending forgot-password requests for this restaurant.
 app.get("/restaurant/password-requests", async (req: Request, res: Response) => {
-	const admin = await enforceAdmin(req, res);
+	const admin = await enforcePermission(req, res, PERM_PASSWORDS);
 	if (!admin) return;
 	try {
 		res.json({ requests: await GetPasswordResetRequests(admin.restaurantId) });
@@ -7649,7 +7820,7 @@ app.get("/restaurant/password-requests", async (req: Request, res: Response) => 
 
 // Admin: dismiss a pending password request without resetting.
 app.post("/restaurant/password-requests/:id/dismiss", async (req: Request, res: Response) => {
-	const admin = await enforceAdmin(req, res);
+	const admin = await enforcePermission(req, res, PERM_PASSWORDS);
 	if (!admin) return;
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	if (!id) { res.status(400).json({ error: "Missing request id" }); return; }
@@ -7933,6 +8104,16 @@ async function bootstrap(): Promise<void> {
 		logger.info("Skipping demo seed (production; set SEED_DEMO=true to override)");
 	}
 
+	// Seed the feature-permission Action rows so the newer (formerly admin-only)
+	// features are grantable to custom roles and auto-appear in the role UIs.
+	// Idempotent; tolerant of a least-privilege runtime (seeded via migrations there).
+	try {
+		await ensureFeaturePermissionActions();
+		logger.info("✅ Feature-permission actions ensured");
+	} catch (error) {
+		logger.warn({ err: error }, "Failed to ensure feature-permission actions");
+	}
+
 	// Fail-closed isolation guard: warn (or abort, if ENFORCE_RLS_AT_BOOT=true) when
 	// any tenant table is missing RLS, so a turnkey deploy never silently serves
 	// traffic without DB-enforced multi-tenant isolation.
@@ -8032,3 +8213,4 @@ bootstrap().catch(error => {
 	logger.error({ err: error }, "Server bootstrap failed");
 	process.exit(1);
 });
+// hot-reload nudge

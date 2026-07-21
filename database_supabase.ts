@@ -18,7 +18,7 @@
 //   6. payment pending approval
 //   7. closed
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomInt } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import net from "node:net";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -59,7 +59,10 @@ export const CORE_ROLES = {
   // tables, and VIEW the menu (f4177b38…) so they can actually take orders.
   waiter: ["4ad474d4-5230-449c-874f-6a238b833bca", "090ea8d4-e348-4e1b-9723-11131a73a085", "c7699d46-0e2f-4448-b325-8ca490a5296b", "b7f78d0f-323d-4622-8d05-aa2f82d54b2e", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610"],
   captain: ["4ad474d4-5230-449c-874f-6a238b833bca", "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "c7699d46-0e2f-4448-b325-8ca490a5296b", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610"],
-  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd"],
+  // "2e7b9c40…" = Review Attendance: managers previously reached GET /attendance
+  // via an admin/manager role check; now that the attendance endpoints are gated
+  // by that granted Action, keep managers' access by granting them the UUID here.
+  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd", "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047"],
 };
 
 export enum Audit_log_category {
@@ -1563,7 +1566,9 @@ export async function AddRestaurantUser(
           empRoles,
           context.res_id,
           context.outlet_id,
-          payload.emp_Lname?.trim() || null,
+          // "emp_Lname" is NOT NULL on the schema; default to "" so a staff member
+          // can be created with only a first name (passing null 500s the insert).
+          payload.emp_Lname?.trim() || "",
         ],
         client,
       );
@@ -1722,7 +1727,7 @@ export async function AddTable(
       `
         update "Tables"
         set is_deleted = false, is_occupied = false, num_covers = 1,
-            linked_order_id = null, table_name = $4, capacity = $5
+            linked_order_id = null, order_otp = null, table_name = $4, capacity = $5
         where id = $1 and res_id = $2 and outlet_id = $3
       `,
       [existing[0].id, context.res_id, context.outlet_id, normalized, cap],
@@ -1808,7 +1813,7 @@ export async function RemoveTable(
     await runQuery(
       `
         update "Tables"
-        set is_deleted = true, is_occupied = false, num_covers = 1, linked_order_id = null
+        set is_deleted = true, is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null
         where id = $1 and res_id = $2 and outlet_id = $3
       `,
       [table.id, context.res_id, context.outlet_id],
@@ -1872,6 +1877,17 @@ async function ensureTableOccupancyColumns(client?: PoolClient): Promise<void> {
     [],
     client,
   );
+  // Per-table ordering OTP (see Restaurant.require_table_otp). Set to a random
+  // 4-digit code when a table is seated while the gate is ON; cleared when the
+  // table is freed. Null/empty means "no active code".
+  await runQuery(
+    `
+      alter table "Tables"
+      add column if not exists order_otp text default null
+    `,
+    [],
+    client,
+  );
   await ensureTableSessionsTable(client);
   });
 }
@@ -1926,6 +1942,42 @@ async function ensureTableSessionsTable(client?: PoolClient): Promise<void> {
   });
 }
 
+// A fresh per-table ordering OTP: a zero-padded 4-digit string ("0000"-"9999").
+function makeTableOtp(): string {
+  return String(randomInt(0, 10000)).padStart(4, "0");
+}
+
+// Read the require_table_otp gate for a restaurant (best-effort; defaults false).
+async function isTableOtpRequired(context: RestaurantContext, client?: PoolClient): Promise<boolean> {
+  await ensureBrandingColumns();
+  const rows = await runQuery<{ require_table_otp: boolean | null }>(
+    `select require_table_otp from "Restaurant" where id = $1 limit 1`,
+    [context.res_id],
+    client,
+  );
+  return rows[0]?.require_table_otp === true;
+}
+
+// When a table transitions to occupied AND the OTP gate is ON, stamp it with a
+// fresh 4-digit code — but only if it doesn't already have one, so re-occupy /
+// cover-count updates never churn the code a guest was already given. No-op when
+// the gate is OFF. Best-effort: never blocks the seating itself.
+async function ensureTableOtpOnOccupy(context: RestaurantContext, tableId: string, client?: PoolClient): Promise<void> {
+  try {
+    if (!(await isTableOtpRequired(context, client))) return;
+    await runQuery(
+      `update "Tables" set order_otp = $4
+         where id = $1 and res_id = $2 and outlet_id = $3
+           and coalesce(is_occupied, false) = true
+           and (order_otp is null or order_otp = '')`,
+      [tableId, context.res_id, context.outlet_id, makeTableOtp()],
+      client,
+    );
+  } catch (err) {
+    logger.warn({ err: (err as any)?.message ?? err }, "ensure_table_otp_on_occupy_failed");
+  }
+}
+
 export async function OccupyTable(
   restaurantId: string,
   table_name: string,
@@ -1975,6 +2027,9 @@ export async function OccupyTable(
     `,
     [tableId, context.res_id, context.outlet_id, coversParam, linkedOrderId ?? null],
   );
+
+  // Seating a guest while the OTP gate is on mints the table's ordering code.
+  await ensureTableOtpOnOccupy(context, tableId);
 
   // Seating a guest auto-assigns the acting employee to the table so APC and
   // feedback ratings are attributed to whoever is serving it. Best-effort.
@@ -2098,7 +2153,7 @@ export async function ReleaseTable(
   const updatedRows = await runQuery<{ is_occupied: boolean }>(
     `
       update "Tables"
-      set is_occupied = false, num_covers = 1, linked_order_id = null
+      set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null
       where id = $1 and res_id = $2 and outlet_id = $3
       returning is_occupied
     `,
@@ -2585,7 +2640,7 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<Array<{ table_name: string; capacity: number | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string }> | null> {
+): Promise<Array<{ table_name: string; capacity: number | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; order_otp?: string | null }> | null> {
   const at = time ? new Date(time as any) : new Date();
   if (Number.isNaN(at.getTime())) return null;
 
@@ -2598,11 +2653,13 @@ export async function GetTables(
     capacity: unknown;
     is_occupied: boolean;
     num_covers: unknown;
+    order_otp: string | null;
   }>(
     `
       select id, table_name, capacity,
              coalesce(is_occupied, false) as is_occupied,
-             coalesce(num_covers, 1) as num_covers
+             coalesce(num_covers, 1) as num_covers,
+             order_otp
       from "Tables"
       where res_id = $1 and outlet_id = $2
         and coalesce(is_deleted, false) = false
@@ -2611,6 +2668,30 @@ export async function GetTables(
     `,
     [context.res_id, context.outlet_id],
   );
+
+  // Staff read the OTP off this grid, so make sure every occupied table has one
+  // while the gate is ON — including tables that were already seated before the
+  // toggle was flipped (order_otp still null). Lazily backfill + reuse the code.
+  const requireOtp = await isTableOtpRequired(context).catch(() => false);
+  if (requireOtp) {
+    for (const row of tableRows) {
+      if (row.is_occupied === true && !String(row.order_otp ?? "").trim()) {
+        const otp = makeTableOtp();
+        try {
+          await runQuery(
+            `update "Tables" set order_otp = $4
+               where id = $1 and res_id = $2 and outlet_id = $3
+                 and coalesce(is_occupied, false) = true
+                 and (order_otp is null or order_otp = '')`,
+            [row.id, context.res_id, context.outlet_id, otp],
+          );
+          row.order_otp = otp;
+        } catch (err) {
+          logger.warn({ err: (err as any)?.message ?? err }, "backfill_table_otp_failed");
+        }
+      }
+    }
+  }
 
   const bookings = await runQuery<{
     table_id: string | null;
@@ -2706,8 +2787,46 @@ export async function GetTables(
       apc_status: occupied && tTotal > 0 ? apcColor(tApc, target) : "neutral",
       qr_sig: signTable(context.res_id, row.table_name),
       qr_token: encodeTableToken(context.res_id, row.table_name),
+      // Per-table ordering OTP (only meaningful while require_table_otp is ON) —
+      // staff read this off the floor grid to tell the seated guest.
+      order_otp: row.order_otp ?? null,
     };
   });
+}
+
+// Verify a guest-supplied per-table OTP for the public QR flow. Shape:
+//   - gate OFF                -> { ok: true,  required: false }
+//   - gate ON, table not seated -> { ok: false, required: true, reason: "not_seated" }
+//   - gate ON, code matches   -> { ok: true,  required: true }
+//   - gate ON, code wrong/absent -> { ok: false, required: true, reason: "wrong" }
+// Pure read (no side effects) — get-tables handles lazy code generation for staff.
+export async function VerifyTableOtp(
+  restaurantId: string,
+  tableName: string,
+  otp: string,
+): Promise<{ ok: true; required: false } | { ok: true; required: true } | { ok: false; required: true; reason: "not_seated" | "wrong" }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  if (!(await isTableOtpRequired(context))) return { ok: true, required: false };
+
+  const normalized = String(tableName ?? "").trim();
+  const rows = await runQuery<{ is_occupied: boolean; order_otp: string | null }>(
+    `select coalesce(is_occupied, false) as is_occupied, order_otp
+       from "Tables"
+       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+         and coalesce(is_deleted, false) = false
+       limit 1`,
+    [context.res_id, context.outlet_id, normalized],
+  );
+  const row = rows[0];
+  if (!row || row.is_occupied !== true) return { ok: false, required: true, reason: "not_seated" };
+
+  const expected = String(row.order_otp ?? "").trim();
+  const provided = String(otp ?? "").trim();
+  if (expected.length > 0 && provided.length > 0 && provided === expected) {
+    return { ok: true, required: true };
+  }
+  return { ok: false, required: true, reason: "wrong" };
 }
 
 export async function GetAvailableTablesForInterval(
@@ -2983,6 +3102,8 @@ export async function UpdateBookingStatus(
            where id = $1 and res_id = $2 and outlet_id = $3 and coalesce(is_deleted, false) = false`,
         [row.table_id, context.res_id, context.outlet_id, covers],
       );
+      // Mint the table's ordering code when the OTP gate is on.
+      await ensureTableOtpOnOccupy(context, row.table_id);
     } catch (err) {
       logger.warn({ err }, "occupy_table_on_seat_failed");
     }
@@ -2996,7 +3117,7 @@ export async function UpdateBookingStatus(
     try {
       await ensureTableOccupancyColumns();
       await runQuery(
-        `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null
+        `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null
            where id = $1 and res_id = $2 and outlet_id = $3 and coalesce(is_deleted, false) = false`,
         [row.table_id, context.res_id, context.outlet_id],
       );
@@ -4468,6 +4589,32 @@ async function ensureIssueStockAction(): Promise<void> {
   });
 }
 
+// Feature-permission Actions: make the newer admin-only features (campaigns,
+// coupons/vouchers, guest messaging, discount approvals, attendance review,
+// restaurant settings, branding, subscription/billing, user passwords)
+// grantable to CUSTOM roles. Seeding these global "Actions" rows makes each
+// auto-appear as a grouped, grantable checkbox in both role-creation UIs (they
+// render whatever GetActions() returns, grouped by "group"). Every "group" here
+// is an existing value of the fixed "Action_groups" enum. Idempotent; same lazy
+// seed pattern as ensureIssueStockAction. Called once at boot (see bootstrap()).
+export async function ensureFeaturePermissionActions(): Promise<void> {
+  await ensureLazyTable("Actions.feature_permissions", async () => {
+    await runQuery(
+      `insert into "Actions" (id, action_name, action_desc, "group") values
+         ('3f9a1c72-6b04-4e19-9d2a-8c5e7f01a4b3', 'Manage Campaigns', 'Create and delete marketing campaigns', 'Customer'::"Action_groups"),
+         ('7c1e4d90-2a6b-4f83-b5c1-9e0d6a2f3418', 'Manage Coupons & Vouchers', 'Create/list/delete discount coupons and gift vouchers', 'Customer'::"Action_groups"),
+         ('5b8d2f16-4c93-47a0-a1e6-3d7f9b0c5e24', 'Guest Messaging', 'View guest messages and run reminder campaigns', 'Customer'::"Action_groups"),
+         ('9a3c6e81-7d40-4b52-8f19-2c6b4a0e7d35', 'Approve Discounts', 'Review, approve or reject discount requests', 'Bills'::"Action_groups"),
+         ('2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047', 'Review Attendance', 'View staff attendance and approve/reject entries', 'Restaurant Specific'::"Action_groups"),
+         ('6d0f3a94-8b21-4c67-9e53-1a4d7b2f8c60', 'Manage Restaurant Settings', 'Change restaurant settings: taxes, service charge, payment keys, OTP, kitchen sections, feedback config, timezone', 'Restaurant Specific'::"Action_groups"),
+         ('4a1c8e73-5f60-49b2-a3d8-7c2e0b6f9153', 'Manage Branding', 'Change logo, colours and customer-page theme', 'Restaurant Specific'::"Action_groups"),
+         ('1c6e9b34-7a52-4f80-9d13-3b8c5a0e6f27', 'Manage Subscription & Billing', 'View and change the subscription plan and process billing', 'Restaurant Specific'::"Action_groups"),
+         ('0b4d7f92-6c81-43a5-b7e0-2f9a1c8d5e36', 'Manage User Passwords', 'Reset staff passwords and handle password-reset requests', 'Roles'::"Action_groups")
+       on conflict (id) do nothing`,
+    ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
+  });
+}
+
 // Latest known purchase cost per ingredient (from the StockMovements ledger).
 async function getLatestUnitCosts(context: RestaurantContext, client?: PoolClient): Promise<Map<string, number>> {
   await ensureStockMovementsTable(client);
@@ -5389,6 +5536,39 @@ export async function SaveMenuItems(
   });
 }
 
+// Update ONLY a menu item's price: the stored description-JSON is re-encoded
+// with every other field (image/availability/modifiers/recipe/station/allergens)
+// preserved verbatim, and name/category are untouched. Used by the
+// menu-insights "apply price suggestion" flow so a price change can never
+// clobber the rest of the item (PUT /menu is a full-menu replace).
+export async function UpdateMenuItemPrice(
+  restaurantId: string,
+  itemId: string,
+  price: number,
+): Promise<{ id: string; name: string; price: number }> {
+  const newPrice = round2(Number(price));
+  if (!Number.isFinite(newPrice) || newPrice <= 0) throw new Error("Price must be a positive number");
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const rows = await runQuery<{ id: string; name: string; description: string | null }>(
+      `select id, name, description from "Menu"
+         where id = $1 and res_id = $2 and outlet_id = $3
+         limit 1
+         for update`,
+      [itemId, context.res_id, context.outlet_id],
+      client,
+    );
+    if (!rows[0]) throw new Error("Menu item not found");
+    const existing = parseMenuDescription(rows[0].description);
+    await runQuery(
+      `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
+      [itemId, context.res_id, context.outlet_id, encodeMenuDescription({ ...existing, price: newPrice })],
+      client,
+    );
+    return { id: rows[0].id, name: rows[0].name, price: newPrice };
+  });
+}
+
 // Rename a kitchen section ACROSS the menu: every item whose station matches
 // `from` (case-insensitive) is re-encoded with station = `to`, in one
 // transaction, preserving every other description-JSON field verbatim.
@@ -6085,19 +6265,17 @@ export async function BarkOrder(
     return { barked_at: new Date(rows[0].barked_at).toISOString(), already_barked: true };
   }
   if (Number(rows[0].status ?? 0) === 5) throw new Error("A cancelled order cannot be barked");
+  // An order still awaiting approval (Pending, status 8) must be ACCEPTED to the
+  // kitchen first — barking no longer implies acceptance. Block it here.
+  if (Number(rows[0].status ?? 0) === 8) throw new Error("Order is awaiting approval — accept it to the kitchen before barking.");
 
   const nowIso = new Date().toISOString();
-  // Barking a Pending order implies acceptance — it moves to Preparing too
-  // (status expressions read the OLD row values, so both refer to pre-update 8).
+  // Bark only stamps the timing gate; the order is already accepted (Preparing).
   await runQuery(
     `
       update "Orders"
       set barked_at = $1,
-          barked_by = $2,
-          status = case when status = 8 then 1 else status end,
-          food = case when status = 8
-            then jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb('Preparing'::text), true)
-            else food::jsonb end
+          barked_by = $2
       where id = $3 and res_id = $4 and outlet_id = $5
     `,
     [nowIso, barkedBy ?? null, orderId, context.res_id, context.outlet_id],
@@ -7304,15 +7482,18 @@ export async function MergeTableBills(
       );
     }
 
-    // Close the source table's open bill and free it.
+    // Close the source table's open bill and free it. Its money moved to the
+    // destination bill (which snapshots the tax-inclusive grand total at settle),
+    // so zero this row — a merge-closed bill left holding the pre-tax running sum
+    // would be double-counted (and tax-free) in the settled-bills revenue basis.
     await runQuery(
-      `update "Bills" set closed_at = now(), closed_by_username = 'merge'
+      `update "Bills" set closed_at = now(), closed_by_username = 'merge', total_amt = 0, tax_breakdown = '[]'::jsonb
          where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null`,
       [fromId, context.res_id, context.outlet_id],
       client,
     );
     await runQuery(
-      `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null where id = $1 and res_id = $2 and outlet_id = $3`,
+      `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null where id = $1 and res_id = $2 and outlet_id = $3`,
       [fromId, context.res_id, context.outlet_id],
       client,
     );
@@ -9777,7 +9958,7 @@ export async function ApproveBillPaymentByAdmin(
     try { await awardLoyaltyForSettledBill(context, tableId, client); } catch (err) { logger.warn({ err }, "loyalty_award_failed"); }
     await completeSeatedBookingsForTable(context, tableId, client);
     await runQuery(
-      `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null where id = $1 and res_id = $2 and outlet_id = $3`,
+      `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null where id = $1 and res_id = $2 and outlet_id = $3`,
       [tableId, context.res_id, context.outlet_id],
       client,
     );
@@ -9864,7 +10045,7 @@ async function provisionVirtualTable(
 async function softDeleteIfVirtual(context: RestaurantContext, tableId: string, client?: PoolClient): Promise<void> {
   try {
     await runQuery(
-      `update "Tables" set is_deleted = true, is_occupied = false
+      `update "Tables" set is_deleted = true, is_occupied = false, order_otp = null
          where id = $1 and res_id = $2 and outlet_id = $3 and coalesce(is_virtual, false) = true`,
       [tableId, context.res_id, context.outlet_id],
       client,
@@ -10114,7 +10295,7 @@ export async function CloseBillByOrder(
         await runQuery(
           `
             update "Tables"
-            set is_occupied = false, num_covers = 1
+            set is_occupied = false, num_covers = 1, order_otp = null
             where id = $1 and res_id = $2 and outlet_id = $3
           `,
           [billTableId, context.res_id, context.outlet_id],
@@ -10220,7 +10401,7 @@ export async function FinalizeOnlinePayment(
     await closeActiveOrdersForTable(context, tableId, client, 4); // Paid
     await completeSeatedBookingsForTable(context, tableId, client);
     await runQuery(
-      `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null
+      `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null
          where id = $1 and res_id = $2 and outlet_id = $3`,
       [tableId, context.res_id, context.outlet_id],
       client,
@@ -10938,6 +11119,8 @@ export async function SeatWaitlistEntry(
       [tableId, context.res_id, context.outlet_id, party],
       client,
     );
+    // Seating from the queue mints the table's ordering code when the gate is on.
+    await ensureTableOtpOnOccupy(context, tableId, client);
     await runQuery(`update "Waitlist" set table_id = $1 where id = $2 and res_id = $3`, [tableId, id, context.res_id], client);
     if (actorEmployeeId && isUuid(actorEmployeeId)) {
       try {
@@ -12596,6 +12779,9 @@ export async function GetMonthlyApcInsights(
 
 export type DishStat = { name: string; category: string; quantity: number; revenue: number; orders: number; current_price: number | null };
 export type PriceSuggestion = {
+  // Menu item UUID (null only if the sold name no longer matches a menu row) —
+  // clients apply a suggestion via PATCH /menu/:id/price with this id.
+  id: string | null;
   name: string;
   category: string;
   current_price: number;
@@ -12717,6 +12903,7 @@ export async function GetMenuPerformanceInsights(
     const price = d.current_price as number;
     if (hotSellers.has(d.name.toLowerCase()) && d.quantity >= 5) {
       price_suggestions.push({
+        id: menuByName.get(d.name.toLowerCase())?.id ?? null,
         name: d.name,
         category: d.category,
         current_price: price,
@@ -12730,6 +12917,7 @@ export async function GetMenuPerformanceInsights(
   for (const mv of slow_movers) {
     if (mv.current_price && mv.current_price > 0 && mv.quantity <= 2) {
       price_suggestions.push({
+        id: menuByName.get(mv.name.toLowerCase())?.id ?? null,
         name: mv.name,
         category: mv.category,
         current_price: mv.current_price,
@@ -12959,6 +13147,16 @@ async function ensureBrandingColumns(): Promise<void> {
   // wall-clock times are interpreted in this zone so a UTC prod server stores the
   // correct instant; the public reserve/queue pages read it via branding.
   await runQuery(`alter table "Restaurant" add column if not exists timezone text default 'Asia/Kolkata'`);
+  // Per-table ordering OTP gate. When ON, a table that staff seat gets a random
+  // 4-digit code (see Tables.order_otp); guests must enter it before the QR page
+  // will place an order — stops a passer-by ordering to an occupied table they
+  // aren't sitting at. Default OFF (existing behaviour: no code needed).
+  await runQuery(`alter table "Restaurant" add column if not exists require_table_otp boolean default false`);
+  // Rich customer-page branding: a sanitized JSON customization object (font +
+  // colors + header/button style — see sanitizeBrandConfigInput / BrandConfig).
+  // Null means "never customized" — the read layer applies sane defaults and
+  // falls the primary colour back to the logo palette / theme_color.
+  await runQuery(`alter table "Restaurant" add column if not exists brand_config jsonb default null`);
   brandingColsEnsured = true;
 }
 
@@ -13334,6 +13532,82 @@ export function sanitizeInventoryCategories(raw: unknown): string[] {
   return out;
 }
 
+// --- Rich customer-page branding (brand_config) ----------------------------
+// Curated font allowlist the customer-facing pages may use — a small, safe set
+// the UIs render as a dropdown. Anything outside this list is dropped on write
+// (the page then uses its default/system font). Kept as a plain string[] so it
+// can be returned verbatim to the clients as `brand_fonts`.
+export const BRAND_FONTS: string[] = [
+  "Inter",
+  "Poppins",
+  "Playfair Display",
+  "Montserrat",
+  "Lato",
+  "Nunito",
+  "Oswald",
+  "Roboto Slab",
+  "DM Sans",
+  "Merriweather",
+];
+
+// A tenant's customer-page customization. Every key is optional at the storage
+// layer (only provided, valid keys are persisted); the read layer applies sane
+// defaults (see resolveBrandConfig).
+export type BrandConfig = {
+  font?: string;
+  color_primary?: string;
+  color_secondary?: string;
+  color_bg?: string;
+  color_text?: string;
+  color_card?: string;
+  header_style?: "gradient" | "solid";
+  button_shape?: "rounded" | "pill" | "square";
+};
+
+const BRAND_HEX_RE = /^#[0-9a-fA-F]{6}$/;
+const BRAND_COLOR_KEYS = ["color_primary", "color_secondary", "color_bg", "color_text", "color_card"] as const;
+
+// Validate a customization payload down to the STORED subset: only the keys the
+// caller actually provided AND that pass validation survive (invalid colours,
+// unknown fonts and bad enums are silently dropped). Returning just the valid
+// provided keys lets SetBranding merge-on-omit (jsonb ||) without a bad value
+// ever landing in the column.
+export function sanitizeBrandConfigInput(raw: unknown): BrandConfig {
+  const s = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const out: BrandConfig = {};
+  if (typeof s.font === "string" && BRAND_FONTS.includes(s.font.trim())) out.font = s.font.trim();
+  for (const key of BRAND_COLOR_KEYS) {
+    const v = s[key];
+    if (typeof v === "string" && BRAND_HEX_RE.test(v.trim())) out[key] = v.trim();
+  }
+  if (s.header_style === "gradient" || s.header_style === "solid") out.header_style = s.header_style;
+  if (s.button_shape === "rounded" || s.button_shape === "pill" || s.button_shape === "square") out.button_shape = s.button_shape;
+  return out;
+}
+
+// Read-time view of the stored brand_config with sane defaults applied so the
+// UIs never have to null-check a key. color_primary falls back to the extracted
+// logo primary (themePrimary) then theme_color, so tenants that only ever set a
+// theme colour look exactly as before. Colours the tenant never set stay absent
+// (the pages keep their own hardcoded fallbacks for those surfaces).
+export function resolveBrandConfig(stored: unknown, themePrimary: string | null, themeColor: string | null): BrandConfig {
+  const c = sanitizeBrandConfigInput(stored);
+  const primaryFallback = themePrimary && BRAND_HEX_RE.test(themePrimary)
+    ? themePrimary
+    : themeColor && BRAND_HEX_RE.test(themeColor) ? themeColor : undefined;
+  const colorPrimary = c.color_primary ?? primaryFallback;
+  return {
+    font: c.font ?? "Inter",
+    header_style: c.header_style ?? "gradient",
+    button_shape: c.button_shape ?? "pill",
+    ...(colorPrimary ? { color_primary: colorPrimary } : {}),
+    ...(c.color_secondary ? { color_secondary: c.color_secondary } : {}),
+    ...(c.color_bg ? { color_bg: c.color_bg } : {}),
+    ...(c.color_text ? { color_text: c.color_text } : {}),
+    ...(c.color_card ? { color_card: c.color_card } : {}),
+  };
+}
+
 export type RestaurantSettings = {
   auto_push_orders: boolean;
   currency: string;
@@ -13372,6 +13646,13 @@ export type RestaurantSettings = {
   inventory_categories: string[];
   // IANA timezone reservation wall-clock times are interpreted in.
   timezone: string;
+  // Whether guests must enter a per-table OTP before ordering from the QR page.
+  require_table_otp: boolean;
+  // Rich customer-page branding (resolved with defaults — see resolveBrandConfig)
+  // so the admin UI can prefill the editor.
+  brand_config: BrandConfig;
+  // The curated font allowlist the branding editor renders as a dropdown.
+  brand_fonts: string[];
 };
 
 // Basic sanitization for an uploaded SVG logo: cap the size and strip the
@@ -13403,8 +13684,8 @@ export async function GetRestaurantSettings(
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null }>(
-    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, queue_show_menu, kitchen_sections, inventory_categories, timezone from "Restaurant" where id = $1 limit 1`,
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
+    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, queue_show_menu, kitchen_sections, inventory_categories, timezone, require_table_otp, theme_color, brand_config from "Restaurant" where id = $1 limit 1`,
     [context.res_id],
   );
   const taxRows = await runQuery<{ default_tax: unknown }>(
@@ -13448,12 +13729,19 @@ export async function GetRestaurantSettings(
     kitchen_sections: sanitizeKitchenSections(rows[0]?.kitchen_sections),
     inventory_categories: sanitizeInventoryCategories(rows[0]?.inventory_categories),
     timezone: sanitizeTimezone(rows[0]?.timezone),
+    require_table_otp: rows[0]?.require_table_otp === true,
+    // Admin editor prefill: the stored customization resolved with defaults
+    // (color_primary falls back to theme_color here — the logo-extracted palette
+    // is only resolved on the public branding path to keep this admin read cheap)
+    // plus the curated font allowlist for the dropdown.
+    brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
+    brand_fonts: [...BRAND_FONTS],
   };
 }
 
 export async function SetRestaurantSettings(
   restaurantId: string,
-  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string },
+  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean },
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
@@ -13534,7 +13822,9 @@ export async function SetRestaurantSettings(
   // Timezone: only written when a non-empty string is sent; an invalid IANA id
   // falls back to Asia/Kolkata (sanitizeTimezone). null leaves it unchanged.
   const timezone = typeof opts.timezone === "string" && opts.timezone.trim() ? sanitizeTimezone(opts.timezone) : null;
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null }>(
+  // Per-table OTP gate: only written when a boolean is sent (null leaves it as-is).
+  const requireTableOtp = typeof opts.require_table_otp === "boolean" ? opts.require_table_otp : null;
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
     `update "Restaurant" set
        auto_push_orders = coalesce($2, auto_push_orders),
        currency = coalesce($3, currency),
@@ -13562,9 +13852,10 @@ export async function SetRestaurantSettings(
        msg_reminder_hours = coalesce($25, msg_reminder_hours),
        kitchen_sections = coalesce($26::jsonb, kitchen_sections),
        timezone = coalesce($27, timezone),
-       inventory_categories = coalesce($28::jsonb, inventory_categories)
+       inventory_categories = coalesce($28::jsonb, inventory_categories),
+       require_table_otp = coalesce($29, require_table_otp)
      where id = $1
-     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone`,
+     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone, require_table_otp, theme_color, brand_config`,
     [
       context.res_id,
       typeof opts.auto_push_orders === "boolean" ? opts.auto_push_orders : null,
@@ -13594,6 +13885,7 @@ export async function SetRestaurantSettings(
       kitchenSections,
       timezone,
       inventoryCategories,
+      requireTableOtp,
     ],
   );
   // First messaging save: mint the webhook secret (Meta hub.verify_token +
@@ -13650,6 +13942,11 @@ export async function SetRestaurantSettings(
     kitchen_sections: sanitizeKitchenSections(rows[0]?.kitchen_sections),
     inventory_categories: sanitizeInventoryCategories(rows[0]?.inventory_categories),
     timezone: sanitizeTimezone(rows[0]?.timezone),
+    require_table_otp: rows[0]?.require_table_otp === true,
+    // brand_config isn't written here (branding is set via SetBranding), but the
+    // type requires it — echo the current stored value resolved with defaults.
+    brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
+    brand_fonts: [...BRAND_FONTS],
   };
 }
 
@@ -13765,11 +14062,11 @@ export async function ExtractLogoPalette(logoRef: string | null): Promise<{ prim
 
 export async function GetPublicBranding(
   restaurantId: string,
-): Promise<{ logo_url: string | null; theme_color: string | null; theme_primary: string | null; theme_secondary: string | null; currency: string; payment_methods: PaymentMethodConfig[]; restaurant_name: string; feedback_config: FeedbackConfig; bill_logo_svg: string; queue_show_menu: boolean; timezone: string }> {
+): Promise<{ logo_url: string | null; theme_color: string | null; theme_primary: string | null; theme_secondary: string | null; currency: string; payment_methods: PaymentMethodConfig[]; restaurant_name: string; feedback_config: FeedbackConfig; bill_logo_svg: string; queue_show_menu: boolean; timezone: string; require_table_otp: boolean; brand_config: BrandConfig }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const rows = await runQuery<{ logo: string | null; theme_color: string | null; currency: string | null; payment_config: unknown; feedback_config: unknown; res_name: string | null; bill_logo_svg: string | null; queue_show_menu: boolean | null; timezone: string | null }>(
-    `select logo, theme_color, currency, payment_config, feedback_config, res_name, bill_logo_svg, queue_show_menu, timezone from "Restaurant" where id = $1 limit 1`,
+  const rows = await runQuery<{ logo: string | null; theme_color: string | null; currency: string | null; payment_config: unknown; feedback_config: unknown; res_name: string | null; bill_logo_svg: string | null; queue_show_menu: boolean | null; timezone: string | null; require_table_otp: boolean | null; brand_config: unknown }>(
+    `select logo, theme_color, currency, payment_config, feedback_config, res_name, bill_logo_svg, queue_show_menu, timezone, require_table_otp, brand_config from "Restaurant" where id = $1 limit 1`,
     [context.res_id],
   );
   const palette = await ExtractLogoPalette(rows[0]?.logo ?? null);
@@ -13789,27 +14086,45 @@ export async function GetPublicBranding(
     // Restaurant timezone so the public reserve/queue pages can render + submit
     // wall-clock times in the correct zone.
     timezone: sanitizeTimezone(rows[0]?.timezone),
+    // Guest QR page reads this to know whether to prompt for the table OTP.
+    require_table_otp: rows[0]?.require_table_otp === true,
+    // Rich customer-page customization with defaults applied; color_primary
+    // falls back to the logo palette / theme_color so existing tenants are
+    // visually unchanged.
+    brand_config: resolveBrandConfig(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
   };
 }
 
 export async function SetBranding(
   restaurantId: string,
-  opts: { logo_url?: string | null; theme_color?: string | null; queue_show_menu?: boolean },
-): Promise<{ logo_url: string | null; theme_color: string | null; queue_show_menu: boolean }> {
+  opts: { logo_url?: string | null; theme_color?: string | null; queue_show_menu?: boolean; brand_config?: unknown },
+): Promise<{ logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: BrandConfig }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const rows = await runQuery<{ logo: string | null; theme_color: string | null; queue_show_menu: boolean | null }>(
+  // brand_config: only touched when provided. Merge-on-omit — the sanitized
+  // (provided, valid keys only) object is jsonb-concatenated onto the stored
+  // one, so keys the caller didn't send keep their current value. An unset/null
+  // column starts from '{}'. Invalid keys were already dropped by the sanitizer.
+  const brandConfig = opts.brand_config !== undefined ? JSON.stringify(sanitizeBrandConfigInput(opts.brand_config)) : null;
+  const rows = await runQuery<{ logo: string | null; theme_color: string | null; queue_show_menu: boolean | null; brand_config: unknown }>(
     `
       update "Restaurant" set
         logo = coalesce($2, logo),
         theme_color = coalesce($3, theme_color),
-        queue_show_menu = coalesce($4, queue_show_menu)
+        queue_show_menu = coalesce($4, queue_show_menu),
+        brand_config = case when $5::jsonb is null then brand_config else coalesce(brand_config, '{}'::jsonb) || $5::jsonb end
       where id = $1
-      returning logo, theme_color, queue_show_menu
+      returning logo, theme_color, queue_show_menu, brand_config
     `,
-    [context.res_id, opts.logo_url ?? null, opts.theme_color ?? null, typeof opts.queue_show_menu === "boolean" ? opts.queue_show_menu : null],
+    [context.res_id, opts.logo_url ?? null, opts.theme_color ?? null, typeof opts.queue_show_menu === "boolean" ? opts.queue_show_menu : null, brandConfig],
   );
-  return { logo_url: rows[0]?.logo ?? null, theme_color: rows[0]?.theme_color ?? null, queue_show_menu: rows[0]?.queue_show_menu ?? true };
+  const palette = await ExtractLogoPalette(rows[0]?.logo ?? null);
+  return {
+    logo_url: rows[0]?.logo ?? null,
+    theme_color: rows[0]?.theme_color ?? null,
+    queue_show_menu: rows[0]?.queue_show_menu ?? true,
+    brand_config: resolveBrandConfig(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
+  };
 }
 
 // --- Staff notifications (bell) --------------------------------------------
@@ -15064,6 +15379,74 @@ export async function GetRestaurantEmployeeCount(restaurantId: string): Promise<
   return Number(rows[0]?.n ?? 0);
 }
 
+// Pre-auth / public: list a restaurant's outlets (id + name ONLY) for the login
+// outlet picker. Resolves the restaurant EXACTLY like login does (slug OR id),
+// RLS-safe, mirroring resolveRestaurantContext's res_id resolution. An unknown
+// restaurant returns [] (the caller surfaces {outlets:[]} with 200 so existence
+// is never revealed). Never returns addresses/phones/revenue — names + ids only.
+export async function GetRestaurantOutletsPublic(
+  slugOrId: string,
+): Promise<{ id: string; name: string }[]> {
+  const raw = String(slugOrId ?? "").trim();
+  if (!raw) return [];
+  const normalized = normalizeRestaurantId(raw);
+  const rows = await runQuery<{ id: string; name: string | null }>(
+    `
+      select o.id as id, o.outlet_name as name
+      from "Restaurant" r
+      join "Outlets" o on o.res_id = r.id
+      where
+        lower(r.res_username) = lower($1)
+        or lower(r.res_username) = lower($2)
+        or r.id::text = $3
+      order by o.created_at asc
+    `,
+    [raw, normalized, raw],
+  );
+  return rows.map((r) => ({ id: r.id, name: r.name ?? "" }));
+}
+
+// The restaurant OWNER (superadmin) is the earliest-created admin login across
+// ALL outlets of the restaurant — STABLE regardless of the active/selected
+// outlet. Falls back to the earliest login overall if no admin currently holds
+// the role. Takes the res_id (UUID) directly. This deliberately IGNORES the
+// active outlet / all-outlets mode so the owner never changes as outlets switch.
+async function resolveRestaurantOwnerId(resId: string, client?: PoolClient): Promise<string | null> {
+  const adminRows = await runQuery<{ employee_id: string }>(
+    `
+      select e.id as employee_id
+      from "Login" l
+      join "Employees" e
+        on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      where l.res_id = $1
+        and (
+          lower(coalesce(e.emp_roles->>'primary', '')) = 'admin'
+          or e.emp_roles::text ilike '%"admin"%'
+        )
+      order by l.created_at asc
+      limit 1
+    `,
+    [resId],
+    client,
+  );
+  if (adminRows[0]?.employee_id) return adminRows[0].employee_id;
+
+  const anyRows = await runQuery<{ employee_id: string }>(
+    `
+      select e.id as employee_id
+      from "Login" l
+      join "Employees" e
+        on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      where l.res_id = $1
+      order by l.created_at asc
+      limit 1
+    `,
+    [resId],
+    client,
+  );
+  return anyRows[0]?.employee_id ?? null;
+}
+
 export async function GetRestaurantUsers(
   restaurantId: string,
 ): Promise<RestaurantUser[]> {
@@ -15114,11 +15497,17 @@ export async function GetRestaurantUsers(
     is_superadmin: false,
   }));
 
-  // The superadmin is the restaurant owner: the earliest-created admin login
-  // (rows are already ordered by created_at asc). Falls back to the very first
-  // user if, for some reason, no one currently holds the admin role.
-  const owner = mapped.find((u) => u.role === "admin" || (u.role_all ?? []).includes("admin")) ?? mapped[0];
-  if (owner) owner.is_superadmin = true;
+  // The superadmin is the restaurant OWNER — the earliest-created admin login
+  // across ALL outlets (resolved once, independent of the currently-viewed
+  // outlet). Flag whichever row in this outlet-scoped list is that owner. If the
+  // owner isn't a user of the viewed outlet, no row is flagged here (correct —
+  // they aren't in this outlet), but the owner id itself stays stable everywhere.
+  const ownerId = await resolveRestaurantOwnerId(context.res_id);
+  if (ownerId) {
+    for (const u of mapped) {
+      if (u.employee_id === ownerId) u.is_superadmin = true;
+    }
+  }
 
   return mapped;
 }
@@ -15126,8 +15515,10 @@ export async function GetRestaurantUsers(
 // The owner employee id (superadmin) for a restaurant — the earliest-created
 // admin. Used to protect the owner from removal / password reset by others.
 export async function GetSuperadminEmployeeId(restaurantId: string): Promise<string | null> {
-  const users = await GetRestaurantUsers(restaurantId);
-  return users.find((u) => u.is_superadmin)?.employee_id ?? null;
+  // Resolve directly against ALL outlets so the owner is STABLE regardless of the
+  // active outlet — do NOT route through the outlet-scoped GetRestaurantUsers.
+  const context = await requireRestaurantContext(restaurantId);
+  return resolveRestaurantOwnerId(context.res_id);
 }
 
 // Admin sets/resets a user's login password directly (rehashes + stores it).
@@ -15259,17 +15650,12 @@ export async function DeleteRestaurantUser(
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client, outletId);
 
-    // The superadmin (owner = earliest-created admin) cannot be removed by anyone.
-    const ownerRows = await runQuery<{ emp_id: string }>(
-      `select l.emp_id from "Login" l
-         join "Employees" e on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
-        where l.res_id = $1 and l.outlet_id = $2
-          and (e.emp_roles->>'primary' = 'admin' or e.emp_roles::text ilike '%"admin"%')
-        order by l.created_at asc limit 1`,
-      [context.res_id, context.outlet_id],
-      client,
-    );
-    if (ownerRows[0]?.emp_id === employeeId) {
+    // The restaurant OWNER (superadmin) — the earliest-created admin across ALL
+    // outlets — cannot be removed by anyone, from any outlet. Resolve it
+    // restaurant-wide (NOT the earliest admin of the currently-viewed outlet) so
+    // protection is STABLE and only ever shields the real owner.
+    const ownerId = await resolveRestaurantOwnerId(context.res_id, client);
+    if (ownerId && ownerId === employeeId) {
       throw new Error("The restaurant owner (superadmin) cannot be removed.");
     }
 
@@ -15373,8 +15759,22 @@ export async function AuthenticateRestaurantEmployee(
   restaurantId: string,
   employeeUsername: string,
   password: string,
+  outletId?: string,
 ): Promise<EmployeeLoginResult | null> {
-  const context = await requireRestaurantContext(restaurantId);
+  // Optional explicit outlet: employee identity is PER-OUTLET, so the login
+  // screen lets the user pick which outlet to sign into. Thread the chosen outlet
+  // through as the outletOverride so the credential query binds to it. Omitted /
+  // empty → unchanged (defaults to the restaurant's first/oldest outlet).
+  const chosenOutlet = typeof outletId === "string" ? outletId.trim() : "";
+  const context = await requireRestaurantContext(restaurantId, undefined, chosenOutlet || undefined);
+  // The login outlet picker always sends an outlet ID. If an explicit outlet was
+  // requested but did NOT resolve to that exact outlet of this restaurant,
+  // resolveRestaurantContext silently falls back to the default outlet — reject
+  // here (clean 401 upstream, never a 500) rather than authenticating against the
+  // wrong/default outlet.
+  if (chosenOutlet && context.outlet_id !== chosenOutlet) {
+    return null;
+  }
   const normalizedEmployeeUsername = employeeUsername.trim();
   if (!normalizedEmployeeUsername) return null;
 
