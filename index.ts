@@ -182,6 +182,7 @@ import {
 	GetMenuPerformanceInsights,
 	OrderTimingAction,
 	GetTimingStats,
+	GetKitchenAnalytics,
 	FireOrderItems,
 	GetExpoView,
 	FIRE_COURSE_ACTION_ID,
@@ -3827,7 +3828,7 @@ app.get("/audit-logs", validateAction("91b24293-7b88-4fe4-8cf5-deb6faaba4f5"), a
 //   403 no-permission | 404 not-found
 //   400 not-allowlisted / blocklisted / missing-before-state / too-old
 //       / cannot-restore-null / cannot-restore-key / target-name-taken
-//   409 already-undone / superseded / target-gone
+//   409 already-undone / superseded / target-gone / bill-settled
 //
 // The whole reversal (re-evaluation, the compensating write, and the appended
 // undo row) runs in ONE transaction with the original row locked FOR UPDATE, so
@@ -3882,7 +3883,7 @@ app.post("/audit-logs/:id/undo", validate, async (req: Request, res: Response) =
 			? 404
 			: result.code === "failed"
 				? (result.required_action_id ? 403 : 400)
-				: (["already_undone", "superseded", "target_gone"].includes(result.code) ? 409 : 400);
+				: (["already_undone", "superseded", "target_gone", "bill_settled"].includes(result.code) ? 409 : 400);
 		res.status(status).json({ error: result.message, reason: result.code });
 	} catch (err) {
 		logger.error({ err }, "audit_undo_failed");
@@ -4330,7 +4331,11 @@ const UNDO_SECRET_SETTING_KEYS = new Set(["razorpay_key_secret", "msg_key_secret
 
 // Diff two settings snapshots into an undo envelope covering ONLY the keys that
 // actually changed. Returns null when nothing reversible changed.
-function buildSettingsUndo(prior: Record<string, unknown> | null, next: Record<string, unknown>): Record<string, unknown> | null {
+function buildSettingsUndo(priorIn: unknown, nextIn: unknown): Record<string, unknown> | null {
+	// Accept any settings-shaped object (interfaces lack an index signature, so we
+	// widen at the boundary and treat the payloads as key bags for the diff).
+	const prior = priorIn as Record<string, unknown> | null;
+	const next = (nextIn ?? {}) as Record<string, unknown>;
 	if (!prior) {return null;}
 	const before: Record<string, unknown> = {};
 	const after: Record<string, unknown> = {};
@@ -4347,9 +4352,14 @@ function buildSettingsUndo(prior: Record<string, unknown> | null, next: Record<s
 // Diff two branding snapshots. Top-level fields keep their own names; every
 // other key comes from brand_config and is restored back into it.
 function buildBrandingUndo(
-	prior: { logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: Record<string, unknown> } | null,
-	next: { logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: Record<string, unknown> },
+	priorIn: unknown,
+	nextIn: unknown,
 ): Record<string, unknown> | null {
+	// Callers pass richer branding snapshots (GetPublicBranding / SetBranding
+	// results whose brand_config is a typed interface); widen at the boundary.
+	type BrandingSnap = { logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: Record<string, unknown> };
+	const prior = priorIn as BrandingSnap | null;
+	const next = nextIn as BrandingSnap;
 	if (!prior) {return null;}
 	const before: Record<string, unknown> = {};
 	const after: Record<string, unknown> = {};
@@ -4816,10 +4826,29 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 	const status = typeof req.body?.status === "string" ? req.body.status.trim() : "";
 	if (!orderId || !status) { res.status(400).json({ error: "orderId and status are required" }); return; }
 	try {
-		const ok = await SetOrderStatus(restaurantId, orderId, status);
-		if (!ok) { res.status(404).json({ error: "Order not found" }); return; }
+		const result = await SetOrderStatus(restaurantId, orderId, status);
+		if (!result.ok) { res.status(404).json({ error: "Order not found" }); return; }
+		// Re-cancelling an order that is already Cancelled is an idempotent no-op:
+		// nothing was written, so nothing is logged (and no second undo envelope
+		// is recorded for the same cancellation).
+		if (!result.changed) { res.json({ success: true, unchanged: true }); return; }
+		// A transition INTO Cancelled is the one order-status change that is
+		// undoable — record the before-state envelope the undo registry reads
+		// (see UNDO_REGISTRY.order_cancel). Every other status change stays
+		// deny-by-default: no envelope, no undo.
+		const isCancel = status.trim().toLowerCase() === "cancelled" || status.trim().toLowerCase() === "canceled";
+		const undoEnvelope = isCancel && result.previous_status
+			? {
+				undo: {
+					kind: "order_cancel",
+					target_id: orderId,
+					before: { status: result.previous_status },
+					after: { status: "Cancelled" },
+				},
+			}
+			: {};
 		try {
-			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Order ${orderId} -> ${status}`, Audit_log_category.Orders, { order_id: orderId, status });
+			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Order ${orderId} -> ${status}`, Audit_log_category.Orders, { order_id: orderId, status, ...undoEnvelope });
 		} catch (e) { logger.warn({ err: e }, "log_audit order status failed"); }
 		res.json({ success: true });
 	} catch (error: any) {
@@ -5153,6 +5182,17 @@ app.get("/orders/timing-stats", validateAction("df75119b-e5f1-4f38-aba5-78a1cf18
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try { res.json(await GetTimingStats(restaurantId)); }
 	catch (err) { logger.error({ err }, "timing_stats_failed"); res.status(500).json({ error: "Unable to fetch timing stats" }); }
+});
+
+// Kitchen analytics: per-dish prep time, per-section (station) averages and an
+// order-level prep summary over the last `days` days (default 30, clamped 1..365).
+app.get("/analytics/kitchen", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
+	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
+	try { res.json(await GetKitchenAnalytics(restaurantId, days)); }
+	catch (err) { logger.error({ err }, "kitchen_analytics_failed"); res.status(500).json({ error: "Unable to fetch kitchen analytics" }); }
 });
 
 // Daily revenue/order series for trend charts.

@@ -4479,6 +4479,25 @@ const AUDIT_UNDO_BLOCKLIST = new Set<string>([
   "df75119b-e5f1-4f38-aba5-78a1cf182f56", // View Order APC
 ]);
 
+/**
+ * DELIBERATE, USER-REQUESTED CARVE-OUT in the blocklist above — the ONLY one.
+ *
+ * The house rule is: "Cancelled orders cannot be modified, once cancelled its
+ * permanently cancelled. Only undo from the audit logs can be done." That makes
+ * the audit-log undo the single sanctioned reversal of a cancellation, but the
+ * cancel is recorded under "Add Orders" (4ad474d4…), which is blocklisted as
+ * part of the order lifecycle — so without this, the one sanctioned route would
+ * be vetoed before the registry is ever reached.
+ *
+ * This does NOT weaken deny-by-default. The exemption is consulted ONLY for an
+ * entry that carries this exact envelope kind AND whose action_id is that
+ * kind's own action_id (see evaluateAuditUndo). Everything else on the
+ * blocklist stays permanently refused, an entry with no envelope is still
+ * refused, and no other order action (bark, fire, serve, status changes that
+ * are not a cancellation) is undoable — none of them writes an `undo` envelope.
+ */
+const UNDO_BLOCKLIST_EXEMPT_KINDS = new Set<string>(["order_cancel"]);
+
 /** The before/after envelope a route writes under additional_details.undo. */
 export interface AuditUndoEnvelope {
   kind: string;
@@ -4496,7 +4515,7 @@ interface UndoStateCache { settings?: RestaurantSettings; branding?: Record<stri
  * up-front (in GET /audit-logs too, via undoable=false) instead of reporting
  * success after a no-op write.
  */
-interface UndoBlock { code: "cannot_restore_null" | "cannot_restore_key" | "target_name_taken"; message: string }
+interface UndoBlock { code: "cannot_restore_null" | "cannot_restore_key" | "target_name_taken" | "bill_settled"; message: string }
 
 interface UndoRegistryEntry {
   /** Permission needed to have PERFORMED the original action — also required to undo it. */
@@ -5009,7 +5028,100 @@ const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
       return { quantity: round2(num(env.before.quantity)), compensating_delta: round2(-delta) };
     },
   },
+
+  // --- Order cancellation (PATCH /orders/:id/status -> Cancelled) ----------
+  // The ONLY sanctioned way back from the terminal Cancelled state (see
+  // ORDER_CANCELLED_MESSAGE). Undo restores the exact status the order held
+  // before the cancel, through the private writeOrderStatusForUndo bypass.
+  //
+  // Cancelling has no other side effect to compensate: the codebase never
+  // deducts inventory when an order is placed (recipes are used for THEORETICAL
+  // costing only — see GetMenuCosting/StockMovements, which is fed exclusively by
+  // manual receive/wastage/issue), and a table's bill total is RECOMPUTED live
+  // from its non-cancelled orders (sumOrderTotalsForTable) rather than stored as
+  // a running tally. So putting the status back is a complete reversal.
+  order_cancel: {
+    action_id: "4ad474d4-5230-449c-874f-6a238b833bca", // Add Orders (the order permission)
+    before_keys: ["status"],
+    async current(restaurantId, env, _cache, client) {
+      const context = await requireRestaurantContext(restaurantId, client);
+      const code = await readOrderStatusCode(context, str(env.target_id), client);
+      return code === null ? null : { status: fromOrderStatusCode(code) };
+    },
+    // Supersession: the order must STILL be cancelled. Anything else means a
+    // later change owns the status and this undo must not clobber it.
+    matches: (cur, env) => str(cur["status"]) === "Cancelled" && str(env.after["status"]) === "Cancelled",
+    async blocked(restaurantId, env, _cache, client) {
+      // Never restore INTO another terminal/settled state — an entry claiming a
+      // prior status of Paid/Closed/Cancelled cannot have been a real cancel.
+      const before = str(env.before["status"]);
+      if (!before || ["Cancelled", "Paid", "Closed"].includes(before)) {
+        return { code: "cannot_restore_key", message: "The status recorded before this cancellation cannot be restored." };
+      }
+      // THE MONEY GUARD.
+      return orderCancelBillBlock(restaurantId, str(env.target_id), client);
+    },
+    async execute(restaurantId, env, _actorId, client) {
+      const status = str(env.before["status"]);
+      if (!client) {throw new Error("Undoing a cancellation requires the undo transaction");}
+      const ok = await writeOrderStatusForUndo(restaurantId, str(env.target_id), status, client);
+      if (!ok) {throw new Error("Order no longer exists");}
+      return { status };
+    },
+  },
 };
+
+/**
+ * Money guard for `order_cancel`: refuse the undo once the bill this order sat
+ * on has moved on. Un-cancelling into a settled bill would retroactively change
+ * money that has already been taken (and would drop a live order onto a table
+ * whose session is over), so it is refused instead.
+ *
+ * Two signals, both read off "Bills" (which is where settlement is recorded):
+ *   1. the table's OPEN bill is already awaiting or past payment approval —
+ *      waiter_confirmed_at / admin_approved_at set, or status in the
+ *      approved(2)/refunded(3) family;
+ *   2. the table has a CLOSED bill closed at or after this order was created —
+ *      i.e. the session this order belonged to has been settled, released
+ *      (ReleaseTable closes the open bill) or merged away.
+ *
+ * (2) is also how a table release is detected. LIMITATION: a table freed
+ * WITHOUT any bill ever existing leaves no record to read, so that case is not
+ * distinguishable and is not guessed at.
+ */
+async function orderCancelBillBlock(
+  restaurantId: string,
+  orderId: string,
+  client?: PoolClient,
+): Promise<UndoBlock | null> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  await ensureBillWorkflowColumns(client);
+  const orderRows = await runQuery<{ table_id: string | null; created_at: Date }>(
+    `select table_id, created_at from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [orderId, context.res_id, context.outlet_id],
+    client,
+  );
+  if (!orderRows[0]) {return null;} // target-gone is reported by current()/matches()
+  const tableId = orderRows[0].table_id;
+  const hit = await runQuery<{ id: string }>(
+    `select b.id from "Bills" b
+      where b.res_id = $1 and b.outlet_id = $2
+        and (($3::uuid is not null and b.table_id = $3::uuid) or b.order_id = $4)
+        and (
+          (b.closed_at is null and (
+             b.waiter_confirmed_at is not null
+             or b.admin_approved_at is not null
+             or coalesce(b.status, 1) in (2, 3)))
+          or (b.closed_at is not null and b.closed_at >= $5)
+        )
+      limit 1`,
+    [context.res_id, context.outlet_id, tableId, orderId, orderRows[0].created_at],
+    client,
+  );
+  return hit[0]
+    ? { code: "bill_settled", message: "The bill for this table has already been settled, so this cancellation can no longer be reversed." }
+    : null;
+}
 
 // --- Small shared comparators/helpers used by the registry ------------------
 
@@ -5100,7 +5212,9 @@ export interface AuditUndoVerdict {
     // faithfully, so it is refused instead of half-applied (or no-op'd).
     | "cannot_restore_null"
     | "cannot_restore_key"
-    | "target_name_taken";
+    | "target_name_taken"
+    // Money guard on order_cancel: the bill this order sat on has moved on.
+    | "bill_settled";
   block_reason: string | null;
   kind: string | null;
   /** Permission of the ORIGINAL action — the caller must hold this too. */
@@ -5129,11 +5243,6 @@ export async function evaluateAuditUndo(
   cache: UndoStateCache = {},
   client?: PoolClient,
 ): Promise<AuditUndoVerdict> {
-  // (blocklist) Permanent refusal, checked before anything else.
-  if (AUDIT_UNDO_BLOCKLIST.has(entry.action_id)) {
-    return undoNo("blocklisted", "Bills, payments, order lifecycle, attendance, subscription, password and user-deletion actions can never be undone.");
-  }
-
   // An undo entry is itself a normal action — it is not re-undoable.
   if (typeof entry.additional_details?.undo_of === "string") {
     return undoNo("not_allowlisted", "This entry is itself an undo and cannot be undone.");
@@ -5142,6 +5251,21 @@ export async function evaluateAuditUndo(
   // (a) allowlist — DEFAULT DENY for anything without a registry envelope.
   const env = entry.additional_details?.undo as AuditUndoEnvelope | undefined;
   const kind = env && typeof env === "object" && typeof env.kind === "string" ? env.kind : null;
+
+  // (blocklist) Permanent refusal on action_id, checked before the registry is
+  // consulted — with ONE deliberate, user-requested carve-out (see
+  // UNDO_BLOCKLIST_EXEMPT_KINDS). The exemption needs BOTH the exact envelope
+  // kind AND that kind's own action_id, so an entry with no envelope, a
+  // hand-crafted envelope on some other blocklisted action, or any other
+  // blocklisted action_id is still permanently refused.
+  const blocklistExempt = kind !== null
+    && UNDO_BLOCKLIST_EXEMPT_KINDS.has(kind)
+    && Object.prototype.hasOwnProperty.call(UNDO_REGISTRY, kind)
+    && UNDO_REGISTRY[kind]!.action_id === entry.action_id;
+  if (AUDIT_UNDO_BLOCKLIST.has(entry.action_id) && !blocklistExempt) {
+    return undoNo("blocklisted", "Bills, payments, order lifecycle, attendance, subscription, password and user-deletion actions can never be undone.");
+  }
+
   if (!kind) {
     return undoNo("not_allowlisted", "This action type cannot be undone.");
   }
@@ -7235,6 +7359,161 @@ export async function GetTimingStats(restaurantId: string): Promise<{ avg_prep_m
   return { avg_prep_ms: count ? Math.round(sum / count) : 0, max_prep_ms: max, count };
 }
 
+// Richer kitchen analytics: per-dish prep time, per-section (station) averages
+// and an order-level prep summary, over the last `days` days. Reuses the same
+// pause-excluded timer math as the KDS (timerElapsedMs) and only counts timers
+// that both started AND ended (a completed prep). All-outlets aware. Station is
+// enriched from the menu at read time (order-item JSON does not persist it), so
+// a dish with no menu station falls under "Unassigned".
+export interface KitchenDishStat { id: string | null; name: string; station: string; count: number; avg_prep_ms: number; max_prep_ms: number }
+export interface KitchenSectionStat { section: string; dishes: number; items_timed: number; avg_prep_ms: number; max_prep_ms: number }
+export interface KitchenAnalytics {
+  order_summary: { orders_timed: number; avg_prep_ms: number; median_prep_ms: number; p90_prep_ms: number; avg_bark_to_served_ms: number; max_prep_ms: number };
+  by_dish: KitchenDishStat[];
+  by_section: KitchenSectionStat[];
+  period_days: number;
+  generated_at: string;
+}
+
+// Abandoned-ticket ceiling: an order/item barked but never properly served or
+// closed leaves its prep timer running for hours or days. Those are not real
+// prep times and would blow up the averages, so any completed timer longer than
+// this is treated as abandoned and excluded. Real kitchen prep is minutes; 3h is
+// a generous cutoff that only drops clearly-broken tickets.
+const KITCHEN_PREP_CEILING_MS = 3 * 60 * 60 * 1000;
+
+export async function GetKitchenAnalytics(restaurantId: string, days = 30): Promise<KitchenAnalytics> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureOrderTimingColumn();
+  await ensureOrderBarkColumns();
+  const og = isAllOutlets() ? "true" : "false";
+  const span = Math.min(365, Math.max(1, Math.round(days)));
+  const now = await currentDbTime();
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (span - 1)));
+  const generatedAt = now.toISOString();
+
+  const rows = await runQuery<{ timing: unknown; food: unknown; barked_at: Date | string | null }>(
+    `select timing, food, barked_at from "Orders"
+       where res_id = $1 and (${og} or outlet_id = $2)
+         and created_at >= $3 and timing is not null`,
+    [context.res_id, context.outlet_id, start.toISOString()],
+  );
+
+  // Station lookup from the menu (KOT routing) — see GetOrders: the order-item
+  // JSON does not persist station, so it is resolved by menu id then dish name.
+  const stationById = new Map<string, string>();
+  const stationByName = new Map<string, string>();
+  try {
+    const menu = await GetMenuItems(restaurantId);
+    for (const m of menu) {
+      if (!m.station) {continue;}
+      stationById.set(String(m.id), m.station);
+      stationByName.set(m.name.trim().toLowerCase(), m.station);
+    }
+  } catch {/* menu unavailable — stations fall back to "Unassigned" */}
+
+  const nowMs = Date.now();
+  const orderPrepMs: number[] = [];
+  const barkToServedMs: number[] = [];
+  const dishAgg = new Map<string, { id: string | null; name: string; station: string; sum: number; count: number; max: number }>();
+  const sectionAgg = new Map<string, { section: string; dishNames: Set<string>; sum: number; count: number; max: number }>();
+
+  for (const r of rows) {
+    const t = parseJsonObject(r.timing) as OrderTiming | null;
+    if (!t) {continue;}
+
+    // Order-level prep (bark-rebased start -> served), completed timers only;
+    // abandoned tickets (> ceiling) are excluded so averages stay meaningful.
+    if (t.order?.started_at && t.order?.ended_at) {
+      const oe = timerElapsedMs(t.order, nowMs);
+      if (oe <= KITCHEN_PREP_CEILING_MS) {orderPrepMs.push(oe);}
+    }
+    // Bark -> served: raw wall-clock from the announce to the order finishing.
+    if (r.barked_at && t.order?.ended_at) {
+      const barked = new Date(r.barked_at).getTime();
+      const ended = Date.parse(t.order.ended_at);
+      if (Number.isFinite(barked) && Number.isFinite(ended) && ended >= barked && ended - barked <= KITCHEN_PREP_CEILING_MS) {barkToServedMs.push(ended - barked);}
+    }
+
+    // Map order-item id -> { name, station } from the food payload (parsed the
+    // same way FireOrderItems / extractItemIds walk it).
+    const food = parseJsonObject(r.food) ?? {};
+    const meta = new Map<string, { name: string; station: string }>();
+    const collect = (arr: unknown) => {
+      for (const it of (Array.isArray(arr) ? arr : [])) {
+        const e = it as any;
+        const id = String(e?.id ?? "");
+        if (!id) {continue;}
+        const name = String(e?.name ?? "Unknown");
+        const station = stationById.get(id) ?? stationByName.get(name.trim().toLowerCase()) ?? "Unassigned";
+        meta.set(id, { name, station });
+      }
+    };
+    if (Array.isArray((food as any).items_split)) {for (const tup of (food as any).items_split) {collect((tup as any)?.[1]);}}
+    if (Array.isArray((food as any).items)) {
+      const items = (food as any).items;
+      if (items.length && Array.isArray(items[0])) {for (const tup of items) {collect((tup as any)?.[1]);}}
+      else {collect(items);}
+    }
+
+    // Per-item prep timers -> per-dish and per-section aggregates.
+    for (const [itemId, timer] of Object.entries(t.items ?? {})) {
+      if (!timer?.started_at || !timer?.ended_at) {continue;}
+      const elapsed = timerElapsedMs(timer, nowMs);
+      // Drop abandoned tickets (barked but never properly served/closed).
+      if (elapsed > KITCHEN_PREP_CEILING_MS) {continue;}
+      const m = meta.get(itemId) ?? { name: "Unknown", station: "Unassigned" };
+      const dishKey = m.name.trim().toLowerCase();
+      const d = dishAgg.get(dishKey) ?? { id: itemId || null, name: m.name, station: m.station, sum: 0, count: 0, max: 0 };
+      d.sum += elapsed; d.count += 1; if (elapsed > d.max) {d.max = elapsed;}
+      dishAgg.set(dishKey, d);
+
+      const sectionKey = m.station || "Unassigned";
+      const s = sectionAgg.get(sectionKey) ?? { section: sectionKey, dishNames: new Set<string>(), sum: 0, count: 0, max: 0 };
+      s.dishNames.add(dishKey); s.sum += elapsed; s.count += 1; if (elapsed > s.max) {s.max = elapsed;}
+      sectionAgg.set(sectionKey, s);
+    }
+  }
+
+  const median = (arr: number[]): number => {
+    if (arr.length === 0) {return 0;}
+    const s = [...arr].sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
+  };
+  const percentile = (arr: number[], p: number): number => {
+    if (arr.length === 0) {return 0;}
+    const s = [...arr].sort((a, b) => a - b);
+    const idx = Math.min(s.length - 1, Math.max(0, Math.ceil((p / 100) * s.length) - 1));
+    return s[idx];
+  };
+  const avg = (arr: number[]): number => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0);
+
+  const by_dish: KitchenDishStat[] = Array.from(dishAgg.values())
+    .map((d) => ({ id: d.id, name: d.name, station: d.station, count: d.count, avg_prep_ms: Math.round(d.sum / d.count), max_prep_ms: d.max }))
+    .sort((a, b) => b.avg_prep_ms - a.avg_prep_ms)
+    .slice(0, 40);
+
+  const by_section: KitchenSectionStat[] = Array.from(sectionAgg.values())
+    .map((s) => ({ section: s.section, dishes: s.dishNames.size, items_timed: s.count, avg_prep_ms: Math.round(s.sum / s.count), max_prep_ms: s.max }))
+    .sort((a, b) => b.avg_prep_ms - a.avg_prep_ms);
+
+  return {
+    order_summary: {
+      orders_timed: orderPrepMs.length,
+      avg_prep_ms: avg(orderPrepMs),
+      median_prep_ms: median(orderPrepMs),
+      p90_prep_ms: percentile(orderPrepMs, 90),
+      avg_bark_to_served_ms: avg(barkToServedMs),
+      max_prep_ms: orderPrepMs.length ? Math.max(...orderPrepMs) : 0,
+    },
+    by_dish,
+    by_section,
+    period_days: span,
+    generated_at: generatedAt,
+  };
+}
+
 // ======================= Course hold-and-fire + expo =======================
 
 // Dedicated audit action so fired courses show up with an honest name in the log.
@@ -7911,6 +8190,9 @@ export async function DeleteOrder(
   // ran the DELETE detached on the request's pooled client (racing connection
   // release) and the route always saw `false` → a spurious 404 on every delete.
   return withTransaction(async (client) => {
+    // "Permanently cancelled" means the row stays: deleting it would erase the
+    // very record the audit-log undo needs to reverse.
+    await assertOrderNotCancelled(context, orderId.trim(), ORDER_CANCELLED_DELETE_MESSAGE, client);
     const rows = await runQuery<{ id: string }>(
       `
         delete from "Orders"
@@ -11502,23 +11784,107 @@ export async function FinalizeOnlinePayment(
   });
 }
 
-// A settled order (Paid = 4, Closed = 7) is final — its status must never change
-// again (the bill is view-once after settlement). Throws when it's locked.
-async function assertOrderStatusEditable(
+/**
+ * CANCELLED (5) IS A TERMINAL STATE.
+ *
+ * House rule: "Cancelled orders cannot be modified, once cancelled its
+ * permanently cancelled. Only undo from the audit logs can be done." So every
+ * order-mutating path refuses a cancelled order — status changes, bark, fire,
+ * pause/resume, per-item serve/pause/resume, item add/delete, bill replacement
+ * and deletion — and the ONLY way back is the audited undo (UNDO_REGISTRY's
+ * `order_cancel`, which writes through the private bypass below).
+ */
+export const ORDER_CANCELLED_MESSAGE =
+  "This order was cancelled and can no longer be modified. Reverse the cancellation from the Audit Log if this was a mistake.";
+
+/** Deleting would contradict "permanently cancelled" — the record must persist. */
+export const ORDER_CANCELLED_DELETE_MESSAGE =
+  "This order was cancelled and is kept permanently as a record — it cannot be deleted. Reverse the cancellation from the Audit Log if this was a mistake.";
+
+/** The order's raw status code, or null when the order does not exist. */
+async function readOrderStatusCode(
   context: RestaurantContext,
   orderId: string,
   client?: PoolClient,
-): Promise<void> {
+): Promise<number | null> {
   const rows = await runQuery<{ status: number | string | null }>(
     `select status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [orderId, context.res_id, context.outlet_id],
     client,
   );
-  if (!rows[0]) {return;} // not found — leave not-found handling to the caller
-  const code = Number(rows[0].status ?? 0);
+  if (!rows[0]) {return null;}
+  return Number(rows[0].status ?? 0);
+}
+
+/**
+ * The shared cancelled guard. Kept callable on its own (not only through
+ * assertOrderStatusEditable) so a path that is NOT a status edit — DeleteOrder —
+ * can refuse cancelled orders with a message that fits what it was asked to do.
+ */
+async function assertOrderNotCancelled(
+  context: RestaurantContext,
+  orderId: string,
+  message: string = ORDER_CANCELLED_MESSAGE,
+  client?: PoolClient,
+): Promise<void> {
+  if ((await readOrderStatusCode(context, orderId, client)) === 5) {
+    throw new Error(message);
+  }
+}
+
+// A settled order (Paid = 4, Closed = 7) is final — its status must never change
+// again (the bill is view-once after settlement). A CANCELLED order (5) is final
+// too, and permanently so. Throws when it's locked.
+//
+// This is the single choke-point every order mutator already went through
+// (SetOrderStatus, BarkOrder, FireOrderItems, OrderTimingAction,
+// UpdateOrderItemsSplit, AddOrder-on-existing, UpdateBillStatusByOrder,
+// ReplaceBill), so adding the cancelled case here closes every one of them at once.
+async function assertOrderStatusEditable(
+  context: RestaurantContext,
+  orderId: string,
+  client?: PoolClient,
+): Promise<void> {
+  const code = await readOrderStatusCode(context, orderId, client);
+  if (code === null) {return;} // not found — leave not-found handling to the caller
+  if (code === 5) {
+    throw new Error(ORDER_CANCELLED_MESSAGE);
+  }
   if (code === 4 || code === 7) {
     throw new Error("This order's bill is already settled and locked — its status can no longer be changed.");
   }
+}
+
+/**
+ * The ONE sanctioned bypass of the cancelled-is-terminal guard: writes an
+ * order's status without running assertOrderStatusEditable.
+ *
+ * It is deliberately NOT exported — index.ts cannot import it, so no HTTP route
+ * can reach it. Its only caller is UNDO_REGISTRY.order_cancel.execute(), which
+ * runs inside PerformAuditUndo's single transaction (hence the required client).
+ */
+async function writeOrderStatusForUndo(
+  restaurantId: string,
+  orderId: string,
+  status: string,
+  client: PoolClient,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  const rows = await runQuery<{ id: string }>(
+    `
+      update "Orders"
+      set status = $1,
+          food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
+      where id = $3 and res_id = $4 and outlet_id = $5
+      returning id
+    `,
+    [toOrderStatusCode(status), status, orderId, context.res_id, context.outlet_id],
+    client,
+  );
+  if (rows.length > 0) {
+    try { await applyTimingForStatus(context, orderId, status); } catch (err) { logger.warn({ err }, "undo timing status hook failed"); }
+  }
+  return rows.length > 0;
 }
 
 export async function UpdateBillStatusByOrder(
@@ -11540,16 +11906,36 @@ export async function UpdateBillStatusByOrder(
   return true;
 }
 
+export interface SetOrderStatusResult {
+  /** False only when the order does not exist (route answers 404). */
+  ok: boolean;
+  /** False when nothing was written (re-cancelling an already-cancelled order). */
+  changed: boolean;
+  /** The status the order held BEFORE this call — the undo envelope's `before`. */
+  previous_status: OrderRecord["status"] | null;
+}
+
 // Advance a single order's kitchen/service stage (Preparing -> Served -> ...).
 // Updates the Orders row so it reflects in the orders list and the KDS.
 export async function SetOrderStatus(
   restaurantId: string,
   orderId: string,
   status: string,
-): Promise<boolean> {
+): Promise<SetOrderStatusResult> {
   const context = await requireRestaurantContext(restaurantId);
-  await assertOrderStatusEditable(context, orderId);
   const code = toOrderStatusCode(status);
+  const previousCode = await readOrderStatusCode(context, orderId);
+  if (previousCode === null) {return { ok: false, changed: false, previous_status: null };}
+  // Re-cancelling an already-cancelled order is a clean idempotent NO-OP: the
+  // order is already where the caller wants it, so there is nothing to refuse
+  // and nothing to write (and no second undo envelope to record).
+  if (previousCode === 5 && code === 5) {
+    return { ok: true, changed: false, previous_status: "Cancelled" };
+  }
+  // Cancelled is terminal; Paid/Closed are locked. Any other transition off a
+  // cancelled order is refused here, which is what makes PATCH
+  // /orders/:id/status (and every other caller) safe.
+  await assertOrderStatusEditable(context, orderId);
   // An un-barked order can be accepted (Preparing) or cancelled, but never
   // advanced past the kitchen queue — the bark is the step in between.
   if (code === 2 || code === 3) {await assertOrderBarked(context, orderId);}
@@ -11566,7 +11952,11 @@ export async function SetOrderStatus(
   if (rows.length > 0) {
     try { await applyTimingForStatus(context, orderId, status); } catch (err) { logger.warn({ err }, "timing status hook failed"); }
   }
-  return rows.length > 0;
+  return {
+    ok: rows.length > 0,
+    changed: rows.length > 0,
+    previous_status: fromOrderStatusCode(previousCode),
+  };
 }
 
 export async function ReplaceBill(
@@ -11598,6 +11988,9 @@ export async function ReplaceBill(
     const context = await requireRestaurantContext(restaurantId, client);
     const oldOrderId = String(payload.old_order_id ?? '').trim();
     if (!oldOrderId) {throw new Error('Missing old_order_id');}
+    // A replacement REWRITES the order's items and drives it to Bill
+    // Verification — a modification, so a cancelled (or settled) order refuses it.
+    await assertOrderStatusEditable(context, oldOrderId, client);
 
     // locate existing bill (if any)
     // try to locate existing bill and update in-place

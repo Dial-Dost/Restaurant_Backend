@@ -9,5 +9,5 @@
     "sourceMap": true
   },
   "include": ["./**/*.ts"],
-  "exclude": ["./build", "./node_modules", "./jest-tests"]
+  "exclude": ["./build", "./node_modules", "./jest-tests", "./test"]
 }
