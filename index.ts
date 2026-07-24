@@ -84,6 +84,10 @@ import {
 	GetEmployeeDetailsFromEmpID,
 	AddAuditLogEntry,
 	GetAuditLogs,
+	PerformAuditUndo,
+	AUDIT_UNDO_PERMISSION_ID,
+	GetMenuItemUndoState,
+	readEmployeeRolesForUndo,
 	GetRestaurantUserRole,
 	EnsureRestaurantSeed,
 	AllocateBestTable,
@@ -2628,7 +2632,12 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	}
 
 	try {
-		await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Added table ${table_name}`, Audit_log_category.Tables, { capacity: table.capacity });
+		await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Added table ${table_name}`, Audit_log_category.Tables, {
+			capacity: table.capacity,
+			// before.existed=false records that the table did not exist; the undo
+			// deletes it again, but only while it is still pristine.
+			undo: { kind: "table_added", target_id: null, before: { existed: false }, after: { table_name } },
+		});
 	} catch (err) {
 		logger.warn({ err }, 'log_audit add-table failed');
 	}
@@ -3810,6 +3819,78 @@ app.get("/audit-logs", validateAction("91b24293-7b88-4fe4-8cf5-deb6faaba4f5"), a
 	}
 });
 
+// Reverse one eligible audit entry. Requires BOTH the undo permission AND the
+// permission of the ORIGINAL action — you may not undo a menu price change
+// unless you could have made one. Admin ("*") satisfies both.
+//
+// The original row is never touched: a successful undo APPENDS a new entry
+// carrying { undo_of: <original id> }. Every refusal class maps to a status:
+//   403 no-permission | 404 not-found
+//   400 not-allowlisted / blocklisted / missing-before-state / too-old
+//       / cannot-restore-null / cannot-restore-key / target-name-taken
+//   409 already-undone / superseded / target-gone
+//
+// The whole reversal (re-evaluation, the compensating write, and the appended
+// undo row) runs in ONE transaction with the original row locked FOR UPDATE, so
+// concurrent undos of the same entry produce exactly one 200 and 409s for the
+// rest — backed by a partial UNIQUE index on the undo_of back-reference.
+app.post("/audit-logs/:id/undo", validate, async (req: Request, res: Response) => {
+	const scope = await enforcePermission(req, res, AUDIT_UNDO_PERMISSION_ID);
+	if (!scope) return;
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const logId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+	if (!logId) { res.status(400).json({ error: "Missing audit log id" }); return; }
+	const employeeId = extractEmployeeId(req);
+	if (!employeeId) { res.status(401).json({ error: "Unauthorized", details: "Missing employee identity" }); return; }
+
+	const granted = req.auth?.actions ?? [];
+	const isAdmin = callerIsAdmin(req);
+	const isOwner = await callerIsSuperadmin(req);
+
+	// Mirrors the guards on /roles/assign and /roles/remove: reversing a role
+	// change must not become a back door around the privilege-escalation rules
+	// those routes enforce. Only the roles the diff actually touches are checked.
+	const roleGuard = (kind: string, envelope: { before: Record<string, unknown>; after: Record<string, unknown> }): true | string => {
+		if (kind !== "role_assign" && kind !== "role_remove") return true;
+		const list = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
+		const before = list(envelope.before.roles);
+		const after = list(envelope.after.roles);
+		const touched = [...before, ...after].filter((r) => !before.includes(r) || !after.includes(r));
+		if (touched.some((r) => isAdminRoleName(r)) && !isOwner) {
+			return "Only the owner (super-admin) can undo a change to the admin role.";
+		}
+		if (touched.some((r) => isPrivilegedRoleName(r)) && !isAdmin) {
+			return "Only an admin can undo a change to the admin or manager role.";
+		}
+		return true;
+	};
+
+	const permitted = (actionId: string, kind: string, envelope: { before: Record<string, unknown>; after: Record<string, unknown> }): true | string => {
+		if (!granted.includes("*") && !granted.includes(actionId)) {
+			return "You do not have permission for the action you are trying to undo.";
+		}
+		return roleGuard(kind, envelope);
+	};
+
+	try {
+		const result = await PerformAuditUndo(restaurantId, logId, employeeId, permitted);
+		if (result.ok) {
+			res.json({ success: true, undo_log_id: result.undo_log_id, restored: result.restored });
+			return;
+		}
+		const status = result.code === "not_found"
+			? 404
+			: result.code === "failed"
+				? (result.required_action_id ? 403 : 400)
+				: (["already_undone", "superseded", "target_gone"].includes(result.code) ? 409 : 400);
+		res.status(status).json({ error: result.message, reason: result.code });
+	} catch (err) {
+		logger.error({ err }, "audit_undo_failed");
+		res.status(500).json({ error: "Unable to undo this action" });
+	}
+});
+
 // app.post("/audit-logs", validateAction("722e1023-99f8-4905-ab51-97404694eab6"), async (req: Request, res: Response) => {
 // 	const restaurantId = extractRestaurantId(req);
 // 	if (!restaurantId) {
@@ -3946,7 +4027,12 @@ app.post("/inventory/receive", validateAction(INV_MANAGE), async (req: Request, 
 	if (!inventory_id || qty <= 0) { res.status(400).json({ error: "inventory_id and a positive qty are required" }); return; }
 	try {
 		const r = await ReceiveStock(restaurantId, { inventory_id, qty, vendor_id: typeof b.vendor_id === "string" ? b.vendor_id : undefined, unit_cost: typeof b.unit_cost === "number" ? b.unit_cost : undefined, note: typeof b.note === "string" ? b.note : undefined, createdBy: extractEmployeeId(req) ?? undefined });
-		try { await log_audit(req, INV_MANAGE, `Received ${qty} stock`, Audit_log_category.Inventory, { inventory_id }); } catch {/* ignore */}
+		// Undo posts a COMPENSATING movement back to the prior quantity — the
+		// original StockMovements row is never removed.
+		try { await log_audit(req, INV_MANAGE, `Received ${qty} stock`, Audit_log_category.Inventory, {
+			inventory_id,
+			undo: { kind: "inventory_adjust", target_id: inventory_id, before: { quantity: r.quantity - qty }, after: { quantity: r.quantity } },
+		}); } catch {/* ignore */}
 		res.json(r);
 	} catch (e: any) { logger.error({ err: e }, "receive_stock_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to receive stock") }); }
 });
@@ -3959,7 +4045,12 @@ app.post("/inventory/wastage", validateAction(INV_MANAGE), async (req: Request, 
 	if (!inventory_id || qty <= 0) { res.status(400).json({ error: "inventory_id and a positive qty are required" }); return; }
 	try {
 		const r = await RecordWastage(restaurantId, { inventory_id, qty, reason: typeof b.reason === "string" ? b.reason : undefined, createdBy: extractEmployeeId(req) ?? undefined });
-		try { await log_audit(req, INV_MANAGE, `Wastage ${qty}`, Audit_log_category.Inventory, { inventory_id }); } catch {/* ignore */}
+		// Undo posts a COMPENSATING receipt back to the prior quantity — the
+		// original StockMovements row is never removed.
+		try { await log_audit(req, INV_MANAGE, `Wastage ${qty}`, Audit_log_category.Inventory, {
+			inventory_id,
+			undo: { kind: "inventory_adjust", target_id: inventory_id, before: { quantity: r.quantity + qty }, after: { quantity: r.quantity } },
+		}); } catch {/* ignore */}
 		res.json(r);
 	} catch (e: any) { logger.error({ err: e }, "record_wastage_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to record wastage") }); }
 });
@@ -4168,6 +4259,11 @@ app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async 
 	}
 
 	try {
+		// Snapshot the item BEFORE the upsert so an availability-only toggle can be
+		// recorded as undoable (see UNDO_REGISTRY.menu_availability).
+		const priorItem = typeof body.id === "string" && body.id
+			? await GetMenuItemUndoState(restaurantId, body.id).catch(() => null)
+			: null;
 		// Fields absent from the request stay `undefined` so UpsertMenuItem
 		// preserves the stored value (partial saves must not wipe recipes etc.).
 		const result = await UpsertMenuItem(restaurantId, {
@@ -4183,7 +4279,25 @@ app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async 
 			allergens: Array.isArray(body.allergens) ? (body.allergens as string[]) : undefined,
 		});
 		try {
-			await log_audit(req, "88a87943-8f0b-43e2-b85e-192fdc901ed2", `Saved menu item ${body.name}`, Audit_log_category.Menu, { id: result.id, available: body.available });
+			// Only an availability-ONLY change is undoable: this route is a general
+			// upsert, and reversing just the flag after a broader edit would leave a
+			// half-restored item. Anything else records no undo envelope (default deny).
+			const nextItem = typeof body.available === "boolean" && priorItem
+				? await GetMenuItemUndoState(restaurantId, result.id).catch(() => null)
+				: null;
+			const availabilityOnly = Boolean(
+				priorItem && nextItem
+				&& priorItem.available !== nextItem.available
+				&& priorItem.name === nextItem.name
+				&& priorItem.price === nextItem.price,
+			);
+			await log_audit(req, "88a87943-8f0b-43e2-b85e-192fdc901ed2", `Saved menu item ${body.name}`, Audit_log_category.Menu, {
+				id: result.id,
+				available: body.available,
+				...(availabilityOnly
+					? { undo: { kind: "menu_availability", target_id: result.id, before: { available: priorItem!.available }, after: { available: nextItem!.available } } }
+					: {}),
+			});
 		} catch (err) { logger.warn({ err }, "log_audit menu-upsert failed"); }
 		res.status(201).json(result);
 	} catch (error) {
@@ -4211,6 +4325,50 @@ app.post("/menu/upload-image", validateAction("88a87943-8f0b-43e2-b85e-192fdc901
 
 // Set the restaurant's customer-facing branding (logo + theme color). Accepts a
 // logo as a hosted URL or base64 (uploaded server-side).
+// Settings/branding keys that must NEVER be copied into an audit entry's
+// before-state — credentials would then sit in plain text in the log.
+const UNDO_SECRET_SETTING_KEYS = new Set(["razorpay_key_secret", "msg_key_secret", "msg_webhook_secret"]);
+
+// Diff two settings snapshots into an undo envelope covering ONLY the keys that
+// actually changed. Returns null when nothing reversible changed.
+function buildSettingsUndo(prior: Record<string, unknown> | null, next: Record<string, unknown>): Record<string, unknown> | null {
+	if (!prior) return null;
+	const before: Record<string, unknown> = {};
+	const after: Record<string, unknown> = {};
+	for (const key of Object.keys(next)) {
+		if (UNDO_SECRET_SETTING_KEYS.has(key)) continue;
+		if (JSON.stringify(prior[key] ?? null) === JSON.stringify(next[key] ?? null)) continue;
+		before[key] = prior[key] ?? null;
+		after[key] = next[key] ?? null;
+	}
+	if (Object.keys(after).length === 0) return null;
+	return { kind: "restaurant_settings", target_id: null, before, after };
+}
+
+// Diff two branding snapshots. Top-level fields keep their own names; every
+// other key comes from brand_config and is restored back into it.
+function buildBrandingUndo(
+	prior: { logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: Record<string, unknown> } | null,
+	next: { logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: Record<string, unknown> },
+): Record<string, unknown> | null {
+	if (!prior) return null;
+	const before: Record<string, unknown> = {};
+	const after: Record<string, unknown> = {};
+	const put = (key: string, a: unknown, b: unknown) => {
+		if (JSON.stringify(a ?? null) === JSON.stringify(b ?? null)) return;
+		before[key] = a ?? null;
+		after[key] = b ?? null;
+	};
+	put("logo_url", prior.logo_url, next.logo_url);
+	put("theme_color", prior.theme_color, next.theme_color);
+	put("queue_show_menu", prior.queue_show_menu, next.queue_show_menu);
+	for (const key of Object.keys(next.brand_config ?? {})) {
+		put(key, (prior.brand_config ?? {})[key], (next.brand_config ?? {})[key]);
+	}
+	if (Object.keys(after).length === 0) return null;
+	return { kind: "branding", target_id: null, before, after };
+}
+
 app.post("/restaurant/branding", validate, async (req: Request, res: Response) => {
 	if (!(await enforcePermission(req, res, PERM_BRANDING))) return;
 	const restaurantId = extractRestaurantId(req);
@@ -4230,8 +4388,18 @@ app.post("/restaurant/branding", validate, async (req: Request, res: Response) =
 			const url = await uploadMenuImage(body.logo_base64, typeof body.content_type === "string" ? body.content_type : "image/png");
 			if (url) logoUrl = url;
 		}
+		// Snapshot before the write so the undo restores only the branding fields
+		// this request changed (SetBranding merges brand_config key-by-key).
+		const priorBranding = await GetPublicBranding(restaurantId).catch(() => null);
 		const result = await SetBranding(restaurantId, { logo_url: logoUrl ?? null, theme_color: themeColor ?? null, queue_show_menu: queueShowMenu, brand_config: brandConfig });
-		try { await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33", `Updated customer-page branding`, Audit_log_category.General, { theme_color: result.theme_color, logo: !!result.logo_url }); } catch (err) { logger.warn({ err }, "log_audit branding failed"); }
+		const brandingUndo = buildBrandingUndo(priorBranding, result);
+		try {
+			await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33", `Updated customer-page branding`, Audit_log_category.General, {
+				theme_color: result.theme_color,
+				logo: !!result.logo_url,
+				...(brandingUndo ? { undo: brandingUndo } : {}),
+			});
+		} catch (err) { logger.warn({ err }, "log_audit branding failed"); }
 		res.json(result);
 	} catch (err: any) {
 		logger.error({ err }, "set_branding_failed");
@@ -4254,6 +4422,9 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	try {
+		// Snapshot before the write so the undo can restore ONLY the keys this
+		// request actually changed (never the whole settings document).
+		const priorSettings = await GetRestaurantSettings(restaurantId).catch(() => null);
 		const result = await SetRestaurantSettings(restaurantId, {
 			auto_push_orders: typeof body.auto_push_orders === "boolean" ? body.auto_push_orders : undefined,
 			currency: typeof body.currency === "string" ? body.currency : undefined,
@@ -4285,7 +4456,14 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 			timezone: typeof body.timezone === "string" ? body.timezone : undefined,
 			require_table_otp: typeof body.require_table_otp === "boolean" ? body.require_table_otp : undefined,
 		});
-		try { await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33", `Updated restaurant settings`, Audit_log_category.General, { auto_push_orders: result.auto_push_orders, currency: result.currency }); } catch (err) { logger.warn({ err }, "log_audit settings failed"); }
+		const settingsUndo = buildSettingsUndo(priorSettings, result);
+		try {
+			await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33", `Updated restaurant settings`, Audit_log_category.General, {
+				auto_push_orders: result.auto_push_orders,
+				currency: result.currency,
+				...(settingsUndo ? { undo: settingsUndo } : {}),
+			});
+		} catch (err) { logger.warn({ err }, "log_audit settings failed"); }
 		res.json(result);
 	} catch (err) {
 		logger.error({ err }, "set_settings_failed");
@@ -4442,7 +4620,13 @@ app.patch("/menu/:id/price", validateAction("ed800655-b937-44ba-a7ca-7458295886c
 	try {
 		const result = await UpdateMenuItemPrice(restaurantId, itemId, price);
 		try {
-			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Updated price of ${result.name} to ${result.price}`, Audit_log_category.Menu, { id: result.id, price: result.price });
+			// `undo` carries the prior price triple so the audit entry is reversible
+			// (see UNDO_REGISTRY.menu_price). The human `reason` is unchanged.
+			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Updated price of ${result.name} to ${result.price}`, Audit_log_category.Menu, {
+				id: result.id,
+				price: result.price,
+				undo: { kind: "menu_price", target_id: result.id, before: result.previous, after: { price: result.price } },
+			});
 		} catch (err) { logger.warn({ err }, "log_audit menu-price failed"); }
 		res.json({ success: true, ...result });
 	} catch (error: any) {
@@ -4522,7 +4706,10 @@ app.post("/kitchen-sections/rename", validateAction("ed800655-b937-44ba-a7ca-745
 			: [...current.kitchen_sections, to]; // renaming an unmanaged station adopts it
 		const saved = await SetRestaurantSettings(restaurantId, { kitchen_sections: nextSections });
 		try {
-			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Renamed kitchen section ${from} -> ${to} (${updated} items)`, Audit_log_category.Menu, { from, to, updated_items: updated });
+			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Renamed kitchen section ${from} -> ${to} (${updated} items)`, Audit_log_category.Menu, {
+				from, to, updated_items: updated,
+				undo: { kind: "kitchen_section_rename", target_id: null, before: { name: from }, after: { name: to } },
+			});
 		} catch (err) { logger.warn({ err }, "log_audit kitchen-section-rename failed"); }
 		res.json({ success: true, updated_items: updated, kitchen_sections: saved.kitchen_sections });
 	} catch (error) {
@@ -4550,7 +4737,10 @@ app.post("/inventory-categories/rename", validateAction(INV_MANAGE), async (req:
 			: [...current.inventory_categories, to]; // renaming an unmanaged category adopts it
 		const saved = await SetRestaurantSettings(restaurantId, { inventory_categories: nextCategories });
 		try {
-			await log_audit(req, INV_MANAGE, `Renamed inventory category ${from} -> ${to} (${updated} items)`, Audit_log_category.Inventory, { from, to, updated_items: updated });
+			await log_audit(req, INV_MANAGE, `Renamed inventory category ${from} -> ${to} (${updated} items)`, Audit_log_category.Inventory, {
+				from, to, updated_items: updated,
+				undo: { kind: "inventory_category_rename", target_id: null, before: { name: from }, after: { name: to } },
+			});
 		} catch (err) { logger.warn({ err }, "log_audit inventory-category-rename failed"); }
 		res.json({ success: true, updated_items: updated, inventory_categories: saved.inventory_categories });
 	} catch (error) {
@@ -6358,7 +6548,20 @@ app.post("/roles", validateAction("c0135d18-68b4-45e9-9b51-849158df6efd"), async
 		: [];
 
 	try {
+		// CreateRole upserts by name — capture the prior permission set so an EDIT
+		// of an existing role is undoable (a brand-new role has no prior state).
+		const priorRole = (await GetRoles(restaurantId).catch(() => []))
+			.find((r) => r.role_name.toLowerCase() === roleName.trim().toLowerCase()) ?? null;
 		const role = await CreateRole(restaurantId, roleName, actions);
+		try {
+			await log_audit(req, "c0135d18-68b4-45e9-9b51-849158df6efd", priorRole ? `Updated permissions of role '${role.role_name}'` : `Created role '${role.role_name}'`, Audit_log_category.Roles, {
+				role_id: role.id,
+				role_name: role.role_name,
+				...(priorRole
+					? { undo: { kind: "role_permissions", target_id: role.id, before: { actions_performable: priorRole.actions_performable }, after: { actions_performable: role.actions_performable } } }
+					: {}),
+			});
+		} catch (err) { logger.warn({ err }, "log_audit create-role failed"); }
 		res.status(201).json(role);
 	} catch (error: any) {
 		logger.error({ err: error }, "create_role_failed");
@@ -6423,8 +6626,19 @@ app.post("/roles/assign", validateAction("4bf54bd9-9124-46c0-a7cc-011ea4c4e172")
 	}
 
 	try {
+		const priorRoles = await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null);
 		await AssignRoleToEmployee(restaurantId, employeeId, roleName);
-		try { await log_audit(req, "4bf54bd9-9124-46c0-a7cc-011ea4c4e172", `Assigned role '${roleName}' to employee ${employeeId}`, Audit_log_category.Roles, { employee_id: employeeId, role: roleName }); } catch (err) { logger.warn({ err }, "log_audit assign-role failed"); }
+		const nextRoles = priorRoles ? await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null) : null;
+		try {
+			await log_audit(req, "4bf54bd9-9124-46c0-a7cc-011ea4c4e172", `Assigned role '${roleName}' to employee ${employeeId}`, Audit_log_category.Roles, {
+				employee_id: employeeId, role: roleName,
+				...(priorRoles && nextRoles
+					// `primary` is captured so the undo restores the recorded primary
+					// role verbatim instead of recomputing one from the role list.
+					? { undo: { kind: "role_assign", target_id: employeeId, before: { roles: priorRoles.roles, primary: priorRoles.primary }, after: { roles: nextRoles.roles, primary: nextRoles.primary } } }
+					: {}),
+			});
+		} catch (err) { logger.warn({ err }, "log_audit assign-role failed"); }
 		res.json({ success: true });
 	} catch (error: any) {
 		logger.error({ err: error }, "assign_role_failed");
@@ -6458,8 +6672,17 @@ app.post("/roles/remove", validateAction("9acc9097-4803-4be0-bb6d-fc2c5de57cf5")
 	}
 
 	try {
+		const priorRoles = await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null);
 		await RemoveRoleFromEmployee(restaurantId, employeeId, roleName);
-		try { await log_audit(req, "9acc9097-4803-4be0-bb6d-fc2c5de57cf5", `Removed role '${roleName}' from employee ${employeeId}`, Audit_log_category.Roles, { employee_id: employeeId, role: roleName }); } catch (err) { logger.warn({ err }, "log_audit remove-role failed"); }
+		const nextRoles = priorRoles ? await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null) : null;
+		try {
+			await log_audit(req, "9acc9097-4803-4be0-bb6d-fc2c5de57cf5", `Removed role '${roleName}' from employee ${employeeId}`, Audit_log_category.Roles, {
+				employee_id: employeeId, role: roleName,
+				...(priorRoles && nextRoles
+					? { undo: { kind: "role_remove", target_id: employeeId, before: { roles: priorRoles.roles, primary: priorRoles.primary }, after: { roles: nextRoles.roles, primary: nextRoles.primary } } }
+					: {}),
+			});
+		} catch (err) { logger.warn({ err }, "log_audit remove-role failed"); }
 		res.json({ success: true });
 	} catch (error: any) {
 		logger.error({ err: error }, "remove_role_failed");

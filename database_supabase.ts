@@ -375,6 +375,17 @@ type AuditLogEntry = {
   category: string;
   details?: string | null;
   timestamp: Date;
+  // --- Undo display flags (computed at read time; never stored on the row) ---
+  /** This entry can be reversed right now by a caller with both permissions. */
+  undoable: boolean;
+  /** Human explanation of why `undoable` is false (null when it is true). */
+  undo_block_reason: string | null;
+  /** A later audit entry has already undone this one. */
+  undone: boolean;
+  /** Id of that undo entry, when `undone`. */
+  undo_log_id: string | null;
+  /** Set on an UNDO entry itself: the id of the original entry it reversed. */
+  undo_of: string | null;
 };
 
 export type InventoryItemRecord = {
@@ -402,6 +413,11 @@ export type MenuItemRecord = {
   // Allergen tags shown on the public QR menu, e.g. ["gluten", "nuts"].
   // Free-form strings (the UI offers a fixed suggestion set); [] / absent = none.
   allergens?: string[];
+  // Price history, maintained server-side (ignored on write — see
+  // stampPriceHistory). Absent/null on items whose price never changed since
+  // the feature landed. Drives the menu-insights convergence guards.
+  price_updated_at?: string | null;
+  price_baseline?: number | null;
 };
 
 export type OrderItemRecord = {
@@ -829,7 +845,7 @@ export function sanitizeAllergens(raw: unknown): string[] {
   return out;
 }
 
-function encodeMenuDescription(payload: { price: number; image_url?: string | null; available?: boolean; modifiers?: unknown; recipe?: unknown; station?: unknown; allergens?: unknown }): string {
+function encodeMenuDescription(payload: { price: number; image_url?: string | null; available?: boolean; modifiers?: unknown; recipe?: unknown; station?: unknown; allergens?: unknown; price_updated_at?: string | null; price_baseline?: number | null }): string {
   const out: Record<string, unknown> = { price: Number.isFinite(payload.price) ? payload.price : 0 };
   const img = typeof payload.image_url === "string" ? payload.image_url.trim() : "";
   if (img) out.image_url = img;
@@ -842,14 +858,30 @@ function encodeMenuDescription(payload: { price: number; image_url?: string | nu
   if (station) out.station = station;
   const allergens = sanitizeAllergens(payload.allergens);
   if (allergens.length > 0) out.allergens = allergens;
+  // Price history (both optional, both absent on legacy rows) — see
+  // stampPriceHistory. Only ever written when a price actually changed.
+  const priceUpdatedAt = typeof payload.price_updated_at === "string" ? payload.price_updated_at.trim() : "";
+  if (priceUpdatedAt) out.price_updated_at = priceUpdatedAt;
+  const baseline = typeof payload.price_baseline === "number" && Number.isFinite(payload.price_baseline) && payload.price_baseline > 0
+    ? round2(payload.price_baseline)
+    : null;
+  if (baseline != null) out.price_baseline = baseline;
   return JSON.stringify(out);
 }
 
-function parseMenuDescription(description: string | null): { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[] } {
-  if (!description) return { price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [] };
+type ParsedMenuDescription = { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[]; price_updated_at: string | null; price_baseline: number | null };
+
+const emptyMenuDescription = (): ParsedMenuDescription => ({ price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [], price_updated_at: null, price_baseline: null });
+
+function parseMenuDescription(description: string | null): ParsedMenuDescription {
+  if (!description) return emptyMenuDescription();
   const parsed = parseJsonObject(description);
-  if (!parsed) return { price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [] };
+  if (!parsed) return emptyMenuDescription();
   const img = typeof parsed.image_url === "string" ? parsed.image_url : null;
+  const priceUpdatedAt = typeof parsed.price_updated_at === "string" && parsed.price_updated_at.trim()
+    ? parsed.price_updated_at.trim()
+    : null;
+  const baseline = parseNumeric(parsed.price_baseline);
   return {
     price: parseNumeric(parsed.price),
     image_url: img,
@@ -858,6 +890,35 @@ function parseMenuDescription(description: string | null): { price: number; imag
     recipe: sanitizeRecipe(parsed.recipe),
     station: typeof parsed.station === "string" && parsed.station.trim() ? parsed.station.trim() : null,
     allergens: sanitizeAllergens(parsed.allergens),
+    price_updated_at: priceUpdatedAt,
+    price_baseline: baseline > 0 ? baseline : null,
+  };
+}
+
+// Price-history stamping, shared by EVERY path that writes a menu price
+// (PATCH /menu/:id/price and the full-menu PUT /menu upsert).
+//
+//  - `price_updated_at` moves only when the price ACTUALLY changes. An edit
+//    that re-saves the same price (e.g. renaming a dish through the full-menu
+//    replace) must not reset it, or it would silently defeat the menu-insights
+//    cooldown guard.
+//  - `price_baseline` is written ONCE — the price as it stood before the very
+//    first recorded change — so the drift cap measures total drift from the
+//    original price rather than from the previous step.
+function stampPriceHistory(
+  existing: { price: number; price_updated_at: string | null; price_baseline: number | null },
+  newPrice: number,
+  nowIso: string,
+): { price_updated_at: string | null; price_baseline: number | null } {
+  if (round2(existing.price) === round2(newPrice)) {
+    return { price_updated_at: existing.price_updated_at, price_baseline: existing.price_baseline };
+  }
+  return {
+    price_updated_at: nowIso,
+    // First recorded change anchors the baseline at the outgoing price.
+    price_baseline: existing.price_updated_at
+      ? existing.price_baseline
+      : (existing.price > 0 ? round2(existing.price) : null),
   };
 }
 
@@ -4275,10 +4336,13 @@ export async function GetAuditLogs(
     created_at: Date;
     reason: string | null;
     category: string | null;
+    action_id: string;
+    additional_details: unknown;
     action_name: string;
     emp_username: string | null;
     fname: string | null;
     lname: string | null;
+    undo_log_id: string | null;
   }>(
     `
       select
@@ -4286,14 +4350,27 @@ export async function GetAuditLogs(
         l.created_at,
         l.reason,
         l.category,
+        l.action_id,
+        l.additional_details,
         a.action_name,
         lg.emp_username,
         e."emp_Fname" as fname,
-        e."emp_Lname" as lname
+        e."emp_Lname" as lname,
+        u.id as undo_log_id
       from "Audit_logs" l
       join "Actions" a on a.id = l.action_id
       left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
       left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
+      -- "Already undone" is DERIVED: an undo appends a new row that back-references
+      -- the original via additional_details->>'undo_of'. The original row is never touched.
+      left join lateral (
+        select x.id
+        from "Audit_logs" x
+        where x.res_id = l.res_id and x.outlet_id = l.outlet_id
+          and x.additional_details ->> 'undo_of' = l.id::text
+        order by x.created_at asc
+        limit 1
+      ) u on true
       where ${where.join(" and ")}
       order by l.created_at desc
       limit ${limIdx} offset ${offIdx}
@@ -4301,15 +4378,991 @@ export async function GetAuditLogs(
     params,
   );
 
-  return rows.map((row) => ({
-    id: row.id,
-    employee:
-      (`${row.fname ?? ""} ${row.lname ?? ""}`.trim() || row.emp_username || "Unknown"),
-    action: row.action_name,
-    category: row.category ?? "General",
-    details: row.reason,
-    timestamp: new Date(row.created_at),
-  }));
+  // One cache shared across the page so the per-row "is it superseded?" checks
+  // fetch each shared document (settings, branding) at most once.
+  const cache: UndoStateCache = {};
+  const out: AuditLogEntry[] = [];
+  for (const row of rows) {
+    const details = parseJsonObject(row.additional_details);
+    const verdict = await evaluateAuditUndo(restaurantId, {
+      action_id: row.action_id,
+      created_at: new Date(row.created_at),
+      additional_details: details,
+      already_undone: Boolean(row.undo_log_id),
+    }, cache);
+    out.push({
+      id: row.id,
+      employee:
+        (`${row.fname ?? ""} ${row.lname ?? ""}`.trim() || row.emp_username || "Unknown"),
+      action: row.action_name,
+      category: row.category ?? "General",
+      details: row.reason,
+      timestamp: new Date(row.created_at),
+      undoable: verdict.undoable,
+      undo_block_reason: verdict.block_reason,
+      undone: Boolean(row.undo_log_id),
+      undo_log_id: row.undo_log_id ?? null,
+      undo_of: typeof details?.undo_of === "string" ? details.undo_of : null,
+    });
+  }
+  return out;
+}
+
+// ========================== Audit-log undo ==================================
+// Reversing an audited action is deliberately NOT a generic "replay backwards"
+// engine. It is a small explicit ALLOWLIST: an entry is undoable only when its
+// recorded `additional_details.undo.kind` names a registry entry below AND the
+// route captured the prior value at the time. Everything else is refused by
+// DEFAULT DENY — including every historical entry, which predates capture.
+//
+// The original "Audit_logs" row is NEVER updated or deleted. An undo APPENDS a
+// new row carrying { undo_of: <original id> }; the "already undone" flag is
+// derived from that back-reference at read time (see the lateral join above).
+
+/** Global Action seeded by ensureFeaturePermissionActions(); required to call the undo endpoint. */
+export const AUDIT_UNDO_PERMISSION_ID = "6f2a4c81-9d35-4b7e-a0c2-5e8b1d3f7a94";
+
+/** Entries older than this are refused: undoing stale intent is more dangerous than leaving it. */
+export const AUDIT_UNDO_MAX_AGE_DAYS = 7;
+
+/**
+ * Actions that can NEVER be undone, checked on action_id BEFORE the registry is
+ * consulted. Default-deny already covers these (none of them writes an `undo`
+ * envelope), but a hard blocklist means a hand-crafted or mis-copied envelope
+ * still cannot reach an executor. Money, order lifecycle, attendance,
+ * subscription/billing, credentials and user deletion live here permanently.
+ */
+// EVERY comment below is the VERBATIM `action_name` of that row in the "Actions"
+// table — not a paraphrase of what the id was assumed to do. Do not add an id
+// here without reading its Actions row first.
+const AUDIT_UNDO_BLOCKLIST = new Set<string>([
+  // --- Money: payment capture / approval -----------------------------------
+  "2393edd7-cdd9-439c-9ff3-d563d5216967", // Captain Confirm Payment Method
+  "fc57d407-4bba-442c-97a2-9e6f3c57f288", // Approve Payment
+  "ec63660a-67c4-4225-862c-70d99a1f42c8", // Bill Payment Approved
+  "97ea36e9-2157-4730-8c94-233ed7fd8517", // Bill Payment Confirmed
+  "7d3a9f52-4b8c-4e16-a2d7-90c5e8b1f634", // Reconcile Settlement (= RECONCILE_ACTION_ID)
+  "6c2e8a4d-7f1b-4d9c-8e35-b0a4d6c2f791", // Valet Charge to Bill (= VALET_ACTION_CHARGE)
+  "5b3f9d71-2c84-47e6-9a05-8e64d1f0b923", // Loyalty Redeem (= LOYALTY_REDEEM_ACTION_ID)
+  // --- Bill lifecycle -------------------------------------------------------
+  "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", // Create Bill
+  "a953d044-31ba-4e31-b96f-99304fe43dfa", // Close Bill
+  "383cc261-7e5c-4745-b16f-06a41e2ae047", // Replace Bill
+  "d5e3f7a9-2b4c-4d6e-9f80-3c5b7d9e1f2a", // Reopened bill
+  // --- Order lifecycle ------------------------------------------------------
+  "4ad474d4-5230-449c-874f-6a238b833bca", // Add Orders
+  "07e364cc-f40d-46f3-b691-0f719dd38e0f", // Update Order Status
+  "d6bebeb5-111f-4371-b373-a99158116d71", // Update Order - Add Food Item
+  "371ecf9f-303e-4114-92fb-3a5120d1565e", // Update Order - Delete Food Item
+  "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63", // Bark Order (= BARK_ORDER_ACTION_ID)
+  "a4b8f0d2-6c3e-4f7a-9b1d-5e8c2a7f4d90", // Fire Course (= FIRE_COURSE_ACTION_ID)
+  // --- Discount approvals ---------------------------------------------------
+  "c4d2e6f8-1a3b-4c5d-8e7f-2b4a6c8d0e1f", // Approve Discount
+  "9a3c6e81-7d40-4b52-8f19-2c6b4a0e7d35", // Approve Discounts
+  // --- Attendance -----------------------------------------------------------
+  "e7a41c3b-5a20-4f6e-9d38-6c2b9a51f0aa", // Approve Attendance
+  "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047", // Review Attendance
+  "b3f8d6a1-2c47-4e0b-8f5d-9e6a7c8b0d21", // Attendance Clock Event
+  // --- Subscription / credentials / irreversible deletions ------------------
+  "1c6e9b34-7a52-4f80-9d13-3b8c5a0e6f27", // Manage Subscription & Billing
+  "0b4d7f92-6c81-43a5-b7e0-2f9a1c8d5e36", // Manage User Passwords
+  "a978f15d-1043-417a-b07b-05f6bddad875", // Remove Employee
+  "53d0927d-00f4-48cc-a40c-51edb09826d8", // Delete Role
+  "add0a9ec-a563-4903-9a24-d2e0b46361a5", // Remove Inventory Items
+  "5777c4aa-29df-4ea1-9c45-c1038d25f746", // Table Deleted
+  "9c4b7d2e-6f18-4a53-b0e9-1d7a3c58f246", // Issue Stock (= ISSUE_STOCK_ACTION_ID)
+  // --- Bookings + irreversible external side effects ------------------------
+  "1f176202-d5e7-4bb0-802c-275a42425394", // Cancel Booking
+  "fdeecab6-7c3a-4239-b87c-99a96f50c551", // Update Booking Status
+  "5b8d2f16-4c93-47a0-a1e6-3d7f9b0c5e24", // Guest Messaging (a sent message cannot be unsent)
+  // --- Read-only permission, kept for belt-and-braces -----------------------
+  "df75119b-e5f1-4f38-aba5-78a1cf182f56", // View Order APC
+]);
+
+/** The before/after envelope a route writes under additional_details.undo. */
+export type AuditUndoEnvelope = {
+  kind: string;
+  target_id?: string | null;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+};
+
+/** Per-page memo so N rows don't re-fetch the same shared documents. */
+type UndoStateCache = { settings?: RestaurantSettings; branding?: Record<string, unknown> | null };
+
+/**
+ * Refusal a kind can raise for itself once the generic guards have passed. These
+ * exist so an undo that CANNOT faithfully restore the prior state says so
+ * up-front (in GET /audit-logs too, via undoable=false) instead of reporting
+ * success after a no-op write.
+ */
+type UndoBlock = { code: "cannot_restore_null" | "cannot_restore_key" | "target_name_taken"; message: string };
+
+type UndoRegistryEntry = {
+  /** Permission needed to have PERFORMED the original action — also required to undo it. */
+  action_id: string;
+  /** Keys that must exist under undo.before, or the entry has no prior state to restore. */
+  before_keys: string[];
+  /** Current state of the target, or null when the target no longer exists. */
+  current(restaurantId: string, env: AuditUndoEnvelope, cache: UndoStateCache, client?: PoolClient): Promise<Record<string, unknown> | null>;
+  /** True when the target still holds exactly what this action set (false => superseded). */
+  matches(current: Record<string, unknown>, env: AuditUndoEnvelope): boolean;
+  /**
+   * Kind-specific feasibility check, run in BOTH the list evaluation and the
+   * transactional perform. Returning a block means "this cannot be reversed
+   * faithfully" — an honest refusal in place of a silent partial restore.
+   */
+  blocked?(restaurantId: string, env: AuditUndoEnvelope, cache: UndoStateCache, client?: PoolClient): Promise<UndoBlock | null>;
+  /**
+   * Reverse it; returns the values restored (echoed to the caller and logged).
+   * `client` is the undo transaction's client — every write MUST run on it so
+   * the reversal and the appended undo row commit or roll back together.
+   */
+  execute(restaurantId: string, env: AuditUndoEnvelope, actorId: string, client?: PoolClient): Promise<Record<string, unknown>>;
+};
+
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : Number(v) || 0);
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+const sameMoney = (a: unknown, b: unknown): boolean => round2(num(a)) === round2(num(b));
+
+async function undoSettings(restaurantId: string, cache: UndoStateCache): Promise<RestaurantSettings> {
+  if (!cache.settings) cache.settings = await GetRestaurantSettings(restaurantId);
+  return cache.settings;
+}
+
+// ---------------------------------------------------------------------------
+// Explicit-value writers used ONLY by undo.
+//
+// SetRestaurantSettings/SetBranding are "patch" writers: every column is written
+// as coalesce($n, col), so a NULL parameter means "leave unchanged". That is
+// right for a user edit and WRONG for an undo — restoring a prior value of NULL
+// through them is a silent no-op that still reports success. The writers below
+// set the named columns DIRECTLY, so null restores as null.
+//
+// Anything they cannot faithfully restore is refused up-front by the `blocked`
+// hooks instead (see undoSettingsKeyBlock / undoBrandingKeyBlock).
+// ---------------------------------------------------------------------------
+
+/**
+ * settings key -> the "Restaurant" column it lives in, plus how to render the
+ * value as a bind parameter. `nullable` mirrors information_schema: every
+ * Restaurant settings column is nullable, so all of these accept a real NULL.
+ */
+const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; nullable: boolean; toDb(v: unknown): unknown }> = {
+  auto_push_orders: { column: "auto_push_orders", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
+  currency: { column: "currency", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" ? v.slice(0, 8) : null) },
+  payment_methods: { column: "payment_config", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(mergePaymentConfig(v))) },
+  razorpay_key_id: { column: "razorpay_key_id", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 80) : null) },
+  service_charge: { column: "service_charge", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
+  discount_approval_threshold: { column: "discount_approval_threshold", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
+  bill_reopen_window_min: { column: "bill_reopen_window_min", cast: "integer", nullable: true, toDb: (v) => (v == null ? null : Math.round(num(v))) },
+  alert_discount_pct: { column: "alert_discount_pct", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
+  alert_void_count: { column: "alert_void_count", cast: "integer", nullable: true, toDb: (v) => (v == null ? null : Math.round(num(v))) },
+  loyalty_earn_per_100: { column: "loyalty_earn_per_100", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
+  loyalty_point_value: { column: "loyalty_point_value", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
+  booking_deposit_amount: { column: "booking_deposit_amount", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
+  booking_deposit_min_party: { column: "booking_deposit_min_party", cast: "integer", nullable: true, toDb: (v) => (v == null ? null : Math.round(num(v))) },
+  booking_cancel_window_hours: { column: "booking_cancel_window_hours", cast: "integer", nullable: true, toDb: (v) => (v == null ? null : Math.round(num(v))) },
+  booking_min_spend: { column: "booking_min_spend", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
+  msg_provider: { column: "msg_provider", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && ["none", "twilio", "meta"].includes(v) ? v : null) },
+  msg_sender: { column: "msg_sender", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 120) : null) },
+  msg_key_id: { column: "msg_key_id", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 120) : null) },
+  msg_reminder_hours: { column: "msg_reminder_hours", cast: "integer", nullable: true, toDb: (v) => (v == null ? null : Math.round(num(v))) },
+  feedback_config: { column: "feedback_config", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(mergeFeedbackConfig(v))) },
+  bill_logo_svg: { column: "bill_logo_svg", cast: "text", nullable: true, toDb: (v) => { const s = v == null ? "" : sanitizeBillLogoSvg(v); return s ? s : null; } },
+  bill_paper_width: { column: "bill_paper_width", cast: "text", nullable: true, toDb: (v) => (v === "58mm" || v === "80mm" ? v : null) },
+  kitchen_sections: { column: "kitchen_sections", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(sanitizeKitchenSections(v))) },
+  inventory_categories: { column: "inventory_categories", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(sanitizeInventoryCategories(v))) },
+  timezone: { column: "timezone", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? sanitizeTimezone(v) : null) },
+  require_table_otp: { column: "require_table_otp", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
+  queue_show_menu: { column: "queue_show_menu", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
+};
+
+/** `taxes` is not a Restaurant column — it lives on Outlets.default_tax, which is NOT NULL. */
+const UNDO_TAXES_KEY = "taxes";
+
+/** Settings keys that are derived/write-only and have no restorable column. */
+function undoSettingsKeyBlock(key: string, priorValue: unknown): UndoBlock | null {
+  if (key === UNDO_TAXES_KEY) {
+    return priorValue == null
+      ? { code: "cannot_restore_null", message: "The previous value was empty and cannot be restored automatically." }
+      : null;
+  }
+  const col = UNDO_SETTINGS_COLUMNS[key];
+  if (!col) {
+    return { code: "cannot_restore_key", message: `“${key}” is a derived or write-only setting and cannot be restored automatically.` };
+  }
+  if (priorValue == null && !col.nullable) {
+    return { code: "cannot_restore_null", message: "The previous value was empty and cannot be restored automatically." };
+  }
+  return null;
+}
+
+/** Restore settings columns EXPLICITLY (null restores as null). */
+async function writeRestaurantSettingsForUndo(
+  restaurantId: string,
+  patch: Record<string, unknown>,
+  client?: PoolClient,
+): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  await ensureBrandingColumns();
+  const sets: string[] = [];
+  const params: unknown[] = [context.res_id];
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === UNDO_TAXES_KEY) continue;
+    const col = UNDO_SETTINGS_COLUMNS[key];
+    if (!col) throw new Error(`Setting "${key}" cannot be restored`);
+    params.push(col.toDb(value));
+    sets.push(`"${col.column}" = $${params.length}::${col.cast}`);
+  }
+  if (sets.length > 0) {
+    await runQuery(`update "Restaurant" set ${sets.join(", ")} where id = $1`, params, client);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, UNDO_TAXES_KEY)) {
+    const taxes = patch[UNDO_TAXES_KEY];
+    if (taxes == null) throw new Error("Taxes cannot be restored to an empty value");
+    await runQuery(
+      `update "Outlets" set default_tax = $2::json where id = $1 and res_id = $3`,
+      [context.outlet_id, JSON.stringify(normalizeTaxes(taxes)), context.res_id],
+      client,
+    );
+  }
+}
+
+/** Branding keys that map to their own "Restaurant" column; everything else is a brand_config sub-key. */
+const UNDO_BRANDING_COLUMNS: Record<string, { column: string; cast: string; toDb(v: unknown): unknown }> = {
+  logo_url: { column: "logo", cast: "text", toDb: (v) => (typeof v === "string" && v.trim() ? v : null) },
+  theme_color: { column: "theme_color", cast: "text", toDb: (v) => (typeof v === "string" && BRAND_HEX_RE.test(v.trim()) ? v.trim() : null) },
+  queue_show_menu: { column: "queue_show_menu", cast: "boolean", toDb: (v) => (typeof v === "boolean" ? v : null) },
+};
+
+// Lazy: BRAND_COLOR_KEYS is declared further down the module.
+let undoBrandConfigKeys: Set<string> | null = null;
+function isUndoBrandConfigKey(key: string): boolean {
+  if (!undoBrandConfigKeys) undoBrandConfigKeys = new Set<string>(["font", "header_style", "button_shape", ...BRAND_COLOR_KEYS]);
+  return undoBrandConfigKeys.has(key);
+}
+
+function undoBrandingKeyBlock(key: string, priorValue: unknown): UndoBlock | null {
+  // All three branding columns are nullable, so a null prior IS restorable.
+  if (UNDO_BRANDING_COLUMNS[key]) return null;
+  if (isUndoBrandConfigKey(key)) return null;
+  return { code: "cannot_restore_key", message: `“${key}” is not a restorable branding field.` };
+}
+
+/**
+ * Restore branding EXPLICITLY. Top-level columns are assigned directly (null
+ * restores as null). brand_config sub-keys are either set to the prior value or
+ * — when the key had no prior value — REMOVED from the jsonb object, which is
+ * the faithful restore of "the tenant had never set it" (the read layer then
+ * re-applies the same default it applied before the change).
+ */
+async function writeBrandingForUndo(
+  restaurantId: string,
+  patch: Record<string, unknown>,
+  client?: PoolClient,
+): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  await ensureBrandingColumns();
+  const sets: string[] = [];
+  const params: unknown[] = [context.res_id];
+  const setKeys: Record<string, unknown> = {};
+  const dropKeys: string[] = [];
+  for (const [key, value] of Object.entries(patch)) {
+    const col = UNDO_BRANDING_COLUMNS[key];
+    if (col) {
+      params.push(col.toDb(value));
+      sets.push(`"${col.column}" = $${params.length}::${col.cast}`);
+      continue;
+    }
+    if (!isUndoBrandConfigKey(key)) throw new Error(`Branding field "${key}" cannot be restored`);
+    // Round-trip through the sanitizer: an invalid stored value is treated as
+    // "was not set" and the key is dropped rather than written back badly.
+    const sanitized = sanitizeBrandConfigInput({ [key]: value }) as Record<string, unknown>;
+    if (sanitized[key] === undefined) dropKeys.push(key);
+    else setKeys[key] = sanitized[key];
+  }
+  params.push(dropKeys);
+  const dropIdx = `$${params.length}`;
+  params.push(JSON.stringify(setKeys));
+  const setIdx = `$${params.length}`;
+  sets.push(`brand_config = ((coalesce(brand_config, '{}'::jsonb) - ${dropIdx}::text[]) || ${setIdx}::jsonb)`);
+  await runQuery(`update "Restaurant" set ${sets.join(", ")} where id = $1`, params, client);
+}
+
+// Writes a menu item's price fields back verbatim (including the price-history
+// stamps) rather than going through UpdateMenuItemPrice — an undo must restore
+// the prior state exactly, not record a fresh price change.
+async function restoreMenuDescriptionFields(
+  restaurantId: string,
+  itemId: string,
+  patch: Record<string, unknown>,
+  outerClient?: PoolClient,
+): Promise<void> {
+  const run = async (client: PoolClient) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const rows = await runQuery<{ description: string | null }>(
+      `select description from "Menu" where id = $1 and res_id = $2 and outlet_id = $3 limit 1 for update`,
+      [itemId, context.res_id, context.outlet_id],
+      client,
+    );
+    if (!rows[0]) throw new Error("Menu item not found");
+    const existing = parseMenuDescription(rows[0].description);
+    await runQuery(
+      `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
+      [itemId, context.res_id, context.outlet_id, encodeMenuDescription({ ...existing, ...patch } as never)],
+      client,
+    );
+  };
+  // Inside the undo transaction we MUST stay on its client — opening a nested
+  // withTransaction here would only add a savepoint, but passing the client
+  // through makes the participation explicit.
+  if (outerClient) return run(outerClient);
+  await withTransaction(run);
+}
+
+const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
+  // --- Menu price change (PATCH /menu/:id/price) ---------------------------
+  menu_price: {
+    action_id: "ed800655-b937-44ba-a7ca-7458295886c9",
+    before_keys: ["price"],
+    async current(restaurantId, env) {
+      const item = await GetMenuItemUndoState(restaurantId, str(env.target_id));
+      return item ? { price: item.price } : null;
+    },
+    matches: (cur, env) => sameMoney(cur.price, env.after.price),
+    async execute(restaurantId, env, _actorId, client) {
+      const price = round2(num(env.before.price));
+      await restoreMenuDescriptionFields(restaurantId, str(env.target_id), {
+        price,
+        price_updated_at: typeof env.before.price_updated_at === "string" ? env.before.price_updated_at : null,
+        price_baseline: typeof env.before.price_baseline === "number" ? env.before.price_baseline : null,
+      }, client);
+      return { price };
+    },
+  },
+
+  // --- Menu availability toggle (POST /menu, availability-only change) -----
+  menu_availability: {
+    action_id: "88a87943-8f0b-43e2-b85e-192fdc901ed2",
+    before_keys: ["available"],
+    async current(restaurantId, env) {
+      const item = await GetMenuItemUndoState(restaurantId, str(env.target_id));
+      return item ? { available: item.available } : null;
+    },
+    matches: (cur, env) => Boolean(cur.available) === Boolean(env.after.available),
+    async execute(restaurantId, env, _actorId, client) {
+      const available = Boolean(env.before.available);
+      await restoreMenuDescriptionFields(restaurantId, str(env.target_id), { available }, client);
+      return { available };
+    },
+  },
+
+  // --- Kitchen-section rename (POST /kitchen-sections/rename) --------------
+  kitchen_section_rename: {
+    action_id: "ed800655-b937-44ba-a7ca-7458295886c9",
+    before_keys: ["name"],
+    async current(restaurantId, env, cache) {
+      const settings = await undoSettings(restaurantId, cache);
+      const to = str(env.after.name).toLowerCase();
+      const hit = settings.kitchen_sections.find((s) => s.toLowerCase() === to);
+      return hit ? { name: hit } : null;
+    },
+    matches: (cur, env) => str(cur.name).toLowerCase() === str(env.after.name).toLowerCase(),
+    // Renaming B back to A MERGES two groups if something called A exists again.
+    // The new name still existing (checked by current/matches) is not enough —
+    // the OLD name must also be free.
+    async blocked(restaurantId, env, cache) {
+      const settings = await undoSettings(restaurantId, cache);
+      const old = str(env.before.name);
+      const taken = settings.kitchen_sections.some((s) => s.toLowerCase() === old.toLowerCase());
+      return taken ? { code: "target_name_taken", message: `A section named "${old}" already exists, so this rename cannot be reversed.` } : null;
+    },
+    async execute(restaurantId, env, _actorId, client) {
+      const from = str(env.after.name);
+      const to = str(env.before.name);
+      const { updated } = await RenameMenuStation(restaurantId, from, to);
+      const current = await GetRestaurantSettings(restaurantId);
+      const next = current.kitchen_sections.map((s) => (s.toLowerCase() === from.toLowerCase() ? to : s));
+      await writeRestaurantSettingsForUndo(restaurantId, { kitchen_sections: next }, client);
+      return { kitchen_section: to, updated_items: updated };
+    },
+  },
+
+  // --- Inventory-category rename (POST /inventory-categories/rename) -------
+  inventory_category_rename: {
+    action_id: "dfe2cde8-c159-4685-b015-ec7b0d4386eb",
+    before_keys: ["name"],
+    async current(restaurantId, env, cache) {
+      const settings = await undoSettings(restaurantId, cache);
+      const to = str(env.after.name).toLowerCase();
+      const hit = settings.inventory_categories.find((c) => c.toLowerCase() === to);
+      return hit ? { name: hit } : null;
+    },
+    matches: (cur, env) => str(cur.name).toLowerCase() === str(env.after.name).toLowerCase(),
+    // Same merge hazard as kitchen_section_rename: the OLD name must be free.
+    async blocked(restaurantId, env, cache) {
+      const settings = await undoSettings(restaurantId, cache);
+      const old = str(env.before.name);
+      const taken = settings.inventory_categories.some((c) => c.toLowerCase() === old.toLowerCase());
+      return taken ? { code: "target_name_taken", message: `A category named "${old}" already exists, so this rename cannot be reversed.` } : null;
+    },
+    async execute(restaurantId, env, _actorId, client) {
+      const from = str(env.after.name);
+      const to = str(env.before.name);
+      const { updated } = await RenameInventoryCategory(restaurantId, from, to);
+      const current = await GetRestaurantSettings(restaurantId);
+      const next = current.inventory_categories.map((c) => (c.toLowerCase() === from.toLowerCase() ? to : c));
+      await writeRestaurantSettingsForUndo(restaurantId, { inventory_categories: next }, client);
+      return { inventory_category: to, updated_items: updated };
+    },
+  },
+
+  // --- Table added (POST /add-table) --------------------------------------
+  // Undo = delete the table, but ONLY while it is pristine: unoccupied and with
+  // no order or bill ever attached. Anything else keeps the table.
+  table_added: {
+    action_id: "194ce6ee-b867-4be3-b5f0-48c28ce0a81b",
+    before_keys: ["existed"],
+    async current(restaurantId, env, _cache, client) {
+      const context = await requireRestaurantContext(restaurantId, client);
+      await ensureTableOccupancyColumns();
+      const rows = await runQuery<{ id: string; is_occupied: boolean; has_history: boolean }>(
+        `select t.id, coalesce(t.is_occupied, false) as is_occupied,
+                (exists(select 1 from "Orders" o where o.table_id = t.id and o.res_id = t.res_id and o.outlet_id = t.outlet_id)
+                 or exists(select 1 from "Bills" b where b.table_id = t.id and b.res_id = t.res_id and b.outlet_id = t.outlet_id)) as has_history
+           from "Tables" t
+          where t.res_id = $1 and t.outlet_id = $2 and lower(t.table_name) = lower($3)
+            and coalesce(t.is_deleted, false) = false
+          limit 1`,
+        [context.res_id, context.outlet_id, str(env.after.table_name)],
+      );
+      return rows[0] ? { exists: true, is_occupied: rows[0].is_occupied, has_history: rows[0].has_history } : null;
+    },
+    // The table must still be untouched. Occupancy or any attached history means
+    // the world moved on since it was created — treat that as superseded.
+    matches: (cur) => cur.exists === true && cur.is_occupied === false && cur.has_history === false,
+    async execute(restaurantId, env) {
+      const table_name = str(env.after.table_name);
+      const result = await RemoveTable(restaurantId, table_name);
+      if (result.status !== "deleted") {
+        throw new Error(result.status === "not_found" ? "Table no longer exists" : (result.message ?? "Table is in use"));
+      }
+      return { deleted_table: table_name };
+    },
+  },
+
+  // --- Employee role assign / remove (POST /roles/assign, /roles/remove) ---
+  role_assign: {
+    action_id: "4bf54bd9-9124-46c0-a7cc-011ea4c4e172",
+    before_keys: ["roles"],
+    current: (restaurantId, env, _cache, client) => readEmployeeRolesForUndo(restaurantId, str(env.target_id), client),
+    matches: (cur, env) => sameRoleSet(cur.roles, env.after.roles),
+    async execute(restaurantId, env, _actorId, client) {
+      const roles = (Array.isArray(env.before.roles) ? env.before.roles : []).map(String);
+      // Restore the RECORDED primary verbatim; recompute only for entries that
+      // predate primary capture (see writeEmployeeRolesForUndo).
+      const primary = typeof env.before.primary === "string" ? env.before.primary : null;
+      await writeEmployeeRolesForUndo(restaurantId, str(env.target_id), roles, primary, client);
+      return { roles, ...(primary ? { primary } : {}) };
+    },
+  },
+  role_remove: {
+    action_id: "9acc9097-4803-4be0-bb6d-fc2c5de57cf5",
+    before_keys: ["roles"],
+    current: (restaurantId, env, _cache, client) => readEmployeeRolesForUndo(restaurantId, str(env.target_id), client),
+    matches: (cur, env) => sameRoleSet(cur.roles, env.after.roles),
+    async execute(restaurantId, env, _actorId, client) {
+      const roles = (Array.isArray(env.before.roles) ? env.before.roles : []).map(String);
+      const primary = typeof env.before.primary === "string" ? env.before.primary : null;
+      await writeEmployeeRolesForUndo(restaurantId, str(env.target_id), roles, primary, client);
+      return { roles, ...(primary ? { primary } : {}) };
+    },
+  },
+
+  // --- Custom role permission change (POST /roles on an existing role) -----
+  role_permissions: {
+    action_id: "c0135d18-68b4-45e9-9b51-849158df6efd",
+    before_keys: ["actions_performable"],
+    async current(restaurantId, env, _cache, client) {
+      const context = await requireRestaurantContext(restaurantId, client);
+      const rows = await runQuery<{ actions_performable: unknown }>(
+        `select actions_performable from "Roles" where id = $1 and res_id = $2 limit 1`,
+        [str(env.target_id), context.res_id],
+        client,
+      );
+      if (!rows[0]) return null;
+      const raw = rows[0].actions_performable;
+      const list = Array.isArray(raw) ? raw : (parseJsonArray(raw) ?? []);
+      return { actions_performable: list.map(String) };
+    },
+    matches: (cur, env) => sameRoleSet(cur.actions_performable, env.after.actions_performable),
+    async execute(restaurantId, env, _actorId, client) {
+      const context = await requireRestaurantContext(restaurantId, client);
+      const actions = (Array.isArray(env.before.actions_performable) ? env.before.actions_performable : []).map(String);
+      await runQuery(
+        `update "Roles" set actions_performable = $3::json where id = $1 and res_id = $2`,
+        [str(env.target_id), context.res_id, JSON.stringify(actions)],
+        client,
+      );
+      return { actions_performable: actions };
+    },
+  },
+
+  // --- Restaurant settings change (POST /restaurant/settings) --------------
+  // Only the keys THIS entry changed are restored — never the whole document,
+  // so an unrelated setting edited afterwards is left alone.
+  restaurant_settings: {
+    action_id: "6d0f3a94-8b21-4c67-9e53-1a4d7b2f8c60",
+    before_keys: [],
+    async current(restaurantId, env, cache) {
+      const settings = await undoSettings(restaurantId, cache) as unknown as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(env.after ?? {})) out[key] = settings[key];
+      return out;
+    },
+    matches: (cur, env) => Object.keys(env.after ?? {}).every((k) => sameSettingValue(cur[k], env.after[k])),
+    // Refuse up-front rather than "succeed" without writing: a derived/write-only
+    // key has no column to restore, and a null prior on a NOT NULL column
+    // (Outlets.default_tax) cannot be put back.
+    async blocked(_restaurantId, env) {
+      for (const key of Object.keys(env.after ?? {})) {
+        const block = undoSettingsKeyBlock(key, env.before[key]);
+        if (block) return block;
+      }
+      return null;
+    },
+    async execute(restaurantId, env, _actorId, client) {
+      const patch: Record<string, unknown> = {};
+      for (const key of Object.keys(env.after ?? {})) patch[key] = env.before[key];
+      // NOT SetRestaurantSettings — that writer coalesces, which would silently
+      // skip any key whose prior value was null.
+      await writeRestaurantSettingsForUndo(restaurantId, patch, client);
+      return patch;
+    },
+  },
+
+  // --- Branding / customer-page theme (POST /restaurant/branding) ----------
+  branding: {
+    action_id: "4a1c8e73-5f60-49b2-a3d8-7c2e0b6f9153",
+    before_keys: [],
+    // Read through the same resolver the writer's return value went through, so
+    // `after` and `current` are always apples-to-apples (defaults included).
+    async current(restaurantId, env) {
+      const branding = await GetPublicBranding(restaurantId).catch(() => null);
+      if (!branding) return null;
+      const cfg = branding.brand_config as unknown as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(env.after ?? {})) {
+        if (key === "logo_url") out[key] = branding.logo_url;
+        else if (key === "theme_color") out[key] = branding.theme_color;
+        else if (key === "queue_show_menu") out[key] = branding.queue_show_menu;
+        else out[key] = cfg?.[key];
+      }
+      return out;
+    },
+    matches: (cur, env) => Object.keys(env.after ?? {}).every((k) => sameSettingValue(cur[k], env.after[k])),
+    async blocked(_restaurantId, env) {
+      for (const key of Object.keys(env.after ?? {})) {
+        const block = undoBrandingKeyBlock(key, env.before[key]);
+        if (block) return block;
+      }
+      return null;
+    },
+    async execute(restaurantId, env, _actorId, client) {
+      const patch: Record<string, unknown> = {};
+      for (const key of Object.keys(env.after ?? {})) patch[key] = env.before[key];
+      // NOT SetBranding — it coalesces the columns and merge-drops unset
+      // brand_config keys, so restoring a null/absent prior was a silent no-op.
+      await writeBrandingForUndo(restaurantId, patch, client);
+      return patch;
+    },
+  },
+
+  // --- Inventory manual adjustment (POST /inventory/receive | /wastage) ----
+  // The StockMovements ledger is append-only: undo posts a COMPENSATING
+  // movement of the opposite sign. The original movement row is never deleted.
+  inventory_adjust: {
+    action_id: "dfe2cde8-c159-4685-b015-ec7b0d4386eb",
+    before_keys: ["quantity"],
+    async current(restaurantId, env, _cache, client) {
+      const context = await requireRestaurantContext(restaurantId, client);
+      // The Inventory PK is `barcode` — there is no `id` column. `inventory_id`
+      // in the undo envelope is exactly the value ReceiveStock/RecordWastage
+      // adjust on (see adjustInventoryQty).
+      const rows = await runQuery<{ quantity: unknown }>(
+        `select "Quantity" as quantity from "Inventory" where barcode = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+        [str(env.target_id), context.res_id, context.outlet_id],
+        client,
+      );
+      return rows[0] ? { quantity: parseNumeric(rows[0].quantity) } : null;
+    },
+    matches: (cur, env) => sameMoney(cur.quantity, env.after.quantity),
+    async execute(restaurantId, env, actorId) {
+      const delta = round2(num(env.after.quantity) - num(env.before.quantity));
+      const inventory_id = str(env.target_id);
+      if (delta > 0) {
+        await RecordWastage(restaurantId, { inventory_id, qty: delta, reason: "Undo of an audited stock receipt", createdBy: actorId });
+      } else if (delta < 0) {
+        await ReceiveStock(restaurantId, { inventory_id, qty: Math.abs(delta), note: "Undo of an audited wastage entry", createdBy: actorId });
+      }
+      return { quantity: round2(num(env.before.quantity)), compensating_delta: round2(-delta) };
+    },
+  },
+};
+
+// --- Small shared comparators/helpers used by the registry ------------------
+
+function parseJsonArray(raw: unknown): unknown[] | null {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw !== "string") return null;
+  try { const p = JSON.parse(raw); return Array.isArray(p) ? p : null; } catch { return null; }
+}
+
+/** Order-insensitive set equality over stringified entries (roles, action ids). */
+function sameRoleSet(a: unknown, b: unknown): boolean {
+  const norm = (v: unknown) => Array.from(new Set((Array.isArray(v) ? v : []).map((x) => String(x).toLowerCase()))).sort();
+  const x = norm(a); const y = norm(b);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+/** Loose value equality good enough for settings/branding scalars and JSON blobs. */
+function sameSettingValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a === "number" || typeof b === "number") return sameMoney(a, b);
+  if (a == null && b == null) return true;
+  try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
+}
+
+/** Reads the employee's roles AND their primary, so an undo can put both back. */
+export async function readEmployeeRolesForUndo(
+  restaurantId: string,
+  employeeId: string,
+  client?: PoolClient,
+): Promise<{ roles: string[]; primary: string } | null> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  const rows = await runQuery<{ emp_roles: unknown }>(
+    `select emp_roles from "Employees" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [employeeId, context.res_id, context.outlet_id],
+    client,
+  );
+  if (!rows[0]) return null;
+  const parsed = parseEmployeeRoles(rows[0].emp_roles);
+  return { roles: parsed.all, primary: parsed.primary };
+}
+
+/**
+ * Restores emp_roles verbatim. `recordedPrimary` is the primary the audit entry
+ * captured — it is restored AS RECORDED whenever it is still one of the roles
+ * being written. Recomputing (first non-uuid core role) is the fallback for
+ * entries written before primary was captured, or when the recorded primary is
+ * no longer in the restored set.
+ */
+async function writeEmployeeRolesForUndo(
+  restaurantId: string,
+  employeeId: string,
+  roles: string[],
+  recordedPrimary?: string | null,
+  client?: PoolClient,
+): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  const all = Array.from(new Set(roles.map((r) => (isUuid(r) ? r : String(r).toLowerCase())).filter(Boolean)));
+  const list = all.length > 0 ? all : ["employee"];
+  const recorded = typeof recordedPrimary === "string" && recordedPrimary.trim()
+    ? (isUuid(recordedPrimary) ? recordedPrimary : recordedPrimary.trim().toLowerCase())
+    : null;
+  // Primary stays a CORE role name, matching parseEmployeeRoles' invariant.
+  const primary = recorded && !isUuid(recorded) && list.includes(recorded)
+    ? recorded
+    : (list.find((r) => !isUuid(r)) ?? "employee");
+  await runQuery(
+    `update "Employees" set emp_roles = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+    [employeeId, context.res_id, context.outlet_id, JSON.stringify({ primary, all: list })],
+    client,
+  );
+}
+
+// --- Guards ----------------------------------------------------------------
+
+export type AuditUndoVerdict = {
+  undoable: boolean;
+  /** Machine-readable refusal class; null when undoable. */
+  code:
+    | null
+    | "blocklisted"
+    | "not_allowlisted"
+    | "missing_before_state"
+    | "already_undone"
+    | "target_gone"
+    | "superseded"
+    | "too_old"
+    // Honest-refusal classes — the reversal is understood but cannot be applied
+    // faithfully, so it is refused instead of half-applied (or no-op'd).
+    | "cannot_restore_null"
+    | "cannot_restore_key"
+    | "target_name_taken";
+  block_reason: string | null;
+  kind: string | null;
+  /** Permission of the ORIGINAL action — the caller must hold this too. */
+  required_action_id: string | null;
+  envelope: AuditUndoEnvelope | null;
+};
+
+const undoOk = (kind: string, action_id: string, envelope: AuditUndoEnvelope): AuditUndoVerdict =>
+  ({ undoable: true, code: null, block_reason: null, kind, required_action_id: action_id, envelope });
+
+const undoNo = (
+  code: NonNullable<AuditUndoVerdict["code"]>,
+  block_reason: string,
+  kind: string | null = null,
+  required_action_id: string | null = null,
+): AuditUndoVerdict => ({ undoable: false, code, block_reason, kind, required_action_id, envelope: null });
+
+/**
+ * Runs every guard except the caller's permissions (that lives in the route,
+ * which owns req.auth). Order matters: cheap/structural checks first, then the
+ * two that touch the database.
+ */
+export async function evaluateAuditUndo(
+  restaurantId: string,
+  entry: { action_id: string; created_at: Date; additional_details: Record<string, unknown> | null; already_undone: boolean },
+  cache: UndoStateCache = {},
+  client?: PoolClient,
+): Promise<AuditUndoVerdict> {
+  // (blocklist) Permanent refusal, checked before anything else.
+  if (AUDIT_UNDO_BLOCKLIST.has(entry.action_id)) {
+    return undoNo("blocklisted", "Bills, payments, order lifecycle, attendance, subscription, password and user-deletion actions can never be undone.");
+  }
+
+  // An undo entry is itself a normal action — it is not re-undoable.
+  if (typeof entry.additional_details?.undo_of === "string") {
+    return undoNo("not_allowlisted", "This entry is itself an undo and cannot be undone.");
+  }
+
+  // (a) allowlist — DEFAULT DENY for anything without a registry envelope.
+  const env = entry.additional_details?.undo as AuditUndoEnvelope | undefined;
+  const kind = env && typeof env === "object" && typeof env.kind === "string" ? env.kind : null;
+  if (!kind) {
+    return undoNo("not_allowlisted", "This action type cannot be undone.");
+  }
+  const rule = Object.prototype.hasOwnProperty.call(UNDO_REGISTRY, kind) ? UNDO_REGISTRY[kind] : undefined;
+  if (!rule) {
+    return undoNo("not_allowlisted", "This action type cannot be undone.");
+  }
+
+  // (a) required before-state — historical entries recorded no prior value.
+  const before = env!.before && typeof env!.before === "object" ? env!.before : null;
+  const after = env!.after && typeof env!.after === "object" ? env!.after : null;
+  if (!before || !after || rule.before_keys.some((k) => before[k] === undefined)) {
+    return undoNo("missing_before_state", "This entry was recorded without the prior value, so there is nothing to restore.", kind, rule.action_id);
+  }
+
+  // (b) not already undone — derived from the back-referencing undo row.
+  if (entry.already_undone) {
+    return undoNo("already_undone", "This action has already been undone.", kind, rule.action_id);
+  }
+
+  // (f) age cap.
+  const ageMs = Date.now() - entry.created_at.getTime();
+  if (ageMs > AUDIT_UNDO_MAX_AGE_DAYS * 86_400_000) {
+    return undoNo("too_old", `Too old to undo (entries older than ${AUDIT_UNDO_MAX_AGE_DAYS} days cannot be reversed).`, kind, rule.action_id);
+  }
+
+  // (c) target still exists.
+  let current: Record<string, unknown> | null;
+  try {
+    current = await rule.current(restaurantId, env!, cache, client);
+  } catch {
+    return undoNo("target_gone", "The target of this action could not be read.", kind, rule.action_id);
+  }
+  if (!current) {
+    return undoNo("target_gone", "The target of this action no longer exists.", kind, rule.action_id);
+  }
+
+  // (d) not superseded — THE critical guard. If the current value is no longer
+  // what this action set, a later change owns it and undo must not clobber it.
+  if (!rule.matches(current, env!)) {
+    return undoNo("superseded", "Superseded by a later change — the current value is no longer what this action set.", kind, rule.action_id);
+  }
+
+  // (g) kind-specific feasibility — refuse anything that could only be restored
+  // partially, silently, or by merging two distinct things together.
+  if (rule.blocked) {
+    let block: UndoBlock | null;
+    try {
+      block = await rule.blocked(restaurantId, env!, cache, client);
+    } catch {
+      return undoNo("target_gone", "The target of this action could not be read.", kind, rule.action_id);
+    }
+    if (block) return undoNo(block.code, block.message, kind, rule.action_id);
+  }
+
+  return undoOk(kind, rule.action_id, env!);
+}
+
+export type AuditUndoOutcome =
+  | { ok: true; undo_log_id: string; restored: Record<string, unknown>; original_reason: string }
+  | { ok: false; code: NonNullable<AuditUndoVerdict["code"]> | "not_found" | "failed"; message: string; required_action_id?: string | null };
+
+/**
+ * Loads one audit entry inside the caller's tenant, re-runs every guard, and —
+ * only on a clean pass — executes the reversal and APPENDS the undo entry.
+ *
+ * `permitted` is called with the original action's id AND the resolved
+ * kind/envelope so the route can enforce both "you may not undo what you could
+ * not have done" against req.auth and any route-specific guard the original
+ * write had (e.g. only an admin may move the admin/manager roles). Returning a
+ * string refuses with that message; true allows.
+ */
+export async function PerformAuditUndo(
+  restaurantId: string,
+  logId: string,
+  actorEmployeeId: string,
+  permitted: (actionId: string, kind: string, envelope: AuditUndoEnvelope) => true | string,
+): Promise<AuditUndoOutcome> {
+  // DDL first, OUTSIDE the undo transaction: a failed CREATE INDEX inside the
+  // transaction would abort the whole undo. Never fatal — the row lock below is
+  // the primary mechanism; the index is a backstop.
+  await ensureAuditUndoUniqueIndex().catch((err) => {
+    logger.warn({ err: (err as any)?.message ?? err }, "audit_undo_unique_index_unavailable");
+  });
+
+  // EVERYTHING below runs in ONE transaction on ONE client. The request's
+  // tenant-bound connection is bound to AsyncLocalStorage, so nested runQuery /
+  // withTransaction calls made by the executors (and by the shared writers they
+  // delegate to) use this same client and therefore this same transaction; the
+  // reversal and the appended undo row commit or roll back together.
+  try {
+    return await withTransaction(async (client) => {
+      const context = await requireRestaurantContext(restaurantId, client);
+
+      // (e) tenant/outlet scoping is part of the lookup itself.
+      // FOR UPDATE serialises concurrent undos of the SAME entry: the second
+      // caller blocks here until the first commits, then re-evaluates below and
+      // sees the freshly committed undo row.
+      const rows = await runQuery<{
+        id: string; created_at: Date; reason: string | null; action_id: string;
+        additional_details: unknown;
+      }>(
+        `select l.id, l.created_at, l.reason, l.action_id, l.additional_details
+           from "Audit_logs" l
+          where l.id = $1 and l.res_id = $2 and l.outlet_id = $3
+          limit 1
+          for update`,
+        [logId, context.res_id, context.outlet_id],
+        client,
+      );
+      const row = rows[0];
+      if (!row) return { ok: false as const, code: "not_found" as const, message: "Audit entry not found for this restaurant." };
+
+      // "Already undone" is re-derived INSIDE the lock, not carried in from a
+      // read taken before it. Kept as its own statement because FOR UPDATE
+      // cannot be applied to the nullable side of the lateral join.
+      const undoRows = await runQuery<{ id: string }>(
+        `select x.id from "Audit_logs" x
+          where x.res_id = $2 and x.outlet_id = $3
+            and x.additional_details ->> 'undo_of' = $1
+          order by x.created_at asc limit 1`,
+        [row.id, context.res_id, context.outlet_id],
+        client,
+      );
+
+      // (a)-(g) the FULL evaluation, re-run under the lock.
+      const verdict = await evaluateAuditUndo(restaurantId, {
+        action_id: row.action_id,
+        created_at: new Date(row.created_at),
+        additional_details: parseJsonObject(row.additional_details),
+        already_undone: undoRows.length > 0,
+      }, {}, client);
+      if (!verdict.undoable || !verdict.envelope || !verdict.kind) {
+        return { ok: false as const, code: verdict.code ?? "failed" as const, message: verdict.block_reason ?? "This action cannot be undone.", required_action_id: verdict.required_action_id };
+      }
+
+      // Undoing a change requires the permission to have MADE that change, plus any
+      // route-specific guard that write was subject to.
+      const allowed = permitted(verdict.required_action_id!, verdict.kind, verdict.envelope);
+      if (allowed !== true) {
+        return { ok: false as const, code: "failed" as const, message: allowed, required_action_id: verdict.required_action_id };
+      }
+
+      const rule = UNDO_REGISTRY[verdict.kind]!;
+      const restored = await rule.execute(restaurantId, verdict.envelope, actorEmployeeId, client);
+
+      // Append-only: a NEW row. The original is left byte-identical.
+      // The partial UNIQUE index on (res_id, additional_details->>'undo_of') is
+      // the database-level backstop behind the row lock — a second undo of the
+      // same entry raises 23505 and is reported as already_undone.
+      const undoLogId = randomUUID();
+      await runQuery(
+        `insert into "Audit_logs" (id, created_at, res_id, outlet_id, employee_id, action_id, reason, category, additional_details)
+           select $1, now(), $2, $3, $4, l.action_id, $5, l.category, $6
+             from "Audit_logs" l where l.id = $7`,
+        [
+          undoLogId,
+          context.res_id,
+          context.outlet_id,
+          actorEmployeeId,
+          `Undid: ${row.reason ?? "(no description)"}`,
+          {
+            undo_of: row.id,
+            // Marks this row as written by the transactional undo path, which is
+            // what the unique backstop index is scoped to.
+            undo_v: AUDIT_UNDO_WRITER_VERSION,
+            undone_action_id: row.action_id,
+            undone_by_employee: actorEmployeeId,
+            undo_kind: verdict.kind,
+            restored,
+          },
+          row.id,
+        ],
+        client,
+      );
+
+      return { ok: true as const, undo_log_id: undoLogId, restored, original_reason: row.reason ?? "" };
+    });
+  } catch (err) {
+    // Unique-violation on the undo_of backstop => someone else undid it first.
+    if ((err as { code?: string })?.code === "23505") {
+      return { ok: false, code: "already_undone", message: "This action has already been undone." };
+    }
+    return { ok: false, code: "failed", message: String((err as Error)?.message ?? "Unable to undo this action.") };
+  }
+}
+
+/**
+ * Stamped into every undo row this (fixed, transactional) code path appends.
+ * It is what the unique backstop keys on — see ensureAuditUndoUniqueIndex.
+ */
+const AUDIT_UNDO_WRITER_VERSION = "2";
+
+/**
+ * Database-level backstop for concurrent undos: at most ONE audit row per tenant
+ * may back-reference a given original entry.
+ *
+ * The predicate is deliberately scoped to `undo_v = '2'` — rows written by this
+ * code path. Audit_logs is APPEND-ONLY, so a database that already contains
+ * duplicate undo rows from the pre-fix race cannot be made to satisfy an
+ * unscoped unique index without deleting history, which is not allowed. Scoping
+ * by writer version gives full enforcement over everything written from here on
+ * while leaving the historical record untouched.
+ *
+ * Created idempotently on first use; a least-privilege runtime role that cannot
+ * run DDL is tolerated (schema then comes from migrations) — the FOR UPDATE row
+ * lock in PerformAuditUndo is the primary mechanism either way.
+ */
+async function ensureAuditUndoUniqueIndex(): Promise<void> {
+  await ensureLazyTable("Audit_logs.undo_of_unique", async () => {
+    await runQuery(
+      `create unique index if not exists audit_logs_undo_of_uniq
+         on "Audit_logs" (res_id, (additional_details ->> 'undo_of'))
+       where additional_details ->> 'undo_of' is not null
+         and additional_details ->> 'undo_v' = '${AUDIT_UNDO_WRITER_VERSION}'`,
+    ).catch((err) => {
+      // Least-privilege runtimes cannot create indexes; the row lock above is
+      // still in force. Anything else is re-raised by ensureLazyTable.
+      if ((err as { code?: string })?.code !== "42501") throw err;
+    });
+  });
 }
 
 // Lazy column: expiry tracking on inventory items (expiring-soon alerts).
@@ -4609,7 +5662,8 @@ export async function ensureFeaturePermissionActions(): Promise<void> {
          ('6d0f3a94-8b21-4c67-9e53-1a4d7b2f8c60', 'Manage Restaurant Settings', 'Change restaurant settings: taxes, service charge, payment keys, OTP, kitchen sections, feedback config, timezone', 'Restaurant Specific'::"Action_groups"),
          ('4a1c8e73-5f60-49b2-a3d8-7c2e0b6f9153', 'Manage Branding', 'Change logo, colours and customer-page theme', 'Restaurant Specific'::"Action_groups"),
          ('1c6e9b34-7a52-4f80-9d13-3b8c5a0e6f27', 'Manage Subscription & Billing', 'View and change the subscription plan and process billing', 'Restaurant Specific'::"Action_groups"),
-         ('0b4d7f92-6c81-43a5-b7e0-2f9a1c8d5e36', 'Manage User Passwords', 'Reset staff passwords and handle password-reset requests', 'Roles'::"Action_groups")
+         ('0b4d7f92-6c81-43a5-b7e0-2f9a1c8d5e36', 'Manage User Passwords', 'Reset staff passwords and handle password-reset requests', 'Roles'::"Action_groups"),
+         ('6f2a4c81-9d35-4b7e-a0c2-5e8b1d3f7a94', 'Undo Audited Action', 'Reverse an eligible action from the audit log', 'Audit Logs'::"Action_groups")
        on conflict (id) do nothing`,
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
   });
@@ -5412,6 +6466,8 @@ export async function GetMenuItems(restaurantId: string): Promise<MenuItemRecord
       recipe: parsed.recipe,
       station: parsed.station,
       allergens: parsed.allergens,
+      price_updated_at: parsed.price_updated_at,
+      price_baseline: parsed.price_baseline,
     };
   });
 }
@@ -5445,10 +6501,11 @@ export async function UpsertMenuItem(
   // edit or drag-reorder) must never silently wipe recipes/modifiers/images.
   // An explicit null/[] still clears the field.
   let merged = { image_url: item.image_url, available: item.available, modifiers: item.modifiers as unknown, recipe: item.recipe as unknown, station: item.station as unknown, allergens: item.allergens as unknown };
-  if (
-    itemId === item.id &&
-    (item.image_url === undefined || item.available === undefined || item.modifiers === undefined || item.recipe === undefined || item.station === undefined || item.allergens === undefined)
-  ) {
+  // Price history is derived from the STORED row (never trusted from the
+  // client), so an existing item is always read back — a full-menu save that
+  // moves a price must stamp it exactly like PATCH /menu/:id/price does.
+  let history: { price_updated_at: string | null; price_baseline: number | null } = { price_updated_at: null, price_baseline: null };
+  if (itemId === item.id) {
     const existingRows = await runQuery<{ description: string | null }>(
       `select description from "Menu" where id = $1 and res_id = $2 and outlet_id = $3`,
       [itemId, context.res_id, context.outlet_id],
@@ -5464,6 +6521,7 @@ export async function UpsertMenuItem(
         station: item.station === undefined ? existing.station : item.station,
         allergens: item.allergens === undefined ? existing.allergens : item.allergens,
       };
+      history = stampPriceHistory(existing, round2(Number(item.price) || 0), new Date().toISOString());
     }
   }
 
@@ -5486,7 +6544,7 @@ export async function UpsertMenuItem(
       context.res_id,
       context.outlet_id,
       item.name.trim(),
-      encodeMenuDescription({ price: item.price, image_url: merged.image_url, available: merged.available, modifiers: merged.modifiers, recipe: merged.recipe, station: merged.station, allergens: merged.allergens }),
+      encodeMenuDescription({ price: item.price, image_url: merged.image_url, available: merged.available, modifiers: merged.modifiers, recipe: merged.recipe, station: merged.station, allergens: merged.allergens, price_updated_at: history.price_updated_at, price_baseline: history.price_baseline }),
       ids.main_cat_id,
       ids.sub_cat_id,
       "15 mins",
@@ -5541,11 +6599,13 @@ export async function SaveMenuItems(
 // preserved verbatim, and name/category are untouched. Used by the
 // menu-insights "apply price suggestion" flow so a price change can never
 // clobber the rest of the item (PUT /menu is a full-menu replace).
+// Returns the prior price triple alongside the new price so the caller can
+// record an undoable before-state on the audit entry (see UNDO_REGISTRY).
 export async function UpdateMenuItemPrice(
   restaurantId: string,
   itemId: string,
   price: number,
-): Promise<{ id: string; name: string; price: number }> {
+): Promise<{ id: string; name: string; price: number; previous: { price: number; price_updated_at: string | null; price_baseline: number | null } }> {
   const newPrice = round2(Number(price));
   if (!Number.isFinite(newPrice) || newPrice <= 0) throw new Error("Price must be a positive number");
   return withTransaction(async (client) => {
@@ -5560,13 +6620,43 @@ export async function UpdateMenuItemPrice(
     );
     if (!rows[0]) throw new Error("Menu item not found");
     const existing = parseMenuDescription(rows[0].description);
+    const history = stampPriceHistory(existing, newPrice, new Date().toISOString());
     await runQuery(
       `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
-      [itemId, context.res_id, context.outlet_id, encodeMenuDescription({ ...existing, price: newPrice })],
+      [itemId, context.res_id, context.outlet_id, encodeMenuDescription({ ...existing, price: newPrice, ...history })],
       client,
     );
-    return { id: rows[0].id, name: rows[0].name, price: newPrice };
+    return {
+      id: rows[0].id,
+      name: rows[0].name,
+      price: newPrice,
+      previous: { price: existing.price, price_updated_at: existing.price_updated_at, price_baseline: existing.price_baseline },
+    };
   });
+}
+
+// Snapshot of the undo-relevant fields of one menu item (name + the parsed
+// description JSON). Used by the routes to record a before-state on the audit
+// entry, and by the undo registry to read the item's CURRENT state.
+export async function GetMenuItemUndoState(
+  restaurantId: string,
+  itemId: string,
+): Promise<{ id: string; name: string; price: number; available: boolean; price_updated_at: string | null; price_baseline: number | null } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ id: string; name: string; description: string | null }>(
+    `select id, name, description from "Menu" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [itemId, context.res_id, context.outlet_id],
+  );
+  if (!rows[0]) return null;
+  const parsed = parseMenuDescription(rows[0].description);
+  return {
+    id: rows[0].id,
+    name: rows[0].name,
+    price: parsed.price,
+    available: parsed.available,
+    price_updated_at: parsed.price_updated_at,
+    price_baseline: parsed.price_baseline,
+  };
 }
 
 // Rename a kitchen section ACROSS the menu: every item whose station matches
@@ -12789,7 +13879,38 @@ export type PriceSuggestion = {
   direction: "increase" | "decrease";
   reason: string;
 };
+// A suggestion that the raw hot-seller/slow-mover rules WOULD have produced but
+// that a convergence guard withheld, so the UI can explain the quiet period
+// instead of silently dropping the item.
+export type SuppressedSuggestion = {
+  id: string | null;
+  name: string;
+  reason: "cooldown" | "drift_cap" | "margin_floor";
+  // Cooldown only: when this item becomes eligible again
+  // (price_updated_at + the analysis window).
+  retry_after?: string;
+};
 export type WaiterStat = { employee_id: string; employee_name: string; orders: number; revenue: number };
+
+// --- Price-suggestion convergence guards ------------------------------------
+// A suggestion is a pure function of the window's sales and the item's CURRENT
+// price, so without these an applied suggestion compounds: the item is still a
+// hot seller / still slow in that same window, and the next call re-suggests
+// another step off the NEW price (repeated cuts walk a price toward zero).
+//
+// Total drift allowed away from an item's baseline (its price before the first
+// recorded adjustment): increases stop at baseline × 1.25, decreases at
+// baseline × 0.75. Bounds compounding across many windows.
+const PRICE_DRIFT_CAP_UP = 1.25;
+const PRICE_DRIFT_CAP_DOWN = 0.75;
+// Minimum gross margin a suggested price must leave over known recipe food
+// cost: suggested_price >= cost × 1.25 (i.e. keep >= 25% gross margin).
+const PRICE_MIN_MARGIN_MULTIPLE = 1.25;
+// A decrease clamped up to the margin floor is only worth surfacing if it is
+// still at least this far below the current price; otherwise it is withheld.
+const PRICE_MIN_MEANINGFUL_CUT = 0.02;
+// Float slack so a price sitting exactly on a cap compares as "at the cap".
+const PRICE_GUARD_EPSILON = 1e-9;
 
 // Actionable menu/staff analytics over the last `days` days: best/worst selling
 // dishes, simple data-driven price suggestions, and revenue by waiter. Built
@@ -12804,6 +13925,7 @@ export async function GetMenuPerformanceInsights(
   top_dishes: DishStat[];
   slow_movers: DishStat[];
   price_suggestions: PriceSuggestion[];
+  suppressed_suggestions: { count: number; items: SuppressedSuggestion[] };
   top_waiters: WaiterStat[];
 }> {
   const context = await requireRestaurantContext(restaurantId);
@@ -12899,11 +14021,60 @@ export async function GetMenuPerformanceInsights(
   const topCount = Math.max(1, Math.ceil(sortedByQty.length * 0.25));
   const hotSellers = new Set(sortedByQty.slice(0, topCount).map((d) => d.name.toLowerCase()));
   const price_suggestions: PriceSuggestion[] = [];
+  const suppressed: SuppressedSuggestion[] = [];
+
+  // Recipe food cost per menu item id, loaded at most once and only if a
+  // decrease actually reaches the margin check.
+  let costByIdPromise: Promise<Map<string, number>> | null = null;
+  const costById = (): Promise<Map<string, number>> => {
+    if (!costByIdPromise) {
+      costByIdPromise = GetMenuCosting(restaurantId)
+        .then((c) => new Map(c.items.filter((i) => i.cost != null && i.cost > 0).map((i) => [i.id, i.cost as number])))
+        .catch(() => new Map<string, number>());
+    }
+    return costByIdPromise;
+  };
+
+  // Guard (a) EVIDENCE COOLDOWN + guard (b) DRIFT CAP — shared by both loops.
+  // Returns the suppression reason, or null when the item may be suggested.
+  const gateSuggestion = (
+    mi: MenuItemRecord | undefined,
+    price: number,
+    direction: "increase" | "decrease",
+  ): SuppressedSuggestion["reason"] | null => {
+    // (a) The price changed during or after the analysis window, so the sales
+    // this suggestion is built on happened at a DIFFERENT price — there is no
+    // clean evidence about the current price yet. Self-scaling: a 7-day view
+    // re-evaluates the item sooner than a 90-day view.
+    const changedAt = mi?.price_updated_at ? Date.parse(mi.price_updated_at) : NaN;
+    if (Number.isFinite(changedAt) && changedAt >= start.getTime()) return "cooldown";
+    // (b) Total drift from the ORIGINAL price (not the last step), so repeated
+    // adjustments across windows cannot compound without bound.
+    const baseline = mi?.price_baseline != null && mi.price_baseline > 0 ? mi.price_baseline : price;
+    if (direction === "increase" && price >= baseline * PRICE_DRIFT_CAP_UP - PRICE_GUARD_EPSILON) return "drift_cap";
+    if (direction === "decrease" && price <= baseline * PRICE_DRIFT_CAP_DOWN + PRICE_GUARD_EPSILON) return "drift_cap";
+    return null;
+  };
+
+  const suppress = (mi: MenuItemRecord | undefined, name: string, reason: SuppressedSuggestion["reason"]) => {
+    const entry: SuppressedSuggestion = { id: mi?.id ?? null, name, reason };
+    if (reason === "cooldown" && mi?.price_updated_at) {
+      const changedAt = Date.parse(mi.price_updated_at);
+      if (Number.isFinite(changedAt)) {
+        entry.retry_after = new Date(changedAt + periodDays * 24 * 60 * 60 * 1000).toISOString();
+      }
+    }
+    suppressed.push(entry);
+  };
+
   for (const d of sortedByQty) {
     const price = d.current_price as number;
     if (hotSellers.has(d.name.toLowerCase()) && d.quantity >= 5) {
+      const mi = menuByName.get(d.name.toLowerCase());
+      const blocked = gateSuggestion(mi, price, "increase");
+      if (blocked) { suppress(mi, d.name, blocked); continue; }
       price_suggestions.push({
-        id: menuByName.get(d.name.toLowerCase())?.id ?? null,
+        id: mi?.id ?? null,
         name: d.name,
         category: d.category,
         current_price: price,
@@ -12916,20 +14087,40 @@ export async function GetMenuPerformanceInsights(
   // Underperformers: available menu items with very low sales over the window.
   for (const mv of slow_movers) {
     if (mv.current_price && mv.current_price > 0 && mv.quantity <= 2) {
+      const mi = menuByName.get(mv.name.toLowerCase());
+      const blocked = gateSuggestion(mi, mv.current_price, "decrease");
+      if (blocked) { suppress(mi, mv.name, blocked); continue; }
+      let suggested = round2(mv.current_price * 0.9);
+      let clamped = false;
+      // (c) MARGIN FLOOR: never suggest a price that eats the dish's gross
+      // margin. When a known recipe cost puts the 10% cut below the floor we
+      // clamp UP to the floor if that is still a meaningful cut, else withhold.
+      const cost = mi ? (await costById()).get(mi.id) : undefined;
+      if (cost != null && cost > 0) {
+        const floor = round2(cost * PRICE_MIN_MARGIN_MULTIPLE);
+        if (suggested < floor) {
+          if (floor <= mv.current_price * (1 - PRICE_MIN_MEANINGFUL_CUT)) { suggested = floor; clamped = true; }
+          else { suppress(mi, mv.name, "margin_floor"); continue; }
+        }
+      }
+      const cutPct = Math.round(((mv.current_price - suggested) / mv.current_price) * 100);
       price_suggestions.push({
-        id: menuByName.get(mv.name.toLowerCase())?.id ?? null,
+        id: mi?.id ?? null,
         name: mv.name,
         category: mv.category,
         current_price: mv.current_price,
-        suggested_price: round2(mv.current_price * 0.9),
+        suggested_price: suggested,
         direction: "decrease",
-        reason: mv.quantity === 0
-          ? `No sales in ${periodDays} days — consider a lower price or a promotion.`
-          : `Only ${mv.quantity} sold in ${periodDays} days — a ~10% cut may lift volume.`,
+        reason: clamped
+          ? `${mv.quantity === 0 ? "No sales" : `Only ${mv.quantity} sold`} in ${periodDays} days — cut limited to ~${cutPct}% to keep a 25% margin over food cost.`
+          : mv.quantity === 0
+            ? `No sales in ${periodDays} days — consider a lower price or a promotion.`
+            : `Only ${mv.quantity} sold in ${periodDays} days — a ~10% cut may lift volume.`,
       });
     }
   }
   const price_suggestions_capped = price_suggestions.slice(0, 12);
+  const suppressed_suggestions = { count: suppressed.length, items: suppressed.slice(0, 12) };
 
   // Resolve waiter names + revenue ranking.
   const waiterIds = Array.from(waiterMap.keys()).filter((id) => isUuid(id));
@@ -12957,6 +14148,7 @@ export async function GetMenuPerformanceInsights(
     top_dishes,
     slow_movers,
     price_suggestions: price_suggestions_capped,
+    suppressed_suggestions,
     top_waiters,
   };
 }
