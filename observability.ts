@@ -49,7 +49,7 @@ export function initObservability(): void {
 }
 
 export function captureException(err: unknown, context?: Record<string, unknown>): void {
-  if (!sentryEnabled) return;
+  if (!sentryEnabled) {return;}
   try {
     Sentry.captureException(err, context ? { extra: context } : undefined);
   } catch {

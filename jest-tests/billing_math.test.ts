@@ -142,7 +142,7 @@ describe("computeCouponDiscount", () => {
 });
 
 describe("computeBillSplit — conservation & allocation", () => {
-  const sum = (r: { parts: Array<{ total: number }> }) => round2(r.parts.reduce((s, p) => s + p.total, 0));
+  const sum = (r: { parts: { total: number }[] }) => round2(r.parts.reduce((s, p) => s + p.total, 0));
 
   test("even split: parts sum back to the grand total exactly (remainder on last)", () => {
     const r = computeBillSplit(100, "even", { parts: 3 });

@@ -8,8 +8,8 @@ async function waitForHealth(timeoutMs = 10000): Promise<void> {
     try {
       const r = await fetch(`${API_BASE}/health`);
       if (r.ok) {
-        const j = (await r.json().catch(() => ({}))) as any;
-        if (!j.mongo || j.mongo.ok === true) return;
+        const j = (await r.json().catch(() => ({})));
+        if (!j.mongo || j.mongo.ok === true) {return;}
       }
     } catch { }
     await new Promise(r => setTimeout(r, 250));
@@ -43,7 +43,7 @@ async function run() {
       const txt = await res.text();
       throw new Error(`Unexpected failure while filling capacity: ${res.status} ${txt}`);
     }
-    const j = (await res.json()) as any;
+    const j = (await res.json());
     created.push(j.booking_id);
     if (created.length > 20) {
       throw new Error('Capacity threshold test created > 20 bookings unexpectedly; check seed tables');

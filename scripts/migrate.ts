@@ -66,7 +66,7 @@ async function main(): Promise<void> {
     }
 
     console.log(`${pending.length} pending migration(s):`);
-    for (const f of pending) console.log(`  - ${f}`);
+    for (const f of pending) {console.log(`  - ${f}`);}
     if (dryRun) {
       console.log("\n--dry-run: no changes made.");
       return;

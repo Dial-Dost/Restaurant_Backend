@@ -39,8 +39,8 @@ export async function initRealtime(httpServer: HttpServer) {
       const subClient = pubClient.duplicate();
       // node-redis emits 'error' on connection drops; without a listener that can
       // crash the process. Log and let node-redis auto-reconnect.
-      pubClient.on("error", (err) => logger.error({ err }, "socketio_redis_pub_error"));
-      subClient.on("error", (err) => logger.error({ err }, "socketio_redis_sub_error"));
+      pubClient.on("error", (err) => { logger.error({ err }, "socketio_redis_pub_error"); });
+      subClient.on("error", (err) => { logger.error({ err }, "socketio_redis_sub_error"); });
       await Promise.all([pubClient.connect(), subClient.connect()]);
       io.adapter(createAdapter(pubClient, subClient));
       adapterReady = true;
@@ -88,11 +88,11 @@ export async function initRealtime(httpServer: HttpServer) {
 
     // All room operations are pinned to the caller's own restaurant.
     socket.on("join", (rid: string) => {
-      if (rid === resId) socket.join(`restaurant:${resId}`);
+      if (rid === resId) {socket.join(`restaurant:${resId}`);}
     });
 
     socket.on("leave", (rid: string) => {
-      if (rid === resId) socket.leave(`restaurant:${resId}`);
+      if (rid === resId) {socket.leave(`restaurant:${resId}`);}
     });
 
     socket.on("joinOutlet", (payload: any) => {
@@ -106,7 +106,7 @@ export async function initRealtime(httpServer: HttpServer) {
 
     socket.on("leaveOutlet", (payload: any) => {
       const o = payload && typeof payload.outletId === 'string' ? payload.outletId : null;
-      if (o) socket.leave(`restaurant:${resId}:outlet:${o}`);
+      if (o) {socket.leave(`restaurant:${resId}:outlet:${o}`);}
     });
   });
 
@@ -114,7 +114,7 @@ export async function initRealtime(httpServer: HttpServer) {
 }
 
 export function emitRestaurant(restaurantId: string, event: string, payload: unknown) {
-  if (!io) return;
+  if (!io) {return;}
   try {
     const room = `restaurant:${restaurantId}`;
     // Don't log the payload (may contain customer/bill data); event name only.
@@ -125,7 +125,7 @@ export function emitRestaurant(restaurantId: string, event: string, payload: unk
 }
 
 export function emitOutlet(restaurantId: string, outletId: string, event: string, payload: unknown) {
-  if (!io) return;
+  if (!io) {return;}
   try {
     const room = `restaurant:${restaurantId}:outlet:${outletId}`;
     io.to(room).emit(event, payload);
@@ -140,6 +140,6 @@ export function getIo() {
 
 // Close socket.io (and its underlying connections) for graceful shutdown.
 export async function closeRealtime(): Promise<void> {
-  if (!io) return;
-  await new Promise<void>((resolve) => io!.close(() => resolve()));
+  if (!io) {return;}
+  await new Promise<void>((resolve) => io!.close(() => { resolve(); }));
 }

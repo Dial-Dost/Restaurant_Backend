@@ -23,7 +23,7 @@ const pool = connectionString
 	: null;
 
 // Don't let an idle-client error (DB restart/blip) crash the process.
-pool?.on("error", (err) => console.error("[pg] platform pool idle error:", (err as any)?.message ?? err));
+pool?.on("error", (err) => { console.error("[pg] platform pool idle error:", (err as any)?.message ?? err); });
 
 export function platformDbConfigured(): boolean {
 	return pool !== null;
@@ -45,11 +45,11 @@ export async function platformQuery<TRow extends QueryResultRow = QueryResultRow
 // in-process billing scheduler). Returns false without running when another
 // holder already owns the lock.
 export async function withPlatformAdvisoryLock(lockKey: number, work: () => Promise<void>): Promise<boolean> {
-	if (!pool) return false;
+	if (!pool) {return false;}
 	const client = await pool.connect();
 	try {
 		const r = await client.query<{ locked: boolean }>("select pg_try_advisory_lock($1) as locked", [lockKey]);
-		if (!r.rows[0]?.locked) return false;
+		if (!r.rows[0]?.locked) {return false;}
 		try {
 			await work();
 		} finally {
@@ -63,5 +63,5 @@ export async function withPlatformAdvisoryLock(lockKey: number, work: () => Prom
 
 // Graceful-shutdown hook for the platform pool.
 export async function closePlatformPool(): Promise<void> {
-	if (pool) await pool.end();
+	if (pool) {await pool.end();}
 }

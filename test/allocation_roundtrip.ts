@@ -9,8 +9,8 @@ async function waitForHealth(timeoutMs = 10000): Promise<void> {
     try {
       const r = await fetch(`${API_BASE}/health`);
       if (r.ok) {
-        const j = (await r.json().catch(() => ({}))) as any;
-        if (!j.mongo || j.mongo.ok === true) return; // proceed when healthy or no mongo field
+        const j = (await r.json().catch(() => ({})));
+        if (!j.mongo || j.mongo.ok === true) {return;} // proceed when healthy or no mongo field
       }
     } catch {
       /* ignore */
@@ -52,9 +52,9 @@ async function testBestFitAlloc(): Promise<void> {
     throw new Error(`Best-fit POST failed: ${postRes.status} ${txt}`);
   }
   const postJson = (await postRes.json()) as { booking_id: string; table_name?: string | null };
-  if (!postJson.booking_id) throw new Error('Missing booking_id in best-fit response');
-  if (!postJson.table_name) throw new Error('Expected server to allocate a table_name');
-  if (postJson.table_name === 'T1') throw new Error('Allocated a 2-top for a 3-person party, expected >= 3 capacity');
+  if (!postJson.booking_id) {throw new Error('Missing booking_id in best-fit response');}
+  if (!postJson.table_name) {throw new Error('Expected server to allocate a table_name');}
+  if (postJson.table_name === 'T1') {throw new Error('Allocated a 2-top for a 3-person party, expected >= 3 capacity');}
 
   // cleanup
   await fetch(`${API_BASE}/booking/${postJson.booking_id}`, {

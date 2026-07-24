@@ -33,7 +33,7 @@ class RedisStore implements SessionStore {
 		await this.client.expire(k, ttl);
 	}
 	async del(k: string | string[]): Promise<void> {
-		await this.client.del(k as never);
+		await this.client.del(k);
 	}
 	async sAdd(k: string, m: string): Promise<void> {
 		await this.client.sAdd(k, m);
@@ -46,7 +46,7 @@ class RedisStore implements SessionStore {
 	}
 	async incr(k: string, ttl: number): Promise<number> {
 		const n = await this.client.incr(k);
-		if (n === 1) await this.client.expire(k, ttl);
+		if (n === 1) {await this.client.expire(k, ttl);}
 		return n;
 	}
 }
@@ -60,7 +60,7 @@ class MemoryStore implements SessionStore {
 	}
 	async get(k: string): Promise<string | null> {
 		const e = this.kv.get(k);
-		if (!e) return null;
+		if (!e) {return null;}
 		if (e.expiresAt <= Date.now()) {
 			this.kv.delete(k);
 			return null;
@@ -69,7 +69,7 @@ class MemoryStore implements SessionStore {
 	}
 	async expire(k: string, ttl: number): Promise<void> {
 		const e = this.kv.get(k);
-		if (e) e.expiresAt = Date.now() + ttl * 1000;
+		if (e) {e.expiresAt = Date.now() + ttl * 1000;}
 	}
 	async del(k: string | string[]): Promise<void> {
 		for (const key of Array.isArray(k) ? k : [k]) {
@@ -113,7 +113,7 @@ export async function getStore(): Promise<SessionStore> {
 		if (url) {
 			storePromise = (async () => {
 				const c = createClient({ url });
-				c.on("error", (err) => console.error("redis_client_error", err));
+				c.on("error", (err) => { console.error("redis_client_error", err); });
 				await c.connect();
 				return new RedisStore(c);
 			})().catch((err) => {

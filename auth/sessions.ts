@@ -5,7 +5,7 @@ import { getStore } from "./store.js";
 // The session token is a random opaque string; the verified identity lives
 // server-side so we can revoke instantly and never trust client-supplied identity.
 
-export type SessionPayload = {
+export interface SessionPayload {
 	employeeId: string;
 	res_id: string;
 	outlet_id: string;
@@ -26,7 +26,7 @@ export type SessionPayload = {
 	employeeUsername: string;
 	restaurantUsername: string;
 	restaurantName: string;
-};
+}
 
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS ?? 60 * 60 * 12); // sliding 12h
 const SESSION_PREFIX = "session:";

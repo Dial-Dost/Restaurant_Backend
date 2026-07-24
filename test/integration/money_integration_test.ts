@@ -103,7 +103,7 @@ async function main() {
   await OccupyTable(RES_ID, "T3", 2, null, null);
   const o1 = await AddOrder(RES_ID, { table: "T3", customer: "Guest", items: [ITEM("i1", "Tea", 50)], subtotal: 50, total: 50, status: "Preparing" });
   await AddOrder(RES_ID, { table: "T3", customer: "Guest", items: [ITEM("i2", "Cake", 80)], subtotal: 80, total: 80, status: "Preparing" });
-  let before = await orderCounts("T3");
+  const before = await orderCounts("T3");
   check("two open orders exist before settle", before.total === 2 && before.open === 2);
   await ConfirmBillPaymentByWaiter(RES_ID, o1.id, "admin", "Cash");
   await ApproveBillPaymentByAdmin(RES_ID, o1.id, "admin");

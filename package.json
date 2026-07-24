@@ -9,6 +9,9 @@
     "tsx-watch": "tsx watch index.ts",
     "run-python": "node scripts/run-python.js",
     "dev": "npm run tsx-watch",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings=0",
+    "lintfix": "eslint . --ext .ts,.tsx --max-warnings=0 --fix",
+    "typecheck": "tsc --noEmit",
     "dev:full": "concurrently --kill-others --raw \"npm:tsx-watch\" \"npm:run-python\"",
     "build": "tsc --project tsconfig.build.json",
     "test:integration": "tsx test/integration/money_integration_test.ts",
@@ -27,15 +30,20 @@
     "test:ci": "npm run build && jest --runInBand"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/express": "^5.0.3",
     "@types/jest": "^29.5.12",
     "@types/node": "^20.15.0",
     "@types/pg": "^8.20.0",
     "concurrently": "^8.2.0",
+    "eslint": "^10.7.0",
+    "eslint-plugin-n": "^18.2.2",
+    "eslint-plugin-security": "^4.0.1",
     "jest": "^30.3.0",
     "ts-jest": "^29.2.4",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.65.0"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",

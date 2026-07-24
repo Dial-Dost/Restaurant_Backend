@@ -8,9 +8,9 @@
 const ESC = 0x1b;
 const GS = 0x1d;
 
-export type ReceiptItem = { name: string; quantity: number; price: number; note?: string; station?: string | null };
-export type ReceiptTax = { name: string; percentage: number; amount: number };
-export type ReceiptOptions = {
+export interface ReceiptItem { name: string; quantity: number; price: number; note?: string; station?: string | null }
+export interface ReceiptTax { name: string; percentage: number; amount: number }
+export interface ReceiptOptions {
   restaurantName: string;
   // Outlet address line, printed under the name.
   address?: string | null;
@@ -44,7 +44,7 @@ export type ReceiptOptions = {
   logo?: Buffer | null;
   // Voluntary service-charge disclaimer printed in the footer (bill only).
   serviceChargeNote?: string | null;
-};
+}
 
 // Native ESC/POS QR code (GS ( k). Works on virtually all modern thermal
 // printers and avoids shipping a raster bitmap. `size` is the module (dot) size
@@ -84,9 +84,9 @@ function asciiSafe(s: string): string {
 // ASCII fallback so amounts print correctly on any thermal printer.
 function currencyToken(sym: string): string {
   const s = (sym ?? "").trim();
-  if (s === "₹" || s.toLowerCase() === "inr") return "Rs";
-  if (s === "€") return "EUR";
-  if (s === "£") return "GBP";
+  if (s === "₹" || s.toLowerCase() === "inr") {return "Rs";}
+  if (s === "€") {return "EUR";}
+  if (s === "£") {return "GBP";}
   // Keep simple ASCII symbols ($), otherwise fall back to the code.
   return /^[\x20-\x7e]{1,4}$/.test(s) ? s : "";
 }
@@ -109,7 +109,7 @@ function wrapText(text: string, maxLen: number): string[] {
   let cur = "";
   for (const w of words) {
     if ((cur + (cur ? " " : "") + w).length > maxLen) {
-      if (cur) lines.push(cur);
+      if (cur) {lines.push(cur);}
       // A single word longer than the column is hard-split.
       if (w.length > maxLen) {
         let rest = w;
@@ -125,7 +125,7 @@ function wrapText(text: string, maxLen: number): string[] {
       cur = cur ? `${cur} ${w}` : w;
     }
   }
-  if (cur) lines.push(cur);
+  if (cur) {lines.push(cur);}
   return lines.length ? lines : [""];
 }
 
@@ -152,10 +152,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   raw(ESC, 0x21, 0x30); // double width + height
   line(opts.restaurantName || "Receipt");
   raw(ESC, 0x21, 0x00); // normal
-  if (isKot) line("** KITCHEN ORDER **");
-  if (isKot && opts.station && opts.station.trim()) line(`[ ${opts.station.trim().toUpperCase()} ]`);
+  if (isKot) {line("** KITCHEN ORDER **");}
+  if (isKot && opts.station?.trim()) {line(`[ ${opts.station.trim().toUpperCase()} ]`);}
   if (!isKot && opts.address) {
-    for (const l of wrapText(opts.address, width)) line(l);
+    for (const l of wrapText(opts.address, width)) {line(l);}
   }
   line(sep);
 
@@ -180,9 +180,9 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // Kitchen ticket: quantity + name (+ note), no prices.
     for (const it of opts.items) {
       const qty = Math.max(1, Math.round(Number(it.quantity) || 1));
-      for (const [i, l] of wrapText(`${qty} x ${it.name}`, width).entries()) line(i === 0 ? l : `   ${l}`);
+      for (const [i, l] of wrapText(`${qty} x ${it.name}`, width).entries()) {line(i === 0 ? l : `   ${l}`);}
       const note = String(it.note ?? "").trim();
-      if (note) line(`  * ${note}`);
+      if (note) {line(`  * ${note}`);}
     }
     line(sep);
   } else {
@@ -207,9 +207,9 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
         padL(price.toFixed(2), COL_PRICE) +
         padL((price * qty).toFixed(2), COL_TOTAL),
       );
-      for (let i = 1; i < nameLines.length; i++) line(nameLines[i] ?? "");
+      for (let i = 1; i < nameLines.length; i++) {line(nameLines[i] ?? "");}
       const note = String(it.note ?? "").trim();
-      if (note) line(`  * ${note}`);
+      if (note) {line(`  * ${note}`);}
     }
     line(sep);
   }
@@ -228,9 +228,9 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
 
   line(twoCol("Subtotal", Number(opts.total).toFixed(2), width));
   line(twoCol("Total Qty", String(totalQty), width));
-  if (discountAmt > 0) line(twoCol(opts.discount?.label || "Discount", `- ${discountAmt.toFixed(2)}`, width));
-  if (sc) line(twoCol(`Service Charge (${sc.percent}%)`, sc.optedOut ? "Opted-out" : Number(sc.amount).toFixed(2), width));
-  for (const t of taxLines) line(twoCol(`${t.name} (${t.percentage}%)`, Number(t.amount).toFixed(2), width));
+  if (discountAmt > 0) {line(twoCol(opts.discount?.label || "Discount", `- ${discountAmt.toFixed(2)}`, width));}
+  if (sc) {line(twoCol(`Service Charge (${sc.percent}%)`, sc.optedOut ? "Opted-out" : Number(sc.amount).toFixed(2), width));}
+  for (const t of taxLines) {line(twoCol(`${t.name} (${t.percentage}%)`, Number(t.amount).toFixed(2), width));}
 
   // Grand total = subtotal − discount + service charge + taxes, then round to the
   // nearest whole unit (round-off shown explicitly), matching the web bill.
@@ -256,7 +256,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     text("\n");
   }
   if (opts.serviceChargeNote) {
-    for (const l of wrapText(opts.serviceChargeNote, width)) line(l);
+    for (const l of wrapText(opts.serviceChargeNote, width)) {line(l);}
   }
   text("\n\n\n");
   raw(GS, 0x56, 0x00); // full cut
@@ -266,7 +266,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
 // Group KOT items by their (upstream-enriched) kitchen station, preserving the
 // order in which stations first appear. Items with no station fall under a
 // shared "General" bucket so nothing is ever dropped from the kitchen.
-export function groupKotItemsByStation(items: ReceiptItem[]): Array<{ station: string; items: ReceiptItem[] }> {
+export function groupKotItemsByStation(items: ReceiptItem[]): { station: string; items: ReceiptItem[] }[] {
   const groups = new Map<string, ReceiptItem[]>();
   const order: string[] = [];
   for (const it of items) {
@@ -284,7 +284,7 @@ export function groupKotItemsByStation(items: ReceiptItem[]): Array<{ station: s
 // emits one print event per station. A printer agent that maps station→printer
 // routes each ticket to its zone; a single-printer agent prints them back-to-back
 // on one roll (same paper outcome as before, just split into labelled tickets).
-export function buildKotBase64(opts: ReceiptOptions, width = 48): Array<{ station: string; escBase64: string }> {
+export function buildKotBase64(opts: ReceiptOptions, width = 48): { station: string; escBase64: string }[] {
   const groups = groupKotItemsByStation(opts.items);
   // No items at all → still emit a single (empty) General ticket so the caller
   // has something to print, mirroring the pre-split single-ticket behavior.

@@ -8,9 +8,9 @@ const venvWindows = path.join(repoRoot, ".venv", "Scripts", "python.exe");
 const venvUnix = path.join(repoRoot, ".venv", "bin", "python");
 
 let pythonPath = null;
-if (fs.existsSync(venvWindows)) pythonPath = venvWindows;
-else if (fs.existsSync(venvUnix)) pythonPath = venvUnix;
-else pythonPath = "python";
+if (fs.existsSync(venvWindows)) {pythonPath = venvWindows;}
+else if (fs.existsSync(venvUnix)) {pythonPath = venvUnix;}
+else {pythonPath = "python";}
 
 const script = path.join(repoRoot, "Python_servers", "main.py");
 
@@ -27,8 +27,8 @@ function checkPortAvailable(port) {
 
 async function findFreePort(start = 8000, end = 8100) {
   for (let p = start; p <= end; p += 1) {
-    // eslint-disable-next-line no-await-in-loop
-    if (await checkPortAvailable(p)) return p;
+     
+    if (await checkPortAvailable(p)) {return p;}
   }
   return null;
 }

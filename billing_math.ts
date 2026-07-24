@@ -9,7 +9,7 @@ export function round2(value: number): number {
   return Number((Number(value) || 0).toFixed(2));
 }
 
-export type BillTaxLine = { name: string; percentage: number; amount: number };
+export interface BillTaxLine { name: string; percentage: number; amount: number }
 
 // Apply a restaurant's configured taxes (e.g. CGST 2.5%, SGST 2.5%) to a
 // pre-tax subtotal. Accepts either the outlet's `default_tax` record
@@ -17,20 +17,20 @@ export type BillTaxLine = { name: string; percentage: number; amount: number };
 // with its computed amount, the tax total, and the tax-inclusive grand total.
 export function computeBillTaxes(
   subtotal: number,
-  taxConfig: Record<string, number> | Array<{ name: string; percentage: number }> | null | undefined,
+  taxConfig: Record<string, number> | { name: string; percentage: number }[] | null | undefined,
 ): { taxes: BillTaxLine[]; tax_total: number; grand_total: number } {
   const base = Number(subtotal) || 0;
-  const entries: Array<{ name: string; percentage: number }> = [];
+  const entries: { name: string; percentage: number }[] = [];
   if (Array.isArray(taxConfig)) {
     for (const t of taxConfig) {
       const name = String(t?.name ?? "").trim();
       const pct = Number(t?.percentage) || 0;
-      if (name && pct > 0) entries.push({ name, percentage: pct });
+      if (name && pct > 0) {entries.push({ name, percentage: pct });}
     }
   } else if (taxConfig && typeof taxConfig === "object") {
     for (const [name, pct] of Object.entries(taxConfig)) {
       const p = Number(pct) || 0;
-      if (name.trim() && p > 0) entries.push({ name: name.trim(), percentage: p });
+      if (name.trim() && p > 0) {entries.push({ name: name.trim(), percentage: p });}
     }
   }
   const taxes = entries.map((e) => ({ name: e.name, percentage: e.percentage, amount: round2((base * e.percentage) / 100) }));
@@ -45,7 +45,7 @@ export type BillDiscount = { type: "percent" | "flat"; value: number } | null | 
 
 export function computeBillCharges(
   subtotal: number,
-  taxConfig: Record<string, number> | Array<{ name: string; percentage: number }> | null | undefined,
+  taxConfig: Record<string, number> | { name: string; percentage: number }[] | null | undefined,
   serviceChargePercent = 0,
   includeServiceCharge = true,
   discount?: BillDiscount,
@@ -95,20 +95,20 @@ export function computeBillCharges(
 
 // Minimal structural shape of a coupon needed to size its discount. The full
 // `CouponRecord` (database_supabase.ts) is assignable to this.
-export type CouponDiscountInput = { type: "percent" | "flat"; value: number; max_discount?: number | null };
+export interface CouponDiscountInput { type: "percent" | "flat"; value: number; max_discount?: number | null }
 
 // Discount a coupon yields against a pre-tax subtotal, clamped to the subtotal
 // and (when set) to the coupon's max_discount cap.
 export function computeCouponDiscount(coupon: CouponDiscountInput, subtotal: number): number {
-  if (subtotal <= 0) return 0;
+  if (subtotal <= 0) {return 0;}
   let d = coupon.type === "flat" ? coupon.value : (subtotal * coupon.value) / 100;
-  if (coupon.max_discount != null && coupon.max_discount > 0) d = Math.min(d, coupon.max_discount);
+  if (coupon.max_discount != null && coupon.max_discount > 0) {d = Math.min(d, coupon.max_discount);}
   return round2(Math.min(d, subtotal));
 }
 
-export type SplitItem = { name: string; price: number; quantity: number };
-export type SplitGroupInput = { label?: string; items?: SplitItem[] };
-export type SplitPart = { label: string; subtotal: number; total: number; items?: SplitItem[] };
+export interface SplitItem { name: string; price: number; quantity: number }
+export interface SplitGroupInput { label?: string; items?: SplitItem[] }
+export interface SplitPart { label: string; subtotal: number; total: number; items?: SplitItem[] }
 
 // Split a bill's grand total into parts. INVARIANT: the parts' totals always sum
 // back to the grand total exactly (the last part absorbs any rounding remainder),

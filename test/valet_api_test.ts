@@ -11,7 +11,7 @@ async function waitForHealth(timeoutMs = 10000): Promise<void> {
   while (Date.now() - start < timeoutMs) {
     try {
       const r = await fetch(`${API_BASE}/health`);
-      if (r.ok) return;
+      if (r.ok) {return;}
     } catch {
       /* ignore */
     }
@@ -72,7 +72,7 @@ async function run() {
       'X-Outlet-Id': OUTLET_ID,
       'X-Action-List': ACTION_LIST,
     },
-    body: JSON.stringify({ booking_id: booking_id }),
+    body: JSON.stringify({ booking_id }),
   });
 
   if (!r.ok) {
@@ -97,7 +97,7 @@ async function run() {
       'X-Outlet-Id': OUTLET_ID,
       'X-Action-List': ACTION_LIST,
     },
-    body: JSON.stringify({ booking_id: booking_id, state: 2 }),
+    body: JSON.stringify({ booking_id, state: 2 }),
   });
 
   if (!updateResponse.ok) {
@@ -143,7 +143,7 @@ async function run() {
       'X-Outlet-Id': OUTLET_ID,
       'X-Action-List': ACTION_LIST,
     },
-    body: JSON.stringify({ booking_id: booking_id, bay_id: bayIdToUse }),
+    body: JSON.stringify({ booking_id, bay_id: bayIdToUse }),
   });
 
   if (!updateResponseBay.ok) {

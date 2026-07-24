@@ -8,8 +8,8 @@ async function waitForHealth(timeoutMs = 10000): Promise<void> {
     try {
       const r = await fetch(`${API_BASE}/health`);
       if (r.ok) {
-        const j = (await r.json().catch(() => ({}))) as any;
-        if (!j.mongo || j.mongo.ok === true) return;
+        const j = (await r.json().catch(() => ({})));
+        if (!j.mongo || j.mongo.ok === true) {return;}
       }
     } catch { }
     await new Promise(r => setTimeout(r, 250));
@@ -32,10 +32,10 @@ async function run() {
       booking: { table_name: null, date: slot.toISOString(), duration: 90, number_of_people: 3 }
     })
   });
-  if (!firstRes.ok) throw new Error(`First booking failed ${firstRes.status}`);
-  const firstJson = (await firstRes.json()) as any;
+  if (!firstRes.ok) {throw new Error(`First booking failed ${firstRes.status}`);}
+  const firstJson = (await firstRes.json());
   const firstTable = firstJson.table_name;
-  if (!firstTable) throw new Error('First booking missing table allocation');
+  if (!firstTable) {throw new Error('First booking missing table allocation');}
 
   // Second booking same slot: same party size 3, should allocate different table if capacity allows
   const secondRes = await fetch(`${API_BASE}/add-booking`, {
@@ -47,10 +47,10 @@ async function run() {
       booking: { table_name: null, date: slot.toISOString(), duration: 90, number_of_people: 3 }
     })
   });
-  if (!secondRes.ok) throw new Error(`Second booking failed ${secondRes.status}`);
-  const secondJson = (await secondRes.json()) as any;
+  if (!secondRes.ok) {throw new Error(`Second booking failed ${secondRes.status}`);}
+  const secondJson = (await secondRes.json());
   const secondTable = secondJson.table_name;
-  if (!secondTable) throw new Error('Second booking missing table allocation');
+  if (!secondTable) {throw new Error('Second booking missing table allocation');}
   if (secondTable === firstTable) {
     console.warn('Warning: second booking reused same table. This could happen if allocation code allows reuse; verify logic.');
   }

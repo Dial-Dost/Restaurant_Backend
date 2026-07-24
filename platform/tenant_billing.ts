@@ -4,7 +4,7 @@
 // at period end (pending_plan_id, applied by the billing cycle).
 import { platformQuery, platformDbConfigured } from "./db.js";
 
-export type PlanRow = {
+export interface PlanRow {
   id: string;
   code: string;
   name: string;
@@ -12,16 +12,16 @@ export type PlanRow = {
   features: Record<string, unknown>;
   limits: Record<string, unknown>;
   active: boolean;
-};
-export type SubRow = {
+}
+export interface SubRow {
   res_id: string;
   plan_id: string | null;
   status: string;
   trial_ends_at: string | null;
   current_period_end: string | null;
   pending_plan_id: string | null;
-};
-export type InvoiceRow = {
+}
+export interface InvoiceRow {
   id: string;
   res_id: string;
   plan_id: string | null;
@@ -34,7 +34,7 @@ export type InvoiceRow = {
   razorpay_order_id?: string | null;
   razorpay_payment_id?: string | null;
   paid_at?: string | null;
-};
+}
 
 export function billingConfigured(): boolean {
   return platformDbConfigured();
@@ -105,12 +105,12 @@ export async function createPendingInvoice(resId: string, planId: string, amount
        order by created_at desc limit 1`,
     [resId, planId],
   );
-  if (existing[0]) return existing[0];
+  if (existing[0]) {return existing[0];}
   const rows = await platformQuery<InvoiceRow>(
     `insert into platform.invoices (res_id, plan_id, amount_cents, status, note) values ($1, $2, $3, 'pending', $4) returning *`,
     [resId, planId, Math.max(0, Math.round(amountCents)), note],
   );
-  if (!rows[0]) throw new Error("Failed to create invoice");
+  if (!rows[0]) {throw new Error("Failed to create invoice");}
   return rows[0];
 }
 
@@ -150,12 +150,12 @@ export async function markInvoicePaidAndActivate(invoiceId: string, paymentId?: 
     [invoiceId, paymentId ?? null],
   );
   const row = inv[0];
-  if (!row) return null; // already paid / not pending — idempotent no-op
-  if (row.plan_id) await activateSubscriptionPlan(row.res_id, row.plan_id);
+  if (!row) {return null;} // already paid / not pending — idempotent no-op
+  if (row.plan_id) {await activateSubscriptionPlan(row.res_id, row.plan_id);}
   return { res_id: row.res_id, plan_id: row.plan_id };
 }
 
-export type PlanChangeResult = { mode: "upgrade" | "downgrade_scheduled" | "noop"; invoice?: InvoiceRow; plan: PlanRow };
+export interface PlanChangeResult { mode: "upgrade" | "downgrade_scheduled" | "noop"; invoice?: InvoiceRow; plan: PlanRow }
 
 // Decide upgrade vs downgrade and act. Upgrade (or converting a trial / first paid
 // plan): a paid plan returns a pending invoice for the caller to pay (then
@@ -163,7 +163,7 @@ export type PlanChangeResult = { mode: "upgrade" | "downgrade_scheduled" | "noop
 // Downgrade/same-price: scheduled at period end via pending_plan_id (no charge now).
 export async function requestPlanChange(resId: string, targetPlanId: string): Promise<PlanChangeResult> {
   const target = await getPlanById(targetPlanId);
-  if (!target || !target.active) throw new Error("Plan not available");
+  if (!target?.active) {throw new Error("Plan not available");}
   const sub = await getSubscription(resId);
   const currentPlan = sub?.plan_id ? await getPlanById(sub.plan_id) : null;
   const currentPrice = currentPlan?.price_cents ?? 0;

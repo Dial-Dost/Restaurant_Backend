@@ -285,7 +285,7 @@ function resolveQrTable(
 	src: { t?: unknown; table_name?: unknown; table?: unknown; sig?: unknown },
 ): string | null {
 	const token = typeof src.t === "string" ? src.t : "";
-	if (token) return decodeTableToken(resId, token);
+	if (token) {return decodeTableToken(resId, token);}
 	const name = typeof src.table_name === "string"
 		? src.table_name.trim()
 		: typeof src.table === "string" ? src.table.trim() : "";
@@ -337,11 +337,11 @@ const FEEDBACK_BASE_URL = (
 async function feedbackUrlForTable(slug: string, tableName: string): Promise<string | null> {
 	try {
 		const ctx = await GetTableFeedbackContext(slug, tableName);
-		if (!ctx) return null;
+		if (!ctx) {return null;}
 		// Always include rid + oid so the customer is redirected to the feedback
 		// form; include eid only when a waiter could be resolved (for attribution).
 		const qs = new URLSearchParams({ rid: slug, oid: ctx.outlet_id });
-		if (ctx.employee_id) qs.set("eid", ctx.employee_id);
+		if (ctx.employee_id) {qs.set("eid", ctx.employee_id);}
 		// No "/" before the query: the base may now carry a path (…/feedback), and
 		// "…/feedback/?rid=" would bounce through Next's trailing-slash redirect.
 		return `${FEEDBACK_BASE_URL}?${qs.toString()}`;
@@ -362,9 +362,9 @@ function requestLog(req: Request, res: Response, next: NextFunction) {
 	const start = Date.now();
 	res.on("finish", () => {
 		const fields = { method: req.method, path: req.path, status: res.statusCode, ms: Date.now() - start, ip: req.ip };
-		if (res.statusCode >= 500) logger.error(fields, "request");
-		else if (res.statusCode >= 400) logger.warn(fields, "request");
-		else logger.info(fields, "request");
+		if (res.statusCode >= 500) {logger.error(fields, "request");}
+		else if (res.statusCode >= 400) {logger.warn(fields, "request");}
+		else {logger.info(fields, "request");}
 	});
 	next();
 }
@@ -391,9 +391,9 @@ function validateAction(expectedUUID: string) {
 
 async function log_audit(req: Request, action_id: string, action_description: string, category: Audit_log_category, additional_details?: Record<string, any>) {
 	const employeeID = extractEmployeeId(req);
-	if (!employeeID) throw new Error("Cannot log audit entry without employee ID");
+	if (!employeeID) {throw new Error("Cannot log audit entry without employee ID");}
 	const emp_dets = await GetEmployeeDetailsFromEmpID(employeeID);
-	if (!emp_dets) throw new Error("Employee details not found for ID");
+	if (!emp_dets) {throw new Error("Employee details not found for ID");}
 	await AddAuditLogEntry(
 		emp_dets.res_id,
 		emp_dets.outlet_id,
@@ -421,7 +421,7 @@ function normalizeRole(rawRole: unknown): AppRole | null {
 	return null;
 }
 
-type AuthContext = {
+interface AuthContext {
 	employeeId: string;
 	res_id: string;
 	outlet_id: string;
@@ -435,7 +435,7 @@ type AuthContext = {
 	// (so writes/app.outlet_id are real); reads span every outlet of the res_id.
 	// Mutations are rejected while true (write guard in requireAuth).
 	allOutlets: boolean;
-};
+}
 
 declare global {
 	namespace Express {
@@ -446,7 +446,7 @@ declare global {
 }
 
 function extractBearerToken(req: Request): string | null {
-	const header = req.headers["authorization"];
+	const header = req.headers.authorization;
 	const value = Array.isArray(header) ? header[0] : header;
 	if (typeof value === "string" && value.toLowerCase().startsWith("bearer ")) {
 		const token = value.slice(7).trim();
@@ -530,7 +530,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
 		};
 		res.once("finish", release);
 		res.once("close", release);
-		conn.run(() => next());
+		conn.run(() => { next(); });
 	} catch (err) {
 		logger.error({ err }, "tenant_connection_open_failed");
 		res.status(503).json({ error: "Database unavailable" });
@@ -561,12 +561,12 @@ function getFeedbackCategoryLabel(category: number | string): string {
 	if (!normalized) {
 		return "this question";
 	}
-	if (normalized === "1") return "initial greeting";
-	if (normalized === "2") return "waiter service";
-	if (normalized === "3") return "food";
-	if (normalized === "4") return "ambience";
-	if (normalized === "5") return "restroom";
-	if (normalized === "6") return "valet parking";
+	if (normalized === "1") {return "initial greeting";}
+	if (normalized === "2") {return "waiter service";}
+	if (normalized === "3") {return "food";}
+	if (normalized === "4") {return "ambience";}
+	if (normalized === "5") {return "restroom";}
+	if (normalized === "6") {return "valet parking";}
 	return normalized.replace(/_/g, " ");
 }
 
@@ -627,7 +627,7 @@ function extractEmployeeId(req: Request): string | null {
 function feedbackHeader(req: Request, name: string, bodyKey: string): string {
 	const v = req.headers[name];
 	const h = Array.isArray(v) ? v[0] : v;
-	if (typeof h === "string" && h.trim()) return h.trim();
+	if (typeof h === "string" && h.trim()) {return h.trim();}
 	const body = req.body as Record<string, unknown> | undefined;
 	const bv = body?.[bodyKey];
 	return typeof bv === "string" ? bv.trim() : "";
@@ -732,7 +732,7 @@ async function enforcePermission(req: Request, res: Response, actionId: string):
 // Non-responding admin check (for guards that decide their own error).
 function callerIsAdmin(req: Request): boolean {
 	const auth = req.auth;
-	if (!auth) return false;
+	if (!auth) {return false;}
 	return [auth.role, ...(auth.role_all ?? [])].map((r) => String(r).toLowerCase()).includes("admin");
 }
 
@@ -748,7 +748,7 @@ function isAdminRoleName(roleName: string): boolean {
 }
 async function callerIsSuperadmin(req: Request): Promise<boolean> {
 	const auth = req.auth;
-	if (!auth) return false;
+	if (!auth) {return false;}
 	try {
 		const superId = await GetSuperadminEmployeeId(auth.res_id);
 		return !!superId && superId === auth.employeeId;
@@ -764,7 +764,7 @@ async function callerIsSuperadmin(req: Request): Promise<boolean> {
 function safeClientError(err: unknown, fallback: string): string {
 	const e = err as { code?: unknown; severity?: unknown; message?: unknown } | null;
 	const isPgError = !!e && ((typeof e.code === "string" && /^[0-9A-Z]{5}$/.test(e.code)) || typeof e.severity === "string");
-	if (isPgError) return fallback;
+	if (isPgError) {return fallback;}
 	const msg = typeof e?.message === "string" ? e.message : "";
 	return msg && msg.length <= 200 ? msg : fallback;
 }
@@ -825,7 +825,7 @@ function extractOutletId(req: Request): string {
 // type is derived from the global fetch instead of naming it.
 async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 12000): Promise<Awaited<ReturnType<typeof fetch>>> {
 	const ctrl = new AbortController();
-	const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+	const timer = setTimeout(() => { ctrl.abort(); }, timeoutMs);
 	try {
 		return await fetch(url, { ...init, signal: ctrl.signal });
 	} finally {
@@ -857,7 +857,7 @@ function passwordPolicyError(pw: string): string | null {
 function clampLimit(raw: unknown, def = 100, max = 500): number {
 	const v = Array.isArray(raw) ? raw[0] : raw;
 	const n = (typeof v === "string" || typeof v === "number") ? Number.parseInt(String(v), 10) : NaN;
-	if (!Number.isFinite(n) || n <= 0) return def;
+	if (!Number.isFinite(n) || n <= 0) {return def;}
 	return Math.min(n, max);
 }
 
@@ -899,7 +899,7 @@ const sBillRefund = z.object({ bill_id: z.string().optional(), table_name: z.str
 function timingSafeStrEqual(a: string, b: string): boolean {
 	const ab = Buffer.from(a);
 	const bb = Buffer.from(b);
-	if (ab.length !== bb.length) return false;
+	if (ab.length !== bb.length) {return false;}
 	try {
 		return timingSafeEqual(ab, bb);
 	} catch {
@@ -981,7 +981,7 @@ app.use(express.json({
 	// X-Hub-Signature-256 is an HMAC over the exact payload, which the parsed
 	// (re-serialized) body can't reproduce.
 	verify: (req, _res, buf) => {
-		if ((req.url ?? "").startsWith("/webhooks/")) (req as any).rawBody = Buffer.from(buf);
+		if ((req.url ?? "").startsWith("/webhooks/")) {(req as any).rawBody = Buffer.from(buf);}
 	},
 }));
 app.use(express.urlencoded({ extended: true, limit: "8mb" }));
@@ -1049,7 +1049,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // plan explicitly sets features[key] === false, so adding entries never breaks a
 // tenant whose plan doesn't set the flag. Operators set these per plan in the
 // platform console (Plan → included features).
-const FEATURE_BY_PREFIX: Array<[RegExp, string]> = [
+const FEATURE_BY_PREFIX: [RegExp, string][] = [
 	[/^\/(reports|expenses|cash)\b/, "accounting"],
 	[/^\/analytics\b/, "analytics"],
 	[/^\/(inventory|purchase-orders|vendors)\b/, "inventory"],
@@ -1058,7 +1058,7 @@ const FEATURE_BY_PREFIX: Array<[RegExp, string]> = [
 	[/^\/attendance\b/, "attendance"],
 ];
 app.use((req: Request, res: Response, next: NextFunction) => {
-	const features = (req.auth?.features ?? {}) as Record<string, unknown>;
+	const features = (req.auth?.features ?? {});
 	for (const [re, key] of FEATURE_BY_PREFIX) {
 		if (re.test(req.path) && features[key] === false) {
 			res.status(403).json({ error: `Your plan does not include ${key.replace(/_/g, " ")}.`, feature: key });
@@ -1100,7 +1100,7 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				queue_show_menu: branding.queue_show_menu,
 				// Guest QR order page reads this to know whether to prompt for the
 				// per-table OTP before letting the guest place an order.
-				require_table_otp: branding.require_table_otp === true,
+				require_table_otp: branding.require_table_otp,
 				// Rich customer-page customization (font/colors/header/button style),
 				// resolved with sane defaults so the page can theme itself fully.
 				brand_config: branding.brand_config,
@@ -1191,8 +1191,8 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 			// SECURITY: never bill at client-sent prices. Re-price every line from the
 			// menu (floor mode keeps modifier upcharges that are >= the menu base);
 			// items with no current menu match are dropped.
-			const priced = await repriceFromMenu(slug, items as any, true);
-			if (priced.length === 0) throw new Error("None of those items are available right now. Please refresh the menu.");
+			const priced = await repriceFromMenu(slug, items, true);
+			if (priced.length === 0) {throw new Error("None of those items are available right now. Please refresh the menu.");}
 			const pricedSubtotal = Math.round(priced.reduce((s, it) => s + it.price * it.quantity, 0) * 100) / 100;
 			// When the restaurant disables auto-push, customer orders land as
 			// "Pending" and a staffer must approve them before the kitchen sees them.
@@ -1337,7 +1337,7 @@ app.post("/qr/:slug/pay", rateLimit("qr_pay", 15, 60_000), async (req: Request, 
 			// Enforce the restaurant's configured payment methods + screenshot rules.
 			const settings = await GetRestaurantSettings(slug).catch(() => null);
 			const cfg = settings?.payment_methods?.find((m) => m.id.toLowerCase() === method.toLowerCase());
-			if (settings && (!cfg || !cfg.enabled)) {
+			if (settings && (!cfg?.enabled)) {
 				throw new Error("This payment method isn't accepted here.");
 			}
 			let screenshotUrl = typeof body.screenshot_url === "string" ? body.screenshot_url.trim() : "";
@@ -1346,7 +1346,7 @@ app.post("/qr/:slug/pay", rateLimit("qr_pay", 15, 60_000), async (req: Request, 
 					body.screenshot_base64,
 					typeof body.screenshot_content_type === "string" ? body.screenshot_content_type : "image/jpeg",
 				);
-				if (url) screenshotUrl = url;
+				if (url) {screenshotUrl = url;}
 			}
 			return SubmitCustomerPayment(slug, tableName, method, screenshotUrl || null, cfg?.requires_screenshot);
 		});
@@ -1381,7 +1381,7 @@ app.get("/qr/:slug/bill", async (req: Request, res: Response) => {
 	let resId: string | null = null;
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
-	const tableName = resolveQrTable(resId, req.query as Record<string, unknown>);
+	const tableName = resolveQrTable(resId, req.query);
 	if (!tableName) {
 		res.status(403).json({ error: "Invalid table code. Please re-scan the QR at your table." });
 		return;
@@ -1461,7 +1461,7 @@ app.post("/qr/:slug/reserve", rateLimit("qr_reserve", 8, 60_000), async (req: Re
 		}
 		const result = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
 			const custId = await GetCustomerIdOrCreateCustomer(slug, name, phone, email);
-			if (!custId) throw new Error("Unable to record the guest");
+			if (!custId) {throw new Error("Unable to record the guest");}
 			let tableName: string | null = null;
 			try { tableName = await AllocateBestTable(slug, date, duration, partySize); } catch {/* assign later */}
 			const booking = await AddBooking(
@@ -1582,9 +1582,9 @@ async function resolveRazorpayKeys(slug: string, resId: string): Promise<{ key_i
 			{ res_id: resId, outlet_id: "", employeeId: "", role: "" },
 			() => GetRestaurantRazorpayKeys(slug),
 		);
-		if (own) return own;
+		if (own) {return own;}
 	} catch {/* fall through to env */}
-	if (RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET) return { key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET };
+	if (RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET) {return { key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET };}
 	return null;
 }
 
@@ -1605,9 +1605,9 @@ const DASHBOARD_BASE_URL = (process.env.DASHBOARD_BASE_URL ?? "http://localhost:
 function normalizeMsgPhone(raw: string): string {
 	const trimmed = String(raw ?? "").trim();
 	const digits = trimmed.replace(/[^0-9]/g, "");
-	if (!digits) return "";
-	if (trimmed.startsWith("+")) return `+${digits}`;
-	if (digits.length === 10) return `+91${digits}`;
+	if (!digits) {return "";}
+	if (trimmed.startsWith("+")) {return `+${digits}`;}
+	if (digits.length === 10) {return `+91${digits}`;}
 	return `+${digits}`;
 }
 
@@ -1659,8 +1659,8 @@ async function sendMessage(
 						body: form.toString(),
 					},
 				);
-				if (resp.ok) await record("sent");
-				else await record("failed", `HTTP ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 500)}`);
+				if (resp.ok) {await record("sent");}
+				else {await record("failed", `HTTP ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 500)}`);}
 			} catch (err: any) {
 				await record("failed", String(err?.message ?? err).slice(0, 500));
 			}
@@ -1677,8 +1677,8 @@ async function sendMessage(
 						body: JSON.stringify({ messaging_product: "whatsapp", to: to.replace(/^\+/, ""), type: "text", text: { body: opts.body } }),
 					},
 				);
-				if (resp.ok) await record("sent");
-				else await record("failed", `HTTP ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 500)}`);
+				if (resp.ok) {await record("sent");}
+				else {await record("failed", `HTTP ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 500)}`);}
 			} catch (err: any) {
 				await record("failed", String(err?.message ?? err).slice(0, 500));
 			}
@@ -1713,7 +1713,7 @@ function queueBookingConfirm(
 			kind: "booking_confirm",
 			refId: args.bookingId,
 		});
-	}).catch((err) => logger.warn({ err }, "booking_confirm_message_failed"));
+	}).catch((err) => { logger.warn({ err }, "booking_confirm_message_failed"); });
 }
 
 // Reminder pass for one tenant: message every booking starting within the
@@ -1723,15 +1723,15 @@ function queueBookingConfirm(
 async function sendDueBookingReminders(resId: string): Promise<number> {
 	return withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
 		const cfg = await GetMessagingConfig(resId);
-		if (cfg.reminder_hours <= 0) return 0;
+		if (cfg.reminder_hours <= 0) {return 0;}
 		const due = await GetDueBookingReminders(resId, cfg.reminder_hours);
-		if (due.length === 0) return 0;
+		if (due.length === 0) {return 0;}
 		const profile = await GetRestaurantProfile(resId).catch(() => null);
 		const name = profile?.restaurant_name || resId;
 		let sent = 0;
 		for (const b of due) {
 			const first = await MarkBookingReminderSent(resId, b.booking_id);
-			if (!first) continue; // another sweep got there first
+			if (!first) {continue;} // another sweep got there first
 			const when = b.start.toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
 			await sendMessage(resId, {
 				to: b.phone,
@@ -1750,12 +1750,12 @@ async function sendDueBookingReminders(resId: string): Promise<number> {
 // the text isn't a well-formed command — the webhook replies with usage help.
 function parseWaBookingCommand(text: string, now = new Date(), tz = "Asia/Kolkata"): { party: number; date: Date } | null {
 	const m = /^\s*book\s+(\d{1,3})\s+(today|tomorrow|\d{4}-\d{2}-\d{2})\s+(\d{1,2})[:.](\d{2})\s*$/i.exec(String(text ?? ""));
-	if (!m) return null;
+	if (!m) {return null;}
 	const [, partyStr = "", dateToken = "", hhStr = "", mmStr = ""] = m;
 	const party = Number.parseInt(partyStr, 10);
 	const hh = Number.parseInt(hhStr, 10);
 	const mm = Number.parseInt(mmStr, 10);
-	if (!Number.isFinite(party) || party <= 0 || hh > 23 || mm > 59) return null;
+	if (!Number.isFinite(party) || party <= 0 || hh > 23 || mm > 59) {return null;}
 	const zone = sanitizeTimezone(tz);
 	const token = dateToken.toLowerCase();
 	// Resolve the requested day as a wall-clock date IN THE RESTAURANT TIMEZONE,
@@ -1777,7 +1777,7 @@ function parseWaBookingCommand(text: string, now = new Date(), tz = "Asia/Kolkat
 		D = Number(dateToken.slice(8, 10));
 	}
 	const date = zonedWallToUtc(Y, Mo, D, hh, mm, zone);
-	if (Number.isNaN(date.getTime())) return null;
+	if (Number.isNaN(date.getTime())) {return null;}
 	return { party, date };
 }
 
@@ -1862,7 +1862,7 @@ app.post("/webhooks/whatsapp/:slug", rateLimit("wa_webhook", 60, 60_000), async 
 	}
 
 	// Status callbacks / non-text events: acknowledge so the provider stops retrying.
-	if (!inbound || !inbound.from || !inbound.text.trim()) {
+	if (!inbound?.from || !inbound.text.trim()) {
 		res.status(200).json({ ignored: true });
 		return;
 	}
@@ -1872,7 +1872,7 @@ app.post("/webhooks/whatsapp/:slug", rateLimit("wa_webhook", 60, 60_000), async 
 	const reply = (text: string, refId?: string | null) =>
 		withTenant(tenantCtx, () =>
 			sendMessage(slug, { to: guestPhone, body: text, channel: "whatsapp", kind: "wa_reply", refId: refId ?? null }),
-		).catch((err) => logger.warn({ err }, "wa_reply_failed"));
+		).catch((err) => { logger.warn({ err }, "wa_reply_failed"); });
 
 	try {
 		// Load settings up front for the restaurant timezone (so "today"/"tomorrow"
@@ -1900,7 +1900,7 @@ app.post("/webhooks/whatsapp/:slug", rateLimit("wa_webhook", 60, 60_000), async 
 				// Reuse the reserve path's internals: customer → table → booking → bell.
 				const result = await withTenant(tenantCtx, async () => {
 					const custId = await GetCustomerIdOrCreateCustomer(slug, guestName, guestPhone);
-					if (!custId) throw new Error("Unable to record the guest");
+					if (!custId) {throw new Error("Unable to record the guest");}
 					let tableName: string | null = null;
 					try { tableName = await AllocateBestTable(slug, cmd.date, 90, cmd.party); } catch {/* assign later */}
 					const booking = await AddBooking(
@@ -1933,8 +1933,8 @@ app.post("/webhooks/whatsapp/:slug", rateLimit("wa_webhook", 60, 60_000), async 
 	}
 
 	// Twilio expects TwiML (empty <Response/> = no auto-reply); Meta just wants a 2xx.
-	if (inbound.shape === "twilio") res.status(200).type("text/xml").send("<Response/>");
-	else res.status(200).json({ success: true });
+	if (inbound.shape === "twilio") {res.status(200).type("text/xml").send("<Response/>");}
+	else {res.status(200).json({ success: true });}
 });
 
 // --- Public waitlist / queue (walk-ins, no session) ---
@@ -2223,7 +2223,7 @@ app.post("/auth/register-restaurant", rateLimit("register", 5, 60_000), validate
 		if (process.env.SAAS_AUTO_TRIAL !== "false") {
 			try {
 				const newResId = await getRestaurantIdFromUsername(restaurantId);
-				if (newResId) await startTrialIfMissing(newResId, Number(process.env.SAAS_TRIAL_DAYS || 14));
+				if (newResId) {await startTrialIfMissing(newResId, Number(process.env.SAAS_TRIAL_DAYS || 14));}
 			} catch (e) {
 				logger.warn({ err: e }, "start_trial_failed");
 			}
@@ -2481,7 +2481,7 @@ async function GetCustomerIdOrCreateCustomer(
 	restaurantId: string,
 	name: string,
 	number: string,
-	email?: string | undefined,
+	email?: string  ,
 	demographics?: CustomerDemographics | null,
 ): Promise<string | null> {
 	const normalizedName = name.trim();
@@ -2525,13 +2525,13 @@ async function linkOrderToCustomer(
 ): Promise<void> {
 	try {
 		const digits = String(phone ?? "").replace(/[^0-9]/g, "");
-		if (digits.length < 7 || !orderId) return; // no usable identity → skip
+		if (digits.length < 7 || !orderId) {return;} // no usable identity → skip
 		const trimmed = String(name ?? "").trim().replace(/\s+/g, " ");
 		// "Guest"/"QR Guest" placeholders aren't real names — store as "Guest"
 		// (identity is the phone; GetCustomerId matches name + phone together).
 		const displayName = trimmed && !/^(qr )?guest$/i.test(trimmed) ? trimmed.slice(0, 80) : "Guest";
 		const custId = await GetCustomerIdOrCreateCustomer(restaurantId, displayName, digits);
-		if (custId) await SetOrderCustomerId(restaurantId, orderId, custId);
+		if (custId) {await SetOrderCustomerId(restaurantId, orderId, custId);}
 	} catch (err) {
 		logger.warn({ err, orderId }, "link_order_customer_failed");
 	}
@@ -2556,7 +2556,7 @@ app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd")
 		return;
 	}
 
-	let customer = req.body.customer;
+	const customer = req.body.customer;
 	if (!(customer.name && customer.number)) {
 		res.status(400).json({ error: "Missing required fields" });
 		return;
@@ -2568,7 +2568,7 @@ app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd")
 		age_group: typeof customer.age_group === "string" ? customer.age_group : null,
 		pincode: typeof customer.pincode === "string" ? customer.pincode : null,
 	};
-	let cust_id = await GetCustomerIdOrCreateCustomer(
+	const cust_id = await GetCustomerIdOrCreateCustomer(
 		restaurantId,
 		customer.name,
 		customer.number,
@@ -2602,7 +2602,7 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 		return;
 	}
 
-	let table = req.body.table;
+	const table = req.body.table;
 	if (!table.name) {
 		res.status(400).json({ error: "Missing required fields" });
 		return;
@@ -2860,17 +2860,16 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 		return;
 	}
 
-	let customer = req.body.customer;
+	const customer = req.body.customer;
 	if (!(customer.name && customer.number)) {
 		res.status(400).json({ error: "Missing customer field(s)" });
 		return;
 	}
 
-	let booking_request = req.body.booking;
+	const booking_request = req.body.booking;
 	if (
 		!(
-			booking_request &&
-			booking_request.date &&
+			booking_request?.date &&
 			booking_request.duration &&
 			booking_request.number_of_people
 		)
@@ -2878,7 +2877,7 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 		res.status(400).json({ error: "Missing booking field(s)" });
 		return;
 	}
-	let cust_id = await GetCustomerIdOrCreateCustomer(
+	const cust_id = await GetCustomerIdOrCreateCustomer(
 		restaurantId,
 		customer.name,
 		customer.number,
@@ -2891,7 +2890,7 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 		return;
 	}
 
-	let date: Date = new Date(booking_request.date);
+	const date: Date = new Date(booking_request.date);
 	if (isNaN(date.getTime())) {
 		res.status(400).json({ error: "Time is in the wrong format" });
 		return;
@@ -2975,18 +2974,18 @@ function FoldedTables(table: any[]): any[][] {
 		return [];
 	}
 
-	let min: number = table[0]["capacity"];
-	let max: number = table[table.length - 1]["capacity"];
+	const min: number = table[0].capacity;
+	const max: number = table[table.length - 1].capacity;
 
-	let folded_tables = [];
+	const folded_tables = [];
 
-	let curr_index: number = 0;
+	let curr_index = 0;
 	for (let capacity = min; capacity <= max; capacity++) {
-		let cur_table = [];
+		const cur_table = [];
 		let push = false;
 		while (
 			table.length > curr_index &&
-			table[curr_index]["capacity"] == capacity
+			table[curr_index].capacity == capacity
 		) {
 			cur_table.push(table[curr_index]);
 			curr_index += 1;
@@ -3061,8 +3060,8 @@ app.get("/get-tables", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), a
 });
 
 function IsActiveBooking(booking: any, time: Date): boolean {
-	let booking_start = new Date(booking.booking_date_time).getTime();
-	let booking_end =
+	const booking_start = new Date(booking.booking_date_time).getTime();
+	const booking_end =
 		new Date(booking_start).getTime() + booking.duration_mins * 60 * 1000;
 
 	if (booking_start <= time.getTime() && time.getTime() <= booking_end) {
@@ -3268,9 +3267,9 @@ app.post("/bills", validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f"), async
 
 app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
-	if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId' });
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
 
-	const body = (req.body ?? {}) as any;
+	const body = (req.body ?? {});
 	const old_order_id = typeof body.old_order_id === 'string' ? body.old_order_id.trim() : '';
 	const reason = typeof body.reason === 'string' ? body.reason.trim() : null;
 	const new_order = body.new_order ?? null;
@@ -3286,7 +3285,7 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 
 	try {
 		const result = await ReplaceBill(restaurantId, { old_order_id, reason, new_order, new_bill });
-		if (!result) return res.status(500).json({ error: 'Replace operation failed' });
+		if (!result) {return res.status(500).json({ error: 'Replace operation failed' });}
 		// emit realtime events for UI updates — use order:updated for in-place changes
 		try {
 			const payloadForEmit = {
@@ -3310,12 +3309,12 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 
 app.get('/bills/order/:orderId', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
-	if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId' });
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
 	const orderId = String(req.params.orderId ?? '').trim();
-	if (!orderId) return res.status(400).json({ error: 'Missing orderId' });
+	if (!orderId) {return res.status(400).json({ error: 'Missing orderId' });}
 	try {
 		const bill = await GetBillByOrder(restaurantId, orderId);
-		if (!bill) return res.status(404).json({ error: 'Bill not found' });
+		if (!bill) {return res.status(404).json({ error: 'Bill not found' });}
 		try {
 			/* read action — not audited (avoids log clutter) */
 		} catch (err) {
@@ -3330,10 +3329,10 @@ app.get('/bills/order/:orderId', validateAction("98b10bde-802d-4a5b-a726-53a8264
 
 app.get('/restaurant/logo', validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
-	if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId' });
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
 	try {
 		const logoBase64 = await GetRestaurantLogo(restaurantId);
-		if (!logoBase64) return res.status(404).json({ error: 'Logo not found' });
+		if (!logoBase64) {return res.status(404).json({ error: 'Logo not found' });}
 		return res.json({ logo_base64: logoBase64 });
 	} catch (err) {
 		logger.error({ err }, 'get restaurant logo failed');
@@ -3350,10 +3349,10 @@ async function buildLogoEscPos(restaurantId: string, targetWidth = 576): Promise
 	try {
 		const settings = await GetRestaurantSettings(restaurantId);
 		const svg = settings.bill_logo_svg?.trim();
-		if (svg) raw = Buffer.from(svg, 'utf8');
+		if (svg) {raw = Buffer.from(svg, 'utf8');}
 	} catch {/* ignore — fall back to the PNG logo */}
-	if (!raw) raw = await GetRestaurantLogoRaw(restaurantId).catch(() => null);
-	if (!raw) return null;
+	if (!raw) {raw = await GetRestaurantLogoRaw(restaurantId).catch(() => null);}
+	if (!raw) {return null;}
 
 	let sharp: any;
 	try { sharp = (await import('sharp')).default ?? (await import('sharp')); } catch (err) {
@@ -3378,7 +3377,7 @@ async function buildLogoEscPos(restaurantId: string, targetWidth = 576): Promise
 				const idx = y * width + x;
 				const pixel = x < width ? data[idx] : 255;
 				// in thresholded raw, 0=black, 255=white
-				if (pixel === 0) byte |= (1 << (7 - bit));
+				if (pixel === 0) {byte |= (1 << (7 - bit));}
 			}
 			bytes.push(byte);
 		}
@@ -3395,10 +3394,10 @@ async function buildLogoEscPos(restaurantId: string, targetWidth = 576): Promise
 
 app.get('/restaurant/logo/escpos', validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
-	if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId' });
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
 	try {
 		const out = await buildLogoEscPos(restaurantId);
-		if (!out) return res.status(404).json({ error: 'Logo not found' });
+		if (!out) {return res.status(404).json({ error: 'Logo not found' });}
 		res.setHeader('Content-Type', 'application/octet-stream');
 		res.setHeader('Content-Length', String(out.length));
 		return res.send(out);
@@ -3427,7 +3426,7 @@ app.patch('/bills/order/:orderId/status', validateAction("07e364cc-f40d-46f3-b69
 		// If items_split is provided, update per-item statuses on the order
 		if (Array.isArray(body.items_split)) {
 			try {
-				await UpdateOrderItemsSplit(restaurantId, orderId, body.items_split as any[]);
+				await UpdateOrderItemsSplit(restaurantId, orderId, body.items_split);
 				await log_audit(req, "07e364cc-f40d-46f3-b691-0f719dd38e0f", `Updated per-item statuses for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId });
 			} catch (err) {
 				logger.error({ err }, 'update_order_items_split_failed');
@@ -3763,12 +3762,12 @@ app.get("/get-withen-range", validateAction("0a98cf2b-8b42-47a7-a523-b7bb73cb870
 		res.status(400).send({ Error: "Missing restaurantId" });
 		return;
 	}
-	if (!(req.body["start"] && req.body["end"])) {
+	if (!(req.body.start && req.body.end)) {
 		res.status(400).send({ Error: "Missing fields" });
 	}
 
-	let start = new Date(req.body.start);
-	let end = new Date(req.body.end);
+	const start = new Date(req.body.start);
+	const end = new Date(req.body.end);
 
 	if (isNaN(start.valueOf()) || isNaN(end.valueOf())) {
 		res.status(400).send({
@@ -3776,7 +3775,7 @@ app.get("/get-withen-range", validateAction("0a98cf2b-8b42-47a7-a523-b7bb73cb870
 		});
 	}
 
-	let count = await GetBookingsInRange(restaurantId, start, end);
+	const count = await GetBookingsInRange(restaurantId, start, end);
 
 	if (count == null) {
 		res.status(400).send({ Error: "Oops something went wrong" });
@@ -3836,7 +3835,7 @@ app.get("/audit-logs", validateAction("91b24293-7b88-4fe4-8cf5-deb6faaba4f5"), a
 // rest — backed by a partial UNIQUE index on the undo_of back-reference.
 app.post("/audit-logs/:id/undo", validate, async (req: Request, res: Response) => {
 	const scope = await enforcePermission(req, res, AUDIT_UNDO_PERMISSION_ID);
-	if (!scope) return;
+	if (!scope) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const logId = typeof req.params.id === "string" ? req.params.id.trim() : "";
@@ -3852,7 +3851,7 @@ app.post("/audit-logs/:id/undo", validate, async (req: Request, res: Response) =
 	// change must not become a back door around the privilege-escalation rules
 	// those routes enforce. Only the roles the diff actually touches are checked.
 	const roleGuard = (kind: string, envelope: { before: Record<string, unknown>; after: Record<string, unknown> }): true | string => {
-		if (kind !== "role_assign" && kind !== "role_remove") return true;
+		if (kind !== "role_assign" && kind !== "role_remove") {return true;}
 		const list = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
 		const before = list(envelope.before.roles);
 		const after = list(envelope.after.roles);
@@ -4157,7 +4156,7 @@ app.post("/purchase-orders/:id/receive", validateAction(INV_MANAGE), async (req:
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const b = (req.body ?? {}) as Record<string, unknown>;
 	const lines = Array.isArray(b.lines)
-		? (b.lines as any[]).map((l) => ({ inventory_id: String(l?.inventory_id ?? ""), qty_received: Number(l?.qty_received ?? 0) || 0 }))
+		? (b.lines).map((l) => ({ inventory_id: String(l?.inventory_id ?? ""), qty_received: Number(l?.qty_received ?? 0) || 0 }))
 		: [];
 	const qualityRating = typeof b.quality_rating === "number" && b.quality_rating >= 1 && b.quality_rating <= 5 ? b.quality_rating : null;
 	try {
@@ -4332,16 +4331,16 @@ const UNDO_SECRET_SETTING_KEYS = new Set(["razorpay_key_secret", "msg_key_secret
 // Diff two settings snapshots into an undo envelope covering ONLY the keys that
 // actually changed. Returns null when nothing reversible changed.
 function buildSettingsUndo(prior: Record<string, unknown> | null, next: Record<string, unknown>): Record<string, unknown> | null {
-	if (!prior) return null;
+	if (!prior) {return null;}
 	const before: Record<string, unknown> = {};
 	const after: Record<string, unknown> = {};
 	for (const key of Object.keys(next)) {
-		if (UNDO_SECRET_SETTING_KEYS.has(key)) continue;
-		if (JSON.stringify(prior[key] ?? null) === JSON.stringify(next[key] ?? null)) continue;
+		if (UNDO_SECRET_SETTING_KEYS.has(key)) {continue;}
+		if (JSON.stringify(prior[key] ?? null) === JSON.stringify(next[key] ?? null)) {continue;}
 		before[key] = prior[key] ?? null;
 		after[key] = next[key] ?? null;
 	}
-	if (Object.keys(after).length === 0) return null;
+	if (Object.keys(after).length === 0) {return null;}
 	return { kind: "restaurant_settings", target_id: null, before, after };
 }
 
@@ -4351,11 +4350,11 @@ function buildBrandingUndo(
 	prior: { logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: Record<string, unknown> } | null,
 	next: { logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: Record<string, unknown> },
 ): Record<string, unknown> | null {
-	if (!prior) return null;
+	if (!prior) {return null;}
 	const before: Record<string, unknown> = {};
 	const after: Record<string, unknown> = {};
 	const put = (key: string, a: unknown, b: unknown) => {
-		if (JSON.stringify(a ?? null) === JSON.stringify(b ?? null)) return;
+		if (JSON.stringify(a ?? null) === JSON.stringify(b ?? null)) {return;}
 		before[key] = a ?? null;
 		after[key] = b ?? null;
 	};
@@ -4365,12 +4364,12 @@ function buildBrandingUndo(
 	for (const key of Object.keys(next.brand_config ?? {})) {
 		put(key, (prior.brand_config ?? {})[key], (next.brand_config ?? {})[key]);
 	}
-	if (Object.keys(after).length === 0) return null;
+	if (Object.keys(after).length === 0) {return null;}
 	return { kind: "branding", target_id: null, before, after };
 }
 
 app.post("/restaurant/branding", validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_BRANDING))) return;
+	if (!(await enforcePermission(req, res, PERM_BRANDING))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -4386,7 +4385,7 @@ app.post("/restaurant/branding", validate, async (req: Request, res: Response) =
 	try {
 		if (!logoUrl && typeof body.logo_base64 === "string" && body.logo_base64.length > 0) {
 			const url = await uploadMenuImage(body.logo_base64, typeof body.content_type === "string" ? body.content_type : "image/png");
-			if (url) logoUrl = url;
+			if (url) {logoUrl = url;}
 		}
 		// Snapshot before the write so the undo restores only the branding fields
 		// this request changed (SetBranding merges brand_config key-by-key).
@@ -4417,7 +4416,7 @@ app.get("/restaurant/settings", validate, async (req: Request, res: Response) =>
 
 app.post("/restaurant/settings", validate, async (req: Request, res: Response) => {
 	// Settings hold payment keys, taxes and operational toggles — admin-only.
-	if (!(await enforcePermission(req, res, PERM_SETTINGS))) return;
+	if (!(await enforcePermission(req, res, PERM_SETTINGS))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -4476,7 +4475,7 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 // their sent/failed/skipped status — surfaced on the web bookings page so the
 // owner can see whether guests are actually receiving messages.
 app.get("/messages", validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_MESSAGING))) return;
+	if (!(await enforcePermission(req, res, PERM_MESSAGING))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try { res.json(await GetOutboundMessages(restaurantId, clampLimit(req.query.limit, 50, 200))); }
@@ -4486,7 +4485,7 @@ app.get("/messages", validate, async (req: Request, res: Response) => {
 // Run the booking-reminder pass for this tenant now (the same function the
 // 30-min timer calls) — lets an admin nudge reminders without waiting a tick.
 app.post("/messages/run-reminders", validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_MESSAGING))) return;
+	if (!(await enforcePermission(req, res, PERM_MESSAGING))) {return;}
 	const resId = req.auth?.res_id;
 	if (!resId) { res.status(400).json({ error: "Missing restaurant context" }); return; }
 	try { res.json({ success: true, sent: await sendDueBookingReminders(resId) }); }
@@ -4777,7 +4776,7 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), asyn
 
 	try {
 		const body = (req.body ?? {}) as Record<string, unknown>;
-		const result = await AddOrder(restaurantId, body as any);
+		const result = await AddOrder(restaurantId, body);
 		// Best-effort guest registration: orders that carry a phone create/match a
 		// Customers row and get cust_id stamped (CRM visit tracking).
 		await linkOrderToCustomer(restaurantId, result.id, body.customer, body.customer_phone);
@@ -4852,9 +4851,9 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			const arr = Array.isArray(tup?.[1]) ? tup[1] : [];
 			const filtered: any[] = [];
 			for (const it of arr) {
-				const id = String((it && it.id) ?? "");
-				if (!id) continue;
-				if (seenIds.has(id)) continue;
+				const id = String((it?.id) ?? "");
+				if (!id) {continue;}
+				if (seenIds.has(id)) {continue;}
 				seenIds.add(id);
 				filtered.push(it);
 			}
@@ -4862,7 +4861,7 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 		}
 
 		// ensure we have a Preparing tuple to add the new item into
-		let preparingIndex = normalizedSplit.findIndex((t: any) => String(t?.[0] ?? "").toLowerCase().includes('prepar'));
+		const preparingIndex = normalizedSplit.findIndex((t: any) => String(t?.[0] ?? "").toLowerCase().includes('prepar'));
 		const newItem = { id: String(item.id ?? randomUUID()), name: String(item.name ?? 'Unknown'), quantity: Number(item.quantity ?? 1), price: Number(item.price ?? 0), orderedAt: String(item.orderedAt ?? new Date().toISOString()), note: item.note ?? null };
 		if (preparingIndex === -1) {
 			normalizedSplit.push(["Preparing", [newItem]]);
@@ -4873,7 +4872,7 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 
 		const split = normalizedSplit;
 
-		await UpdateOrderItemsSplit(restaurantId, orderId, split as any[]);
+		await UpdateOrderItemsSplit(restaurantId, orderId, split);
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Added item ${newItem.id} to order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, item: newItem }); } catch (err) { logger.warn({ err }, 'log_audit add-order-item failed'); }
 
 		res.status(201).json({ success: true, item: newItem });
@@ -4899,10 +4898,10 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 		// remove item from both sections
 		for (const tuple of split) {
 			if (Array.isArray(tuple[1])) {
-				const before = (tuple[1] as any[]).length;
-				tuple[1] = (tuple[1] as any[]).filter((it) => String(it.id) !== itemId);
+				const before = (tuple[1]).length;
+				tuple[1] = (tuple[1]).filter((it) => String(it.id) !== itemId);
 				const after = (tuple[1] as any[]).length;
-				if (after !== before) break;
+				if (after !== before) {break;}
 			}
 		}
 
@@ -4952,7 +4951,7 @@ app.get("/orders/apc", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), a
 	const periodRaw = typeof req.query.period === "string" ? req.query.period.trim().toLowerCase() : "";
 	const period = (periodRaw === "day" || periodRaw === "week" || periodRaw === "month"
 		? periodRaw
-		: "month") as "day" | "week" | "month";
+		: "month");
 
 	const monthRaw = typeof req.query.month === "string" ? req.query.month.trim() : "";
 	let monthStart: Date | undefined;
@@ -5050,7 +5049,7 @@ app.get("/analytics/history", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f
 // Marketing campaigns (admin): create/delete; ROI is computed by /analytics/advanced.
 app.post("/campaigns", async (req: Request, res: Response) => {
 	const auth = await enforcePermission(req, res, PERM_CAMPAIGNS);
-	if (!auth) return;
+	if (!auth) {return;}
 	const b = (req.body ?? {}) as Record<string, unknown>;
 	try {
 		const campaign = await CreateCampaign(auth.restaurantId, {
@@ -5067,7 +5066,7 @@ app.post("/campaigns", async (req: Request, res: Response) => {
 
 app.delete("/campaigns/:id", async (req: Request, res: Response) => {
 	const auth = await enforcePermission(req, res, PERM_CAMPAIGNS);
-	if (!auth) return;
+	if (!auth) {return;}
 	try {
 		await DeleteCampaign(auth.restaurantId, String(req.params.id));
 		try { await log_audit(req, "df75119b-e5f1-4f38-aba5-78a1cf182f56", `Deleted campaign ${req.params.id}`, Audit_log_category.General, { id: req.params.id }); } catch {/* ignore */}
@@ -5188,7 +5187,7 @@ app.get("/analytics/menu-insights", validateAction("df75119b-e5f1-4f38-aba5-78a1
 // Gated by the analytics/financial-reports permission.
 const ACCOUNTING_PERM = "df75119b-e5f1-4f38-aba5-78a1cf182f56";
 
-function toCsv(headers: string[], rows: Array<Array<string | number>>): string {
+function toCsv(headers: string[], rows: (string | number)[][]): string {
 	const esc = (v: string | number) => {
 		const s = String(v ?? "");
 		return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -5262,7 +5261,7 @@ app.get("/payroll.csv", validateAction(ACCOUNTING_PERM), async (req: Request, re
 	try {
 		const p = await GetPayroll(restaurantId, period);
 		const r2 = (n: number) => Math.round(n * 100) / 100;
-		const rows: Array<Array<string | number>> = p.rows.map((r) => {
+		const rows: (string | number)[][] = p.rows.map((r) => {
 			const prof = r.profile;
 			const gross = prof ? r2(prof.pay_type === "hourly" ? r.hours_worked * prof.hourly_rate : prof.base_salary) : 0;
 			return [
@@ -5379,7 +5378,7 @@ const platformRazorpayReady = Boolean(PLATFORM_RAZORPAY_KEY_ID && PLATFORM_RAZOR
 
 app.get("/billing", async (req: Request, res: Response) => {
 	const auth = await enforcePermission(req, res, PERM_BILLING);
-	if (!auth) return;
+	if (!auth) {return;}
 	if (!billingConfigured()) {
 		res.json({ configured: false, online_pay: false, subscription: null, plan: null, pending_plan: null, plans: [], invoices: [] });
 		return;
@@ -5392,7 +5391,7 @@ app.get("/billing", async (req: Request, res: Response) => {
 
 app.post("/billing/change-plan", async (req: Request, res: Response) => {
 	const auth = await enforcePermission(req, res, PERM_BILLING);
-	if (!auth) return;
+	if (!auth) {return;}
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const planId = typeof body.plan_id === "string" ? body.plan_id.trim() : "";
 	if (!planId) { res.status(400).json({ error: "plan_id is required" }); return; }
@@ -5404,7 +5403,7 @@ app.post("/billing/change-plan", async (req: Request, res: Response) => {
 
 app.post("/billing/pay/create", async (req: Request, res: Response) => {
 	const auth = await enforcePermission(req, res, PERM_BILLING);
-	if (!auth) return;
+	if (!auth) {return;}
 	if (!platformRazorpayReady) { res.status(503).json({ error: "Online payment isn't set up. Your provider will confirm the payment manually." }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const invoiceId = typeof body.invoice_id === "string" ? body.invoice_id.trim() : "";
@@ -5431,7 +5430,7 @@ app.post("/billing/pay/create", async (req: Request, res: Response) => {
 
 app.post("/billing/pay/verify", async (req: Request, res: Response) => {
 	const auth = await enforcePermission(req, res, PERM_BILLING);
-	if (!auth) return;
+	if (!auth) {return;}
 	if (!platformRazorpayReady) { res.status(503).json({ error: "Online payment isn't set up." }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const invoiceId = typeof body.invoice_id === "string" ? body.invoice_id.trim() : "";
@@ -5616,7 +5615,7 @@ app.get("/reports/sales.csv", validateAction(ACCOUNTING_PERM), async (req: Reque
 	const { from, to } = reportRange(req);
 	try {
 		const r = await GetSalesReport(restaurantId, from, to);
-		const rows: Array<Array<string | number>> = r.by_day.map((d) => [d.date, d.bills, d.sales, d.tax, d.refund]);
+		const rows: (string | number)[][] = r.by_day.map((d) => [d.date, d.bills, d.sales, d.tax, d.refund]);
 		rows.push(["Total", r.bill_count, r.total_sales, r.total_tax, r.total_refund]);
 		res.setHeader("Content-Type", "text/csv; charset=utf-8");
 		res.setHeader("Content-Disposition", `attachment; filename="sales_${r.from}_to_${r.to}.csv"`);
@@ -5630,7 +5629,7 @@ app.get("/reports/gst.csv", validateAction(ACCOUNTING_PERM), async (req: Request
 	const { from, to } = reportRange(req);
 	try {
 		const r = await GetGstReport(restaurantId, from, to);
-		const rows: Array<Array<string | number>> = r.by_rate.map((t) => [t.name, t.percentage, t.taxable, t.tax]);
+		const rows: (string | number)[][] = r.by_rate.map((t) => [t.name, t.percentage, t.taxable, t.tax]);
 		rows.push(["Total", "", r.total_taxable, r.total_tax]);
 		res.setHeader("Content-Type", "text/csv; charset=utf-8");
 		res.setHeader("Content-Disposition", `attachment; filename="gst_${r.from}_to_${r.to}.csv"`);
@@ -5657,7 +5656,7 @@ app.get("/expenses.csv", validateAction(ACCOUNTING_PERM), async (req: Request, r
 	const { from, to } = reportRange(req);
 	try {
 		const ex = await GetExpenses(restaurantId, from, to);
-		const rows: Array<Array<string | number>> = ex.map((e) => [e.spent_on, e.category, e.vendor ?? "", e.amount, e.note ?? ""]);
+		const rows: (string | number)[][] = ex.map((e) => [e.spent_on, e.category, e.vendor ?? "", e.amount, e.note ?? ""]);
 		res.setHeader("Content-Type", "text/csv; charset=utf-8");
 		res.setHeader("Content-Disposition", `attachment; filename="expenses.csv"`);
 		res.send(toCsv(["Date", "Category", "Vendor", "Amount", "Note"], rows));
@@ -5680,7 +5679,7 @@ app.get("/analytics/operations", validateAction("df75119b-e5f1-4f38-aba5-78a1cf1
 const ATTENDANCE_REVIEW_ACTION = "e7a41c3b-5a20-4f6e-9d38-6c2b9a51f0aa";
 async function handleAttendanceReview(req: Request, res: Response, approve: boolean): Promise<void> {
 	const admin = await enforcePermission(req, res, PERM_ATTENDANCE);
-	if (!admin) return;
+	if (!admin) {return;}
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	if (!id) { res.status(400).json({ error: "Missing id" }); return; }
 	try {
@@ -5728,7 +5727,7 @@ app.get("/attendance/me", validate, async (req: Request, res: Response) => {
 
 app.get("/attendance", validate, async (req: Request, res: Response) => {
 	const auth = await enforcePermission(req, res, PERM_ATTENDANCE);
-	if (!auth) return;
+	if (!auth) {return;}
 	const from = typeof req.query.from === "string" ? req.query.from : undefined;
 	const to = typeof req.query.to === "string" ? req.query.to : undefined;
 	try { res.json(await GetAttendanceSummary(auth.restaurantId, from, to)); }
@@ -5794,7 +5793,7 @@ app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9")
 			return;
 		}
 
-		const outlets = await GetOutlets(restaurantId).catch(() => [] as Array<{ id: string }>);
+		const outlets = await GetOutlets(restaurantId).catch(() => [] as { id: string }[]);
 		const outletBelongs = outlets.some((o) => String(o.id) === String(outletId));
 		if (!outletBelongs) {
 			res.status(400).json({ error: 'Invalid outletId for the restaurant' });
@@ -5853,7 +5852,7 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			const stationByName = new Map<string, string>();
 			try {
 				const menu = await GetMenuItems(restaurantId);
-				for (const m of menu) if (m.station) stationByName.set(m.name.trim().toLowerCase(), m.station);
+				for (const m of menu) {if (m.station) {stationByName.set(m.name.trim().toLowerCase(), m.station);}}
 			} catch {/* menu unavailable — items fall under a single General ticket */}
 			const kotItems = bill.items.map((it) => ({ ...it, station: stationByName.get(String(it.name).trim().toLowerCase()) ?? null }));
 			const tickets = buildKotBase64({
@@ -5924,7 +5923,7 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 // Admin: remove a wrongly-added item from a table's running bill.
 app.post('/bills/remove-item', validateBody(sBillRemoveItem), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
 	const itemName = typeof body.item_name === "string" ? body.item_name.trim() : "";
@@ -6011,7 +6010,7 @@ app.post('/bills/discount', validateAction("4ad474d4-5230-449c-874f-6a238b833bca
 
 // --- Discount approval queue (admin) -----------------------------------------
 app.get('/discount-requests', validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_DISCOUNTS))) return;
+	if (!(await enforcePermission(req, res, PERM_DISCOUNTS))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const status = typeof req.query.status === "string" ? req.query.status : undefined;
@@ -6023,7 +6022,7 @@ app.get('/discount-requests', validate, async (req: Request, res: Response) => {
 // discount uses; reject leaves the bill untouched. Both are audit-logged.
 for (const decision of ["approve", "reject"] as const) {
 	app.post(`/discount-requests/:id/${decision}`, validate, async (req: Request, res: Response) => {
-		if (!(await enforcePermission(req, res, PERM_DISCOUNTS))) return;
+		if (!(await enforcePermission(req, res, PERM_DISCOUNTS))) {return;}
 		const restaurantId = extractRestaurantId(req);
 		if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 		const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
@@ -6031,7 +6030,7 @@ for (const decision of ["approve", "reject"] as const) {
 		try {
 			const request = await DecideDiscountRequest(restaurantId, id, decision === "approve", extractEmployeeId(req));
 			if (decision === "approve") {
-				try { if (request.table_name) emitRestaurant(restaurantId, "bill:updated", { table: request.table_name }); } catch {/* ignore */}
+				try { if (request.table_name) {emitRestaurant(restaurantId, "bill:updated", { table: request.table_name });} } catch {/* ignore */}
 			}
 			try {
 				const label = `${request.discount_value}${request.discount_type === "percent" ? "%" : ""} (≈${request.amount})`;
@@ -6047,7 +6046,7 @@ for (const decision of ["approve", "reject"] as const) {
 
 // --- Coupons (admin-managed promo codes) ------------------------------------
 app.get('/coupons', validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try { res.json({ coupons: await GetCoupons(restaurantId) }); }
@@ -6055,7 +6054,7 @@ app.get('/coupons', validate, async (req: Request, res: Response) => {
 });
 
 app.post('/coupons', validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const b = (req.body ?? {}) as Record<string, unknown>;
@@ -6067,7 +6066,7 @@ app.post('/coupons', validate, async (req: Request, res: Response) => {
 });
 
 app.delete('/coupons/:id', validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
@@ -6078,7 +6077,7 @@ app.delete('/coupons/:id', validate, async (req: Request, res: Response) => {
 // Issue a gift voucher (admin). Redemption happens through the normal coupon
 // paths (/bills/apply-coupon, /qr/:slug/coupon) — staff just enter the code.
 app.post('/vouchers', validate, async (req: Request, res: Response) => {
-	if (!(await enforcePermission(req, res, PERM_COUPONS))) return;
+	if (!(await enforcePermission(req, res, PERM_COUPONS))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -6125,7 +6124,7 @@ app.post('/loyalty/redeem', validateAction("4ad474d4-5230-449c-874f-6a238b833bca
 // Mint/rotate the restaurant's intake API key. The key is returned ONCE here
 // (stored plain server-side; generating again rotates it).
 app.post('/aggregator/generate-key', validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforceAdmin(req, res))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
@@ -6153,7 +6152,7 @@ app.post('/aggregator/order', rateLimit("aggregator", 120, 60_000), async (req: 
 	if (items.length === 0) { res.status(400).json({ error: "At least one item is required" }); return; }
 	try {
 		const result = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () =>
-			AddAggregatorOrder(resId!, {
+			AddAggregatorOrder(resId, {
 				source,
 				external_id: externalId,
 				items: items as any,
@@ -6262,7 +6261,7 @@ app.post('/bills/merge', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"),
 // it also attempts a gateway refund when keys are configured.
 app.post('/bills/refund', validateBody(sBillRefund), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	const restaurantId = auth.restaurantId;
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const billId = typeof body.bill_id === "string" ? body.bill_id.trim() : "";
@@ -6313,7 +6312,7 @@ app.post('/bills/refund', validateBody(sBillRefund), async (req: Request, res: R
 			}
 		}
 		try { await log_audit(req, "fc57d407-4bba-442c-97a2-9e6f3c57f288", `Refunded bill ${result.bill_id} (amount ${result.amount}, gateway ${gateway})`, Audit_log_category.Bill, { bill_id: result.bill_id, amount: result.amount, gateway }); } catch {/* ignore */}
-		try { if (tableName) emitRestaurant(restaurantId, "bill:updated", { table: tableName }); } catch {/* ignore */}
+		try { if (tableName) {emitRestaurant(restaurantId, "bill:updated", { table: tableName });} } catch {/* ignore */}
 		res.json({ ...result, gateway });
 	} catch (e: any) {
 		logger.error({ err: e }, 'refund_bill_failed');
@@ -6324,14 +6323,14 @@ app.post('/bills/refund', validateBody(sBillRefund), async (req: Request, res: R
 // Re-open a closed bill (admin only) within the restaurant's configured window
 // (Settings → bill_reopen_window_min, default 240). Refunded bills are refused.
 app.post('/bills/:id/reopen', validate, async (req: Request, res: Response) => {
-	if (!(await enforceAdmin(req, res))) return;
+	if (!(await enforceAdmin(req, res))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const billId = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	if (!billId) { res.status(400).json({ error: "Bill id is required" }); return; }
 	try {
 		const result = await ReopenBill(restaurantId, billId, extractEmployeeId(req));
-		try { if (result.bill.table_name) emitRestaurant(restaurantId, "bill:updated", { table: result.bill.table_name }); } catch {/* ignore */}
+		try { if (result.bill.table_name) {emitRestaurant(restaurantId, "bill:updated", { table: result.bill.table_name });} } catch {/* ignore */}
 		try {
 			await log_audit(req, "d5e3f7a9-2b4c-4d6e-9f80-3c5b7d9e1f2a", `Re-opened bill ${result.bill.bill_no ?? result.bill.id} (table ${result.bill.table_name ?? "?"}, ${result.restored_orders} orders restored)`, Audit_log_category.Bill, { bill_id: result.bill.id, table: result.bill.table_name, restored_orders: result.restored_orders });
 		} catch {/* ignore */}
@@ -6855,7 +6854,7 @@ app.post("/delete-valet-bay", validateAction("6e9be65f-4081-4b86-8ba0-0592ee26f7
 
 app.post("/update-valet-bay", validateAction("2caeab74-5941-424d-9c3a-5c68ef0186e1"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
-	if (!auth) return;
+	if (!auth) {return;}
 
 	const body = req.body as Record<string, unknown> | undefined;
 	const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
@@ -6901,7 +6900,7 @@ app.post("/update-valet-bay", validateAction("2caeab74-5941-424d-9c3a-5c68ef0186
 
 app.post("/set-valet-bay-current", validateAction("2ff51c3d-f18c-406c-9f49-7c54f468c835"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
-	if (!auth) return;
+	if (!auth) {return;}
 
 	const body = req.body as Record<string, unknown> | undefined;
 	const bayId = body?.Bay_id ? String(body.Bay_id) : undefined;
@@ -7021,13 +7020,13 @@ function extractPlate(raw: string): string | null {
 	const up = raw.toUpperCase();
 	const canonical = /[A-Z]{2}[\s-]?\d{1,2}[\s-]?[A-Z]{1,3}[\s-]?\d{3,4}/;
 	const m = canonical.exec(up);
-	if (m) return m[0].replace(/[\s-]/g, "");
+	if (m) {return m[0].replace(/[\s-]/g, "");}
 	let best: string | null = null;
 	for (const tok of up.split(/[^A-Z0-9]+/)) {
-		if (tok.length < 5 || tok.length > 11) continue;
+		if (tok.length < 5 || tok.length > 11) {continue;}
 		const hasLetter = /[A-Z]/.test(tok);
 		const hasDigit = /\d/.test(tok);
-		if (hasLetter && hasDigit && (best === null || tok.length > best.length)) best = tok;
+		if (hasLetter && hasDigit && (best === null || tok.length > best.length)) {best = tok;}
 	}
 	return best;
 }
@@ -7220,7 +7219,7 @@ app.post("/update_valet_state", validateAction("b8e02c25-b91c-427c-b462-8df009ed
 			: 500;
 		const payload = (error as { payload?: unknown })?.payload;
 		if (status !== 500 && payload && typeof payload === "object") {
-			res.status(status).json(payload as Record<string, unknown>);
+			res.status(status).json(payload);
 			return;
 		}
 		res.status(500).json({ error: "Unable to update valet state" });
@@ -7266,7 +7265,7 @@ app.post("/update_valet_bay", validateAction("b8e02c25-b91c-427c-b462-8df009ede0
 
 app.post("/unassign-valet-bay", validateAction("5ef876a7-eb92-4602-b4d3-5590ce379540"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
-	if (!auth) return;
+	if (!auth) {return;}
 
 	const body = req.body as Record<string, unknown> | undefined;
 	const booking_id = typeof body?.booking_id === 'string' ? body.booking_id.trim() : undefined;
@@ -7315,7 +7314,7 @@ async function valetPlateFor(restaurantId: string, bookingId: string, outletId?:
 // /get-tables, so the picker gets its own read under the valet-info action).
 app.get("/valet/charge-targets", validateAction("9e37297d-408b-446d-a51b-7892ad216b7d"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	try {
 		const tables = await GetTables(auth.restaurantId);
 		const targets = (tables ?? [])
@@ -7331,14 +7330,14 @@ app.get("/valet/charge-targets", validateAction("9e37297d-408b-446d-a51b-7892ad2
 // Parking location / condition notes (+ optional photo) / retrieval ETA.
 app.post("/valet/:bookingId/ops", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	const bookingId = typeof req.params.bookingId === "string" ? req.params.bookingId.trim() : "";
 	if (!bookingId) { res.status(400).json({ error: "Missing booking ID" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
 
 	const patch: import("./database_supabase.js").ValetOpsPatch = {};
-	if ("parking_location" in body) patch.parking_location = typeof body.parking_location === "string" ? body.parking_location.slice(0, 120) : null;
-	if ("condition_notes" in body) patch.condition_notes = typeof body.condition_notes === "string" ? body.condition_notes.slice(0, 1000) : null;
+	if ("parking_location" in body) {patch.parking_location = typeof body.parking_location === "string" ? body.parking_location.slice(0, 120) : null;}
+	if ("condition_notes" in body) {patch.condition_notes = typeof body.condition_notes === "string" ? body.condition_notes.slice(0, 1000) : null;}
 	if ("eta_minutes" in body) {
 		const eta = Number(body.eta_minutes);
 		patch.eta_minutes = Number.isFinite(eta) && eta > 0 ? Math.min(240, Math.round(eta)) : null;
@@ -7350,7 +7349,7 @@ app.post("/valet/:bookingId/ops", validateAction("b8e02c25-b91c-427c-b462-8df009
 				body.condition_photo_base64,
 				typeof body.condition_photo_content_type === "string" ? body.condition_photo_content_type : "image/jpeg",
 			);
-			if (url) patch.condition_photo_url = url;
+			if (url) {patch.condition_photo_url = url;}
 		} catch (err) {
 			logger.warn({ err }, "valet condition photo upload failed");
 		}
@@ -7386,7 +7385,7 @@ app.post("/valet/:bookingId/ops", validateAction("b8e02c25-b91c-427c-b462-8df009
 // "handover" records them leaving (returned to guest / hung on the board).
 app.post("/valet/:bookingId/keys", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	const bookingId = typeof req.params.bookingId === "string" ? req.params.bookingId.trim() : "";
 	const action = String((req.body as Record<string, unknown> | undefined)?.action ?? "").trim().toLowerCase();
 	if (!bookingId) { res.status(400).json({ error: "Missing booking ID" }); return; }
@@ -7437,7 +7436,7 @@ app.post("/valet/:bookingId/keys", validateAction("b8e02c25-b91c-427c-b462-8df00
 // the "no open session" guard.
 app.post("/valet/:bookingId/charge", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	const bookingId = typeof req.params.bookingId === "string" ? req.params.bookingId.trim() : "";
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
@@ -7680,7 +7679,7 @@ app.post("/feedback/valet-checkin", rateLimit("valet_checkin", 10, 60_000), vali
 		// Read the tenant's valet records. Prefer the optional Python service (keeps
 		// the existing read path), but fall back to the TS DB layer so matching still
 		// works when Python is down — the guest's "bring my car" must not depend on it.
-		type ValetLite = { booking_id: string; number_plate: string; state: number };
+		interface ValetLite { booking_id: string; number_plate: string; state: number }
 		let records: ValetLite[] = [];
 		let readOk = false;
 		try {
@@ -7691,19 +7690,19 @@ app.post("/feedback/valet-checkin", rateLimit("valet_checkin", 10, 60_000), vali
 			if (recordsResponse.ok) {
 				const recordsPayload = (await recordsResponse.json().catch(() => null)) as
 					| Record<string, unknown>
-					| Array<Record<string, unknown>>
+					| Record<string, unknown>[]
 					| null;
 				const raw = Array.isArray(recordsPayload)
 					? recordsPayload
-					: Array.isArray((recordsPayload as Record<string, unknown> | null)?.records)
-						? (((recordsPayload as Record<string, unknown>).records as unknown[]) as Array<Record<string, unknown>>)
+					: Array.isArray((recordsPayload)?.records)
+						? (((recordsPayload).records as unknown[]) as Record<string, unknown>[])
 						: [];
 				records = raw.map((r) => ({
 					booking_id:
 						typeof r.booking_id === "string"
 							? r.booking_id
-							: typeof (r as Record<string, unknown>).bookingId === "string"
-								? ((r as Record<string, unknown>).bookingId as string)
+							: typeof (r).bookingId === "string"
+								? ((r).bookingId)
 								: "",
 					number_plate: typeof r.number_plate === "string" ? r.number_plate : "",
 					state: Number(r.state),
@@ -7886,7 +7885,7 @@ app.post("/feedback/submit", rateLimit("feedback", 20, 60_000), async (req: Requ
 
 app.get("/restaurant/users", validateAction("92cb8236-1039-4b47-a66f-6c7c8b0144ae"), async (req: Request, res: Response) => {
 	const auth = await enforceRolesIgnoreOutletID(req, res, ["admin", "employee"]);
-	if (!auth) return;
+	if (!auth) {return;}
 
 	try {
 		const users = await GetRestaurantUsers(auth.restaurantId);
@@ -7899,7 +7898,7 @@ app.get("/restaurant/users", validateAction("92cb8236-1039-4b47-a66f-6c7c8b0144a
 
 app.post("/restaurant/users", validateAction("58fdfca7-7a97-439b-aeb2-00e4395a9a30"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
-	if (!auth) return;
+	if (!auth) {return;}
 
 	// Enforce the subscribed plan's employee limit, when it defines one.
 	const empLimit = Number(req.auth?.limits?.employees ?? 0);
@@ -7962,7 +7961,7 @@ app.post("/restaurant/users", validateAction("58fdfca7-7a97-439b-aeb2-00e4395a9a
 
 app.delete("/restaurant/users", validateAction("a978f15d-1043-417a-b07b-05f6bddad875"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
-	if (!auth) return;
+	if (!auth) {return;}
 
 	const outletId = extractOutletId(req);
 
@@ -7994,7 +7993,7 @@ app.delete("/restaurant/users", validateAction("a978f15d-1043-417a-b07b-05f6bdda
 // request). A non-superadmin admin cannot reset the superadmin's password.
 app.post("/restaurant/users/password", async (req: Request, res: Response) => {
 	const admin = await enforcePermission(req, res, PERM_PASSWORDS);
-	if (!admin) return;
+	if (!admin) {return;}
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const employeeId = typeof body.employeeId === "string" ? body.employeeId.trim() : "";
 	const password = typeof body.password === "string" ? body.password : "";
@@ -8032,7 +8031,7 @@ app.post("/restaurant/users/password", async (req: Request, res: Response) => {
 // Admin: list pending forgot-password requests for this restaurant.
 app.get("/restaurant/password-requests", async (req: Request, res: Response) => {
 	const admin = await enforcePermission(req, res, PERM_PASSWORDS);
-	if (!admin) return;
+	if (!admin) {return;}
 	try {
 		res.json({ requests: await GetPasswordResetRequests(admin.restaurantId) });
 	} catch (e) {
@@ -8044,7 +8043,7 @@ app.get("/restaurant/password-requests", async (req: Request, res: Response) => 
 // Admin: dismiss a pending password request without resetting.
 app.post("/restaurant/password-requests/:id/dismiss", async (req: Request, res: Response) => {
 	const admin = await enforcePermission(req, res, PERM_PASSWORDS);
-	if (!admin) return;
+	if (!admin) {return;}
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	if (!id) { res.status(400).json({ error: "Missing request id" }); return; }
 	try {
@@ -8095,7 +8094,7 @@ app.get("/feedback", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), asy
 // Service-recovery tickets (staff): list open low-rating feedback + resolve.
 app.get("/feedback/recovery", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	const includeResolved = String(req.query.all ?? "") === "1" || req.query.all === "true";
 	try { res.json({ tickets: await GetRecoveryTickets(auth.restaurantId, includeResolved) }); }
 	catch (err) { logger.error({ err }, "get_recovery_tickets_failed"); res.status(500).json({ error: "Unable to fetch recovery tickets" }); }
@@ -8103,7 +8102,7 @@ app.get("/feedback/recovery", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf
 
 app.post("/feedback/recovery/:id/resolve", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
-	if (!auth) return;
+	if (!auth) {return;}
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	if (!id) { res.status(400).json({ error: "Missing id" }); return; }
 	const note = typeof (req.body as Record<string, unknown> | undefined)?.note === "string" ? String((req.body as Record<string, unknown>).note) : undefined;
@@ -8131,7 +8130,7 @@ app.get("/feedback/summary", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf5
 
 app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
-	if (!auth) return;
+	if (!auth) {return;}
 
 	try {
 		const mode = String(req.query.mode ?? "daily");
@@ -8139,9 +8138,9 @@ app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"
 
 		// helper to parse ISO date (yyyy-mm-dd)
 		const parseDateISO = (s: string | undefined | null) => {
-			if (!s) return null;
+			if (!s) {return null;}
 			const d = new Date(s);
-			if (!isNaN(d.getTime())) return d;
+			if (!isNaN(d.getTime())) {return d;}
 			const parts = (s || "").split("-");
 			if (parts.length >= 3) {
 				const y = Number(parts[0]);
@@ -8159,15 +8158,15 @@ app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"
 			const targetYMD = date.toISOString().slice(0, 10);
 			const hours = Array.from({ length: 24 }, (_, i) => ({ hour: i, count: 0 }));
 			for (const r of rows) {
-				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
 				const s = new Date(raw);
-				if (isNaN(s.getTime())) continue;
+				if (isNaN(s.getTime())) {continue;}
 				const ymd = s.toISOString().slice(0, 10);
 				if (ymd === targetYMD) {
 					const h = s.getUTCHours();
 					if (h >= 0 && h < hours.length) {
 						const bucket = hours[h];
-						if (bucket) bucket.count += 1;
+						if (bucket) {bucket.count += 1;}
 					}
 				}
 			}
@@ -8180,7 +8179,7 @@ app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"
 			const day = weekStart.getUTCDay();
 			const diff = (day + 6) % 7;
 			weekStart = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() - diff));
-			const days = [] as Array<{ label: string; date: string; count: number }>;
+			const days = [] as { label: string; date: string; count: number }[];
 			const dayLabels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 			for (let i = 0; i < 7; i++) {
 				const d = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() + i));
@@ -8189,15 +8188,15 @@ app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"
 			const startMs = Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate());
 			const endMs = startMs + 7 * 24 * 60 * 60 * 1000;
 			for (const r of rows) {
-				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
 				const s = new Date(raw);
-				if (isNaN(s.getTime())) continue;
+				if (isNaN(s.getTime())) {continue;}
 				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
 				if (t >= startMs && t < endMs) {
 					const idx = Math.floor((t - startMs) / (24 * 60 * 60 * 1000));
 					if (idx >= 0 && idx < days.length) {
 						const bucket = days[idx];
-						if (bucket) bucket.count += 1;
+						if (bucket) {bucket.count += 1;}
 					}
 				}
 			}
@@ -8217,18 +8216,18 @@ app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"
 			const day0 = monthStart.getUTCDay();
 			const diff0 = (day0 + 6) % 7; // days since Monday
 			let weekStart = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth(), monthStart.getUTCDate() - diff0));
-			const weeks = [] as Array<{ start: string; end: string; label: string; count: number }>;
+			const weeks = [] as { start: string; end: string; label: string; count: number }[];
 			while (weekStart < monthEnd) {
 				const s = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate()));
 				const e = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + 7));
-				weeks.push({ start: s.toISOString().slice(0, 10), end: e.toISOString().slice(0, 10), label: `${s.toISOString().slice(5, 10)}`, count: 0 });
+				weeks.push({ start: s.toISOString().slice(0, 10), end: e.toISOString().slice(0, 10), label: s.toISOString().slice(5, 10), count: 0 });
 				weekStart = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() + 7));
 			}
 			// count events
 			for (const r of rows) {
-				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
 				const s = new Date(raw);
-				if (isNaN(s.getTime())) continue;
+				if (isNaN(s.getTime())) {continue;}
 				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
 				for (let idx = 0; idx < weeks.length; idx++) {
 					const ws = weeks[idx]!;
@@ -8244,14 +8243,14 @@ app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"
 			const yearParam = Number(req.query.year ?? new Date().getUTCFullYear());
 			const months = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, label: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][i], count: 0 }));
 			for (const r of rows) {
-				const raw = (r as any).submitted_at ?? (r as any).submittedAt ?? (r as any).submittedAt;
+				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
 				const s = new Date(raw);
-				if (isNaN(s.getTime())) continue;
+				if (isNaN(s.getTime())) {continue;}
 				if (s.getUTCFullYear() === yearParam) {
 					const mi = s.getUTCMonth();
 					if (mi >= 0 && mi < months.length) {
 						const bucket = months[mi];
-						if (bucket) bucket.count += 1;
+						if (bucket) {bucket.count += 1;}
 					}
 				}
 			}
@@ -8284,7 +8283,7 @@ app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
 	const correlationId = randomUUID();
 	logger.error({ err, correlationId, method: req.method, path: req.path }, "unhandled_request_error");
 	captureException(err, { correlationId, method: req.method, path: req.path });
-	if (res.headersSent) return;
+	if (res.headersSent) {return;}
 	const status = Number(err?.status || err?.statusCode) || 500;
 	res.status(status >= 400 && status < 600 ? status : 500).json({
 		error: "Something went wrong. Please try again.",
@@ -8362,7 +8361,7 @@ async function bootstrap(): Promise<void> {
 	// one slow sweep from stacking on the next tick.
 	let exceptionSweepRunning = false;
 	const exceptionSweep = async () => {
-		if (exceptionSweepRunning) return;
+		if (exceptionSweepRunning) {return;}
 		exceptionSweepRunning = true;
 		try {
 			const tenantIds = await ListRestaurantIds();
@@ -8395,7 +8394,7 @@ async function bootstrap(): Promise<void> {
 	// settle and we don't abandon connections. Force-exit if draining stalls.
 	let shuttingDown = false;
 	const shutdown = async (signal: string) => {
-		if (shuttingDown) return;
+		if (shuttingDown) {return;}
 		shuttingDown = true;
 		logger.info(`Received ${signal}, shutting down gracefully...`);
 		const forceTimer = setTimeout(() => {
@@ -8404,7 +8403,7 @@ async function bootstrap(): Promise<void> {
 		}, 15_000);
 		forceTimer.unref?.();
 		try {
-			await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+			await new Promise<void>((resolve) => httpServer.close(() => { resolve(); }));
 			await closeRealtime();
 			await Promise.allSettled([closePools(), closePlatformPool()]);
 			logger.info("Shutdown complete.");

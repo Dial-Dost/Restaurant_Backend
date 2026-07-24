@@ -24,13 +24,13 @@ function main() {
 
   const pkByTable = {};
   for (const row of constraints.primary_keys) {
-    if (!pkByTable[row.table_name]) pkByTable[row.table_name] = [];
+    if (!pkByTable[row.table_name]) {pkByTable[row.table_name] = [];}
     pkByTable[row.table_name].push(row.column_name);
   }
 
   const fkByTable = {};
   for (const row of constraints.foreign_keys) {
-    if (!fkByTable[row.table_name]) fkByTable[row.table_name] = [];
+    if (!fkByTable[row.table_name]) {fkByTable[row.table_name] = [];}
     fkByTable[row.table_name].push(
       `${row.column_name}->${row.foreign_table_name}.${row.foreign_column_name}`
     );

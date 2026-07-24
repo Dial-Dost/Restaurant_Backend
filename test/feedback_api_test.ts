@@ -9,7 +9,7 @@ async function waitForHealth(timeoutMs = 10000): Promise<void> {
 	while (Date.now() - start < timeoutMs) {
 		try {
 			const r = await fetch(`${API_BASE}/health`);
-			if (r.ok) return;
+			if (r.ok) {return;}
 		} catch {
 			/* ignore */
 		}
@@ -49,10 +49,10 @@ async function run() {
 	};
 
 	const list = await fetchJson<{ items: any[] }>(`${API_BASE}/feedback?limit=5`, { headers }, 'GET /feedback failed');
-	if (!Array.isArray(list.items)) throw new Error('Invalid /feedback response format');
+	if (!Array.isArray(list.items)) {throw new Error('Invalid /feedback response format');}
 
 	const summary = await fetchJson<any>(`${API_BASE}/feedback/summary`, { headers }, 'GET /feedback/summary failed');
-	if (!summary || typeof summary !== 'object') throw new Error('Invalid /feedback/summary response');
+	if (!summary || typeof summary !== 'object') {throw new Error('Invalid /feedback/summary response');}
 
 	// Test get_main_feedback_question
 	const mainResp = await fetch(`${API_BASE}/get_main_feedback_question`, {

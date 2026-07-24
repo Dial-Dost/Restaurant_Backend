@@ -43,7 +43,7 @@ describe("qr_signing", () => {
   test("decodeTableToken rejects a tampered or malformed token", () => {
     const token = encodeTableToken(RES, "Patio 12");
     const [name64, sig] = token.split(".");
-    if (!name64 || !sig) throw new Error("token did not have the expected name.sig shape");
+    if (!name64 || !sig) {throw new Error("token did not have the expected name.sig shape");}
     // wrong restaurant
     expect(decodeTableToken(OTHER, token)).toBeNull();
     // tampered signature

@@ -21,7 +21,7 @@ declare global {
 }
 
 function bearer(req: Request): string | null {
-	const h = req.headers["authorization"];
+	const h = req.headers.authorization;
 	const v = Array.isArray(h) ? h[0] : h;
 	if (typeof v === "string" && v.toLowerCase().startsWith("bearer ")) {
 		const t = v.slice(7).trim();
@@ -79,7 +79,7 @@ function platformLoginAllowed(ip: string): boolean {
 	if (!b || b.resetAt <= now) { b = { count: 0, resetAt: now + 60_000 }; _platformLoginBuckets.set(ip, b); }
 	b.count++;
 	if (_platformLoginBuckets.size > 5000) {
-		for (const [k, v] of _platformLoginBuckets) if (v.resetAt <= now) _platformLoginBuckets.delete(k);
+		for (const [k, v] of _platformLoginBuckets) {if (v.resetAt <= now) {_platformLoginBuckets.delete(k);}}
 	}
 	return b.count <= 10;
 }
@@ -102,7 +102,7 @@ const isoDate = (d: Date) => d.toISOString().slice(0, 10);
 // current_period_end forward. Idempotent — designed for a daily cron OR the
 // in-process scheduler below. No-ops when the control plane isn't configured.
 export async function runBillingCycle(): Promise<{ generated: number; past_due: number; suspended: number }> {
-	if (!platformDbConfigured()) return { generated: 0, past_due: 0, suspended: 0 };
+	if (!platformDbConfigured()) {return { generated: 0, past_due: 0, suspended: 0 };}
 	let generated = 0;
 	let past_due = 0;
 	let suspended = 0;
@@ -131,7 +131,7 @@ export async function runBillingCycle(): Promise<{ generated: number; past_due: 
 			 returning id`,
 			[s.res_id, s.plan_id, s.price_cents ?? 0, isoDate(periodStart), isoDate(periodEnd)],
 		);
-		if (ins.length > 0) generated++;
+		if (ins.length > 0) {generated++;}
 		await platformQuery(
 			`update platform.subscriptions set status = 'past_due', updated_at = now() where res_id = $1 and status = 'active'`,
 			[s.res_id],
@@ -163,7 +163,7 @@ const BILLING_LOCK_KEY = 0x5245_5342; // "RESB"
 // deduped on (res_id, period_end) (migration 007), AND a Postgres advisory lock
 // elects a single leader so only one replica runs the cycle at a time.
 function startBillingScheduler(): void {
-	if (billingSchedulerStarted || !platformDbConfigured()) return;
+	if (billingSchedulerStarted || !platformDbConfigured()) {return;}
 	billingSchedulerStarted = true;
 	const run = () => {
 		withPlatformAdvisoryLock(BILLING_LOCK_KEY, async () => {
@@ -172,8 +172,8 @@ function startBillingScheduler(): void {
 				logger.info(`billing_cycle: ${r.generated} renewal invoice(s), ${r.past_due} past-due, ${r.suspended} suspended`);
 			}
 		})
-			.then((ran) => { if (!ran) logger.info("billing_cycle: skipped (another replica holds the lock)"); })
-			.catch((err) => logger.error({ err }, "billing_cycle_failed"));
+			.then((ran) => { if (!ran) {logger.info("billing_cycle: skipped (another replica holds the lock)");} })
+			.catch((err) => { logger.error({ err }, "billing_cycle_failed"); });
 	};
 	setTimeout(run, 60_000).unref?.(); // ~1 min after boot
 	setInterval(run, 24 * 60 * 60 * 1000).unref?.(); // daily
@@ -188,7 +188,7 @@ export function registerPlatformRoutes(app: Express): void {
 		}
 		// Brute-force guard: cap login attempts per IP (this endpoint controls the
 		// whole fleet, so it's the highest-value target).
-		const ip = (req.ip || req.socket?.remoteAddress || "unknown") as string;
+		const ip = (req.ip || req.socket?.remoteAddress || "unknown");
 		if (!platformLoginAllowed(ip)) {
 			res.setHeader("Retry-After", "60");
 			res.status(429).json({ error: "Too many attempts. Please wait a minute and try again." });
@@ -271,7 +271,7 @@ export function registerPlatformRoutes(app: Express): void {
 					logger.error({ err }, "platform_metrics_failed");
 				}
 			}
-			const restaurants = (rows as Array<Record<string, any>>).map((r) => ({
+			const restaurants = (rows as Record<string, any>[]).map((r) => ({
 				...r,
 				employees: metrics.get(r.id)?.employees ?? null,
 				outlets: metrics.get(r.id)?.outlets ?? null,
@@ -314,7 +314,7 @@ export function registerPlatformRoutes(app: Express): void {
 					`select emp_username, fname, lname from platform.get_restaurant_owner($1)`,
 					[req.params.id],
 				);
-				if (o[0]) owner = { username: o[0].emp_username, name: `${String(o[0].fname ?? "").trim()} ${String(o[0].lname ?? "").trim()}`.trim() };
+				if (o[0]) {owner = { username: o[0].emp_username, name: `${String(o[0].fname ?? "").trim()} ${String(o[0].lname ?? "").trim()}`.trim() };}
 			} catch {/* owner is optional */}
 			res.json({ restaurant: { ...rows[0], owner } });
 		} catch (err) {
@@ -324,7 +324,7 @@ export function registerPlatformRoutes(app: Express): void {
 	});
 
 	app.post("/platform/restaurants/:id/suspend", requirePlatformAuth, async (req: Request, res: Response) => {
-		const resId = req.params.id as string;
+		const resId = req.params.id!;
 		try {
 			const rows = await platformQuery<{ id: string }>(
 				`update "Restaurant" set account_status = 'suspended' where id = $1 returning id`,
@@ -345,7 +345,7 @@ export function registerPlatformRoutes(app: Express): void {
 	});
 
 	app.post("/platform/restaurants/:id/activate", requirePlatformAuth, async (req: Request, res: Response) => {
-		const resId = req.params.id as string;
+		const resId = req.params.id!;
 		try {
 			const rows = await platformQuery<{ id: string }>(
 				`update "Restaurant" set account_status = 'active' where id = $1 returning id`,
@@ -447,7 +447,7 @@ export function registerPlatformRoutes(app: Express): void {
 
 	// --- Subscription assignment -----------------------------------------
 	app.put("/platform/restaurants/:id/subscription", requirePlatformAuth, async (req: Request, res: Response) => {
-		const resId = req.params.id as string;
+		const resId = req.params.id!;
 		const body = (req.body ?? {}) as Record<string, unknown>;
 		const status = typeof body.status === "string" ? body.status.trim() : "active";
 		const allowed = new Set(["trial", "active", "past_due", "suspended", "cancelled", "expired"]);
@@ -496,7 +496,7 @@ export function registerPlatformRoutes(app: Express): void {
 
 	// --- Billing history (invoices) -----------------------------------------
 	app.get("/platform/restaurants/:id/invoices", requirePlatformAuth, async (req: Request, res: Response) => {
-		const resId = req.params.id as string;
+		const resId = req.params.id!;
 		try {
 			const rows = await platformQuery(
 				`select i.*, p.name as plan_name, p.code as plan_code
@@ -514,7 +514,7 @@ export function registerPlatformRoutes(app: Express): void {
 	});
 
 	app.post("/platform/restaurants/:id/invoices", requirePlatformAuth, async (req: Request, res: Response) => {
-		const resId = req.params.id as string;
+		const resId = req.params.id!;
 		const body = (req.body ?? {}) as Record<string, unknown>;
 		const status = typeof body.status === "string" && ["paid", "pending", "void"].includes(body.status) ? body.status : "paid";
 		try {
@@ -526,8 +526,8 @@ export function registerPlatformRoutes(app: Express): void {
 					`select s.plan_id, p.price_cents from platform.subscriptions s left join platform.plans p on p.id = s.plan_id where s.res_id = $1 limit 1`,
 					[resId],
 				);
-				if (!planId) planId = sub[0]?.plan_id ?? null;
-				if (amountCents == null) amountCents = sub[0]?.price_cents ?? 0;
+				if (!planId) {planId = sub[0]?.plan_id ?? null;}
+				if (amountCents == null) {amountCents = sub[0]?.price_cents ?? 0;}
 			}
 			const rows = await platformQuery(
 				`insert into platform.invoices (res_id, plan_id, amount_cents, status, period_start, period_end, note)
@@ -633,7 +633,7 @@ export function registerPlatformRoutes(app: Express): void {
 				   from platform.subscriptions group by status`,
 			);
 			const byStatus: Record<string, number> = {};
-			for (const s of subs) byStatus[s.status] = Number(s.n);
+			for (const s of subs) {byStatus[s.status] = Number(s.n);}
 			// Trials expiring within 7 days — worth the operator's attention.
 			const expiring = await platformQuery<{ n: number }>(
 				`select count(*)::int as n from platform.subscriptions
@@ -680,7 +680,7 @@ export function registerPlatformRoutes(app: Express): void {
 	// locked out, the operator sets a new password for the owner (earliest-created
 	// admin) and all that tenant's live sessions are revoked.
 	app.post("/platform/restaurants/:id/reset-owner-password", requirePlatformAuth, async (req: Request, res: Response) => {
-		const resId = req.params.id as string;
+		const resId = req.params.id!;
 		const body = (req.body ?? {}) as Record<string, unknown>;
 		const password = typeof body.password === "string" ? body.password.trim() : "";
 		if (password.length < 4) {

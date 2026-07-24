@@ -33,10 +33,10 @@ if (!process.env.OPENAI_API_KEY) {
 
 const reservationsCsvPath = path.resolve(repoRoot, "reservations.csv");
 
-export type RestaurantInfoEntry = {
+export interface RestaurantInfoEntry {
   field: string;
   value: string;
-};
+}
 
 type AvailabilityStatus =
   | "available"
@@ -44,13 +44,13 @@ type AvailabilityStatus =
   | "connectivity"
   | "validation";
 
-type AvailabilityResult = {
+interface AvailabilityResult {
   status: AvailabilityStatus;
   message: string;
-  tables?: Array<{ tableName: string; capacity: number | null }>; // smallest-first order
-};
+  tables?: { tableName: string; capacity: number | null }[]; // smallest-first order
+}
 
-type ReservationPayload = {
+interface ReservationPayload {
   guestName: string;
   contactNumber: string;
   partySize: number;
@@ -58,27 +58,27 @@ type ReservationPayload = {
   reservationTime: string; // HH:MM (24-hour)
   tablePreference?: string | null;
   specialRequests?: string | null;
-};
+}
 
-type ReservationResult = {
+interface ReservationResult {
   status: "confirmed" | "queued" | "failed";
   message: string;
   tableName?: string;
   referenceId?: string | null;
-};
+}
 
-type RestaurantKnowledge = {
+interface RestaurantKnowledge {
   infoEntries: RestaurantInfoEntry[];
   infoContext: string;
   openingTime: string;
   closingTime: string;
   timezone: string;
-};
+}
 
 // Validate an IANA zone id; fall back to Asia/Kolkata for empty/invalid input.
 function sanitizeTimezone(raw: unknown): string {
   const tz = typeof raw === "string" ? raw.trim() : "";
-  if (!tz) return "Asia/Kolkata";
+  if (!tz) {return "Asia/Kolkata";}
   try {
     new Intl.DateTimeFormat(undefined, { timeZone: tz });
     return tz;
@@ -161,9 +161,7 @@ function normalizePhoneNumber(value: string): string {
 
 function parseTimeString(value: string): string {
   const raw = value.trim().toLowerCase();
-  const timeMatch = raw.match(
-    /^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?$/i,
-  );
+  const timeMatch = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?$/i.exec(raw);
   if (!timeMatch) {
     throw new Error(
       `Expected a time in HH:MM format (optionally with AM/PM). Received: ${value}`,
@@ -221,7 +219,7 @@ function toReservationDateTime(dateIso: string, timeValue: string, tz: string): 
   // timezone so the stored instant is correct regardless of the server's zone.
   const [Y, M, D] = trimmed.split("-").map(Number);
   const [hh, mi] = time24.split(":").map(Number);
-  const combined = zonedWallToUtc(Y as number, M as number, D as number, hh as number, mi as number, sanitizeTimezone(tz));
+  const combined = zonedWallToUtc(Y!, M!, D!, hh!, mi!, sanitizeTimezone(tz));
   if (Number.isNaN(combined.getTime())) {
     throw new Error(`Unable to interpret reservation slot ${dateIso} ${timeValue}`);
   }
@@ -300,12 +298,12 @@ class ReservationService {
         };
       }
 
-      const tablesRaw = (await response.json()) as Array<{
+      const tablesRaw = (await response.json()) as {
         table_name?: string;
         name?: string;
         capacity?: number | null;
         booked?: boolean;
-      }>;
+      }[];
 
       const tables = tablesRaw
         .filter((table) => !table.booked)
@@ -371,7 +369,7 @@ class ReservationService {
       JSON.stringify(payload.guestName),
       JSON.stringify(payload.contactNumber),
       JSON.stringify(String(payload.partySize)),
-      JSON.stringify(`${slot.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true })}`),
+      JSON.stringify(slot.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true })),
       JSON.stringify(tableName),
       JSON.stringify(payload.reservationDate),
       JSON.stringify(freeUp.toISOString()),
@@ -700,9 +698,9 @@ You are Mia, a warm and attentive receptionist for Iron Hill Bengaluru. You spea
 ${restaurantKnowledge.infoContext}
 `;
 
-export type ReceptionAgentContext = {
+export interface ReceptionAgentContext {
   restaurantName: string;
-};
+}
 
 export const receptionistAgent = new RealtimeAgent<ReceptionAgentContext>({
   name: "ironhill-receptionist",

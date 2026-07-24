@@ -8,7 +8,7 @@ async function waitForHealth(timeoutMs = 10000): Promise<void> {
   while (Date.now() - start < timeoutMs) {
     try {
       const r = await fetch(`${API_BASE}/health`);
-      if (r.ok) return;
+      if (r.ok) {return;}
     } catch {
       /* ignore */
     }
@@ -53,7 +53,7 @@ async function run() {
     throw new Error(`POST /add-booking failed: ${postRes.status} ${txt}`);
   }
   const postJson = (await postRes.json()) as { booking_id: string };
-  if (!postJson.booking_id) throw new Error('Missing booking_id in response');
+  if (!postJson.booking_id) {throw new Error('Missing booking_id in response');}
 
   // 2) GET /get-bookings and assert the id is present
   const getRes = await fetch(
@@ -64,7 +64,7 @@ async function run() {
     const txt = await getRes.text();
     throw new Error(`GET /get-bookings failed: ${getRes.status} ${txt}`);
   }
-  const bookings = (await getRes.json()) as Array<{ booking_id: string; customer_name: string; number_of_people: number; }>;
+  const bookings = (await getRes.json()) as { booking_id: string; customer_name: string; number_of_people: number; }[];
   const hit = bookings.find((b) => b.booking_id === postJson.booking_id);
   if (!hit) {
     throw new Error('Round-trip booking not found in GET /get-bookings');

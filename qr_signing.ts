@@ -38,11 +38,11 @@ export function signTable(resId: string, tableName: string): string {
 }
 
 export function verifyTable(resId: string, tableName: string, sig: string): boolean {
-  if (!sig || !tableName || !resId) return false;
+  if (!sig || !tableName || !resId) {return false;}
   const expected = signTable(resId, tableName);
   const a = Buffer.from(expected);
   const b = Buffer.from(sig);
-  if (a.length !== b.length) return false;
+  if (a.length !== b.length) {return false;}
   try {
     return timingSafeEqual(a, b);
   } catch {
@@ -59,9 +59,9 @@ export function encodeTableToken(resId: string, tableName: string): string {
 }
 
 export function decodeTableToken(resId: string, token: string): string | null {
-  if (!token || typeof token !== "string") return null;
+  if (!token || typeof token !== "string") {return null;}
   const dot = token.lastIndexOf(".");
-  if (dot <= 0) return null;
+  if (dot <= 0) {return null;}
   const name64 = token.slice(0, dot);
   const sig = token.slice(dot + 1);
   let tableName: string;
@@ -70,6 +70,6 @@ export function decodeTableToken(resId: string, token: string): string | null {
   } catch {
     return null;
   }
-  if (!tableName) return null;
+  if (!tableName) {return null;}
   return verifyTable(resId, tableName, sig) ? tableName : null;
 }

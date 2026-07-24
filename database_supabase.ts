@@ -97,9 +97,9 @@ if (!connectionString) {
 // doesn't speak it. Use SSL only for remote hosts so the backend also runs against a
 // local dev / integration-test DB. Override via sslmode=require / sslmode=disable.
 function pgSslFor(cs: string | undefined): false | { rejectUnauthorized: boolean } {
-  if (!cs) return false;
-  if (/[?&]sslmode=require/i.test(cs)) return { rejectUnauthorized: false };
-  if (/[?&]sslmode=disable/i.test(cs) || /@(localhost|127\.0\.0\.1|\[::1\])[:/]/i.test(cs)) return false;
+  if (!cs) {return false;}
+  if (/[?&]sslmode=require/i.test(cs)) {return { rejectUnauthorized: false };}
+  if (/[?&]sslmode=disable/i.test(cs) || /@(localhost|127\.0\.0\.1|\[::1\])[:/]/i.test(cs)) {return false;}
   return { rejectUnauthorized: false };
 }
 
@@ -164,7 +164,7 @@ let isipv4Fallback = false;
 // client, opens a transaction, sets the `app.*` GUCs that RLS policies read, and
 // stashes the client in AsyncLocalStorage so all runQuery() calls made during
 // that request automatically use the tenant-scoped connection.
-export type TenantContext = {
+export interface TenantContext {
 	res_id: string;
 	outlet_id: string;
 	employeeId: string;
@@ -176,9 +176,9 @@ export type TenantContext = {
 	// res_id, so this stays within the tenant. WRITES are rejected while set (see
 	// the write guard in index.ts requireAuth).
 	allOutlets?: boolean;
-};
+}
 
-type TenantStore = { client: PoolClient; ctx: TenantContext; txnDepth: number };
+interface TenantStore { client: PoolClient; ctx: TenantContext; txnDepth: number }
 const tenantStorage = new AsyncLocalStorage<TenantStore>();
 
 export function currentTenant(): TenantContext | null {
@@ -196,7 +196,7 @@ export function isAllOutlets(): boolean {
 	return tenantStorage.getStore()?.ctx.allOutlets === true;
 }
 
-type RestaurantContext = {
+interface RestaurantContext {
   inputId: string;
   res_id: string;
   restaurant_slug: string;
@@ -205,23 +205,23 @@ type RestaurantContext = {
   restaurant_logo_url: string | null;
 
   outlet_id: string;
-};
+}
 
 // Reservation deposit held inside the booking's slot JSON. Lifecycle:
 // pending (Razorpay order created, unpaid) -> paid (signature verified) ->
 // refund_due (cancelled outside the cancel window; refunded MANUALLY from the
 // restaurant's Razorpay dashboard) | forfeited (late cancel). No auto-refund
 // call by design — refunds are a deliberate staff action.
-export type BookingDeposit = {
+export interface BookingDeposit {
   amount: number;
   status: "pending" | "paid" | "refund_due" | "forfeited";
   order_id?: string | null;
   payment_id?: string | null;
   paid_at?: string | null;
   resolved_at?: string | null;
-};
+}
 
-type SlotPayload = {
+interface SlotPayload {
   start: string;
   duration: number;
   source?: string | null;
@@ -236,9 +236,9 @@ type SlotPayload = {
   // 30-min sweep). Rides the slot JSON like deposit/min_spend, so every slot
   // read-modify-write path MUST round-trip it (encodeSlot/decodeSlot do).
   reminder_sent?: boolean | null;
-};
+}
 
-type RestaurantUser = {
+interface RestaurantUser {
   id: string,
   res_id: string,
   outlet_id: string,
@@ -253,25 +253,25 @@ type RestaurantUser = {
   // True for the restaurant owner (the first admin created at registration). The
   // superadmin is shown with a crown and cannot be removed/demoted by others.
   is_superadmin?: boolean;
-};
+}
 
-export type FeedbackCategoryRatingInput = {
+export interface FeedbackCategoryRatingInput {
   key: string;
   label: string;
   rating: number;
   question?: string | null;
   follow_up?: string | null;
   follow_up_answer?: string | null;
-};
+}
 
-export type FeedbackThemeInput = {
+export interface FeedbackThemeInput {
   background: string;
   surface: string;
   text: string;
   accent: string;
-};
+}
 
-export type FeedbackSubmissionInput = {
+export interface FeedbackSubmissionInput {
   customer_name?: string | null;
   visit_date?: Date | null;
   comments?: string | null;
@@ -279,9 +279,9 @@ export type FeedbackSubmissionInput = {
   image_theme?: FeedbackThemeInput | null;
   source?: string | null;
   nps?: number | null; // optional 0–10 "would you recommend us?" answer
-};
+}
 
-export type FeedbackEntry = {
+export interface FeedbackEntry {
   id: string;
   restaurant_id: string;
   employeeId: string; // uuid of Employees.id
@@ -298,16 +298,16 @@ export type FeedbackEntry = {
   image_theme?: FeedbackThemeInput | null;
   source?: string | null;
   submitted_at: Date;
-};
+}
 
-export type FeedbackSummary = {
+export interface FeedbackSummary {
   totalResponses: number;
   averageRating: number | null;
   categoryAverages: Record<string, { label: string; average: number | null }>;
   last30DaysResponses: number;
-};
+}
 
-type BookingSummary = {
+interface BookingSummary {
   booking_id: string;
   customer_id: string;
   customer_name: string;
@@ -321,32 +321,32 @@ type BookingSummary = {
   notes?: string | null;
   deposit?: BookingDeposit | null;
   min_spend?: number | null;
-};
+}
 
-type TableAvailability = {
+interface TableAvailability {
   table_name: string;
   capacity: number | null;
   booked: boolean;
   reserved: boolean;
-};
+}
 
-type CustomerSummary = {
+interface CustomerSummary {
   customer_id: string;
   name: string;
   phone_number: string;
   email?: string | null;
   booking_count: number;
-};
+}
 
-export type ParkingBayRecord = {
+export interface ParkingBayRecord {
   Bay_id: string;
   Bay_name: string;
   current_capacity: number;
   total_capacity: number;
   restaurant_id: string;
-};
+}
 
-export type ValetVehicleStateRecord = {
+export interface ValetVehicleStateRecord {
   booking_id: string;
   state: number;
   entry_time: string | null;
@@ -360,15 +360,15 @@ export type ValetVehicleStateRecord = {
   condition_photo_url: string | null;
   eta_minutes: number | null;
   requested_at: string | null;
-};
+}
 
-export type ValetVehicleMetaRecord = {
+export interface ValetVehicleMetaRecord {
   booking_id: string;
   number_plate: string;
   customer_name: string | null;
-};
+}
 
-type AuditLogEntry = {
+interface AuditLogEntry {
   id: string;
   employee: string;
   action: string;
@@ -386,9 +386,9 @@ type AuditLogEntry = {
   undo_log_id: string | null;
   /** Set on an UNDO entry itself: the id of the original entry it reversed. */
   undo_of: string | null;
-};
+}
 
-export type InventoryItemRecord = {
+export interface InventoryItemRecord {
   id: string;
   name: string;
   category: string;
@@ -396,9 +396,9 @@ export type InventoryItemRecord = {
   unit: string;
   status: "In Stock" | "Low Stock" | "Out of Stock";
   expiry_date: string | null; // "YYYY-MM-DD" when set
-};
+}
 
-export type MenuItemRecord = {
+export interface MenuItemRecord {
   id: string;
   name: string;
   price: number;
@@ -418,9 +418,9 @@ export type MenuItemRecord = {
   // the feature landed. Drives the menu-insights convergence guards.
   price_updated_at?: string | null;
   price_baseline?: number | null;
-};
+}
 
-export type OrderItemRecord = {
+export interface OrderItemRecord {
   id: string;
   name: string;
   quantity: number;
@@ -433,9 +433,9 @@ export type OrderItemRecord = {
   // until it is fired; firing stamps fired_at and clears the hold.
   course_hold?: boolean;
   fired_at?: string | null;
-};
+}
 
-export type OrderRecord = {
+export interface OrderRecord {
   id: string;
   table: string;
   customer: string;
@@ -449,7 +449,7 @@ export type OrderRecord = {
   items: OrderItemRecord[];
   subtotal: number;
   serviceChargePercentage?: number;
-  taxes?: Array<{ id: string; name: string; percentage: number }>;
+  taxes?: { id: string; name: string; percentage: number }[];
   applyServiceCharge: boolean;
   total: number;
   status:
@@ -473,7 +473,7 @@ export type OrderRecord = {
   bill_closed_at?: string | null;
   bill_closed_by?: string | null;
   bill_id?: string | null;
-};
+}
 
 export type PaymentMethod =
   | "Upi"       // 1
@@ -486,17 +486,17 @@ export type PaymentMethod =
   | "Razorpay"  // online (auto-verified)
   | "Split";    // split tender — real modes live in Bills.payment_splits
 
-export type TableAssignmentRecord = {
+export interface TableAssignmentRecord {
   id: string;
   table_name: string;
   employee_id: string;
   employee_name: string;
   employee_role: string;
-};
+}
 
 export type ApcZone = "red" | "yellow" | "green";
 
-export type OrderApcInsight = {
+export interface OrderApcInsight {
   order_id: string;
   table_name: string;
   created_at: string;
@@ -506,9 +506,9 @@ export type OrderApcInsight = {
   zone: ApcZone;
   assigned_employee_id: string | null;
   assigned_employee_name: string | null;
-};
+}
 
-export type EmployeeApcIncentive = {
+export interface EmployeeApcIncentive {
   employee_id: string;
   employee_name: string;
   employee_role: string;
@@ -517,9 +517,9 @@ export type EmployeeApcIncentive = {
   covers_count: number;
   mean_apc: number;
   zone: ApcZone;
-};
+}
 
-export type MonthlyApcInsight = {
+export interface MonthlyApcInsight {
   month: string;
   period: "day" | "week" | "month";
   period_start: string;
@@ -530,15 +530,15 @@ export type MonthlyApcInsight = {
   yellow_band_percent: number;
   orders: OrderApcInsight[];
   employee_incentives: EmployeeApcIncentive[];
-};
+}
 
-type ApcInsightOptions = {
+interface ApcInsightOptions {
   period?: "day" | "week" | "month";
   periodStart?: Date;
   employeeId?: string;
-};
+}
 
-export type RestaurantProfileRecord = {
+export interface RestaurantProfileRecord {
   res_id: string;
   restaurant_username: string;
   restaurant_main_office_add: string | null;
@@ -552,20 +552,20 @@ export type RestaurantProfileRecord = {
   outlet_phone: string;
   email: string;
   outlet_hours: string;
-};
+}
 
-export type RoleRecord = {
+export interface RoleRecord {
   id: string;
   role_name: string;
   actions_performable: string[];
-};
+}
 
-type EmployeeRolesPayload = {
+interface EmployeeRolesPayload {
   primary: string;
   all: string[];
-};
+}
 
-type RestaurantSeedInput = {
+interface RestaurantSeedInput {
   id?: string;
   name: string;
   admin: {
@@ -573,17 +573,17 @@ type RestaurantSeedInput = {
     name: string;
     password: string;
   };
-  tables: Array<{
+  tables: {
     name: string;
     capacity: number;
-  }>;
+  }[];
   profile?: {
     address?: string;
     phone?: string;
     email?: string;
     hours?: string;
   };
-};
+}
 
 const MINUTE_IN_MS = 60_000;
 
@@ -603,7 +603,7 @@ function isUuid(value: string): boolean {
 // Validate an IANA zone id; fall back to Asia/Kolkata for empty/invalid input.
 export function sanitizeTimezone(raw: unknown): string {
   const tz = typeof raw === "string" ? raw.trim() : "";
-  if (!tz) return "Asia/Kolkata";
+  if (!tz) {return "Asia/Kolkata";}
   try {
     new Intl.DateTimeFormat(undefined, { timeZone: tz });
     return tz;
@@ -640,7 +640,7 @@ export function parseWallClockInZone(value: string, tz: string): Date {
   const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?$/.exec(
     String(value ?? "").trim(),
   );
-  if (!m) return new Date(value);
+  if (!m) {return new Date(value);}
   return zonedWallToUtc(
     Number(m[1]),
     Number(m[2]),
@@ -693,7 +693,7 @@ function splitName(fullName: string): { first: string; last: string } {
 }
 
 function parseNumeric(value: unknown): number {
-  if (typeof value === "number") return value;
+  if (typeof value === "number") {return value;}
   if (typeof value === "string") {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : 0;
@@ -706,9 +706,9 @@ function toNonNegativeInt(value: unknown): number {
 }
 
 function clampRating(value: number): number {
-  if (!Number.isFinite(value)) return 1;
-  if (value < 1) return 1;
-  if (value > 5) return 5;
+  if (!Number.isFinite(value)) {return 1;}
+  if (value < 1) {return 1;}
+  if (value > 5) {return 5;}
   return Math.round(value);
 }
 
@@ -721,7 +721,7 @@ function toRole(raw: unknown): RestaurantUser["role"] {
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> | null {
-  if (!value) return null;
+  if (!value) {return null;}
   if (typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
   }
@@ -749,7 +749,7 @@ function parseEmployeeRoles(raw: unknown): EmployeeRolesPayload {
     primaryRaw = primaryRaw.toLowerCase() || "employee";
   }
 
-  const allRaw = Array.isArray(parsed?.all) ? parsed!.all.map((entry) => String(entry).trim()).filter(Boolean) : [];
+  const allRaw = Array.isArray(parsed?.all) ? parsed.all.map((entry) => String(entry).trim()).filter(Boolean) : [];
 
   // Normalize entries: if an entry is a UUID, keep as-is (custom role id), otherwise lowercase core role name
   const normalizedAll = allRaw.map((entry) => (isUuid(entry) ? entry : entry.toLowerCase()));
@@ -762,8 +762,8 @@ function parseEmployeeRoles(raw: unknown): EmployeeRolesPayload {
 }
 
 function inventoryStatusFromStock(stock: number): InventoryItemRecord["status"] {
-  if (stock <= 0) return "Out of Stock";
-  if (stock < 10) return "Low Stock";
+  if (stock <= 0) {return "Out of Stock";}
+  if (stock < 10) {return "Low Stock";}
   return "In Stock";
 }
 
@@ -788,36 +788,36 @@ function parseInventoryDescription(description: string | null): { category: stri
   };
 }
 
-export type MenuModifierGroup = {
+export interface MenuModifierGroup {
   name: string;
   multi: boolean;
   required: boolean;
-  options: Array<{ name: string; price: number }>;
-};
+  options: { name: string; price: number }[];
+}
 
-export type RecipeItem = { inventory_id: string; qty: number; note?: string };
+export interface RecipeItem { inventory_id: string; qty: number; note?: string }
 // Recipe = inventory ingredients consumed per unit sold (for auto-deduction).
 export function sanitizeRecipe(raw: unknown): RecipeItem[] {
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {return [];}
   const out: RecipeItem[] = [];
   for (const r of raw) {
     const ing = (r ?? {}) as Record<string, unknown>;
     const inventory_id = typeof ing.inventory_id === "string" ? ing.inventory_id.trim() : "";
     const qty = parseNumeric(ing.qty);
     const note = typeof ing.note === "string" ? ing.note.trim().slice(0, 120) : "";
-    if (inventory_id && qty > 0) out.push({ inventory_id, qty, ...(note ? { note } : {}) });
+    if (inventory_id && qty > 0) {out.push({ inventory_id, qty, ...(note ? { note } : {}) });}
   }
   return out;
 }
 
 // Coerce arbitrary input into clean modifier groups (drops empties).
 export function sanitizeModifiers(raw: unknown): MenuModifierGroup[] {
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {return [];}
   const groups: MenuModifierGroup[] = [];
   for (const g of raw) {
     const grp = (g ?? {}) as Record<string, unknown>;
     const name = typeof grp.name === "string" ? grp.name.trim() : "";
-    if (!name) continue;
+    if (!name) {continue;}
     const optsRaw = Array.isArray(grp.options) ? grp.options : [];
     const options = optsRaw
       .map((o) => {
@@ -825,7 +825,7 @@ export function sanitizeModifiers(raw: unknown): MenuModifierGroup[] {
         return { name: typeof opt.name === "string" ? opt.name.trim() : "", price: parseNumeric(opt.price) };
       })
       .filter((o) => o.name.length > 0);
-    if (options.length === 0) continue;
+    if (options.length === 0) {continue;}
     groups.push({ name, multi: grp.multi === true, required: grp.required === true, options });
   }
   return groups;
@@ -835,12 +835,12 @@ export function sanitizeModifiers(raw: unknown): MenuModifierGroup[] {
 // deduped, capped in count and length. Free-form by design — the UI offers a
 // fixed suggestion set (gluten/dairy/nuts/…) but any tag is allowed.
 export function sanitizeAllergens(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {return [];}
   const out: string[] = [];
   for (const a of raw) {
     const tag = typeof a === "string" ? a.trim().toLowerCase().slice(0, 24) : "";
-    if (tag && !out.includes(tag)) out.push(tag);
-    if (out.length >= 12) break;
+    if (tag && !out.includes(tag)) {out.push(tag);}
+    if (out.length >= 12) {break;}
   }
   return out;
 }
@@ -848,35 +848,35 @@ export function sanitizeAllergens(raw: unknown): string[] {
 function encodeMenuDescription(payload: { price: number; image_url?: string | null; available?: boolean; modifiers?: unknown; recipe?: unknown; station?: unknown; allergens?: unknown; price_updated_at?: string | null; price_baseline?: number | null }): string {
   const out: Record<string, unknown> = { price: Number.isFinite(payload.price) ? payload.price : 0 };
   const img = typeof payload.image_url === "string" ? payload.image_url.trim() : "";
-  if (img) out.image_url = img;
-  if (payload.available === false) out.available = false; // default true (omit)
+  if (img) {out.image_url = img;}
+  if (payload.available === false) {out.available = false;} // default true (omit)
   const mods = sanitizeModifiers(payload.modifiers);
-  if (mods.length > 0) out.modifiers = mods;
+  if (mods.length > 0) {out.modifiers = mods;}
   const recipe = sanitizeRecipe(payload.recipe);
-  if (recipe.length > 0) out.recipe = recipe;
+  if (recipe.length > 0) {out.recipe = recipe;}
   const station = typeof payload.station === "string" ? payload.station.trim().slice(0, 40) : "";
-  if (station) out.station = station;
+  if (station) {out.station = station;}
   const allergens = sanitizeAllergens(payload.allergens);
-  if (allergens.length > 0) out.allergens = allergens;
+  if (allergens.length > 0) {out.allergens = allergens;}
   // Price history (both optional, both absent on legacy rows) — see
   // stampPriceHistory. Only ever written when a price actually changed.
   const priceUpdatedAt = typeof payload.price_updated_at === "string" ? payload.price_updated_at.trim() : "";
-  if (priceUpdatedAt) out.price_updated_at = priceUpdatedAt;
+  if (priceUpdatedAt) {out.price_updated_at = priceUpdatedAt;}
   const baseline = typeof payload.price_baseline === "number" && Number.isFinite(payload.price_baseline) && payload.price_baseline > 0
     ? round2(payload.price_baseline)
     : null;
-  if (baseline != null) out.price_baseline = baseline;
+  if (baseline != null) {out.price_baseline = baseline;}
   return JSON.stringify(out);
 }
 
-type ParsedMenuDescription = { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[]; price_updated_at: string | null; price_baseline: number | null };
+interface ParsedMenuDescription { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[]; price_updated_at: string | null; price_baseline: number | null }
 
 const emptyMenuDescription = (): ParsedMenuDescription => ({ price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [], price_updated_at: null, price_baseline: null });
 
 function parseMenuDescription(description: string | null): ParsedMenuDescription {
-  if (!description) return emptyMenuDescription();
+  if (!description) {return emptyMenuDescription();}
   const parsed = parseJsonObject(description);
-  if (!parsed) return emptyMenuDescription();
+  if (!parsed) {return emptyMenuDescription();}
   const img = typeof parsed.image_url === "string" ? parsed.image_url : null;
   const priceUpdatedAt = typeof parsed.price_updated_at === "string" && parsed.price_updated_at.trim()
     ? parsed.price_updated_at.trim()
@@ -924,18 +924,18 @@ function stampPriceHistory(
 
 function toOrderStatusCode(status: string | undefined): number {
   const lowered = String(status ?? "preparing").trim().toLowerCase();
-  if (lowered === "pending" || lowered === "awaiting approval" || lowered === "awaiting_approval") return 8;
-  if (lowered === "cancelled" || lowered === "canceled") return 5;
-  if (lowered === "closed") return 7;
-  if (lowered === "paid") return 4;
+  if (lowered === "pending" || lowered === "awaiting approval" || lowered === "awaiting_approval") {return 8;}
+  if (lowered === "cancelled" || lowered === "canceled") {return 5;}
+  if (lowered === "closed") {return 7;}
+  if (lowered === "paid") {return 4;}
   if (
     lowered === "payment pending approval"
     || lowered === "payment_pending_approval"
     || lowered === "pending approval"
     || lowered === "pending_approval"
-  ) return 6;
-  if (lowered === "bill verification" || lowered === "bill_verification" || lowered === "verification") return 3;
-  if (lowered === "served") return 2;
+  ) {return 6;}
+  if (lowered === "bill verification" || lowered === "bill_verification" || lowered === "verification") {return 3;}
+  if (lowered === "served") {return 2;}
   return 1; // Preparing
 }
 
@@ -965,16 +965,16 @@ function fromOrderStatusCode(status: unknown): OrderRecord["status"] {
 
 function normalizePaymentMethod(raw: unknown): PaymentMethod | null {
   const n = String(raw ?? "").trim().toLowerCase();
-  if (!n) return null;
-  if (n === "upi") return "Upi";
-  if (n === "cash") return "Cash";
-  if (n === "card") return "Card";
-  if (n === "dineout" || n === "dine out") return "Dineout";
-  if (n === "zomato" || n === "zomato pay" || n === "zomatopay") return "Zomato";
-  if (n === "eazydiner" || n === "easydiner" || n === "easy diner") return "Eazydiner";
-  if (n === "district") return "District";
-  if (n === "razorpay") return "Razorpay";
-  if (n === "split") return "Split";
+  if (!n) {return null;}
+  if (n === "upi") {return "Upi";}
+  if (n === "cash") {return "Cash";}
+  if (n === "card") {return "Card";}
+  if (n === "dineout" || n === "dine out") {return "Dineout";}
+  if (n === "zomato" || n === "zomato pay" || n === "zomatopay") {return "Zomato";}
+  if (n === "eazydiner" || n === "easydiner" || n === "easy diner") {return "Eazydiner";}
+  if (n === "district") {return "District";}
+  if (n === "razorpay") {return "Razorpay";}
+  if (n === "split") {return "Split";}
   return null;
 }
 
@@ -1010,12 +1010,12 @@ function encodeSlot(payload: SlotPayload): string {
 
 // Validate an arbitrary parsed value into a BookingDeposit (or null).
 function parseBookingDeposit(raw: unknown): BookingDeposit | null {
-  if (!raw || typeof raw !== "object") return null;
+  if (!raw || typeof raw !== "object") {return null;}
   const o = raw as Record<string, unknown>;
   const amount = Number(o.amount);
   const status = String(o.status ?? "").trim();
-  if (!Number.isFinite(amount) || amount <= 0) return null;
-  if (!["pending", "paid", "refund_due", "forfeited"].includes(status)) return null;
+  if (!Number.isFinite(amount) || amount <= 0) {return null;}
+  if (!["pending", "paid", "refund_due", "forfeited"].includes(status)) {return null;}
   return {
     amount: Math.round(amount * 100) / 100,
     status: status as BookingDeposit["status"],
@@ -1107,11 +1107,11 @@ function isInsufficientPrivilege(err: any): boolean {
 
 // Run a lazy table's DDL once per process. `key` is the logical table group.
 async function ensureLazyTable(key: string, run: () => Promise<void>): Promise<void> {
-  if (ddlEnsured.has(key)) return;
+  if (ddlEnsured.has(key)) {return;}
   try {
     await run();
   } catch (err) {
-    if (!isInsufficientPrivilege(err)) throw err;
+    if (!isInsufficientPrivilege(err)) {throw err;}
     // Running as app_runtime: schema comes from migrations; nothing to do.
   }
   ddlEnsured.add(key);
@@ -1134,7 +1134,7 @@ async function applyTenantRls(tableName: string): Promise<void> {
        END $$;`,
     );
   } catch (err) {
-    if (!isInsufficientPrivilege(err)) throw err;
+    if (!isInsufficientPrivilege(err)) {throw err;}
   }
 }
 
@@ -1156,13 +1156,13 @@ export async function verifyTenantRlsAtBoot(): Promise<void> {
         `[rls-check] runtime DB role "${row.role}" BYPASSES row-level security ` +
         `(is_superuser=${row.su}, bypassrls=${row.bypass}). Tenant isolation is NOT enforced — ` +
         `repoint the runtime connection to the app_runtime (NOBYPASSRLS) role.`;
-      if (process.env.ENFORCE_RLS_AT_BOOT === "true") throw new Error(m);
+      if (process.env.ENFORCE_RLS_AT_BOOT === "true") {throw new Error(m);}
       logger.warn(m + " (set ENFORCE_RLS_AT_BOOT=true to refuse to start)");
     } else if (row) {
       logger.info(`[rls-check] OK — runtime role "${row.role}" does not bypass RLS.`);
     }
   } catch (err) {
-    if (process.env.ENFORCE_RLS_AT_BOOT === "true") throw err;
+    if (process.env.ENFORCE_RLS_AT_BOOT === "true") {throw err;}
     logger.warn({ err: (err as any)?.message ?? err }, "[rls-check] could not verify runtime role privileges:");
   }
 
@@ -1330,7 +1330,7 @@ export async function openTenantConnection(ctx: TenantContext): Promise<{
   return {
     run: (fn) => tenantStorage.run({ client, ctx, txnDepth: 0 }, fn),
     release: async () => {
-      if (released) return;
+      if (released) {return;}
       released = true;
       try {
         // Close any stray open transaction first (ROLLBACK is a harmless no-op
@@ -1364,10 +1364,10 @@ async function resolveRestaurantContext(
   // the ambient tenant request (the session's / the admin-selected outlet) so
   // every data-layer call scopes to the ACTIVE outlet. Single-outlet restaurants
   // are unaffected — their bound outlet IS the only outlet.
-  let effectiveOverride = outletOverride && outletOverride.trim() ? outletOverride.trim() : "";
+  let effectiveOverride = outletOverride?.trim() ? outletOverride.trim() : "";
   if (!effectiveOverride) {
     const ambient = tenantStorage.getStore()?.ctx.outlet_id;
-    if (typeof ambient === "string" && isUuid(ambient.trim())) effectiveOverride = ambient.trim();
+    if (typeof ambient === "string" && isUuid(ambient.trim())) {effectiveOverride = ambient.trim();}
   }
 
   if (effectiveOverride) {
@@ -1402,7 +1402,7 @@ async function resolveRestaurantContext(
     );
 
     const row = rows[0];
-    if (row && row.outlet_id) {
+    if (row?.outlet_id) {
       return {
         inputId: restaurantId,
         res_id: row.res_id,
@@ -1448,7 +1448,7 @@ async function resolveRestaurantContext(
   );
 
   const row = rows[0];
-  if (!row || !row.outlet_id) {
+  if (!row?.outlet_id) {
     return null;
   }
 
@@ -1489,7 +1489,7 @@ async function findOrCreateActionId(actionName: string, client: PoolClient): Pro
   );
 
   const found = existing[0];
-  if (found) return found.id;
+  if (found) {return found.id;}
 
   const id = randomUUID();
 
@@ -1525,7 +1525,7 @@ async function findEmployeeIdByUsername(
   );
 
   const existingRow = existing[0];
-  if (existingRow) return existingRow.emp_id;
+  if (existingRow) {return existingRow.emp_id;}
 
   throw new Error(`Employee with username '${_username}' not found in restaurant '${context.restaurant_name}', '${context.res_id}'`);
 
@@ -1662,7 +1662,7 @@ export async function AddRestaurantUser(
     );
 
     const created = rows[0] ?? null;
-    if (!created) throw new Error("failed to create employee");
+    if (!created) {throw new Error("failed to create employee");}
 
     // attach employee_id for compatibility with callers
     return { ...created, employee_id: employeeUuid };
@@ -1680,7 +1680,7 @@ export async function CheckDatabaseHealth(): Promise<boolean> {
 
 // Optional, PII-light demographic tags on customers (aggregated in analytics —
 // never shown per-person to staff). All free-form-but-normalized text columns.
-export type CustomerDemographics = { gender?: string | null; age_group?: string | null; pincode?: string | null };
+export interface CustomerDemographics { gender?: string | null; age_group?: string | null; pincode?: string | null }
 
 async function ensureCustomerDemographicCols(): Promise<void> {
   await ensureLazyTable("Customers.demographics", async () => {
@@ -1747,7 +1747,7 @@ export async function UpdateCustomerDemographics(
   const context = await requireRestaurantContext(restaurantId);
   await ensureCustomerDemographicCols();
   const demo = normalizeDemographics(demographics);
-  if (!demo.gender && !demo.age_group && !demo.pincode) return;
+  if (!demo.gender && !demo.age_group && !demo.pincode) {return;}
   await runQuery(
     `update "Customers" set
        gender = coalesce($3, gender),
@@ -2025,7 +2025,7 @@ async function isTableOtpRequired(context: RestaurantContext, client?: PoolClien
 // the gate is OFF. Best-effort: never blocks the seating itself.
 async function ensureTableOtpOnOccupy(context: RestaurantContext, tableId: string, client?: PoolClient): Promise<void> {
   try {
-    if (!(await isTableOtpRequired(context, client))) return;
+    if (!(await isTableOtpRequired(context, client))) {return;}
     await runQuery(
       `update "Tables" set order_otp = $4
          where id = $1 and res_id = $2 and outlet_id = $3
@@ -2283,18 +2283,18 @@ export async function GetTableStatus(
 type Course = "starter" | "main" | "dessert" | "drink" | "other";
 function classifyCourse(category: string): Course {
   const c = String(category ?? "").toLowerCase();
-  if (/start|appet|tikka|kebab|soup|salad|snack|finger|bite/.test(c)) return "starter";
-  if (/dessert|sweet|ice cream|icecream|cake|pastry|gulab|kulfi|brownie|pudding/.test(c)) return "dessert";
-  if (/drink|beverage|juice|shake|coffee|tea|mocktail|cocktail|soda|water|lassi|smoothie|beer|wine|mojito/.test(c)) return "drink";
-  if (/main|course|biry|curry|rice|pizza|burger|pasta|noodle|thali|bread|naan|roti|gravy|combo|meal|sandwich|wrap|dosa/.test(c)) return "main";
+  if (/start|appet|tikka|kebab|soup|salad|snack|finger|bite/.test(c)) {return "starter";}
+  if (/dessert|sweet|ice cream|icecream|cake|pastry|gulab|kulfi|brownie|pudding/.test(c)) {return "dessert";}
+  if (/drink|beverage|juice|shake|coffee|tea|mocktail|cocktail|soda|water|lassi|smoothie|beer|wine|mojito/.test(c)) {return "drink";}
+  if (/main|course|biry|curry|rice|pizza|burger|pasta|noodle|thali|bread|naan|roti|gravy|combo|meal|sandwich|wrap|dosa/.test(c)) {return "main";}
   return "other";
 }
 
 // green = at/above target; yellow = within 20% below; red = well below; neutral = no target.
 function apcColor(tableApc: number, target: number): "green" | "yellow" | "red" | "neutral" {
-  if (target <= 0 || tableApc <= 0) return "neutral";
-  if (tableApc >= target) return "green";
-  if (tableApc >= target * 0.8) return "yellow";
+  if (target <= 0 || tableApc <= 0) {return "neutral";}
+  if (tableApc >= target) {return "green";}
+  if (tableApc >= target * 0.8) {return "yellow";}
   return "red";
 }
 
@@ -2317,10 +2317,10 @@ async function getTargetApc(context: RestaurantContext): Promise<number> {
   const coversByTable = new Map<string, number>();
   for (const r of rows) {
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
-    if (st !== "paid" && st !== "closed") continue;
+    if (st !== "paid" && st !== "closed") {continue;}
     const p = parseJsonObject(r.food) ?? {};
     revenue += parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
-    if (r.table_id) coversByTable.set(r.table_id, Math.max(1, Number(r.num_covers ?? 1)));
+    if (r.table_id) {coversByTable.set(r.table_id, Math.max(1, Number(r.num_covers ?? 1)));}
   }
   const totalCovers = [...coversByTable.values()].reduce((a, b) => a + b, 0);
   return totalCovers > 0 ? round2(revenue / totalCovers) : 0;
@@ -2368,7 +2368,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; taxes: BillTaxLine[]; tax_total: number; grand_total: number; covers: number; apc: number; order_ids: string[]; items: Array<{ name: string; price: number; quantity: number; note?: string }>; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; taxes: BillTaxLine[]; tax_total: number; grand_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
 
@@ -2443,10 +2443,10 @@ export async function GetBillForTable(
     const f = parseJsonObject(o.food) ?? {};
     // Use the first non-empty, non-placeholder customer name for the bill header.
     if (!billCustomer) {
-      const c = String((f as Record<string, unknown>).customer ?? "").trim();
-      if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") billCustomer = c;
+      const c = String((f).customer ?? "").trim();
+      if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") {billCustomer = c;}
     }
-    const list = Array.isArray((f as Record<string, unknown>).items) ? (f as { items: unknown[] }).items : [];
+    const list = Array.isArray((f).items) ? (f as { items: unknown[] }).items : [];
     for (const raw of list) {
       const it = (raw ?? {}) as Record<string, unknown>;
       const name = String(it.name ?? "Item");
@@ -2457,7 +2457,7 @@ export async function GetBillForTable(
       const existing = itemMap.get(key);
       if (existing) {
         existing.quantity += quantity;
-        if (note) existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;
+        if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
       } else {
         itemMap.set(key, { name, price, quantity, note: note || undefined });
       }
@@ -2506,7 +2506,7 @@ export async function GetBillForTable(
     if (apcStatusVal === "yellow" || apcStatusVal === "red") {
       const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
       const catByName = new Map<string, string>();
-      for (const m of menu) catByName.set(m.name.toLowerCase(), m.category);
+      for (const m of menu) {catByName.set(m.name.toLowerCase(), m.category);}
       const orderedByCourse: Record<Course, number> = { starter: 0, main: 0, dessert: 0, drink: 0, other: 0 };
       for (const it of items) {
         const course = classifyCourse(catByName.get(it.name.toLowerCase()) ?? "");
@@ -2680,7 +2680,7 @@ export async function AddEmailToCustomer(
 
 async function getBookingsWithTableMeta(
   context: RestaurantContext,
-): Promise<Array<{ table_id: string; slot: string; created_at: string }>> {
+): Promise<{ table_id: string; slot: string; created_at: string }[]> {
   const rows = await runQuery<{
     table_id: string;
     slot: string;
@@ -2701,9 +2701,9 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<Array<{ table_name: string; capacity: number | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; order_otp?: string | null }> | null> {
-  const at = time ? new Date(time as any) : new Date();
-  if (Number.isNaN(at.getTime())) return null;
+): Promise<{ table_name: string; capacity: number | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; order_otp?: string | null }[] | null> {
+  const at = time ? new Date(time) : new Date();
+  if (Number.isNaN(at.getTime())) {return null;}
 
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
@@ -2736,7 +2736,7 @@ export async function GetTables(
   const requireOtp = await isTableOtpRequired(context).catch(() => false);
   if (requireOtp) {
     for (const row of tableRows) {
-      if (row.is_occupied === true && !String(row.order_otp ?? "").trim()) {
+      if (row.is_occupied && !String(row.order_otp ?? "").trim()) {
         const otp = makeTableOtp();
         try {
           await runQuery(
@@ -2785,10 +2785,10 @@ export async function GetTables(
     // or seated/arrived (the party came and the table is cleared on release), or a
     // no-show. Without this, a completed booking whose slot time is still in the
     // future kept the table stuck showing "reserved" after it was cleared.
-    if (isTerminalBookingStatus(slot.status)) continue;
+    if (isTerminalBookingStatus(slot.status)) {continue;}
     const start = new Date(slot.start);
     const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) continue;
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {continue;}
     if (start <= at && end > at) {
       active.push(booking);
       continue;
@@ -2823,14 +2823,14 @@ export async function GetTables(
   ).catch(() => [] as { table_id: string | null; food: unknown }[]);
   const totalByTable = new Map<string, number>();
   for (const o of activeOrders) {
-    if (!o.table_id) continue;
+    if (!o.table_id) {continue;}
     const p = parseJsonObject(o.food) ?? {};
     const t = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     totalByTable.set(o.table_id, (totalByTable.get(o.table_id) ?? 0) + t);
   }
 
   return tableRows.map((row) => {
-    const occupied = row.is_occupied === true;
+    const occupied = row.is_occupied;
     const tCovers = Math.max(1, parseNumeric(row.num_covers) ?? 1);
     const tTotal = totalByTable.get(row.id) ?? 0;
     const tApc = occupied && tTotal > 0 ? round2(tTotal / tCovers) : 0;
@@ -2868,7 +2868,7 @@ export async function VerifyTableOtp(
 ): Promise<{ ok: true; required: false } | { ok: true; required: true } | { ok: false; required: true; reason: "not_seated" | "wrong" }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
-  if (!(await isTableOtpRequired(context))) return { ok: true, required: false };
+  if (!(await isTableOtpRequired(context))) {return { ok: true, required: false };}
 
   const normalized = String(tableName ?? "").trim();
   const rows = await runQuery<{ is_occupied: boolean; order_otp: string | null }>(
@@ -2880,7 +2880,7 @@ export async function VerifyTableOtp(
     [context.res_id, context.outlet_id, normalized],
   );
   const row = rows[0];
-  if (!row || row.is_occupied !== true) return { ok: false, required: true, reason: "not_seated" };
+  if (!row?.is_occupied) {return { ok: false, required: true, reason: "not_seated" };}
 
   const expected = String(row.order_otp ?? "").trim();
   const provided = String(otp ?? "").trim();
@@ -2894,7 +2894,7 @@ export async function GetAvailableTablesForInterval(
   restaurantId: string,
   start: Date,
   durationMins: number,
-): Promise<Array<{ table_name: string; capacity: number | null }>> {
+): Promise<{ table_name: string; capacity: number | null }[]> {
   ensureValidDate(start);
   const end = new Date(start.getTime() + durationMins * MINUTE_IN_MS);
   const context = await requireRestaurantContext(restaurantId);
@@ -2921,13 +2921,13 @@ export async function GetAvailableTablesForInterval(
     const slot = decodeSlot(booking.slot, new Date(booking.created_at));
     // Cancelled bookings are kept as rows when they carry a deposit (the
     // refund_due/forfeited record must survive) — they no longer hold a table.
-    if (String(slot.status ?? "").toLowerCase().includes("cancel")) continue;
+    if (String(slot.status ?? "").toLowerCase().includes("cancel")) {continue;}
     const bookingStart = new Date(slot.start);
     const bookingEnd = new Date(bookingStart.getTime() + slot.duration * MINUTE_IN_MS);
-    if (Number.isNaN(bookingStart.getTime()) || Number.isNaN(bookingEnd.getTime())) continue;
+    if (Number.isNaN(bookingStart.getTime()) || Number.isNaN(bookingEnd.getTime())) {continue;}
 
     const overlaps = bookingStart < end && bookingEnd > start;
-    if (overlaps) busyIds.add(booking.table_id);
+    if (overlaps) {busyIds.add(booking.table_id);}
   }
 
   return tableRows
@@ -2942,14 +2942,14 @@ export async function AllocateBestTable(
   partySize: number,
 ): Promise<string | null> {
   const free = await GetAvailableTablesForInterval(restaurantId, start, durationMins);
-  if (free.length === 0) return null;
+  if (free.length === 0) {return null;}
 
   const fit = free.filter((t) => (t.capacity ?? Number.MAX_SAFE_INTEGER) >= partySize);
-  if (fit.length === 0) return null;
+  if (fit.length === 0) {return null;}
 
   fit.sort((a, b) => {
     const diff = (a.capacity ?? Number.MAX_SAFE_INTEGER) - (b.capacity ?? Number.MAX_SAFE_INTEGER);
-    if (diff !== 0) return diff;
+    if (diff !== 0) {return diff;}
     return a.table_name.localeCompare(b.table_name);
   });
 
@@ -2961,7 +2961,7 @@ export async function GetBookingsAfterTime(
   time?: string,
 ): Promise<BookingSummary[] | null> {
   const at = time ? new Date(time) : new Date();
-  if (Number.isNaN(at.getTime())) return null;
+  if (Number.isNaN(at.getTime())) {return null;}
 
   const context = await requireRestaurantContext(restaurantId);
   const og = isAllOutlets() ? "true" : "false";
@@ -3001,8 +3001,8 @@ export async function GetBookingsAfterTime(
     const slot = decodeSlot(row.slot, row.created_at);
     const start = new Date(slot.start);
     const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) continue;
-    if (end <= at) continue;
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {continue;}
+    if (end <= at) {continue;}
 
     result.push({
       booking_id: row.booking_id,
@@ -3063,7 +3063,7 @@ export async function GetBookingSummaryById(
     [booking_id, context.res_id, context.outlet_id],
   );
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
   const slot = decodeSlot(row.slot, row.created_at);
   return {
     booking_id: row.booking_id,
@@ -3100,16 +3100,16 @@ export async function UpdateBookingDeposit(
     [booking_id, context.res_id, context.outlet_id],
   );
   const row = rows[0];
-  if (!row) return false;
+  if (!row) {return false;}
   const slot = decodeSlot(row.slot, row.created_at);
-  if (!slot.deposit) return false;
+  if (!slot.deposit) {return false;}
   slot.deposit.status = updates.deposit_status;
-  if (updates.payment_id !== undefined) slot.deposit.payment_id = updates.payment_id;
-  if (updates.deposit_status === "paid") slot.deposit.paid_at = new Date().toISOString();
+  if (updates.payment_id !== undefined) {slot.deposit.payment_id = updates.payment_id;}
+  if (updates.deposit_status === "paid") {slot.deposit.paid_at = new Date().toISOString();}
   if (updates.deposit_status === "refund_due" || updates.deposit_status === "forfeited") {
     slot.deposit.resolved_at = new Date().toISOString();
   }
-  if (updates.slot_status) slot.status = updates.slot_status;
+  if (updates.slot_status) {slot.status = updates.slot_status;}
   await runQuery(
     `update "Bookings" set slot = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
     [booking_id, context.res_id, context.outlet_id, encodeSlot(slot)],
@@ -3135,7 +3135,7 @@ export async function UpdateBookingStatus(
   );
 
   const row = rows[0];
-  if (!row) return false;
+  if (!row) {return false;}
 
   const slot = decodeSlot(row.slot, row.created_at);
   const prevStatus = String(slot.status ?? "").trim().toLowerCase();
@@ -3287,7 +3287,7 @@ export async function GetCustomerAndBookings(
 }
 
 // --- Guest CRM insights -------------------------------------------------------
-export type CustomerInsight = {
+export interface CustomerInsight {
   customer_id: string;
   name: string;
   phone: string;
@@ -3297,8 +3297,8 @@ export type CustomerInsight = {
   avg_rating: number | null; // from feedback matched by guest name
   feedbacks: number;
   segment: "new" | "regular" | "high-spend" | "dormant";
-  history: Array<{ day: string; orders: number; spend: number }>; // recent visit days, newest first
-};
+  history: { day: string; orders: number; spend: number }[]; // recent visit days, newest first
+}
 
 // Per-customer visit/spend/rating + segment for the CRM page. Order identity:
 // a direct cust_id link when the order has one (orders are now linked to a
@@ -3340,7 +3340,7 @@ export async function GetCustomerInsights(
   // Key each identity bucket by cust_id (when the order is directly linked),
   // normalized phone (when the ident IS a phone) or lower-cased name, so
   // customer matching is format-insensitive.
-  const buckets = new Map<string, Array<{ day: string; orders: number; spend: number }>>();
+  const buckets = new Map<string, { day: string; orders: number; spend: number }[]>();
   for (const r of orderRows) {
     let key: string;
     if (r.ident.startsWith("c:")) {
@@ -3372,7 +3372,7 @@ export async function GetCustomerInsights(
     // order lands in exactly one of them).
     const days = new Map<string, { orders: number; spend: number }>();
     for (const key of [`c:${c.id}`, digits ? `p:${digits}` : "", name ? `n:${name.toLowerCase()}` : ""]) {
-      if (!key) continue;
+      if (!key) {continue;}
       for (const b of buckets.get(key) ?? []) {
         const cur = days.get(b.day) ?? { orders: 0, spend: 0 };
         cur.orders += b.orders;
@@ -3408,9 +3408,9 @@ export async function GetCustomerInsights(
     let segment: CustomerInsight["segment"] = "new";
     if (c.visits > 0 && c.last_visit) {
       const daysSince = Math.floor((todayMs - new Date(`${c.last_visit}T00:00:00Z`).getTime()) / 86_400_000);
-      if (daysSince > 30) segment = "dormant";
-      else if (c.total_spend >= p75) segment = "high-spend";
-      else if (c.visits >= 3) segment = "regular";
+      if (daysSince > 30) {segment = "dormant";}
+      else if (c.total_spend >= p75) {segment = "high-spend";}
+      else if (c.visits >= 3) {segment = "regular";}
     }
     return { ...c, segment };
   });
@@ -3426,7 +3426,7 @@ async function resolveParkingBayId(
   client?: PoolClient,
 ): Promise<string | null> {
   const trimmed = bayIdentifier.trim();
-  if (!trimmed) return null;
+  if (!trimmed) {return null;}
 
   if (isUuid(trimmed)) {
     const rows = await runQuery<{ id: string }>(
@@ -3439,7 +3439,7 @@ async function resolveParkingBayId(
       [context.res_id, context.outlet_id, trimmed],
       client,
     );
-    if (rows[0]?.id) return rows[0].id;
+    if (rows[0]?.id) {return rows[0].id;}
   }
 
   const byName = await runQuery<{ id: string }>(
@@ -3472,7 +3472,7 @@ async function ensureDefaultParkingBayId(
     [context.res_id, context.outlet_id, preferredName],
     client,
   );
-  if (preferred[0]?.id) return preferred[0].id;
+  if (preferred[0]?.id) {return preferred[0].id;}
 
   const first = await runQuery<{ id: string }>(
     `
@@ -3485,7 +3485,7 @@ async function ensureDefaultParkingBayId(
     [context.res_id, context.outlet_id],
     client,
   );
-  if (first[0]?.id) return first[0].id;
+  if (first[0]?.id) {return first[0].id;}
 
   const inserted = await runQuery<{ id: string }>(
     `
@@ -3640,7 +3640,7 @@ export async function UpdateParkingBay(
     if (!targetId) {
       targetId = await resolveParkingBayId(context, normalizedName, client);
     }
-    if (!targetId) return null;
+    if (!targetId) {return null;}
 
     const rows = await runQuery<{
       id: string;
@@ -3665,7 +3665,7 @@ export async function UpdateParkingBay(
     );
 
     const row = rows[0];
-    if (!row) return null;
+    if (!row) {return null;}
     return {
       Bay_id: row.id,
       Bay_name: row.bay_name,
@@ -3692,7 +3692,7 @@ export async function DeleteParkingBay(
     if (!targetId && bayName?.trim()) {
       targetId = await resolveParkingBayId(context, bayName.trim(), client);
     }
-    if (!targetId) return null;
+    if (!targetId) {return null;}
 
     const deletedValetRows = await runQuery<{ id: string }>(
       `
@@ -3714,7 +3714,7 @@ export async function DeleteParkingBay(
       client,
     );
 
-    if (!deletedBayRows[0]) return null;
+    if (!deletedBayRows[0]) {return null;}
 
     return {
       Bay_id: targetId,
@@ -3731,7 +3731,7 @@ export async function SetParkingBayCurrent(
 ): Promise<ParkingBayRecord | null> {
   const context = await requireRestaurantContext(restaurantId, undefined, outletOverride);
   const targetId = await resolveParkingBayId(context, bayId);
-  if (!targetId) return null;
+  if (!targetId) {return null;}
 
   const rows = await runQuery<{
     id: string;
@@ -3749,7 +3749,7 @@ export async function SetParkingBayCurrent(
   );
 
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
   return {
     Bay_id: row.id,
     Bay_name: row.bay_name,
@@ -3946,7 +3946,7 @@ export async function GetValetVehicleState(
   );
 
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
   return mapValetStateRow(row);
 }
 
@@ -3956,7 +3956,7 @@ export async function GetValetVehicleState(
 // entrance) transitions so the "Valet Retrieval" KPI can accrue going forward.
 let valetRetrievalColsEnsured = false;
 async function ensureValetRetrievalColumns(): Promise<void> {
-  if (valetRetrievalColsEnsured) return;
+  if (valetRetrievalColsEnsured) {return;}
   await runQuery(`alter table "Valet_vehicle_state" add column if not exists requested_at timestamptz`);
   await runQuery(`alter table "Valet_vehicle_state" add column if not exists delivered_at timestamptz`);
   valetRetrievalColsEnsured = true;
@@ -3986,13 +3986,13 @@ async function ensureValetOpsColumns(): Promise<void> {
   });
 }
 
-export type ValetOpsPatch = {
+export interface ValetOpsPatch {
   parking_location?: string | null;
   key_holder?: string | null;
   condition_notes?: string | null;
   condition_photo_url?: string | null;
   eta_minutes?: number | null;
-};
+}
 
 // Patch the valet ops fields on a vehicle's state row. Only the keys present on
 // the patch are written; passing null clears a field. Setting key_holder (or
@@ -4043,7 +4043,7 @@ export async function UpdateValetVehicleOps(
   );
 
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
   return mapValetStateRow(row);
 }
 
@@ -4071,7 +4071,7 @@ export async function UpdateValetVehicleState(
     [bookingId, context.res_id, context.outlet_id, normalizedState],
   );
 
-  if (!rows[0]) return null;
+  if (!rows[0]) {return null;}
   return { booking_id: rows[0].id };
 }
 
@@ -4105,7 +4105,7 @@ export async function UpdateValetVehicleBay(
   );
 
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
   return {
     booking_id: row.id,
     bay_id: row.bay_id,
@@ -4133,7 +4133,7 @@ export async function HasActiveBooking(
     const slot = decodeSlot(row.slot, row.created_at);
     const start = new Date(slot.start);
     const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return false;
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {return false;}
     return start <= checkTime && end > checkTime;
   });
 }
@@ -4161,7 +4161,7 @@ export async function GetBookingsInRange(
     for (const row of rows) {
       const slot = decodeSlot(row.slot, row.created_at);
       const bookingStart = new Date(slot.start);
-      if (Number.isNaN(bookingStart.getTime())) continue;
+      if (Number.isNaN(bookingStart.getTime())) {continue;}
       if (bookingStart >= start && bookingStart <= end) {
         count += 1;
       }
@@ -4220,8 +4220,8 @@ export async function GetEmployeeDetailsFromEmpID(employeeID: string): Promise<R
     emp_Fname: row.emp_Fname,
     emp_Lname: row.emp_Lname,
     password: "",
-    role: role["primary"],
-    role_all: role["all"] || []
+    role: role.primary,
+    role_all: role.all || []
   };
 }
 
@@ -4299,14 +4299,14 @@ export async function AddAuditLogEntry(
 //   });
 // }
 
-export type AuditLogFilter = {
+export interface AuditLogFilter {
   limit?: number;
   offset?: number;
   category?: string;
   search?: string;
   from?: string; // ISO lower bound (inclusive)
   to?: string;   // ISO upper bound (inclusive)
-};
+}
 
 export async function GetAuditLogs(
   restaurantId: string,
@@ -4323,7 +4323,7 @@ export async function GetAuditLogs(
   if (opts.category && opts.category !== "All") { params.push(opts.category); where.push(`l.category = $${params.length}::"Audit_log_cat"`); }
   if (opts.from) { params.push(opts.from); where.push(`l.created_at >= $${params.length}`); }
   if (opts.to) { params.push(opts.to); where.push(`l.created_at <= $${params.length}`); }
-  if (opts.search && opts.search.trim()) {
+  if (opts.search?.trim()) {
     params.push(`%${opts.search.trim()}%`);
     const p = `$${params.length}`;
     where.push(`(l.reason ILIKE ${p} OR a.action_name ILIKE ${p} OR e."emp_Fname" ILIKE ${p} OR lg.emp_username ILIKE ${p})`);
@@ -4480,15 +4480,15 @@ const AUDIT_UNDO_BLOCKLIST = new Set<string>([
 ]);
 
 /** The before/after envelope a route writes under additional_details.undo. */
-export type AuditUndoEnvelope = {
+export interface AuditUndoEnvelope {
   kind: string;
   target_id?: string | null;
   before: Record<string, unknown>;
   after: Record<string, unknown>;
-};
+}
 
 /** Per-page memo so N rows don't re-fetch the same shared documents. */
-type UndoStateCache = { settings?: RestaurantSettings; branding?: Record<string, unknown> | null };
+interface UndoStateCache { settings?: RestaurantSettings; branding?: Record<string, unknown> | null }
 
 /**
  * Refusal a kind can raise for itself once the generic guards have passed. These
@@ -4496,9 +4496,9 @@ type UndoStateCache = { settings?: RestaurantSettings; branding?: Record<string,
  * up-front (in GET /audit-logs too, via undoable=false) instead of reporting
  * success after a no-op write.
  */
-type UndoBlock = { code: "cannot_restore_null" | "cannot_restore_key" | "target_name_taken"; message: string };
+interface UndoBlock { code: "cannot_restore_null" | "cannot_restore_key" | "target_name_taken"; message: string }
 
-type UndoRegistryEntry = {
+interface UndoRegistryEntry {
   /** Permission needed to have PERFORMED the original action — also required to undo it. */
   action_id: string;
   /** Keys that must exist under undo.before, or the entry has no prior state to restore. */
@@ -4519,14 +4519,14 @@ type UndoRegistryEntry = {
    * the reversal and the appended undo row commit or roll back together.
    */
   execute(restaurantId: string, env: AuditUndoEnvelope, actorId: string, client?: PoolClient): Promise<Record<string, unknown>>;
-};
+}
 
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : Number(v) || 0);
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const sameMoney = (a: unknown, b: unknown): boolean => round2(num(a)) === round2(num(b));
 
 async function undoSettings(restaurantId: string, cache: UndoStateCache): Promise<RestaurantSettings> {
-  if (!cache.settings) cache.settings = await GetRestaurantSettings(restaurantId);
+  if (!cache.settings) {cache.settings = await GetRestaurantSettings(restaurantId);}
   return cache.settings;
 }
 
@@ -4609,9 +4609,9 @@ async function writeRestaurantSettingsForUndo(
   const sets: string[] = [];
   const params: unknown[] = [context.res_id];
   for (const [key, value] of Object.entries(patch)) {
-    if (key === UNDO_TAXES_KEY) continue;
+    if (key === UNDO_TAXES_KEY) {continue;}
     const col = UNDO_SETTINGS_COLUMNS[key];
-    if (!col) throw new Error(`Setting "${key}" cannot be restored`);
+    if (!col) {throw new Error(`Setting "${key}" cannot be restored`);}
     params.push(col.toDb(value));
     sets.push(`"${col.column}" = $${params.length}::${col.cast}`);
   }
@@ -4620,7 +4620,7 @@ async function writeRestaurantSettingsForUndo(
   }
   if (Object.prototype.hasOwnProperty.call(patch, UNDO_TAXES_KEY)) {
     const taxes = patch[UNDO_TAXES_KEY];
-    if (taxes == null) throw new Error("Taxes cannot be restored to an empty value");
+    if (taxes == null) {throw new Error("Taxes cannot be restored to an empty value");}
     await runQuery(
       `update "Outlets" set default_tax = $2::json where id = $1 and res_id = $3`,
       [context.outlet_id, JSON.stringify(normalizeTaxes(taxes)), context.res_id],
@@ -4639,14 +4639,14 @@ const UNDO_BRANDING_COLUMNS: Record<string, { column: string; cast: string; toDb
 // Lazy: BRAND_COLOR_KEYS is declared further down the module.
 let undoBrandConfigKeys: Set<string> | null = null;
 function isUndoBrandConfigKey(key: string): boolean {
-  if (!undoBrandConfigKeys) undoBrandConfigKeys = new Set<string>(["font", "header_style", "button_shape", ...BRAND_COLOR_KEYS]);
+  if (!undoBrandConfigKeys) {undoBrandConfigKeys = new Set<string>(["font", "header_style", "button_shape", ...BRAND_COLOR_KEYS]);}
   return undoBrandConfigKeys.has(key);
 }
 
 function undoBrandingKeyBlock(key: string, priorValue: unknown): UndoBlock | null {
   // All three branding columns are nullable, so a null prior IS restorable.
-  if (UNDO_BRANDING_COLUMNS[key]) return null;
-  if (isUndoBrandConfigKey(key)) return null;
+  if (UNDO_BRANDING_COLUMNS[key]) {return null;}
+  if (isUndoBrandConfigKey(key)) {return null;}
   return { code: "cannot_restore_key", message: `“${key}” is not a restorable branding field.` };
 }
 
@@ -4675,12 +4675,12 @@ async function writeBrandingForUndo(
       sets.push(`"${col.column}" = $${params.length}::${col.cast}`);
       continue;
     }
-    if (!isUndoBrandConfigKey(key)) throw new Error(`Branding field "${key}" cannot be restored`);
+    if (!isUndoBrandConfigKey(key)) {throw new Error(`Branding field "${key}" cannot be restored`);}
     // Round-trip through the sanitizer: an invalid stored value is treated as
     // "was not set" and the key is dropped rather than written back badly.
     const sanitized = sanitizeBrandConfigInput({ [key]: value }) as Record<string, unknown>;
-    if (sanitized[key] === undefined) dropKeys.push(key);
-    else setKeys[key] = sanitized[key];
+    if (sanitized[key] === undefined) {dropKeys.push(key);}
+    else {setKeys[key] = sanitized[key];}
   }
   params.push(dropKeys);
   const dropIdx = `$${params.length}`;
@@ -4706,18 +4706,18 @@ async function restoreMenuDescriptionFields(
       [itemId, context.res_id, context.outlet_id],
       client,
     );
-    if (!rows[0]) throw new Error("Menu item not found");
+    if (!rows[0]) {throw new Error("Menu item not found");}
     const existing = parseMenuDescription(rows[0].description);
     await runQuery(
       `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
-      [itemId, context.res_id, context.outlet_id, encodeMenuDescription({ ...existing, ...patch } as never)],
+      [itemId, context.res_id, context.outlet_id, encodeMenuDescription({ ...existing, ...patch })],
       client,
     );
   };
   // Inside the undo transaction we MUST stay on its client — opening a nested
   // withTransaction here would only add a savepoint, but passing the client
   // through makes the participation explicit.
-  if (outerClient) return run(outerClient);
+  if (outerClient) {return run(outerClient);}
   await withTransaction(run);
 }
 
@@ -4891,7 +4891,7 @@ const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
         [str(env.target_id), context.res_id],
         client,
       );
-      if (!rows[0]) return null;
+      if (!rows[0]) {return null;}
       const raw = rows[0].actions_performable;
       const list = Array.isArray(raw) ? raw : (parseJsonArray(raw) ?? []);
       return { actions_performable: list.map(String) };
@@ -4918,7 +4918,7 @@ const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
     async current(restaurantId, env, cache) {
       const settings = await undoSettings(restaurantId, cache) as unknown as Record<string, unknown>;
       const out: Record<string, unknown> = {};
-      for (const key of Object.keys(env.after ?? {})) out[key] = settings[key];
+      for (const key of Object.keys(env.after ?? {})) {out[key] = settings[key];}
       return out;
     },
     matches: (cur, env) => Object.keys(env.after ?? {}).every((k) => sameSettingValue(cur[k], env.after[k])),
@@ -4928,13 +4928,13 @@ const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
     async blocked(_restaurantId, env) {
       for (const key of Object.keys(env.after ?? {})) {
         const block = undoSettingsKeyBlock(key, env.before[key]);
-        if (block) return block;
+        if (block) {return block;}
       }
       return null;
     },
     async execute(restaurantId, env, _actorId, client) {
       const patch: Record<string, unknown> = {};
-      for (const key of Object.keys(env.after ?? {})) patch[key] = env.before[key];
+      for (const key of Object.keys(env.after ?? {})) {patch[key] = env.before[key];}
       // NOT SetRestaurantSettings — that writer coalesces, which would silently
       // skip any key whose prior value was null.
       await writeRestaurantSettingsForUndo(restaurantId, patch, client);
@@ -4950,14 +4950,14 @@ const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
     // `after` and `current` are always apples-to-apples (defaults included).
     async current(restaurantId, env) {
       const branding = await GetPublicBranding(restaurantId).catch(() => null);
-      if (!branding) return null;
+      if (!branding) {return null;}
       const cfg = branding.brand_config as unknown as Record<string, unknown>;
       const out: Record<string, unknown> = {};
       for (const key of Object.keys(env.after ?? {})) {
-        if (key === "logo_url") out[key] = branding.logo_url;
-        else if (key === "theme_color") out[key] = branding.theme_color;
-        else if (key === "queue_show_menu") out[key] = branding.queue_show_menu;
-        else out[key] = cfg?.[key];
+        if (key === "logo_url") {out[key] = branding.logo_url;}
+        else if (key === "theme_color") {out[key] = branding.theme_color;}
+        else if (key === "queue_show_menu") {out[key] = branding.queue_show_menu;}
+        else {out[key] = cfg?.[key];}
       }
       return out;
     },
@@ -4965,13 +4965,13 @@ const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
     async blocked(_restaurantId, env) {
       for (const key of Object.keys(env.after ?? {})) {
         const block = undoBrandingKeyBlock(key, env.before[key]);
-        if (block) return block;
+        if (block) {return block;}
       }
       return null;
     },
     async execute(restaurantId, env, _actorId, client) {
       const patch: Record<string, unknown> = {};
-      for (const key of Object.keys(env.after ?? {})) patch[key] = env.before[key];
+      for (const key of Object.keys(env.after ?? {})) {patch[key] = env.before[key];}
       // NOT SetBranding — it coalesces the columns and merge-drops unset
       // brand_config keys, so restoring a null/absent prior was a silent no-op.
       await writeBrandingForUndo(restaurantId, patch, client);
@@ -5014,8 +5014,8 @@ const UNDO_REGISTRY: Record<string, UndoRegistryEntry> = {
 // --- Small shared comparators/helpers used by the registry ------------------
 
 function parseJsonArray(raw: unknown): unknown[] | null {
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw !== "string") return null;
+  if (Array.isArray(raw)) {return raw;}
+  if (typeof raw !== "string") {return null;}
   try { const p = JSON.parse(raw); return Array.isArray(p) ? p : null; } catch { return null; }
 }
 
@@ -5028,9 +5028,9 @@ function sameRoleSet(a: unknown, b: unknown): boolean {
 
 /** Loose value equality good enough for settings/branding scalars and JSON blobs. */
 function sameSettingValue(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a === "number" || typeof b === "number") return sameMoney(a, b);
-  if (a == null && b == null) return true;
+  if (a === b) {return true;}
+  if (typeof a === "number" || typeof b === "number") {return sameMoney(a, b);}
+  if (a == null && b == null) {return true;}
   try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
 }
 
@@ -5046,7 +5046,7 @@ export async function readEmployeeRolesForUndo(
     [employeeId, context.res_id, context.outlet_id],
     client,
   );
-  if (!rows[0]) return null;
+  if (!rows[0]) {return null;}
   const parsed = parseEmployeeRoles(rows[0].emp_roles);
   return { roles: parsed.all, primary: parsed.primary };
 }
@@ -5084,7 +5084,7 @@ async function writeEmployeeRolesForUndo(
 
 // --- Guards ----------------------------------------------------------------
 
-export type AuditUndoVerdict = {
+export interface AuditUndoVerdict {
   undoable: boolean;
   /** Machine-readable refusal class; null when undoable. */
   code:
@@ -5106,7 +5106,7 @@ export type AuditUndoVerdict = {
   /** Permission of the ORIGINAL action — the caller must hold this too. */
   required_action_id: string | null;
   envelope: AuditUndoEnvelope | null;
-};
+}
 
 const undoOk = (kind: string, action_id: string, envelope: AuditUndoEnvelope): AuditUndoVerdict =>
   ({ undoable: true, code: null, block_reason: null, kind, required_action_id: action_id, envelope });
@@ -5194,7 +5194,7 @@ export async function evaluateAuditUndo(
     } catch {
       return undoNo("target_gone", "The target of this action could not be read.", kind, rule.action_id);
     }
-    if (block) return undoNo(block.code, block.message, kind, rule.action_id);
+    if (block) {return undoNo(block.code, block.message, kind, rule.action_id);}
   }
 
   return undoOk(kind, rule.action_id, env!);
@@ -5224,7 +5224,7 @@ export async function PerformAuditUndo(
   // transaction would abort the whole undo. Never fatal — the row lock below is
   // the primary mechanism; the index is a backstop.
   await ensureAuditUndoUniqueIndex().catch((err) => {
-    logger.warn({ err: (err as any)?.message ?? err }, "audit_undo_unique_index_unavailable");
+    logger.warn({ err: (err)?.message ?? err }, "audit_undo_unique_index_unavailable");
   });
 
   // EVERYTHING below runs in ONE transaction on ONE client. The request's
@@ -5253,7 +5253,7 @@ export async function PerformAuditUndo(
         client,
       );
       const row = rows[0];
-      if (!row) return { ok: false as const, code: "not_found" as const, message: "Audit entry not found for this restaurant." };
+      if (!row) {return { ok: false as const, code: "not_found" as const, message: "Audit entry not found for this restaurant." };}
 
       // "Already undone" is re-derived INSIDE the lock, not carried in from a
       // read taken before it. Kept as its own statement because FOR UPDATE
@@ -5360,7 +5360,7 @@ async function ensureAuditUndoUniqueIndex(): Promise<void> {
     ).catch((err) => {
       // Least-privilege runtimes cannot create indexes; the row lock above is
       // still in force. Anything else is re-raised by ensureLazyTable.
-      if ((err as { code?: string })?.code !== "42501") throw err;
+      if ((err as { code?: string })?.code !== "42501") {throw err;}
     });
   });
 }
@@ -5438,7 +5438,7 @@ export async function SetInventoryExpiry(
        returning barcode`,
     [context.res_id, context.outlet_id, inventoryId.trim(), expiryDate],
   );
-  if (rows.length === 0) throw new Error("Inventory item not found");
+  if (rows.length === 0) {throw new Error("Inventory item not found");}
   return { success: true };
 }
 
@@ -5511,7 +5511,7 @@ async function ensureVendorsTable(_client?: PoolClient): Promise<void> {
   });
 }
 
-export type VendorRecord = { id: string; name: string; phone: string | null; email: string | null; notes: string | null };
+export interface VendorRecord { id: string; name: string; phone: string | null; email: string | null; notes: string | null }
 
 export async function GetVendors(restaurantId: string): Promise<VendorRecord[]> {
   const context = await requireRestaurantContext(restaurantId);
@@ -5526,7 +5526,7 @@ export async function AddVendor(restaurantId: string, input: { name: string; pho
   const context = await requireRestaurantContext(restaurantId);
   await ensureVendorsTable();
   const name = (input.name ?? "").trim();
-  if (!name) throw new Error("Vendor name is required");
+  if (!name) {throw new Error("Vendor name is required");}
   const id = randomUUID();
   const phone = input.phone?.trim() || null;
   const email = input.email?.trim() || null;
@@ -5548,7 +5548,7 @@ export async function UpdateVendor(restaurantId: string, id: string, input: { na
   if (typeof input.phone === "string") { sets.push(`phone = $${p++}`); params.push(input.phone.trim() || null); }
   if (typeof input.email === "string") { sets.push(`email = $${p++}`); params.push(input.email.trim() || null); }
   if (typeof input.notes === "string") { sets.push(`notes = $${p++}`); params.push(input.notes.trim() || null); }
-  if (sets.length === 0) return { success: true };
+  if (sets.length === 0) {return { success: true };}
   await runQuery(`update "Vendors" set ${sets.join(", ")} where id = $1 and res_id = $2 and outlet_id = $3`, params);
   return { success: true };
 }
@@ -5594,9 +5594,9 @@ export async function ReceiveStock(
     const context = await requireRestaurantContext(restaurantId, client);
     await ensureStockMovementsTable(client);
     const qty = Math.max(0, Number(input.qty) || 0);
-    if (qty <= 0) throw new Error("Quantity must be greater than zero");
+    if (qty <= 0) {throw new Error("Quantity must be greater than zero");}
     const item = await adjustInventoryQty(context, input.inventory_id, qty, client);
-    if (!item) throw new Error("Inventory item not found");
+    if (!item) {throw new Error("Inventory item not found");}
     await runQuery(
       `insert into "StockMovements" (id, res_id, outlet_id, inventory_id, item_name, delta, kind, reason, vendor_id, unit_cost, created_by)
        values ($1, $2, $3, $4, $5, $6, 'purchase', $7, $8, $9, $10)`,
@@ -5616,9 +5616,9 @@ export async function RecordWastage(
     const context = await requireRestaurantContext(restaurantId, client);
     await ensureStockMovementsTable(client);
     const qty = Math.max(0, Number(input.qty) || 0);
-    if (qty <= 0) throw new Error("Quantity must be greater than zero");
+    if (qty <= 0) {throw new Error("Quantity must be greater than zero");}
     const item = await adjustInventoryQty(context, input.inventory_id, -qty, client);
-    if (!item) throw new Error("Inventory item not found");
+    if (!item) {throw new Error("Inventory item not found");}
     await runQuery(
       `insert into "StockMovements" (id, res_id, outlet_id, inventory_id, item_name, delta, kind, reason, created_by)
        values ($1, $2, $3, $4, $5, $6, 'wastage', $7, $8)`,
@@ -5695,9 +5695,9 @@ export async function IssueStock(
     const context = await requireRestaurantContext(restaurantId, client);
     await ensureStockMovementsTable(client);
     const qty = Math.max(0, Number(input.qty) || 0);
-    if (qty <= 0) throw new Error("Quantity must be greater than zero");
+    if (qty <= 0) {throw new Error("Quantity must be greater than zero");}
     const item = await adjustInventoryQty(context, input.inventory_id, -qty, client);
-    if (!item) throw new Error("Inventory item not found");
+    if (!item) {throw new Error("Inventory item not found");}
     const costRows = await runQuery<{ unit_cost: number | string }>(
       `select unit_cost from "StockMovements"
          where res_id = $1 and outlet_id = $2 and inventory_id = $3 and kind = 'purchase' and unit_cost is not null
@@ -5717,7 +5717,7 @@ export async function IssueStock(
 }
 
 // Vendor price history for one ingredient: every costed purchase, oldest first.
-export type PricePoint = { date: string; qty: number; unit_cost: number; vendor: string | null };
+export interface PricePoint { date: string; qty: number; unit_cost: number; vendor: string | null }
 export async function GetVendorPriceHistory(restaurantId: string, inventoryId: string): Promise<{ item_name: string | null; points: PricePoint[] }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureStockMovementsTable();
@@ -5745,8 +5745,8 @@ export async function GetVendorPriceHistory(restaurantId: string, inventoryId: s
 // Theoretical (recipe/BOM) costing per dish. Ingredient unit cost = latest
 // recorded purchase cost; dishes whose recipe references uncosted ingredients
 // report a partial cost with missing_costs > 0 so the UI can flag it.
-export type MenuCostingIngredient = { inventory_id: string; name: string; unit: string; qty: number; note: string | null; unit_cost: number | null; line_cost: number | null };
-export type MenuCostingItem = {
+export interface MenuCostingIngredient { inventory_id: string; name: string; unit: string; qty: number; note: string | null; unit_cost: number | null; line_cost: number | null }
+export interface MenuCostingItem {
   id: string;
   name: string;
   category: string;
@@ -5755,10 +5755,10 @@ export type MenuCostingItem = {
   margin_pct: number | null;  // (price − cost) ÷ price × 100
   missing_costs: number;      // recipe ingredients with no recorded purchase cost
   ingredients: MenuCostingIngredient[];
-};
+}
 export async function GetMenuCosting(restaurantId: string): Promise<{
   items: MenuCostingItem[];
-  ingredients: Array<{ id: string; name: string; unit: string; unit_cost: number | null }>;
+  ingredients: { id: string; name: string; unit: string; unit_cost: number | null }[];
 }> {
   const context = await requireRestaurantContext(restaurantId);
   const [menu, inventory, unitCosts] = await Promise.all([
@@ -5805,7 +5805,7 @@ export async function GetMenuCosting(restaurantId: string): Promise<{
   };
 }
 
-export type StockMovementRow = { id: string; inventory_id: string; item_name: string | null; delta: number; kind: string; reason: string | null; vendor_id: string | null; unit_cost: number | null; created_at: string };
+export interface StockMovementRow { id: string; inventory_id: string; item_name: string | null; delta: number; kind: string; reason: string | null; vendor_id: string | null; unit_cost: number | null; created_at: string }
 
 export async function GetStockMovements(restaurantId: string, fromIso?: string, toIso?: string): Promise<StockMovementRow[]> {
   const context = await requireRestaurantContext(restaurantId);
@@ -5836,14 +5836,14 @@ export async function GetStockMovements(restaurantId: string, fromIso?: string, 
 // inventory through the SAME StockMovements ledger as ad-hoc receive-stock and
 // tracks qty_received per line, enabling expected-vs-received reconciliation.
 
-export type PurchaseOrderItem = {
+export interface PurchaseOrderItem {
   inventory_id: string;
   name: string;
   qty_ordered: number;
   unit_cost: number;
   qty_received: number;
-};
-export type PurchaseOrderRecord = {
+}
+export interface PurchaseOrderRecord {
   id: string;
   vendor_id: string | null;
   vendor_name: string | null;
@@ -5857,7 +5857,7 @@ export type PurchaseOrderRecord = {
   ordered_at: string | null;
   received_at: string | null;
   quality_rating: number | null;
-};
+}
 
 async function ensurePurchaseOrdersTable(_client?: PoolClient): Promise<void> {
   await ensureLazyTable("PurchaseOrders", async () => {
@@ -5887,7 +5887,7 @@ async function ensurePurchaseOrdersTable(_client?: PoolClient): Promise<void> {
 }
 
 function normalizePoItems(raw: unknown): PurchaseOrderItem[] {
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {return [];}
   const out: PurchaseOrderItem[] = [];
   for (const r of raw) {
     const o = (r ?? {}) as Record<string, unknown>;
@@ -5896,7 +5896,7 @@ function normalizePoItems(raw: unknown): PurchaseOrderItem[] {
     const qty_ordered = Math.max(0, parseNumeric(o.qty_ordered ?? o.quantity ?? o.qty));
     const unit_cost = Math.max(0, parseNumeric(o.unit_cost ?? o.cost ?? 0));
     const qty_received = Math.max(0, parseNumeric(o.qty_received ?? 0));
-    if (!inventory_id || qty_ordered <= 0) continue;
+    if (!inventory_id || qty_ordered <= 0) {continue;}
     out.push({ inventory_id, name, qty_ordered: round2(qty_ordered), unit_cost: round2(unit_cost), qty_received: round2(qty_received) });
   }
   return out;
@@ -5935,7 +5935,7 @@ export async function CreatePurchaseOrder(
   const context = await requireRestaurantContext(restaurantId);
   await ensurePurchaseOrdersTable();
   const items = normalizePoItems(input.items);
-  if (items.length === 0) throw new Error("A purchase order needs at least one item with a quantity");
+  if (items.length === 0) {throw new Error("A purchase order needs at least one item with a quantity");}
   const status = input.status === "ordered" ? "ordered" : "draft";
   const expected = input.expected_date && /^\d{4}-\d{2}-\d{2}$/.test(input.expected_date) ? input.expected_date : null;
   const total = poTotal(items);
@@ -5952,7 +5952,7 @@ export async function CreatePurchaseOrder(
      returning *`,
     [randomUUID(), context.res_id, context.outlet_id, vendorId, vendorName, status, JSON.stringify(items), total, input.notes?.trim() || null, expected, input.createdBy || null],
   );
-  if (!rows[0]) throw new Error("Failed to create purchase order");
+  if (!rows[0]) {throw new Error("Failed to create purchase order");}
   return mapPurchaseOrder(rows[0]);
 }
 
@@ -5989,18 +5989,18 @@ export async function SetPurchaseOrderStatus(restaurantId: string, id: string, s
   const context = await requireRestaurantContext(restaurantId);
   await ensurePurchaseOrdersTable();
   const next = ["draft", "ordered", "cancelled"].includes(status) ? status : null;
-  if (!next) throw new Error("Invalid status");
+  if (!next) {throw new Error("Invalid status");}
   return withTransaction(async (client) => {
     const cur = await runQuery<{ status: string }>(`select status from "PurchaseOrders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`, [id, context.res_id, context.outlet_id], client);
-    if (!cur[0]) throw new Error("Purchase order not found");
-    if (cur[0].status === "received") throw new Error("A received purchase order can't change status");
+    if (!cur[0]) {throw new Error("Purchase order not found");}
+    if (cur[0].status === "received") {throw new Error("A received purchase order can't change status");}
     const rows = await runQuery<Record<string, any>>(
       `update "PurchaseOrders" set status = $1, ordered_at = case when $1 = 'ordered' and ordered_at is null then now() else ordered_at end
          where id = $2 and res_id = $3 and outlet_id = $4 returning *`,
       [next, id, context.res_id, context.outlet_id], client,
     );
     const updated = rows[0];
-    if (!updated) throw new Error("Failed to update purchase order");
+    if (!updated) {throw new Error("Failed to update purchase order");}
     return mapPurchaseOrder(updated);
   });
 }
@@ -6008,7 +6008,7 @@ export async function SetPurchaseOrderStatus(restaurantId: string, id: string, s
 export async function ReceivePurchaseOrder(
   restaurantId: string,
   id: string,
-  lines: Array<{ inventory_id: string; qty_received: number }>,
+  lines: { inventory_id: string; qty_received: number }[],
   receivedBy?: string,
   qualityRating?: number | null,
 ): Promise<PurchaseOrderRecord> {
@@ -6018,21 +6018,21 @@ export async function ReceivePurchaseOrder(
   return withTransaction(async (client) => {
     const rows = await runQuery<Record<string, any>>(`select * from "PurchaseOrders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`, [id, context.res_id, context.outlet_id], client);
     const po = rows[0] ? mapPurchaseOrder(rows[0]) : null;
-    if (!po) throw new Error("Purchase order not found");
-    if (po.status === "cancelled") throw new Error("Cannot receive a cancelled purchase order");
+    if (!po) {throw new Error("Purchase order not found");}
+    if (po.status === "cancelled") {throw new Error("Cannot receive a cancelled purchase order");}
 
     const byId = new Map(po.items.map((it) => [it.inventory_id, it]));
     const receiveMap = new Map<string, number>();
     for (const l of lines ?? []) {
       const invId = String(l?.inventory_id ?? "").trim();
       const q = Math.max(0, parseNumeric(l?.qty_received));
-      if (invId && q > 0 && byId.has(invId)) receiveMap.set(invId, q);
+      if (invId && q > 0 && byId.has(invId)) {receiveMap.set(invId, q);}
     }
-    if (receiveMap.size === 0) throw new Error("Nothing to receive");
+    if (receiveMap.size === 0) {throw new Error("Nothing to receive");}
 
     for (const [invId, q] of receiveMap) {
       const line = byId.get(invId);
-      if (!line) continue;
+      if (!line) {continue;}
       const item = await adjustInventoryQty(context, invId, q, client);
       await runQuery(
         `insert into "StockMovements" (id, res_id, outlet_id, inventory_id, item_name, delta, kind, reason, vendor_id, unit_cost, created_by)
@@ -6055,7 +6055,7 @@ export async function ReceivePurchaseOrder(
       [JSON.stringify(po.items), newStatus, id, context.res_id, context.outlet_id, rating], client,
     );
     const updated = out[0];
-    if (!updated) throw new Error("Failed to update purchase order");
+    if (!updated) {throw new Error("Failed to update purchase order");}
     return mapPurchaseOrder(updated);
   });
 }
@@ -6064,8 +6064,8 @@ export async function DeletePurchaseOrder(restaurantId: string, id: string): Pro
   const context = await requireRestaurantContext(restaurantId);
   await ensurePurchaseOrdersTable();
   const cur = await runQuery<{ status: string }>(`select status from "PurchaseOrders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`, [id, context.res_id, context.outlet_id]);
-  if (!cur[0]) return { success: true };
-  if (cur[0].status === "received") throw new Error("A received purchase order can't be deleted (it affected stock)");
+  if (!cur[0]) {return { success: true };}
+  if (cur[0].status === "received") {throw new Error("A received purchase order can't be deleted (it affected stock)");}
   await runQuery(`delete from "PurchaseOrders" where id = $1 and res_id = $2 and outlet_id = $3`, [id, context.res_id, context.outlet_id]);
   return { success: true };
 }
@@ -6073,7 +6073,7 @@ export async function DeletePurchaseOrder(restaurantId: string, id: string): Pro
 // --- Marketing campaigns (ROI tracking) --------------------------------------
 // A campaign is just a name + spend + date window; ROI compares bill revenue in
 // the window against an equal-length window immediately before it.
-export type CampaignRecord = {
+export interface CampaignRecord {
   id: string;
   name: string;
   cost: number;
@@ -6081,7 +6081,7 @@ export type CampaignRecord = {
   ends_at: string;   // YYYY-MM-DD
   notes: string | null;
   created_at: string;
-};
+}
 
 async function ensureCampaignsTable(): Promise<void> {
   await ensureLazyTable("Campaigns", async () => {
@@ -6139,17 +6139,17 @@ export async function CreateCampaign(
   const context = await requireRestaurantContext(restaurantId);
   await ensureCampaignsTable();
   const name = (input.name ?? "").trim().slice(0, 80);
-  if (!name) throw new Error("Campaign name is required");
+  if (!name) {throw new Error("Campaign name is required");}
   const dateRe = /^\d{4}-\d{2}-\d{2}$/;
-  if (!dateRe.test(input.starts_at) || !dateRe.test(input.ends_at)) throw new Error("Dates must be YYYY-MM-DD");
-  if (input.ends_at < input.starts_at) throw new Error("End date must be on or after the start date");
+  if (!dateRe.test(input.starts_at) || !dateRe.test(input.ends_at)) {throw new Error("Dates must be YYYY-MM-DD");}
+  if (input.ends_at < input.starts_at) {throw new Error("End date must be on or after the start date");}
   const cost = Math.max(0, round2(parseNumeric(input.cost)));
   const rows = await runQuery<Record<string, any>>(
     `insert into "Campaigns" (id, res_id, outlet_id, name, cost, starts_at, ends_at, notes)
      values ($1, $2, $3, $4, $5, $6::date, $7::date, $8) returning *`,
     [randomUUID(), context.res_id, context.outlet_id, name, cost, input.starts_at, input.ends_at, input.notes?.trim() || null],
   );
-  if (!rows[0]) throw new Error("Failed to create campaign");
+  if (!rows[0]) {throw new Error("Failed to create campaign");}
   return mapCampaign(rows[0]);
 }
 
@@ -6165,7 +6165,7 @@ export async function DeleteCampaign(restaurantId: string, id: string): Promise<
 // Hourly staff are paid from Attendance hours (shifts capped at 16h to guard
 // forgotten clock-outs); recording a payment also books a "Payroll" expense so
 // P&L and the expense report stay truthful.
-export type PayrollProfile = {
+export interface PayrollProfile {
   emp_id: string;
   pay_type: "monthly" | "hourly";
   base_salary: number;   // per month (monthly staff)
@@ -6174,9 +6174,9 @@ export type PayrollProfile = {
   deductions: number;    // subtracted per month
   pf_pct: number;        // statutory PF %, applied to the gross (base / hours×rate)
   esi_pct: number;       // statutory ESI %, applied to the gross (base / hours×rate)
-};
+}
 
-export type PayrollRow = {
+export interface PayrollRow {
   emp_id: string;
   name: string;
   role: string;
@@ -6188,7 +6188,7 @@ export type PayrollRow = {
   paid: boolean;
   paid_amount: number | null;
   paid_at: string | null;
-};
+}
 
 async function ensurePayrollTables(): Promise<void> {
   await ensureLazyTable("Payroll", async () => {
@@ -6243,7 +6243,7 @@ function payrollComputedPay(p: PayrollProfile, hours: number): { gross: number; 
 export async function GetPayroll(restaurantId: string, period: string): Promise<{ period: string; rows: PayrollRow[]; total_due: number; total_paid: number }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensurePayrollTables();
-  if (!/^\d{4}-\d{2}$/.test(period)) throw new Error("period must be YYYY-MM");
+  if (!/^\d{4}-\d{2}$/.test(period)) {throw new Error("period must be YYYY-MM");}
   const rid = context.res_id, oid = context.outlet_id;
 
   const emps = await runQuery<{ id: string; fname: string | null; lname: string | null; role: string | null }>(
@@ -6310,7 +6310,7 @@ export async function SetPayrollProfile(
 ): Promise<{ success: true }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensurePayrollTables();
-  if (!isUuid(empId)) throw new Error("Invalid employee");
+  if (!isUuid(empId)) {throw new Error("Invalid employee");}
   const payType = cfg.pay_type === "hourly" ? "hourly" : "monthly";
   const nn = (v: unknown) => round2(Math.max(0, Number(v) || 0));
   const pct = (v: unknown) => round2(Math.min(100, Math.max(0, Number(v) || 0)));
@@ -6330,10 +6330,10 @@ export async function RecordPayrollPayment(
 ): Promise<{ success: true; amount: number }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensurePayrollTables();
-  if (!isUuid(input.emp_id)) throw new Error("Invalid employee");
-  if (!/^\d{4}-\d{2}$/.test(input.period)) throw new Error("period must be YYYY-MM");
+  if (!isUuid(input.emp_id)) {throw new Error("Invalid employee");}
+  if (!/^\d{4}-\d{2}$/.test(input.period)) {throw new Error("period must be YYYY-MM");}
   const amount = round2(Math.max(0, Number(input.amount) || 0));
-  if (amount <= 0) throw new Error("A positive amount is required");
+  if (amount <= 0) {throw new Error("A positive amount is required");}
 
   const inserted = await runQuery<{ id: string }>(
     `insert into "PayrollPayments" (res_id, outlet_id, emp_id, period, amount, note, paid_by)
@@ -6342,7 +6342,7 @@ export async function RecordPayrollPayment(
      returning id`,
     [context.res_id, context.outlet_id, input.emp_id, input.period, amount, input.note?.trim() || null, input.paidBy || null],
   );
-  if (!inserted[0]) throw new Error("Salary for this month is already recorded for this employee");
+  if (!inserted[0]) {throw new Error("Salary for this month is already recorded for this employee");}
 
   // Book it as a Payroll expense so P&L / expense reports include salaries.
   const emp = await runQuery<{ fname: string | null; lname: string | null }>(
@@ -6371,7 +6371,7 @@ async function ensureMenuCategoryIds(
 ): Promise<{ main_cat_id: string; sub_cat_id: string }> {
   const normalized = categoryName.trim() || "General";
 
-  let main = await runQuery<{ id: string }>(
+  const main = await runQuery<{ id: string }>(
     `
       select id
       from "Menue_main_cat"
@@ -6397,7 +6397,7 @@ async function ensureMenuCategoryIds(
     );
   }
 
-  let sub = await runQuery<{ id: string }>(
+  const sub = await runQuery<{ id: string }>(
     `
       select id
       from "Menue_sub_cat"
@@ -6607,7 +6607,7 @@ export async function UpdateMenuItemPrice(
   price: number,
 ): Promise<{ id: string; name: string; price: number; previous: { price: number; price_updated_at: string | null; price_baseline: number | null } }> {
   const newPrice = round2(Number(price));
-  if (!Number.isFinite(newPrice) || newPrice <= 0) throw new Error("Price must be a positive number");
+  if (!Number.isFinite(newPrice) || newPrice <= 0) {throw new Error("Price must be a positive number");}
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const rows = await runQuery<{ id: string; name: string; description: string | null }>(
@@ -6618,7 +6618,7 @@ export async function UpdateMenuItemPrice(
       [itemId, context.res_id, context.outlet_id],
       client,
     );
-    if (!rows[0]) throw new Error("Menu item not found");
+    if (!rows[0]) {throw new Error("Menu item not found");}
     const existing = parseMenuDescription(rows[0].description);
     const history = stampPriceHistory(existing, newPrice, new Date().toISOString());
     await runQuery(
@@ -6647,7 +6647,7 @@ export async function GetMenuItemUndoState(
     `select id, name, description from "Menu" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [itemId, context.res_id, context.outlet_id],
   );
-  if (!rows[0]) return null;
+  if (!rows[0]) {return null;}
   const parsed = parseMenuDescription(rows[0].description);
   return {
     id: rows[0].id,
@@ -6670,7 +6670,7 @@ export async function RenameMenuStation(
 ): Promise<{ updated: number }> {
   const fromKey = from.trim().toLowerCase();
   const toName = to.trim().slice(0, 40);
-  if (!fromKey || !toName) return { updated: 0 };
+  if (!fromKey || !toName) {return { updated: 0 };}
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const rows = await runQuery<{ id: string; description: string | null }>(
@@ -6682,7 +6682,7 @@ export async function RenameMenuStation(
     for (const row of rows) {
       const parsed = parseJsonObject(row.description);
       const station = typeof parsed?.station === "string" ? parsed.station.trim() : "";
-      if (!station || station.toLowerCase() !== fromKey) continue;
+      if (!station || station.toLowerCase() !== fromKey) {continue;}
       const next = JSON.stringify({ ...(parsed ?? {}), station: toName });
       await runQuery(
         `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
@@ -6707,7 +6707,7 @@ export async function RenameInventoryCategory(
 ): Promise<{ updated: number }> {
   const fromKey = from.trim().toLowerCase();
   const toName = to.trim().slice(0, 40);
-  if (!fromKey || !toName) return { updated: 0 };
+  if (!fromKey || !toName) {return { updated: 0 };}
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const rows = await runQuery<{ barcode: string; description: string | null }>(
@@ -6719,7 +6719,7 @@ export async function RenameInventoryCategory(
     for (const row of rows) {
       const parsed = parseJsonObject(row.description);
       const category = typeof parsed?.category === "string" ? parsed.category.trim() : "";
-      if (!category || category.toLowerCase() !== fromKey) continue;
+      if (!category || category.toLowerCase() !== fromKey) {continue;}
       const next = JSON.stringify({ ...(parsed ?? {}), category: toName });
       await runQuery(
         `update "Inventory" set description = $4 where barcode = $1 and res_id = $2 and outlet_id = $3`,
@@ -6889,7 +6889,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
   try {
     const menu = await GetMenuItems(restaurantId);
     for (const m of menu) {
-      if (!m.station) continue;
+      if (!m.station) {continue;}
       stationById.set(String(m.id), m.station);
       stationByName.set(m.name.trim().toLowerCase(), m.station);
     }
@@ -6926,12 +6926,12 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
     let items_split: any[] | undefined = undefined;
     if (Array.isArray(payload.items_split) && payload.items_split.length > 0) {
       items_split = payload.items_split;
-      items = (payload.items_split as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []).map(mapEntry);
+      items = (payload.items_split).flatMap((t) => Array.isArray(t[1]) ? t[1] : []).map(mapEntry);
     } else if (Array.isArray(payload.items)) {
       // detect tuple form in payload.items for backward compatibility
       if (payload.items.length > 0 && Array.isArray(payload.items[0]) && typeof payload.items[0][0] === 'string' && Array.isArray(payload.items[0][1])) {
         items_split = payload.items;
-        items = (payload.items as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []).map(mapEntry);
+        items = (payload.items).flatMap((t) => Array.isArray(t[1]) ? t[1] : []).map(mapEntry);
       } else {
         items = payload.items.map(mapEntry);
       }
@@ -6942,11 +6942,11 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
     if (stationFilter) {
       items = items.filter((it) => String(it.station ?? "").trim().toLowerCase() === stationFilter);
       if (items_split) {
-        items_split = (items_split as any[])
+        items_split = (items_split)
           .map((t) => (Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter(entryMatches)] : t))
           .filter((t) => Array.isArray(t) && Array.isArray(t[1]) && t[1].length > 0);
       }
-      if (items.length === 0) return null;
+      if (items.length === 0) {return null;}
     }
 
     const subtotal = parseNumeric(payload.subtotal);
@@ -7024,12 +7024,12 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
 // ======================= Order / item preparation timing ===================
 // Each order has a `timing` jsonb column: order-level + per-item timers tracking
 // ordered -> preparing -> served durations, with pause/resume (excluded time).
-type OrderTimer = { started_at: string | null; ended_at: string | null; paused: boolean; pause_started_at: string | null; paused_ms: number };
-type OrderTiming = { ordered_at: string; order: OrderTimer; items: Record<string, OrderTimer> };
+interface OrderTimer { started_at: string | null; ended_at: string | null; paused: boolean; pause_started_at: string | null; paused_ms: number }
+interface OrderTiming { ordered_at: string; order: OrderTimer; items: Record<string, OrderTimer> }
 
 let orderTimingColEnsured = false;
 async function ensureOrderTimingColumn(): Promise<void> {
-  if (orderTimingColEnsured) return;
+  if (orderTimingColEnsured) {return;}
   await runQuery(`alter table "Orders" add column if not exists timing jsonb`);
   orderTimingColEnsured = true;
 }
@@ -7064,7 +7064,7 @@ async function isOrderBarked(context: RestaurantContext, orderId: string, client
     [orderId, context.res_id, context.outlet_id],
     client,
   );
-  if (!rows[0]) return true;
+  if (!rows[0]) {return true;}
   return Boolean(rows[0].barked_at);
 }
 
@@ -7078,30 +7078,30 @@ function newTimer(started: boolean): OrderTimer {
   const now = new Date().toISOString();
   return { started_at: started ? now : null, ended_at: null, paused: false, pause_started_at: null, paused_ms: 0 };
 }
-function startTimer(t: OrderTimer | undefined): void { if (t && !t.started_at) t.started_at = new Date().toISOString(); }
+function startTimer(t: OrderTimer | undefined): void { if (t && !t.started_at) {t.started_at = new Date().toISOString();} }
 function endTimer(t: OrderTimer | undefined): void {
-  if (!t || !t.started_at || t.ended_at) return;
+  if (!t?.started_at || t.ended_at) {return;}
   if (t.paused && t.pause_started_at) { t.paused_ms += Date.now() - Date.parse(t.pause_started_at); t.paused = false; t.pause_started_at = null; }
   t.ended_at = new Date().toISOString();
 }
-function pauseTimer(t: OrderTimer | undefined): void { if (t && t.started_at && !t.ended_at && !t.paused) { t.paused = true; t.pause_started_at = new Date().toISOString(); } }
+function pauseTimer(t: OrderTimer | undefined): void { if (t?.started_at && !t.ended_at && !t.paused) { t.paused = true; t.pause_started_at = new Date().toISOString(); } }
 function resumeTimer(t: OrderTimer | undefined): void { if (t && t.paused && t.pause_started_at) { t.paused_ms += Date.now() - Date.parse(t.pause_started_at); t.paused = false; t.pause_started_at = null; } }
 function timerElapsedMs(t: OrderTimer | undefined, nowMs: number): number {
-  if (!t?.started_at) return 0;
+  if (!t?.started_at) {return 0;}
   const end = t.ended_at ? Date.parse(t.ended_at) : nowMs;
   let paused = t.paused_ms ?? 0;
-  if (t.paused && t.pause_started_at) paused += nowMs - Date.parse(t.pause_started_at);
+  if (t.paused && t.pause_started_at) {paused += nowMs - Date.parse(t.pause_started_at);}
   return Math.max(0, end - Date.parse(t.started_at) - paused);
 }
 
 function extractItemIds(food: Record<string, unknown>): string[] {
   const ids: string[] = [];
-  const collect = (arr: unknown) => { for (const it of (Array.isArray(arr) ? arr : [])) { const id = String((it as any)?.id ?? ""); if (id) ids.push(id); } };
-  if (Array.isArray((food as any).items_split)) for (const t of (food as any).items_split) collect((t as any)?.[1]);
+  const collect = (arr: unknown) => { for (const it of (Array.isArray(arr) ? arr : [])) { const id = String((it)?.id ?? ""); if (id) {ids.push(id);} } };
+  if (Array.isArray((food as any).items_split)) {for (const t of (food as any).items_split) {collect((t)?.[1]);}}
   else if (Array.isArray((food as any).items)) {
     const items = (food as any).items;
-    if (items.length && Array.isArray(items[0])) for (const t of items) collect((t as any)?.[1]);
-    else collect(items);
+    if (items.length && Array.isArray(items[0])) {for (const t of items) {collect((t)?.[1]);}}
+    else {collect(items);}
   }
   return ids;
 }
@@ -7112,16 +7112,16 @@ function extractHeldItemIds(food: Record<string, unknown>): Set<string> {
   const held = new Set<string>();
   const collect = (arr: unknown) => {
     for (const it of (Array.isArray(arr) ? arr : [])) {
-      const e = it as any;
+      const e = it;
       const id = String(e?.id ?? "");
-      if (id && e?.course_hold === true && !e?.fired_at) held.add(id);
+      if (id && e?.course_hold === true && !e?.fired_at) {held.add(id);}
     }
   };
-  if (Array.isArray((food as any).items_split)) for (const t of (food as any).items_split) collect((t as any)?.[1]);
+  if (Array.isArray((food as any).items_split)) {for (const t of (food as any).items_split) {collect((t)?.[1]);}}
   if (Array.isArray((food as any).items)) {
     const items = (food as any).items;
-    if (items.length && Array.isArray(items[0])) for (const t of items) collect((t as any)?.[1]);
-    else collect(items);
+    if (items.length && Array.isArray(items[0])) {for (const t of items) {collect((t)?.[1]);}}
+    else {collect(items);}
   }
   return held;
 }
@@ -7133,12 +7133,12 @@ async function loadOrderTiming(context: RestaurantContext, orderId: string): Pro
     `select timing, food, status, created_at, barked_at from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [orderId, context.res_id, context.outlet_id],
   );
-  if (!rows[0]) return null;
+  if (!rows[0]) {return null;}
   const existing = parseJsonObject(rows[0].timing) as OrderTiming | null;
-  if (existing && existing.order && existing.items) return existing;
+  if (existing && existing.order && existing.items) {return existing;}
   // Lazy init from current food + status. Un-barked orders never age.
   const food = parseJsonObject(rows[0].food) ?? {};
-  const orderedAt = new Date((rows[0].created_at as string) ?? Date.now()).toISOString();
+  const orderedAt = new Date((rows[0].created_at) ?? Date.now()).toISOString();
   const started = Boolean(rows[0].barked_at)
     && ["preparing", "served"].includes(String(fromOrderStatusCode(rows[0].status)).toLowerCase());
   const timing: OrderTiming = {
@@ -7147,7 +7147,7 @@ async function loadOrderTiming(context: RestaurantContext, orderId: string): Pro
     items: {},
   };
   const held = extractHeldItemIds(food);
-  for (const id of extractItemIds(food)) timing.items[id] = { started_at: started && !held.has(id) ? orderedAt : null, ended_at: null, paused: false, pause_started_at: null, paused_ms: 0 };
+  for (const id of extractItemIds(food)) {timing.items[id] = { started_at: started && !held.has(id) ? orderedAt : null, ended_at: null, paused: false, pause_started_at: null, paused_ms: 0 };}
   return timing;
 }
 async function saveOrderTiming(context: RestaurantContext, orderId: string, timing: OrderTiming): Promise<void> {
@@ -7161,21 +7161,21 @@ async function saveOrderTiming(context: RestaurantContext, orderId: string, timi
 // timers are (re)based at the moment of the bark instead.
 async function applyTimingForStatus(context: RestaurantContext, orderId: string, status: string): Promise<void> {
   const s = status.toLowerCase();
-  if (s !== "preparing" && s !== "served") return;
+  if (s !== "preparing" && s !== "served") {return;}
   const timing = await loadOrderTiming(context, orderId);
-  if (!timing) return;
+  if (!timing) {return;}
   if (s === "preparing") {
     const rows = await runQuery<{ food: unknown; barked_at: unknown }>(
       `select food, barked_at from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
       [orderId, context.res_id, context.outlet_id],
     );
-    if (!rows[0] || !rows[0].barked_at) return; // awaiting bark — timers stay idle
+    if (!rows[0]?.barked_at) {return;} // awaiting bark — timers stay idle
     const held = extractHeldItemIds(parseJsonObject(rows[0].food) ?? {});
     startTimer(timing.order);
-    for (const k of Object.keys(timing.items)) if (!held.has(k)) startTimer(timing.items[k]);
+    for (const k of Object.keys(timing.items)) {if (!held.has(k)) {startTimer(timing.items[k]);}}
   } else {
     endTimer(timing.order);
-    for (const k of Object.keys(timing.items)) endTimer(timing.items[k]);
+    for (const k of Object.keys(timing.items)) {endTimer(timing.items[k]);}
   }
   await saveOrderTiming(context, orderId, timing);
 }
@@ -7192,12 +7192,12 @@ export async function OrderTimingAction(
   // would mutate a locked bill's order JSON — block them.
   await assertOrderStatusEditable(context, orderId);
   // Nothing is cooking before the bark — serve/start would fake prep times.
-  if (action === "serve" || action === "start") await assertOrderBarked(context, orderId);
+  if (action === "serve" || action === "start") {await assertOrderBarked(context, orderId);}
   const timing = await loadOrderTiming(context, orderId);
-  if (!timing) return false;
+  if (!timing) {return false;}
   let target: OrderTimer;
   if (itemId) {
-    if (!timing.items[itemId]) timing.items[itemId] = newTimer(true);
+    if (!timing.items[itemId]) {timing.items[itemId] = newTimer(true);}
     target = timing.items[itemId];
   } else {
     target = timing.order;
@@ -7228,9 +7228,9 @@ export async function GetTimingStats(restaurantId: string): Promise<{ avg_prep_m
   let sum = 0, count = 0, max = 0;
   for (const r of rows) {
     const t = parseJsonObject(r.timing) as OrderTiming | null;
-    if (!t?.order?.ended_at) continue;
+    if (!t?.order?.ended_at) {continue;}
     const e = timerElapsedMs(t.order, Date.now());
-    sum += e; count += 1; if (e > max) max = e;
+    sum += e; count += 1; if (e > max) {max = e;}
   }
   return { avg_prep_ms: count ? Math.round(sum / count) : 0, max_prep_ms: max, count };
 }
@@ -7241,7 +7241,7 @@ export async function GetTimingStats(restaurantId: string): Promise<{ avg_prep_m
 export const FIRE_COURSE_ACTION_ID = "a4b8f0d2-6c3e-4f7a-9b1d-5e8c2a7f4d90";
 let fireCourseActionSeeded = false;
 async function ensureFireCourseAction(): Promise<void> {
-  if (fireCourseActionSeeded) return;
+  if (fireCourseActionSeeded) {return;}
   await runQuery(
     `insert into "Actions" (id, action_name, action_desc)
      values ($1, 'Fire Course', 'Fired a held course to the kitchen')
@@ -7268,31 +7268,31 @@ export async function FireOrderItems(
     `select food from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [orderId, context.res_id, context.outlet_id],
   );
-  if (!rows[0]) throw new Error("Order not found");
+  if (!rows[0]) {throw new Error("Order not found");}
 
   const payload = parseJsonObject(rows[0].food) ?? {};
   const wanted = new Set(itemIds.map((i) => String(i).trim()).filter(Boolean));
-  if (wanted.size === 0) throw new Error("item_ids is required");
+  if (wanted.size === 0) {throw new Error("item_ids is required");}
   const nowIso = new Date().toISOString();
   const fired = new Set<string>();
 
   const touch = (arr: unknown) => {
     for (const it of (Array.isArray(arr) ? arr : [])) {
-      const e = it as any;
+      const e = it;
       const id = String(e?.id ?? "");
-      if (!id || !wanted.has(id)) continue;
-      if (e?.course_hold === true && !e?.fired_at) fired.add(id);
+      if (!id || !wanted.has(id)) {continue;}
+      if (e?.course_hold === true && !e?.fired_at) {fired.add(id);}
       e.course_hold = false;
-      if (!e.fired_at) e.fired_at = nowIso;
+      if (!e.fired_at) {e.fired_at = nowIso;}
     }
   };
-  if (Array.isArray((payload as any).items_split)) for (const t of (payload as any).items_split) touch((t as any)?.[1]);
+  if (Array.isArray((payload as any).items_split)) {for (const t of (payload as any).items_split) {touch((t)?.[1]);}}
   if (Array.isArray((payload as any).items)) {
     const items = (payload as any).items;
-    if (items.length && Array.isArray(items[0])) for (const t of items) touch((t as any)?.[1]);
-    else touch(items);
+    if (items.length && Array.isArray(items[0])) {for (const t of items) {touch((t)?.[1]);}}
+    else {touch(items);}
   }
-  if (fired.size === 0) throw new Error("No held items matched — they may already be fired");
+  if (fired.size === 0) {throw new Error("No held items matched — they may already be fired");}
 
   await runQuery(
     `update "Orders" set food = $1::json where id = $2 and res_id = $3 and outlet_id = $4`,
@@ -7304,8 +7304,8 @@ export async function FireOrderItems(
     const timing = await loadOrderTiming(context, orderId);
     if (timing) {
       for (const id of fired) {
-        if (!timing.items[id]) timing.items[id] = newTimer(true);
-        else startTimer(timing.items[id]);
+        if (!timing.items[id]) {timing.items[id] = newTimer(true);}
+        else {startTimer(timing.items[id]);}
       }
       startTimer(timing.order);
       await saveOrderTiming(context, orderId, timing);
@@ -7321,7 +7321,7 @@ export async function FireOrderItems(
 export const BARK_ORDER_ACTION_ID = "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63";
 let barkOrderActionSeeded = false;
 async function ensureBarkOrderAction(): Promise<void> {
-  if (barkOrderActionSeeded) return;
+  if (barkOrderActionSeeded) {return;}
   await runQuery(
     `insert into "Actions" (id, action_name, action_desc)
      values ($1, 'Bark Order', 'Barked (announced) an order to the kitchen')
@@ -7350,14 +7350,14 @@ export async function BarkOrder(
     `select status, barked_at, food from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [orderId, context.res_id, context.outlet_id],
   );
-  if (!rows[0]) throw new Error("Order not found");
+  if (!rows[0]) {throw new Error("Order not found");}
   if (rows[0].barked_at) {
     return { barked_at: new Date(rows[0].barked_at).toISOString(), already_barked: true };
   }
-  if (Number(rows[0].status ?? 0) === 5) throw new Error("A cancelled order cannot be barked");
+  if (Number(rows[0].status ?? 0) === 5) {throw new Error("A cancelled order cannot be barked");}
   // An order still awaiting approval (Pending, status 8) must be ACCEPTED to the
   // kitchen first — barking no longer implies acceptance. Block it here.
-  if (Number(rows[0].status ?? 0) === 8) throw new Error("Order is awaiting approval — accept it to the kitchen before barking.");
+  if (Number(rows[0].status ?? 0) === 8) {throw new Error("Order is awaiting approval — accept it to the kitchen before barking.");}
 
   const nowIso = new Date().toISOString();
   // Bark only stamps the timing gate; the order is already accepted (Preparing).
@@ -7379,7 +7379,7 @@ export async function BarkOrder(
       const food = parseJsonObject(rows[0].food) ?? {};
       const held = extractHeldItemIds(food);
       const rebase = (t: OrderTimer) => {
-        if (t.ended_at) return; // an already-finished timer keeps its record
+        if (t.ended_at) {return;} // an already-finished timer keeps its record
         t.started_at = nowIso;
         t.paused = false;
         t.pause_started_at = null;
@@ -7387,8 +7387,8 @@ export async function BarkOrder(
       };
       rebase(timing.order);
       for (const itemId of extractItemIds(food)) {
-        if (held.has(itemId)) continue;
-        if (!timing.items[itemId]) timing.items[itemId] = newTimer(false);
+        if (held.has(itemId)) {continue;}
+        if (!timing.items[itemId]) {timing.items[itemId] = newTimer(false);}
         rebase(timing.items[itemId]);
       }
       await saveOrderTiming(context, orderId, timing);
@@ -7402,8 +7402,8 @@ export async function BarkOrder(
 
 // Expo/pass screen: one card per active table consolidating every order's items
 // with their kitchen state (served / preparing / held) + station.
-export type ExpoItem = { name: string; qty: number; station: string | null; status: "served" | "preparing" | "held" | "unbarked" };
-export type ExpoTable = { table: string; items: ExpoItem[]; ready_count: number; pending_count: number; source: string | null };
+export interface ExpoItem { name: string; qty: number; station: string | null; status: "served" | "preparing" | "held" | "unbarked" }
+export interface ExpoTable { table: string; items: ExpoItem[]; ready_count: number; pending_count: number; source: string | null }
 export async function GetExpoView(restaurantId: string): Promise<{ tables: ExpoTable[] }> {
   const orders = await GetOrders(restaurantId);
   const byTable = new Map<string, Map<string, ExpoItem>>();
@@ -7412,22 +7412,22 @@ export async function GetExpoView(restaurantId: string): Promise<{ tables: ExpoT
 
   for (const order of orders as any[]) {
     const status = String(order.status ?? "").toLowerCase();
-    if (status !== "preparing" && status !== "served") continue; // settled/pending orders are not on the pass
+    if (status !== "preparing" && status !== "served") {continue;} // settled/pending orders are not on the pass
     const table = String(order.table ?? "").trim() || "—";
     const channel = String(order.order_type ?? "").trim().toLowerCase();
-    if (channel && channel !== "dine_in" && !sourceByTable.has(table)) sourceByTable.set(table, channel);
+    if (channel && channel !== "dine_in" && !sourceByTable.has(table)) {sourceByTable.set(table, channel);}
 
     // Ids sitting in a "Served" tuple count as served even without a timer.
     const servedIds = new Set<string>();
     for (const tup of (Array.isArray(order.items_split) ? order.items_split : [])) {
       const label = String(tup?.[0] ?? "").toLowerCase();
-      if (!label.startsWith("serv")) continue;
+      if (!label.startsWith("serv")) {continue;}
       for (const it of (Array.isArray(tup?.[1]) ? tup[1] : [])) {
-        const id = String((it as any)?.id ?? "");
-        if (id) servedIds.add(id);
+        const id = String((it)?.id ?? "");
+        if (id) {servedIds.add(id);}
       }
     }
-    const timers = ((order.timing as any)?.items ?? {}) as Record<string, any>;
+    const timers = ((order.timing)?.items ?? {}) as Record<string, any>;
 
     const bucket = byTable.get(table) ?? new Map<string, ExpoItem>();
     byTable.set(table, bucket);
@@ -7435,20 +7435,20 @@ export async function GetExpoView(restaurantId: string): Promise<{ tables: ExpoT
     const orderBarked = Boolean(order.barked_at);
     for (const item of (Array.isArray(order.items) ? order.items : []) as OrderItemRecord[]) {
       let state: ExpoItem["status"] = "preparing";
-      if (!orderBarked) state = "unbarked";
-      else if (item.course_hold === true && !item.fired_at) state = "held";
-      else if (servedIds.has(item.id) || timers[item.id]?.ended_at) state = "served";
+      if (!orderBarked) {state = "unbarked";}
+      else if (item.course_hold === true && !item.fired_at) {state = "held";}
+      else if (servedIds.has(item.id) || timers[item.id]?.ended_at) {state = "served";}
       const key = `${item.name.toLowerCase()}::${item.station ?? ""}::${state}`;
       const existing = bucket.get(key);
-      if (existing) existing.qty += item.quantity;
-      else bucket.set(key, { name: item.name, qty: item.quantity, station: item.station ?? null, status: state });
+      if (existing) {existing.qty += item.quantity;}
+      else {bucket.set(key, { name: item.name, qty: item.quantity, station: item.station ?? null, status: state });}
     }
   }
 
   const tables: ExpoTable[] = [];
   for (const [table, bucket] of byTable.entries()) {
     const items = Array.from(bucket.values()).sort((a, b) => a.name.localeCompare(b.name));
-    if (items.length === 0) continue;
+    if (items.length === 0) {continue;}
     const ready = items.filter((i) => i.status === "served").reduce((s, i) => s + i.qty, 0);
     const pending = items.filter((i) => i.status !== "served").reduce((s, i) => s + i.qty, 0);
     tables.push({ table, items, ready_count: ready, pending_count: pending, source: sourceByTable.get(table) ?? null });
@@ -7463,29 +7463,29 @@ export async function UpdateOrderItemsSplit(
   items_split: any[],
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
-  if (!Array.isArray(items_split)) throw new Error('items_split must be an array');
+  if (!Array.isArray(items_split)) {throw new Error('items_split must be an array');}
   await assertOrderStatusEditable(context, orderId);
 
   // build flattened items
-  const flattened = (items_split as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []);
+  const flattened = (items_split).flatMap((t) => Array.isArray(t[1]) ? t[1] : []);
 
   // fetch existing order to preserve other fields
   const existing = await runQuery<{ food: unknown }>(
     `select food from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [orderId, context.res_id, context.outlet_id],
   );
-  if (!existing[0]) throw new Error('Order not found');
+  if (!existing[0]) {throw new Error('Order not found');}
 
   const payload = parseJsonObject(existing[0].food) ?? {};
   // determine order status: if any Preparing tuple contains one or more items -> Preparing, else Served
-  const hasPreparingItems = Array.isArray(items_split) && (items_split as any[]).some((t) => {
+  const hasPreparingItems = Array.isArray(items_split) && (items_split).some((t) => {
     const label = String(t?.[0] ?? "").toLowerCase();
     const list = Array.isArray(t?.[1]) ? t[1] : [];
     return label.includes('prepar') && list.length > 0;
   });
   const newStatus = hasPreparingItems ? 'Preparing' : 'Served';
   // Drag-dropping every item into Served must not skip the bark step.
-  if (newStatus === 'Served') await assertOrderBarked(context, orderId);
+  if (newStatus === 'Served') {await assertOrderBarked(context, orderId);}
 
   // include status in the food JSON payload so UI can read textual status
   const newPayload = { ...payload, items: flattened, items_split, status: newStatus };
@@ -7501,9 +7501,9 @@ export async function UpdateOrderItemsSplit(
 const LOW_STOCK_THRESHOLD = 5;
 // Auto-deduct inventory for sold items per their menu recipe; notify on low stock.
 async function consumeInventory(restaurantId: string, context: RestaurantContext, soldItems: unknown[]): Promise<void> {
-  if (!Array.isArray(soldItems) || soldItems.length === 0) return;
+  if (!Array.isArray(soldItems) || soldItems.length === 0) {return;}
   const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
-  if (menu.length === 0) return;
+  if (menu.length === 0) {return;}
   const byId = new Map(menu.map((m) => [m.id, m]));
   const byName = new Map(menu.map((m) => [m.name.toLowerCase(), m]));
   const deltas = new Map<string, number>();
@@ -7511,11 +7511,11 @@ async function consumeInventory(restaurantId: string, context: RestaurantContext
     const it = (raw ?? {}) as Record<string, unknown>;
     const m = byId.get(String(it.id ?? "")) ?? byName.get(String(it.name ?? "").toLowerCase());
     const recipe = m?.recipe;
-    if (!Array.isArray(recipe) || recipe.length === 0) continue;
+    if (!Array.isArray(recipe) || recipe.length === 0) {continue;}
     const qty = Math.max(1, Math.round(parseNumeric(it.quantity) || 1));
-    for (const ing of recipe) deltas.set(ing.inventory_id, (deltas.get(ing.inventory_id) ?? 0) + ing.qty * qty);
+    for (const ing of recipe) {deltas.set(ing.inventory_id, (deltas.get(ing.inventory_id) ?? 0) + ing.qty * qty);}
   }
-  if (deltas.size === 0) return;
+  if (deltas.size === 0) {return;}
   // Deduct ALL ingredients in ONE statement (was N awaited UPDATEs inside the
   // order transaction, which lengthened lock-hold time with menu complexity).
   const invIds = [...deltas.keys()];
@@ -7612,7 +7612,7 @@ export async function AddOrder(
   const isNewOrder = !existingOrderRows[0];
   // An upsert must never resurrect/overwrite a settled (Paid/Closed) order — the
   // bill is view-once after settlement.
-  if (!isNewOrder) await assertOrderStatusEditable(context, id);
+  if (!isNewOrder) {await assertOrderStatusEditable(context, id);}
 
 
   const takenByEmployeeIdRaw = String(
@@ -7653,13 +7653,13 @@ export async function AddOrder(
   if (existingOrderRows[0]) {
     try {
       const existingItems: any[] = Array.isArray(existingPayload.items_split) && existingPayload.items_split.length > 0
-        ? (existingPayload.items_split as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : [])
+        ? (existingPayload.items_split).flatMap((t) => Array.isArray(t[1]) ? t[1] : [])
         : Array.isArray(existingPayload.items) ? existingPayload.items : [];
 
       const existingById = new Map<string, any>();
       for (const it of existingItems) {
         const idStr = String(it?.id ?? "");
-        if (idStr) existingById.set(idStr, { ...it });
+        if (idStr) {existingById.set(idStr, { ...it });}
       }
 
       // incoming items (from the request) as parsed earlier into itemsForStore
@@ -7714,8 +7714,8 @@ export async function AddOrder(
         const filtered: any[] = [];
         for (const it of arr) {
           const id = String(it?.id ?? "");
-          if (!id) continue;
-          if (seen.has(id)) continue;
+          if (!id) {continue;}
+          if (seen.has(id)) {continue;}
           seen.add(id);
           // prefer merged quantity if available
           const merged = mergedById.get(id);
@@ -7808,7 +7808,7 @@ export async function AddOrder(
         ? String((order as Record<string, unknown>).delivery_address).trim()
         : (typeof existingPayload.delivery_address === "string" ? existingPayload.delivery_address : null),
   };
-  if (itemsSplitForStore !== undefined) payload.items_split = itemsSplitForStore;
+  if (itemsSplitForStore !== undefined) {payload.items_split = itemsSplitForStore;}
 
   await runQuery(
     `
@@ -7868,11 +7868,11 @@ export async function AddOrder(
       const started = statusCode === 1 && barkedAt !== null;
       const held = extractHeldItemIds(payload);
       for (const itemId of extractItemIds(payload)) {
-        if (!timing.items[itemId]) timing.items[itemId] = newTimer(started && !held.has(itemId));
+        if (!timing.items[itemId]) {timing.items[itemId] = newTimer(started && !held.has(itemId));}
       }
       if (started) {
         startTimer(timing.order);
-        for (const k of Object.keys(timing.items)) if (!held.has(k)) startTimer(timing.items[k]);
+        for (const k of Object.keys(timing.items)) {if (!held.has(k)) {startTimer(timing.items[k]);}}
       }
       await saveOrderTiming(context, id, timing);
     }
@@ -7921,7 +7921,7 @@ export async function DeleteOrder(
       client,
     );
 
-    if (rows.length === 0) return false;
+    if (rows.length === 0) {return false;}
 
     await runQuery<{}>(
       `
@@ -7956,7 +7956,7 @@ async function sumOrderTotalsForTable(
     // Only the CURRENT occupancy counts: skip cancelled/paid/closed orders so a
     // re-occupied table never re-sums a previous session's (closed) orders.
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
-    if (st === "cancelled" || st === "paid" || st === "closed") continue;
+    if (st === "cancelled" || st === "paid" || st === "closed") {continue;}
     const p = parseJsonObject(r.food) ?? {};
     const total = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     sum += total;
@@ -8006,7 +8006,7 @@ async function removeItemFromTableOrders(
     const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
     const items: any[] = Array.isArray(f.items) ? f.items : [];
     const keep = items.filter((it) => !matches(it));
-    if (keep.length === items.length) continue; // nothing removed from this order
+    if (keep.length === items.length) {continue;} // nothing removed from this order
     for (const it of items) {
       if (matches(it)) { removedName = String(it?.name ?? "Item"); removedPrice = Number(it?.price) || 0; removedQty += Math.max(1, Math.round(Number(it?.quantity) || 1)); }
     }
@@ -8016,7 +8016,7 @@ async function removeItemFromTableOrders(
     }
     const subtotal = round2(keep.reduce((s, it) => s + (Number(it?.price) || 0) * Math.max(1, Math.round(Number(it?.quantity) || 1)), 0));
     const newFood: Record<string, any> = { ...f, items: keep, subtotal, total: subtotal };
-    if (split !== undefined) newFood.items_split = split;
+    if (split !== undefined) {newFood.items_split = split;}
     if (keep.length === 0) {
       await runQuery(`update "Orders" set food = $4::json, status = 5 where id = $1 and res_id = $2 and outlet_id = $3`,
         [o.id, context.res_id, context.outlet_id, JSON.stringify(newFood)], client);
@@ -8026,7 +8026,7 @@ async function removeItemFromTableOrders(
     }
   }
 
-  if (removedQty === 0) return null;
+  if (removedQty === 0) {return null;}
 
   const openBill = await runQuery<{ id: string }>(
     `select id from "Bills" where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null order by created_at desc limit 1`,
@@ -8079,10 +8079,10 @@ export async function RemoveBillItem(
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const tableId = await tableIdByName(context, tableName, client);
-    if (!tableId) throw new Error("Table not found");
+    if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
     const removed = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client);
-    if (!removed) throw new Error("Item not found on this table's bill");
+    if (!removed) {throw new Error("Item not found on this table's bill");}
     return { success: true, removed };
   });
 }
@@ -8100,7 +8100,7 @@ export async function SetBillItemNote(
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const tableId = await tableIdByName(context, tableName, client);
-    if (!tableId) throw new Error("Table not found");
+    if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
 
     const trimmedNote = String(note ?? "").trim().slice(0, 280);
@@ -8110,7 +8110,7 @@ export async function SetBillItemNote(
       (!Number.isFinite(itemPrice) || itemPrice <= 0 || Math.abs((Number(it?.price) || 0) - itemPrice) < 0.005);
     const withNote = (it: any) => {
       const c = { ...it };
-      if (matches(c)) { if (trimmedNote) c.note = trimmedNote; else delete c.note; }
+      if (matches(c)) { if (trimmedNote) {c.note = trimmedNote;} else {delete c.note;} }
       return c;
     };
 
@@ -8127,7 +8127,7 @@ export async function SetBillItemNote(
     for (const o of orders) {
       const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
       const items: any[] = Array.isArray(f.items) ? f.items : [];
-      if (!items.some(matches)) continue;
+      if (!items.some(matches)) {continue;}
       updated += items.filter(matches).length;
       const newItems = items.map(withNote);
       let split = f.items_split;
@@ -8136,11 +8136,11 @@ export async function SetBillItemNote(
           Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).map(withNote)] : t);
       }
       const newFood: Record<string, any> = { ...f, items: newItems };
-      if (split !== undefined) newFood.items_split = split;
+      if (split !== undefined) {newFood.items_split = split;}
       await runQuery(`update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
         [o.id, context.res_id, context.outlet_id, JSON.stringify(newFood)], client);
     }
-    if (updated === 0) throw new Error("Item not found on this table's bill");
+    if (updated === 0) {throw new Error("Item not found on this table's bill");}
     return { success: true, updated, note: trimmedNote };
   });
 }
@@ -8161,14 +8161,14 @@ export async function MoveBillItem(
     const context = await requireRestaurantContext(restaurantId, client);
     const fromId = await tableIdByName(context, fromTable, client);
     const toId = await tableIdByName(context, toTable, client);
-    if (!fromId) throw new Error("Source table not found");
-    if (!toId) throw new Error("Destination table not found");
-    if (fromId === toId) throw new Error("Pick a different destination table");
+    if (!fromId) {throw new Error("Source table not found");}
+    if (!toId) {throw new Error("Destination table not found");}
+    if (fromId === toId) {throw new Error("Pick a different destination table");}
     await assertBillEditable(context, fromId, client);
     await assertBillEditable(context, toId, client);
 
     const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client);
-    if (!moved) throw new Error("Item not found on the source table");
+    if (!moved) {throw new Error("Item not found on the source table");}
 
     // Ensure the destination table is occupied so the order/bill attaches.
     await runQuery(`update "Tables" set is_occupied = true where id = $1 and res_id = $2 and outlet_id = $3`,
@@ -8303,7 +8303,7 @@ async function ensureDiscountRequestsTable(): Promise<void> {
   });
 }
 
-export type DiscountRequestRecord = {
+export interface DiscountRequestRecord {
   id: string;
   bill_id: string;
   table_name: string | null;
@@ -8316,7 +8316,7 @@ export type DiscountRequestRecord = {
   decided_by: string | null;
   decided_at: string | null;
   created_at: string;
-};
+}
 
 function mapDiscountRequest(r: Record<string, any>): DiscountRequestRecord {
   return {
@@ -8335,7 +8335,7 @@ function mapDiscountRequest(r: Record<string, any>): DiscountRequestRecord {
   };
 }
 
-export type BillDiscountOutcome = {
+export interface BillDiscountOutcome {
   success: true;
   // applied path
   applied?: boolean;
@@ -8346,7 +8346,7 @@ export type BillDiscountOutcome = {
   request_id?: string;
   amount?: number;
   threshold?: number;
-};
+}
 
 // Discount entry point with the approval gate. Admins (and clears) always apply
 // directly; a non-admin discount above the configured threshold becomes a
@@ -8364,12 +8364,12 @@ export async function SetBillDiscountWithApproval(
     await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
     const tableId = await tableIdByName(context, tableName, client);
-    if (!tableId) throw new Error("Table not found");
+    if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
 
     const value = Math.max(0, Number(valueRaw) || 0);
     const type: "percent" | "flat" | null = value <= 0 ? null : typeRaw === "flat" ? "flat" : "percent";
-    if (type === "percent" && value > 100) throw new Error("A percentage discount cannot exceed 100%");
+    if (type === "percent" && value > 100) {throw new Error("A percentage discount cannot exceed 100%");}
 
     if (type !== null && !opts.isAdmin) {
       const threshold = await getDiscountApprovalThreshold(context.res_id, client);
@@ -8455,7 +8455,7 @@ export async function DecideDiscountRequest(
       [requestId, context.res_id, context.outlet_id, approve ? "approved" : "rejected", decider],
       client,
     );
-    if (!rows[0]) throw new Error("Discount request not found or already decided");
+    if (!rows[0]) {throw new Error("Discount request not found or already decided");}
     const request = mapDiscountRequest(rows[0]);
 
     if (approve) {
@@ -8481,10 +8481,10 @@ export async function SplitBillForTable(
   restaurantId: string,
   tableName: string,
   mode: "even" | "item",
-  options: { parts?: number; groups?: Array<{ label?: string; items?: Array<{ name: string; price: number; quantity: number }> }> },
-): Promise<{ mode: "even" | "item"; grand_total: number; parts: Array<{ label: string; subtotal: number; total: number; items?: Array<{ name: string; price: number; quantity: number }> }> }> {
+  options: { parts?: number; groups?: { label?: string; items?: { name: string; price: number; quantity: number }[] }[] },
+): Promise<{ mode: "even" | "item"; grand_total: number; parts: { label: string; subtotal: number; total: number; items?: { name: string; price: number; quantity: number }[] }[] }> {
   const bill = await GetBillForTable(restaurantId, tableName);
-  if (!bill) throw new Error("No open bill for this table");
+  if (!bill) {throw new Error("No open bill for this table");}
   // Pure, unit-tested allocation (see billing_math.computeBillSplit) — parts always
   // sum back to the grand total exactly.
   return computeBillSplit(bill.grand_total, mode, {
@@ -8508,9 +8508,9 @@ export async function MergeTableBills(
     const context = await requireRestaurantContext(restaurantId, client);
     const fromId = await tableIdByName(context, fromTable, client);
     const toId = await tableIdByName(context, toTable, client);
-    if (!fromId) throw new Error("Source table not found");
-    if (!toId) throw new Error("Destination table not found");
-    if (fromId === toId) throw new Error("Pick a different destination table");
+    if (!fromId) {throw new Error("Source table not found");}
+    if (!toId) {throw new Error("Destination table not found");}
+    if (fromId === toId) {throw new Error("Pick a different destination table");}
     await assertBillEditable(context, fromId, client);
     await assertBillEditable(context, toId, client);
 
@@ -8522,11 +8522,11 @@ export async function MergeTableBills(
       [context.res_id, context.outlet_id, fromId],
       client,
     );
-    if (orders.length === 0) throw new Error("That table has no active orders to merge");
+    if (orders.length === 0) {throw new Error("That table has no active orders to merge");}
 
     const destName = toTable.trim();
     for (const o of orders) {
-      const f = (parseJsonObject(o.food) ?? {}) as Record<string, unknown>;
+      const f = (parseJsonObject(o.food) ?? {});
       f.table = destName;
       await runQuery(
         `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
@@ -8605,14 +8605,14 @@ export async function RefundBill(
     await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
 
-    type RefundRow = {
+    interface RefundRow {
       id: string;
       total_amt: number | string | null;
       payment_method: string | null;
       payment_proof_screenshot_url: string | null;
       refunded_at: Date | null;
       refund_ref: string | null;
-    };
+    }
     let billRow: RefundRow | undefined;
     if (opts.billId) {
       const rows = await runQuery<RefundRow>(
@@ -8624,7 +8624,7 @@ export async function RefundBill(
       billRow = rows[0];
     } else if (opts.tableName) {
       const tableId = await tableIdByName(context, opts.tableName, client);
-      if (!tableId) throw new Error("Table not found");
+      if (!tableId) {throw new Error("Table not found");}
       const rows = await runQuery<RefundRow>(
         `select id, total_amt, payment_method, payment_proof_screenshot_url, refunded_at, refund_ref
            from "Bills" where table_id = $1 and res_id = $2 and outlet_id = $3
@@ -8638,7 +8638,7 @@ export async function RefundBill(
       throw new Error("A bill_id or table_name is required");
     }
 
-    if (!billRow) throw new Error("No settled bill found to refund");
+    if (!billRow) {throw new Error("No settled bill found to refund");}
     // Two-phase refund: refunded_at records the INTENT. A Razorpay refund is only
     // truly complete once the gateway returns a refund id (refund_ref). So block a
     // repeat only when there's nothing left to do — a non-gateway refund (already
@@ -8691,7 +8691,7 @@ export async function SetBillRefundRef(restaurantId: string, billId: string, ref
   );
 }
 
-export type ReopenedBill = {
+export interface ReopenedBill {
   success: true;
   bill: {
     id: string;
@@ -8708,7 +8708,7 @@ export type ReopenedBill = {
   };
   restored_orders: number;
   window_min: number;
-};
+}
 
 // Re-open a CLOSED bill within the restaurant's configured window (admin only,
 // enforced at the route). The exact inverse of the approve/close finalization:
@@ -8751,11 +8751,11 @@ export async function ReopenBill(
       client,
     );
     const bill = rows[0];
-    if (!bill) throw new Error("Bill not found");
-    if (!bill.closed_at) throw new Error("This bill is not closed");
-    if (bill.refunded_at) throw new Error("A refunded bill cannot be re-opened");
+    if (!bill) {throw new Error("Bill not found");}
+    if (!bill.closed_at) {throw new Error("This bill is not closed");}
+    if (bill.refunded_at) {throw new Error("A refunded bill cannot be re-opened");}
     const windowMin = Math.max(0, Math.round(Number(bill.window_min ?? 240) || 0));
-    if (windowMin <= 0) throw new Error("Bill re-opening is disabled for this restaurant");
+    if (windowMin <= 0) {throw new Error("Bill re-opening is disabled for this restaurant");}
     if (!bill.within_window) {
       throw new Error(`This bill can no longer be re-opened (allowed within ${windowMin} minutes of closing)`);
     }
@@ -8768,7 +8768,7 @@ export async function ReopenBill(
         [bill.table_id, context.res_id, context.outlet_id],
         client,
       );
-      if (open[0]) throw new Error("The table already has a new open bill — settle or clear it first");
+      if (open[0]) {throw new Error("The table already has a new open bill — settle or clear it first");}
     }
 
     const updated = await runQuery<{ id: string; waiter_confirmed_at: Date | null; status: number | null; created_at: Date }>(
@@ -8783,7 +8783,7 @@ export async function ReopenBill(
       [bill.id, context.res_id, context.outlet_id],
       client,
     );
-    if (!updated[0]) throw new Error("Failed to re-open bill");
+    if (!updated[0]) {throw new Error("Failed to re-open bill");}
 
     // Restore THIS session's settled orders (Paid/Closed between the previous
     // bill's close and this bill's close) so the bill is actionable again. Older
@@ -8865,7 +8865,7 @@ async function ensureExpensesTable(_client?: PoolClient): Promise<void> {
   });
 }
 
-export type ExpenseRecord = {
+export interface ExpenseRecord {
   id: string;
   spent_on: string;
   category: string;
@@ -8874,15 +8874,15 @@ export type ExpenseRecord = {
   note: string | null;
   created_by: string | null;
   created_at: string;
-};
+}
 
 // Normalize a report range to whole-day UTC boundaries: [from 00:00, to+1day
 // 00:00) so the requested 'to' day is inclusive. Defaults to the last 30 days.
 function normalizeReportRange(fromInput?: string, toInput?: string): { fromIso: string; toIso: string; fromDate: string; toDate: string } {
   let to = toInput ? new Date(toInput) : new Date();
-  if (Number.isNaN(to.getTime())) to = new Date();
+  if (Number.isNaN(to.getTime())) {to = new Date();}
   let from = fromInput ? new Date(fromInput) : new Date(to.getTime() - 29 * 24 * 60 * 60 * 1000);
-  if (Number.isNaN(from.getTime())) from = new Date(to.getTime() - 29 * 24 * 60 * 60 * 1000);
+  if (Number.isNaN(from.getTime())) {from = new Date(to.getTime() - 29 * 24 * 60 * 60 * 1000);}
   const fromDay = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate()));
   const toDayExcl = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate() + 1));
   return {
@@ -8895,7 +8895,7 @@ function normalizeReportRange(fromInput?: string, toInput?: string): { fromIso: 
 
 function dayKeyOf(value: Date | string): string {
   const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return "";
+  if (Number.isNaN(d.getTime())) {return "";}
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
@@ -8915,7 +8915,7 @@ function parseTaxLines(raw: unknown): BillTaxLine[] {
   if (typeof raw === "string") {
     try { arr = JSON.parse(raw); } catch { return []; }
   }
-  if (!Array.isArray(arr)) return [];
+  if (!Array.isArray(arr)) {return [];}
   return arr
     .map((l) => {
       const o = (l ?? {}) as Record<string, unknown>;
@@ -8925,12 +8925,12 @@ function parseTaxLines(raw: unknown): BillTaxLine[] {
 }
 
 // Parse a Bills.payment_splits payload ([{method, amount}]) tolerantly.
-function parsePaymentSplits(raw: unknown): Array<{ method: string; amount: number }> {
+function parsePaymentSplits(raw: unknown): { method: string; amount: number }[] {
   let arr: unknown = raw;
   if (typeof raw === "string") {
     try { arr = JSON.parse(raw); } catch { return []; }
   }
-  if (!Array.isArray(arr)) return [];
+  if (!Array.isArray(arr)) {return [];}
   return arr
     .map((s) => {
       const o = (s ?? {}) as Record<string, unknown>;
@@ -8939,14 +8939,14 @@ function parsePaymentSplits(raw: unknown): Array<{ method: string; amount: numbe
     .filter((s) => s.method && s.amount > 0);
 }
 
-type SettledBill = {
+interface SettledBill {
   settled_at: Date | string;
   total_amt: number;
   tax_breakdown: unknown;
   payment_method: string | null;
   payment_splits: unknown;
   refund_amount: number;
-};
+}
 
 // Settled bills (admin-approved and/or closed) in a range, keyed off the
 // settlement timestamp. total_amt is the grand total charged (all settle paths
@@ -8989,7 +8989,7 @@ export async function AddExpense(
   const context = await requireRestaurantContext(restaurantId);
   await ensureExpensesTable();
   const amount = round2(Math.max(0, Number(input.amount) || 0));
-  if (amount <= 0) throw new Error("Expense amount must be greater than zero");
+  if (amount <= 0) {throw new Error("Expense amount must be greater than zero");}
   const category = (input.category ?? "General").trim() || "General";
   const spentOn = input.spent_on && /^\d{4}-\d{2}-\d{2}$/.test(input.spent_on) ? input.spent_on : null;
   const rows = await runQuery<ExpenseRecord>(
@@ -8998,7 +8998,7 @@ export async function AddExpense(
      returning id, to_char(spent_on,'YYYY-MM-DD') as spent_on, category, vendor, amount, note, created_by, created_at`,
     [randomUUID(), context.res_id, context.outlet_id, spentOn, category, input.vendor?.trim() || null, amount, input.note?.trim() || null, input.createdBy ?? null],
   );
-  if (!rows[0]) throw new Error("Failed to record expense");
+  if (!rows[0]) {throw new Error("Failed to record expense");}
   return rows[0];
 }
 
@@ -9029,7 +9029,7 @@ export async function DeleteExpense(restaurantId: string, id: string): Promise<b
 // settled CASH bills in the window; variance = counted - expected. One open
 // session per outlet at a time.
 
-export type CashSessionRecord = {
+export interface CashSessionRecord {
   id: string;
   opened_at: string;
   opened_by: string | null;
@@ -9044,7 +9044,7 @@ export type CashSessionRecord = {
   variance: number | null;
   notes: string | null;
   status: "open" | "closed";
-};
+}
 
 async function ensureCashSessionsTable(_client?: PoolClient): Promise<void> {
   await ensureLazyTable("CashSessions", async () => {
@@ -9132,7 +9132,7 @@ async function cashTotalsSince(
       const cashPart = parsePaymentSplits(r.payment_splits)
         .filter((s) => s.method.toLowerCase() === "cash")
         .reduce((s, p) => s + p.amount, 0);
-      if (cashPart <= 0) continue;
+      if (cashPart <= 0) {continue;}
       cash_sales += cashPart;
       bill_count += 1;
       continue;
@@ -9155,7 +9155,7 @@ export async function GetCurrentCashSession(
     `select * from "CashSessions" where res_id = $1 and outlet_id = $2 and status = 'open' order by opened_at desc limit 1`,
     [context.res_id, context.outlet_id],
   );
-  if (!rows[0]) return null;
+  if (!rows[0]) {return null;}
   const session = mapCashSession(rows[0]);
   const totals = await cashTotalsSince(context, session.opened_at);
   const live_expected = round2(session.opening_float + totals.cash_sales - totals.cash_refunds);
@@ -9174,7 +9174,7 @@ export async function OpenCashSession(
       [context.res_id, context.outlet_id],
       client,
     );
-    if (open[0]) throw new Error("A cash session is already open for this outlet. Close it first.");
+    if (open[0]) {throw new Error("A cash session is already open for this outlet. Close it first.");}
     const opening = round2(Math.max(0, Number(input.opening_float) || 0));
     const rows = await runQuery<Record<string, any>>(
       `insert into "CashSessions" (id, res_id, outlet_id, opened_by, opening_float, status)
@@ -9182,7 +9182,7 @@ export async function OpenCashSession(
       [randomUUID(), context.res_id, context.outlet_id, input.openedBy ?? null, opening],
       client,
     );
-    if (!rows[0]) throw new Error("Failed to open cash session");
+    if (!rows[0]) {throw new Error("Failed to open cash session");}
     return mapCashSession(rows[0]);
   });
 }
@@ -9200,7 +9200,7 @@ export async function CloseCashSession(
       client,
     );
     const session = rows[0];
-    if (!session) throw new Error("No open cash session to close");
+    if (!session) {throw new Error("No open cash session to close");}
     const openedAtIso = session.opened_at instanceof Date ? session.opened_at.toISOString() : String(session.opened_at);
     const totals = await cashTotalsSince(context, openedAtIso, client);
     const openingFloat = round2(parseNumeric(session.opening_float));
@@ -9222,7 +9222,7 @@ export async function CloseCashSession(
       ],
       client,
     );
-    if (!updated[0]) throw new Error("Failed to close cash session");
+    if (!updated[0]) {throw new Error("Failed to close cash session");}
     return mapCashSession(updated[0]);
   });
 }
@@ -9241,7 +9241,7 @@ export async function GetCashSessions(restaurantId: string, fromIso?: string, to
   return rows.map(mapCashSession);
 }
 
-export type SalesReport = {
+export interface SalesReport {
   from: string;
   to: string;
   total_sales: number;
@@ -9249,9 +9249,9 @@ export type SalesReport = {
   total_refund: number;
   net_sales: number;
   bill_count: number;
-  by_day: Array<{ date: string; sales: number; tax: number; refund: number; bills: number }>;
-  by_method: Array<{ method: string; sales: number; bills: number }>;
-};
+  by_day: { date: string; sales: number; tax: number; refund: number; bills: number }[];
+  by_method: { method: string; sales: number; bills: number }[];
+}
 
 export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<SalesReport> {
   const context = await requireRestaurantContext(restaurantId);
@@ -9303,13 +9303,13 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
   };
 }
 
-export type GstReport = {
+export interface GstReport {
   from: string;
   to: string;
   total_taxable: number;
   total_tax: number;
-  by_rate: Array<{ name: string; percentage: number; taxable: number; tax: number }>;
-};
+  by_rate: { name: string; percentage: number; taxable: number; tax: number }[];
+}
 
 export async function GetGstReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<GstReport> {
   const context = await requireRestaurantContext(restaurantId);
@@ -9339,7 +9339,7 @@ export async function GetGstReport(restaurantId: string, fromIso?: string, toIso
   };
 }
 
-export type ProfitAndLoss = {
+export interface ProfitAndLoss {
   from: string;
   to: string;
   gross_sales: number;
@@ -9348,15 +9348,15 @@ export type ProfitAndLoss = {
   net_revenue: number;
   total_expenses: number;
   net_profit: number;
-  expenses_by_category: Array<{ category: string; amount: number }>;
-};
+  expenses_by_category: { category: string; amount: number }[];
+}
 
 export async function GetProfitAndLoss(restaurantId: string, fromIso?: string, toIso?: string): Promise<ProfitAndLoss> {
   const sales = await GetSalesReport(restaurantId, fromIso, toIso);
   const expenses = await GetExpenses(restaurantId, fromIso, toIso);
   const totalExpenses = round2(expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0));
   const byCat = new Map<string, number>();
-  for (const e of expenses) byCat.set(e.category, round2((byCat.get(e.category) ?? 0) + (Number(e.amount) || 0)));
+  for (const e of expenses) {byCat.set(e.category, round2((byCat.get(e.category) ?? 0) + (Number(e.amount) || 0)));}
   // Tax collected is pass-through (owed to the government), so net revenue and
   // profit are computed ex-tax.
   const netRevenue = round2(sales.total_sales - sales.total_refund - sales.total_tax);
@@ -9378,7 +9378,7 @@ export async function GetProfitAndLoss(restaurantId: string, fromIso?: string, t
 // report. IMPORTANT: total_amt is snapshotted NET of discount at every settle
 // path, so the sales / GST / P&L figures already reflect these discounts — this
 // report is additive context, never a number to subtract from revenue again.
-export type DiscountsReport = {
+export interface DiscountsReport {
   from: string;
   to: string;
   bill_count: number;
@@ -9392,9 +9392,9 @@ export type DiscountsReport = {
   // Same basis as SalesReport.total_sales (net of discount) — shown for context.
   total_sales: number;
   gift_redemption_total: number;
-  by_coupon: Array<{ code: string; kind: "promo" | "gift"; uses: number; amount: number }>;
+  by_coupon: { code: string; kind: "promo" | "gift"; uses: number; amount: number }[];
   notes: string[];
-};
+}
 
 export async function GetDiscountsReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<DiscountsReport> {
   const context = await requireRestaurantContext(restaurantId);
@@ -9424,7 +9424,7 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
     const total = round2(parseNumeric(b.total_amt));
     totalSales = round2(totalSales + total);
     const value = Math.max(0, parseNumeric(b.discount_value));
-    if (value <= 0) continue;
+    if (value <= 0) {continue;}
     discountedBills += 1;
     let money = 0;
     if (b.discount_type === "percent") {
@@ -9448,8 +9448,8 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
       money = round2(value);
     }
     totalDiscount = round2(totalDiscount + money);
-    if ((b.coupon_code ?? "").trim()) couponDiscount = round2(couponDiscount + money);
-    else manualDiscount = round2(manualDiscount + money);
+    if ((b.coupon_code ?? "").trim()) {couponDiscount = round2(couponDiscount + money);}
+    else {manualDiscount = round2(manualDiscount + money);}
   }
 
   // Per-code redemptions restricted to bills settled in the range. A redemption
@@ -9457,7 +9457,7 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
   // redemptions are deleted, so surviving rows are money actually given away.
   // Coupons is a lazily-created table — tolerate its absence (42P01) for tenants
   // that never configured a promo (same stance as GetAdvancedAnalytics).
-  let byCoupon: Array<{ code: string; kind: "promo" | "gift"; uses: number; amount: number }> = [];
+  let byCoupon: { code: string; kind: "promo" | "gift"; uses: number; amount: number }[] = [];
   try {
     const rows = await runQuery<{ code: string; kind: string | null; uses: number; amount: number | string | null }>(
       `select r.code, coalesce(max(c.kind), 'promo') as kind, count(*)::int as uses, coalesce(sum(r.amount), 0) as amount
@@ -9479,7 +9479,7 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
       amount: round2(parseNumeric(r.amount)),
     }));
   } catch (err: any) {
-    if (err?.code !== "42P01") throw err;
+    if (err?.code !== "42P01") {throw err;}
   }
   const giftTotal = round2(byCoupon.filter((c) => c.kind === "gift").reduce((s, c) => s + c.amount, 0));
 
@@ -9511,13 +9511,13 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
 // Not a double-entry ledger: each line is derived from the operational tables
 // that exist today, and equity is the balancing figure. Simplifications are
 // spelled out in `notes` (and shown in the UI) so the owner knows what's counted.
-export type BalanceSheet = {
+export interface BalanceSheet {
   as_of: string;
   assets: { cash_in_hand: number; receivables: number; inventory_value: number; total: number };
   liabilities: { payables: number; unpaid_payroll: number; total: number };
   equity: number;
   notes: string[];
-};
+}
 
 export async function GetBalanceSheet(restaurantId: string, asOf?: string): Promise<BalanceSheet> {
   const context = await requireRestaurantContext(restaurantId);
@@ -9575,7 +9575,7 @@ export async function GetBalanceSheet(restaurantId: string, asOf?: string): Prom
   let inventoryValue = 0;
   for (const r of invRows) {
     const cost = costByItem.get(r.barcode);
-    if (cost != null) inventoryValue = round2(inventoryValue + Math.max(0, parseNumeric(r.qty)) * cost);
+    if (cost != null) {inventoryValue = round2(inventoryValue + Math.max(0, parseNumeric(r.qty)) * cost);}
   }
 
   // Payables: purchase orders committed (ordered) before the cutoff and not yet
@@ -9655,7 +9655,7 @@ function methodTotalsOf(bills: SettledBill[]): Map<string, number> {
   for (const b of bills) {
     const splits = (b.payment_method ?? "").toLowerCase() === "split" ? parsePaymentSplits(b.payment_splits) : [];
     if (splits.length > 0) {
-      for (const s of splits) totals.set(s.method, round2((totals.get(s.method) ?? 0) + s.amount));
+      for (const s of splits) {totals.set(s.method, round2((totals.get(s.method) ?? 0) + s.amount));}
     } else {
       const m = b.payment_method || "Other";
       totals.set(m, round2((totals.get(m) ?? 0) + b.total_amt));
@@ -9664,13 +9664,13 @@ function methodTotalsOf(bills: SettledBill[]): Map<string, number> {
   return totals;
 }
 
-export type ReconciliationRow = {
+export interface ReconciliationRow {
   method: string;
   expected: number;
   actual: number | null;
   status: "matched" | "variance" | null;
   note: string | null;
-};
+}
 
 export async function GetReconciliation(restaurantId: string, date?: string): Promise<{ date: string; rows: ReconciliationRow[] }> {
   const context = await requireRestaurantContext(restaurantId);
@@ -9704,11 +9704,11 @@ export async function SaveReconciliation(
 ): Promise<ReconciliationRow & { date: string }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureSettlementBatchesTable();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(input.date ?? "").trim())) throw new Error("date must be YYYY-MM-DD");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(input.date ?? "").trim())) {throw new Error("date must be YYYY-MM-DD");}
   const method = String(input.method ?? "").trim();
-  if (!method) throw new Error("method is required");
+  if (!method) {throw new Error("method is required");}
   const actualNum = Number(input.actual);
-  if (!Number.isFinite(actualNum) || actualNum < 0) throw new Error("actual must be a non-negative amount");
+  if (!Number.isFinite(actualNum) || actualNum < 0) {throw new Error("actual must be a non-negative amount");}
   const actual = round2(actualNum);
 
   const range = dayRangeOf(input.date);
@@ -9731,9 +9731,9 @@ export async function SaveReconciliation(
 export async function DeleteReconciliation(restaurantId: string, date: string, method: string): Promise<{ success: true }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureSettlementBatchesTable();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date ?? "").trim())) throw new Error("date must be YYYY-MM-DD");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date ?? "").trim())) {throw new Error("date must be YYYY-MM-DD");}
   const m = String(method ?? "").trim();
-  if (!m) throw new Error("method is required");
+  if (!m) {throw new Error("method is required");}
   await runQuery(
     `delete from "SettlementBatches" where res_id = $1 and outlet_id = $2 and date = $3::date and method = $4`,
     [context.res_id, context.outlet_id, date.trim(), m],
@@ -9753,7 +9753,7 @@ export async function BuildTallyXml(restaurantId: string, fromIso?: string, toIs
   let companyName = "Restaurant";
   try {
     const prof = (await GetRestaurantProfile(restaurantId)) as { name?: string } | null;
-    if (prof && typeof prof.name === "string" && prof.name.trim()) companyName = prof.name.trim();
+    if (prof && typeof prof.name === "string" && prof.name.trim()) {companyName = prof.name.trim();}
   } catch {/* ignore */}
 
   const esc = (s: unknown) =>
@@ -9764,7 +9764,7 @@ export async function BuildTallyXml(restaurantId: string, fromIso?: string, toIs
   const messages: string[] = [];
   let vno = 1;
   for (const d of sales.by_day) {
-    if (d.sales <= 0) continue;
+    if (d.sales <= 0) {continue;}
     const net = round2(d.sales - d.tax);
     const taxEntry = d.tax > 0
       ? `<ALLLEDGERENTRIES.LIST><LEDGERNAME>Output Tax</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${amt(d.tax)}</AMOUNT></ALLLEDGERENTRIES.LIST>`
@@ -9782,7 +9782,7 @@ export async function BuildTallyXml(restaurantId: string, fromIso?: string, toIs
   }
   for (const e of expenses) {
     const a = round2(Number(e.amount) || 0);
-    if (a <= 0) continue;
+    if (a <= 0) {continue;}
     const cat = esc(e.category || "Expenses");
     messages.push(
       `<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Payment" ACTION="Create">` +
@@ -10035,9 +10035,9 @@ async function getOpenBillDiscount(
       client,
     );
     const r = rows[0];
-    if (!r || !r.discount_type) return null;
+    if (!r?.discount_type) {return null;}
     const v = Math.max(0, Number(r.discount_value ?? 0) || 0);
-    if (v <= 0) return null;
+    if (v <= 0) {return null;}
     return { type: r.discount_type === "flat" ? "flat" : "percent", value: v };
   } catch {
     return null;
@@ -10045,7 +10045,7 @@ async function getOpenBillDiscount(
 }
 
 // --- Coupons (fully configurable promo codes) -------------------------------
-export type CouponRecord = {
+export interface CouponRecord {
   id: string;
   code: string;
   description: string | null;
@@ -10063,7 +10063,7 @@ export type CouponRecord = {
   // whose remaining spendable balance decrements on every redemption.
   kind: "promo" | "gift";
   balance: number | null;
-};
+}
 
 async function ensureCouponsTable(_client?: PoolClient): Promise<void> {
   await ensureLazyTable("Coupons", async () => {
@@ -10146,7 +10146,7 @@ export async function GetCoupons(restaurantId: string): Promise<CouponRecord[]> 
   return rows.map(mapCoupon);
 }
 
-export type CouponInput = {
+export interface CouponInput {
   id?: string | null;
   code: string;
   description?: string | null;
@@ -10159,18 +10159,18 @@ export type CouponInput = {
   valid_from?: string | null;
   valid_to?: string | null;
   active?: boolean | null;
-};
+}
 
 export async function UpsertCoupon(restaurantId: string, input: CouponInput): Promise<CouponRecord> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureCouponsTable();
   const code = String(input.code ?? "").trim().toUpperCase();
-  if (!code) throw new Error("Coupon code is required");
-  if (!/^[A-Z0-9_-]{2,32}$/.test(code)) throw new Error("Code must be 2–32 chars: A–Z, 0–9, - or _");
+  if (!code) {throw new Error("Coupon code is required");}
+  if (!/^[A-Z0-9_-]{2,32}$/.test(code)) {throw new Error("Code must be 2–32 chars: A–Z, 0–9, - or _");}
   const type = input.type === "flat" ? "flat" : "percent";
   const value = Math.max(0, Number(input.value ?? 0) || 0);
-  if (value <= 0) throw new Error("Discount value must be greater than 0");
-  if (type === "percent" && value > 100) throw new Error("A percentage coupon cannot exceed 100%");
+  if (value <= 0) {throw new Error("Discount value must be greater than 0");}
+  if (type === "percent" && value > 100) {throw new Error("A percentage coupon cannot exceed 100%");}
   const num = (v: unknown) => (v == null || v === "" ? null : Math.max(0, Number(v) || 0));
   const intNum = (v: unknown) => (v == null || v === "" ? null : Math.max(0, Math.round(Number(v) || 0)));
   const params = [
@@ -10198,7 +10198,7 @@ export async function UpsertCoupon(restaurantId: string, input: CouponInput): Pr
        where id=$14 and res_id=$1 and (outlet_id=$2 or outlet_id is null) returning *`,
       [...params, input.id],
     );
-    if (!rows[0]) throw new Error("Coupon not found");
+    if (!rows[0]) {throw new Error("Coupon not found");}
     return mapCoupon(rows[0]);
   }
   // Reject a duplicate active code for this outlet.
@@ -10206,18 +10206,18 @@ export async function UpsertCoupon(restaurantId: string, input: CouponInput): Pr
     `select id from "Coupons" where res_id=$1 and (outlet_id=$2 or outlet_id is null) and upper(code)=upper($3) limit 1`,
     [context.res_id, context.outlet_id, code],
   );
-  if (dup[0]) throw new Error(`Coupon "${code}" already exists`);
+  if (dup[0]) {throw new Error(`Coupon "${code}" already exists`);}
   try {
     const rows = await runQuery<Record<string, any>>(
       `insert into "Coupons" (id, res_id, outlet_id, code, description, type, value, min_order, max_discount, usage_limit, per_customer_limit, valid_from, valid_to, active)
        values ($14, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) returning *`,
       [...params, randomUUID()],
     );
-    if (!rows[0]) throw new Error("Failed to create coupon");
+    if (!rows[0]) {throw new Error("Failed to create coupon");}
     return mapCoupon(rows[0]);
   } catch (err: any) {
     // Unique-index race (migration 007): another request created the same code.
-    if (err?.code === "23505") throw new Error(`Coupon "${code}" already exists`);
+    if (err?.code === "23505") {throw new Error(`Coupon "${code}" already exists`);}
     throw err;
   }
 }
@@ -10240,9 +10240,9 @@ export async function CreateGiftVoucher(
   const context = await requireRestaurantContext(restaurantId);
   await ensureCouponsTable();
   const amount = round2(Math.max(0, Number(input.amount) || 0));
-  if (amount <= 0) throw new Error("Voucher amount must be greater than 0");
+  if (amount <= 0) {throw new Error("Voucher amount must be greater than 0");}
   const explicit = String(input.code ?? "").trim().toUpperCase();
-  if (explicit && !/^[A-Z0-9_-]{2,32}$/.test(explicit)) throw new Error("Code must be 2–32 chars: A–Z, 0–9, - or _");
+  if (explicit && !/^[A-Z0-9_-]{2,32}$/.test(explicit)) {throw new Error("Code must be 2–32 chars: A–Z, 0–9, - or _");}
   // Auto-generated codes retry on the (vanishingly unlikely) unique collision.
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = explicit || `GV-${randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase()}`;
@@ -10252,10 +10252,10 @@ export async function CreateGiftVoucher(
          values ($1, $2, $3, $4, 'Gift voucher', 'flat', $5, 0, true, 'gift', $5) returning *`,
         [randomUUID(), context.res_id, context.outlet_id, code, amount],
       );
-      if (rows[0]) return mapCoupon(rows[0]);
+      if (rows[0]) {return mapCoupon(rows[0]);}
     } catch (err: any) {
       if (err?.code === "23505") {
-        if (explicit) throw new Error(`Coupon "${explicit}" already exists`);
+        if (explicit) {throw new Error(`Coupon "${explicit}" already exists`);}
         continue; // generated code collided — roll a new one
       }
       throw err;
@@ -10281,28 +10281,28 @@ async function validateCoupon(
     [context.res_id, context.outlet_id, code.trim()],
     client,
   );
-  if (!rows[0]) return { error: "Invalid coupon code" };
+  if (!rows[0]) {return { error: "Invalid coupon code" };}
   const c = mapCoupon(rows[0]);
-  if (!c.active) return { error: "This coupon is not active" };
+  if (!c.active) {return { error: "This coupon is not active" };}
   const now = Date.now();
-  if (c.valid_from && now < new Date(c.valid_from).getTime()) return { error: "This coupon isn't valid yet" };
-  if (c.valid_to && now > new Date(c.valid_to).getTime()) return { error: "This coupon has expired" };
-  if (c.min_order > 0 && subtotal < c.min_order) return { error: `Minimum order of ${c.min_order} required` };
-  if (c.usage_limit != null && c.used_count >= c.usage_limit) return { error: "This coupon has reached its usage limit" };
+  if (c.valid_from && now < new Date(c.valid_from).getTime()) {return { error: "This coupon isn't valid yet" };}
+  if (c.valid_to && now > new Date(c.valid_to).getTime()) {return { error: "This coupon has expired" };}
+  if (c.min_order > 0 && subtotal < c.min_order) {return { error: `Minimum order of ${c.min_order} required` };}
+  if (c.usage_limit != null && c.used_count >= c.usage_limit) {return { error: "This coupon has reached its usage limit" };}
   if (c.per_customer_limit != null && customerPhone) {
     const used = await runQuery<{ n: string }>(
       `select count(*)::int as n from "CouponRedemptions" where res_id=$1 and coupon_id=$2 and customer_phone=$3`,
       [context.res_id, c.id, customerPhone], client,
     );
-    if (Number(used[0]?.n ?? 0) >= c.per_customer_limit) return { error: "You've already used this coupon" };
+    if (Number(used[0]?.n ?? 0) >= c.per_customer_limit) {return { error: "You've already used this coupon" };}
   }
   // Gift vouchers spend their remaining balance (capped at the bill subtotal);
   // promo coupons compute their configured percent/flat discount.
   const discount = c.kind === "gift"
     ? round2(Math.min(Math.max(0, c.balance ?? 0), Math.max(0, subtotal)))
     : computeCouponDiscount(c, subtotal);
-  if (c.kind === "gift" && (c.balance ?? 0) <= 0) return { error: "This gift voucher has no balance left" };
-  if (discount <= 0) return { error: "This coupon gives no discount on this order" };
+  if (c.kind === "gift" && (c.balance ?? 0) <= 0) {return { error: "This gift voucher has no balance left" };}
+  if (discount <= 0) {return { error: "This coupon gives no discount on this order" };}
   return { coupon: c, discount };
 }
 
@@ -10315,7 +10315,7 @@ export async function CheckCoupon(
 ): Promise<{ valid: boolean; discount: number; description?: string | null; error?: string }> {
   const context = await requireRestaurantContext(restaurantId);
   const r = await validateCoupon(context, code, Number(subtotal) || 0, customerPhone);
-  if ("error" in r) return { valid: false, discount: 0, error: r.error };
+  if ("error" in r) {return { valid: false, discount: 0, error: r.error };}
   return { valid: true, discount: r.discount, description: r.coupon.description };
 }
 
@@ -10328,7 +10328,7 @@ async function clearBillCoupon(context: RestaurantContext, tableId: string, clie
     [tableId, context.res_id, context.outlet_id], client,
   );
   const bill = rows[0];
-  if (!bill || !bill.coupon_code) return;
+  if (!bill?.coupon_code) {return;}
   // Decrement the EXACT coupon that was applied (by id from its redemption row),
   // not by code — a tenant can have an outlet-specific AND a global coupon with
   // the same code, and decrementing by code would corrupt the other's counter.
@@ -10351,7 +10351,7 @@ async function clearBillCoupon(context: RestaurantContext, tableId: string, clie
 // snapshotted redemption amount to the balance and reactivate the code. No-op
 // for promo coupons (the where clause pins kind='gift').
 async function restoreGiftBalance(context: RestaurantContext, couponId: string, amount: number, client: PoolClient): Promise<void> {
-  if (amount <= 0) return;
+  if (amount <= 0) {return;}
   await runQuery(
     `update "Coupons" set balance = round(coalesce(balance, 0)::numeric + $3::numeric, 2), active = true
        where id=$1 and res_id=$2 and kind='gift'`,
@@ -10368,7 +10368,7 @@ async function reverseCouponForBill(context: RestaurantContext, billId: string, 
     `select coupon_code from "Bills" where id=$1 and res_id=$2 limit 1`, [billId, context.res_id], client,
   );
   const code = rows[0]?.coupon_code;
-  if (!code) return; // no coupon on this bill → nothing to reverse
+  if (!code) {return;} // no coupon on this bill → nothing to reverse
   const redemption = await runQuery<{ coupon_id: string; amount: number | string | null }>(
     `select coupon_id, amount from "CouponRedemptions" where res_id=$1 and table_name=$2 order by created_at desc limit 1`,
     [context.res_id, billId], client,
@@ -10395,7 +10395,7 @@ export async function ApplyCouponToBill(
     await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
     const tableId = await tableIdByName(context, tableName, client);
-    if (!tableId) throw new Error("Table not found");
+    if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
 
     const subtotal = await sumOrderTotalsForTable(context, tableId, client);
@@ -10404,7 +10404,7 @@ export async function ApplyCouponToBill(
     // usage/per-customer limits during validation below.
     await clearBillCoupon(context, tableId, client);
     const v = await validateCoupon(context, code, subtotal, customerPhone, client);
-    if ("error" in v) throw new Error(v.error);
+    if ("error" in v) {throw new Error(v.error);}
 
     const existing = await runQuery<{ id: string }>(
       `select id from "Bills" where table_id=$1 and res_id=$2 and outlet_id=$3 and closed_at is null order by created_at desc limit 1`,
@@ -10524,7 +10524,7 @@ async function awardLoyaltyForSettledBill(
   client: PoolClient,
 ): Promise<void> {
   const cfg = await getLoyaltyConfig(context.res_id, client);
-  if (cfg.earn_per_100 <= 0) return; // loyalty off
+  if (cfg.earn_per_100 <= 0) {return;} // loyalty off
   await ensureLoyaltyTable();
   // The bill this settle just closed (latest closed bill on the table).
   const bills = await runQuery<{ id: string; total_amt: number | string | null }>(
@@ -10534,7 +10534,7 @@ async function awardLoyaltyForSettledBill(
     [tableId, context.res_id, context.outlet_id], client,
   );
   const bill = bills[0];
-  if (!bill) return;
+  if (!bill) {return;}
   // Most recent order on the table carrying a phone = this session's customer.
   const phones = await runQuery<{ phone: string | null }>(
     `select nullif(trim((food)::jsonb->>'customer_phone'), '') as phone
@@ -10545,10 +10545,10 @@ async function awardLoyaltyForSettledBill(
     [context.res_id, context.outlet_id, tableId], client,
   );
   const phone = phones[0]?.phone?.trim();
-  if (!phone) return;
+  if (!phone) {return;}
   const total = round2(Number(bill.total_amt ?? 0) || 0);
   const points = Math.floor(total / 100) * cfg.earn_per_100;
-  if (points <= 0) return;
+  if (points <= 0) {return;}
   await runQuery(
     `insert into "LoyaltyLedger" (id, res_id, outlet_id, customer_phone, points, kind, bill_id, note)
      values ($1, $2, $3, $4, $5, 'earn', $6, $7)
@@ -10561,11 +10561,11 @@ async function awardLoyaltyForSettledBill(
 export async function GetLoyaltyAccount(
   restaurantId: string,
   phoneRaw: string,
-): Promise<{ phone: string; balance: number; point_value: number; earn_per_100: number; history: Array<{ points: number; kind: string; note: string | null; bill_id: string | null; created_at: string }> }> {
+): Promise<{ phone: string; balance: number; point_value: number; earn_per_100: number; history: { points: number; kind: string; note: string | null; bill_id: string | null; created_at: string }[] }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureLoyaltyTable();
   const phone = phoneRaw.trim();
-  if (!phone) throw new Error("Phone number is required");
+  if (!phone) {throw new Error("Phone number is required");}
   const cfg = await getLoyaltyConfig(context.res_id);
   const balance = await loyaltyBalance(context, phone);
   const rows = await runQuery<{ points: number | string; kind: string; note: string | null; bill_id: string | null; created_at: Date }>(
@@ -10604,19 +10604,19 @@ export async function RedeemLoyaltyPoints(
     await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
     const phone = String(opts.phone ?? "").trim();
-    if (!phone) throw new Error("Phone number is required");
+    if (!phone) {throw new Error("Phone number is required");}
     const points = Math.floor(Number(opts.points) || 0);
-    if (points <= 0) throw new Error("Points to redeem must be greater than 0");
+    if (points <= 0) {throw new Error("Points to redeem must be greater than 0");}
     const cfg = await getLoyaltyConfig(context.res_id, client);
-    if (cfg.point_value <= 0) throw new Error("Loyalty redemption is not enabled (point value is 0)");
+    if (cfg.point_value <= 0) {throw new Error("Loyalty redemption is not enabled (point value is 0)");}
     const balance = await loyaltyBalance(context, phone, client);
-    if (points > balance) throw new Error(`Not enough points — the balance is ${balance}`);
+    if (points > balance) {throw new Error(`Not enough points — the balance is ${balance}`);}
 
     const tableId = await tableIdByName(context, opts.table_name, client);
-    if (!tableId) throw new Error("Table not found");
+    if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
     const subtotal = await sumOrderTotalsForTable(context, tableId, client);
-    if (subtotal <= 0) throw new Error("This table has no active orders to discount");
+    if (subtotal <= 0) {throw new Error("This table has no active orders to discount");}
     const discount = round2(points * cfg.point_value);
     if (discount > subtotal) {
       throw new Error(`${points} points are worth ₹${discount} — more than the bill subtotal (₹${subtotal}). Redeem fewer points.`);
@@ -10688,9 +10688,9 @@ async function updateOrderWorkflowStatus(
 // Validate a split-tender payload: 2-6 rows of {method, amount} using REAL
 // methods (no nested 'Split'), positive amounts. Sum is checked against the
 // bill's grand total later (once it is known).
-function normalizePaymentSplits(raw: unknown): Array<{ method: PaymentMethod; amount: number }> {
-  if (!Array.isArray(raw) || raw.length === 0) return [];
-  if (raw.length < 2 || raw.length > 6) throw new Error("A split payment needs between 2 and 6 parts");
+function normalizePaymentSplits(raw: unknown): { method: PaymentMethod; amount: number }[] {
+  if (!Array.isArray(raw) || raw.length === 0) {return [];}
+  if (raw.length < 2 || raw.length > 6) {throw new Error("A split payment needs between 2 and 6 parts");}
   return raw.map((s) => {
     const o = (s ?? {}) as Record<string, unknown>;
     const method = normalizePaymentMethod(o.method);
@@ -10698,7 +10698,7 @@ function normalizePaymentSplits(raw: unknown): Array<{ method: PaymentMethod; am
       throw new Error(`Invalid split payment method: ${String(o.method ?? "")}`);
     }
     const amount = round2(Number(o.amount) || 0);
-    if (amount <= 0) throw new Error("Every split part needs an amount greater than zero");
+    if (amount <= 0) {throw new Error("Every split part needs an amount greater than zero");}
     return { method, amount };
   });
 }
@@ -10710,7 +10710,7 @@ export async function ConfirmBillPaymentByWaiter(
   paymentMethodRaw: string,
   paymentProofScreenshotUrlRaw?: string | null,
   splitsRaw?: unknown,
-): Promise<{ success: true; payment_method: PaymentMethod; splits?: Array<{ method: PaymentMethod; amount: number }> }> {
+): Promise<{ success: true; payment_method: PaymentMethod; splits?: { method: PaymentMethod; amount: number }[] }> {
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
@@ -10862,7 +10862,7 @@ export async function SubmitCustomerPayment(
     const context = await requireRestaurantContext(restaurantId, client);
     const paymentMethod = normalizePaymentMethod(paymentMethodRaw);
     // 'Split' is staff-only (needs the per-mode breakdown) — never a QR option.
-    if (!paymentMethod || paymentMethod === "Split") throw new Error("Invalid payment method");
+    if (!paymentMethod || paymentMethod === "Split") {throw new Error("Invalid payment method");}
     const screenshotUrl = typeof screenshotUrlRaw === "string" ? screenshotUrlRaw.trim() : "";
     // Screenshot requirement is config-driven when an override is supplied,
     // otherwise falls back to the built-in proof-method defaults.
@@ -10878,7 +10878,7 @@ export async function SubmitCustomerPayment(
       client,
     );
     const tableId = tableRows[0]?.id;
-    if (!tableId) throw new Error("Table not found");
+    if (!tableId) {throw new Error("Table not found");}
 
     const ord = await runQuery<{ id: string; food: unknown }>(
       `select id, food from "Orders" where res_id = $1 and outlet_id = $2 and table_id = $3 order by created_at desc limit 1`,
@@ -10886,7 +10886,7 @@ export async function SubmitCustomerPayment(
       client,
     );
     const orderId = ord[0]?.id;
-    if (!orderId) throw new Error("No orders to pay for on this table");
+    if (!orderId) {throw new Error("No orders to pay for on this table");}
 
     let empId = String((parseJsonObject(ord[0]?.food) ?? {}).taken_by_employee_id ?? "").trim();
     if (!empId || !isUuid(empId)) {
@@ -11000,7 +11000,7 @@ export async function ApproveBillPaymentByAdmin(
         [tableId, context.res_id, context.outlet_id],
         client,
       );
-      if (already[0]) return { success: true };
+      if (already[0]) {return { success: true };}
       throw new Error("Bill not found");
     }
 
@@ -11158,7 +11158,7 @@ export async function AddTakeawayOrder(
     ...(order as Record<string, unknown>),
     table: virt.table_name,
     order_type: kind.toLowerCase(),
-  } as Partial<OrderRecord>);
+  });
   return { id: created.id, table: virt.table_name, order_type: kind.toLowerCase() };
 }
 
@@ -11202,7 +11202,7 @@ export async function GenerateAggregatorKey(restaurantId: string): Promise<strin
 // before any tenant binding). Null = unknown/invalid key.
 export async function GetRestaurantIdByAggregatorKey(key: string): Promise<string | null> {
   const trimmed = key.trim();
-  if (trimmed.length < 12) return null;
+  if (trimmed.length < 12) {return null;}
   await ensureBrandingColumns();
   const rows = await runQuery<{ id: string }>(
     `select id from "Restaurant" where aggregator_key = $1 limit 1`,
@@ -11216,7 +11216,7 @@ export async function AddAggregatorOrder(
   input: {
     source: "swiggy" | "zomato";
     external_id: string;
-    items: Array<{ name: unknown; qty?: unknown; quantity?: unknown; price: unknown }>;
+    items: { name: unknown; qty?: unknown; quantity?: unknown; price: unknown }[];
     customer_name?: string;
     customer_phone?: string;
   },
@@ -11225,7 +11225,7 @@ export async function AddAggregatorOrder(
   await ensureAggregatorOrdersTable();
   const source = input.source;
   const externalId = String(input.external_id ?? "").trim().slice(0, 64);
-  if (!externalId) throw new Error("external_id is required");
+  if (!externalId) {throw new Error("external_id is required");}
 
   // Webhook retries / duplicate posts return the original order (200, deduped).
   const existing = await runQuery<{ order_id: string | null }>(
@@ -11245,7 +11245,7 @@ export async function AddAggregatorOrder(
       quantity: Math.max(1, Math.round(Number(it.qty ?? it.quantity) || 1)),
     };
   });
-  if (items.length === 0) throw new Error("At least one item is required");
+  if (items.length === 0) {throw new Error("At least one item is required");}
   const subtotal = round2(items.reduce((s, it) => s + it.price * it.quantity, 0));
 
   const label = source.toUpperCase(); // SWIGGY / ZOMATO — the KDS source tag
@@ -11335,7 +11335,7 @@ export async function CloseBillByOrder(
         [tableId, context.res_id, context.outlet_id],
         client,
       );
-      if (already[0]) return { success: true };
+      if (already[0]) {return { success: true };}
       throw new Error("Bill is not ready to be closed");
     }
 
@@ -11432,7 +11432,7 @@ export async function FinalizeOnlinePayment(
       client,
     );
     const tableId = tableRows[0]?.id;
-    if (!tableId) throw new Error("Table not found");
+    if (!tableId) {throw new Error("Table not found");}
 
     const subtotal = await sumOrderTotalsForTable(context, tableId, client);
     // Fold the optional service charge + taxes into the charged/recorded total.
@@ -11514,7 +11514,7 @@ async function assertOrderStatusEditable(
     [orderId, context.res_id, context.outlet_id],
     client,
   );
-  if (!rows[0]) return; // not found — leave not-found handling to the caller
+  if (!rows[0]) {return;} // not found — leave not-found handling to the caller
   const code = Number(rows[0].status ?? 0);
   if (code === 4 || code === 7) {
     throw new Error("This order's bill is already settled and locked — its status can no longer be changed.");
@@ -11552,7 +11552,7 @@ export async function SetOrderStatus(
   const code = toOrderStatusCode(status);
   // An un-barked order can be accepted (Preparing) or cancelled, but never
   // advanced past the kitchen queue — the bark is the step in between.
-  if (code === 2 || code === 3) await assertOrderBarked(context, orderId);
+  if (code === 2 || code === 3) {await assertOrderBarked(context, orderId);}
   const rows = await runQuery<{ id: string }>(
     `
       update "Orders"
@@ -11584,7 +11584,7 @@ export async function ReplaceBill(
       subtotal: number;
       serviceChargePercentage?: number | null;
       applyServiceCharge?: boolean;
-      taxes?: Array<{ id?: string; name: string; percentage: number }>;
+      taxes?: { id?: string; name: string; percentage: number }[];
     };
     new_bill: {
       total_amt: number;
@@ -11597,7 +11597,7 @@ export async function ReplaceBill(
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const oldOrderId = String(payload.old_order_id ?? '').trim();
-    if (!oldOrderId) throw new Error('Missing old_order_id');
+    if (!oldOrderId) {throw new Error('Missing old_order_id');}
 
     // locate existing bill (if any)
     // try to locate existing bill and update in-place
@@ -11635,7 +11635,7 @@ export async function ReplaceBill(
       );
       tableId = tableRows[0]?.id ?? null;
     }
-    if (!tableId && oldBillRow) tableId = oldBillRow.table_id ?? null;
+    if (!tableId && oldBillRow) {tableId = oldBillRow.table_id ?? null;}
 
     // resolve employee id for bill update. prefer provided, fall back to existing bill emp_id
     let empId: string | null = null;
@@ -11668,7 +11668,7 @@ export async function ReplaceBill(
       );
 
       // if empId not resolved, keep existing emp_id
-      if (!empId) empId = oldBillRow.emp_id ?? null;
+      if (!empId) {empId = oldBillRow.emp_id ?? null;}
 
       // update existing bill row in-place
       await runQuery(
@@ -11767,8 +11767,8 @@ function toApcZone(current: number, target: number, yellowBandPercent = 0.1): Ap
 
   const lower = target * (1 - yellowBandPercent);
   const upper = target * (1 + yellowBandPercent);
-  if (current < lower) return "red";
-  if (current <= upper) return "yellow";
+  if (current < lower) {return "red";}
+  if (current <= upper) {return "yellow";}
   return "green";
 }
 
@@ -11846,7 +11846,7 @@ async function resolveEmployeeByUsername(
   );
 
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
   return {
     id: row.id,
     username: row.username,
@@ -11860,11 +11860,11 @@ async function resolveEmployeeByUsername(
 // Walk-in parties join a queue (public QR) when the floor is full; staff call &
 // seat them. A held pre_order (items picked while waiting) is placed as a real
 // order on seating. RLS-scoped by res_id like every tenant table.
-export type WaitlistItem = { id: string; name: string; price: number; quantity: number; note?: string };
+export interface WaitlistItem { id: string; name: string; price: number; quantity: number; note?: string }
 // Additive contact-capture: everyone who scans the shared "join party" QR records
 // their own name/phone here. Does NOT change party_size (that's still the head count).
-export type WaitlistMember = { name: string; phone: string; joined_at: string };
-export type WaitlistEntry = {
+export interface WaitlistMember { name: string; phone: string; joined_at: string }
+export interface WaitlistEntry {
   id: string;
   name: string;
   phone: string | null;
@@ -11878,7 +11878,7 @@ export type WaitlistEntry = {
   created_at: string;
   called_at: string | null;
   seated_at: string | null;
-};
+}
 
 async function ensureWaitlistTable(_client?: PoolClient): Promise<void> {
   await ensureLazyTable("Waitlist", async () => {
@@ -11918,13 +11918,13 @@ async function ensureWaitlistTable(_client?: PoolClient): Promise<void> {
 // and enforces the 25-member ceiling. Used both when reading (mapWaitlist) and
 // when appending (AddWaitlistMember).
 function normalizeWaitlistMembers(raw: unknown): WaitlistMember[] {
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {return [];}
   const out: WaitlistMember[] = [];
   for (const r of raw.slice(0, 25)) {
     const o = (r ?? {}) as Record<string, unknown>;
     const name = String(o.name ?? "").trim().slice(0, 80);
     const phone = String(o.phone ?? "").trim().slice(0, 40);
-    if (!name && !phone) continue;
+    if (!name && !phone) {continue;}
     const joined_at = typeof o.joined_at === "string" && o.joined_at ? o.joined_at : new Date().toISOString();
     out.push({ name, phone, joined_at });
   }
@@ -11938,12 +11938,12 @@ function waitlistMemberPhoneKey(phone: string): string {
 }
 
 function normalizeWaitlistItems(raw: unknown): WaitlistItem[] {
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {return [];}
   const out: WaitlistItem[] = [];
   for (const r of raw.slice(0, 100)) { // cap line count (anti-DoS)
     const o = (r ?? {}) as Record<string, unknown>;
     const name = String(o.name ?? "").trim();
-    if (!name) continue;
+    if (!name) {continue;}
     const quantity = Math.min(99, Math.max(1, Math.round(parseNumeric(o.quantity ?? 1) || 1)));
     const price = Math.max(0, parseNumeric(o.price ?? 0));
     const note = typeof o.note === "string" ? o.note.trim().slice(0, 280) : "";
@@ -11958,15 +11958,15 @@ function normalizeWaitlistItems(raw: unknown): WaitlistItem[] {
 // otherwise the exact menu price is used. Items with no current menu match are
 // DROPPED (they can't be billed). Must run inside the tenant context.
 export async function repriceFromMenu(restaurantId: string, items: WaitlistItem[], floorOnly = false): Promise<WaitlistItem[]> {
-  if (!Array.isArray(items) || items.length === 0) return [];
+  if (!Array.isArray(items) || items.length === 0) {return [];}
   const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
-  if (menu.length === 0) return [];
+  if (menu.length === 0) {return [];}
   const byId = new Map(menu.map((m) => [String(m.id), m]));
   const byName = new Map(menu.map((m) => [m.name.trim().toLowerCase(), m]));
   const out: WaitlistItem[] = [];
   for (const it of items) {
     const m = byId.get(String(it.id)) ?? byName.get(String(it.name).trim().toLowerCase());
-    if (!m) continue;
+    if (!m) {continue;}
     const base = round2(parseNumeric(m.price));
     const price = floorOnly ? Math.max(base, round2(parseNumeric(it.price))) : base;
     out.push({ id: String(m.id), name: m.name, price, quantity: it.quantity, ...(it.note ? { note: it.note } : {}) });
@@ -11999,7 +11999,7 @@ function mapWaitlist(r: Record<string, any>): WaitlistEntry {
 
 // Parties still waiting ahead of this one (created earlier).
 async function waitlistPosition(context: RestaurantContext, entry: { created_at: string; status: string }, outletId?: string): Promise<number> {
-  if (entry.status !== "waiting") return 0;
+  if (entry.status !== "waiting") {return 0;}
   // Count against the ENTRY's own outlet — the public status-poll binds an empty
   // outlet (resolves to the default), so a party who joined a non-default branch
   // must still be ranked within THAT branch's queue, not outlet #1's.
@@ -12015,7 +12015,7 @@ export async function JoinWaitlist(restaurantId: string, input: { name: string; 
   const context = await requireRestaurantContext(restaurantId);
   await ensureWaitlistTable();
   const name = (input.name ?? "").trim();
-  if (!name) throw new Error("Name is required to join the queue");
+  if (!name) {throw new Error("Name is required to join the queue");}
   const party = Math.max(1, Math.min(50, Math.round(Number(input.party_size) || 1)));
   const phone = input.phone?.trim() || null;
   // Dedupe: if this phone already has an active entry, return it instead of stacking
@@ -12037,7 +12037,7 @@ export async function JoinWaitlist(restaurantId: string, input: { name: string; 
      values ($1, $2, $3, $4, $5, $6, $7, 'waiting') returning *`,
     [randomUUID(), context.res_id, context.outlet_id, randomUUID(), name, phone, party],
   );
-  if (!rows[0]) throw new Error("Failed to join the queue");
+  if (!rows[0]) {throw new Error("Failed to join the queue");}
   const entry = mapWaitlist(rows[0]);
   return { ...entry, position: await waitlistPosition(context, entry) };
 }
@@ -12049,7 +12049,7 @@ export async function GetWaitlistEntryByToken(restaurantId: string, token: strin
     `select w.*, t.table_name from "Waitlist" w left join "Tables" t on t.id = w.table_id where w.token = $1 and w.res_id = $2 limit 1`,
     [token, context.res_id],
   );
-  if (!rows[0]) return null;
+  if (!rows[0]) {return null;}
   const entry = mapWaitlist(rows[0]);
   // Once seated, hand the client the table's SIGNED ordering token so the queue
   // page can redirect the party straight to that table's menu. It can't be forged
@@ -12070,7 +12070,7 @@ export async function SetWaitlistPreorder(restaurantId: string, token: string, i
     `update "Waitlist" set pre_order = $1::jsonb where token = $2 and res_id = $3 and status in ('waiting','called') returning id`,
     [JSON.stringify(normalized), token, context.res_id],
   );
-  if (!rows[0]) return { error: "Your queue entry is no longer active" };
+  if (!rows[0]) {return { error: "Your queue entry is no longer active" };}
   return { success: true };
 }
 
@@ -12087,8 +12087,8 @@ export async function AddWaitlistMember(
   await ensureWaitlistTable();
   const name = String(input?.name ?? "").trim().slice(0, 80);
   const phoneRaw = String(input?.phone ?? "").trim().slice(0, 40);
-  if (!name) return { error: "Please enter your name" };
-  if (waitlistMemberPhoneKey(phoneRaw).length < 7) return { error: "Please enter a valid phone number" };
+  if (!name) {return { error: "Please enter your name" };}
+  if (waitlistMemberPhoneKey(phoneRaw).length < 7) {return { error: "Please enter a valid phone number" };}
   const key = waitlistMemberPhoneKey(phoneRaw);
 
   return withTransaction(async () => {
@@ -12096,7 +12096,7 @@ export async function AddWaitlistMember(
       `select party_members from "Waitlist" where token = $1 and res_id = $2 and status in ('waiting','called') for update`,
       [token, context.res_id],
     );
-    if (!rows[0]) return { error: "This queue entry is no longer active" };
+    if (!rows[0]) {return { error: "This queue entry is no longer active" };}
     const members = normalizeWaitlistMembers(
       typeof rows[0].party_members === "string" ? JSON.parse(rows[0].party_members) : rows[0].party_members,
     );
@@ -12105,7 +12105,7 @@ export async function AddWaitlistMember(
       existing.name = name; // same phone → update the name only, keep joined_at
       existing.phone = phoneRaw;
     } else {
-      if (members.length >= 25) return { error: "This party is full (25 people max)" };
+      if (members.length >= 25) {return { error: "This party is full (25 people max)" };}
       members.push({ name, phone: phoneRaw, joined_at: new Date().toISOString() });
     }
     await runQuery(
@@ -12123,7 +12123,7 @@ export async function CancelWaitlistByToken(restaurantId: string, token: string)
   return { success: true };
 }
 
-export async function GetWaitlist(restaurantId: string): Promise<Array<WaitlistEntry & { position: number; minutes_waiting: number }>> {
+export async function GetWaitlist(restaurantId: string): Promise<(WaitlistEntry & { position: number; minutes_waiting: number })[]> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureWaitlistTable();
   const rows = await runQuery<Record<string, any>>(
@@ -12148,7 +12148,7 @@ export async function CallWaitlistEntry(restaurantId: string, id: string): Promi
     `update "Waitlist" set status = 'called', called_at = now() where id = $1 and res_id = $2 and outlet_id = $3 and status = 'waiting' returning *`,
     [id, context.res_id, context.outlet_id],
   );
-  if (!rows[0]) throw new Error("Entry not found or not waiting");
+  if (!rows[0]) {throw new Error("Entry not found or not waiting");}
   return mapWaitlist(rows[0]);
 }
 
@@ -12170,7 +12170,7 @@ export async function SeatWaitlistEntry(
   await ensureWaitlistTable();
   await ensureTableOccupancyColumns();
   const table = String(tableName ?? "").trim();
-  if (!table) throw new Error("A table is required to seat the party");
+  if (!table) {throw new Error("A table is required to seat the party");}
 
   // The whole seat is one transaction: claim the queue entry, claim a FREE table
   // (row-locked), occupy it, and place the held pre-order. If anything fails
@@ -12186,7 +12186,7 @@ export async function SeatWaitlistEntry(
       [id, context.res_id, context.outlet_id],
       client,
     );
-    if (!claimed[0]) throw new Error("This party is no longer in the queue");
+    if (!claimed[0]) {throw new Error("This party is no longer in the queue");}
     const party = Math.max(1, Math.round(Number(claimed[0].party_size ?? 1) || 1));
     const name = String(claimed[0].name ?? "").trim();
     const preRaw = claimed[0].pre_order;
@@ -12201,8 +12201,8 @@ export async function SeatWaitlistEntry(
       [context.res_id, context.outlet_id, table],
       client,
     );
-    if (!trows[0]) throw new Error("Table not found");
-    if (trows[0].occ) throw new Error("That table is already occupied — pick another");
+    if (!trows[0]) {throw new Error("Table not found");}
+    if (trows[0].occ) {throw new Error("That table is already occupied — pick another");}
     const tableId = trows[0].id;
     await runQuery(
       `update "Tables" set is_occupied = true, num_covers = $4, linked_order_id = null where id = $1 and res_id = $2 and outlet_id = $3`,
@@ -12427,7 +12427,7 @@ export async function GetTableFeedbackContext(
 
   // Fallback: no explicit table->waiter assignment, so credit the employee who
   // took the table's most recent order (so feedback still attributes correctly).
-  if (!row || !row.employee_id) {
+  if (!row?.employee_id) {
     const orderRows = await runQuery<{ food: unknown }>(
       `select o.food
          from "Orders" o
@@ -12465,7 +12465,7 @@ async function currentDbTime(): Promise<Date> {
   try {
     const rows = await runQuery<{ now: Date }>(`select now() as now`);
     const v = rows[0]?.now;
-    return v ? new Date(v as unknown as string) : new Date();
+    return v ? new Date(v) : new Date();
   } catch {
     return new Date();
   }
@@ -12475,7 +12475,7 @@ async function currentDbTime(): Promise<Date> {
 export async function GetDailyRevenueSeries(
   restaurantId: string,
   days = 14,
-): Promise<Array<{ date: string; revenue: number; orders: number }>> {
+): Promise<{ date: string; revenue: number; orders: number }[]> {
   const context = await requireRestaurantContext(restaurantId);
   const span = Math.min(90, Math.max(1, Math.round(days)));
   const now = await currentDbTime();
@@ -12490,9 +12490,9 @@ export async function GetDailyRevenueSeries(
   const byDay = new Map<string, { revenue: number; orders: number }>();
   for (const r of rows) {
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
-    if (st === "cancelled") continue;
-    const d = new Date(r.created_at as string);
-    if (Number.isNaN(d.getTime())) continue;
+    if (st === "cancelled") {continue;}
+    const d = new Date(r.created_at);
+    if (Number.isNaN(d.getTime())) {continue;}
     const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
     const p = parseJsonObject(r.food) ?? {};
     const total = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
@@ -12502,7 +12502,7 @@ export async function GetDailyRevenueSeries(
     byDay.set(key, cur);
   }
 
-  const series: Array<{ date: string; revenue: number; orders: number }> = [];
+  const series: { date: string; revenue: number; orders: number }[] = [];
   for (let i = 0; i < span; i++) {
     const d = new Date(start.getTime() + i * 24 * 60 * 60 * 1000);
     const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
@@ -12520,8 +12520,8 @@ export async function GetOperationsAnalytics(
   days = 30,
 ): Promise<{
   days: number;
-  by_hour: Array<{ hour: number; orders: number; revenue: number }>;
-  by_weekday: Array<{ weekday: number; label: string; orders: number; revenue: number }>;
+  by_hour: { hour: number; orders: number; revenue: number }[];
+  by_weekday: { weekday: number; label: string; orders: number; revenue: number }[];
 }> {
   const context = await requireRestaurantContext(restaurantId);
   const span = Math.min(180, Math.max(1, Math.round(days)));
@@ -12536,9 +12536,9 @@ export async function GetOperationsAnalytics(
   const byWeekday = wkLabels.map((label, weekday) => ({ weekday, label, orders: 0, revenue: 0 }));
   for (const r of rows) {
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
-    if (st === "cancelled") continue;
-    const d = new Date(r.created_at as string);
-    if (Number.isNaN(d.getTime())) continue;
+    if (st === "cancelled") {continue;}
+    const d = new Date(r.created_at);
+    if (Number.isNaN(d.getTime())) {continue;}
     const p = parseJsonObject(r.food) ?? {};
     const total = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     const hb = byHour[d.getUTCHours()];
@@ -12559,12 +12559,12 @@ export async function GetOperationsAnalytics(
 
 let outletColumnsEnsured = false;
 async function ensureOutletColumns(client?: PoolClient): Promise<void> {
-  if (outletColumnsEnsured && !client) return;
+  if (outletColumnsEnsured && !client) {return;}
   await runQuery(`alter table "Outlets" add column if not exists is_active boolean not null default true`, [], client);
   // Per-outlet running invoice counter — each outlet keeps its own sequential
   // bill (invoice) number series, as GST expects per place of business.
   await runQuery(`alter table "Outlets" add column if not exists bill_seq integer not null default 0`, [], client);
-  if (!client) outletColumnsEnsured = true;
+  if (!client) {outletColumnsEnsured = true;}
 }
 
 // Atomically allocate the next sequential bill number for the outlet. The
@@ -12583,7 +12583,7 @@ async function nextBillNo(context: RestaurantContext, client?: PoolClient): Prom
   return rows[0]?.bill_seq ?? 1;
 }
 
-export type OutletRecord = {
+export interface OutletRecord {
   id: string;
   outlet_name: string;
   outlet_add: string | null;
@@ -12591,7 +12591,7 @@ export type OutletRecord = {
   outlet_hours: string | null;
   is_active: boolean;
   is_default: boolean;
-};
+}
 
 export async function GetOutlets(restaurantId: string): Promise<OutletRecord[]> {
   const context = await requireRestaurantContext(restaurantId);
@@ -12627,7 +12627,7 @@ export async function AddOutlet(
   const context = await requireRestaurantContext(restaurantId);
   await ensureOutletColumns();
   const name = (input.name ?? "").trim();
-  if (!name) throw new Error("Outlet name is required");
+  if (!name) {throw new Error("Outlet name is required");}
   const id = randomUUID();
   const slugPart = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "outlet";
   const username = `${context.restaurant_slug}-${slugPart}-${id.slice(0, 6)}`;
@@ -12654,7 +12654,7 @@ export async function UpdateOutlet(
   if (typeof input.address === "string") { sets.push(`outlet_add = $${p++}`); params.push(input.address.trim()); }
   if (typeof input.phone === "string") { sets.push(`outlet_main_ph = $${p++}`); params.push(normalizePhone(input.phone) || null); }
   if (typeof input.hours === "string") { sets.push(`outlet_working_hours = $${p++}`); params.push(input.hours.trim() || null); }
-  if (sets.length === 0) return { success: true };
+  if (sets.length === 0) {return { success: true };}
   await runQuery(`update "Outlets" set ${sets.join(", ")} where id = $1 and res_id = $2`, params);
   return { success: true };
 }
@@ -12664,9 +12664,9 @@ export async function SetOutletActive(restaurantId: string, outletId: string, ac
   await ensureOutletColumns();
   const outlets = await GetOutlets(restaurantId);
   const target = outlets.find((o) => o.id === outletId);
-  if (!target) throw new Error("Outlet not found");
-  if (target.is_default && !active) throw new Error("The main outlet cannot be deactivated");
-  if (!active && outlets.filter((o) => o.is_active).length <= 1) throw new Error("At least one outlet must stay active");
+  if (!target) {throw new Error("Outlet not found");}
+  if (target.is_default && !active) {throw new Error("The main outlet cannot be deactivated");}
+  if (!active && outlets.filter((o) => o.is_active).length <= 1) {throw new Error("At least one outlet must stay active");}
   await runQuery(`update "Outlets" set is_active = $3 where id = $1 and res_id = $2`, [outletId, context.res_id, active]);
   return { success: true };
 }
@@ -12676,8 +12676,8 @@ export async function DeleteOutlet(restaurantId: string, outletId: string): Prom
   await ensureOutletColumns();
   const outlets = await GetOutlets(restaurantId);
   const target = outlets.find((o) => o.id === outletId);
-  if (!target) throw new Error("Outlet not found");
-  if (target.is_default) throw new Error("The main outlet cannot be deleted");
+  if (!target) {throw new Error("Outlet not found");}
+  if (target.is_default) {throw new Error("The main outlet cannot be deleted");}
   // Block hard-delete when the outlet has history (FK + accounting integrity) —
   // deactivate it instead.
   const used = await runQuery<{ n: number }>(
@@ -12687,7 +12687,7 @@ export async function DeleteOutlet(restaurantId: string, outletId: string): Prom
       )::int as n`,
     [outletId, context.res_id],
   );
-  if ((used[0]?.n ?? 0) > 0) throw new Error("This outlet has orders/bills — deactivate it instead of deleting");
+  if ((used[0]?.n ?? 0) > 0) {throw new Error("This outlet has orders/bills — deactivate it instead of deleting");}
   await runQuery(`delete from "Outlets" where id = $1 and res_id = $2`, [outletId, context.res_id]);
   return { success: true };
 }
@@ -12700,7 +12700,7 @@ export async function GetOutletsRollup(
   days = 30,
 ): Promise<{
   days: number;
-  outlets: Array<{ outlet_id: string; name: string; revenue: number; orders: number }>;
+  outlets: { outlet_id: string; name: string; revenue: number; orders: number }[];
   totals: { revenue: number; orders: number; outlets: number };
 }> {
   const context = await requireRestaurantContext(restaurantId);
@@ -12721,7 +12721,7 @@ export async function GetOutletsRollup(
   const agg = new Map<string, { revenue: number; orders: number }>();
   for (const r of orderRows) {
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
-    if (st === "cancelled") continue;
+    if (st === "cancelled") {continue;}
     const oid = r.outlet_id ?? "";
     const p = parseJsonObject(r.food) ?? {};
     const total = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
@@ -12756,7 +12756,7 @@ export async function GetOutletsComparison(
   days = 30,
 ): Promise<{
   days: number;
-  outlets: Array<{ outlet_id: string; name: string; revenue: number; bills: number; orders: number; avg_rating: number | null }>;
+  outlets: { outlet_id: string; name: string; revenue: number; bills: number; orders: number; avg_rating: number | null }[];
 }> {
   const context = await requireRestaurantContext(restaurantId);
   const span = Math.max(1, Math.min(365, Math.round(days)));
@@ -12810,11 +12810,11 @@ export async function GetOutletsComparison(
 // Green=on-target, Amber=watch, Red=action, Grey=missing data). `dir` says which
 // direction is good; `b` are the three cut points [excellent, on-target, watch].
 export type KpiStatus = "blue" | "green" | "amber" | "red" | "grey";
-export type KpiCard = { key: string; label: string; value: number | null; unit: string; status: KpiStatus };
+export interface KpiCard { key: string; label: string; value: number | null; unit: string; status: KpiStatus }
 
 function kpiBand(value: number | null, dir: "lower" | "higher", b: [number, number, number]): KpiStatus {
-  if (value == null || !Number.isFinite(value)) return "grey";
-  if (dir === "lower") return value <= b[0] ? "blue" : value <= b[1] ? "green" : value <= b[2] ? "amber" : "red";
+  if (value == null || !Number.isFinite(value)) {return "grey";}
+  if (dir === "lower") {return value <= b[0] ? "blue" : value <= b[1] ? "green" : value <= b[2] ? "amber" : "red";}
   return value >= b[0] ? "blue" : value >= b[1] ? "green" : value >= b[2] ? "amber" : "red";
 }
 
@@ -12890,9 +12890,9 @@ export async function GetAdvancedAnalytics(
   const totalOnTime = supRows.reduce((s, r) => s + r.on_time, 0);
   const overall_on_time_pct = totalPo > 0 ? round2((totalOnTime / totalPo) * 100) : null;
   const supplierScore = (onTimeFrac: number | null, quality: number | null): number | null => {
-    if (onTimeFrac == null && quality == null) return null;
-    if (quality == null) return round2(onTimeFrac ?? 0);
-    if (onTimeFrac == null) return round2(quality / 5);
+    if (onTimeFrac == null && quality == null) {return null;}
+    if (quality == null) {return round2(onTimeFrac ?? 0);}
+    if (onTimeFrac == null) {return round2(quality / 5);}
     return round2(0.6 * onTimeFrac + 0.4 * (quality / 5));
   };
   const suppliers = supRows.map((r) => {
@@ -12947,7 +12947,7 @@ export async function GetAdvancedAnalytics(
     `select * from "Campaigns" where res_id=$1 and (${og} or outlet_id=$2) order by starts_at desc limit 10`,
     [rid, oid],
   );
-  const campaigns: Array<{ id: string; name: string; cost: number; starts_at: string; ends_at: string; sales_during: number; sales_before: number; uplift_pct: number | null; roi_pct: number | null }> = [];
+  const campaigns: { id: string; name: string; cost: number; starts_at: string; ends_at: string; sales_during: number; sales_before: number; uplift_pct: number | null; roi_pct: number | null }[] = [];
   for (const raw of campRows) {
     const c = mapCampaign(raw);
     const sums = (await runQuery<{ during: number; before: number }>(
@@ -13010,10 +13010,10 @@ export async function GetAdvancedAnalytics(
   for (const b of bookingRows) {
     let st = "";
     try { st = String((typeof b.slot === "string" ? JSON.parse(b.slot) : b.slot)?.status ?? "").toLowerCase(); } catch { /* unparseable slot */ }
-    if (st.includes("cancel")) continue;
+    if (st.includes("cancel")) {continue;}
     bkTotal += 1;
-    if (st.includes("complete") || st.includes("seated")) bkDone += 1;
-    else if (st.replace(/[\s_-]/g, "").includes("noshow")) bkNoShow += 1;
+    if (st.includes("complete") || st.includes("seated")) {bkDone += 1;}
+    else if (st.replace(/[\s_-]/g, "").includes("noshow")) {bkNoShow += 1;}
   }
   const booking_fill_pct = bkTotal > 0 ? round2((bkDone / bkTotal) * 100) : null;
   const booking_no_show_pct = bkTotal > 0 ? round2((bkNoShow / bkTotal) * 100) : null;
@@ -13148,7 +13148,7 @@ export async function GetAdvancedAnalytics(
        from it where coalesce(name,'') <> '' group by name order by 2 desc limit 60`,
     [rid, oid, String(days)],
   );
-  const median = (xs: number[]) => { if (!xs.length) return 0; const s = [...xs].sort((a, b) => a - b); const m = Math.floor(s.length / 2); return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2; };
+  const median = (xs: number[]) => { if (!xs.length) {return 0;} const s = [...xs].sort((a, b) => a - b); const m = Math.floor(s.length / 2); return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2; };
   const qtyMed = median(itemRows.map((r) => r.qty));
   const unitMed = median(itemRows.map((r) => (r.qty > 0 ? r.revenue / r.qty : 0)));
   const totalQty = itemRows.reduce((s, r) => s + r.qty, 0);
@@ -13285,13 +13285,13 @@ export async function GetAdvancedAnalytics(
   }
   const byItem = new Map<string, Map<string, number>>();
   for (const r of weekRows) {
-    if (!byItem.has(r.name)) byItem.set(r.name, new Map());
+    if (!byItem.has(r.name)) {byItem.set(r.name, new Map());}
     byItem.get(r.name)!.set(r.wk, r.qty);
   }
   const W = [0.4, 0.3, 0.2, 0.1];
   const wavg = (series: number[], endIdx: number) => {
     let s = 0;
-    for (let k = 0; k < 4; k += 1) s += W[k]! * (series[endIdx - k] ?? 0);
+    for (let k = 0; k < 4; k += 1) {s += W[k]! * (series[endIdx - k] ?? 0);}
     return s;
   };
   const mapeErrs: number[] = [];
@@ -13306,7 +13306,7 @@ export async function GetAdvancedAnalytics(
       // retro-MAPE contributions from weeks that had actual sales
       for (let i = 4; i < series.length; i += 1) {
         const actual = series[i]!;
-        if (actual > 0) mapeErrs.push(Math.abs(wavg(series, i - 1) - actual) / actual);
+        if (actual > 0) {mapeErrs.push(Math.abs(wavg(series, i - 1) - actual) / actual);}
       }
       return { name, total_qty: round2(total), forecast_next_week: forecast, trend };
     })
@@ -13318,7 +13318,7 @@ export async function GetAdvancedAnalytics(
   // --- Offer redemption (coupon usage) ----------------------------------------
   // Coupons is a lazily-created table — tolerate its absence (42P01) for tenants
   // that never configured a promo.
-  let offers: Array<{ code: string; used: number; limit: number | null; redemption_pct: number | null }> = [];
+  let offers: { code: string; used: number; limit: number | null; redemption_pct: number | null }[] = [];
   try {
     const cRows = await runQuery<{ code: string; used_count: number; usage_limit: number | null }>(
       `select code, used_count, usage_limit from "Coupons" where res_id=$1 and ((${og} or outlet_id=$2) or outlet_id is null) order by used_count desc limit 20`,
@@ -13326,7 +13326,7 @@ export async function GetAdvancedAnalytics(
     );
     offers = cRows.map((c) => ({ code: c.code, used: c.used_count, limit: c.usage_limit, redemption_pct: c.usage_limit && c.usage_limit > 0 ? round2((c.used_count / c.usage_limit) * 100) : null }));
   } catch (err: any) {
-    if (err?.code !== "42P01") throw err;
+    if (err?.code !== "42P01") {throw err;}
   }
   const offersWithLimit = offers.filter((o) => o.redemption_pct != null);
   const overall_redemption_pct = offersWithLimit.length
@@ -13430,14 +13430,14 @@ export async function GetAdvancedAnalytics(
   };
 }
 
-export type ApcTrendPoint = {
+export interface ApcTrendPoint {
   month: string;         // "YYYY-MM"
   period_start: string;  // ISO
   total_revenue: number;
   total_covers: number;
   monthly_apc: number;
   bills: number;         // consolidated table-bills that month
-};
+}
 
 // Historical month-by-month trend (revenue / covers / APC), reusing the exact
 // same per-month aggregation as the single-month cards so the numbers always
@@ -13468,7 +13468,7 @@ export async function GetApcTrends(
 // One row per calendar month, up to 36 months back — built from single-pass
 // grouped queries (NOT the per-month APC engine, which would be far too slow at
 // this range). Months with no activity are zero-filled so the timeline is gapless.
-export type MonthlyHistoryRow = {
+export interface MonthlyHistoryRow {
   month: string; // "YYYY-MM"
   revenue: number;
   bills: number;
@@ -13479,7 +13479,7 @@ export type MonthlyHistoryRow = {
   avg_rating: number | null;
   new_customers: number;
   avg_tat_min: number | null;
-};
+}
 
 export async function GetMonthlyHistory(
   restaurantId: string,
@@ -13654,11 +13654,11 @@ export async function GetMonthlyApcInsights(
     [context.res_id, context.outlet_id, monthStart.toISOString(), monthEnd.toISOString()],
   );
 
-  const bookingsByTable = new Map<string, Array<{
+  const bookingsByTable = new Map<string, {
     start: Date;
     end: Date;
     people: number;
-  }>>();
+  }[]>();
 
   for (const row of bookingRows) {
     const slot = decodeSlot(row.slot, row.created_at);
@@ -13681,7 +13681,7 @@ export async function GetMonthlyApcInsights(
     const total = parseNumeric(payload.total) > 0 ? parseNumeric(payload.total) : subtotal;
 
     const payloadPeopleRaw = parseNumeric(
-      (payload.people_count as unknown) ?? (payload.number_of_people as unknown),
+      (payload.people_count) ?? (payload.number_of_people),
     );
 
     // Prioritize num_covers from table, then payload, then booking lookup
@@ -13759,7 +13759,7 @@ export async function GetMonthlyApcInsights(
   // counted ONCE. (Counting a table's covers once per order inflates the cover
   // count and crushes APC when a table places several orders.) APC for a table
   // = its bill (sum of orders) / the number of people on it.
-  type TableAgg = {
+  interface TableAgg {
     table_name: string;
     total: number;
     covers: number;
@@ -13767,7 +13767,7 @@ export async function GetMonthlyApcInsights(
     employee_id: string | null;
     employee_name: string | null;
     employee_role: string;
-  };
+  }
   const byTable = new Map<string, TableAgg>();
   for (const o of effectiveOrders) {
     const key = o.table_name || o.order_id;
@@ -13782,7 +13782,7 @@ export async function GetMonthlyApcInsights(
     };
     agg.total = round2(agg.total + o.total);
     agg.covers = Math.max(agg.covers, o.people_count); // covers counted once per table
-    if (o.created_at > agg.created_at) agg.created_at = o.created_at;
+    if (o.created_at > agg.created_at) {agg.created_at = o.created_at;}
     agg.employee_id ??= o.assigned_employee_id;
     agg.employee_name ??= o.assigned_employee_name;
     byTable.set(key, agg);
@@ -13819,7 +13819,7 @@ export async function GetMonthlyApcInsights(
   }>();
 
   for (const order of effectiveOrders) {
-    if (!order.assigned_employee_id) continue;
+    if (!order.assigned_employee_id) {continue;}
     const existing = employeeAccumulator.get(order.assigned_employee_id) ?? {
       employee_name: order.assigned_employee_name || order.assigned_employee_id,
       employee_role: order.assigned_employee_role || "waiter",
@@ -13867,8 +13867,8 @@ export async function GetMonthlyApcInsights(
   };
 }
 
-export type DishStat = { name: string; category: string; quantity: number; revenue: number; orders: number; current_price: number | null };
-export type PriceSuggestion = {
+export interface DishStat { name: string; category: string; quantity: number; revenue: number; orders: number; current_price: number | null }
+export interface PriceSuggestion {
   // Menu item UUID (null only if the sold name no longer matches a menu row) —
   // clients apply a suggestion via PATCH /menu/:id/price with this id.
   id: string | null;
@@ -13878,19 +13878,19 @@ export type PriceSuggestion = {
   suggested_price: number;
   direction: "increase" | "decrease";
   reason: string;
-};
+}
 // A suggestion that the raw hot-seller/slow-mover rules WOULD have produced but
 // that a convergence guard withheld, so the UI can explain the quiet period
 // instead of silently dropping the item.
-export type SuppressedSuggestion = {
+export interface SuppressedSuggestion {
   id: string | null;
   name: string;
   reason: "cooldown" | "drift_cap" | "margin_floor";
   // Cooldown only: when this item becomes eligible again
   // (price_updated_at + the analysis window).
   retry_after?: string;
-};
-export type WaiterStat = { employee_id: string; employee_name: string; orders: number; revenue: number };
+}
+export interface WaiterStat { employee_id: string; employee_name: string; orders: number; revenue: number }
 
 // --- Price-suggestion convergence guards ------------------------------------
 // A suggestion is a pure function of the window's sales and the item's CURRENT
@@ -13946,7 +13946,7 @@ export async function GetMenuPerformanceInsights(
 
   const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
   const menuByName = new Map<string, MenuItemRecord>();
-  for (const mi of menu) menuByName.set(mi.name.toLowerCase(), mi);
+  for (const mi of menu) {menuByName.set(mi.name.toLowerCase(), mi);}
 
   // Aggregate sold line items by dish name.
   const dishMap = new Map<string, { name: string; quantity: number; revenue: number; orders: number }>();
@@ -13956,7 +13956,7 @@ export async function GetMenuPerformanceInsights(
 
   for (const o of orderRows) {
     const f = parseJsonObject(o.food) ?? {};
-    const list = Array.isArray((f as Record<string, unknown>).items) ? (f as { items: unknown[] }).items : [];
+    const list = Array.isArray((f).items) ? (f as { items: unknown[] }).items : [];
     let orderRevenue = 0;
     for (const raw of list) {
       const it = (raw ?? {}) as Record<string, unknown>;
@@ -13971,10 +13971,10 @@ export async function GetMenuPerformanceInsights(
       const key = name.toLowerCase();
       const ex = dishMap.get(key);
       if (ex) { ex.quantity += quantity; ex.revenue = round2(ex.revenue + lineRevenue); ex.orders += 1; }
-      else dishMap.set(key, { name, quantity, revenue: lineRevenue, orders: 1 });
+      else {dishMap.set(key, { name, quantity, revenue: lineRevenue, orders: 1 });}
     }
     totalRevenue = round2(totalRevenue + orderRevenue);
-    const empId = String((f as Record<string, unknown>).taken_by_employee_id ?? "").trim();
+    const empId = String((f).taken_by_employee_id ?? "").trim();
     if (empId) {
       const w = waiterMap.get(empId) ?? { revenue: 0, orders: 0 };
       w.revenue = round2(w.revenue + orderRevenue);
@@ -14029,7 +14029,7 @@ export async function GetMenuPerformanceInsights(
   const costById = (): Promise<Map<string, number>> => {
     if (!costByIdPromise) {
       costByIdPromise = GetMenuCosting(restaurantId)
-        .then((c) => new Map(c.items.filter((i) => i.cost != null && i.cost > 0).map((i) => [i.id, i.cost as number])))
+        .then((c) => new Map(c.items.filter((i) => i.cost != null && i.cost > 0).map((i) => [i.id, i.cost!])))
         .catch(() => new Map<string, number>());
     }
     return costByIdPromise;
@@ -14047,12 +14047,12 @@ export async function GetMenuPerformanceInsights(
     // clean evidence about the current price yet. Self-scaling: a 7-day view
     // re-evaluates the item sooner than a 90-day view.
     const changedAt = mi?.price_updated_at ? Date.parse(mi.price_updated_at) : NaN;
-    if (Number.isFinite(changedAt) && changedAt >= start.getTime()) return "cooldown";
+    if (Number.isFinite(changedAt) && changedAt >= start.getTime()) {return "cooldown";}
     // (b) Total drift from the ORIGINAL price (not the last step), so repeated
     // adjustments across windows cannot compound without bound.
     const baseline = mi?.price_baseline != null && mi.price_baseline > 0 ? mi.price_baseline : price;
-    if (direction === "increase" && price >= baseline * PRICE_DRIFT_CAP_UP - PRICE_GUARD_EPSILON) return "drift_cap";
-    if (direction === "decrease" && price <= baseline * PRICE_DRIFT_CAP_DOWN + PRICE_GUARD_EPSILON) return "drift_cap";
+    if (direction === "increase" && price >= baseline * PRICE_DRIFT_CAP_UP - PRICE_GUARD_EPSILON) {return "drift_cap";}
+    if (direction === "decrease" && price <= baseline * PRICE_DRIFT_CAP_DOWN + PRICE_GUARD_EPSILON) {return "drift_cap";}
     return null;
   };
 
@@ -14068,7 +14068,7 @@ export async function GetMenuPerformanceInsights(
   };
 
   for (const d of sortedByQty) {
-    const price = d.current_price as number;
+    const price = d.current_price!;
     if (hotSellers.has(d.name.toLowerCase()) && d.quantity >= 5) {
       const mi = menuByName.get(d.name.toLowerCase());
       const blocked = gateSuggestion(mi, price, "increase");
@@ -14261,7 +14261,7 @@ export async function GetRestaurantProfile(
 // --- Customer-facing branding (logo + theme color) -------------------------
 let brandingColsEnsured = false;
 async function ensureBrandingColumns(): Promise<void> {
-  if (brandingColsEnsured) return;
+  if (brandingColsEnsured) {return;}
   await runQuery(`alter table "Restaurant" add column if not exists theme_color text`);
   await runQuery(`alter table "Restaurant" add column if not exists auto_push_orders boolean default true`);
   await runQuery(`alter table "Restaurant" add column if not exists currency text`);
@@ -14365,7 +14365,7 @@ export async function GetRestaurantRazorpayKeys(
   );
   const id = (rows[0]?.razorpay_key_id ?? "").trim();
   const secret = (rows[0]?.razorpay_key_secret ?? "").trim();
-  if (!id || !secret) return null;
+  if (!id || !secret) {return null;}
   return { key_id: id, key_secret: secret };
 }
 
@@ -14376,14 +14376,14 @@ export async function GetRestaurantRazorpayKeys(
 
 // Server-side messaging credentials (never sent to clients — the settings
 // endpoint only exposes a configured flag for the secret).
-export type MessagingConfig = {
+export interface MessagingConfig {
   provider: "none" | "twilio" | "meta";
   sender: string;
   key_id: string;
   key_secret: string;
   reminder_hours: number;
   webhook_secret: string;
-};
+}
 
 export async function GetMessagingConfig(restaurantId: string): Promise<MessagingConfig> {
   const context = await requireRestaurantContext(restaurantId);
@@ -14428,7 +14428,7 @@ async function ensureOutboundMessagesTable(): Promise<void> {
   });
 }
 
-export type OutboundMessageEntry = {
+export interface OutboundMessageEntry {
   channel: "sms" | "whatsapp";
   to_phone: string | null;
   body: string;
@@ -14437,7 +14437,7 @@ export type OutboundMessageEntry = {
   status: "sent" | "failed" | "skipped_no_provider";
   error?: string | null;
   provider?: string | null;
-};
+}
 
 export async function RecordOutboundMessage(
   restaurantId: string,
@@ -14470,7 +14470,7 @@ export async function RecordOutboundMessage(
 export async function GetOutboundMessages(
   restaurantId: string,
   limit = 50,
-): Promise<Array<{ id: string; channel: string; to_phone: string | null; body: string | null; kind: string | null; ref_id: string | null; status: string; error: string | null; provider: string | null; created_at: Date }>> {
+): Promise<{ id: string; channel: string; to_phone: string | null; body: string | null; kind: string | null; ref_id: string | null; status: string; error: string | null; provider: string | null; created_at: Date }[]> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureOutboundMessagesTable();
   return runQuery(
@@ -14483,14 +14483,14 @@ export async function GetOutboundMessages(
   );
 }
 
-export type DueBookingReminder = {
+export interface DueBookingReminder {
   booking_id: string;
   customer_name: string;
   phone: string;
   start: Date;
   party: number;
   table_name: string | null;
-};
+}
 
 // Bookings starting within the next `withinHours` that still need a reminder:
 // active-ish status, a guest phone on file and no reminder_sent stamp yet.
@@ -14536,12 +14536,12 @@ export async function GetDueBookingReminders(
   const due: DueBookingReminder[] = [];
   for (const row of rows) {
     const slot = decodeSlot(row.slot, row.created_at);
-    if (slot.reminder_sent === true) continue;
-    if (!REMINDABLE.has(String(slot.status ?? "Confirmed").trim().toLowerCase())) continue;
+    if (slot.reminder_sent === true) {continue;}
+    if (!REMINDABLE.has(String(slot.status ?? "Confirmed").trim().toLowerCase())) {continue;}
     const start = new Date(slot.start).getTime();
-    if (!Number.isFinite(start) || start <= now || start > horizon) continue;
+    if (!Number.isFinite(start) || start <= now || start > horizon) {continue;}
     const phone = (row.phone ?? "").trim();
-    if (!phone) continue;
+    if (!phone) {continue;}
     due.push({
       booking_id: row.booking_id,
       customer_name: `${row.cust_fname} ${row.cust_lname}`.trim(),
@@ -14568,9 +14568,9 @@ export async function MarkBookingReminderSent(
     [booking_id, context.res_id, context.outlet_id],
   );
   const row = rows[0];
-  if (!row) return false;
+  if (!row) {return false;}
   const slot = decodeSlot(row.slot, row.created_at);
-  if (slot.reminder_sent === true) return false;
+  if (slot.reminder_sent === true) {return false;}
   slot.reminder_sent = true;
   await runQuery(
     `update "Bookings" set slot = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
@@ -14579,7 +14579,7 @@ export async function MarkBookingReminderSent(
   return true;
 }
 
-export type PaymentMethodConfig = { id: string; label: string; enabled: boolean; requires_screenshot: boolean; online?: boolean };
+export interface PaymentMethodConfig { id: string; label: string; enabled: boolean; requires_screenshot: boolean; online?: boolean }
 
 // Default payment methods. Razorpay (online) on by default; alternate methods
 // 4–7 require a screenshot by default. Restaurants override via settings.
@@ -14596,7 +14596,7 @@ export const DEFAULT_PAYMENT_METHODS: PaymentMethodConfig[] = [
 
 function mergePaymentConfig(stored: unknown): PaymentMethodConfig[] {
   const byId = new Map<string, Record<string, unknown>>();
-  if (Array.isArray(stored)) for (const m of stored) { const id = String((m as any)?.id ?? ""); if (id) byId.set(id, m as any); }
+  if (Array.isArray(stored)) {for (const m of stored) { const id = String((m)?.id ?? ""); if (id) {byId.set(id, m);} }}
   return DEFAULT_PAYMENT_METHODS.map((def) => {
     const ov = byId.get(def.id);
     return {
@@ -14608,15 +14608,15 @@ function mergePaymentConfig(stored: unknown): PaymentMethodConfig[] {
 }
 
 // --- Customer feedback form configuration -----------------------------------
-export type FeedbackCategoryConfig = { key: string; label: string };
-export type FeedbackConfig = {
+export interface FeedbackCategoryConfig { key: string; label: string }
+export interface FeedbackConfig {
   title: string;
   subtitle: string;
   valet_enabled: boolean;
   require_image: boolean;
   review_url: string; // external review link (Google/TripAdvisor) for the high-rating CTA
   categories: FeedbackCategoryConfig[];
-};
+}
 
 const DEFAULT_FEEDBACK_CATEGORIES: FeedbackCategoryConfig[] = [
   { key: "initial_greeting", label: "Initial Greeting" },
@@ -14645,7 +14645,7 @@ function mergeFeedbackConfig(stored: unknown): FeedbackConfig {
         .map((c) => {
           const o = (c ?? {}) as Record<string, unknown>;
           const label = String(o.label ?? "").trim();
-          if (!label) return null;
+          if (!label) {return null;}
           const key = String(o.key ?? "").trim() || label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
           return { key: (key || "category").slice(0, 40), label: label.slice(0, 40) };
         })
@@ -14663,19 +14663,19 @@ function mergeFeedbackConfig(stored: unknown): FeedbackConfig {
 
 // Normalize an arbitrary tax payload (array of {name,percentage} or a
 // name->percentage record) into an ordered, validated array.
-function normalizeTaxes(raw: unknown): Array<{ name: string; percentage: number }> {
-  const out: Array<{ name: string; percentage: number }> = [];
+function normalizeTaxes(raw: unknown): { name: string; percentage: number }[] {
+  const out: { name: string; percentage: number }[] = [];
   if (Array.isArray(raw)) {
     for (const t of raw) {
       const o = (t ?? {}) as Record<string, unknown>;
       const name = String(o.name ?? "").trim();
       const pct = Number(o.percentage);
-      if (name && Number.isFinite(pct) && pct >= 0) out.push({ name: name.slice(0, 24), percentage: round2(pct) });
+      if (name && Number.isFinite(pct) && pct >= 0) {out.push({ name: name.slice(0, 24), percentage: round2(pct) });}
     }
   } else if (raw && typeof raw === "object") {
     for (const [name, pct] of Object.entries(raw as Record<string, unknown>)) {
       const p = Number(pct);
-      if (name.trim() && Number.isFinite(p) && p >= 0) out.push({ name: name.trim().slice(0, 24), percentage: round2(p) });
+      if (name.trim() && Number.isFinite(p) && p >= 0) {out.push({ name: name.trim().slice(0, 24), percentage: round2(p) });}
     }
   }
   return out;
@@ -14684,17 +14684,17 @@ function normalizeTaxes(raw: unknown): Array<{ name: string; percentage: number 
 // Managed kitchen-section list: trimmed, case-insensitively deduped, capped at
 // 20 sections of 32 chars each. Order is preserved (it drives KDS chip order).
 export function sanitizeKitchenSections(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {return [];}
   const out: string[] = [];
   const seen = new Set<string>();
   for (const s of raw) {
     const name = typeof s === "string" ? s.trim().replace(/\s+/g, " ").slice(0, 32) : "";
-    if (!name) continue;
+    if (!name) {continue;}
     const key = name.toLowerCase();
-    if (seen.has(key)) continue;
+    if (seen.has(key)) {continue;}
     seen.add(key);
     out.push(name);
-    if (out.length >= 20) break;
+    if (out.length >= 20) {break;}
   }
   return out;
 }
@@ -14709,17 +14709,17 @@ export const DEFAULT_INVENTORY_CATEGORIES: string[] = ["Vegetable", "Meat", "Dai
 // A non-array value (i.e. the column was never written) falls back to the
 // built-in defaults so GET /restaurant/settings always returns a usable list.
 export function sanitizeInventoryCategories(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [...DEFAULT_INVENTORY_CATEGORIES];
+  if (!Array.isArray(raw)) {return [...DEFAULT_INVENTORY_CATEGORIES];}
   const out: string[] = [];
   const seen = new Set<string>();
   for (const s of raw) {
     const name = typeof s === "string" ? s.trim().replace(/\s+/g, " ").slice(0, 40) : "";
-    if (!name) continue;
+    if (!name) {continue;}
     const key = name.toLowerCase();
-    if (seen.has(key)) continue;
+    if (seen.has(key)) {continue;}
     seen.add(key);
     out.push(name);
-    if (out.length >= 40) break;
+    if (out.length >= 40) {break;}
   }
   return out;
 }
@@ -14745,7 +14745,7 @@ export const BRAND_FONTS: string[] = [
 // A tenant's customer-page customization. Every key is optional at the storage
 // layer (only provided, valid keys are persisted); the read layer applies sane
 // defaults (see resolveBrandConfig).
-export type BrandConfig = {
+export interface BrandConfig {
   font?: string;
   color_primary?: string;
   color_secondary?: string;
@@ -14754,7 +14754,7 @@ export type BrandConfig = {
   color_card?: string;
   header_style?: "gradient" | "solid";
   button_shape?: "rounded" | "pill" | "square";
-};
+}
 
 const BRAND_HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const BRAND_COLOR_KEYS = ["color_primary", "color_secondary", "color_bg", "color_text", "color_card"] as const;
@@ -14767,13 +14767,13 @@ const BRAND_COLOR_KEYS = ["color_primary", "color_secondary", "color_bg", "color
 export function sanitizeBrandConfigInput(raw: unknown): BrandConfig {
   const s = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const out: BrandConfig = {};
-  if (typeof s.font === "string" && BRAND_FONTS.includes(s.font.trim())) out.font = s.font.trim();
+  if (typeof s.font === "string" && BRAND_FONTS.includes(s.font.trim())) {out.font = s.font.trim();}
   for (const key of BRAND_COLOR_KEYS) {
     const v = s[key];
-    if (typeof v === "string" && BRAND_HEX_RE.test(v.trim())) out[key] = v.trim();
+    if (typeof v === "string" && BRAND_HEX_RE.test(v.trim())) {out[key] = v.trim();}
   }
-  if (s.header_style === "gradient" || s.header_style === "solid") out.header_style = s.header_style;
-  if (s.button_shape === "rounded" || s.button_shape === "pill" || s.button_shape === "square") out.button_shape = s.button_shape;
+  if (s.header_style === "gradient" || s.header_style === "solid") {out.header_style = s.header_style;}
+  if (s.button_shape === "rounded" || s.button_shape === "pill" || s.button_shape === "square") {out.button_shape = s.button_shape;}
   return out;
 }
 
@@ -14800,11 +14800,11 @@ export function resolveBrandConfig(stored: unknown, themePrimary: string | null,
   };
 }
 
-export type RestaurantSettings = {
+export interface RestaurantSettings {
   auto_push_orders: boolean;
   currency: string;
   payment_methods: PaymentMethodConfig[];
-  taxes: Array<{ name: string; percentage: number }>;
+  taxes: { name: string; percentage: number }[];
   service_charge: number;
   discount_approval_threshold: number;
   bill_reopen_window_min: number;
@@ -14845,17 +14845,17 @@ export type RestaurantSettings = {
   brand_config: BrandConfig;
   // The curated font allowlist the branding editor renders as a dropdown.
   brand_fonts: string[];
-};
+}
 
 // Basic sanitization for an uploaded SVG logo: cap the size and strip the
 // script/event-handler vectors so a stored logo can't run code where it's
 // rendered. Returns "" for anything that isn't a plausible <svg> document.
 export function sanitizeBillLogoSvg(input: unknown): string {
-  if (typeof input !== "string") return "";
+  if (typeof input !== "string") {return "";}
   let svg = input.trim();
-  if (!svg) return "";
-  if (svg.length > 100_000) svg = svg.slice(0, 100_000);
-  if (!/^<svg[\s>]/i.test(svg) || !/<\/svg>/i.test(svg)) return "";
+  if (!svg) {return "";}
+  if (svg.length > 100_000) {svg = svg.slice(0, 100_000);}
+  if (!/^<svg[\s>]/i.test(svg) || !/<\/svg>/i.test(svg)) {return "";}
   // Drop <script> blocks, on*= handlers, and javascript: URLs.
   svg = svg
     .replace(/<script[\s\S]*?<\/script>/gi, "")
@@ -15151,30 +15151,30 @@ function isBlockedIp(ip: string): boolean {
   if (net.isIPv4(ip)) {
     const o = ip.split(".").map(Number);
     const a = o[0] ?? 0, b = o[1] ?? 0;
-    if (a === 127 || a === 10 || a === 0) return true;      // loopback / 10-8 / this-host
-    if (a === 172 && b >= 16 && b <= 31) return true;        // 172.16/12
-    if (a === 192 && b === 168) return true;                 // 192.168/16
-    if (a === 169 && b === 254) return true;                 // link-local + cloud metadata
-    if (a === 100 && b >= 64 && b <= 127) return true;       // CGNAT 100.64/10
-    if (a >= 224) return true;                               // multicast / reserved
+    if (a === 127 || a === 10 || a === 0) {return true;}      // loopback / 10-8 / this-host
+    if (a === 172 && b >= 16 && b <= 31) {return true;}        // 172.16/12
+    if (a === 192 && b === 168) {return true;}                 // 192.168/16
+    if (a === 169 && b === 254) {return true;}                 // link-local + cloud metadata
+    if (a === 100 && b >= 64 && b <= 127) {return true;}       // CGNAT 100.64/10
+    if (a >= 224) {return true;}                               // multicast / reserved
     return false;
   }
   const l = ip.toLowerCase();
-  if (l === "::1" || l === "::" || l.startsWith("fe80") || l.startsWith("fc") || l.startsWith("fd")) return true;
-  if (l.startsWith("::ffff:")) return isBlockedIp(l.slice(7));        // IPv4-mapped
+  if (l === "::1" || l === "::" || l.startsWith("fe80") || l.startsWith("fc") || l.startsWith("fd")) {return true;}
+  if (l.startsWith("::ffff:")) {return isBlockedIp(l.slice(7));}        // IPv4-mapped
   return false;
 }
 // Returns the URL only if it's a PUBLIC http(s) target (DNS-resolved, no private IP).
 async function assertPublicHttpUrl(urlStr: string): Promise<URL | null> {
   let u: URL;
   try { u = new URL(urlStr); } catch { return null; }
-  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  if (u.protocol !== "http:" && u.protocol !== "https:") {return null;}
   const host = u.hostname.replace(/^\[|\]$/g, "");
-  if (!host || /(^|\.)(localhost|internal|local)$/i.test(host)) return null;
-  if (net.isIP(host)) return isBlockedIp(host) ? null : u;
+  if (!host || /(^|\.)(localhost|internal|local)$/i.test(host)) {return null;}
+  if (net.isIP(host)) {return isBlockedIp(host) ? null : u;}
   try {
     const addrs = await dnsLookup(host, { all: true });
-    if (addrs.length === 0 || addrs.some((a) => isBlockedIp(a.address))) return null;
+    if (addrs.length === 0 || addrs.some((a) => isBlockedIp(a.address))) {return null;}
     return u;
   } catch { return null; }
 }
@@ -15188,11 +15188,11 @@ async function logoToBuffer(logoRef: string): Promise<Buffer | null> {
   }
   try {
     const blob = await downloadFile(logoRef);
-    if (blob) return Buffer.from(await blob.arrayBuffer());
+    if (blob) {return Buffer.from(await blob.arrayBuffer());}
   } catch {/* fall through to direct fetch */}
   if (/^https?:\/\//.test(logoRef)) {
     const safe = await assertPublicHttpUrl(logoRef);
-    if (!safe) return null; // SSRF guard: refuse internal/metadata targets
+    if (!safe) {return null;} // SSRF guard: refuse internal/metadata targets
     try {
       // redirect:"manual" so a 3xx can't bounce us to an internal host post-check.
       const r = await fetch(safe, { redirect: "manual" });
@@ -15211,8 +15211,8 @@ const logoPaletteCache = new Map<string, { primary: string; secondary: string } 
 // distinct accent) from the logo. Done server-side so there's no canvas/CORS
 // taint that previously left the customer pages stuck on the default theme.
 export async function ExtractLogoPalette(logoRef: string | null): Promise<{ primary: string; secondary: string } | null> {
-  if (!logoRef) return null;
-  if (logoPaletteCache.has(logoRef)) return logoPaletteCache.get(logoRef) ?? null;
+  if (!logoRef) {return null;}
+  if (logoPaletteCache.has(logoRef)) {return logoPaletteCache.get(logoRef) ?? null;}
   let result: { primary: string; secondary: string } | null = null;
   try {
     const buf = await logoToBuffer(logoRef);
@@ -15222,14 +15222,14 @@ export async function ExtractLogoPalette(logoRef: string | null): Promise<{ prim
       const buckets = new Map<string, { count: number; r: number; g: number; b: number }>();
       for (let i = 0; i + ch - 1 < data.length; i += ch) {
         const a = ch >= 4 ? (data[i + 3] ?? 255) : 255;
-        if (a < 200) continue;
+        if (a < 200) {continue;}
         const r = data[i] ?? 0, g = data[i + 1] ?? 0, b = data[i + 2] ?? 0;
-        if (r > 238 && g > 238 && b > 238) continue; // skip near-white
-        if (r < 18 && g < 18 && b < 18) continue;     // skip near-black
+        if (r > 238 && g > 238 && b > 238) {continue;} // skip near-white
+        if (r < 18 && g < 18 && b < 18) {continue;}     // skip near-black
         const key = `${r >> 5}-${g >> 5}-${b >> 5}`;
         const ex = buckets.get(key);
         if (ex) { ex.count++; ex.r += r; ex.g += g; ex.b += b; }
-        else buckets.set(key, { count: 1, r, g, b });
+        else {buckets.set(key, { count: 1, r, g, b });}
       }
       if (buckets.size > 0) {
         const toHex = (c: { r: number; g: number; b: number }) =>
@@ -15355,7 +15355,7 @@ export async function AddNotification(
 export async function GetNotifications(
   restaurantId: string,
   limit = 50,
-): Promise<{ notifications: Array<Record<string, unknown>>; unread: number }> {
+): Promise<{ notifications: Record<string, unknown>[]; unread: number }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureNotificationsTable();
   const rows = await runQuery<Record<string, unknown>>(
@@ -15582,7 +15582,7 @@ export async function GetOutletDefaultTax(restaurantId: string): Promise<Record<
   );
 
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
   return row.default_tax ?? null;
 }
 
@@ -15600,10 +15600,10 @@ export async function GetRestaurantLogo(restaurantId: string): Promise<string | 
     [context.res_id],
   );
   const row = rows[0];
-  if (!row || !row.logo_url) return null;
+  if (!row?.logo_url) {return null;}
   const logo_base64 = await downloadFile(row.logo_url)
     .then(async (blob) => {
-      if (!blob) return null;
+      if (!blob) {return null;}
       const arrayBuffer = await blob.arrayBuffer();
       return Buffer.from(arrayBuffer).toString("base64");
     })
@@ -15667,7 +15667,7 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
     [orderId, context.res_id, context.outlet_id, tableId],
   );
   const row = rows[0];
-  if (!row) return null;
+  if (!row) {return null;}
 
   return {
     ...row,
@@ -15695,8 +15695,8 @@ export async function GetRestaurantLogoRaw(restaurantId: string): Promise<Buffer
     [context.res_id],
   );
   const row = rows[0];
-  if (!row || !row.logo) return null;
-  return row.logo as Buffer;
+  if (!row?.logo) {return null;}
+  return row.logo;
 }
 
 export async function UpdateOutletDefaultTax(restaurantId: string, defaultTax: Record<string, number> | null): Promise<void> {
@@ -15736,12 +15736,12 @@ export async function GetRoles(restaurantId: string): Promise<RoleRecord[]> {
   }));
 }
 
-export type ActionRecord = {
+export interface ActionRecord {
   id: string;
   action_name: string;
   action_desc?: string | null;
   group?: string | null;
-};
+}
 
 export class ValidationError extends Error {
   public invalidActionIds: string[];
@@ -15890,7 +15890,7 @@ export async function AssignRoleToEmployee(
         [raw, context.res_id],
         client,
       );
-      if (!roleRows[0]) throw new Error("Role does not exist");
+      if (!roleRows[0]) {throw new Error("Role does not exist");}
       entryToAdd = roleRows[0].id; // store id for custom role
     } else {
       const normalizedRole = raw.toLowerCase();
@@ -15943,7 +15943,7 @@ export async function RemoveRoleFromEmployee(
 ): Promise<void> {
   const context = await requireRestaurantContext(restaurantId);
   const raw = String(roleName ?? "").trim();
-  if (!raw) throw new Error("Role is required");
+  if (!raw) {throw new Error("Role is required");}
 
   await withTransaction(async (client) => {
     const employee = await getEmployeeRoleRow(context, employeeId, client);
@@ -16016,7 +16016,7 @@ export async function DeleteRole(
       client,
     );
     const role = roleRows[0];
-    if (!role) return false;
+    if (!role) {return false;}
     if (["admin", "employee", "valet"].includes(role.role_name.trim().toLowerCase())) {
       throw new Error("Core roles cannot be deleted");
     }
@@ -16079,7 +16079,7 @@ export async function GetRestaurantUserRole(
 ): Promise<RestaurantUser["role"] | null> {
   const context = await requireRestaurantContext(restaurantId);
   const normalizedEmployeeId = employeeId.trim();
-  if (!normalizedEmployeeId) return null;
+  if (!normalizedEmployeeId) {return null;}
 
   // Accept either employee username (case-insensitive) or employee UUID (emp_id)
   const normalizedEmployeeLower = normalizedEmployeeId.toLowerCase();
@@ -16108,7 +16108,7 @@ export async function GetRestaurantUserRole(
 
 let feedbackColsEnsured = false;
 async function ensureFeedbackColumns(client?: PoolClient): Promise<void> {
-  if (feedbackColsEnsured && !client) return;
+  if (feedbackColsEnsured && !client) {return;}
   // Service-recovery: low-rating feedback becomes an internal ticket staff resolve.
   await runQuery(`alter table "Feedback_entries" add column if not exists recovery_status text`, [], client);
   await runQuery(`alter table "Feedback_entries" add column if not exists recovery_resolved_at timestamptz`, [], client);
@@ -16116,7 +16116,7 @@ async function ensureFeedbackColumns(client?: PoolClient): Promise<void> {
   await runQuery(`alter table "Feedback_entries" add column if not exists recovery_note text`, [], client);
   // NPS: optional 0–10 recommend score asked on the feedback form.
   await runQuery(`alter table "Feedback_entries" add column if not exists nps integer`, [], client);
-  if (!client) feedbackColsEnsured = true;
+  if (!client) {feedbackColsEnsured = true;}
 }
 
 export async function AddFeedbackEntry(
@@ -16290,7 +16290,7 @@ export async function GetFeedbackSummary(
 
     for (const category of row.category_ratings ?? []) {
       const key = category.key.trim();
-      if (!key) continue;
+      if (!key) {continue;}
       const existing = categoryTotals.get(key) ?? {
         label: category.label,
         total: 0,
@@ -16321,18 +16321,18 @@ export async function GetFeedbackSummary(
   };
 }
 
-export type RecoveryTicket = {
+export interface RecoveryTicket {
   id: string;
   customer_name: string | null;
   overall_rating: number;
   comments: string | null;
-  category_ratings: Array<{ key: string; label: string; rating: number; follow_up_answer: string | null }>;
+  category_ratings: { key: string; label: string; rating: number; follow_up_answer: string | null }[];
   submitted_at: string;
   recovery_status: string;
   recovery_resolved_at: string | null;
   recovery_resolved_by: string | null;
   recovery_note: string | null;
-};
+}
 
 // Service-recovery tickets: low-rating feedback that needs staff follow-up. By
 // default returns OPEN tickets only.
@@ -16362,7 +16362,7 @@ export async function GetRecoveryTickets(restaurantId: string, includeResolved =
     [context.res_id, context.outlet_id],
   );
   return rows.map((r) => {
-    const cats = Array.isArray(r.category_ratings) ? (r.category_ratings as any[]) : [];
+    const cats = Array.isArray(r.category_ratings) ? (r.category_ratings) : [];
     return {
       id: r.id,
       customer_name: r.cust_name,
@@ -16451,9 +16451,9 @@ async function findOpenShift(context: RestaurantContext, employeeId: string): Pr
 export async function ClockIn(restaurantId: string, employeeId: string): Promise<{ clocked_in: true; since: string }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureAttendanceTable();
-  if (!isUuid(employeeId)) throw new Error("Invalid employee");
+  if (!isUuid(employeeId)) {throw new Error("Invalid employee");}
   const open = await findOpenShift(context, employeeId);
-  if (open) return { clocked_in: true, since: new Date(open.clock_in).toISOString() };
+  if (open) {return { clocked_in: true, since: new Date(open.clock_in).toISOString() };}
   // clock_in defaults to now() — the REAL clock-in moment; approval never moves it.
   const rows = await runQuery<{ clock_in: Date }>(
     `insert into "Attendance" (id, res_id, outlet_id, emp_id, status) values ($1, $2, $3, $4, 'pending') returning clock_in`,
@@ -16479,7 +16479,7 @@ export async function SetAttendanceApproval(
       returning id, emp_id, status, clock_in`,
     [attendanceId, context.res_id, context.outlet_id, approve ? "approved" : "rejected", approvedBy || null],
   );
-  if (!rows[0]) throw new Error("Clock-in not found or already reviewed");
+  if (!rows[0]) {throw new Error("Clock-in not found or already reviewed");}
   return { ...rows[0], clock_in: new Date(rows[0].clock_in).toISOString() };
 }
 
@@ -16487,7 +16487,7 @@ export async function ClockOut(restaurantId: string, employeeId: string): Promis
   const context = await requireRestaurantContext(restaurantId);
   await ensureAttendanceTable();
   const open = await findOpenShift(context, employeeId);
-  if (!open) throw new Error("You are not clocked in");
+  if (!open) {throw new Error("You are not clocked in");}
   const rows = await runQuery<{ clock_in: Date; clock_out: Date }>(
     `update "Attendance" set clock_out = now() where id = $1 and res_id = $2 and outlet_id = $3 returning clock_in, clock_out`,
     [open.id, context.res_id, context.outlet_id],
@@ -16500,7 +16500,7 @@ export async function ClockOut(restaurantId: string, employeeId: string): Promis
 export async function GetMyAttendance(restaurantId: string, employeeId: string): Promise<{ clocked_in: boolean; since: string | null; today_minutes: number; pending_approval: boolean }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureAttendanceTable();
-  if (!isUuid(employeeId)) return { clocked_in: false, since: null, today_minutes: 0, pending_approval: false };
+  if (!isUuid(employeeId)) {return { clocked_in: false, since: null, today_minutes: 0, pending_approval: false };}
   const open = await findOpenShift(context, employeeId);
   const now = new Date();
   const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
@@ -16512,16 +16512,16 @@ export async function GetMyAttendance(restaurantId: string, employeeId: string):
   let today = 0;
   let pendingApproval = false;
   for (const r of rows) {
-    if (r.status === "rejected") continue; // rejected shifts never count
-    if (r.status === "pending") pendingApproval = true;
+    if (r.status === "rejected") {continue;} // rejected shifts never count
+    if (r.status === "pending") {pendingApproval = true;}
     const end = r.clock_out ? new Date(r.clock_out).getTime() : Date.now();
     today += Math.max(0, (end - new Date(r.clock_in).getTime()) / 60000);
   }
   return { clocked_in: !!open, since: open ? new Date(open.clock_in).toISOString() : null, today_minutes: Math.round(today), pending_approval: pendingApproval };
 }
 
-export type AttendanceSummaryRow = { emp_id: string; name: string; minutes: number; shifts: number; open: boolean };
-export type PendingClockIn = { id: string; emp_id: string; name: string; clock_in: string; clock_out: string | null };
+export interface AttendanceSummaryRow { emp_id: string; name: string; minutes: number; shifts: number; open: boolean }
+export interface PendingClockIn { id: string; emp_id: string; name: string; clock_in: string; clock_out: string | null }
 export async function GetAttendanceSummary(
   restaurantId: string,
   fromIso?: string,
@@ -16546,13 +16546,13 @@ export async function GetAttendanceSummary(
       pending.push({ id: r.id, emp_id: r.emp_id, name, clock_in: new Date(r.clock_in).toISOString(), clock_out: r.clock_out ? new Date(r.clock_out).toISOString() : null });
     }
     // Rejected shifts never count; pending shifts count only once approved.
-    if (r.status === "pending" || r.status === "rejected") continue;
+    if (r.status === "pending" || r.status === "rejected") {continue;}
     const end = r.clock_out ? new Date(r.clock_out).getTime() : Date.now();
     const mins = Math.max(0, Math.round((end - new Date(r.clock_in).getTime()) / 60000));
     const e = byEmp.get(r.emp_id) ?? { emp_id: r.emp_id, name, minutes: 0, shifts: 0, open: false };
     e.minutes += mins;
     e.shifts += 1;
-    if (!r.clock_out) e.open = true;
+    if (!r.clock_out) {e.open = true;}
     e.name = name;
     byEmp.set(r.emp_id, e);
   }
@@ -16580,7 +16580,7 @@ export async function GetRestaurantOutletsPublic(
   slugOrId: string,
 ): Promise<{ id: string; name: string }[]> {
   const raw = String(slugOrId ?? "").trim();
-  if (!raw) return [];
+  if (!raw) {return [];}
   const normalized = normalizeRestaurantId(raw);
   const rows = await runQuery<{ id: string; name: string | null }>(
     `
@@ -16621,7 +16621,7 @@ async function resolveRestaurantOwnerId(resId: string, client?: PoolClient): Pro
     [resId],
     client,
   );
-  if (adminRows[0]?.employee_id) return adminRows[0].employee_id;
+  if (adminRows[0]?.employee_id) {return adminRows[0].employee_id;}
 
   const anyRows = await runQuery<{ employee_id: string }>(
     `
@@ -16697,7 +16697,7 @@ export async function GetRestaurantUsers(
   const ownerId = await resolveRestaurantOwnerId(context.res_id);
   if (ownerId) {
     for (const u of mapped) {
-      if (u.employee_id === ownerId) u.is_superadmin = true;
+      if (u.employee_id === ownerId) {u.is_superadmin = true;}
     }
   }
 
@@ -16721,7 +16721,7 @@ export async function SetUserPassword(
   newPassword: string,
 ): Promise<boolean> {
   const pass = String(newPassword ?? "").trim();
-  if (pass.length < 4) throw new Error("Password must be at least 4 characters");
+  if (pass.length < 4) {throw new Error("Password must be at least 4 characters");}
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const hash = await hashPassword(pass);
@@ -16732,7 +16732,7 @@ export async function SetUserPassword(
       [context.res_id, context.outlet_id, employeeId, hash],
       client,
     );
-    if (!rows[0]) throw new Error("User not found");
+    if (!rows[0]) {throw new Error("User not found");}
     await ensurePasswordResetTable(client);
     await runQuery(
       `update "PasswordResetRequests" set status = 'resolved', resolved_at = now()
@@ -16771,7 +16771,7 @@ export async function AddPasswordResetRequest(
   username: string,
 ): Promise<{ success: true }> {
   const uname = String(username ?? "").trim();
-  if (!uname) throw new Error("Username is required");
+  if (!uname) {throw new Error("Username is required");}
   const context = await requireRestaurantContext(restaurantSlug);
   return withTenant(
     { res_id: context.res_id, outlet_id: context.outlet_id, employeeId: "", role: "" },
@@ -16803,7 +16803,7 @@ export async function AddPasswordResetRequest(
 
 export async function GetPasswordResetRequests(
   restaurantId: string,
-): Promise<Array<{ id: string; employee_id: string; username: string; name: string; created_at: string }>> {
+): Promise<{ id: string; employee_id: string; username: string; name: string; created_at: string }[]> {
   const context = await requireRestaurantContext(restaurantId);
   await ensurePasswordResetTable();
   const rows = await runQuery<{ id: string; emp_id: string; username: string; fname: string | null; lname: string | null; created_at: Date }>(
@@ -16888,7 +16888,7 @@ export async function DeleteRestaurantUser(
   });
 }
 
-export type EmployeeLoginResult = {
+export interface EmployeeLoginResult {
   employeeId: string; // uuid of Employees.id
   employeeUsername: string; // login username
   role: "admin" | "employee" | "valet" | "waiter" | "cashier" | "captain" | "manager";
@@ -16901,7 +16901,7 @@ export type EmployeeLoginResult = {
   emp_Lname: string | null;
   actions_set: Set<string>;
   action_names: string[];
-};
+}
 
 // Effective lifecycle status of a restaurant ('active' | 'suspended' |
 // 'expired'), via the platform SECURITY DEFINER function. Returns 'active' when
@@ -16923,10 +16923,10 @@ export async function GetRestaurantAccountStatus(resId: string): Promise<string>
   }
 }
 
-export type RestaurantPlan = {
+export interface RestaurantPlan {
   features: Record<string, unknown>;
   limits: Record<string, unknown>;
-};
+}
 
 // Effective plan features + limits for a restaurant, via the platform SECURITY
 // DEFINER function. Returns empty objects when the control plane isn't deployed
@@ -16968,7 +16968,7 @@ export async function AuthenticateRestaurantEmployee(
     return null;
   }
   const normalizedEmployeeUsername = employeeUsername.trim();
-  if (!normalizedEmployeeUsername) return null;
+  if (!normalizedEmployeeUsername) {return null;}
 
   // Login touches tenant tables (Login/Employees/Roles), so run the lookups
   // inside the restaurant's tenant context (RLS-safe) now that res_id is known
@@ -17011,11 +17011,11 @@ export async function AuthenticateRestaurantEmployee(
       );
 
       const row = rows[0];
-      if (!row) return null;
+      if (!row) {return null;}
 
       // Verify against the stored secret (argon2 hash, or legacy plaintext).
       const passwordOk = await verifyPassword(row.emp_pass, password);
-      if (!passwordOk) return null;
+      if (!passwordOk) {return null;}
 
       // Transparently upgrade a legacy plaintext credential to an argon2 hash.
       if (!isHashedPassword(row.emp_pass)) {
@@ -17027,7 +17027,7 @@ export async function AuthenticateRestaurantEmployee(
       }
 
       const coreRoleName = Object.keys(CORE_ROLES);
-      let actionSet = new Set<string>();
+      const actionSet = new Set<string>();
       const promises = (row.emp_roles['all'] ?? []).map(async role => {
         if (coreRoleName.includes(role)) {
           CORE_ROLES[role as CoreRoleKey].forEach(action => actionSet.add(action));
@@ -17087,7 +17087,7 @@ export async function EnsureRestaurantSeed(seed: RestaurantSeedInput): Promise<v
   const profile = seed.profile ?? {};
 
   await withTransaction(async (client) => {
-    let restaurantRows = await runQuery<{ id: string }>(
+    const restaurantRows = await runQuery<{ id: string }>(
       `
         select id
         from "Restaurant"
@@ -17127,7 +17127,7 @@ export async function EnsureRestaurantSeed(seed: RestaurantSeedInput): Promise<v
     // metadata tables and accept the rows above even before this is set.
     await client.query("select set_config('app.res_id', $1, true)", [resId]);
 
-    let outletRows = await runQuery<{ id: string }>(
+    const outletRows = await runQuery<{ id: string }>(
       `
         select id
         from "Outlets"
