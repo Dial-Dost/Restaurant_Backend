@@ -26,9 +26,18 @@ export interface SessionPayload {
 	employeeUsername: string;
 	restaurantUsername: string;
 	restaurantName: string;
+	// Epoch ms the session was minted. Stamped by createSession (never by the
+	// caller) and used to enforce the ABSOLUTE lifetime below, so a token cannot
+	// be kept alive forever by the sliding TTL. Optional so sessions minted before
+	// this field existed keep working until their sliding TTL lapses.
+	issued_at?: number;
 }
 
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS ?? 60 * 60 * 12); // sliding 12h
+// Hard ceiling on a session's life regardless of activity: refreshTtl slides the
+// 12h window on every request, so without this a token that keeps being used
+// never expires. 7 days by default.
+const SESSION_MAX_LIFETIME_SECONDS = Number(process.env.SESSION_MAX_LIFETIME_SECONDS ?? 60 * 60 * 24 * 7);
 const SESSION_PREFIX = "session:";
 const EMP_SESSIONS_PREFIX = "emp_sessions:";
 const RES_SESSIONS_PREFIX = "res_sessions:";
@@ -40,7 +49,7 @@ function newToken(): string {
 export async function createSession(payload: SessionPayload): Promise<string> {
 	const store = await getStore();
 	const token = newToken();
-	await store.set(SESSION_PREFIX + token, JSON.stringify(payload), SESSION_TTL_SECONDS);
+	await store.set(SESSION_PREFIX + token, JSON.stringify({ ...payload, issued_at: Date.now() }), SESSION_TTL_SECONDS);
 	// Index the token under the employee so we can revoke every session for a
 	// user (role change, password reset, "log out everywhere").
 	const empKey = EMP_SESSIONS_PREFIX + payload.employeeId;
@@ -63,10 +72,35 @@ export async function getSession(token: string): Promise<SessionPayload | null> 
 	if (!raw) {
 		return null;
 	}
+	let payload: SessionPayload;
 	try {
-		return JSON.parse(raw) as SessionPayload;
+		payload = JSON.parse(raw) as SessionPayload;
 	} catch {
 		return null;
+	}
+	// Absolute lifetime: past the ceiling the token is dead even though the
+	// sliding TTL kept refreshing it. Sessions minted before issued_at existed
+	// have no stamp and are left to their sliding TTL.
+	if (
+		typeof payload.issued_at === "number" &&
+		Date.now() - payload.issued_at > SESSION_MAX_LIFETIME_SECONDS * 1000
+	) {
+		await destroySessionRecord(store, token, payload);
+		return null;
+	}
+	return payload;
+}
+
+// Drop a session key and its employee/restaurant index entries.
+async function destroySessionRecord(
+	store: Awaited<ReturnType<typeof getStore>>,
+	token: string,
+	payload: SessionPayload | null,
+): Promise<void> {
+	await store.del(SESSION_PREFIX + token);
+	if (payload) {
+		await store.sRem(EMP_SESSIONS_PREFIX + payload.employeeId, token);
+		await store.sRem(RES_SESSIONS_PREFIX + payload.res_id, token);
 	}
 }
 
@@ -84,11 +118,7 @@ export async function destroySession(token: string): Promise<void> {
 	}
 	const store = await getStore();
 	const payload = await getSession(token);
-	await store.del(SESSION_PREFIX + token);
-	if (payload) {
-		await store.sRem(EMP_SESSIONS_PREFIX + payload.employeeId, token);
-		await store.sRem(RES_SESSIONS_PREFIX + payload.res_id, token);
-	}
+	await destroySessionRecord(store, token, payload);
 }
 
 export async function destroyAllForEmployee(employeeId: string): Promise<void> {

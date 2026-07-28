@@ -50,6 +50,28 @@ async function requirePlatformAuth(req: Request, res: Response, next: NextFuncti
 		res.status(401).json({ error: "Unauthorized" });
 		return;
 	}
+	// The session store alone is not authority: an operator who is deactivated or
+	// deleted in platform.admins must lose fleet-wide access IMMEDIATELY, not when
+	// their (constantly refreshed) 8h TTL happens to lapse. The control plane is
+	// low-traffic, so this re-check runs per request rather than on a cache.
+	let stillActive = false;
+	try {
+		const rows = await platformQuery<{ active: boolean | null }>(
+			`select active from platform.admins where id = $1 limit 1`,
+			[session.adminId],
+		);
+		stillActive = rows.length > 0 && rows[0]?.active !== false;
+	} catch (err) {
+		logger.error({ err }, "platform_admin_recheck_failed");
+		res.status(503).json({ error: "Control plane unavailable" });
+		return;
+	}
+	if (!stillActive) {
+		// The account is gone or disabled — drop the token so it stops resolving.
+		try { await destroyPlatformSession(token); } catch (err) { logger.error({ err }, "platform_session_destroy_failed"); }
+		res.status(401).json({ error: "Unauthorized" });
+		return;
+	}
 	req.platformAdmin = session;
 	void refreshPlatformTtl(token);
 	next();

@@ -12,6 +12,8 @@ import {
 	AddCustomer,
 	AddEmailToCustomer,
 	AddTable,
+	UpdateTable,
+	GetSeatingSuggestion,
 	RemoveTable,
 	OccupyTable,
 	UpdateTableCovers,
@@ -91,6 +93,7 @@ import {
 	GetRestaurantUserRole,
 	EnsureRestaurantSeed,
 	AllocateBestTable,
+	GetAvailableTablesForInterval,
 	AddFeedbackEntry,
 	GetFeedbackEntries,
 	GetFeedbackSummary,
@@ -121,6 +124,8 @@ import {
 	ReceivePurchaseOrder,
 	DeletePurchaseOrder,
 	GetRestaurantUsers,
+	GetEmployeeIdsWithRole,
+	ResolveOutletForRestaurant,
 	GetRestaurantEmployeeCount,
 	AddRestaurantUser,
 	DeleteRestaurantUser,
@@ -139,10 +144,12 @@ import {
 	EnsureMenuCategory,
 	DeleteMenuCategory,
 	SaveMenuItems,
+	MenuBulkDeleteError,
 	UpdateMenuItemPrice,
 	RenameMenuStation,
 	RenameInventoryCategory,
 	GetOrders,
+	GetOrdersScope,
 	AddOrder,
 	AddTakeawayOrder,
 	SetOrderCustomerId,
@@ -190,6 +197,7 @@ import {
 	BARK_ORDER_ACTION_ID,
 	AddNotification,
 	GetNotifications,
+	ResolveNotificationTarget,
 	MarkNotificationRead,
 	MarkAllNotificationsRead,
 	DeleteNotification,
@@ -253,17 +261,18 @@ import {
 	CancelWaitlistEntry,
 	SeatWaitlistEntry,
 	repriceFromMenu,
+	applyMenuPriceFloor,
+	type BookingWindow,
 } from "./database_supabase.js";
 import {
 	OPENAI_REALTIME_MODEL,
 	checkAvailabilityForRequest,
 	createReceptionSession,
-	createReservationForRequest,
 	getRestaurantKnowledgeSnapshot,
 } from "./realtime_reception_agent.js";
 import { initRealtime, emitRestaurant, emitOutlet, closeRealtime, realtimeAdapterReady } from "./realtime.js";
 import { buildReceiptBase64, buildKotBase64 } from "./escpos.js";
-import { createSession, getSession, refreshTtl, destroySession } from "./auth/sessions.js";
+import { createSession, getSession, refreshTtl, destroySession, destroyAllForEmployee } from "./auth/sessions.js";
 import { getStore } from "./auth/store.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
 import { closePlatformPool } from "./platform/db.js";
@@ -278,6 +287,8 @@ import {
 } from "./platform/tenant_billing.js";
 import { uploadScreenshot, uploadMenuImage } from "./storage_bucket_supabase.js";
 import { verifyTable, decodeTableToken } from "./qr_signing.js";
+import { METRIC_EXPLAINERS } from "./analytics_explainers.js";
+import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "./phone_validation.js";
 
 // Resolve the table for a public QR request. Prefers the opaque ?t= token; falls
 // back to table_name+sig. Returns the verified table name, or null if invalid.
@@ -459,6 +470,11 @@ function extractBearerToken(req: Request): string | null {
 // Verifies the bearer token against the Redis session store, populates req.auth
 // with the server-trusted identity, and binds a tenant-scoped DB connection for
 // the request so RLS isolates this restaurant's data.
+// Requests that must never be rejected for a bad X-Outlet-Id: they are exactly
+// how a client holding a stale/foreign stored outlet discovers the truth and
+// repairs its selection. Served from the caller's session outlet instead.
+const OUTLET_SELF_HEAL_PATHS = new Set(["/outlets", "/auth/me"]);
+
 async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
 	const token = extractBearerToken(req);
 	if (!token) {
@@ -482,19 +498,45 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
 	const normalizedRole = normalizeRole(session.role) ?? "employee";
 	const isPrivileged = normalizedRole === "admin" || normalizedRole === "manager";
 	// Admins/managers may act on another of their restaurant's outlets by passing
-	// an X-Outlet-Id header/param (RLS still bounds them to their own res_id, and
-	// resolveRestaurantContext falls back to their home outlet if it doesn't
-	// match). Everyone else is pinned to their session outlet.
+	// an X-Outlet-Id header/param. Everyone else is pinned to their session outlet
+	// (a header they send is ignored, never honoured).
 	const requestedOutlet = rawRequestedOutletId(req);
 	// The "all" sentinel turns on aggregate READ mode for admins/managers only;
 	// the connection stays bound to a CONCRETE default outlet (their session
 	// outlet) so app.outlet_id is a real value and writes still target one outlet.
 	const allOutlets = isPrivileged && isAllOutletsSentinel(requestedOutlet);
-	const effectiveOutlet = allOutlets
-		? session.outlet_id
-		: requestedOutlet && isPrivileged
-			? requestedOutlet
-			: session.outlet_id;
+	let effectiveOutlet = session.outlet_id;
+	if (!allOutlets && requestedOutlet && isPrivileged && requestedOutlet !== session.outlet_id) {
+		// The override is honoured ONLY when it really is one of THIS restaurant's
+		// outlets. An unknown, stale or cross-restaurant id used to fall through to
+		// resolveRestaurantContext's "first outlet of the restaurant" default, which
+		// silently read AND wrote the main outlet's data while the API echoed back
+		// the outlet that was asked for — so it is a hard 400 now. Names resolve to
+		// their canonical Outlets.id (resolveRestaurantContext accepts either).
+		let resolved: string | null = null;
+		try {
+			resolved = await ResolveOutletForRestaurant(session.res_id, requestedOutlet);
+		} catch (err) {
+			logger.error({ err }, "outlet_membership_lookup_failed");
+			res.status(503).json({ error: "Database unavailable" });
+			return;
+		}
+		if (!resolved) {
+			if (OUTLET_SELF_HEAL_PATHS.has(req.path)) {
+				// The client's recovery path: these two are how a UI holding a stale
+				// stored outlet re-reads who it is and which outlets exist. 400-ing
+				// them would make the bad selection unfixable, so serve them from the
+				// session outlet — /outlets echoes current_outlet_id, which tells the
+				// UI what actually applied.
+				effectiveOutlet = session.outlet_id;
+			} else {
+				res.status(400).json({ error: "Unknown outlet", details: "The requested outlet does not belong to this restaurant" });
+				return;
+			}
+		} else {
+			effectiveOutlet = resolved;
+		}
+	}
 
 	req.auth = {
 		employeeId: session.employeeId,
@@ -715,6 +757,18 @@ const PERM_SETTINGS = "6d0f3a94-8b21-4c67-9e53-1a4d7b2f8c60"; // Manage Restaura
 const PERM_BRANDING = "4a1c8e73-5f60-49b2-a3d8-7c2e0b6f9153"; // Manage Branding (Restaurant Specific)
 const PERM_BILLING = "1c6e9b34-7a52-4f80-9d13-3b8c5a0e6f27"; // Manage Subscription & Billing (Restaurant Specific)
 const PERM_PASSWORDS = "0b4d7f92-6c81-43a5-b7e0-2f9a1c8d5e36"; // Manage User Passwords (Roles)
+// Split out of over-broad permissions (audit 2026-07-27): "Add Orders" used to
+// let a WAITER delete an order and settle it to Paid, and "Update Menu" covered
+// category deletion plus the full-menu replace. Destructive/financial work is
+// now grantable on its own instead of riding along with everyday duties.
+const PERM_ORDER_DELETE = "8c3f5b21-0e74-4a96-b2d8-6f1a9c4e7b53"; // Delete Orders (Orders)
+const PERM_MENU_CAT_DELETE = "3d9e7a05-6c18-4f2b-9a41-8b5d0e3c6f72"; // Delete Menu Categories (Menu)
+const PERM_MENU_BULK_REPLACE = "7b2c9d48-3a51-4e07-8d6f-1c4e5a9b0837"; // Bulk Replace Menu (Menu)
+const PERM_FEEDBACK_RESOLVE = "5e8a1f36-9b47-42c0-a7e5-0d3b6c8f4291"; // Resolve Feedback Recovery (Feedback Questions)
+const PERM_CLOSE_BILL = "a953d044-31ba-4e31-b96f-99304fe43dfa"; // Close Bill (Bills) — required to settle an order to Paid
+const PERM_VALET_CHARGE = "6c2e8a4d-7f1b-4d9c-8e35-b0a4d6c2f791"; // Valet Charge to Bill (existing, was unused as a gate)
+const PERM_VALET_OPS = "8e4b2d6f-3a1c-4f7e-9b05-d2c6a8e0f413"; // Valet Ops Update (existing, was unused as a gate)
+const PERM_VALET_KEYS = "4a7d1c9e-5b3f-4e8a-a6d2-0c9f7b3e5a18"; // Valet Key Log (existing, was unused as a gate)
 
 // Permission gate for a specific granted Action. Admin (actions include "*")
 // always passes; any role granted this action UUID passes; everyone else 403.
@@ -728,6 +782,28 @@ async function enforcePermission(req: Request, res: Response, actionId: string):
 		return null;
 	}
 	return { restaurantId: auth.res_id, outletId: extractOutletId(req) };
+}
+
+// Revoke every live session of an employee. Must run whenever the identity or
+// the permissions behind an issued token change — the employee is deleted, their
+// password is reset, or their roles change — because session.actions is resolved
+// ONCE at login and refreshTtl slides the TTL on every request, so an un-revoked
+// token would otherwise stay valid (with stale permissions) indefinitely.
+// Best-effort: a store failure is logged, never surfaced as a request failure.
+async function revokeEmployeeSessions(employeeId: string, reason: string): Promise<void> {
+	if (!employeeId) {return;}
+	try {
+		await destroyAllForEmployee(employeeId);
+	} catch (err) {
+		logger.error({ err, employeeId, reason }, "revoke_employee_sessions_failed");
+	}
+}
+
+// Non-responding permission check (for handlers that shape their own response
+// instead of rejecting — e.g. redacting fields the caller may not read).
+function callerHasPermission(req: Request, actionId: string): boolean {
+	const actions = req.auth?.actions ?? [];
+	return actions.includes(actionId) || actions.includes("*");
 }
 
 // Non-responding admin check (for guards that decide their own error).
@@ -810,13 +886,11 @@ function extractOutletId(req: Request): string {
 	if (!auth) {
 		throw new Error("Missing authenticated context");
 	}
-	const requested = rawRequestedOutletId(req);
-	// The "all" sentinel is not a real outlet — fall through to the concrete bound
-	// outlet (auth.outlet_id, the session default while in aggregate mode) so any
-	// write path that reaches here targets one real outlet, never "all".
-	if (requested && !isAllOutletsSentinel(requested) && (auth.role === "admin" || auth.role === "manager")) {
-		return requested;
-	}
+	// Always the outlet requireAuth RESOLVED and bound the connection to: a
+	// validated (and canonicalised) X-Outlet-Id override for an admin/manager, or
+	// the session outlet. Never the raw header — an unvalidated value here used to
+	// let a write land on an outlet the caller never proved membership of, and the
+	// "all" sentinel is not a real outlet at all.
 	return auth.outlet_id;
 }
 
@@ -832,6 +906,39 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs =
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+// --- Mobile-number gate (WRITE paths) ---------------------------------------
+// Indian mobile numbers are exactly 10 digits, so every endpoint that STORES a
+// phone runs it through the shared validator (phone_validation.ts) and rejects
+// anything else with one consistent 400 — a client cannot bypass the UI's
+// maxLength by calling the API directly.
+//
+// Applies to NEW writes only: lookup-by-phone paths (loyalty balance, coupon
+// eligibility) still accept whatever is on existing rows, so customers stored
+// with other lengths before this rule keep working.
+
+/** Required phone. Returns the normalized 10 digits, or null AFTER sending the 400. */
+function requireMobile10(res: Response, raw: unknown): string | null {
+	const value = normalizeMobile10(raw);
+	if (!value) {
+		res.status(400).json({ error: MOBILE_10_ERROR });
+		return null;
+	}
+	return value;
+}
+
+/**
+ * Optional phone. Blank/absent is allowed (value null); anything typed must be
+ * exactly 10 digits. On failure the 400 is already sent and `ok` is false.
+ */
+function optionalMobile10(res: Response, raw: unknown): { ok: true; value: string | null } | { ok: false } {
+	const result = normalizeOptionalMobile10(raw);
+	if (!result.ok) {
+		res.status(400).json({ error: MOBILE_10_ERROR });
+		return { ok: false };
+	}
+	return result;
 }
 
 // Minimum password policy for account-creation / reset paths. Returns an error
@@ -1069,6 +1176,92 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 	next();
 });
 
+// --- New-order fan-out (notification + realtime) ---------------------------
+// EVERY route that creates an order goes through these two helpers, so a
+// staff-typed order is indistinguishable from a guest QR order downstream: the
+// same `order` notification shape (AddNotification stamps module/entity_type/
+// entity_id/outlet_id from meta.order_id, so the bell's target resolver and both
+// clients' deep-links keep working unchanged) and the same realtime event.
+//
+// `order:updated` is the ONLY new-order event the clients already subscribe to
+// (web: the orders grid and the KDS/expo screen, via the RealtimeContext →
+// `realtime:event` bridge). Reusing it makes both refresh immediately instead of
+// waiting out their 10s poll. Neither helper ever throws — a notification or a
+// dead socket must never fail an order that is already committed.
+
+/** Total units on an order payload (falls back to 1 per line). */
+function orderItemCount(items: unknown): number {
+	if (!Array.isArray(items)) {return 0;}
+	return items.reduce<number>((sum, raw) => {
+		const q = Math.round(Number((raw as Record<string, unknown> | null)?.quantity ?? 1) || 1);
+		return sum + Math.max(1, q);
+	}, 0);
+}
+
+/** Channel of an order: takeaway/delivery name themselves, everything else is dine-in. */
+function orderChannelOf(orderType: unknown): "takeaway" | "delivery" | null {
+	const t = String(orderType ?? "").trim().toLowerCase();
+	if (t === "delivery") {return "delivery";}
+	if (t === "takeaway") {return "takeaway";}
+	return null;
+}
+
+interface CreatedOrderInfo {
+	orderId: string;
+	/** Physical table for dine-in, virtual table for takeaway/delivery; may be absent. */
+	table?: string | null;
+	items?: unknown;
+	total?: unknown;
+	/** Resulting order status — "Pending" means a staffer still has to approve it. */
+	status?: unknown;
+	orderType?: unknown;
+}
+
+function emitOrderCreated(restaurantId: string, o: CreatedOrderInfo): void {
+	const channel = orderChannelOf(o.orderType);
+	try {
+		emitRestaurant(restaurantId, "order:updated", {
+			order_id: o.orderId,
+			table: String(o.table ?? "").trim() || null,
+			created: true,
+			...(channel ? { order_type: channel } : {}),
+		});
+	} catch (err) { logger.warn({ err }, "emit order:updated failed"); }
+}
+
+async function notifyOrderCreated(restaurantId: string, o: CreatedOrderInfo): Promise<void> {
+	try {
+		const table = String(o.table ?? "").trim();
+		const channel = orderChannelOf(o.orderType);
+		const pending = String(o.status ?? "").trim().toLowerCase() === "pending";
+		const count = orderItemCount(o.items);
+		const total = Number(o.total);
+		// Takeaway/delivery name the CHANNEL — their table is a hidden virtual row
+		// that would mean nothing to a waiter. Dine-in names the table when we know
+		// it, and simply says "New order" when we don't.
+		const what = channel ? `${channel} order` : "order";
+		const where = channel ? "" : (table ? ` · Table ${table}` : "");
+		const title = pending
+			? `${channel ? `New ${what} to approve` : "Order to approve"}${where}`
+			: `New ${what}${where}`;
+		const parts: string[] = [];
+		if (count > 0) {parts.push(`${count} item${count > 1 ? "s" : ""}`);}
+		if (Number.isFinite(total) && total > 0) {parts.push(`₹${total}`);}
+		if (pending) {parts.push("tap Orders to approve");}
+		await AddNotification(restaurantId, {
+			type: "order",
+			title,
+			body: parts.join(" · ") || null,
+			meta: {
+				table: table || null,
+				order_id: o.orderId,
+				needs_approval: pending,
+				...(channel ? { order_type: channel } : {}),
+			},
+		});
+	} catch (err) { logger.warn({ err }, "order created notification failed"); }
+}
+
 // ---------------------------------------------------------------------------
 // Public QR self-ordering (no staff login). The restaurant is identified by the
 // slug in the URL; queries run inside that tenant's context so RLS still
@@ -1088,7 +1281,7 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				GetMenuItems(slug),
 				GetMenuCategories(slug),
 				GetRestaurantProfile(slug),
-				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "pill" } })),
+				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "rounded", surface_style: "frosted" } })),
 			]);
 			return {
 				restaurant_name: profile?.restaurant_name ?? slug,
@@ -1102,8 +1295,10 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				// Guest QR order page reads this to know whether to prompt for the
 				// per-table OTP before letting the guest place an order.
 				require_table_otp: branding.require_table_otp,
-				// Rich customer-page customization (font/colors/header/button style),
-				// resolved with sane defaults so the page can theme itself fully.
+				// Customer-page customization, resolved with sane defaults. The LIVE
+				// keys the dark guest design consumes are color_primary (accent ramp),
+				// font, header_style, button_shape and surface_style; the legacy colour
+				// keys are still returned when set but drive nothing (BRAND_LIVE_FIELDS).
 				brand_config: branding.brand_config,
 				categories,
 				items,
@@ -1129,8 +1324,11 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 	const tableName = resolveQrTable(resId, body);
 	const customer = typeof body.customer === "string" ? body.customer.trim() : "";
 	// Optional guest phone — captured into the order JSON and used to register
-	// the guest as a Customer (CRM) when present.
-	const customerPhone = typeof body.customer_phone === "string" ? body.customer_phone.trim().slice(0, 20) : "";
+	// the guest as a Customer (CRM) when present. Blank stays blank; anything
+	// typed must be a real 10-digit mobile (it becomes the CRM identity).
+	const phoneCheck = optionalMobile10(res, body.customer_phone);
+	if (!phoneCheck.ok) {return;}
+	const customerPhone = phoneCheck.value ?? "";
 	const note = typeof body.note === "string" ? body.note.trim().slice(0, 500) : "";
 	const items = (Array.isArray(body.items) ? body.items : [])
 		.slice(0, 100) // cap line count (anti-DoS), like the waitlist preorder path
@@ -1238,6 +1436,9 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 				meta: { table: tableName, order_id: result.order_id, needs_approval: pending },
 			});
 		} catch {/* ignore */}
+		// This path already notifies (above) — it only lacked the realtime nudge,
+		// so the orders grid and the KDS sat on their poll for up to 10s.
+		emitOrderCreated(resId, { orderId: result.order_id, table: tableName });
 		res.status(201).json({ success: true, ...result });
 	} catch (err: any) {
 		logger.error({ err }, "qr_order_failed");
@@ -1408,13 +1609,17 @@ app.post("/qr/:slug/reserve", rateLimit("qr_reserve", 8, 60_000), async (req: Re
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const name = typeof body.name === "string" ? body.name.trim() : "";
-	const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+	const rawPhone = typeof body.phone === "string" ? body.phone.trim() : "";
 	const email = typeof body.email === "string" ? body.email.trim() : undefined;
 	const notes = typeof body.notes === "string" ? body.notes.trim() : null;
 	const partySize = Number.parseInt(String(body.party_size ?? body.number_of_people ?? ""), 10);
 	const duration = Number.isFinite(Number(body.duration)) ? Number(body.duration) : 90;
 	const dateStr = typeof body.date === "string" ? body.date.trim() : "";
-	if (!name || !phone) { res.status(400).json({ error: "Name and phone are required" }); return; }
+	if (!name || !rawPhone) { res.status(400).json({ error: "Name and phone are required" }); return; }
+	// The reservation's phone is how staff (and the confirmation SMS) reach the
+	// guest, so it must be a real 10-digit mobile.
+	const phone = requireMobile10(res, rawPhone);
+	if (!phone) {return;}
 	if (!Number.isFinite(partySize) || partySize <= 0) { res.status(400).json({ error: "A valid party size is required" }); return; }
 	if (!dateStr) { res.status(400).json({ error: "A valid date/time is required" }); return; }
 	try {
@@ -1946,7 +2151,12 @@ app.post("/qr/:slug/waitlist/join", rateLimit("waitlist", 12, 60_000), async (re
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const name = typeof body.name === "string" ? body.name.trim() : "";
-	const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+	// Phone stays optional on a walk-in join (staff can call the party by name),
+	// but a typed number must be a full 10-digit mobile — the queue dedupes and
+	// texts on it.
+	const joinPhone = optionalMobile10(res, body.phone);
+	if (!joinPhone.ok) {return;}
+	const phone = joinPhone.value ?? "";
 	const party = Number(body.party_size ?? 1) || 1;
 	// Multi-outlet: a branch's entrance QR can carry ?outlet=<id> so the walk-in
 	// lands in that branch's queue (where its staff are looking). Single-outlet
@@ -1997,8 +2207,12 @@ app.post("/qr/:slug/waitlist/:token/member", rateLimit("waitlist", 20, 60_000), 
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
+	// A party member's phone is their identity in the party list (it dedupes on
+	// it), so it is required AND must be exactly 10 digits.
+	const memberPhone = requireMobile10(res, body.phone);
+	if (!memberPhone) {return;}
 	try {
-		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => AddWaitlistMember(slug, String(req.params.token), { name: body.name, phone: body.phone }));
+		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => AddWaitlistMember(slug, String(req.params.token), { name: body.name, phone: memberPhone }));
 		if ("error" in r) { res.status(400).json(r); return; }
 		try { emitRestaurant(resId, "waitlist:updated", { action: "member" }); } catch {/* ignore */}
 		res.json(r);
@@ -2423,26 +2637,114 @@ app.post("/reception/create-reservation", rateLimit("reception_create", 6, 60_00
 		return;
 	}
 
+	// The reception agent (and any other caller) must supply a real 10-digit mobile
+	// — this becomes the reservation's Customers row.
+	const contactNumber = requireMobile10(res, payload.contactNumber);
+	if (!contactNumber) {return;}
+
+	// The booking is written IN-PROCESS (like /qr/:slug/reserve). This used to
+	// round-trip back into the REST API over HTTP with no Authorization header,
+	// against a base URL that isn't even this server's port, so /get-tables always
+	// failed and the caller was told "no table available" — with HTTP 200 — while
+	// nothing was ever created.
+	// Tenant comes from the request (slug/header) so this works in a multi-tenant
+	// deployment; RECEPTION_RESTAURANT_ID remains the single-tenant fallback for
+	// the voice agent, which has no other way to say who it is answering for.
+	const slug = String(
+		payload.restaurantId ?? payload.slug ?? req.headers["x-restaurant-id"] ?? process.env.RECEPTION_RESTAURANT_ID ?? "",
+	).trim();
+	let resId: string | null = null;
+	if (slug) {
+		try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	}
+	if (!resId) {
+		res.status(404).json({ status: "failed", message: "I couldn't find that restaurant to book against." });
+		return;
+	}
+
+	const partySize = Number.parseInt(String(payload.partySize), 10);
+	if (!Number.isFinite(partySize) || partySize <= 0) {
+		res.status(400).json({ status: "failed", message: "A valid party size is required." });
+		return;
+	}
+	const duration = Number.parseInt(process.env.RECEPTION_BOOKING_DURATION ?? "120", 10) || 120;
+	const source = process.env.RECEPTION_BOOKING_SOURCE ?? "Voice";
+	const tablePreference = typeof payload.tablePreference === "string" ? payload.tablePreference.trim() : "";
+	const notes = typeof payload.specialRequests === "string" && payload.specialRequests.trim()
+		? payload.specialRequests.trim()
+		: null;
+	const guestName = String(payload.guestName).trim();
+
 	try {
-		const result = await createReservationForRequest({
-			guestName: String(payload.guestName),
-			contactNumber: String(payload.contactNumber),
-			partySize: Number(payload.partySize),
-			reservationDate: String(payload.reservationDate),
-			reservationTime: String(payload.reservationTime),
-			tablePreference:
-				payload.tablePreference === null || payload.tablePreference === undefined
-					? null
-					: String(payload.tablePreference),
-			specialRequests:
-				payload.specialRequests === null || payload.specialRequests === undefined
-					? null
-					: String(payload.specialRequests),
+		const settings = await withTenant(
+			{ res_id: resId, outlet_id: "", employeeId: "", role: "" },
+			() => GetRestaurantSettings(slug),
+		).catch(() => null);
+		// The caller states a wall-clock date + time; interpret it in the
+		// restaurant's own timezone so a UTC server stores the right instant.
+		const date = parseWallClockInZone(`${String(payload.reservationDate).trim()}T${String(payload.reservationTime).trim()}`, settings?.timezone ?? "Asia/Kolkata");
+		if (Number.isNaN(date.getTime())) {
+			res.status(400).json({ status: "failed", message: "I couldn't read that date and time." });
+			return;
+		}
+		if (date.getTime() < Date.now() - 60_000) {
+			res.status(400).json({ status: "failed", message: "That slot is in the past — could we pick a future time?" });
+			return;
+		}
+
+		const result = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
+			// Allocate BEFORE touching Customers so a "no table" answer doesn't leave
+			// an orphan customer row behind.
+			let tableName: string | null = null;
+			if (tablePreference) {
+				const free = await GetAvailableTablesForInterval(slug, date, duration).catch(() => []);
+				const match = free.find(
+					(t) => t.table_name.toLowerCase() === tablePreference.toLowerCase() && (t.capacity ?? Number.MAX_SAFE_INTEGER) >= partySize,
+				);
+				tableName = match?.table_name ?? null;
+			}
+			if (!tableName) {
+				tableName = await AllocateBestTable(slug, date, duration, partySize);
+			}
+			if (!tableName) {return null;}
+			const custId = await GetCustomerIdOrCreateCustomer(slug, guestName, contactNumber);
+			if (!custId) {throw new Error("Unable to record the guest");}
+			const booking = await AddBooking(
+				slug, custId, date, duration, partySize, tableName, source,
+				"Confirmed", "reception", notes,
+			);
+			return { booking_id: String(booking._id), table_name: tableName };
 		});
-		res.json(result);
+
+		if (!result) {
+			// Honest failure status — a 200 here is what let callers record a
+			// reservation that does not exist.
+			res.status(409).json({
+				status: "failed",
+				message: "I couldn't find an open table that fits that group at that time. I'm happy to look at another slot if you'd like!",
+			});
+			return;
+		}
+
+		try { emitRestaurant(resId, "booking:created", { booking_id: result.booking_id, source: "reception" }); } catch {/* ignore */}
+		try {
+			await AddNotification(slug, {
+				type: "reservation",
+				title: "New reservation (reception)",
+				body: `${guestName} · party ${partySize} · ${date.toLocaleString()} · ${result.table_name}`,
+				meta: { booking_id: result.booking_id },
+			});
+		} catch {/* ignore */}
+
+		res.json({
+			status: "confirmed",
+			message: `All set! I've booked ${result.table_name} for ${guestName} on ${payload.reservationDate} at ${payload.reservationTime}. Confirmation ID: ${result.booking_id}.`,
+			tableName: result.table_name,
+			referenceId: result.booking_id,
+		});
 	} catch (error) {
 		logger.error({ err: error }, "create_reservation_failed");
-		res.status(500).json({ error: "Unable to create reservation" });
+		res.status(500).json({ status: "failed", error: "Unable to create reservation" });
 	}
 });
 
@@ -2562,6 +2864,10 @@ app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd")
 		res.status(400).json({ error: "Missing required fields" });
 		return;
 	}
+	// The customer's number IS their CRM identity (GetCustomerId matches on
+	// name + number), so a partial one silently creates a duplicate person.
+	const customerNumber = requireMobile10(res, customer.number);
+	if (!customerNumber) {return;}
 
 	// Optional aggregated-analytics demographics (gender / age group / pincode).
 	const demographics = {
@@ -2572,7 +2878,7 @@ app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd")
 	const cust_id = await GetCustomerIdOrCreateCustomer(
 		restaurantId,
 		customer.name,
-		customer.number,
+		customerNumber,
 		customer.email,
 		demographics,
 	);
@@ -2591,7 +2897,9 @@ app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd")
 	{
 	   "table": {
 		   "name": "T1",
-		   "capacity": 4 // Optional
+		   "capacity": 4, // Optional — normal (comfortable) seats
+		   "max_capacity": 6 // Optional — most it can take with extra chairs.
+		                     // Defaults to capacity; clamped up if sent lower.
 	   }
 	}
 	returns the table_name if you want to store it somewhere
@@ -2604,19 +2912,36 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	}
 
 	const table = req.body.table;
-	if (!table.name) {
-		res.status(400).json({ error: "Missing required fields" });
+	// A whitespace-only name is truthy, so it used to slip past this check and
+	// create a permanent, nameless, un-deletable table row (lookups match on the
+	// trimmed name, so nothing could ever address it again).
+	if (typeof table?.name !== "string" || table.name.trim().length === 0) {
+		res.status(400).json({ error: "Table name is required" });
 		return;
 	}
 
+	// max_capacity must be a whole number >= 1; AddTable clamps it up to capacity.
+	if (table.max_capacity !== undefined && table.max_capacity !== null) {
+		const requestedMax = Number(table.max_capacity);
+		if (!Number.isFinite(requestedMax) || Math.round(requestedMax) < 1) {
+			res.status(400).json({ error: "max_capacity must be a whole number >= 1" });
+			return;
+		}
+	}
+
 	let table_name: string | null = null;
+	let max_capacity: number | null = null;
 	try {
 		const created = await AddTable(
 			restaurantId,
 			table.name,
 			table.capacity !== undefined ? parseInt(table.capacity) : undefined,
+			table.max_capacity !== undefined && table.max_capacity !== null
+				? Math.round(Number(table.max_capacity))
+				: undefined,
 		);
 		table_name = created.table_name;
+		max_capacity = created.max_capacity;
 	} catch (error) {
 		logger.info(error);
 		table_name = null;
@@ -2627,7 +2952,7 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	}
 
 	try {
-		emitRestaurant(restaurantId, "table:added", { table_name, capacity: table.capacity });
+		emitRestaurant(restaurantId, "table:added", { table_name, capacity: table.capacity, max_capacity });
 	} catch (err) {
 		logger.warn({ err }, "emit table:added failed");
 	}
@@ -2635,6 +2960,7 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	try {
 		await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Added table ${table_name}`, Audit_log_category.Tables, {
 			capacity: table.capacity,
+			max_capacity,
 			// before.existed=false records that the table did not exist; the undo
 			// deletes it again, but only while it is still pristine.
 			undo: { kind: "table_added", target_id: null, before: { existed: false }, after: { table_name } },
@@ -2644,6 +2970,111 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	}
 
 	res.send(table_name);
+});
+
+/*
+	Edit an existing table's seating numbers (same permission as adding one).
+	PATCH /table/:name  body { "capacity": 4, "max_capacity": 6 } — both optional,
+	omitted fields are left alone. max_capacity is clamped up to capacity.
+	Returns { table_name, capacity, max_capacity }.
+*/
+app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const rawName = req.params.name;
+	const tableName = typeof rawName === "string" ? rawName.trim() : "";
+	if (!tableName) {
+		res.status(400).json({ error: "Invalid table name" });
+		return;
+	}
+
+	const body = req.body as Record<string, unknown> | undefined;
+	const readSeats = (value: unknown): number | null | undefined => {
+		if (value === undefined || value === null) {return undefined;}
+		const num = Number(value);
+		if (!Number.isFinite(num) || Math.round(num) < 1) {return null;}
+		return Math.round(num);
+	};
+	const capacity = readSeats(body?.capacity);
+	const maxCapacity = readSeats(body?.max_capacity);
+	if (capacity === null || maxCapacity === null) {
+		res.status(400).json({ error: "capacity and max_capacity must be whole numbers >= 1" });
+		return;
+	}
+	if (capacity === undefined && maxCapacity === undefined) {
+		res.status(400).json({ error: "Nothing to update" });
+		return;
+	}
+
+	try {
+		const updated = await UpdateTable(restaurantId, tableName, { capacity, max_capacity: maxCapacity });
+		if (!updated) {
+			res.status(404).json({ error: "Table not found" });
+			return;
+		}
+
+		try {
+			emitRestaurant(restaurantId, "table:updated", updated);
+		} catch (err) {
+			logger.warn({ err }, "emit table:updated failed");
+		}
+		try {
+			await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Updated table ${updated.table_name} seating (capacity ${updated.capacity}, max ${updated.max_capacity})`, Audit_log_category.Tables, updated);
+		} catch (err) {
+			logger.warn({ err }, 'log_audit update-table failed');
+		}
+
+		res.json(updated);
+	} catch (error: any) {
+		logger.error({ err: error }, "update_table_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to update table") });
+	}
+});
+
+/*
+	Seating suggestion for a party at a time window — SUGGESTS ONLY, never assigns.
+	GET /tables/seating-suggestion?party=8&at=<ISO>&duration=<mins>
+	Same permission as assigning tables to bookings (c7699d46…).
+	See GetSeatingSuggestion for the shape.
+*/
+app.get("/tables/seating-suggestion", validateAction("c7699d46-0e2f-4448-b325-8ca490a5296b"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+
+	const party = Number(Array.isArray(req.query.party) ? req.query.party[0] : req.query.party);
+	if (!Number.isFinite(party) || Math.round(party) < 1) {
+		res.status(400).json({ error: "party must be a whole number >= 1" });
+		return;
+	}
+
+	const atRaw = Array.isArray(req.query.at) ? req.query.at[0] : req.query.at;
+	const at = typeof atRaw === "string" && atRaw.trim() ? new Date(atRaw) : new Date();
+	if (Number.isNaN(at.getTime())) {
+		res.status(400).json({ error: "at must be an ISO date-time" });
+		return;
+	}
+
+	const durationRaw = Array.isArray(req.query.duration) ? req.query.duration[0] : req.query.duration;
+	const duration = durationRaw === undefined || durationRaw === "" ? 120 : Number(durationRaw);
+	if (!Number.isFinite(duration) || Math.round(duration) < 1) {
+		res.status(400).json({ error: "duration must be a whole number of minutes >= 1" });
+		return;
+	}
+
+	try {
+		const suggestion = await GetSeatingSuggestion(restaurantId, Math.round(party), at, Math.round(duration));
+		res.json(suggestion);
+	} catch (error: any) {
+		logger.error({ err: error }, "seating_suggestion_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to build a seating suggestion") });
+	}
 });
 
 app.delete("/table/:name", validateAction("5777c4aa-29df-4ea1-9c45-c1038d25f746"), async (req: Request, res: Response) => {
@@ -2727,10 +3158,21 @@ app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"
 
 	const body = req.body as Record<string, unknown> | undefined;
 	const tableName = typeof body?.table_name === 'string' ? body.table_name.trim() : '';
-	const numCovers = typeof body?.num_covers === 'number' ? body.num_covers : 1;
+	// Covers is the APC denominator, so a missing/garbage value is REJECTED — it
+	// used to silently fall back to 1, wiping the real head count (and writing an
+	// audit line claiming the caller asked for 1). Numeric strings are accepted.
+	const rawCovers = typeof body?.num_covers === 'number' || typeof body?.num_covers === 'string'
+		? Number(body.num_covers)
+		: Number.NaN;
+	const numCovers = Math.round(rawCovers);
 
 	if (!tableName) {
 		res.status(400).json({ error: "table_name is required" });
+		return;
+	}
+
+	if (!Number.isFinite(rawCovers) || numCovers < 1) {
+		res.status(400).json({ error: "num_covers must be a whole number of 1 or more" });
 		return;
 	}
 
@@ -2846,6 +3288,10 @@ Needs request body as
    // Table must exist
    "booking": {
 		"table_name": "T1",
+		// Optional clubbed booking: EXTRA tables held alongside table_name (all
+		// must exist). Only ever set from an explicit staff choice — the server
+		// never clubs tables on its own. See GET /tables/seating-suggestion.
+		"combined_table_names": ["T2"],
 		"date": "YYYY-MM-DDThh:mm:ssTZD"
 		"duration": "30" // in minutes
 		"number_of_people": "3"
@@ -2866,6 +3312,10 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 		res.status(400).json({ error: "Missing customer field(s)" });
 		return;
 	}
+	// Bookings are confirmed/reminded by SMS on this number, so it must be a real
+	// 10-digit mobile before a Customers row is created for it.
+	const bookingCustomerNumber = requireMobile10(res, customer.number);
+	if (!bookingCustomerNumber) {return;}
 
 	const booking_request = req.body.booking;
 	if (
@@ -2881,7 +3331,7 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 	const cust_id = await GetCustomerIdOrCreateCustomer(
 		restaurantId,
 		customer.name,
-		customer.number,
+		bookingCustomerNumber,
 		customer.email,
 	);
 	if (cust_id == null) {
@@ -2907,6 +3357,18 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 	if (!Number.isFinite(partySize)) {
 		res.status(400).json({ error: "number_of_people must be a valid number" });
 		return;
+	}
+
+	// Clubbed booking: the caller (staff, after accepting a suggestion) names the
+	// EXTRA tables explicitly. Never inferred here.
+	const combinedRaw = booking_request.combined_table_names ?? booking_request.table_names;
+	let combinedTableNames: string[] | null = null;
+	if (combinedRaw !== undefined && combinedRaw !== null) {
+		if (!Array.isArray(combinedRaw)) {
+			res.status(400).json({ error: "combined_table_names must be an array of table names" });
+			return;
+		}
+		combinedTableNames = combinedRaw.map((n: unknown) => String(n ?? "").trim()).filter((n: string) => n.length > 0);
 	}
 
 	let booking;
@@ -2937,12 +3399,17 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 			booking_request.status ?? "Confirmed",
 			booking_request.from,
 			booking_request.notes ?? booking_request.additional_information ?? null,
+			null,
+			null,
+			combinedTableNames,
 		);
 	} catch (error) {
+		logger.warn({ err: error }, "add_booking_failed");
 		res.status(400).json({ error: "Oops something went wrong" });
 		return;
 	}
 	const booking_id = String(booking._id);
+	const bookingTableNames = booking.table_names;
 
 	try {
 		emitRestaurant(restaurantId, "booking:created", { booking_id, table_name: tableName });
@@ -2961,13 +3428,15 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 	if (req.auth?.res_id) {
 		queueBookingConfirm(req.auth.res_id, restaurantId, {
 			bookingId: booking_id,
-			phone: String(customer.number ?? ""),
+			phone: bookingCustomerNumber,
 			party: partySize,
 			date,
 			table: tableName,
 		});
 	}
-	res.json({ booking_id, table_name: tableName });
+	// table_name stays the primary (unchanged for single-table callers);
+	// table_names lists every table the booking holds.
+	res.json({ booking_id, table_name: tableName, table_names: bookingTableNames });
 });
 
 function FoldedTables(table: any[]): any[][] {
@@ -3102,8 +3571,14 @@ app.get("/get-bookings", validate, async (req: Request, res: Response) => {
 	const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
 	const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
 
+	// Bug B: `?window=upcoming|past|all` chooses which slice to return. Absent or
+	// unrecognised → "upcoming", so the default response is unchanged from before.
+	const windowQuery = Array.isArray(req.query.window) ? req.query.window[0] : req.query.window;
+	const bookingWindow: BookingWindow =
+		windowQuery === "past" || windowQuery === "all" ? windowQuery : "upcoming";
+
 	try {
-		bookings = await GetBookingsAfterTime(restaurantId, requestedTime);
+		bookings = await GetBookingsAfterTime(restaurantId, requestedTime, bookingWindow);
 	} catch (error) {
 		logger.info(error);
 		res.status(400).send({ error: "Oops something went wrong" });
@@ -3210,7 +3685,17 @@ app.patch("/booking/:id/status", validateAction("fdeecab6-7c3a-4239-b87c-99a96f5
 		return;
 	}
 
-	const updated = await UpdateBookingStatus(auth.restaurantId, bookingId, status);
+	let updated = false;
+	try {
+		updated = await UpdateBookingStatus(auth.restaurantId, bookingId, status);
+	} catch (error: any) {
+		// Seating a party bigger than the table(s) can hold is a 400 with the
+		// standard "raise max seats / club another table" message, same as
+		// /occupy-table — the booking keeps its previous status.
+		logger.error({ err: error }, "update_booking_status_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to update booking status") });
+		return;
+	}
 	if (!updated) {
 		res.status(404).json({ error: "Booking not found" });
 		return;
@@ -3596,8 +4081,20 @@ app.patch("/booking/:id/table", validateAction("c7699d46-0e2f-4448-b325-8ca490a5
 			? null
 			: String(tableNameRaw).trim() || null;
 
+	// Clubbed assignment: omit the key to leave the current set alone, send [] to
+	// un-club back to the single primary table.
+	const combinedRaw = req.body?.combined_table_names;
+	let combinedTableNames: string[] | undefined;
+	if (combinedRaw !== undefined && combinedRaw !== null) {
+		if (!Array.isArray(combinedRaw)) {
+			res.status(400).json({ error: "combined_table_names must be an array of table names" });
+			return;
+		}
+		combinedTableNames = combinedRaw.map((n: unknown) => String(n ?? "").trim()).filter((n: string) => n.length > 0);
+	}
+
 	try {
-		const updated = await AssignTableToBooking(auth.restaurantId, bookingId, tableName);
+		const updated = await AssignTableToBooking(auth.restaurantId, bookingId, tableName, combinedTableNames);
 		if (!updated) {
 			res.status(404).json({ error: "Booking not found" });
 			return;
@@ -3608,7 +4105,7 @@ app.patch("/booking/:id/table", validateAction("c7699d46-0e2f-4448-b325-8ca490a5
 	}
 
 	try {
-		await log_audit(req, "c7699d46-0e2f-4448-b325-8ca490a5296b", `Assigned table ${tableName ?? 'null'} to booking ${bookingId}`, Audit_log_category.Bookings, { booking_id: bookingId, table_name: tableName });
+		await log_audit(req, "c7699d46-0e2f-4448-b325-8ca490a5296b", `Assigned table ${[tableName ?? 'null', ...(combinedTableNames ?? [])].join(' + ')} to booking ${bookingId}`, Audit_log_category.Bookings, { booking_id: bookingId, table_name: tableName, combined_table_names: combinedTableNames ?? null });
 	} catch (err) {
 		logger.warn({ err }, 'log_audit assign-table-to-booking failed');
 	}
@@ -4257,6 +4754,16 @@ app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async 
 		res.status(400).json({ error: "name and category are required" });
 		return;
 	}
+	// Same rule PATCH /menu/:id/price enforces: a menu price must be a positive
+	// finite number. This route always WRITES price (UpsertMenuItem has no
+	// "preserve" path for it), so an omitted / zero / negative / non-numeric price
+	// silently stored a ₹0 dish — free food that also poisons the order-path
+	// re-pricing floor. Rejecting the write leaves the existing row untouched.
+	const price = Number(body.price ?? NaN);
+	if (!Number.isFinite(price) || price <= 0) {
+		res.status(400).json({ error: "price must be a positive number" });
+		return;
+	}
 
 	try {
 		// Snapshot the item BEFORE the upsert so an availability-only toggle can be
@@ -4269,7 +4776,7 @@ app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async 
 		const result = await UpsertMenuItem(restaurantId, {
 			id: typeof body.id === "string" ? body.id : "",
 			name: body.name,
-			price: Number(body.price ?? 0),
+			price,
 			category: body.category,
 			image_url: typeof body.image_url === "string" ? body.image_url : body.image_url === null ? null : undefined,
 			available: typeof body.available === "boolean" ? body.available : undefined,
@@ -4277,6 +4784,9 @@ app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async 
 			recipe: Array.isArray(body.recipe) ? (body.recipe as RecipeItem[]) : undefined,
 			station: typeof body.station === "string" ? body.station : body.station === null ? null : undefined,
 			allergens: Array.isArray(body.allergens) ? (body.allergens as string[]) : undefined,
+			// Guest-facing dish description (sanitized in encodeMenuDescription).
+			// Absent = keep the stored text; "" / null = clear it.
+			blurb: typeof body.blurb === "string" ? body.blurb : body.blurb === null ? null : undefined,
 		});
 		try {
 			// Only an availability-ONLY change is undoable: this route is a general
@@ -4388,7 +4898,9 @@ app.post("/restaurant/branding", validate, async (req: Request, res: Response) =
 		? body.theme_color
 		: undefined;
 	const queueShowMenu = typeof body.queue_show_menu === "boolean" ? body.queue_show_menu : undefined;
-	// Rich customer-page customization object (font/colors/header/button style).
+	// Customer-page customization object. Live keys: color_primary, font,
+	// header_style, button_shape, surface_style (legacy colour keys are still
+	// accepted and stored, but drive nothing — see BRAND_LIVE_FIELDS).
 	// Passed through as-is — SetBranding sanitizes it (invalid keys dropped) and
 	// merges it onto the stored config (keys omitted here keep their value).
 	const brandConfig = body.brand_config && typeof body.brand_config === "object" ? body.brand_config : undefined;
@@ -4416,11 +4928,44 @@ app.post("/restaurant/branding", validate, async (req: Request, res: Response) =
 	}
 });
 
+// Settings fields that are CREDENTIALS or fraud-detection thresholds. The rest
+// of the document is operational (currency, taxes, service charge, printing,
+// kitchen sections, timezone…) and every POS/KDS screen reads it, so the GET
+// stays open to any authenticated user — but these keys are stripped for anyone
+// without PERM_SETTINGS. msg_webhook_secret in particular is the HMAC key that
+// authenticates the PUBLIC /webhooks/whatsapp/:slug endpoint.
+const SETTINGS_PRIVILEGED_FIELDS = [
+	"msg_provider",
+	"msg_sender",
+	"msg_key_id",
+	"msg_secret_configured",
+	"msg_webhook_secret",
+	"msg_reminder_hours",
+	"razorpay_key_id",
+	"razorpay_configured",
+	"discount_approval_threshold",
+	"alert_discount_pct",
+	"alert_void_count",
+] as const;
+
+function redactRestaurantSettings(settings: Awaited<ReturnType<typeof GetRestaurantSettings>>): Record<string, unknown> {
+	const out: Record<string, unknown> = { ...settings };
+	for (const key of SETTINGS_PRIVILEGED_FIELDS) {
+		delete out[key];
+	}
+	return out;
+}
+
 // Restaurant operational settings (e.g. push orders straight to kitchen vs. require approval).
 app.get("/restaurant/settings", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	try { res.json(await GetRestaurantSettings(restaurantId)); }
+	try {
+		const settings = await GetRestaurantSettings(restaurantId);
+		// Same gate as the POST: the full document is admin-only. Non-holders get
+		// the operational subset with the credentials/thresholds removed.
+		res.json(callerHasPermission(req, PERM_SETTINGS) ? settings : redactRestaurantSettings(settings));
+	}
 	catch (err) { logger.error({ err }, "get_settings_failed"); res.status(500).json({ error: "Unable to load settings" }); }
 });
 
@@ -4514,6 +5059,27 @@ app.get("/notifications", validate, async (req: Request, res: Response) => {
 	}
 });
 
+// Where a tapped notification should go, and whether the record is actually
+// reachable from here. Registered BEFORE /notifications/:id/read so the more
+// specific path is unambiguous.
+//
+// Returns 404 only when the NOTIFICATION itself is gone. A notification whose
+// target record was deleted / lives on another outlet / has aged out of the live
+// orders list still returns 200 with still_exists / visible_here / reason_gone /
+// message so the client can say what happened instead of opening a blank screen.
+app.get("/notifications/:id/target", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try {
+		const target = await ResolveNotificationTarget(restaurantId, String(req.params.id));
+		if (!target) { res.status(404).json({ error: "Notification not found" }); return; }
+		res.json(target);
+	} catch (err) {
+		logger.error({ err }, "notif_target_failed");
+		res.status(500).json({ error: "Unable to resolve notification target" });
+	}
+});
+
 app.post("/notifications/read-all", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -4554,7 +5120,7 @@ app.get("/qr/:slug/branding", async (req: Request, res: Response) => {
 			async () => {
 				const [profile, branding] = await Promise.all([
 					GetRestaurantProfile(slug),
-					GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, timezone: "Asia/Kolkata", require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "pill" } })),
+					GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, timezone: "Asia/Kolkata", require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "rounded", surface_style: "frosted" } })),
 				]);
 				return { restaurant_name: profile?.restaurant_name ?? slug, ...branding };
 			},
@@ -4566,7 +5132,7 @@ app.get("/qr/:slug/branding", async (req: Request, res: Response) => {
 	}
 });
 
-app.put("/menu", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
+app.put("/menu", validateAction(PERM_MENU_BULK_REPLACE), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -4582,6 +5148,11 @@ app.put("/menu", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (
 	try {
 		// Fields absent from the request stay `undefined` so UpsertMenuItem
 		// preserves the stored value (bulk reorders must not wipe recipes etc.).
+		// A full-menu save prunes anything missing from the payload — the exact
+		// mechanism that once destroyed 56 items' images/recipes. SaveMenuItems now
+		// refuses to prune more than a couple of items unless the caller explicitly
+		// opts in here, so a stale or partially-loaded list can no longer wipe the menu.
+		const allowBulkDelete = req.body?.allow_bulk_delete === true;
 		await SaveMenuItems(
 			restaurantId,
 			items.map((item: any) => ({
@@ -4595,7 +5166,11 @@ app.put("/menu", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (
 				recipe: Array.isArray(item.recipe) ? item.recipe : undefined,
 				station: typeof item.station === "string" ? item.station : item.station === null ? null : undefined,
 				allergens: Array.isArray(item.allergens) ? item.allergens : undefined,
+				// Guest-facing dish description — absent keeps the stored text, so a
+				// bulk save from a client that doesn't know the field can't wipe it.
+				blurb: typeof item.blurb === "string" ? item.blurb : item.blurb === null ? null : undefined,
 			})),
+			{ allowBulkDelete },
 		);
 		try {
 			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Saved menu (${items.length} items)`, Audit_log_category.Menu, { count: items.length });
@@ -4603,6 +5178,16 @@ app.put("/menu", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (
 		res.json({ success: true });
 	} catch (error) {
 		logger.error({ err: error }, "save_menu_failed");
+		// The bulk-delete guard is a deliberate refusal, not a server fault.
+		if (error instanceof MenuBulkDeleteError) {
+			res.status(409).json({
+				error: error.message,
+				stored: error.stored,
+				kept: error.kept,
+				would_delete: error.wouldDelete,
+			});
+			return;
+		}
 		res.status(500).json({ error: "Unable to save menu" });
 	}
 });
@@ -4668,7 +5253,7 @@ app.post("/menu/categories", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed
 	}
 });
 
-app.delete("/menu/categories", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
+app.delete("/menu/categories", validateAction(PERM_MENU_CAT_DELETE), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -4777,6 +5362,35 @@ app.get("/orders", validateAction("b7f78d0f-323d-4622-8d05-aa2f82d54b2e"), async
 	}
 });
 
+// Why the orders grid looks the way it does — the context a client needs to
+// EXPLAIN an empty list instead of rendering a blank screen.
+//
+// GET /orders stays scoped to the caller's outlet (a branch view must never leak
+// another branch's orders), and guest/QR orders always land on the TABLE's
+// outlet — so a staffer signed into a branch with no tables correctly sees zero
+// orders. This endpoint hands the UI the numbers to say so out loud:
+// "No orders in Branch 2 — 11 are in Main Outlet. Switch outlet?".
+//
+// Kept as a COMPANION endpoint rather than reshaping GET /orders, whose response
+// is a bare array that both clients already consume.
+//
+// `X-Outlet-Id: all` (admin/manager) works here exactly as it does on GET
+// /orders: the counts span every outlet, is_all_outlets is true, and
+// other_outlet_orders is 0 because nothing is hidden in that mode.
+app.get("/orders/scope", validateAction("b7f78d0f-323d-4622-8d05-aa2f82d54b2e"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {
+		res.status(400).json({ error: "Missing restaurantId" });
+		return;
+	}
+	try {
+		res.json(await GetOrdersScope(restaurantId));
+	} catch (error) {
+		logger.error({ err: error }, "get_orders_scope_failed");
+		res.status(500).json({ error: "Unable to fetch order scope" });
+	}
+});
+
 app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
@@ -4784,12 +5398,36 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), asyn
 		return;
 	}
 
+	const orderBody = (req.body ?? {}) as Record<string, unknown>;
+	// Phone is optional on a dine-in order; a typed one must be a full 10-digit
+	// mobile before it becomes a CRM identity.
+	const orderPhone = optionalMobile10(res, orderBody.customer_phone);
+	if (!orderPhone.ok) {return;}
+
 	try {
-		const body = (req.body ?? {}) as Record<string, unknown>;
+		const body: Record<string, unknown> = { ...orderBody, ...(orderPhone.value ? { customer_phone: orderPhone.value } : {}) };
 		const result = await AddOrder(restaurantId, body);
 		// Best-effort guest registration: orders that carry a phone create/match a
 		// Customers row and get cust_id stamped (CRM visit tracking).
-		await linkOrderToCustomer(restaurantId, result.id, body.customer, body.customer_phone);
+		await linkOrderToCustomer(restaurantId, result.id, body.customer, orderPhone.value);
+		// A staff-typed dine-in order is a new kitchen ticket exactly like a QR
+		// one, so it raises the same notification and the same realtime event.
+		const created: CreatedOrderInfo = {
+			orderId: result.id,
+			table: typeof body.table === "string" ? body.table : null,
+			items: body.items,
+			total: body.total ?? body.subtotal,
+			status: body.status ?? "Preparing",
+			orderType: body.order_type,
+		};
+		await notifyOrderCreated(restaurantId, created);
+		// Placing an order was the only order operation with no audit trail.
+		try {
+			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				`New order ${created.orderId}${created.table ? ` on table ${created.table}` : ""}`,
+				Audit_log_category.Orders, { order_id: created.orderId, table: created.table ?? null });
+		} catch (err) { logger.warn({ err }, "log_audit order-create failed"); }
+		emitOrderCreated(restaurantId, created);
 		res.status(201).json(result);
 	} catch (error: any) {
 		logger.error({ err: error }, "add_order_failed");
@@ -4805,11 +5443,31 @@ app.post("/orders/takeaway", validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const orderType = String(body.order_type ?? "takeaway").toLowerCase() === "delivery" ? "delivery" : "takeaway";
 	if (!Array.isArray(body.items) || body.items.length === 0) { res.status(400).json({ error: "At least one item is required" }); return; }
+	// A takeaway/delivery guest is reached on this number, so a typed one must be a
+	// full 10-digit mobile (still optional for counter takeaways).
+	const takeawayPhone = optionalMobile10(res, body.customer_phone);
+	if (!takeawayPhone.ok) {return;}
 	try {
-		const result = await AddTakeawayOrder(restaurantId, { ...(body as any), order_type: orderType });
+		const result = await AddTakeawayOrder(restaurantId, {
+			...(body as any),
+			order_type: orderType,
+			...(takeawayPhone.value ? { customer_phone: takeawayPhone.value } : {}),
+		});
 		// Takeaway/delivery orders usually carry the guest's phone — register them too.
-		await linkOrderToCustomer(restaurantId, result.id, body.customer, body.customer_phone);
+		await linkOrderToCustomer(restaurantId, result.id, body.customer, takeawayPhone.value);
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `New ${orderType} order ${result.id}`, Audit_log_category.Orders, { order_id: result.id, order_type: orderType }); } catch {/* ignore */}
+		// Same fan-out as dine-in, but the copy names the CHANNEL ("New takeaway
+		// order") — the carried table is a hidden virtual row, not a real one.
+		const createdTakeaway: CreatedOrderInfo = {
+			orderId: result.id,
+			table: result.table,
+			items: body.items,
+			total: body.total ?? body.subtotal,
+			status: body.status ?? "Preparing",
+			orderType: result.order_type ?? orderType,
+		};
+		await notifyOrderCreated(restaurantId, createdTakeaway);
+		emitOrderCreated(restaurantId, createdTakeaway);
 		res.status(201).json(result);
 	} catch (error: any) {
 		logger.error({ err: error }, "add_takeaway_order_failed");
@@ -4825,6 +5483,12 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 	const orderId = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	const status = typeof req.body?.status === "string" ? req.body.status.trim() : "";
 	if (!orderId || !status) { res.status(400).json({ error: "orderId and status are required" }); return; }
+	// Settling money is a different job from moving a ticket along. Everyday
+	// transitions (Preparing → Served …) stay with "Add Orders" so waiters keep
+	// working, but marking an order PAID additionally requires "Close Bill" —
+	// previously any waiter could settle a bill.
+	const settles = ["paid", "closed"].includes(status.toLowerCase());
+	if (settles && !(await enforcePermission(req, res, PERM_CLOSE_BILL))) {return;}
 	try {
 		const result = await SetOrderStatus(restaurantId, orderId, status);
 		if (!result.ok) { res.status(404).json({ error: "Order not found" }); return; }
@@ -4871,7 +5535,11 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 		if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
 
 		// build items_split if missing; clone to avoid mutating source
-		const rawSplit = Array.isArray((order as any).items_split) ? JSON.parse(JSON.stringify((order as any).items_split)) as any[] : [["Served", []], ["Preparing", []]];
+		const rawSplit = Array.isArray((order as any).items_split)
+			? JSON.parse(JSON.stringify((order as any).items_split)) as any[]
+			// Same legacy-order guard as the delete path: seed from the order's real
+			// items so adding one never discards the ones already on the ticket.
+			: [["Served", []], ["Preparing", Array.isArray((order as any).items) ? JSON.parse(JSON.stringify((order as any).items)) : []]];
 		// normalize tuples: ensure each tuple is [label, array] and dedupe items across tuples (preserve first occurrence)
 		const seenIds = new Set<string>();
 		const normalizedSplit: any[] = [];
@@ -4891,7 +5559,12 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 
 		// ensure we have a Preparing tuple to add the new item into
 		const preparingIndex = normalizedSplit.findIndex((t: any) => String(t?.[0] ?? "").toLowerCase().includes('prepar'));
-		const newItem = { id: String(item.id ?? randomUUID()), name: String(item.name ?? 'Unknown'), quantity: Number(item.quantity ?? 1), price: Number(item.price ?? 0), orderedAt: String(item.orderedAt ?? new Date().toISOString()), note: item.note ?? null };
+		const typedItem = { id: String(item.id ?? randomUUID()), name: String(item.name ?? 'Unknown'), quantity: Number(item.quantity ?? 1), price: Number(item.price ?? 0), orderedAt: String(item.orderedAt ?? new Date().toISOString()), note: item.note ?? null };
+		// SECURITY: same server-side re-pricing the create path applies — an added
+		// line that resolves to a menu row is floored at the menu price so it can't
+		// be rung in at 1. UpdateOrderItemsSplit then re-derives the order subtotal
+		// from these prices. A genuinely off-menu line is kept as typed.
+		const [newItem] = await applyMenuPriceFloor(restaurantId, [typedItem]);
 		if (preparingIndex === -1) {
 			normalizedSplit.push(["Preparing", [newItem]]);
 		} else {
@@ -4902,7 +5575,9 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 		const split = normalizedSplit;
 
 		await UpdateOrderItemsSplit(restaurantId, orderId, split);
-		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Added item ${newItem.id} to order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, item: newItem }); } catch (err) { logger.warn({ err }, 'log_audit add-order-item failed'); }
+		// Titled by the action's NAME in the audit log, so use the item-level action
+		// ("Update Order - Add Food Item") rather than the generic "Add Orders".
+		try { await log_audit(req, "d6bebeb5-111f-4371-b373-a99158116d71", `Added item ${newItem.id} to order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, item: newItem }); } catch (err) { logger.warn({ err }, 'log_audit add-order-item failed'); }
 
 		res.status(201).json({ success: true, item: newItem });
 	} catch (err: any) {
@@ -4923,7 +5598,11 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 		const order = existing.find(o => o.id === orderId);
 		if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
 
-		const split = (order as any).items_split ?? [["Served", []], ["Preparing", []]];
+		// A legacy order (no items_split — 92 of 94 rows) must seed the skeleton
+		// from its REAL items; starting from an empty one flattened the order to
+		// zero items while leaving the bill total intact.
+		const split = (order as any).items_split
+			?? [["Served", []], ["Preparing", Array.isArray((order as any).items) ? (order as any).items : []]];
 		// remove item from both sections
 		for (const tuple of split) {
 			if (Array.isArray(tuple[1])) {
@@ -4935,7 +5614,7 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 		}
 
 		await UpdateOrderItemsSplit(restaurantId, orderId, split as any[]);
-		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Deleted item ${itemId} from order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, deleted_item_id: itemId }); } catch (err) { logger.warn({ err }, 'log_audit delete-order-item failed'); }
+		try { await log_audit(req, "371ecf9f-303e-4114-92fb-3a5120d1565e", `Deleted item ${itemId} from order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, deleted_item_id: itemId }); } catch (err) { logger.warn({ err }, 'log_audit delete-order-item failed'); }
 
 		res.json({ success: true });
 	} catch (err: any) {
@@ -4944,7 +5623,7 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 	}
 });
 
-app.delete("/orders/:id", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+app.delete("/orders/:id", validateAction(PERM_ORDER_DELETE), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -4963,6 +5642,12 @@ app.delete("/orders/:id", validateAction("4ad474d4-5230-449c-874f-6a238b833bca")
 			res.status(404).json({ error: "Order not found" });
 			return;
 		}
+		// Permanent deletion had no audit trail at all — the single most
+		// destructive order operation was invisible after the fact.
+		try {
+			await log_audit(req, PERM_ORDER_DELETE, `Deleted order ${orderId}`,
+				Audit_log_category.Orders, { order_id: orderId });
+		} catch (err) { logger.warn({ err }, "log_audit order-delete failed"); }
 		res.status(204).send();
 	} catch (error: any) {
 		logger.error({ err: error }, "delete_order_failed");
@@ -5195,6 +5880,13 @@ app.get("/analytics/kitchen", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f
 	catch (err) { logger.error({ err }, "kitchen_analytics_failed"); res.status(500).json({ error: "Unable to fetch kitchen analytics" }); }
 });
 
+// "What does this number mean?" copy for the analytics screens. Static text, no
+// restaurant data — served from here so the web and Flutter clients render the
+// identical wording for a metric. Keyed by metric id (see METRIC_EXPLAINERS).
+app.get("/analytics/metric-explainers", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), (_req: Request, res: Response) => {
+	res.json({ explainers: METRIC_EXPLAINERS });
+});
+
 // Daily revenue/order series for trend charts.
 app.get("/orders/daily-revenue", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -5392,6 +6084,15 @@ app.post("/waitlist/:id/seat", validateAction(WAITLIST_PERM), async (req: Reques
 	try {
 		const r = await SeatWaitlistEntry(restaurantId, String(req.params.id), tableName, extractEmployeeId(req) ?? undefined);
 		try { emitRestaurant(restaurantId, "waitlist:updated", { action: "seat" }); } catch {/* ignore */}
+		// Seating a queued party auto-places its held pre-order — that is a real new
+		// kitchen ticket, so it gets the same notification/realtime fan-out as any
+		// other order. Notified HERE (not inside SeatWaitlistEntry) so a rolled-back
+		// seat can never leave a notification for an order that does not exist.
+		if (r.placed_order_id) {
+			const seatedOrder: CreatedOrderInfo = { orderId: r.placed_order_id, table: r.table_name };
+			await notifyOrderCreated(restaurantId, seatedOrder);
+			emitOrderCreated(restaurantId, seatedOrder);
+		}
 		try { await log_audit(req, WAITLIST_PERM, `Seated queue party at ${r.table_name}`, Audit_log_category.Tables, { table: r.table_name, order: r.placed_order_id }); } catch {/* ignore */}
 		res.json(r);
 	} catch (e: any) { logger.error({ err: e }, "waitlist_seat_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to seat this party") }); }
@@ -6592,6 +7293,16 @@ app.post("/roles", validateAction("c0135d18-68b4-45e9-9b51-849158df6efd"), async
 		const priorRole = (await GetRoles(restaurantId).catch(() => []))
 			.find((r) => r.role_name.toLowerCase() === roleName.trim().toLowerCase()) ?? null;
 		const role = await CreateRole(restaurantId, roleName, actions);
+		// Editing an existing role rewrites what its holders may do, but every live
+		// session still carries the action list resolved at ITS login — revoke the
+		// holders' sessions so the new list actually applies. A brand-new role has
+		// no holders, so nothing to revoke.
+		if (priorRole) {
+			const holders = await GetEmployeeIdsWithRole(restaurantId, [role.id, role.role_name]).catch(() => [] as string[]);
+			for (const holder of holders) {
+				await revokeEmployeeSessions(holder, "role_permissions_changed");
+			}
+		}
 		try {
 			await log_audit(req, "c0135d18-68b4-45e9-9b51-849158df6efd", priorRole ? `Updated permissions of role '${role.role_name}'` : `Created role '${role.role_name}'`, Audit_log_category.Roles, {
 				role_id: role.id,
@@ -6626,10 +7337,16 @@ app.delete("/roles/:id", validateAction("53d0927d-00f4-48cc-a40c-51edb09826d8"),
 	}
 
 	try {
+		// Capture the holders before the role disappears — their sessions carry the
+		// permissions this role granted and must be revoked with it.
+		const holders = await GetEmployeeIdsWithRole(restaurantId, [roleId]).catch(() => [] as string[]);
 		const removed = await DeleteRole(restaurantId, roleId);
 		if (!removed) {
 			res.status(404).json({ error: "Role not found" });
 			return;
+		}
+		for (const holder of holders) {
+			await revokeEmployeeSessions(holder, "role_deleted");
 		}
 		res.status(204).send();
 	} catch (error) {
@@ -6667,6 +7384,9 @@ app.post("/roles/assign", validateAction("4bf54bd9-9124-46c0-a7cc-011ea4c4e172")
 	try {
 		const priorRoles = await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null);
 		await AssignRoleToEmployee(restaurantId, employeeId, roleName);
+		// Permissions are cached on the session at login, so the new role only
+		// takes effect once the holder re-authenticates.
+		await revokeEmployeeSessions(employeeId, "role_assigned");
 		const nextRoles = priorRoles ? await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null) : null;
 		try {
 			await log_audit(req, "4bf54bd9-9124-46c0-a7cc-011ea4c4e172", `Assigned role '${roleName}' to employee ${employeeId}`, Audit_log_category.Roles, {
@@ -6713,6 +7433,8 @@ app.post("/roles/remove", validateAction("9acc9097-4803-4be0-bb6d-fc2c5de57cf5")
 	try {
 		const priorRoles = await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null);
 		await RemoveRoleFromEmployee(restaurantId, employeeId, roleName);
+		// A revoked role must stop working NOW, not at the holder's next logout.
+		await revokeEmployeeSessions(employeeId, "role_removed");
 		const nextRoles = priorRoles ? await readEmployeeRolesForUndo(restaurantId, employeeId).catch(() => null) : null;
 		try {
 			await log_audit(req, "9acc9097-4803-4be0-bb6d-fc2c5de57cf5", `Removed role '${roleName}' from employee ${employeeId}`, Audit_log_category.Roles, {
@@ -7368,7 +8090,7 @@ app.get("/valet/charge-targets", validateAction("9e37297d-408b-446d-a51b-7892ad2
 });
 
 // Parking location / condition notes (+ optional photo) / retrieval ETA.
-app.post("/valet/:bookingId/ops", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
+app.post("/valet/:bookingId/ops", validateAction(PERM_VALET_OPS), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {return;}
 	const bookingId = typeof req.params.bookingId === "string" ? req.params.bookingId.trim() : "";
@@ -7423,7 +8145,7 @@ app.post("/valet/:bookingId/ops", validateAction("b8e02c25-b91c-427c-b462-8df009
 
 // Digital key log: "take" puts the keys in the logged-in attendant's hands,
 // "handover" records them leaving (returned to guest / hung on the board).
-app.post("/valet/:bookingId/keys", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
+app.post("/valet/:bookingId/keys", validateAction(PERM_VALET_KEYS), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {return;}
 	const bookingId = typeof req.params.bookingId === "string" ? req.params.bookingId.trim() : "";
@@ -7474,7 +8196,7 @@ app.post("/valet/:bookingId/keys", validateAction("b8e02c25-b91c-427c-b462-8df00
 // existing one-bill-per-table math (subtotal → discount → service charge → tax)
 // with zero special-casing; AddOrder rejects unoccupied tables, which is exactly
 // the "no open session" guard.
-app.post("/valet/:bookingId/charge", validateAction("b8e02c25-b91c-427c-b462-8df009ede055"), async (req: Request, res: Response) => {
+app.post("/valet/:bookingId/charge", validateAction(PERM_VALET_CHARGE), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "valet"]);
 	if (!auth) {return;}
 	const bookingId = typeof req.params.bookingId === "string" ? req.params.bookingId.trim() : "";
@@ -7961,7 +8683,11 @@ app.post("/restaurant/users", validateAction("58fdfca7-7a97-439b-aeb2-00e4395a9a
 	const email = typeof body.email === 'string' ? body.email.trim() : null;
 	const role = typeof body.role === 'string' ? body.role : 'employee';
 	const password = body.password;
-	const ph = typeof body.ph === 'string' || typeof body.ph === 'number' ? String(body.ph) : undefined;
+	// Staff phone is optional, but a typed one must be a full 10-digit mobile
+	// (it is the number rosters/shift messages use).
+	const staffPhone = optionalMobile10(res, body.ph);
+	if (!staffPhone.ok) {return;}
+	const ph = staffPhone.value ?? undefined;
 	const add = typeof body.add === 'string' ? body.add : undefined;
 
 	// Creating a user directly WITH the admin role is owner-only, matching the
@@ -8019,6 +8745,10 @@ app.delete("/restaurant/users", validateAction("a978f15d-1043-417a-b07b-05f6bdda
 			return;
 		}
 
+		// The login row is gone — kill the bearer tokens too, or a deleted user
+		// keeps working until their sliding session lapses.
+		await revokeEmployeeSessions(employeeId, "user_deleted");
+
 		try { emitRestaurant(auth.restaurantId, 'restaurant:user:deleted', { employeeId }); } catch (e) { /* ignore emit errors */ }
 
 		res.json({ success: true });
@@ -8060,7 +8790,13 @@ app.post("/restaurant/users/password", async (req: Request, res: Response) => {
 			return;
 		}
 		await SetUserPassword(admin.restaurantId, employeeId, password);
-		try { await log_audit(req, "a978f15d-1043-417a-b07b-05f6bddad875", `Reset password for a user`, Audit_log_category.General, { employeeId }); } catch {/* ignore */}
+		// A password reset must invalidate whatever was issued under the OLD
+		// credential (the usual reason for a reset is that it leaked).
+		await revokeEmployeeSessions(employeeId, "password_reset");
+		// Log under the PASSWORD action (not a978f15d, whose real name is "Remove
+		// Employee") — the audit log shows the action's NAME as the entry title, so
+		// reusing an unrelated id titled a password reset "Remove Employee".
+		try { await log_audit(req, PERM_PASSWORDS, `Reset password for a user`, Audit_log_category.General, { employeeId }); } catch {/* ignore */}
 		res.json({ success: true });
 	} catch (e: any) {
 		logger.error({ err: e }, "set_user_password_failed");
@@ -8140,7 +8876,7 @@ app.get("/feedback/recovery", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf
 	catch (err) { logger.error({ err }, "get_recovery_tickets_failed"); res.status(500).json({ error: "Unable to fetch recovery tickets" }); }
 });
 
-app.post("/feedback/recovery/:id/resolve", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"), async (req: Request, res: Response) => {
+app.post("/feedback/recovery/:id/resolve", validateAction(PERM_FEEDBACK_RESOLVE), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin", "employee"]);
 	if (!auth) {return;}
 	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";

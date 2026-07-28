@@ -27,6 +27,7 @@ import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import sharp from "sharp";
 import { downloadFile } from "./storage_bucket_supabase.js";
 import { signTable, encodeTableToken } from "./qr_signing.js";
+import { MOBILE_10_ERROR, normalizeMobile10 } from "./phone_validation.js";
 import {
   round2,
   computeBillTaxes,
@@ -236,6 +237,11 @@ interface SlotPayload {
   // 30-min sweep). Rides the slot JSON like deposit/min_spend, so every slot
   // read-modify-write path MUST round-trip it (encodeSlot/decodeSlot do).
   reminder_sent?: boolean | null;
+  // Clubbed tables: the EXTRA "Tables".id values this booking holds on top of
+  // Bookings.table_id (the primary). Absent/empty for an ordinary single-table
+  // booking — encodeSlot omits the key entirely so those rows stay byte-identical
+  // to what they were before combined bookings existed.
+  combined_table_ids?: string[] | null;
 }
 
 interface RestaurantUser {
@@ -312,6 +318,10 @@ interface BookingSummary {
   customer_id: string;
   customer_name: string;
   table_name: string | null;
+  // Every table the booking holds, primary first. Single-table bookings get a
+  // one-entry array (or an empty one when no table is assigned yet) — table_name
+  // stays the primary so existing clients are unaffected.
+  table_names?: string[];
   booking_date_time: Date;
   duration_mins: number;
   number_of_people: number;
@@ -413,6 +423,12 @@ export interface MenuItemRecord {
   // Allergen tags shown on the public QR menu, e.g. ["gluten", "nuts"].
   // Free-form strings (the UI offers a fixed suggestion set); [] / absent = none.
   allergens?: string[];
+  // Human-readable dish description ("a few lines") shown to guests when they
+  // open an item on the QR ordering page. Plain text, max 500 chars — see
+  // sanitizeMenuBlurb. Stored as `blurb` inside the Menu.description JSON blob
+  // (that column is NOT a plain description — see encodeMenuDescription).
+  // `undefined` on write = keep the stored value; "" / null = clear it.
+  blurb?: string | null;
   // Price history, maintained server-side (ignored on write — see
   // stampPriceHistory). Absent/null on items whose price never changed since
   // the feature landed. Drives the menu-insights convergence guards.
@@ -845,7 +861,29 @@ export function sanitizeAllergens(raw: unknown): string[] {
   return out;
 }
 
-function encodeMenuDescription(payload: { price: number; image_url?: string | null; available?: boolean; modifiers?: unknown; recipe?: unknown; station?: unknown; allergens?: unknown; price_updated_at?: string | null; price_baseline?: number | null }): string {
+// Guest-facing dish description. Plain text ONLY: markup is stripped (never
+// rendered as HTML anywhere), control characters are dropped, runs of blank
+// space/lines are collapsed, and the result is capped at 500 characters so a
+// pasted essay can't bloat the menu payload. Returns "" for anything unusable,
+// which is how the field is cleared.
+export function sanitizeMenuBlurb(raw: unknown): string {
+  if (typeof raw !== "string") {return "";}
+  const text = raw
+    .replace(/\r\n?/g, "\n")
+    .replace(/<[^>]*>/g, " ") // plain text only — no HTML ever reaches a client
+    .replace(/\t/g, " ")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/[ \u00A0]{2,}/g, " ")
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return text.slice(0, 500).trim();
+}
+
+function encodeMenuDescription(payload: { price: number; image_url?: string | null; available?: boolean; modifiers?: unknown; recipe?: unknown; station?: unknown; allergens?: unknown; blurb?: string | null; price_updated_at?: string | null; price_baseline?: number | null }): string {
   const out: Record<string, unknown> = { price: Number.isFinite(payload.price) ? payload.price : 0 };
   const img = typeof payload.image_url === "string" ? payload.image_url.trim() : "";
   if (img) {out.image_url = img;}
@@ -858,6 +896,12 @@ function encodeMenuDescription(payload: { price: number; image_url?: string | nu
   if (station) {out.station = station;}
   const allergens = sanitizeAllergens(payload.allergens);
   if (allergens.length > 0) {out.allergens = allergens;}
+  // Guest-facing dish description (omitted when empty, so items without one keep
+  // a lean blob). EVERY write path routes through here, so an unrelated edit
+  // (price, availability, reorder) can never drop it — the callers merge the
+  // stored value in first.
+  const blurb = sanitizeMenuBlurb(payload.blurb);
+  if (blurb) {out.blurb = blurb;}
   // Price history (both optional, both absent on legacy rows) — see
   // stampPriceHistory. Only ever written when a price actually changed.
   const priceUpdatedAt = typeof payload.price_updated_at === "string" ? payload.price_updated_at.trim() : "";
@@ -869,9 +913,9 @@ function encodeMenuDescription(payload: { price: number; image_url?: string | nu
   return JSON.stringify(out);
 }
 
-interface ParsedMenuDescription { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[]; price_updated_at: string | null; price_baseline: number | null }
+interface ParsedMenuDescription { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[]; blurb: string; price_updated_at: string | null; price_baseline: number | null }
 
-const emptyMenuDescription = (): ParsedMenuDescription => ({ price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [], price_updated_at: null, price_baseline: null });
+const emptyMenuDescription = (): ParsedMenuDescription => ({ price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [], blurb: "", price_updated_at: null, price_baseline: null });
 
 function parseMenuDescription(description: string | null): ParsedMenuDescription {
   if (!description) {return emptyMenuDescription();}
@@ -890,6 +934,7 @@ function parseMenuDescription(description: string | null): ParsedMenuDescription
     recipe: sanitizeRecipe(parsed.recipe),
     station: typeof parsed.station === "string" && parsed.station.trim() ? parsed.station.trim() : null,
     allergens: sanitizeAllergens(parsed.allergens),
+    blurb: sanitizeMenuBlurb(parsed.blurb),
     price_updated_at: priceUpdatedAt,
     price_baseline: baseline > 0 ? baseline : null,
   };
@@ -1005,7 +1050,61 @@ function encodeSlot(payload: SlotPayload): string {
     deposit: payload.deposit ?? null,
     min_spend: payload.min_spend ?? null,
     reminder_sent: payload.reminder_sent === true ? true : null,
+    // Only written for a clubbed booking: an ordinary single-table slot must
+    // serialise to exactly the same JSON it always did.
+    ...(payload.combined_table_ids && payload.combined_table_ids.length > 0
+      ? { combined_table_ids: payload.combined_table_ids }
+      : {}),
   });
+}
+
+// Extra clubbed table ids out of a slot blob (defensive — the blob is free-form
+// JSON written by several code paths and by hand-edited legacy rows).
+function parseCombinedTableIds(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) {return null;}
+  const ids: string[] = [];
+  for (const entry of raw) {
+    const id = String(entry ?? "").trim();
+    if (id.length > 0 && !ids.includes(id)) {ids.push(id);}
+  }
+  return ids.length > 0 ? ids : null;
+}
+
+// Every "Tables".id a booking occupies: the primary column plus any clubbed
+// extras from the slot blob, primary first, de-duplicated. Availability checks
+// MUST go through this or a clubbed table could be double-booked.
+// Display names for every table a booking holds, primary first. De-duplicated
+// for the same reason bookingTableIds is: re-pointing the primary onto a table
+// that is already in combined_table_ids (PATCH /booking/:id/table without the
+// combined_table_names key) would otherwise render "T2 + T2".
+function bookingTableNames(
+  primaryName: string | null | undefined,
+  slot: SlotPayload,
+  combinedNames: Map<string, string>,
+): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  const add = (name: string | null | undefined): void => {
+    const trimmed = String(name ?? "").trim();
+    if (!trimmed) {return;}
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) {return;}
+    seen.add(key);
+    names.push(trimmed);
+  };
+  add(primaryName);
+  for (const id of slot.combined_table_ids ?? []) {add(combinedNames.get(id));}
+  return names;
+}
+
+function bookingTableIds(primaryId: string | null | undefined, slot: SlotPayload): string[] {
+  const ids: string[] = [];
+  const primary = String(primaryId ?? "").trim();
+  if (primary) {ids.push(primary);}
+  for (const id of slot.combined_table_ids ?? []) {
+    if (id && !ids.includes(id)) {ids.push(id);}
+  }
+  return ids;
 }
 
 // Validate an arbitrary parsed value into a BookingDeposit (or null).
@@ -1056,6 +1155,7 @@ function decodeSlot(slot: string | null, fallbackCreatedAt?: Date): SlotPayload 
       deposit: parseBookingDeposit(parsed.deposit),
       min_spend: Number.isFinite(minSpend) && minSpend > 0 ? minSpend : null,
       reminder_sent: parsed.reminder_sent === true ? true : null,
+      combined_table_ids: parseCombinedTableIds(parsed.combined_table_ids),
     };
   } catch {
     const guess = new Date(slot);
@@ -1527,39 +1627,11 @@ async function findEmployeeIdByUsername(
   const existingRow = existing[0];
   if (existingRow) {return existingRow.emp_id;}
 
+  // No such employee. Callers create staff via AddRestaurantUser, which hashes
+  // the password. We deliberately do NOT auto-create a login here: the removed
+  // fallback below this throw was unreachable dead code that inserted a PLAINTEXT
+  // "changeme" password — a security landmine if ever re-enabled.
   throw new Error(`Employee with username '${_username}' not found in restaurant '${context.restaurant_name}', '${context.res_id}'`);
-
-  const parts = splitName(fallbackDisplayName || _username);
-  const employeeUuid = randomUUID();
-
-  await runQuery(
-    `
-      insert into "Employees"
-        (id, created_at, "emp_Fname", "emp_email", "emp_ph", "emp_add", emp_roles, res_id, outlet_id, "emp_Lname")
-      values
-        ($1, now(), $2, null, null, null, $3::json, $4, $5, $6)
-    `,
-    [
-      employeeUuid,
-      parts.first,
-      JSON.stringify({ primary: "employee", all: ["employee"] }),
-      context.res_id,
-      context.outlet_id,
-      parts.last,
-    ],
-    client,
-  );
-
-  await runQuery(
-    `
-      insert into "Login" (emp_id, created_at, res_id, outlet_id, emp_username, emp_pass)
-      values ($1, now(), $2, $3, $4, $5)
-    `,
-    [employeeUuid, context.res_id, context.outlet_id, _username, "changeme"],
-    client,
-  );
-
-  return employeeUuid;
 }
 
 export async function getRestaurantIdFromUsername(res_username: string): Promise<string | null> {
@@ -1762,11 +1834,15 @@ export async function AddTable(
   restaurantId: string,
   table_name: string,
   capacity?: number,
-): Promise<{ _id: string; table_name: string }> {
+  max_capacity?: number,
+): Promise<{ _id: string; table_name: string; capacity: number; max_capacity: number }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   const normalized = table_name.trim();
   const cap = Math.max(1, Number(capacity ?? 1));
+  // A max below the normal capacity is meaningless, so clamp up rather than
+  // reject (the caller is told the stored value in the response).
+  const maxCap = Math.max(cap, Math.round(Number(max_capacity ?? cap)) || cap);
 
   const existing = await runQuery<{ id: string; is_deleted: boolean }>(
     `
@@ -1788,24 +1864,72 @@ export async function AddTable(
       `
         update "Tables"
         set is_deleted = false, is_occupied = false, num_covers = 1,
-            linked_order_id = null, order_otp = null, table_name = $4, capacity = $5
+            linked_order_id = null, order_otp = null, table_name = $4, capacity = $5,
+            max_capacity = $6
         where id = $1 and res_id = $2 and outlet_id = $3
       `,
-      [existing[0].id, context.res_id, context.outlet_id, normalized, cap],
+      [existing[0].id, context.res_id, context.outlet_id, normalized, cap, maxCap],
     );
-    return { _id: existing[0].id, table_name: normalized };
+    return { _id: existing[0].id, table_name: normalized, capacity: cap, max_capacity: maxCap };
   }
 
   const id = randomUUID();
   await runQuery(
     `
-      insert into "Tables" (id, created_at, res_id, outlet_id, table_name, capacity)
-      values ($1, now(), $2, $3, $4, $5)
+      insert into "Tables" (id, created_at, res_id, outlet_id, table_name, capacity, max_capacity)
+      values ($1, now(), $2, $3, $4, $5, $6)
     `,
-    [id, context.res_id, context.outlet_id, normalized, cap],
+    [id, context.res_id, context.outlet_id, normalized, cap, maxCap],
   );
 
-  return { _id: id, table_name: normalized };
+  return { _id: id, table_name: normalized, capacity: cap, max_capacity: maxCap };
+}
+
+// Edit an existing table's seating numbers. Only the supplied fields change;
+// max_capacity is clamped up to capacity so the pair can never invert.
+export async function UpdateTable(
+  restaurantId: string,
+  table_name: string,
+  updates: { capacity?: number | null; max_capacity?: number | null },
+): Promise<{ table_name: string; capacity: number; max_capacity: number } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  const normalized = String(table_name ?? "").trim();
+  if (!normalized) {return null;}
+
+  const rows = await runQuery<{ id: string; table_name: string; capacity: unknown; max_capacity: unknown }>(
+    `
+      select id, table_name, capacity, max_capacity
+      from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+        and coalesce(is_deleted, false) = false
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+  );
+  const row = rows[0];
+  if (!row) {return null;}
+
+  const nextCap =
+    updates.capacity === undefined || updates.capacity === null
+      ? Math.max(1, Math.round(parseNumeric(row.capacity) || 1))
+      : Math.max(1, Math.round(Number(updates.capacity)));
+  const requestedMax =
+    updates.max_capacity === undefined || updates.max_capacity === null
+      ? Math.round(parseNumeric(row.max_capacity))
+      : Math.round(Number(updates.max_capacity));
+  const nextMax = requestedMax >= nextCap ? requestedMax : nextCap;
+
+  await runQuery(
+    `
+      update "Tables"
+      set capacity = $4, max_capacity = $5
+      where id = $1 and res_id = $2 and outlet_id = $3
+    `,
+    [row.id, context.res_id, context.outlet_id, nextCap, nextMax],
+  );
+
+  return { table_name: row.table_name, capacity: nextCap, max_capacity: nextMax };
 }
 
 export type RemoveTableResult =
@@ -1951,6 +2075,33 @@ async function ensureTableOccupancyColumns(client?: PoolClient): Promise<void> {
   );
   await ensureTableSessionsTable(client);
   });
+  await ensureTableMaxCapacityColumn(client);
+}
+
+// Per-table MAXIMUM cover count (extra chairs squeezed in) as opposed to
+// `capacity`, the comfortable seating. Null on legacy rows and read everywhere
+// as coalesce(max_capacity, capacity) so nothing changes until it is set.
+// Its own ensure key so it still runs in a process that already ensured the
+// older occupancy columns.
+async function ensureTableMaxCapacityColumn(client?: PoolClient): Promise<void> {
+  await ensureLazyTable("Tables.max_capacity", async () => {
+    await runQuery(
+      `
+        alter table "Tables"
+        add column if not exists max_capacity integer
+      `,
+      [],
+      client,
+    );
+  });
+}
+
+// Effective maximum a table can seat: the explicit max when set, else its normal
+// capacity, never below 1 (legacy rows can carry null/0 capacity).
+function effectiveMaxCapacity(capacity: unknown, maxCapacity: unknown): number {
+  const cap = Math.max(1, Math.round(parseNumeric(capacity) || 1));
+  const max = Math.round(parseNumeric(maxCapacity));
+  return max >= cap ? max : cap;
 }
 
 // --- Table sessions (turnaround time) ----------------------------------------
@@ -1975,6 +2126,9 @@ async function ensureTableSessionsTable(client?: PoolClient): Promise<void> {
     );
     await runQuery(`create index if not exists table_sessions_lookup_idx on "TableSessions" (res_id, outlet_id, seated_at desc)`, [], client);
     await runQuery(`create index if not exists table_sessions_open_idx on "TableSessions" (table_id) where left_at is null`, [], client);
+    // getTargetApc attributes each settled order to the seating it fell inside
+    // (table_id + time window), so that lookup gets its own index.
+    await runQuery(`create index if not exists table_sessions_table_time_idx on "TableSessions" (table_id, seated_at desc)`, [], client);
     await runQuery(
       `create or replace function table_session_track() returns trigger as $fn$
        begin
@@ -2039,6 +2193,28 @@ async function ensureTableOtpOnOccupy(context: RestaurantContext, tableId: strin
   }
 }
 
+/**
+ * A table may not be seated beyond its maximum. The override is deliberate and
+ * role-gated: someone with table-management permission raises the table's
+ * `max_capacity` (PATCH /table/:name) — seating simply cannot exceed whatever
+ * that number currently is. Enforced HERE, in the data layer, so every caller
+ * (POS, owner app, QR flow, waitlist seating) is covered rather than one route.
+ */
+function assertCoversFitTable(
+  tableName: string,
+  covers: number | null,
+  capacity: unknown,
+  maxCapacity: unknown,
+): void {
+  if (covers == null) {return;}
+  const max = effectiveMaxCapacity(capacity, maxCapacity);
+  if (covers > max) {
+    throw new Error(
+      `${tableName} seats up to ${max}. To seat ${covers}, raise this table's max seats (needs table-management permission) or combine tables.`,
+    );
+  }
+}
+
 export async function OccupyTable(
   restaurantId: string,
   table_name: string,
@@ -2060,9 +2236,9 @@ export async function OccupyTable(
   // silently resets a table's covers back to 1.
   const coversParam = typeof num_covers === "number" && num_covers >= 1 ? Math.round(num_covers) : null;
 
-  const rows = await runQuery<{ id: string }>(
+  const rows = await runQuery<{ id: string; capacity: unknown; max_capacity: unknown }>(
     `
-      select id
+      select id, capacity, max_capacity
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
         and coalesce(is_deleted, false) = false
@@ -2070,6 +2246,9 @@ export async function OccupyTable(
     `,
     [context.res_id, context.outlet_id, normalized],
   );
+  if (rows[0]) {
+    assertCoversFitTable(normalized, coversParam, rows[0].capacity, rows[0].max_capacity);
+  }
 
   if (!rows[0]) {
     throw new Error("Table not found");
@@ -2128,9 +2307,9 @@ export async function UpdateTableCovers(
     throw new Error("Number of covers must be at least 1");
   }
 
-  const rows = await runQuery<{ id: string }>(
+  const rows = await runQuery<{ id: string; capacity: unknown; max_capacity: unknown }>(
     `
-      select id
+      select id, capacity, max_capacity
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
         and coalesce(is_deleted, false) = false
@@ -2142,6 +2321,8 @@ export async function UpdateTableCovers(
   if (!rows[0]) {
     throw new Error("Table not found");
   }
+
+  assertCoversFitTable(normalized, Math.round(num_covers), rows[0].capacity, rows[0].max_capacity);
 
   const tableId = rows[0].id;
 
@@ -2191,12 +2372,30 @@ export async function ReleaseTable(
 
   const tableId = rows[0].id;
 
+  // MONEY GUARD: a guest who has already paid is sitting in status 6 (Payment
+  // Pending Approval) with a waiter-confirmed bill awaiting admin approval.
+  // Releasing used to void those orders and close the bill as 'released', so the
+  // collected cash disappeared from revenue entirely. Refuse instead, and tell
+  // staff what to do.
+  const pendingPayment = await runQuery<{ n: string }>(
+    `select count(*)::text as n from "Bills"
+       where res_id = $1 and outlet_id = $2 and table_id = $3
+         and closed_at is null and waiter_confirmed_at is not null and admin_approved_at is null`,
+    [context.res_id, context.outlet_id, tableId],
+  );
+  if (Number(pendingPayment[0]?.n ?? 0) > 0) {
+    throw new Error(
+      `${normalized} has a payment awaiting approval. Approve or reject that payment before releasing the table — releasing now would void money the guest has already paid.`,
+    );
+  }
+
   // Releasing without payment voids the table's still-active orders so they don't
-  // carry into the next session.
+  // carry into the next session. Status 6 (Payment Pending Approval) is EXCLUDED
+  // alongside Paid/Cancelled/Closed: the guest has paid, so it is not "active".
   await runQuery(
     `update "Orders" set status = 5
        where res_id = $1 and outlet_id = $2 and table_id = $3
-         and coalesce(status::text, '1') not in ('4','5','7')`,
+         and coalesce(status::text, '1') not in ('4','5','6','7')`,
     [context.res_id, context.outlet_id, tableId],
   );
 
@@ -2237,7 +2436,7 @@ export async function ReleaseTable(
 export async function GetTableStatus(
   restaurantId: string,
   table_name: string,
-): Promise<{ table_id: string; table_name: string; capacity: number | null; is_occupied: boolean; num_covers: number; linked_order_id: string | null } | null> {
+): Promise<{ table_id: string; table_name: string; capacity: number | null; max_capacity: number; is_occupied: boolean; num_covers: number; linked_order_id: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
 
@@ -2250,12 +2449,13 @@ export async function GetTableStatus(
     id: string;
     table_name: string;
     capacity: unknown;
+    max_capacity: unknown;
     is_occupied: boolean;
     num_covers: number;
     linked_order_id: string | null;
   }>(
     `
-      select id, table_name, capacity, is_occupied, num_covers, linked_order_id
+      select id, table_name, capacity, max_capacity, is_occupied, num_covers, linked_order_id
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
         and coalesce(is_deleted, false) = false
@@ -2273,6 +2473,7 @@ export async function GetTableStatus(
     table_id: row.id,
     table_name: row.table_name,
     capacity: parseNumeric(row.capacity),
+    max_capacity: effectiveMaxCapacity(row.capacity, row.max_capacity),
     is_occupied: row.is_occupied ?? false,
     num_covers: row.num_covers ?? 1,
     linked_order_id: row.linked_order_id ?? null,
@@ -2298,31 +2499,66 @@ function apcColor(tableApc: number, target: number): "green" | "yellow" | "red" 
   return "red";
 }
 
-// Restaurant's monthly APC = monthly revenue / Σ(per-table covers). Used as the
-// benchmark each open table is compared against.
+// Restaurant's monthly APC = monthly revenue / guests SERVED that month. Used as
+// the benchmark each open table is compared against.
+//
+// The denominator must be covers per SEATING, not per table: a table seats many
+// parties a month, and ReleaseTable/settle reset its num_covers to 1, so keying
+// covers by table_id (the old shape) collapsed a whole month of guests down to
+// "one cover per table that happened to be used" and produced a target in the
+// tens of thousands — every table permanently red. Each settled order is instead
+// attributed to the "TableSessions" row it was placed inside (one row per
+// seating, written by the table_sessions_trg trigger and carrying that party's
+// covers), and each distinct seating is counted ONCE no matter how many orders
+// it produced. A settled order that matches no session (pre-dates the sessions
+// trigger, or its table was re-seated since) falls back to counting as its own
+// seating at the table's current covers, so its revenue is never divided by zero
+// guests.
 async function getTargetApc(context: RestaurantContext): Promise<number> {
   const now = await currentDbTime();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   const monthEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
-  const rows = await runQuery<{ table_id: string | null; num_covers: number; food: unknown; status: unknown }>(
-    `select o.table_id, coalesce(t.num_covers, 1) as num_covers, o.food, o.status
+  const rows = await runQuery<{
+    order_id: string;
+    session_id: string | null;
+    session_covers: number | null;
+    num_covers: number;
+    food: unknown;
+    status: unknown;
+  }>(
+    `select o.id as order_id, o.food, o.status,
+            coalesce(t.num_covers, 1) as num_covers,
+            s.session_id, s.session_covers
        from "Orders" o
        left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+       left join lateral (
+         select ts.id as session_id, greatest(1, coalesce(ts.covers, 1)) as session_covers
+           from "TableSessions" ts
+          where ts.table_id = o.table_id and ts.res_id = o.res_id and ts.outlet_id = o.outlet_id
+            and o.created_at >= ts.seated_at
+            and o.created_at < coalesce(ts.left_at, now())
+          order by ts.seated_at desc
+          limit 1
+       ) s on true
        where o.res_id = $1 and o.outlet_id = $2 and o.created_at >= $3 and o.created_at < $4`,
     [context.res_id, context.outlet_id, monthStart.toISOString(), monthEnd.toISOString()],
   );
   // Benchmark = SETTLED business only (paid/closed). Active/in-progress tables
   // must not inflate the target they're being measured against (circularity).
   let revenue = 0;
-  const coversByTable = new Map<string, number>();
+  const coversBySeating = new Map<string, number>();
   for (const r of rows) {
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
     if (st !== "paid" && st !== "closed") {continue;}
     const p = parseJsonObject(r.food) ?? {};
     revenue += parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
-    if (r.table_id) {coversByTable.set(r.table_id, Math.max(1, Number(r.num_covers ?? 1)));}
+    const seatingKey = r.session_id ?? `order:${r.order_id}`;
+    const seatingCovers = r.session_id
+      ? Math.max(1, Number(r.session_covers ?? 1))
+      : Math.max(1, Number(r.num_covers ?? 1));
+    coversBySeating.set(seatingKey, seatingCovers);
   }
-  const totalCovers = [...coversByTable.values()].reduce((a, b) => a + b, 0);
+  const totalCovers = [...coversBySeating.values()].reduce((a, b) => a + b, 0);
   return totalCovers > 0 ? round2(revenue / totalCovers) : 0;
 }
 
@@ -2558,7 +2794,10 @@ export async function AddBooking(
   notes?: string | null,
   deposit?: BookingDeposit | null,
   min_spend?: number | null,
-): Promise<{ _id: string }> {
+  // Clubbed booking: EXTRA tables held alongside table_name. Only ever set when
+  // the caller passes them explicitly — nothing here auto-clubs.
+  combined_table_names?: string[] | null,
+): Promise<{ _id: string; table_names: string[] }> {
   ensureValidDate(booking_date_time);
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
@@ -2595,6 +2834,8 @@ export async function AddBooking(
     throw new Error("Table not found for restaurant");
   }
 
+  const extra = await resolveCombinedTables(context, table.id, combined_table_names);
+
   const bookingId = randomUUID();
   const slot = encodeSlot({
     start: booking_date_time.toISOString(),
@@ -2605,6 +2846,7 @@ export async function AddBooking(
     notes: notes ?? null,
     deposit: deposit ?? null,
     min_spend: min_spend ?? null,
+    combined_table_ids: extra.ids.length > 0 ? extra.ids : null,
   });
 
   await runQuery(
@@ -2625,7 +2867,59 @@ export async function AddBooking(
     ],
   );
 
-  return { _id: bookingId };
+  return { _id: bookingId, table_names: [table_name.trim(), ...extra.names] };
+}
+
+// id -> table_name for a set of table ids (soft-deleted rows included, so a
+// historical clubbed booking still reads back with all of its table names).
+// Scoped by res_id only because booking reads can span outlets.
+async function lookupTableNames(
+  context: RestaurantContext,
+  ids: string[],
+): Promise<Map<string, string>> {
+  if (ids.length === 0) {return new Map();}
+  const rows = await runQuery<{ id: string; table_name: string }>(
+    `select id, table_name from "Tables" where res_id = $1 and id = any($2::uuid[])`,
+    [context.res_id, ids],
+  ).catch(() => [] as { id: string; table_name: string }[]);
+  return new Map(rows.map((r) => [r.id, r.table_name]));
+}
+
+// Resolve caller-supplied clubbed table NAMES to ids, dropping the primary and
+// duplicates. Throws when a name does not exist so a typo can never silently
+// produce a half-clubbed booking.
+async function resolveCombinedTables(
+  context: RestaurantContext,
+  primaryId: string,
+  names: string[] | null | undefined,
+): Promise<{ ids: string[]; names: string[] }> {
+  const wanted = (names ?? [])
+    .map((n) => String(n ?? "").trim())
+    .filter((n) => n.length > 0);
+  if (wanted.length === 0) {return { ids: [], names: [] };}
+
+  const rows = await runQuery<{ id: string; table_name: string }>(
+    `
+      select id, table_name
+      from "Tables"
+      where res_id = $1 and outlet_id = $2
+        and coalesce(is_deleted, false) = false
+        and lower(table_name) = any($3::text[])
+    `,
+    [context.res_id, context.outlet_id, wanted.map((n) => n.toLowerCase())],
+  );
+
+  const byLower = new Map(rows.map((r) => [r.table_name.toLowerCase(), r]));
+  const ids: string[] = [];
+  const resolved: string[] = [];
+  for (const name of wanted) {
+    const row = byLower.get(name.toLowerCase());
+    if (!row) {throw new Error(`Table not found for restaurant: ${name}`);}
+    if (row.id === primaryId || ids.includes(row.id)) {continue;}
+    ids.push(row.id);
+    resolved.push(row.table_name);
+  }
+  return { ids, names: resolved };
 }
 
 export async function GetCustomerId(
@@ -2701,7 +2995,7 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<{ table_name: string; capacity: number | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; order_otp?: string | null }[] | null> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; order_otp?: string | null }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
@@ -2712,12 +3006,13 @@ export async function GetTables(
     id: string;
     table_name: string;
     capacity: unknown;
+    max_capacity: unknown;
     is_occupied: boolean;
     num_covers: unknown;
     order_otp: string | null;
   }>(
     `
-      select id, table_name, capacity,
+      select id, table_name, capacity, max_capacity,
              coalesce(is_occupied, false) as is_occupied,
              coalesce(num_covers, 1) as num_covers,
              order_otp
@@ -2776,8 +3071,8 @@ export async function GetTables(
   const dayEnd = new Date(at);
   dayEnd.setHours(23, 59, 59, 999);
 
-  const active = [] as typeof bookings;
-  const upcoming = [] as typeof bookings;
+  const active: string[][] = [];
+  const upcoming: string[][] = [];
   for (const booking of bookings) {
     const slot = decodeSlot(booking.slot, new Date(booking.created_at));
     // A booking only holds its table while the party is still expected. Terminal
@@ -2789,17 +3084,20 @@ export async function GetTables(
     const start = new Date(slot.start);
     const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {continue;}
+    // A clubbed booking holds every table in its set, not just the primary.
+    const held = bookingTableIds(booking.table_id, slot);
+    if (held.length === 0) {continue;}
     if (start <= at && end > at) {
-      active.push(booking);
+      active.push(held);
       continue;
     }
     if (start > at && start <= dayEnd) {
-      upcoming.push(booking);
+      upcoming.push(held);
     }
   }
 
-  const bookedTables = new Set(active.map((b) => b.table_id).filter(Boolean));
-  const reservedTables = new Set(upcoming.map((b) => b.table_id).filter(Boolean));
+  const bookedTables = new Set(active.flat());
+  const reservedTables = new Set(upcoming.flat());
 
   // Tables whose open bill is awaiting staff approval (customer paid via QR).
   const pendingRows = await runQuery<{ table_id: string | null }>(
@@ -2837,6 +3135,8 @@ export async function GetTables(
     return {
       table_name: row.table_name,
       capacity: parseNumeric(row.capacity),
+      // The most this table can seat with extra chairs (falls back to capacity).
+      max_capacity: effectiveMaxCapacity(row.capacity, row.max_capacity),
       booked: bookedTables.has(row.id),
       reserved: reservedTables.has(row.id),
       occupied,
@@ -2894,7 +3194,7 @@ export async function GetAvailableTablesForInterval(
   restaurantId: string,
   start: Date,
   durationMins: number,
-): Promise<{ table_name: string; capacity: number | null }[]> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity: number }[]> {
   ensureValidDate(start);
   const end = new Date(start.getTime() + durationMins * MINUTE_IN_MS);
   const context = await requireRestaurantContext(restaurantId);
@@ -2904,9 +3204,10 @@ export async function GetAvailableTablesForInterval(
     id: string;
     table_name: string;
     capacity: unknown;
+    max_capacity: unknown;
   }>(
     `
-      select id, table_name, capacity
+      select id, table_name, capacity, max_capacity
       from "Tables"
       where res_id = $1 and outlet_id = $2
         and coalesce(is_deleted, false) = false
@@ -2927,12 +3228,19 @@ export async function GetAvailableTablesForInterval(
     if (Number.isNaN(bookingStart.getTime()) || Number.isNaN(bookingEnd.getTime())) {continue;}
 
     const overlaps = bookingStart < end && bookingEnd > start;
-    if (overlaps) {busyIds.add(booking.table_id);}
+    // Clubbed bookings hold every table in the set, so all of them are busy.
+    if (overlaps) {
+      for (const id of bookingTableIds(booking.table_id, slot)) {busyIds.add(id);}
+    }
   }
 
   return tableRows
     .filter((row) => !busyIds.has(row.id))
-    .map((row) => ({ table_name: row.table_name, capacity: parseNumeric(row.capacity) }));
+    .map((row) => ({
+      table_name: row.table_name,
+      capacity: parseNumeric(row.capacity),
+      max_capacity: effectiveMaxCapacity(row.capacity, row.max_capacity),
+    }));
 }
 
 export async function AllocateBestTable(
@@ -2956,9 +3264,204 @@ export async function AllocateBestTable(
   return fit[0]?.table_name ?? null;
 }
 
+// --- Seating suggestion (party bigger than one table) -------------------------
+// Staff-facing SUGGESTION only: nothing here writes, and nothing auto-assigns.
+// Adjacency is inferred from the table NAME's trailing number (T1+T2, "Table 3"
+// +"Table 4") because the schema carries no floor coordinates — tables whose
+// name has no trailing number can never be clubbed automatically.
+
+// Most tables we will ever propose clubbing together.
+const MAX_CLUBBED_TABLES = 3;
+
+export interface SeatingSuggestionTable {
+  table_id: string;
+  table_name: string;
+  capacity: number;
+  max_capacity: number;
+}
+
+export interface SeatingCombination {
+  table_ids: string[];
+  table_names: string[];
+  total_capacity: number;
+  adjacent: true;
+}
+
+export interface SeatingSuggestion {
+  party: number;
+  at: string;
+  duration_mins: number;
+  single: SeatingSuggestionTable[];
+  combinations: SeatingCombination[];
+  free_tables: SeatingSuggestionTable[];
+  unnumbered_free_tables: string[];
+  none_reason: string | null;
+}
+
+// "T1" -> { prefix: "t", number: 1 }; "Table 12" -> { prefix: "table", number: 12 };
+// "Patio" -> null (un-clubbable). The prefix is normalised so only tables from the
+// same naming series are treated as neighbours (T1 + "Table 2" are not).
+function parseTableSeries(name: string): { prefix: string; number: number } | null {
+  const match = /^(.*?)(\d+)\s*$/.exec(String(name ?? "").trim());
+  if (!match) {return null;}
+  const number = Number.parseInt(match[2]!, 10);
+  if (!Number.isFinite(number)) {return null;}
+  return { prefix: match[1]!.toLowerCase().replace(/[^a-z0-9]/g, ""), number };
+}
+
+export async function GetSeatingSuggestion(
+  restaurantId: string,
+  party: number,
+  start: Date,
+  durationMins: number,
+): Promise<SeatingSuggestion> {
+  ensureValidDate(start);
+  const partySize = Math.max(1, Math.round(party));
+  const duration = Math.max(1, Math.round(durationMins));
+  const end = new Date(start.getTime() + duration * MINUTE_IN_MS);
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+
+  const tableRows = await runQuery<{
+    id: string;
+    table_name: string;
+    capacity: unknown;
+    max_capacity: unknown;
+    is_occupied: boolean;
+  }>(
+    `
+      select id, table_name, capacity, max_capacity,
+             coalesce(is_occupied, false) as is_occupied
+      from "Tables"
+      where res_id = $1 and outlet_id = $2
+        and coalesce(is_deleted, false) = false
+        and coalesce(is_virtual, false) = false
+      order by table_name asc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  // Same overlap rule as GetAvailableTablesForInterval, extended to clubbed sets.
+  const bookings = await getBookingsWithTableMeta(context);
+  const busyIds = new Set<string>();
+  for (const booking of bookings) {
+    const slot = decodeSlot(booking.slot, new Date(booking.created_at));
+    // Terminal bookings (cancelled/completed/seated/no-show) release their tables.
+    if (isTerminalBookingStatus(slot.status)) {continue;}
+    const bookingStart = new Date(slot.start);
+    const bookingEnd = new Date(bookingStart.getTime() + slot.duration * MINUTE_IN_MS);
+    if (Number.isNaN(bookingStart.getTime()) || Number.isNaN(bookingEnd.getTime())) {continue;}
+    if (bookingStart < end && bookingEnd > start) {
+      for (const id of bookingTableIds(booking.table_id, slot)) {busyIds.add(id);}
+    }
+  }
+
+  // A window that is happening right now must also skip tables with a party
+  // already sitting at them (walk-ins never create a Bookings row).
+  const now = new Date();
+  const windowIsNow = start <= now && end > now;
+
+  const free: SeatingSuggestionTable[] = [];
+  const unnumberedFree: string[] = [];
+  const series: { prefix: string; number: number; table: SeatingSuggestionTable }[] = [];
+  for (const row of tableRows) {
+    if (busyIds.has(row.id)) {continue;}
+    if (windowIsNow && row.is_occupied) {continue;}
+    const table: SeatingSuggestionTable = {
+      table_id: row.id,
+      table_name: row.table_name,
+      capacity: Math.max(1, Math.round(parseNumeric(row.capacity) || 1)),
+      max_capacity: effectiveMaxCapacity(row.capacity, row.max_capacity),
+    };
+    free.push(table);
+    const parsed = parseTableSeries(row.table_name);
+    if (parsed) {
+      series.push({ ...parsed, table });
+    } else {
+      unnumberedFree.push(row.table_name);
+    }
+  }
+
+  // Smallest table that still fits first, so an 8-top is not burned on a pair.
+  const single = free
+    .filter((t) => t.max_capacity >= partySize)
+    .sort((a, b) => a.max_capacity - b.max_capacity || a.capacity - b.capacity || a.table_name.localeCompare(b.table_name));
+
+  // Runs of consecutively-numbered free tables from the same naming series.
+  const byPrefix = new Map<string, typeof series>();
+  for (const entry of series) {
+    const bucket = byPrefix.get(entry.prefix);
+    if (bucket) {bucket.push(entry);} else {byPrefix.set(entry.prefix, [entry]);}
+  }
+
+  const combinations: SeatingCombination[] = [];
+  for (const bucket of byPrefix.values()) {
+    bucket.sort((a, b) => a.number - b.number);
+    for (let i = 0; i < bucket.length; i++) {
+      let total = bucket[i]!.table.max_capacity;
+      for (let size = 2; size <= MAX_CLUBBED_TABLES && i + size - 1 < bucket.length; size++) {
+        const prev = bucket[i + size - 2]!;
+        const next = bucket[i + size - 1]!;
+        if (next.number !== prev.number + 1) {break;}
+        total += next.table.max_capacity;
+        if (total < partySize) {continue;}
+        const members = bucket.slice(i, i + size).map((e) => e.table);
+        combinations.push({
+          table_ids: members.map((t) => t.table_id),
+          table_names: members.map((t) => t.table_name),
+          total_capacity: total,
+          adjacent: true,
+        });
+        // Adding a further table to a set that already fits only wastes seats.
+        break;
+      }
+    }
+  }
+
+  // Fewest tables first, then the least wasted seats, then table order.
+  combinations.sort(
+    (a, b) =>
+      a.table_ids.length - b.table_ids.length ||
+      a.total_capacity - b.total_capacity ||
+      a.table_names[0]!.localeCompare(b.table_names[0]!),
+  );
+
+  let none_reason: string | null = null;
+  if (single.length === 0 && combinations.length === 0) {
+    if (free.length === 0) {
+      none_reason = `No tables are free for ${duration} minutes from ${start.toISOString()}.`;
+    } else {
+      none_reason =
+        `No free table or adjacent group (up to ${MAX_CLUBBED_TABLES} tables) can seat ${partySize} at that time.` +
+        (unnumberedFree.length > 0
+          ? ` Tables without a number in their name (${unnumberedFree.join(", ")}) cannot be clubbed automatically.`
+          : "");
+    }
+  }
+
+  return {
+    party: partySize,
+    at: start.toISOString(),
+    duration_mins: duration,
+    single,
+    combinations,
+    free_tables: free,
+    unnumbered_free_tables: unnumberedFree,
+    none_reason,
+  };
+}
+
+// Which slice of the bookings list to return. `upcoming` (the default) is the
+// operational view — only reservations whose slot has NOT yet ended, oldest
+// first. `past` shows finished/elapsed reservations most-recent-first so a
+// booking never just disappears the moment its slot ends (Bug B). `all` shows
+// upcoming (oldest-first) followed by past (most-recent-first).
+export type BookingWindow = "upcoming" | "past" | "all";
+
 export async function GetBookingsAfterTime(
   restaurantId: string,
   time?: string,
+  window: BookingWindow = "upcoming",
 ): Promise<BookingSummary[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
@@ -2997,18 +3500,33 @@ export async function GetBookingsAfterTime(
 
   const result: BookingSummary[] = [];
 
+  // Clubbed bookings keep their extra tables as ids in the slot blob; resolve
+  // them to names in one pass so each summary can report the whole set.
+  const combinedIds = new Set<string>();
+  for (const row of rows) {
+    for (const id of decodeSlot(row.slot, row.created_at).combined_table_ids ?? []) {
+      combinedIds.add(id);
+    }
+  }
+  const combinedNames = await lookupTableNames(context, [...combinedIds]);
+
+  // Split into upcoming (slot still live) and past (slot ended) as we map, so the
+  // same row→summary mapping serves all three windows. `end <= at` is the exact
+  // boundary the upcoming view has always used, so `upcoming` stays byte-identical.
+  const upcoming: BookingSummary[] = [];
+  const past: BookingSummary[] = [];
   for (const row of rows) {
     const slot = decodeSlot(row.slot, row.created_at);
     const start = new Date(slot.start);
     const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {continue;}
-    if (end <= at) {continue;}
 
-    result.push({
+    const summary: BookingSummary = {
       booking_id: row.booking_id,
       customer_id: row.customer_id,
       customer_name: `${row.cust_fname} ${row.cust_lname}`.trim(),
       table_name: row.table_name,
+      table_names: bookingTableNames(row.table_name, slot, combinedNames),
       booking_date_time: start,
       duration_mins: slot.duration,
       number_of_people: Math.max(1, Math.round(parseNumeric(row.num_adults))),
@@ -3018,11 +3536,22 @@ export async function GetBookingsAfterTime(
       notes: slot.notes ?? null,
       deposit: slot.deposit ?? null,
       min_spend: slot.min_spend ?? null,
-    });
+    };
+    (end <= at ? past : upcoming).push(summary);
   }
 
-  result.sort((a, b) => a.booking_date_time.getTime() - b.booking_date_time.getTime());
-  return result;
+  const byTimeAsc = (a: BookingSummary, b: BookingSummary) =>
+    a.booking_date_time.getTime() - b.booking_date_time.getTime();
+  const byTimeDesc = (a: BookingSummary, b: BookingSummary) =>
+    b.booking_date_time.getTime() - a.booking_date_time.getTime();
+
+  upcoming.sort(byTimeAsc);
+  past.sort(byTimeDesc);
+
+  if (window === "past") {return past;}
+  if (window === "all") {return [...upcoming, ...past];}
+  // upcoming (default): unchanged from the original behaviour.
+  return upcoming;
 }
 
 // Single-booking lookup (same shape as GetBookingsAfterTime rows) — used by the
@@ -3065,11 +3594,13 @@ export async function GetBookingSummaryById(
   const row = rows[0];
   if (!row) {return null;}
   const slot = decodeSlot(row.slot, row.created_at);
+  const combinedNames = await lookupTableNames(context, slot.combined_table_ids ?? []);
   return {
     booking_id: row.booking_id,
     customer_id: row.customer_id,
     customer_name: `${row.cust_fname} ${row.cust_lname}`.trim(),
     table_name: row.table_name,
+    table_names: bookingTableNames(row.table_name, slot, combinedNames),
     booking_date_time: new Date(slot.start),
     duration_mins: slot.duration,
     number_of_people: Math.max(1, Math.round(parseNumeric(row.num_adults))),
@@ -3139,6 +3670,55 @@ export async function UpdateBookingStatus(
 
   const slot = decodeSlot(row.slot, row.created_at);
   const prevStatus = String(slot.status ?? "").trim().toLowerCase();
+
+  const normalizedStatus = status.trim().toLowerCase();
+  const isSeating = (s: string) => s === "seated" || s === "arrived";
+  // A clubbed booking holds its primary table AND every table in
+  // combined_table_ids: seating it must occupy the whole set (leaving the extras
+  // free re-offers half of a seated party to the next walk-in) and un-seating it
+  // must release the whole set.
+  const tableIds = bookingTableIds(row.table_id, slot);
+  const covers = Math.max(1, toNonNegativeInt(row.num_adults) + toNonNegativeInt(row.num_kids));
+
+  // Plan the seating BEFORE writing the status, so an over-capacity party is
+  // rejected outright (the same cap /occupy-table enforces) instead of the
+  // booking flipping to Seated with num_covers written past the table's max.
+  let seatPlan: { id: string; covers: number }[] = [];
+  if (isSeating(normalizedStatus) && tableIds.length > 0) {
+    await ensureTableOccupancyColumns();
+    const capRows = await runQuery<{ id: string; table_name: string; capacity: unknown; max_capacity: unknown }>(
+      `select id, table_name, capacity, max_capacity
+         from "Tables"
+        where id = any($1::uuid[]) and res_id = $2 and outlet_id = $3
+          and coalesce(is_deleted, false) = false`,
+      [tableIds, context.res_id, context.outlet_id],
+    );
+    const seats = tableIds
+      .map((id) => capRows.find((t) => t.id === id))
+      .filter((t): t is { id: string; table_name: string; capacity: unknown; max_capacity: unknown } => Boolean(t))
+      .map((t) => ({ id: t.id, name: t.table_name, max: effectiveMaxCapacity(t.capacity, t.max_capacity) }));
+    if (seats.length === 1) {
+      assertCoversFitTable(seats[0].name, covers, null, seats[0].max);
+    } else if (seats.length > 1) {
+      const totalMax = seats.reduce((sum, t) => sum + t.max, 0);
+      if (covers > totalMax) {
+        throw new Error(
+          `${seats.map((t) => t.name).join(" + ")} seat up to ${totalMax}. To seat ${covers}, raise a table's max seats (needs table-management permission) or club another table.`,
+        );
+      }
+    }
+    // Spread the party over the clubbed set, primary first, so no single table is
+    // written past its own max and the covers still sum to the party size (covers
+    // is the APC denominator).
+    let left = covers;
+    seatPlan = seats.map((t, i) => {
+      const rest = seats.length - i - 1;
+      const take = Math.max(1, Math.min(t.max, left - rest));
+      left -= take;
+      return { id: t.id, covers: take };
+    });
+  }
+
   slot.status = status;
 
   await runQuery(
@@ -3150,37 +3730,35 @@ export async function UpdateBookingStatus(
     [booking_id, context.res_id, context.outlet_id, encodeSlot(slot)],
   );
 
-  const normalizedStatus = status.trim().toLowerCase();
-  const isSeating = (s: string) => s === "seated" || s === "arrived";
-  if (isSeating(normalizedStatus) && row.table_id) {
-    // Seating/arriving a booking occupies its assigned table (so the floor view +
+  if (seatPlan.length > 0) {
+    // Seating/arriving a booking occupies its assigned table(s) (so the floor view +
     // ordering reflect it). Covers default to the party size.
-    const covers = Math.max(1, toNonNegativeInt(row.num_adults) + toNonNegativeInt(row.num_kids));
     try {
-      await ensureTableOccupancyColumns();
-      await runQuery(
-        `update "Tables" set is_occupied = true, num_covers = $4
-           where id = $1 and res_id = $2 and outlet_id = $3 and coalesce(is_deleted, false) = false`,
-        [row.table_id, context.res_id, context.outlet_id, covers],
-      );
-      // Mint the table's ordering code when the OTP gate is on.
-      await ensureTableOtpOnOccupy(context, row.table_id);
+      for (const seat of seatPlan) {
+        await runQuery(
+          `update "Tables" set is_occupied = true, num_covers = $4
+             where id = $1 and res_id = $2 and outlet_id = $3 and coalesce(is_deleted, false) = false`,
+          [seat.id, context.res_id, context.outlet_id, seat.covers],
+        );
+        // Mint the table's ordering code when the OTP gate is on.
+        await ensureTableOtpOnOccupy(context, seat.id);
+      }
     } catch (err) {
       logger.warn({ err }, "occupy_table_on_seat_failed");
     }
-  } else if (!isSeating(normalizedStatus) && isSeating(prevStatus) && row.table_id) {
-    // The booking was holding its table (it had been seated/arrived) and is now
+  } else if (!isSeating(normalizedStatus) && isSeating(prevStatus) && tableIds.length > 0) {
+    // The booking was holding its table(s) (it had been seated/arrived) and is now
     // moving to a NON-seating status (cancelled / completed / no-show / back to
-    // confirmed) — the party is no longer there, so release the table instead of
-    // leaving it stuck "occupied" with the party's covers. Gated on the PRIOR
+    // confirmed) — the party is no longer there, so release them instead of
+    // leaving them stuck "occupied" with the party's covers. Gated on the PRIOR
     // status so cancelling a never-seated booking can't clear a walk-in that
     // independently occupied the same table.
     try {
       await ensureTableOccupancyColumns();
       await runQuery(
         `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null
-           where id = $1 and res_id = $2 and outlet_id = $3 and coalesce(is_deleted, false) = false`,
-        [row.table_id, context.res_id, context.outlet_id],
+           where id = any($1::uuid[]) and res_id = $2 and outlet_id = $3 and coalesce(is_deleted, false) = false`,
+        [tableIds, context.res_id, context.outlet_id],
       );
     } catch (err) {
       logger.warn({ err }, "release_table_on_unseat_failed");
@@ -3210,6 +3788,9 @@ export async function AssignTableToBooking(
   restaurantId: string,
   booking_id: string,
   table_name: string | null,
+  // Extra tables to club with the primary. `undefined` leaves whatever the
+  // booking already had; `[]` explicitly un-clubs it back to a single table.
+  combined_table_names?: string[] | null,
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
@@ -3234,14 +3815,40 @@ export async function AssignTableToBooking(
     throw new Error("Table not found for restaurant");
   }
 
+  // Re-point the primary only — the slot blob (deposit, min_spend, reminder…)
+  // is left untouched unless the caller is actually changing the clubbed set.
+  if (combined_table_names === undefined) {
+    const rows = await runQuery<{ id: string }>(
+      `
+        update "Bookings"
+        set table_id = $4
+        where id = $1 and res_id = $2 and outlet_id = $3
+        returning id
+      `,
+      [booking_id, context.res_id, context.outlet_id, table.id],
+    );
+    return rows.length > 0;
+  }
+
+  const existing = await runQuery<{ slot: string; created_at: Date }>(
+    `select slot, created_at from "Bookings" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [booking_id, context.res_id, context.outlet_id],
+  );
+  const current = existing[0];
+  if (!current) {return false;}
+
+  const extra = await resolveCombinedTables(context, table.id, combined_table_names);
+  const slot = decodeSlot(current.slot, current.created_at);
+  slot.combined_table_ids = extra.ids.length > 0 ? extra.ids : null;
+
   const rows = await runQuery<{ id: string }>(
     `
       update "Bookings"
-      set table_id = $4
+      set table_id = $4, slot = $5
       where id = $1 and res_id = $2 and outlet_id = $3
       returning id
     `,
-    [booking_id, context.res_id, context.outlet_id, table.id],
+    [booking_id, context.res_id, context.outlet_id, table.id, encodeSlot(slot)],
   );
 
   return rows.length > 0;
@@ -4658,7 +5265,7 @@ const UNDO_BRANDING_COLUMNS: Record<string, { column: string; cast: string; toDb
 // Lazy: BRAND_COLOR_KEYS is declared further down the module.
 let undoBrandConfigKeys: Set<string> | null = null;
 function isUndoBrandConfigKey(key: string): boolean {
-  if (!undoBrandConfigKeys) {undoBrandConfigKeys = new Set<string>(["font", "header_style", "button_shape", ...BRAND_COLOR_KEYS]);}
+  if (!undoBrandConfigKeys) {undoBrandConfigKeys = new Set<string>(["font", "header_style", "button_shape", "surface_style", ...BRAND_COLOR_KEYS]);}
   return undoBrandConfigKeys.has(key);
 }
 
@@ -5787,7 +6394,15 @@ export async function ensureFeaturePermissionActions(): Promise<void> {
          ('4a1c8e73-5f60-49b2-a3d8-7c2e0b6f9153', 'Manage Branding', 'Change logo, colours and customer-page theme', 'Restaurant Specific'::"Action_groups"),
          ('1c6e9b34-7a52-4f80-9d13-3b8c5a0e6f27', 'Manage Subscription & Billing', 'View and change the subscription plan and process billing', 'Restaurant Specific'::"Action_groups"),
          ('0b4d7f92-6c81-43a5-b7e0-2f9a1c8d5e36', 'Manage User Passwords', 'Reset staff passwords and handle password-reset requests', 'Roles'::"Action_groups"),
-         ('6f2a4c81-9d35-4b7e-a0c2-5e8b1d3f7a94', 'Undo Audited Action', 'Reverse an eligible action from the audit log', 'Audit Logs'::"Action_groups")
+         ('6f2a4c81-9d35-4b7e-a0c2-5e8b1d3f7a94', 'Undo Audited Action', 'Reverse an eligible action from the audit log', 'Audit Logs'::"Action_groups"),
+         -- Split out of over-broad permissions so destructive work is grantable on
+         -- its own. Previously "Add Orders" also let a WAITER delete an order and
+         -- settle it to Paid, and "Update Menu" covered category deletion and the
+         -- full-menu replace that once wiped 56 items' images/recipes.
+         ('8c3f5b21-0e74-4a96-b2d8-6f1a9c4e7b53', 'Delete Orders', 'Permanently delete an order (separate from placing or editing orders)', 'Orders'::"Action_groups"),
+         ('3d9e7a05-6c18-4f2b-9a41-8b5d0e3c6f72', 'Delete Menu Categories', 'Delete a menu category and its grouping', 'Menu'::"Action_groups"),
+         ('7b2c9d48-3a51-4e07-8d6f-1c4e5a9b0837', 'Bulk Replace Menu', 'Replace the ENTIRE menu in one save — destructive; a partial payload removes items', 'Menu'::"Action_groups"),
+         ('5e8a1f36-9b47-42c0-a7e5-0d3b6c8f4291', 'Resolve Feedback Recovery', 'Mark a guest-recovery case resolved (a write, not a view)', 'Feedback Questions'::"Action_groups")
        on conflict (id) do nothing`,
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
   });
@@ -6590,6 +7205,7 @@ export async function GetMenuItems(restaurantId: string): Promise<MenuItemRecord
       recipe: parsed.recipe,
       station: parsed.station,
       allergens: parsed.allergens,
+      blurb: parsed.blurb,
       price_updated_at: parsed.price_updated_at,
       price_baseline: parsed.price_baseline,
     };
@@ -6618,18 +7234,41 @@ export async function UpsertMenuItem(
 ): Promise<{ id: string }> {
   const context = await requireRestaurantContext(restaurantId, client);
   const ids = await ensureMenuCategoryIds(context, item.category, client);
-  const itemId = isUuid(item.id) ? item.id : randomUUID();
+
+  // DATA-LOSS GUARD. A payload item with no usable id used to mint a fresh UUID
+  // immediately, which skipped the merge below (it keyed off `itemId === item.id`)
+  // and inserted a BARE row; SaveMenuItems then deleted every row not in its
+  // keep-list, destroying the original along with its image, kitchen section,
+  // modifiers, recipe, allergens and price history. That is exactly how a bulk
+  // save once wiped 56 items. So: before minting an id, look the dish up by
+  // name within the same category — an id-less save now UPDATES the existing row
+  // (extras merged) instead of replacing it.
+  let itemId = isUuid(item.id) ? item.id : "";
+  if (!itemId) {
+    const existingByName = await runQuery<{ id: string }>(
+      `select id from "Menu"
+         where res_id = $1 and outlet_id = $2 and lower(name) = lower($3) and main_cat_id = $4
+         limit 1`,
+      [context.res_id, context.outlet_id, String(item.name ?? "").trim(), ids.main_cat_id],
+      client,
+    );
+    if (existingByName[0]) {itemId = existingByName[0].id;}
+  }
+  if (!itemId) {itemId = randomUUID();}
 
   // Description-JSON fields the caller did NOT send (undefined) are preserved
   // from the stored row instead of being reset — a partial client (e.g. a price
   // edit or drag-reorder) must never silently wipe recipes/modifiers/images.
   // An explicit null/[] still clears the field.
-  let merged = { image_url: item.image_url, available: item.available, modifiers: item.modifiers as unknown, recipe: item.recipe as unknown, station: item.station as unknown, allergens: item.allergens as unknown };
+  let merged = { image_url: item.image_url, available: item.available, modifiers: item.modifiers as unknown, recipe: item.recipe as unknown, station: item.station as unknown, allergens: item.allergens as unknown, blurb: item.blurb as string | null | undefined };
   // Price history is derived from the STORED row (never trusted from the
   // client), so an existing item is always read back — a full-menu save that
   // moves a price must stamp it exactly like PATCH /menu/:id/price does.
   let history: { price_updated_at: string | null; price_baseline: number | null } = { price_updated_at: null, price_baseline: null };
-  if (itemId === item.id) {
+  // Merge from whatever row this id resolves to — whether the caller supplied the
+  // id or we matched it by name above. (This used to be `itemId === item.id`,
+  // which silently skipped the merge for every id-less item.)
+  {
     const existingRows = await runQuery<{ description: string | null }>(
       `select description from "Menu" where id = $1 and res_id = $2 and outlet_id = $3`,
       [itemId, context.res_id, context.outlet_id],
@@ -6644,6 +7283,7 @@ export async function UpsertMenuItem(
         recipe: item.recipe === undefined ? existing.recipe : item.recipe,
         station: item.station === undefined ? existing.station : item.station,
         allergens: item.allergens === undefined ? existing.allergens : item.allergens,
+        blurb: item.blurb === undefined ? existing.blurb : item.blurb,
       };
       history = stampPriceHistory(existing, round2(Number(item.price) || 0), new Date().toISOString());
     }
@@ -6668,7 +7308,7 @@ export async function UpsertMenuItem(
       context.res_id,
       context.outlet_id,
       item.name.trim(),
-      encodeMenuDescription({ price: item.price, image_url: merged.image_url, available: merged.available, modifiers: merged.modifiers, recipe: merged.recipe, station: merged.station, allergens: merged.allergens, price_updated_at: history.price_updated_at, price_baseline: history.price_baseline }),
+      encodeMenuDescription({ price: item.price, image_url: merged.image_url, available: merged.available, modifiers: merged.modifiers, recipe: merged.recipe, station: merged.station, allergens: merged.allergens, blurb: merged.blurb, price_updated_at: history.price_updated_at, price_baseline: history.price_baseline }),
       ids.main_cat_id,
       ids.sub_cat_id,
       "15 mins",
@@ -6679,14 +7319,62 @@ export async function UpsertMenuItem(
   return { id: itemId };
 }
 
+// A bulk save that would drop MORE than this many stored dishes is refused
+// unless the caller opts in explicitly. Every legitimate caller removes at most
+// ONE row per save (the web and Flutter single-item delete); drag-reorder, the
+// organise dialog and the CSV import remove none. Anything larger is a stale or
+// half-loaded client — the exact shape that permanently erased 56 dishes.
+const MENU_MAX_IMPLICIT_DELETES = 2;
+
+// Thrown instead of deleting, so the whole transaction (including the upserts)
+// rolls back and the route can answer 409 with the counts.
+export class MenuBulkDeleteError extends Error {
+  public stored: number;
+  public kept: number;
+  public wouldDelete: number;
+  constructor(message: string, counts: { stored: number; kept: number; wouldDelete: number }) {
+    super(message);
+    this.name = 'MenuBulkDeleteError';
+    this.stored = counts.stored;
+    this.kept = counts.kept;
+    this.wouldDelete = counts.wouldDelete;
+  }
+}
+
+// Bulk menu save (PUT /menu). Upsert-first, and the delete-missing sweep is
+// bounded: rows absent from the payload are removed only while that is a small,
+// deliberate-looking edit. `allowBulkDelete` is the explicit opt-in for a real
+// bulk prune; an EMPTY payload is refused outright either way — wiping the whole
+// menu is never something this route should be able to do.
 export async function SaveMenuItems(
   restaurantId: string,
   items: MenuItemRecord[],
-): Promise<void> {
-  await withTransaction(async (client) => {
+  opts?: { allowBulkDelete?: boolean },
+): Promise<{ saved: number; deleted: number }> {
+  return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
-    const keepIds: string[] = [];
 
+    // Snapshot the stored ids BEFORE the upserts so newly inserted rows are not
+    // mistaken for survivors when the sweep is sized.
+    const storedRows = await runQuery<{ id: string }>(
+      `
+        select id from "Menu"
+        where res_id = $1 and outlet_id = $2
+      `,
+      [context.res_id, context.outlet_id],
+      client,
+    );
+    const storedIds = new Set(storedRows.map((r) => r.id));
+
+    if (items.length === 0) {
+      if (storedIds.size === 0) {return { saved: 0, deleted: 0 };}
+      throw new MenuBulkDeleteError(
+        `Refusing to delete the entire menu (${storedIds.size} items) from an empty payload. Delete items individually.`,
+        { stored: storedIds.size, kept: 0, wouldDelete: storedIds.size },
+      );
+    }
+
+    const keepIds: string[] = [];
     for (const item of items) {
       // Pass the item through wholesale — UpsertMenuItem preserves any
       // description-JSON fields (recipe/modifiers/image/availability) the
@@ -6695,26 +7383,27 @@ export async function SaveMenuItems(
       keepIds.push(upserted.id);
     }
 
-    if (keepIds.length === 0) {
-      await runQuery(
-        `
-          delete from "Menu"
-          where res_id = $1 and outlet_id = $2
-        `,
-        [context.res_id, context.outlet_id],
-        client,
+    const kept = new Set(keepIds);
+    const missing = [...storedIds].filter((id) => !kept.has(id));
+    if (missing.length === 0) {return { saved: keepIds.length, deleted: 0 };}
+
+    if (missing.length > MENU_MAX_IMPLICIT_DELETES && opts?.allowBulkDelete !== true) {
+      throw new MenuBulkDeleteError(
+        `This save would delete ${missing.length} of ${storedIds.size} menu items that are missing from the payload. `
+        + `Reload the menu and try again, or resend with allow_bulk_delete: true if that removal is intended.`,
+        { stored: storedIds.size, kept: kept.size, wouldDelete: missing.length },
       );
-      return;
     }
 
     await runQuery(
       `
         delete from "Menu"
-        where res_id = $1 and outlet_id = $2 and not (id = any($3::uuid[]))
+        where res_id = $1 and outlet_id = $2 and id = any($3::uuid[])
       `,
-      [context.res_id, context.outlet_id, keepIds],
+      [context.res_id, context.outlet_id, missing],
       client,
     );
+    return { saved: keepIds.length, deleted: missing.length };
   });
 }
 
@@ -6944,6 +7633,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
     status: unknown;
     timing: unknown;
     barked_at: Date | string | null;
+    created_at: Date | string | null;
     table_name: string | null;
     bill_id: string | null;
     bill_status: number | null;
@@ -6963,6 +7653,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
         o.status,
         o.timing,
         o.barked_at,
+        o.created_at,
         t.table_name,
         b.bill_id,
         b.status as bill_status,
@@ -6998,7 +7689,14 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
         -- Live orders grid: recent OR any still-open bill (never hide an unsettled
         -- order). Old, closed orders belong to reports, not this hot-polled list —
         -- this bounds the previously all-time scan + per-row lateral join.
-        and (o.created_at >= now() - interval '3 days' or b.closed_at is null)
+        -- Cancelled(5) is TERMINAL and never gets a closed bill, so without the
+        -- status guard every cancelled ticket stayed in the live list forever
+        -- (17 of them had piled up). It ages out after the window like Paid/Closed
+        -- and remains available in History/Reports and to audit-log undo.
+        and (
+          o.created_at >= now() - interval '3 days'
+          or (b.closed_at is null and coalesce(o.status::text, '1') <> '5')
+        )
       order by o.created_at desc
       limit 5000
     `,
@@ -7127,6 +7825,11 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       bill_id: row.bill_id ?? null,
       timing: parseJsonObject(row.timing) ?? null,
       barked_at: row.barked_at ? new Date(row.barked_at).toISOString() : null,
+      // When the order was placed. The list is already sorted newest-first, but
+      // clients that re-sort need a real key to break ties on — without this the
+      // owner app's comparator called most pairs "equal" and Dart's unstable
+      // sort scrambled the order (an old cancelled ticket floated to the top).
+      created_at: row.created_at ? new Date(row.created_at).toISOString() : null,
     };
 
     // include flattened and split representations if available
@@ -7143,6 +7846,105 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
 
   // Orders with no items for the requested station were mapped to null — drop them.
   return (stationFilter ? result.filter((o) => o !== null) : result) as OrderRecord[];
+}
+
+// How many days back GetOrders' live grid reaches for orders whose bill is
+// already closed. Exported so the scope endpoint can tell the UI the exact
+// window instead of the client hard-coding "3 days" in its copy.
+export const LIVE_ORDERS_WINDOW_DAYS = 3;
+
+export interface OrdersScopeOutlet {
+  outlet_id: string;
+  outlet_name: string;
+  live_orders: number;
+  tables: number;
+  is_current: boolean;
+}
+
+export interface OrdersScope {
+  outlet: { id: string; name: string };
+  is_all_outlets: boolean;
+  live_orders: number;
+  other_outlet_orders: number;
+  outlets: OrdersScopeOutlet[];
+  live_window_days: number;
+  current_outlet_has_tables: boolean;
+}
+
+// Context a client needs to EXPLAIN an empty orders grid instead of rendering a
+// blank screen (bug: staff signed into a branch with no tables saw 0 orders and
+// assumed the orders had vanished).
+//
+// Deliberately does NOT widen GetOrders' scoping — a branch view must never leak
+// another branch's orders. It only reports COUNTS per outlet (plus that outlet's
+// table count, since a guest/QR order always lands on the TABLE's outlet, so an
+// outlet with no tables can never receive one). RLS keys on res_id, so counting
+// across the restaurant's outlets stays inside the tenant.
+//
+// The `live_orders` counts use the SAME predicate as GetOrders (recent OR an
+// open bill), so "11 in Main Outlet" is exactly what the user would see after
+// switching — not a different, larger number.
+export async function GetOrdersScope(restaurantId: string): Promise<OrdersScope> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
+  const rows = await runQuery<{
+    outlet_id: string;
+    outlet_name: string | null;
+    live_orders: number;
+    tables: number;
+  }>(
+    `
+      select
+        o.id::text as outlet_id,
+        o.outlet_name,
+        coalesce(l.n, 0)::int as live_orders,
+        coalesce(t.n, 0)::int as tables
+      from "Outlets" o
+      left join (
+        select ord.outlet_id, count(*)::int as n
+        from "Orders" ord
+        left join lateral (
+          select b.closed_at
+          from "Bills" b
+          where b.order_id = ord.id and b.res_id = ord.res_id and b.outlet_id = ord.outlet_id
+          order by b.created_at desc, b.id desc
+          limit 1
+        ) b on true
+        where ord.res_id = $1
+          and (ord.created_at >= now() - ($2 || ' days')::interval or b.closed_at is null)
+        group by ord.outlet_id
+      ) l on l.outlet_id = o.id
+      left join (
+        select tb.outlet_id, count(*)::int as n from "Tables" tb where tb.res_id = $1 group by tb.outlet_id
+      ) t on t.outlet_id = o.id
+      where o.res_id = $1
+      order by o.created_at asc
+    `,
+    [context.res_id, String(LIVE_ORDERS_WINDOW_DAYS)],
+  );
+
+  const all = isAllOutlets();
+  const outlets: OrdersScopeOutlet[] = rows.map((r) => ({
+    outlet_id: r.outlet_id,
+    outlet_name: r.outlet_name ?? "",
+    live_orders: Number(r.live_orders) || 0,
+    tables: Number(r.tables) || 0,
+    is_current: !all && r.outlet_id === context.outlet_id,
+  }));
+  const current = outlets.find((o) => o.is_current) ?? null;
+  const total = outlets.reduce((s, o) => s + o.live_orders, 0);
+  // In ALL-OUTLETS mode the view already spans every outlet, so nothing is
+  // "elsewhere" — other_outlet_orders is 0 by definition, not a hidden count.
+  const visible = all ? total : current?.live_orders ?? 0;
+  return {
+    outlet: { id: all ? "all" : context.outlet_id, name: all ? "All outlets (combined)" : current?.outlet_name ?? "" },
+    is_all_outlets: all,
+    live_orders: visible,
+    other_outlet_orders: all ? 0 : total - visible,
+    outlets,
+    live_window_days: LIVE_ORDERS_WINDOW_DAYS,
+    current_outlet_has_tables: all ? outlets.some((o) => o.tables > 0) : (current?.tables ?? 0) > 0,
+  };
 }
 
 // ======================= Order / item preparation timing ===================
@@ -7365,8 +8167,29 @@ export async function GetTimingStats(restaurantId: string): Promise<{ avg_prep_m
 // that both started AND ended (a completed prep). All-outlets aware. Station is
 // enriched from the menu at read time (order-item JSON does not persist it), so
 // a dish with no menu station falls under "Unassigned".
-export interface KitchenDishStat { id: string | null; name: string; station: string; count: number; avg_prep_ms: number; max_prep_ms: number }
-export interface KitchenSectionStat { section: string; dishes: number; items_timed: number; avg_prep_ms: number; max_prep_ms: number }
+export interface KitchenDishStat {
+  id: string | null;
+  name: string;
+  station: string;
+  count: number;
+  avg_prep_ms: number;
+  max_prep_ms: number;
+  // Drill-down spread: the 90th-percentile and best-case prep for this dish, so
+  // a UI can say "usually 6 min, worst 14 min" without re-reading raw timers.
+  p90_prep_ms: number;
+  min_prep_ms: number;
+}
+export interface KitchenSectionStat {
+  section: string;
+  dishes: number;
+  items_timed: number;
+  avg_prep_ms: number;
+  max_prep_ms: number;
+  // Drill-down: the section's 90th-percentile prep and the single dish dragging
+  // its average up (null when the section timed no dishes).
+  p90_prep_ms: number;
+  slowest_dish: { name: string; avg_prep_ms: number } | null;
+}
 export interface KitchenAnalytics {
   order_summary: { orders_timed: number; avg_prep_ms: number; median_prep_ms: number; p90_prep_ms: number; avg_bark_to_served_ms: number; max_prep_ms: number };
   by_dish: KitchenDishStat[];
@@ -7415,8 +8238,10 @@ export async function GetKitchenAnalytics(restaurantId: string, days = 30): Prom
   const nowMs = Date.now();
   const orderPrepMs: number[] = [];
   const barkToServedMs: number[] = [];
-  const dishAgg = new Map<string, { id: string | null; name: string; station: string; sum: number; count: number; max: number }>();
-  const sectionAgg = new Map<string, { section: string; dishNames: Set<string>; sum: number; count: number; max: number }>();
+  // `samples` keeps the individual (ceiling-filtered) prep times so the
+  // drill-down percentiles below are exact rather than estimated from sum/count.
+  const dishAgg = new Map<string, { id: string | null; name: string; station: string; sum: number; count: number; max: number; min: number; samples: number[] }>();
+  const sectionAgg = new Map<string, { section: string; dishNames: Set<string>; sum: number; count: number; max: number; samples: number[] }>();
 
   for (const r of rows) {
     const t = parseJsonObject(r.timing) as OrderTiming | null;
@@ -7464,13 +8289,16 @@ export async function GetKitchenAnalytics(restaurantId: string, days = 30): Prom
       if (elapsed > KITCHEN_PREP_CEILING_MS) {continue;}
       const m = meta.get(itemId) ?? { name: "Unknown", station: "Unassigned" };
       const dishKey = m.name.trim().toLowerCase();
-      const d = dishAgg.get(dishKey) ?? { id: itemId || null, name: m.name, station: m.station, sum: 0, count: 0, max: 0 };
+      const d = dishAgg.get(dishKey) ?? { id: itemId || null, name: m.name, station: m.station, sum: 0, count: 0, max: 0, min: Number.POSITIVE_INFINITY, samples: [] };
       d.sum += elapsed; d.count += 1; if (elapsed > d.max) {d.max = elapsed;}
+      if (elapsed < d.min) {d.min = elapsed;}
+      d.samples.push(elapsed);
       dishAgg.set(dishKey, d);
 
       const sectionKey = m.station || "Unassigned";
-      const s = sectionAgg.get(sectionKey) ?? { section: sectionKey, dishNames: new Set<string>(), sum: 0, count: 0, max: 0 };
+      const s = sectionAgg.get(sectionKey) ?? { section: sectionKey, dishNames: new Set<string>(), sum: 0, count: 0, max: 0, samples: [] };
       s.dishNames.add(dishKey); s.sum += elapsed; s.count += 1; if (elapsed > s.max) {s.max = elapsed;}
+      s.samples.push(elapsed);
       sectionAgg.set(sectionKey, s);
     }
   }
@@ -7489,13 +8317,42 @@ export async function GetKitchenAnalytics(restaurantId: string, days = 30): Prom
   };
   const avg = (arr: number[]): number => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0);
 
-  const by_dish: KitchenDishStat[] = Array.from(dishAgg.values())
-    .map((d) => ({ id: d.id, name: d.name, station: d.station, count: d.count, avg_prep_ms: Math.round(d.sum / d.count), max_prep_ms: d.max }))
-    .sort((a, b) => b.avg_prep_ms - a.avg_prep_ms)
-    .slice(0, 40);
+  // Every timed dish (not just the 40 returned) — the section rollup below picks
+  // its slowest dish from the full set.
+  const dishStats: (KitchenDishStat & { section_key: string })[] = Array.from(dishAgg.values())
+    .map((d) => ({
+      id: d.id,
+      name: d.name,
+      station: d.station,
+      count: d.count,
+      avg_prep_ms: Math.round(d.sum / d.count),
+      max_prep_ms: d.max,
+      p90_prep_ms: percentile(d.samples, 90),
+      min_prep_ms: Number.isFinite(d.min) ? d.min : 0,
+      section_key: d.station || "Unassigned",
+    }))
+    .sort((a, b) => b.avg_prep_ms - a.avg_prep_ms);
+
+  const slowestBySection = new Map<string, { name: string; avg_prep_ms: number }>();
+  for (const d of dishStats) {
+    // dishStats is sorted slowest-average first, so the first hit per section wins.
+    if (!slowestBySection.has(d.section_key)) {slowestBySection.set(d.section_key, { name: d.name, avg_prep_ms: d.avg_prep_ms });}
+  }
+
+  const by_dish: KitchenDishStat[] = dishStats
+    .slice(0, 40)
+    .map(({ section_key: _section, ...d }) => d);
 
   const by_section: KitchenSectionStat[] = Array.from(sectionAgg.values())
-    .map((s) => ({ section: s.section, dishes: s.dishNames.size, items_timed: s.count, avg_prep_ms: Math.round(s.sum / s.count), max_prep_ms: s.max }))
+    .map((s) => ({
+      section: s.section,
+      dishes: s.dishNames.size,
+      items_timed: s.count,
+      avg_prep_ms: Math.round(s.sum / s.count),
+      max_prep_ms: s.max,
+      p90_prep_ms: percentile(s.samples, 90),
+      slowest_dish: slowestBySection.get(s.section) ?? null,
+    }))
     .sort((a, b) => b.avg_prep_ms - a.avg_prep_ms);
 
   return {
@@ -7766,8 +8623,27 @@ export async function UpdateOrderItemsSplit(
   // Drag-dropping every item into Served must not skip the bark step.
   if (newStatus === 'Served') {await assertOrderBarked(context, orderId);}
 
+  // Re-price from the items that actually remain. Without this, adding an item
+  // showed it on the bill but left subtotal/total untouched, so the guest was
+  // never charged for it (and removals never credited). Mirrors what
+  // removeItemFromTableOrders already does.
+  const repricedSubtotal = round2(
+    flattened.reduce((acc: number, it: unknown) => {
+      const item = parseJsonObject(it) ?? {};
+      return acc + parseNumeric(item.price) * Math.max(1, parseNumeric(item.quantity) || 1);
+    }, 0),
+  );
+
   // include status in the food JSON payload so UI can read textual status
-  const newPayload = { ...payload, items: flattened, items_split, status: newStatus };
+  const newPayload = {
+    ...payload,
+    items: flattened,
+    items_split,
+    status: newStatus,
+    subtotal: repricedSubtotal,
+    // `total` is the PRE-TAX base the bill builds on (see sumOrderTotalsForTable).
+    total: repricedSubtotal,
+  };
   // update both the JSON food column and the numeric status column
   await runQuery(
     `update "Orders" set food = $1::json, status = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
@@ -8037,6 +8913,30 @@ export async function AddOrder(
     }
   }
 
+  // SECURITY: never bill a staff-entered line below its menu price, and never
+  // trust the client's subtotal/total. A waiter posting {price: 390 x3, total: 1}
+  // used to settle 1,170 of food for ₹1.16 while the bill still printed all three
+  // dishes. Lines that don't resolve to a menu row (valet fee, aggregator line,
+  // open item) keep the price they were sent with — see applyMenuPriceFloor.
+  itemsForStore = await applyMenuPriceFloor(restaurantId, itemsForStore);
+  if (Array.isArray(itemsSplitForStore)) {
+    itemsSplitForStore = await Promise.all(
+      (itemsSplitForStore as any[]).map(async (t) => [
+        t?.[0],
+        Array.isArray(t?.[1]) ? await applyMenuPriceFloor(restaurantId, t[1] as unknown[]) : [],
+      ]),
+    );
+  }
+  // The stored subtotal/total is the PRE-TAX base every bill builds on
+  // (sumOrderTotalsForTable), so derive it from the priced lines rather than
+  // echoing whatever the client claimed.
+  const pricedSubtotal = round2(
+    (itemsForStore as unknown[]).reduce((acc: number, raw) => {
+      const it = parseJsonObject(raw) ?? {};
+      return acc + parseNumeric(it.price) * Math.max(1, parseNumeric(it.quantity) || 1);
+    }, 0),
+  );
+
   // "Barked" step: new orders always arrive UN-barked — the expo barks them to
   // the kitchen and only then do prep timers run. Exceptions already past the
   // kitchen queue: a caller-supplied barked_at (moved/auto-barked lines) and a
@@ -8060,11 +8960,11 @@ export async function AddOrder(
     taken_by_employee_name: takenByEmployeeNameRaw || null,
     taken_by_employee_role: takenByEmployeeRoleRaw || null,
     items: itemsForStore,
-    subtotal: parseNumeric(order.subtotal),
+    subtotal: pricedSubtotal,
     serviceChargePercentage: parseNumeric(order.serviceChargePercentage),
     taxes: Array.isArray(order.taxes) ? order.taxes : [],
     applyServiceCharge: Boolean(order.applyServiceCharge),
-    total: parseNumeric(order.total),
+    total: pricedSubtotal,
     status: String(order.status ?? "Preparing"),
     // Free-text order note / special instructions (kitchen + bill). Preserved on
     // upsert when the caller doesn't supply one.
@@ -8240,7 +9140,14 @@ async function sumOrderTotalsForTable(
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
     if (st === "cancelled" || st === "paid" || st === "closed") {continue;}
     const p = parseJsonObject(r.food) ?? {};
-    const total = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
+    // This sum is the PRE-TAX base that computeBillCharges then adds service
+    // charge and taxes to, so it must never include them. Prefer the order's
+    // own subtotal: the web POS was sending `total` already inflated with
+    // service charge + tax, which computeBillCharges then charged a SECOND time
+    // (~15% overcharge to the guest). Fall back to `total` only for legacy rows
+    // that carry no subtotal.
+    const subtotal = parseNumeric(p.subtotal);
+    const total = subtotal > 0 ? subtotal : parseNumeric(p.total);
     sum += total;
   }
   return round2(sum);
@@ -8338,6 +9245,38 @@ async function assertBillEditable(context: RestaurantContext, tableId: string, c
   if (rows[0]?.admin_approved_at) {
     throw new Error("This bill has been approved and is locked — it can no longer be modified.");
   }
+}
+
+// POST-SETTLE LOCK. A settled table has no ACTIVE orders left: admin approval
+// marks every order Paid(4)/Closed(7) and release marks them Cancelled(5).
+// assertBillEditable can't catch this — it only inspects bills with
+// `closed_at is null`, so it silently becomes a no-op the moment the bill closes.
+// Money operations then fell through to ensureOpenBillIdForTable / their inline
+// insert and MINTED A BRAND-NEW BILL on the closed session: a replayed
+// waiter-confirm or a discount on a fully-settled table returned 200 and left a
+// phantom ₹0 bill holding a burnt bill number, which GET /bill-for-table then
+// served as if it were live. (Reachable from the Flutter settle dialog, which
+// runs confirm → approve → close in sequence and re-runs confirm on any retry,
+// and from a stale web Orders tab.) Refuse instead — /bills/:id/reopen is the
+// sanctioned way back into a settled bill, and it restores this session's orders
+// to Payment Pending Approval so the operation becomes legal again.
+async function assertTableSessionOpen(
+  context: RestaurantContext,
+  tableId: string,
+  action: string,
+  client?: PoolClient,
+): Promise<void> {
+  const rows = await runQuery<{ n: number | string }>(
+    `select count(*)::int as n from "Orders"
+       where res_id = $1 and outlet_id = $2 and table_id = $3
+         and coalesce(status::text, '1') not in ('4','5','7')`,
+    [context.res_id, context.outlet_id, tableId],
+    client,
+  );
+  if (Number(rows[0]?.n ?? 0) > 0) {return;}
+  throw new Error(
+    `This table's bill is already settled and closed — ${action} is no longer possible. Re-open the bill first if it has to change.`,
+  );
 }
 
 // The id of the table's current open (un-closed) bill, or null. Used to reuse a
@@ -8648,6 +9587,10 @@ export async function SetBillDiscountWithApproval(
     const tableId = await tableIdByName(context, tableName, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
+    // Post-settle lock: discounting a settled table used to create a second,
+    // phantom bill (bill_no burnt, total 0, discount recorded) on the closed
+    // session instead of failing.
+    await assertTableSessionOpen(context, tableId, "changing the discount", client);
 
     const value = Math.max(0, Number(valueRaw) || 0);
     const type: "percent" | "flat" | null = value <= 0 ? null : typeRaw === "flat" ? "flat" : "percent";
@@ -10679,6 +11622,8 @@ export async function ApplyCouponToBill(
     const tableId = await tableIdByName(context, tableName, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
+    // Post-settle lock: same phantom-bill hole as the manual discount path.
+    await assertTableSessionOpen(context, tableId, "applying a coupon", client);
 
     const subtotal = await sumOrderTotalsForTable(context, tableId, client);
     // Revert any coupon already on this bill FIRST, so re-applying the same code
@@ -11031,6 +11976,10 @@ export async function ConfirmBillPaymentByWaiter(
     if (!tableId) {
       throw new Error("Order table not found");
     }
+    // Post-settle lock: a replay of this call against an already-Paid order used
+    // to mint a fresh bill on the closed session (see assertTableSessionOpen).
+    await assertOrderStatusEditable(context, orderId, client);
+    await assertTableSessionOpen(context, tableId, "recording a payment", client);
 
     const billRows = await runQuery<{ id: string }>(
       `
@@ -11259,9 +12208,10 @@ export async function ApproveBillPaymentByAdmin(
     const billRows = await runQuery<{
       payment_method: string | null;
       payment_proof_screenshot_url: string | null;
+      payment_splits: unknown;
     }>(
       `
-        select payment_method, payment_proof_screenshot_url
+        select payment_method, payment_proof_screenshot_url, payment_splits
         from "Bills"
         where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null
         order by created_at desc
@@ -11294,21 +12244,65 @@ export async function ApproveBillPaymentByAdmin(
       throw new Error("Payment proof screenshot is required before approval for Dineout, Zomato, EasyDiner or District");
     }
 
+    // Re-price at approval time. Any bill edit landing between waiter-confirm and
+    // admin-approve (AddOrder / RemoveBillItem / MoveBillItem all re-sync
+    // Bills.total_amt with the PRE-TAX subtotal) otherwise got frozen into the
+    // closed bill, recording revenue ~13% under what the guest actually paid.
+    const subtotalAtApproval = await sumOrderTotalsForTable(context, tableId, client);
+    const taxRowsAtApproval = await runQuery<{ default_tax: any }>(
+      `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
+      [context.outlet_id, context.res_id],
+      client,
+    );
+    const scPctAtApproval = await getServiceChargePercent(context.res_id, client);
+    const discountAtApproval = await getOpenBillDiscount(context, tableId, client);
+    const chargesAtApproval = computeBillCharges(
+      subtotalAtApproval,
+      taxRowsAtApproval[0]?.default_tax ?? null,
+      scPctAtApproval,
+      true,
+      discountAtApproval,
+    );
+
+    // Split tender must STILL reconcile with the bill as it stands now. The
+    // "parts must sum to the grand total" rule was enforced once, at
+    // waiter-confirm, and never re-checked — so any bill edit landing before
+    // approval closed the bill with frozen parts (e.g. splits summing 293.88 on a
+    // 755.55 bill). methodTotalsOf routes a Split bill's money via
+    // payment_splits, so GetReconciliation then reported an unexplained variance
+    // for the whole day with no warning anywhere. Refuse instead: the waiter
+    // re-takes the payment against the correct total.
+    const splitsAtApproval = parsePaymentSplits(bill.payment_splits);
+    if (splitsAtApproval.length > 0) {
+      const splitSum = round2(splitsAtApproval.reduce((s, p) => s + p.amount, 0));
+      if (Math.abs(splitSum - chargesAtApproval.grand_total) > 0.01) {
+        throw new Error(
+          `The split payment no longer matches this bill — the recorded parts add up to ${splitSum} but the bill is now ${chargesAtApproval.grand_total}. Re-take the payment with the corrected split, then approve.`,
+        );
+      }
+    }
+
     const updated = await runQuery<{ id: string }>(
       `
         update "Bills"
         set admin_approved_at = now(),
             admin_approved_by_username = $1,
-            status = 2
+            status = 2,
+            total_amt = $5,
+            tax_breakdown = $6::json
         where
           table_id = $2
           and res_id = $3
           and outlet_id = $4
           and waiter_confirmed_at is not null
           and status <> 3
+          -- Scope to the OPEN bill: without this every previously settled bill on
+          -- the table was re-stamped with today's approver and timestamp.
+          and closed_at is null
         returning id
       `,
-      [admin.username, tableId, context.res_id, context.outlet_id],
+      [admin.username, tableId, context.res_id, context.outlet_id,
+        chargesAtApproval.grand_total, JSON.stringify(chargesAtApproval.taxes)],
       client,
     );
 
@@ -12367,6 +13361,39 @@ export async function repriceFromMenu(restaurantId: string, items: WaitlistItem[
   return out;
 }
 
+// SECURITY: the STAFF order paths must bill at MENU prices too. Anyone holding
+// "Add Orders" could otherwise post `price: 1` for a ₹390 dish and under-ring the
+// bill while the ticket still printed the full item list (the guest QR path has
+// defended against this since repriceFromMenu landed; the staff path had no
+// equivalent).
+//
+// Rule — every line whose id OR name resolves to a live menu row is FLOORED at
+// that row's price. Flooring rather than overwriting keeps modifier upcharges
+// working: those always arrive ABOVE the menu base (same `floorOnly` semantics
+// the QR path uses). A line that resolves to NOTHING is a genuine off-menu
+// charge — a valet fee, an aggregator line, a one-off "open item" — and is billed
+// exactly as typed. That is the one deliberate difference from repriceFromMenu,
+// which DROPS unmatched lines because a guest may only order from the menu.
+//
+// Must run inside the tenant context. Returns the input untouched when the menu
+// can't be read, so a menu outage can never block order entry.
+export async function applyMenuPriceFloor<T>(restaurantId: string, items: T[]): Promise<T[]> {
+  if (!Array.isArray(items) || items.length === 0) {return items;}
+  const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
+  if (menu.length === 0) {return items;}
+  const byId = new Map(menu.map((m) => [String(m.id), m]));
+  const byName = new Map(menu.map((m) => [m.name.trim().toLowerCase(), m]));
+  return items.map((raw) => {
+    const it = parseJsonObject(raw);
+    if (!it) {return raw;}
+    const m = byId.get(String(it.id ?? "")) ?? byName.get(String(it.name ?? "").trim().toLowerCase());
+    if (!m) {return raw;} // off-menu / custom charge — bill it as typed
+    const base = round2(parseNumeric(m.price));
+    if (round2(parseNumeric(it.price)) >= base) {return raw;}
+    return { ...it, price: base } as unknown as T;
+  });
+}
+
 function mapWaitlist(r: Record<string, any>): WaitlistEntry {
   const iso = (v: any) => (v == null ? null : v instanceof Date ? v.toISOString() : String(v));
   let pre: WaitlistItem[] = [];
@@ -12410,7 +13437,11 @@ export async function JoinWaitlist(restaurantId: string, input: { name: string; 
   const name = (input.name ?? "").trim();
   if (!name) {throw new Error("Name is required to join the queue");}
   const party = Math.max(1, Math.min(50, Math.round(Number(input.party_size) || 1)));
-  const phone = input.phone?.trim() || null;
+  // Optional, but when given it must be a real 10-digit mobile (the dedupe key and
+  // the number staff call). Second line of defence behind the route's own check.
+  const raw = input.phone?.trim() || "";
+  if (raw && !normalizeMobile10(raw)) {throw new Error(MOBILE_10_ERROR);}
+  const phone = raw ? normalizeMobile10(raw) : null;
   // Dedupe: if this phone already has an active entry, return it instead of stacking
   // duplicate parties (which would inflate everyone else's position).
   if (phone) {
@@ -12481,8 +13512,11 @@ export async function AddWaitlistMember(
   const name = String(input?.name ?? "").trim().slice(0, 80);
   const phoneRaw = String(input?.phone ?? "").trim().slice(0, 40);
   if (!name) {return { error: "Please enter your name" };}
-  if (waitlistMemberPhoneKey(phoneRaw).length < 7) {return { error: "Please enter a valid phone number" };}
-  const key = waitlistMemberPhoneKey(phoneRaw);
+  // Exactly 10 digits — the party list dedupes on this number, and a partial one
+  // is not reachable. Second line of defence behind the route's own check.
+  const normalizedPhone = normalizeMobile10(phoneRaw);
+  if (!normalizedPhone) {return { error: MOBILE_10_ERROR };}
+  const key = waitlistMemberPhoneKey(normalizedPhone);
 
   return withTransaction(async () => {
     const rows = await runQuery<Record<string, any>>(
@@ -12587,8 +13621,8 @@ export async function SeatWaitlistEntry(
 
     // 2) Atomically claim the table — must exist and be free (row lock prevents two
     //    parties racing onto the same table).
-    const trows = await runQuery<{ id: string; occ: boolean }>(
-      `select id, coalesce(is_occupied, false) as occ from "Tables"
+    const trows = await runQuery<{ id: string; table_name: string; occ: boolean; capacity: unknown; max_capacity: unknown }>(
+      `select id, table_name, coalesce(is_occupied, false) as occ, capacity, max_capacity from "Tables"
          where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3) and coalesce(is_deleted, false) = false
          limit 1 for update`,
       [context.res_id, context.outlet_id, table],
@@ -12596,6 +13630,11 @@ export async function SeatWaitlistEntry(
     );
     if (!trows[0]) {throw new Error("Table not found");}
     if (trows[0].occ) {throw new Error("That table is already occupied — pick another");}
+    // Same occupancy cap the POS enforces: a party may not be seated past the
+    // table's max. Inside the txn, so the whole seat (including the queue claim
+    // above) rolls back with the standard "raise max seats or combine tables"
+    // message instead of writing an over-capacity num_covers.
+    assertCoversFitTable(trows[0].table_name, party, trows[0].capacity, trows[0].max_capacity);
     const tableId = trows[0].id;
     await runQuery(
       `update "Tables" set is_occupied = true, num_covers = $4, linked_order_id = null where id = $1 and res_id = $2 and outlet_id = $3`,
@@ -12920,8 +13959,11 @@ export async function GetOperationsAnalytics(
   const span = Math.min(180, Math.max(1, Math.round(days)));
   const now = await currentDbTime();
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (span - 1)));
+  // ALL-OUTLETS aggregate: span every outlet of the restaurant, exactly as the
+  // sibling analytics endpoints do (GetKitchenAnalytics / GetAdvancedAnalytics).
+  const og = isAllOutlets() ? "true" : "false";
   const rows = await runQuery<{ created_at: Date | string; food: unknown; status: unknown }>(
-    `select created_at, food, status from "Orders" where res_id = $1 and outlet_id = $2 and created_at >= $3`,
+    `select created_at, food, status from "Orders" where res_id = $1 and (${og} or outlet_id = $2) and created_at >= $3`,
     [context.res_id, context.outlet_id, start.toISOString()],
   );
   const byHour = Array.from({ length: 24 }, (_, h) => ({ hour: h, orders: 0, revenue: 0 }));
@@ -13013,6 +14055,49 @@ export async function GetOutlets(restaurantId: string): Promise<OutletRecord[]> 
   }));
 }
 
+// --- Outlet membership (auth-time validation) --------------------------------
+// requireAuth has to decide whether an X-Outlet-Id override really belongs to the
+// caller's restaurant BEFORE the tenant connection is bound, so this runs on the
+// shared pool (runQuery falls back to it when there is no ambient tenant).
+// Cached per restaurant for a minute; a cache MISS always re-reads from the DB
+// before answering "no", so an outlet created seconds ago is usable immediately.
+const outletKeyCache = new Map<string, { keys: Map<string, string>; expiresAt: number }>();
+const OUTLET_KEY_CACHE_TTL_MS = 60_000;
+
+async function readOutletKeys(resId: string): Promise<Map<string, string>> {
+  const rows = await runQuery<{ id: string; outlet_name: string | null }>(
+    `select id, outlet_name from "Outlets" where res_id = $1`,
+    [resId],
+  );
+  const keys = new Map<string, string>();
+  for (const row of rows) {
+    const id = String(row.id ?? "").trim();
+    if (!id) {continue;}
+    keys.set(id.toLowerCase(), id);
+    const name = String(row.outlet_name ?? "").trim().toLowerCase();
+    // Names are accepted as an alias because resolveRestaurantContext matches on
+    // them too; the caller always gets the canonical UUID back.
+    if (name && !keys.has(name)) {keys.set(name, id);}
+  }
+  outletKeyCache.set(resId, { keys, expiresAt: Date.now() + OUTLET_KEY_CACHE_TTL_MS });
+  return keys;
+}
+
+/**
+ * The canonical Outlets.id for `requested` (an outlet id or name) WITHIN this
+ * restaurant, or null when it is not one of the restaurant's outlets.
+ */
+export async function ResolveOutletForRestaurant(resId: string, requested: string): Promise<string | null> {
+  const key = String(requested ?? "").trim().toLowerCase();
+  if (!resId || !key) {return null;}
+  const cached = outletKeyCache.get(resId);
+  if (cached && cached.expiresAt > Date.now()) {
+    const hit = cached.keys.get(key);
+    if (hit) {return hit;}
+  }
+  return (await readOutletKeys(resId)).get(key) ?? null;
+}
+
 export async function AddOutlet(
   restaurantId: string,
   input: { name: string; address?: string; phone?: string; hours?: string },
@@ -13030,6 +14115,7 @@ export async function AddOutlet(
      values ($1, now(), $2, $3, $4, $5, $6, $7, true)`,
     [id, username, name, input.address?.trim() ?? "", phone, input.hours?.trim() || null, context.res_id],
   );
+  outletKeyCache.delete(context.res_id); // the new outlet must be selectable at once
   return { id, outlet_name: name, outlet_add: input.address?.trim() ?? "", outlet_phone: phone, outlet_hours: input.hours?.trim() || null, is_active: true, is_default: false };
 }
 
@@ -13049,6 +14135,7 @@ export async function UpdateOutlet(
   if (typeof input.hours === "string") { sets.push(`outlet_working_hours = $${p++}`); params.push(input.hours.trim() || null); }
   if (sets.length === 0) {return { success: true };}
   await runQuery(`update "Outlets" set ${sets.join(", ")} where id = $1 and res_id = $2`, params);
+  outletKeyCache.delete(context.res_id); // a renamed outlet changes the name alias
   return { success: true };
 }
 
@@ -13082,6 +14169,7 @@ export async function DeleteOutlet(restaurantId: string, outletId: string): Prom
   );
   if ((used[0]?.n ?? 0) > 0) {throw new Error("This outlet has orders/bills — deactivate it instead of deleting");}
   await runQuery(`delete from "Outlets" where id = $1 and res_id = $2`, [outletId, context.res_id]);
+  outletKeyCache.delete(context.res_id); // a deleted outlet must stop resolving
   return { success: true };
 }
 
@@ -13476,6 +14564,9 @@ export async function GetAdvancedAnalytics(
        select item->>'name' as name, coalesce((item->>'quantity')::numeric, 1) as qty
          from "Orders" o, jsonb_array_elements((o.food)::jsonb->'items') item
         where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= ${since}
+          -- Cancelled orders are not sales: they were inflating theoretical food cost,
+          -- menu-engineering classes and the demand forecast (~50% of counted units).
+          and coalesce(o.status::text, '1') <> '5'
      )
      select name, sum(qty)::float qty from it where coalesce(name,'') <> '' group by name limit 500`,
     [rid, oid, String(days)],
@@ -13536,6 +14627,7 @@ export async function GetAdvancedAnalytics(
               coalesce((item->>'price')::numeric, 0) * coalesce((item->>'quantity')::numeric, 1) as rev
          from "Orders" o, jsonb_array_elements((o.food)::jsonb->'items') item
         where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= ${since}
+          and coalesce(o.status::text, '1') <> '5'   -- exclude cancelled: not sales
      )
      select name, sum(qty)::float qty, sum(rev)::float revenue
        from it where coalesce(name,'') <> '' group by name order by 2 desc limit 60`,
@@ -13661,6 +14753,7 @@ export async function GetAdvancedAnalytics(
               coalesce((item->>'quantity')::numeric, 1) as qty
          from "Orders" o, jsonb_array_elements((o.food)::jsonb->'items') item
         where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= now() - interval '12 weeks'
+          and coalesce(o.status::text, '1') <> '5'   -- exclude cancelled: not sales
      )
      select name, wk, sum(qty)::float qty from it where coalesce(name,'') <> '' group by name, wk`,
     [rid, oid],
@@ -14270,18 +15363,40 @@ export interface PriceSuggestion {
   current_price: number;
   suggested_price: number;
   direction: "increase" | "decrease";
+  // One-to-two sentence explanation (why + expected effect). Kept for
+  // back-compat; new clients should prefer the structured fields below.
   reason: string;
+  // --- Structured explainer (additive) ---------------------------------------
+  // Plain-English cause: what in the sales data triggered this suggestion.
+  why: string;
+  // What the change should do, stated honestly (assumes volume holds).
+  expected_effect: string;
+  // How much to trust it, driven by sample size and how long the window is.
+  confidence: "high" | "medium" | "low";
+  confidence_note: string;
+  // suggested_price - current_price, and the same as a percentage of current.
+  delta_amount: number;
+  delta_percent: number;
+  // Only when a recipe food cost is known for the item.
+  margin_note?: string;
+  // Only when something genuinely warrants a warning (weak sample, a price that
+  // moved recently, or a suggestion pushing close to the drift cap).
+  caution?: string;
 }
 // A suggestion that the raw hot-seller/slow-mover rules WOULD have produced but
 // that a convergence guard withheld, so the UI can explain the quiet period
 // instead of silently dropping the item.
 export interface SuppressedSuggestion {
   id: string | null;
-  name: string;
+  // Machine-readable guard code — clients switch on this, so it stays a code.
+  // The owner-facing sentence is `explanation`.
   reason: "cooldown" | "drift_cap" | "margin_floor";
+  name: string;
   // Cooldown only: when this item becomes eligible again
   // (price_updated_at + the analysis window).
   retry_after?: string;
+  // Human sentence saying why the item is quiet and (for cooldown) until when.
+  explanation: string;
 }
 export interface WaiterStat { employee_id: string; employee_name: string; orders: number; revenue: number }
 
@@ -14304,6 +15419,147 @@ const PRICE_MIN_MARGIN_MULTIPLE = 1.25;
 const PRICE_MIN_MEANINGFUL_CUT = 0.02;
 // Float slack so a price sitting exactly on a cap compares as "at the cap".
 const PRICE_GUARD_EPSILON = 1e-9;
+// A price that last moved inside this many windows is still "recent" — worth a
+// caution so an owner does not walk a price in steps every period.
+const PRICE_RECENT_MOVE_WINDOWS = 2;
+// The raw rule steps: +8% on a hot seller, -10% on a stagnant item. Named so the
+// explanation text and the arithmetic can never drift apart.
+const PRICE_STEP_UP = 0.08;
+const PRICE_STEP_DOWN = 0.1;
+// Sample-size thresholds behind `confidence`. Below LOW a suggestion is a hint,
+// not evidence; HIGH also needs a window long enough to average out a bad week.
+const PRICE_CONFIDENCE_HIGH_QTY = 20;
+const PRICE_CONFIDENCE_MEDIUM_QTY = 5;
+const PRICE_CONFIDENCE_HIGH_DAYS = 14;
+const PRICE_CONFIDENCE_MIN_DAYS = 7;
+// The "look at a longer period" nudge only makes sense below this span.
+const PRICE_LONGER_PERIOD_DAYS = 60;
+
+// --- Owner-facing wording ----------------------------------------------------
+// Suggestion copy is generated HERE (one source of truth) so the web dashboard
+// and the Flutter app show the identical sentence and neither has to re-derive
+// it by parsing `reason`.
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// "20 Aug" — short, unambiguous and ICU-independent.
+const shortDate = (iso: string | null | undefined): string | null => {
+  if (!iso) {return null;}
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) {return null;}
+  const d = new Date(t);
+  return `${d.getUTCDate()} ${MONTH_ABBR[d.getUTCMonth()]}`;
+};
+// "₹1,150" — whole rupees with thousands grouping, matching how money is
+// written in other generated strings in this file.
+const money = (n: number): string => {
+  const grouped = String(Math.round(Math.abs(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${n < 0 ? "-" : ""}₹${grouped}`;
+};
+const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+const pct = (frac: number): number => Math.round(frac * 100);
+
+// Confidence is a statement about the SAMPLE, not about the price: 20+ sales
+// over a fortnight or more is solid, 5-19 is actionable, below 5 is a hint.
+function priceSuggestionConfidence(
+  quantity: number,
+  periodDays: number,
+): { confidence: PriceSuggestion["confidence"]; confidence_note: string } {
+  const span = plural(periodDays, "day", "days");
+  if (quantity < PRICE_CONFIDENCE_MEDIUM_QTY) {
+    return {
+      confidence: "low",
+      confidence_note: quantity === 0
+        ? `No sales at all in ${span}, so this is a guess about the cause — check the dish itself before repricing.`
+        : `Based on only ${plural(quantity, "sale", "sales")}, so treat this as a weak signal.`,
+    };
+  }
+  if (periodDays < PRICE_CONFIDENCE_MIN_DAYS) {
+    return {
+      confidence: "low",
+      confidence_note: `${plural(quantity, "sale", "sales")} is a fair sample, but ${span} is too short a period to judge a price on.`,
+    };
+  }
+  if (quantity >= PRICE_CONFIDENCE_HIGH_QTY && periodDays >= PRICE_CONFIDENCE_HIGH_DAYS) {
+    return { confidence: "high", confidence_note: `Based on ${plural(quantity, "sale", "sales")} over ${span} — a solid sample.` };
+  }
+  return { confidence: "medium", confidence_note: `Based on ${plural(quantity, "sale", "sales")} over ${span} — enough to act on, worth re-checking next period.` };
+}
+
+// Warnings worth showing next to a suggestion. Returns undefined when there is
+// genuinely nothing to flag (better than a reassuring sentence nobody reads).
+function priceSuggestionCaution(opts: {
+  confidence: PriceSuggestion["confidence"];
+  direction: "increase" | "decrease";
+  quantity: number;
+  periodDays: number;
+  currentPrice: number;
+  suggestedPrice: number;
+  baseline: number | null;
+  priceUpdatedAt: string | null;
+  nowMs: number;
+}): string | undefined {
+  const parts: string[] = [];
+  if (opts.confidence === "low") {
+    if (opts.quantity === 0) {
+      // "Look at a longer period" is useless advice for a dish that sold nothing.
+      parts.push(`Nothing sold at all, so the price may not be the problem — check that the dish is visible on the menu and actually in stock.`);
+    } else if (opts.periodDays < PRICE_LONGER_PERIOD_DAYS) {
+      parts.push(`Weak evidence — look at a longer period (${PRICE_LONGER_PERIOD_DAYS} or 90 days) before you change the price.`);
+    } else {
+      parts.push(`Weak evidence — ${plural(opts.quantity, "sale", "sales")} in ${plural(opts.periodDays, "day", "days")} is a nudge, not a decision.`);
+    }
+  }
+  const changedAt = opts.priceUpdatedAt ? Date.parse(opts.priceUpdatedAt) : NaN;
+  if (Number.isFinite(changedAt)) {
+    const ageDays = (opts.nowMs - changedAt) / (24 * 60 * 60 * 1000);
+    const when = shortDate(opts.priceUpdatedAt);
+    if (ageDays <= opts.periodDays * PRICE_RECENT_MOVE_WINDOWS && when) {
+      parts.push(`This item's price already moved on ${when}, so step it gradually.`);
+    }
+  }
+  if (opts.baseline != null && opts.baseline > 0) {
+    const driftAfter = Math.abs(opts.suggestedPrice / opts.baseline - 1);
+    const capFrac = opts.direction === "increase" ? PRICE_DRIFT_CAP_UP - 1 : 1 - PRICE_DRIFT_CAP_DOWN;
+    // Within a fifth of the cap: the next period probably will not suggest again.
+    if (driftAfter >= capFrac * 0.8) {
+      parts.push(
+        `After this it sits ${pct(driftAfter)}% ${opts.direction === "increase" ? "above" : "below"} its original ${money(opts.baseline)}, and automatic ${opts.direction === "increase" ? "rises" : "cuts"} stop at ${pct(capFrac)}%.`,
+      );
+    }
+  }
+  return parts.length ? parts.join(" ") : undefined;
+}
+
+// Why a guard withheld an item, in a sentence an owner can act on.
+function suppressionExplanation(
+  reason: SuppressedSuggestion["reason"],
+  opts: {
+    direction: "increase" | "decrease";
+    periodDays: number;
+    currentPrice: number;
+    baseline: number | null;
+    priceUpdatedAt: string | null;
+    retryAfter?: string;
+    cost?: number;
+  },
+): string {
+  if (reason === "cooldown") {
+    const changed = shortDate(opts.priceUpdatedAt);
+    const until = shortDate(opts.retryAfter);
+    const tail = `the price changed${changed ? ` on ${changed}` : ` inside this period`}, so there isn't a full ${plural(opts.periodDays, "day", "days")} of sales at the new price yet.`;
+    return until ? `Paused until ${until}: ${tail}` : `Paused: ${tail}`;
+  }
+  if (reason === "drift_cap") {
+    const base = opts.baseline != null && opts.baseline > 0 ? opts.baseline : opts.currentPrice;
+    const drift = pct(Math.abs(opts.currentPrice / base - 1));
+    return opts.direction === "increase"
+      ? `Already ${drift}% above its original ${money(base)} — automatic rises stop at ${pct(PRICE_DRIFT_CAP_UP - 1)}%.`
+      : `Already ${drift}% below its original ${money(base)} — automatic cuts stop at ${pct(1 - PRICE_DRIFT_CAP_DOWN)}%.`;
+  }
+  const floorPct = pct(PRICE_MIN_MARGIN_MULTIPLE - 1);
+  return opts.cost != null && opts.cost > 0
+    ? `A further cut would fall below the ${floorPct}% margin floor over its ${money(opts.cost)} food cost.`
+    : `A further cut would fall below the ${floorPct}% margin floor over its food cost.`;
+}
 
 // Actionable menu/staff analytics over the last `days` days: best/worst selling
 // dishes, simple data-driven price suggestions, and revenue by waiter. Built
@@ -14326,11 +15582,14 @@ export async function GetMenuPerformanceInsights(
   const periodDays = Math.max(1, Math.min(365, Math.floor(Number(days) || 30)));
   const start = new Date(now.getTime() - periodDays * 24 * 60 * 60 * 1000);
 
+  // ALL-OUTLETS aggregate: span every outlet of the restaurant, exactly as the
+  // sibling analytics endpoints do (GetKitchenAnalytics / GetAdvancedAnalytics).
+  const og = isAllOutlets() ? "true" : "false";
   const orderRows = await runQuery<{ food: unknown }>(
     `
       select o.food
       from "Orders" o
-      where o.res_id = $1 and o.outlet_id = $2
+      where o.res_id = $1 and (${og} or o.outlet_id = $2)
         and o.created_at >= $3
         and coalesce(o.status::text, '1') <> '5'
     `,
@@ -14417,7 +15676,7 @@ export async function GetMenuPerformanceInsights(
   const suppressed: SuppressedSuggestion[] = [];
 
   // Recipe food cost per menu item id, loaded at most once and only if a
-  // decrease actually reaches the margin check.
+  // suggestion actually needs it (the margin check, or a margin note).
   let costByIdPromise: Promise<Map<string, number>> | null = null;
   const costById = (): Promise<Map<string, number>> => {
     if (!costByIdPromise) {
@@ -14449,15 +15708,113 @@ export async function GetMenuPerformanceInsights(
     return null;
   };
 
-  const suppress = (mi: MenuItemRecord | undefined, name: string, reason: SuppressedSuggestion["reason"]) => {
-    const entry: SuppressedSuggestion = { id: mi?.id ?? null, name, reason };
+  const suppress = (
+    mi: MenuItemRecord | undefined,
+    name: string,
+    reason: SuppressedSuggestion["reason"],
+    direction: "increase" | "decrease",
+    price: number,
+    cost?: number,
+  ) => {
+    const entry: SuppressedSuggestion = { id: mi?.id ?? null, name, reason, explanation: "" };
     if (reason === "cooldown" && mi?.price_updated_at) {
       const changedAt = Date.parse(mi.price_updated_at);
       if (Number.isFinite(changedAt)) {
         entry.retry_after = new Date(changedAt + periodDays * 24 * 60 * 60 * 1000).toISOString();
       }
     }
+    entry.explanation = suppressionExplanation(reason, {
+      direction,
+      periodDays,
+      currentPrice: price,
+      baseline: mi?.price_baseline ?? null,
+      priceUpdatedAt: mi?.price_updated_at ?? null,
+      retryAfter: entry.retry_after,
+      cost,
+    });
     suppressed.push(entry);
+  };
+
+  // Assemble one suggestion together with the owner-facing explanation. Both
+  // rule branches funnel through here so the wording stays consistent.
+  const buildSuggestion = (opts: {
+    mi: MenuItemRecord | undefined;
+    name: string;
+    category: string;
+    quantity: number;
+    price: number;
+    suggested: number;
+    direction: "increase" | "decrease";
+    clamped: boolean;
+    cost?: number;
+  }): PriceSuggestion => {
+    const { mi, name, category, quantity, price, suggested, direction, clamped, cost } = opts;
+    const delta_amount = round2(suggested - price);
+    const delta_percent = round2((delta_amount / price) * 100);
+    const stepPct = Math.abs(Math.round(delta_percent));
+    const span = plural(periodDays, "day", "days");
+    // Sales normalised to a month so the rupee figure means something to an
+    // owner regardless of the window they are looking at.
+    const monthlyQty = quantity > 0 ? Math.max(1, Math.round((quantity * 30) / periodDays)) : 0;
+    const monthlyDelta = Math.abs(delta_amount) * monthlyQty;
+    const { confidence, confidence_note } = priceSuggestionConfidence(quantity, periodDays);
+
+    const why = direction === "increase"
+      ? `One of your top sellers: ${quantity} sold in the last ${span}, which puts it in the top 25% by volume.`
+      : quantity === 0
+        ? `No sales in the last ${span} while it stayed available on the menu.`
+        : `Only ${quantity} sold in ${span} while it stayed available on the menu.`;
+
+    const expected_effect = direction === "increase"
+      ? `A ~${stepPct}% rise takes it from ${money(price)} to ${money(suggested)} — about ${money(monthlyDelta)}/month more at today's volume of ${monthlyQty} a month, assuming demand holds.`
+      : quantity === 0
+        ? `A ~${stepPct}% cut lowers the price from ${money(price)} to ${money(suggested)} to try to lift volume. It sells nothing today, so there is no revenue to lose by testing it.`
+        : `A ~${stepPct}% cut lowers the price from ${money(price)} to ${money(suggested)} to try to lift volume. At today's ${monthlyQty} a month that gives up only about ${money(monthlyDelta)}/month, so the downside is small.`;
+
+    let margin_note: string | undefined;
+    if (cost != null && cost > 0) {
+      const marginNow = pct((price - cost) / price);
+      const marginAfter = pct((suggested - cost) / suggested);
+      const floorPct = pct(PRICE_MIN_MARGIN_MULTIPLE - 1);
+      margin_note = clamped
+        ? `Food cost ${money(cost)}; a full ${pct(PRICE_STEP_DOWN)}% cut would break the ${floorPct}%-over-cost floor, so it stops at ${money(suggested)} where your margin is ${marginAfter}%.`
+        : direction === "increase"
+          ? `Food cost ${money(cost)}; at ${money(suggested)} your margin improves from ${marginNow}% to ${marginAfter}%.`
+          : `Food cost ${money(cost)}; at ${money(suggested)} your margin is ${marginAfter}%.`;
+    }
+
+    const caution = priceSuggestionCaution({
+      confidence,
+      direction,
+      quantity,
+      periodDays,
+      currentPrice: price,
+      suggestedPrice: suggested,
+      baseline: mi?.price_baseline ?? null,
+      priceUpdatedAt: mi?.price_updated_at ?? null,
+      nowMs: now.getTime(),
+    });
+
+    const suggestion: PriceSuggestion = {
+      id: mi?.id ?? null,
+      name,
+      category,
+      current_price: price,
+      suggested_price: suggested,
+      direction,
+      // Legacy single-string field: the same explanation, joined. A clamped cut
+      // needs the margin sentence to explain why the step is smaller.
+      reason: [why, expected_effect, clamped ? margin_note : null].filter(Boolean).join(" "),
+      why,
+      expected_effect,
+      confidence,
+      confidence_note,
+      delta_amount,
+      delta_percent,
+    };
+    if (margin_note) {suggestion.margin_note = margin_note;}
+    if (caution) {suggestion.caution = caution;}
+    return suggestion;
   };
 
   for (const d of sortedByQty) {
@@ -14465,16 +15822,19 @@ export async function GetMenuPerformanceInsights(
     if (hotSellers.has(d.name.toLowerCase()) && d.quantity >= 5) {
       const mi = menuByName.get(d.name.toLowerCase());
       const blocked = gateSuggestion(mi, price, "increase");
-      if (blocked) { suppress(mi, d.name, blocked); continue; }
-      price_suggestions.push({
-        id: mi?.id ?? null,
+      if (blocked) { suppress(mi, d.name, blocked, "increase", price); continue; }
+      price_suggestions.push(buildSuggestion({
+        mi,
         name: d.name,
         category: d.category,
-        current_price: price,
-        suggested_price: round2(price * 1.08),
+        quantity: d.quantity,
+        price,
+        suggested: round2(price * (1 + PRICE_STEP_UP)),
         direction: "increase",
-        reason: `Strong demand — ${d.quantity} sold in ${periodDays} days. A ~8% rise likely won't dent volume.`,
-      });
+        clamped: false,
+        // Margin note only; an increase can never breach the margin floor.
+        cost: mi ? (await costById()).get(mi.id) : undefined,
+      }));
     }
   }
   // Underperformers: available menu items with very low sales over the window.
@@ -14482,8 +15842,8 @@ export async function GetMenuPerformanceInsights(
     if (mv.current_price && mv.current_price > 0 && mv.quantity <= 2) {
       const mi = menuByName.get(mv.name.toLowerCase());
       const blocked = gateSuggestion(mi, mv.current_price, "decrease");
-      if (blocked) { suppress(mi, mv.name, blocked); continue; }
-      let suggested = round2(mv.current_price * 0.9);
+      if (blocked) { suppress(mi, mv.name, blocked, "decrease", mv.current_price); continue; }
+      let suggested = round2(mv.current_price * (1 - PRICE_STEP_DOWN));
       let clamped = false;
       // (c) MARGIN FLOOR: never suggest a price that eats the dish's gross
       // margin. When a known recipe cost puts the 10% cut below the floor we
@@ -14493,23 +15853,20 @@ export async function GetMenuPerformanceInsights(
         const floor = round2(cost * PRICE_MIN_MARGIN_MULTIPLE);
         if (suggested < floor) {
           if (floor <= mv.current_price * (1 - PRICE_MIN_MEANINGFUL_CUT)) { suggested = floor; clamped = true; }
-          else { suppress(mi, mv.name, "margin_floor"); continue; }
+          else { suppress(mi, mv.name, "margin_floor", "decrease", mv.current_price, cost); continue; }
         }
       }
-      const cutPct = Math.round(((mv.current_price - suggested) / mv.current_price) * 100);
-      price_suggestions.push({
-        id: mi?.id ?? null,
+      price_suggestions.push(buildSuggestion({
+        mi,
         name: mv.name,
         category: mv.category,
-        current_price: mv.current_price,
-        suggested_price: suggested,
+        quantity: mv.quantity,
+        price: mv.current_price,
+        suggested,
         direction: "decrease",
-        reason: clamped
-          ? `${mv.quantity === 0 ? "No sales" : `Only ${mv.quantity} sold`} in ${periodDays} days — cut limited to ~${cutPct}% to keep a 25% margin over food cost.`
-          : mv.quantity === 0
-            ? `No sales in ${periodDays} days — consider a lower price or a promotion.`
-            : `Only ${mv.quantity} sold in ${periodDays} days — a ~10% cut may lift volume.`,
-      });
+        clamped,
+        cost,
+      }));
     }
   }
   const price_suggestions_capped = price_suggestions.slice(0, 12);
@@ -15118,6 +16475,24 @@ export function sanitizeInventoryCategories(raw: unknown): string[] {
 }
 
 // --- Rich customer-page branding (brand_config) ----------------------------
+//
+// LIVE vs LEGACY -----------------------------------------------------------
+// The customer-facing surfaces (QR order page, feedback + valet) are a committed
+// premium DARK design: a near-black #08080A shell, animated accent orbs and
+// frosted-glass panels, themed entirely from a 6-stop accent RAMP derived from
+// one brand colour. That design can honour an accent, a body font, the hero wash
+// and the control/panel shape — it CANNOT honour an arbitrary page background,
+// body-text colour or card colour without destroying its own contrast and glass
+// material, and it no longer needs an independent secondary colour (the ramp
+// derives accMid/accDeep from the accent).
+//
+// So brand_config keys are split into two sets, both still accepted on write and
+// never dropped from storage:
+//   LIVE   — actually drives the guest UI (see BRAND_LIVE_FIELDS)
+//   LEGACY — kept for back-compat / future use, drives nothing (BRAND_LEGACY_FIELDS)
+// Both lists are returned by GET /restaurant/settings as `brand_fields` so the
+// editors can stop rendering dead controls without hardcoding the split.
+//
 // Curated font allowlist the customer-facing pages may use — a small, safe set
 // the UIs render as a dropdown. Anything outside this list is dropped on write
 // (the page then uses its default/system font). Kept as a plain string[] so it
@@ -15139,18 +16514,49 @@ export const BRAND_FONTS: string[] = [
 // layer (only provided, valid keys are persisted); the read layer applies sane
 // defaults (see resolveBrandConfig).
 export interface BrandConfig {
+  // --- LIVE (drives the dark guest design) ---------------------------------
+  /** Body font for the guest surfaces (BRAND_FONTS allowlist). */
   font?: string;
+  /** The brand ACCENT — the single hex the 6-stop accent ramp is derived from. */
   color_primary?: string;
+  /** Hero/header wash: accent gradient (default) or a flat accent block. */
+  header_style?: "gradient" | "solid";
+  /** Radius of controls/buttons/chips (--rCtrl): rounded 13px | pill 999px | square 4px. */
+  button_shape?: "rounded" | "pill" | "square";
+  /** Panel material of every card/sheet (--panelBg/--blur/--pbA). */
+  surface_style?: "frosted" | "solid" | "tinted";
+  // --- LEGACY (stored, sanitized, but no longer drives anything) -----------
   color_secondary?: string;
   color_bg?: string;
   color_text?: string;
   color_card?: string;
-  header_style?: "gradient" | "solid";
-  button_shape?: "rounded" | "pill" | "square";
 }
 
 const BRAND_HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const BRAND_COLOR_KEYS = ["color_primary", "color_secondary", "color_bg", "color_text", "color_card"] as const;
+export const BRAND_HEADER_STYLES: string[] = ["gradient", "solid"];
+export const BRAND_BUTTON_SHAPES: string[] = ["rounded", "pill", "square"];
+export const BRAND_SURFACE_STYLES: string[] = ["frosted", "solid", "tinted"];
+
+/**
+ * Keys the guest surfaces actually consume. Editors should render exactly these.
+ *  - color_primary  → the accent ramp (acc/accHi/accMid/accDeep/accShadow/onAcc)
+ *  - font           → guest body font
+ *  - header_style   → hero wash: "gradient" (accent → near-black) | "solid" (flat accent)
+ *  - button_shape   → control radius --rCtrl: rounded 13px | pill 9999px | square 4px
+ *  - surface_style  → panel material --panelBg/--blur/--pbA:
+ *      frosted (rgba(26,26,31,0.55) / 22px / 0.12)  ← the shipped look
+ *      solid   (rgba(18,18,21,0.94) / 0px  / 0.10)
+ *      tinted  (accent-tinted glass: rgba(accShadow,0.42) / 22px / 0.18)
+ */
+export const BRAND_LIVE_FIELDS: string[] = ["color_primary", "font", "header_style", "button_shape", "surface_style"];
+
+/**
+ * Keys still accepted and stored (a tenant may have set them long ago) but which
+ * the dark guest design cannot express, so they drive nothing. Editors must not
+ * offer them as if they had an effect.
+ */
+export const BRAND_LEGACY_FIELDS: string[] = ["color_secondary", "color_bg", "color_text", "color_card"];
 
 // Validate a customization payload down to the STORED subset: only the keys the
 // caller actually provided AND that pass validation survive (invalid colours,
@@ -15167,14 +16573,21 @@ export function sanitizeBrandConfigInput(raw: unknown): BrandConfig {
   }
   if (s.header_style === "gradient" || s.header_style === "solid") {out.header_style = s.header_style;}
   if (s.button_shape === "rounded" || s.button_shape === "pill" || s.button_shape === "square") {out.button_shape = s.button_shape;}
+  if (s.surface_style === "frosted" || s.surface_style === "solid" || s.surface_style === "tinted") {out.surface_style = s.surface_style;}
   return out;
 }
 
 // Read-time view of the stored brand_config with sane defaults applied so the
 // UIs never have to null-check a key. color_primary falls back to the extracted
 // logo primary (themePrimary) then theme_color, so tenants that only ever set a
-// theme colour look exactly as before. Colours the tenant never set stay absent
-// (the pages keep their own hardcoded fallbacks for those surfaces).
+// theme colour look exactly as before. Legacy colours the tenant never set stay
+// absent (they drive nothing either way — see BRAND_LEGACY_FIELDS).
+//
+// The LIVE enum defaults are exactly the shipped dark design, so a tenant that
+// never touched branding keeps today's guest page pixel-for-pixel:
+// header_style "gradient", button_shape "rounded" (--rCtrl 13px) and
+// surface_style "frosted". NOTE: button_shape used to default to "pill" while
+// nothing consumed it; the default moved to "rounded" when the key became live.
 export function resolveBrandConfig(stored: unknown, themePrimary: string | null, themeColor: string | null): BrandConfig {
   const c = sanitizeBrandConfigInput(stored);
   const primaryFallback = themePrimary && BRAND_HEX_RE.test(themePrimary)
@@ -15184,7 +16597,8 @@ export function resolveBrandConfig(stored: unknown, themePrimary: string | null,
   return {
     font: c.font ?? "Inter",
     header_style: c.header_style ?? "gradient",
-    button_shape: c.button_shape ?? "pill",
+    button_shape: c.button_shape ?? "rounded",
+    surface_style: c.surface_style ?? "frosted",
     ...(colorPrimary ? { color_primary: colorPrimary } : {}),
     ...(c.color_secondary ? { color_secondary: c.color_secondary } : {}),
     ...(c.color_bg ? { color_bg: c.color_bg } : {}),
@@ -15238,6 +16652,27 @@ export interface RestaurantSettings {
   brand_config: BrandConfig;
   // The curated font allowlist the branding editor renders as a dropdown.
   brand_fonts: string[];
+  // Which brand_config keys actually drive the guest surfaces (`live`) and which
+  // are only kept for back-compat (`legacy`) — see BRAND_LIVE_FIELDS. Editors
+  // render controls for `live` only; `legacy` values are still returned in
+  // brand_config when set, so nothing is lost.
+  brand_fields: { live: string[]; legacy: string[] };
+  // Accepted values for each enum-ish live key, so the editors don't hardcode them.
+  brand_field_options: { font: string[]; header_style: string[]; button_shape: string[]; surface_style: string[] };
+}
+
+// The live/legacy split + option lists, returned by GetRestaurantSettings and
+// SetRestaurantSettings so both editors read it from one place.
+function brandFieldMeta(): Pick<RestaurantSettings, "brand_fields" | "brand_field_options"> {
+  return {
+    brand_fields: { live: [...BRAND_LIVE_FIELDS], legacy: [...BRAND_LEGACY_FIELDS] },
+    brand_field_options: {
+      font: [...BRAND_FONTS],
+      header_style: [...BRAND_HEADER_STYLES],
+      button_shape: [...BRAND_BUTTON_SHAPES],
+      surface_style: [...BRAND_SURFACE_STYLES],
+    },
+  };
 }
 
 // Basic sanitization for an uploaded SVG logo: cap the size and strip the
@@ -15318,9 +16753,10 @@ export async function GetRestaurantSettings(
     // Admin editor prefill: the stored customization resolved with defaults
     // (color_primary falls back to theme_color here — the logo-extracted palette
     // is only resolved on the public branding path to keep this admin read cheap)
-    // plus the curated font allowlist for the dropdown.
+    // plus the curated font allowlist for the dropdown and the live/legacy split.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
     brand_fonts: [...BRAND_FONTS],
+    ...brandFieldMeta(),
   };
 }
 
@@ -15532,6 +16968,7 @@ export async function SetRestaurantSettings(
     // type requires it — echo the current stored value resolved with defaults.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
     brand_fonts: [...BRAND_FONTS],
+    ...brandFieldMeta(),
   };
 }
 
@@ -15739,9 +17176,26 @@ export async function AddNotification(
 ): Promise<void> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureNotificationsTable();
+  const type = n.type ?? "info";
+  const meta = { ...(n.meta ?? {}) };
+  // Stamp a TARGET onto every notification, derived from the same mapping the
+  // resolver uses. Call sites only have to pass the entity id they already know
+  // (order_id / booking_id / waitlist_id / …); the module label, the entity kind
+  // and the owning outlet are filled in here so a tapped notification can always
+  // be routed — including notifications produced by future call sites.
+  const { module, entity } = notificationEntityOf(type, meta);
+  if (module) {meta.module = module;}
+  if (entity) {
+    meta.entity_type = entity.type;
+    meta.entity_id = entity.id;
+  }
+  // The outlet the notification was RAISED on. A cross-outlet notification uses
+  // this to tell the client which outlet to switch to (the resolver re-reads the
+  // entity's own outlet and prefers that, but this covers rows it can't look up).
+  if (context.outlet_id) {meta.outlet_id = context.outlet_id;}
   await runQuery(
     `insert into "Notifications" (res_id, outlet_id, type, title, body, meta) values ($1, $2, $3, $4, $5, $6)`,
-    [context.res_id, context.outlet_id, n.type ?? "info", n.title, n.body ?? null, JSON.stringify(n.meta ?? {})],
+    [context.res_id, context.outlet_id, type, n.title, n.body ?? null, JSON.stringify(meta)],
   );
 }
 
@@ -15751,8 +17205,11 @@ export async function GetNotifications(
 ): Promise<{ notifications: Record<string, unknown>[]; unread: number }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureNotificationsTable();
+  // outlet_id is returned so a client can tell at a glance that a notification
+  // belongs to a DIFFERENT branch than the one it is currently viewing (the
+  // resolver below turns that into actionable copy).
   const rows = await runQuery<Record<string, unknown>>(
-    `select id, type, title, body, meta, read_at, created_at
+    `select id, type, title, body, meta, outlet_id, read_at, created_at
        from "Notifications" where res_id = $1 order by created_at desc limit $2`,
     [context.res_id, limit],
   );
@@ -15761,6 +17218,318 @@ export async function GetNotifications(
     [context.res_id],
   );
   return { notifications: rows, unread: countRows[0]?.n ?? 0 };
+}
+
+// --- Notification target resolution ----------------------------------------
+// A bell notification is only useful if tapping it lands on the record it is
+// about. This resolves one notification into (module to open, entity to focus,
+// outlet the entity lives on) and — crucially — whether that record can actually
+// be reached from the caller's CURRENT scope. Without this, a notification for a
+// deleted order, an order on another branch, or an order older than the live
+// grid's window opened an empty screen with no explanation.
+//
+// Never fabricates: a record that is genuinely gone reports still_exists false.
+
+export interface NotificationTarget {
+  notification_id: string;
+  type: string;
+  /** Client module label to open ("Orders", "Bookings", …); null = nothing to open. */
+  module: string | null;
+  entity: { type: string; id: string } | null;
+  /** Outlet the ENTITY lives on (null when unknown or not outlet-scoped). */
+  outlet_id: string | null;
+  outlet_name: string | null;
+  /** The row is present in the database. */
+  still_exists: boolean;
+  /** The record will appear in the destination module's default list for THIS caller. */
+  visible_here: boolean;
+  /** Machine-readable why-not, set whenever visible_here is false. */
+  reason_gone?: string;
+  /** Honest one-line copy the client can show instead of an empty screen. */
+  message?: string;
+  /** Outlet to switch to when reason_gone is "other_outlet" (else null). */
+  switch_outlet_id: string | null;
+  /** Everything the notification carried, so a module can focus by table/etc. */
+  meta: Record<string, unknown>;
+}
+
+// Which module + entity a notification points at. Type wins (it is set by the
+// producer); meta ids disambiguate the overloaded `warning` type. Mirrors the
+// owner app's _moduleForType so both agree on the destination.
+function notificationEntityOf(
+  type: string,
+  meta: Record<string, unknown>,
+): { module: string | null; entity: { type: string; id: string } | null } {
+  const s = (k: string): string => {
+    const v = meta[k];
+    return typeof v === "string" && v.trim() ? v.trim() : typeof v === "number" ? String(v) : "";
+  };
+  const pick = (module: string, entityType: string, key: string) => {
+    const id = s(key);
+    return id ? { module, entity: { type: entityType, id } } : { module, entity: null };
+  };
+
+  switch (type) {
+    case "order":
+    case "payment":
+      return pick("Orders", "order", "order_id");
+    case "reservation":
+      return pick("Bookings", "booking", "booking_id");
+    case "waitlist":
+      return pick("Waitlist", "waitlist", "waitlist_id");
+    case "valet":
+      return pick("Valet", "valet_record", "booking_id");
+    case "stock":
+      return pick("Inventory", "inventory_item", "inventory_id");
+    case "warning":
+      if (s("request_id")) {return pick("Orders", "discount_request", "request_id");}
+      if (s("feedback_id")) {return pick("Feedback", "feedback", "feedback_id");}
+      // KPI/exception alerts are restaurant-wide numbers, not a row — Analytics
+      // is the honest destination and there is nothing to focus.
+      return { module: "Analytics", entity: null };
+    default:
+      break;
+  }
+  // Unknown/legacy type: fall back to whichever id it carries.
+  if (s("order_id")) {return pick("Orders", "order", "order_id");}
+  if (s("booking_id")) {return pick("Bookings", "booking", "booking_id");}
+  if (s("waitlist_id")) {return pick("Waitlist", "waitlist", "waitlist_id");}
+  if (s("feedback_id")) {return pick("Feedback", "feedback", "feedback_id");}
+  if (s("request_id")) {return pick("Orders", "discount_request", "request_id");}
+  if (s("inventory_id")) {return pick("Inventory", "inventory_item", "inventory_id");}
+  if (s("employee_id")) {return pick("Employees", "employee", "employee_id");}
+  return { module: null, entity: null };
+}
+
+export async function ResolveNotificationTarget(
+  restaurantId: string,
+  notificationId: string,
+): Promise<NotificationTarget | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureNotificationsTable();
+  const rows = await runQuery<{ id: string; type: string | null; outlet_id: string | null; meta: unknown }>(
+    `select id, type, outlet_id, meta from "Notifications" where id = $1 and res_id = $2 limit 1`,
+    [notificationId, context.res_id],
+  );
+  const row = rows[0];
+  if (!row) {return null;}
+
+  const meta = parseJsonObject(row.meta) ?? {};
+  const type = String(row.type ?? "info");
+  const { module, entity } = notificationEntityOf(type, meta as Record<string, unknown>);
+
+  const outletNames = new Map<string, string>();
+  for (const o of await runQuery<{ id: string; outlet_name: string | null }>(
+    `select id::text as id, outlet_name from "Outlets" where res_id = $1`,
+    [context.res_id],
+  )) {
+    outletNames.set(o.id, o.outlet_name ?? "");
+  }
+  const all = isAllOutlets();
+
+  const base: NotificationTarget = {
+    notification_id: row.id,
+    type,
+    module,
+    entity,
+    outlet_id: row.outlet_id ?? null,
+    outlet_name: row.outlet_id ? outletNames.get(row.outlet_id) ?? null : null,
+    still_exists: true,
+    visible_here: true,
+    switch_outlet_id: null,
+    meta: meta as Record<string, unknown>,
+  };
+
+  // Nothing row-shaped to check (KPI alerts, plain info pings): the module still
+  // opens, there is just nothing to focus.
+  if (!entity) {
+    return module
+      ? base
+      : { ...base, visible_here: false, reason_gone: "no_target", message: "This notification is informational — there is nothing to open." };
+  }
+
+  // Look the entity up and decide whether the destination's DEFAULT list will
+  // actually show it for this caller. Each branch answers three things:
+  // present?, on which outlet?, and inside the module's default filter?
+  let found: { outlet_id: string | null; inDefaultList: boolean; whyNot?: string; whyNotMsg?: string } | null = null;
+
+  switch (entity.type) {
+    case "order": {
+      const r = await runQuery<{ outlet_id: string | null; recent: boolean; closed: boolean }>(
+        `
+          select
+            o.outlet_id::text as outlet_id,
+            (o.created_at >= now() - ($3 || ' days')::interval) as recent,
+            (b.closed_at is not null) as closed
+          from "Orders" o
+          left join lateral (
+            select b.closed_at from "Bills" b
+            where b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
+            order by b.created_at desc, b.id desc limit 1
+          ) b on true
+          where o.id = $1 and o.res_id = $2 limit 1
+        `,
+        [entity.id, context.res_id, String(LIVE_ORDERS_WINDOW_DAYS)],
+      );
+      if (r[0]) {
+        const live = r[0].recent === true || r[0].closed !== true;
+        found = {
+          outlet_id: r[0].outlet_id,
+          inDefaultList: live,
+          whyNot: live ? undefined : "outside_live_window",
+          whyNotMsg: live
+            ? undefined
+            : `This order is settled and older than ${LIVE_ORDERS_WINDOW_DAYS} days, so it is no longer on the live Orders list — find it under History.`,
+        };
+      }
+      break;
+    }
+    case "discount_request": {
+      const r = await runQuery<{ outlet_id: string | null; status: string | null }>(
+        `select outlet_id::text as outlet_id, status from "DiscountRequests" where id = $1 and res_id = $2 limit 1`,
+        [entity.id, context.res_id],
+      ).catch(() => [] as { outlet_id: string | null; status: string | null }[]);
+      if (r[0]) {
+        const pending = String(r[0].status ?? "").toLowerCase() === "pending";
+        found = {
+          outlet_id: r[0].outlet_id,
+          inDefaultList: pending,
+          whyNot: pending ? undefined : "already_resolved",
+          whyNotMsg: pending ? undefined : "This discount request has already been decided.",
+        };
+      }
+      break;
+    }
+    case "booking": {
+      const r = await runQuery<{ outlet_id: string | null; slot: string; created_at: Date }>(
+        `select outlet_id::text as outlet_id, slot, created_at from "Bookings" where id = $1 and res_id = $2 limit 1`,
+        [entity.id, context.res_id],
+      );
+      if (r[0]) {
+        // The bookings list (GetBookingsAfterTime) drops any slot whose END has
+        // already passed, so a notification about a finished reservation must NOT
+        // claim to be visible there — otherwise the client navigates to a page
+        // the booking isn't on. Mirror that rule exactly.
+        const slot = decodeSlot(r[0].slot, r[0].created_at);
+        const start = new Date(slot.start);
+        const end = new Date(start.getTime() + slot.duration * MINUTE_IN_MS);
+        const upcoming = !Number.isNaN(end.getTime()) && end > new Date();
+        found = {
+          outlet_id: r[0].outlet_id,
+          inDefaultList: upcoming,
+          whyNot: upcoming ? undefined : "past_booking",
+          whyNotMsg: upcoming
+            ? undefined
+            : "That reservation's time has already passed, so it is no longer in the bookings list.",
+        };
+      }
+      break;
+    }
+    case "waitlist": {
+      const r = await runQuery<{ outlet_id: string | null; status: string | null }>(
+        `select outlet_id::text as outlet_id, status from "Waitlist" where id = $1 and res_id = $2 limit 1`,
+        [entity.id, context.res_id],
+      );
+      if (r[0]) {
+        const active = ["waiting", "called"].includes(String(r[0].status ?? "").toLowerCase());
+        found = {
+          outlet_id: r[0].outlet_id,
+          inDefaultList: active,
+          whyNot: active ? undefined : "no_longer_in_queue",
+          whyNotMsg: active ? undefined : `This party has already been ${String(r[0].status ?? "removed").toLowerCase()} and has left the queue.`,
+        };
+      }
+      break;
+    }
+    case "valet_record": {
+      const r = await runQuery<{ outlet_id: string | null }>(
+        `select outlet_id::text as outlet_id from "Valet_vehicle_state" where id = $1 and res_id = $2 limit 1`,
+        [entity.id, context.res_id],
+      ).catch(() => [] as { outlet_id: string | null }[]);
+      if (r[0]) {found = { outlet_id: r[0].outlet_id, inDefaultList: true };}
+      break;
+    }
+    case "feedback": {
+      const r = await runQuery<{ outlet_id: string | null }>(
+        `select outlet_id::text as outlet_id from "Feedback_entries" where id = $1 and res_id = $2 limit 1`,
+        [entity.id, context.res_id],
+      );
+      if (r[0]) {found = { outlet_id: r[0].outlet_id, inDefaultList: true };}
+      break;
+    }
+    case "inventory_item": {
+      // The Inventory PK is `barcode` (no id column) — inventory_id in the meta
+      // is exactly that value.
+      const r = await runQuery<{ outlet_id: string | null }>(
+        `select outlet_id::text as outlet_id from "Inventory" where barcode = $1 and res_id = $2 limit 1`,
+        [entity.id, context.res_id],
+      );
+      if (r[0]) {found = { outlet_id: r[0].outlet_id, inDefaultList: true };}
+      break;
+    }
+    case "employee": {
+      const r = await runQuery<{ outlet_id: string | null }>(
+        `select outlet_id::text as outlet_id from "Employees" where id = $1 and res_id = $2 limit 1`,
+        [entity.id, context.res_id],
+      );
+      if (r[0]) {found = { outlet_id: r[0].outlet_id, inDefaultList: true };}
+      break;
+    }
+    default:
+      // Unknown entity kind — report it as unverifiable rather than inventing an
+      // existence answer.
+      return {
+        ...base,
+        still_exists: false,
+        visible_here: false,
+        reason_gone: "unknown_entity",
+        message: "This notification points at a record type this app cannot open yet.",
+      };
+  }
+
+  if (!found) {
+    return {
+      ...base,
+      still_exists: false,
+      visible_here: false,
+      reason_gone: "deleted",
+      message: "The record this notification was about no longer exists — it was deleted.",
+    };
+  }
+
+  const entityOutlet = found.outlet_id ?? base.outlet_id;
+  const entityOutletName = entityOutlet ? outletNames.get(entityOutlet) ?? null : null;
+  const resolved: NotificationTarget = {
+    ...base,
+    outlet_id: entityOutlet,
+    outlet_name: entityOutletName,
+    still_exists: true,
+  };
+
+  // Cross-outlet: the row exists but the caller's branch view cannot show it.
+  // ALL-OUTLETS readers see every branch, so this never applies to them.
+  if (!all && entityOutlet && entityOutlet !== context.outlet_id) {
+    return {
+      ...resolved,
+      visible_here: false,
+      reason_gone: "other_outlet",
+      switch_outlet_id: entityOutlet,
+      message: entityOutletName
+        ? `This is in ${entityOutletName}, not the outlet you are viewing. Switch outlet to open it.`
+        : "This belongs to another outlet. Switch outlet to open it.",
+    };
+  }
+
+  if (!found.inDefaultList) {
+    return {
+      ...resolved,
+      visible_here: false,
+      reason_gone: found.whyNot ?? "not_in_default_list",
+      message: found.whyNotMsg ?? "This record is no longer in the default list for that screen.",
+    };
+  }
+
+  return resolved;
 }
 
 export async function MarkNotificationRead(restaurantId: string, id: string): Promise<void> {
@@ -16509,6 +18278,23 @@ async function ensureFeedbackColumns(client?: PoolClient): Promise<void> {
   await runQuery(`alter table "Feedback_entries" add column if not exists recovery_note text`, [], client);
   // NPS: optional 0–10 recommend score asked on the feedback form.
   await runQuery(`alter table "Feedback_entries" add column if not exists nps integer`, [], client);
+  // overall_rating was an INTEGER, so an average of 4.8 was stored as 5 — the
+  // guest saw 4.8 on their phone and the dashboard showed 5/5. Widen it to two
+  // decimals so the stored score is the score that was actually given.
+  await runQuery(
+    `do $$
+     begin
+       if exists (
+         select 1 from information_schema.columns
+         where table_schema = 'public' and table_name = 'Feedback_entries'
+           and column_name = 'overall_rating' and data_type = 'integer'
+       ) then
+         alter table "Feedback_entries" alter column overall_rating type numeric(3,2);
+       end if;
+     end $$;`,
+    [],
+    client,
+  );
   if (!client) {feedbackColsEnsured = true;}
 }
 
@@ -16536,9 +18322,11 @@ export async function AddFeedbackEntry(
     throw new Error("At least one category rating is required");
   }
 
+  // Keep the true average (2dp) — Math.round() here turned a genuine 4.8 into a
+  // 5/5 on the dashboard while the guest's own screen said 4.8.
   const overallRating = Math.max(
     1,
-    Math.min(5, Math.round(ratings.reduce((acc, cur) => acc + cur.rating, 0) / ratings.length)),
+    Math.min(5, round2(ratings.reduce((acc, cur) => acc + cur.rating, 0) / ratings.length)),
   );
 
   // Low-rating feedback opens a service-recovery ticket for staff to follow up.
@@ -16620,6 +18408,7 @@ export async function GetFeedbackEntries(
     category_ratings: unknown;
     visit_date: Date;
     source: string;
+    nps: number | string | null;
     submitted_at: Date;
   }>(
     `
@@ -16633,6 +18422,7 @@ export async function GetFeedbackEntries(
         cattegory_ratings as category_ratings,
         visit_date,
         source,
+        nps,
         submitted_at
       from "Feedback_entries"
       where res_id = $1 and outlet_id = $2
@@ -16655,6 +18445,9 @@ export async function GetFeedbackEntries(
       : [],
     image_theme: null,
     source: row.source,
+    // Surfaced so the dashboard's expanded view can show the recommend score
+    // alongside the per-question ratings.
+    nps: row.nps == null ? null : Number(row.nps),
     submitted_at: new Date(row.submitted_at),
   }));
 }
@@ -17095,6 +18888,34 @@ export async function GetRestaurantUsers(
   }
 
   return mapped;
+}
+
+// Every employee of the restaurant (across ALL outlets) holding any of the given
+// role identifiers — a core role NAME ("manager") or a custom role UUID, since
+// emp_roles.all stores custom roles by id. Used to revoke live sessions when a
+// role's permission set is edited: session.actions is resolved once at login, so
+// the holders must re-authenticate to pick the new permissions up.
+export async function GetEmployeeIdsWithRole(
+  restaurantId: string,
+  roleIdentifiers: string[],
+): Promise<string[]> {
+  const wanted = new Set(
+    (roleIdentifiers ?? [])
+      .map((entry) => String(entry ?? "").trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (wanted.size === 0) {return [];}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ id: string; emp_roles: unknown }>(
+    `select id, emp_roles from "Employees" where res_id = $1`,
+    [context.res_id],
+  );
+  const ids: string[] = [];
+  for (const row of rows) {
+    const roles = parseEmployeeRoles(row.emp_roles);
+    if (roles.all.some((entry) => wanted.has(entry.toLowerCase()))) {ids.push(row.id);}
+  }
+  return ids;
 }
 
 // The owner employee id (superadmin) for a restaurant — the earliest-created
