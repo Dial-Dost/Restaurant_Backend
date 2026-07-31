@@ -13,6 +13,10 @@ import {
 	AddEmailToCustomer,
 	AddTable,
 	UpdateTable,
+	GetTableSections,
+	TableSectionExists,
+	RenameTableSection,
+	DeleteTableSection,
 	GetSeatingSuggestion,
 	RemoveTable,
 	OccupyTable,
@@ -144,6 +148,7 @@ import {
 	EnsureMenuCategory,
 	DeleteMenuCategory,
 	SaveMenuItems,
+	IsOrderItemServed,
 	MenuBulkDeleteError,
 	UpdateMenuItemPrice,
 	RenameMenuStation,
@@ -190,6 +195,7 @@ import {
 	OrderTimingAction,
 	GetTimingStats,
 	GetKitchenAnalytics,
+	GetOverviewInsights,
 	FireOrderItems,
 	GetExpoView,
 	FIRE_COURSE_ACTION_ID,
@@ -206,6 +212,8 @@ import {
 	GetRestaurantLogo,
 	GetRestaurantLogoRaw,
 	GetBillByOrder,
+	GetClosedBill,
+	ListClosedBills,
 	UpdateOutletDefaultTax,
 	AddBill,
 	ReplaceBill,
@@ -260,10 +268,21 @@ import {
 	CallWaitlistEntry,
 	CancelWaitlistEntry,
 	SeatWaitlistEntry,
+	GetPendingPreorders,
+	ConfirmWaitlistPreorder,
+	DeclineWaitlistPreorder,
+	ClaimWaitlistPreorder,
+	SavePushSubscription,
+	DeletePushSubscription,
+	GetPushSubscriptionsForWaitlist,
+	RecordPushResult,
+	resolveBrandConfig,
+	resolveBrandPalette,
 	repriceFromMenu,
 	applyMenuPriceFloor,
 	type BookingWindow,
 } from "./database_supabase.js";
+import { isPushConfigured, pushPublicKey, sendPush } from "./web_push.js";
 import {
 	OPENAI_REALTIME_MODEL,
 	checkAvailabilityForRequest,
@@ -769,6 +788,10 @@ const PERM_CLOSE_BILL = "a953d044-31ba-4e31-b96f-99304fe43dfa"; // Close Bill (B
 const PERM_VALET_CHARGE = "6c2e8a4d-7f1b-4d9c-8e35-b0a4d6c2f791"; // Valet Charge to Bill (existing, was unused as a gate)
 const PERM_VALET_OPS = "8e4b2d6f-3a1c-4f7e-9b05-d2c6a8e0f413"; // Valet Ops Update (existing, was unused as a gate)
 const PERM_VALET_KEYS = "4a7d1c9e-5b3f-4e8a-a6d2-0c9f7b3e5a18"; // Valet Key Log (existing, was unused as a gate)
+// Floor-section ADMINISTRATION. Split out of "Table Added" (194ce6ee…), which
+// section create/rename/delete used to ride on. See TABLE_SECTION_PERM below for
+// why MOVING a table between existing sections deliberately stays on 194ce6ee.
+const PERM_TABLE_SECTIONS = "2f7c5a94-8e13-4b60-9d27-6a0f3c8e5b41"; // Manage Table Sections (Tables)
 
 // Permission gate for a specific granted Action. Admin (actions include "*")
 // always passes; any role granted this action UUID passes; everyone else 403.
@@ -969,6 +992,17 @@ function clampLimit(raw: unknown, def = 100, max = 500): number {
 	return Math.min(n, max);
 }
 
+// Upper bound of a date range. A bare "YYYY-MM-DD" parses as MIDNIGHT, so
+// `to=2026-07-28` silently excluded everything that happened on the 28th — never
+// what a date picker means. Widen a bare date to the end of that day; anything
+// that already carries a time (full ISO) is passed through untouched.
+function endOfDayBound(raw: unknown): string | undefined {
+	const v = Array.isArray(raw) ? raw[0] : raw;
+	if (typeof v !== "string" || v.trim().length === 0) {return undefined;}
+	const s = v.trim().slice(0, 40);
+	return /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T23:59:59.999Z` : s;
+}
+
 // Validate req.body against a zod schema and 400 on failure (replaces the no-op
 // `validate` for routes where the shape is known). On success req.body is the
 // parsed/coerced data. Apply to new/abuse-prone routes; broaden over time.
@@ -1075,6 +1109,10 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 		// or the browser blocks the request before it reaches the handler.
 		"Content-Type,Authorization,X-Outlet-Id,X-Restaurant-Id,X-Employee-Id,X-Restaurant-Username",
 	);
+	// Paging metadata on list endpoints (audit logs, closed bills) travels in
+	// headers so the response body can stay the shape existing clients expect.
+	// Without this a browser hides them from fetch() even on a same-tenant call.
+	res.header("Access-Control-Expose-Headers", "X-Total-Count,X-Has-More");
 	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 	if (req.method === "OPTIONS") {
 		res.sendStatus(204);
@@ -1281,7 +1319,7 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				GetMenuItems(slug),
 				GetMenuCategories(slug),
 				GetRestaurantProfile(slug),
-				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "rounded", surface_style: "frosted" } })),
+				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: resolveBrandConfig(null, null, null), brand_palette: resolveBrandPalette(null, null, null) })),
 			]);
 			return {
 				restaurant_name: profile?.restaurant_name ?? slug,
@@ -1300,6 +1338,10 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				// font, header_style, button_shape and surface_style; the legacy colour
 				// keys are still returned when set but drive nothing (BRAND_LIVE_FIELDS).
 				brand_config: branding.brand_config,
+				// The RESOLVED palette: every guest colour role as a #rrggbb, never
+				// null, defaults reproducing the shipped design exactly. Guest pages
+				// should theme from THIS and stop deriving colours themselves.
+				brand_palette: branding.brand_palette,
 				categories,
 				items,
 			};
@@ -2152,11 +2194,11 @@ app.post("/qr/:slug/waitlist/join", rateLimit("waitlist", 12, 60_000), async (re
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const name = typeof body.name === "string" ? body.name.trim() : "";
 	// Phone stays optional on a walk-in join (staff can call the party by name),
-	// but a typed number must be a full 10-digit mobile — the queue dedupes and
-	// texts on it.
-	const joinPhone = optionalMobile10(res, body.phone);
-	if (!joinPhone.ok) {return;}
-	const phone = joinPhone.value ?? "";
+	// REQUIRED: staff call a waiting party on this number when their table is
+	// ready, and the waitlist board shows it beside the party size. Enforced here
+	// too so an API caller cannot join without one.
+	const phone = requireMobile10(res, body.phone);
+	if (!phone) {return;}
 	const party = Number(body.party_size ?? 1) || 1;
 	// Multi-outlet: a branch's entrance QR can carry ?outlet=<id> so the walk-in
 	// lands in that branch's queue (where its staff are looking). Single-outlet
@@ -2229,6 +2271,104 @@ app.post("/qr/:slug/waitlist/:token/cancel", rateLimit("waitlist", 20, 60_000), 
 		try { emitRestaurant(resId, "waitlist:updated", { action: "cancel" }); } catch {/* ignore */}
 		res.json({ success: true });
 	} catch (e: any) { logger.error({ err: e }, "waitlist_cancel_failed"); res.status(500).json({ error: "Unable to leave the queue" }); }
+});
+
+// --- Guest confirmation of a held pre-order --------------------------------
+// Seating a queued party no longer fires its pre-order at the kitchen (see
+// SeatWaitlistEntry). These three let the GUEST resolve it from their own queue
+// page, using the token they already hold; staff have the same actions under
+// /waitlist/:id/preorder/*.
+//
+// confirm -> places the order exactly as seating used to (idempotent)
+// decline -> nothing is placed, items stay on the entry
+// claim   -> the table's order page pulls the declined items to seed the cart
+//            (?peek=1 reads them WITHOUT consuming, for a preview)
+app.post("/qr/:slug/waitlist/:token/preorder/confirm", rateLimit("waitlist", 20, 60_000), async (req: Request, res: Response) => {
+	const slug = String(req.params.slug ?? "").trim();
+	let resId: string | null = null;
+	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	try {
+		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => ConfirmWaitlistPreorder(slug, { token: String(req.params.token) }));
+		if ("error" in r) { res.status(400).json(r); return; }
+		// A confirmed pre-order is a real new kitchen ticket — same fan-out as any
+		// other order. Skipped on the idempotent replay so it isn't announced twice.
+		if (r.placed_order_id && !r.already) {
+			const placed: CreatedOrderInfo = { orderId: r.placed_order_id, table: r.table_name };
+			try { await notifyOrderCreated(resId, placed); } catch {/* ignore */}
+			try { emitOrderCreated(resId, placed); } catch {/* ignore */}
+		}
+		try { emitRestaurant(resId, "waitlist:updated", { action: "preorder_confirm" }); } catch {/* ignore */}
+		res.json(r);
+	} catch (e: any) { logger.error({ err: e }, "waitlist_preorder_confirm_failed"); res.status(500).json({ error: "Unable to confirm your order" }); }
+});
+
+app.post("/qr/:slug/waitlist/:token/preorder/decline", rateLimit("waitlist", 20, 60_000), async (req: Request, res: Response) => {
+	const slug = String(req.params.slug ?? "").trim();
+	let resId: string | null = null;
+	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	try {
+		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => DeclineWaitlistPreorder(slug, { token: String(req.params.token) }));
+		if ("error" in r) { res.status(400).json(r); return; }
+		try { emitRestaurant(resId, "waitlist:updated", { action: "preorder_decline" }); } catch {/* ignore */}
+		res.json(r);
+	} catch (e: any) { logger.error({ err: e }, "waitlist_preorder_decline_failed"); res.status(500).json({ error: "Unable to update your order" }); }
+});
+
+app.post("/qr/:slug/waitlist/:token/preorder/claim", rateLimit("waitlist", 30, 60_000), async (req: Request, res: Response) => {
+	const slug = String(req.params.slug ?? "").trim();
+	let resId: string | null = null;
+	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	const peek = req.query.peek === "1" || req.query.peek === "true";
+	try {
+		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => ClaimWaitlistPreorder(slug, String(req.params.token), peek));
+		if ("error" in r) { res.status(404).json(r); return; }
+		res.json(r);
+	} catch (e: any) { logger.error({ err: e }, "waitlist_preorder_claim_failed"); res.status(500).json({ error: "Unable to load your saved items" }); }
+});
+
+// --- Web Push for the queue (public) ---------------------------------------
+// The guest's browser needs the PUBLIC application server key before it can
+// create a subscription; `enabled` tells the page whether to offer push at all.
+app.get("/qr/:slug/push/key", async (_req: Request, res: Response) => {
+	res.json({ enabled: isPushConfigured(), vapid_public_key: pushPublicKey() });
+});
+
+app.post("/qr/:slug/push/subscribe", rateLimit("push_sub", 20, 60_000), async (req: Request, res: Response) => {
+	const slug = String(req.params.slug ?? "").trim();
+	let resId: string | null = null;
+	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	const body = (req.body ?? {}) as Record<string, any>;
+	// Accept the browser's PushSubscription verbatim (subscription.keys.*) or the
+	// same three values flattened, so a client can post either shape.
+	const sub = body.subscription && typeof body.subscription === "object" ? body.subscription : body;
+	const keys = sub?.keys && typeof sub.keys === "object" ? sub.keys : sub;
+	try {
+		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => SavePushSubscription(slug, {
+			token: String(body.token ?? req.query.token ?? ""),
+			endpoint: sub?.endpoint,
+			p256dh: keys?.p256dh,
+			auth: keys?.auth,
+			user_agent: req.get("user-agent"),
+		}));
+		if ("error" in r) { res.status(400).json(r); return; }
+		res.status(201).json({ success: true, enabled: isPushConfigured() });
+	} catch (e: any) { logger.error({ err: e }, "push_subscribe_failed"); res.status(500).json({ error: "Unable to enable notifications" }); }
+});
+
+app.post("/qr/:slug/push/unsubscribe", rateLimit("push_sub", 20, 60_000), async (req: Request, res: Response) => {
+	const slug = String(req.params.slug ?? "").trim();
+	let resId: string | null = null;
+	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	try {
+		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => DeletePushSubscription(slug, { endpoint: body.endpoint, token: body.token }));
+		res.json(r);
+	} catch (e: any) { logger.error({ err: e }, "push_unsubscribe_failed"); res.status(500).json({ error: "Unable to turn off notifications" }); }
 });
 
 app.post("/qr/:slug/razorpay/create", async (req: Request, res: Response) => {
@@ -2893,13 +3033,42 @@ app.post("/add-customer", validateAction("daf1d71f-2b37-4cd1-b951-28fece7719cd")
 });
 
 /*
+	Sections have no table of their own — a zone IS the set of tables carrying
+	that label — so "create a section" and "move a table into a section" are the
+	SAME write. This resolves which one the caller is actually doing: naming a
+	label no live table carries yet CREATES a zone (needs "Manage Table
+	Sections"), naming one that already exists only MOVES a table into it (stays
+	on "Table Added", so the floor can re-seat mid-service). Unassigning
+	(null/"") is never a create.
+	Returns true when it has already answered with 403 — the caller must return.
+*/
+async function requireSectionAdminForNewSection(
+	req: Request,
+	res: Response,
+	restaurantId: string,
+	section: string | null | undefined,
+): Promise<boolean> {
+	const label = typeof section === "string" ? section.trim() : "";
+	if (!label) {return false;}
+	const actions = req.auth?.actions ?? [];
+	if (actions.includes("*") || actions.includes(PERM_TABLE_SECTIONS)) {return false;}
+	if (await TableSectionExists(restaurantId, label)) {return false;}
+	res.status(403).json({
+		error: "Action not permitted",
+		details: `Creating the new section "${label}" requires the Manage Table Sections permission. Moving a table into an existing section does not.`,
+	});
+	return true;
+}
+
+/*
 	Needs request body as
 	{
 	   "table": {
 		   "name": "T1",
 		   "capacity": 4, // Optional — normal (comfortable) seats
-		   "max_capacity": 6 // Optional — most it can take with extra chairs.
-		                     // Defaults to capacity; clamped up if sent lower.
+		   "max_capacity": 6, // Optional — most it can take with extra chairs.
+		                      // Defaults to capacity; clamped up if sent lower.
+		   "section": "Garden" // Optional floor section/zone. Absent/blank = unassigned.
 	   }
 	}
 	returns the table_name if you want to store it somewhere
@@ -2929,8 +3098,13 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 		}
 	}
 
+	// Adding a table straight into a zone that does not exist yet creates that
+	// zone, so it needs the section-admin grant just like PATCH does.
+	if (await requireSectionAdminForNewSection(req, res, restaurantId, typeof table.section === "string" ? table.section : null)) {return;}
+
 	let table_name: string | null = null;
 	let max_capacity: number | null = null;
+	let section: string | null = null;
 	try {
 		const created = await AddTable(
 			restaurantId,
@@ -2939,9 +3113,11 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 			table.max_capacity !== undefined && table.max_capacity !== null
 				? Math.round(Number(table.max_capacity))
 				: undefined,
+			typeof table.section === "string" ? table.section : undefined,
 		);
 		table_name = created.table_name;
 		max_capacity = created.max_capacity;
+		section = created.section;
 	} catch (error) {
 		logger.info(error);
 		table_name = null;
@@ -2952,7 +3128,7 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	}
 
 	try {
-		emitRestaurant(restaurantId, "table:added", { table_name, capacity: table.capacity, max_capacity });
+		emitRestaurant(restaurantId, "table:added", { table_name, capacity: table.capacity, max_capacity, section });
 	} catch (err) {
 		logger.warn({ err }, "emit table:added failed");
 	}
@@ -2961,6 +3137,7 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 		await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Added table ${table_name}`, Audit_log_category.Tables, {
 			capacity: table.capacity,
 			max_capacity,
+			section,
 			// before.existed=false records that the table did not exist; the undo
 			// deletes it again, but only while it is still pristine.
 			undo: { kind: "table_added", target_id: null, before: { existed: false }, after: { table_name } },
@@ -2973,10 +3150,14 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 });
 
 /*
-	Edit an existing table's seating numbers (same permission as adding one).
-	PATCH /table/:name  body { "capacity": 4, "max_capacity": 6 } — both optional,
-	omitted fields are left alone. max_capacity is clamped up to capacity.
-	Returns { table_name, capacity, max_capacity }.
+	Edit an existing table's seating numbers and/or floor section (same permission
+	as adding one).
+	PATCH /table/:name  body { "capacity": 4, "max_capacity": 6, "section": "Garden" }
+	— all optional, omitted fields are left alone. max_capacity is clamped up to
+	capacity. `section: null` or "" moves the table to "unassigned".
+	THIS is the drag-and-drop endpoint: dropping a table into another section is
+	one PATCH touching one row — never a bulk floor rewrite.
+	Returns { table_name, capacity, max_capacity, section }.
 */
 app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -3005,13 +3186,24 @@ app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b")
 		res.status(400).json({ error: "capacity and max_capacity must be whole numbers >= 1" });
 		return;
 	}
-	if (capacity === undefined && maxCapacity === undefined) {
+	// `section` absent -> untouched; null or a string (incl. "") -> written.
+	// Anything else (number, object) is a client bug, not an "unassign".
+	const hasSection = body !== undefined && Object.prototype.hasOwnProperty.call(body, "section");
+	if (hasSection && body?.section !== null && typeof body?.section !== "string") {
+		res.status(400).json({ error: "section must be a string or null" });
+		return;
+	}
+	const section = hasSection ? ((body?.section as string | null) ?? null) : undefined;
+	if (capacity === undefined && maxCapacity === undefined && section === undefined) {
 		res.status(400).json({ error: "Nothing to update" });
 		return;
 	}
+	// Dropping a table onto an EXISTING zone is a move (Table Added is enough);
+	// typing a brand-new zone name here creates one (Manage Table Sections).
+	if (await requireSectionAdminForNewSection(req, res, restaurantId, section)) {return;}
 
 	try {
-		const updated = await UpdateTable(restaurantId, tableName, { capacity, max_capacity: maxCapacity });
+		const updated = await UpdateTable(restaurantId, tableName, { capacity, max_capacity: maxCapacity, section });
 		if (!updated) {
 			res.status(404).json({ error: "Table not found" });
 			return;
@@ -3023,7 +3215,7 @@ app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b")
 			logger.warn({ err }, "emit table:updated failed");
 		}
 		try {
-			await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Updated table ${updated.table_name} seating (capacity ${updated.capacity}, max ${updated.max_capacity})`, Audit_log_category.Tables, updated);
+			await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Updated table ${updated.table_name} (capacity ${updated.capacity}, max ${updated.max_capacity}, section ${updated.section ?? "unassigned"})`, Audit_log_category.Tables, updated);
 		} catch (err) {
 			logger.warn({ err }, 'log_audit update-table failed');
 		}
@@ -3032,6 +3224,76 @@ app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b")
 	} catch (error: any) {
 		logger.error({ err: error }, "update_table_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to update table") });
+	}
+});
+
+/*
+	Floor sections (zones). There is no Sections table — a section IS the set of
+	tables carrying that name, so these three routes are a group-by and two
+	one-statement label updates. Same permission as editing a table.
+
+	GET    /table-sections            -> { sections: [{ section, tables, seats }], unassigned }
+	PATCH  /table-sections/:name      body { "name": "New name" } -> { section, updated }
+	DELETE /table-sections/:name      -> { section, updated }  (tables become unassigned;
+	                                     no table is ever deleted by this route)
+	To MOVE one table, use PATCH /table/:name { section } — one row, O(1) per drop.
+
+	PERMISSION SPLIT (see requireSectionAdminForNewSection below):
+	  • Creating a zone, renaming one, removing one — and listing the zone
+	    roster — is floor-plan ADMINISTRATION and needs "Manage Table Sections"
+	    (2f7c5a94…). It reshapes how the whole floor is organised.
+	  • MOVING a table into a zone that already exists (and un-assigning it)
+	    stays on "Table Added" (194ce6ee…), the permission the floor already
+	    holds for editing tables. Re-seating during service must never wait on
+	    an admin-level grant, and a move cannot invent or destroy a zone.
+	Admin ("*") passes both.
+*/
+const TABLE_SECTION_PERM = PERM_TABLE_SECTIONS;
+
+app.get("/table-sections", validateAction(TABLE_SECTION_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try {
+		res.json(await GetTableSections(restaurantId));
+	} catch (error: any) {
+		logger.error({ err: error }, "table_sections_list_failed");
+		res.status(500).json({ error: "Unable to fetch table sections" });
+	}
+});
+
+app.patch("/table-sections/:name", validateAction(TABLE_SECTION_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const from = typeof req.params.name === "string" ? req.params.name.trim() : "";
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const to = typeof body.name === "string" ? body.name : typeof body.section === "string" ? body.section : "";
+	if (!from || !String(to).trim()) { res.status(400).json({ error: "Both the current and new section name are required" }); return; }
+	try {
+		const r = await RenameTableSection(restaurantId, from, String(to));
+		if (r.updated === 0) { res.status(404).json({ error: "Section not found" }); return; }
+		try { emitRestaurant(restaurantId, "table:sections_updated", { action: "rename", from, to: r.section, tables: r.updated }); } catch { /* ignore realtime errors */ }
+		try { await log_audit(req, TABLE_SECTION_PERM, `Renamed table section ${from} to ${r.section} (${r.updated} tables)`, Audit_log_category.Tables, r); } catch (err) { logger.warn({ err }, "log_audit rename-section failed"); }
+		res.json(r);
+	} catch (error: any) {
+		logger.error({ err: error }, "table_section_rename_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to rename section") });
+	}
+});
+
+app.delete("/table-sections/:name", validateAction(TABLE_SECTION_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const name = typeof req.params.name === "string" ? req.params.name.trim() : "";
+	if (!name) { res.status(400).json({ error: "Section name is required" }); return; }
+	try {
+		const r = await DeleteTableSection(restaurantId, name);
+		if (r.updated === 0) { res.status(404).json({ error: "Section not found" }); return; }
+		try { emitRestaurant(restaurantId, "table:sections_updated", { action: "delete", section: r.section, tables: r.updated }); } catch { /* ignore realtime errors */ }
+		try { await log_audit(req, TABLE_SECTION_PERM, `Removed table section ${r.section} (${r.updated} tables unassigned)`, Audit_log_category.Tables, r); } catch (err) { logger.warn({ err }, "log_audit delete-section failed"); }
+		res.json(r);
+	} catch (error: any) {
+		logger.error({ err: error }, "table_section_delete_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to remove section") });
 	}
 });
 
@@ -3341,7 +3603,17 @@ app.post("/add-booking", validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104"),
 		return;
 	}
 
-	const date: Date = new Date(booking_request.date);
+	// The documented contract for this field carries a zone designator, and such a
+	// string is an absolute instant that parseWallClockInZone passes through
+	// untouched. But clients do send a BARE "YYYY-MM-DDTHH:mm" wall clock, and
+	// `new Date()` read that in the SERVER's zone — correct on an IST dev box,
+	// 5.5h wrong on a UTC prod server. Interpret it in the restaurant's own
+	// timezone, exactly as the public /reserve path already does.
+	const bookingSettings = await GetRestaurantSettings(restaurantId).catch(() => null);
+	const date: Date = parseWallClockInZone(
+		String(booking_request.date),
+		bookingSettings?.timezone ?? "Asia/Kolkata",
+	);
 	if (isNaN(date.getTime())) {
 		res.status(400).json({ error: "Time is in the wrong format" });
 		return;
@@ -3793,6 +4065,64 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 	}
 });
 
+// --- Closed (settled) bills ------------------------------------------------
+// A settled bill used to be invisible: the table is freed and its orders flip to
+// Paid/Closed, so neither the floor grid nor the live orders list can show it,
+// and /bill-for-table only ever returns the OPEN bill. These two reads are what
+// Accounting and History use to browse and re-open a closed bill in full.
+//
+// Both are gated by the existing "View Bill" action (98b10bde…) — the same
+// permission that already lets a role read a table's running bill. No new
+// permission to hand out, and waiters/captains (who now hold it) can look up a
+// bill they just settled.
+
+// Paged, date-filterable list, newest settled first. Query params:
+//   limit (1-200, default 50), offset, from, to (ISO or YYYY-MM-DD),
+//   table, payment_method, search, include_open=1
+// Also sets X-Total-Count / X-Has-More so a scroller can use headers alone.
+app.get('/bills/closed', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
+	const str = (v: unknown): string | undefined =>
+		typeof v === 'string' && v.trim().length > 0 ? v.trim().slice(0, 200) : undefined;
+	try {
+		const page = await ListClosedBills(restaurantId, {
+			limit: clampLimit(req.query.limit, 50, 200),
+			offset: Math.max(0, Math.min(Number(req.query.offset) || 0, 100000)),
+			from: str(req.query.from),
+			to: endOfDayBound(req.query.to),
+			table: str(req.query.table),
+			payment_method: str(req.query.payment_method),
+			search: str(req.query.search),
+			include_open: req.query.include_open === '1' || req.query.include_open === 'true',
+		});
+		res.setHeader("X-Total-Count", String(page.total));
+		res.setHeader("X-Has-More", page.has_more ? "1" : "0");
+		return res.json(page);
+	} catch (err) {
+		logger.error({ err }, 'list_closed_bills_failed');
+		return res.status(500).json({ error: 'Unable to fetch closed bills' });
+	}
+});
+
+// ONE closed bill in full — line items, per-tax lines, service charge, discount/
+// coupon, grand total, payment method + split parts, who confirmed/approved/
+// closed it, table, covers, APC and every timestamp.
+app.get('/bills/closed/:id', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
+	const billId = String(req.params.id ?? '').trim();
+	if (!billId) {return res.status(400).json({ error: 'Missing bill id' });}
+	try {
+		const bill = await GetClosedBill(restaurantId, billId);
+		if (!bill) {return res.status(404).json({ error: 'Bill not found' });}
+		return res.json(bill);
+	} catch (err) {
+		logger.error({ err }, 'get_closed_bill_failed');
+		return res.status(500).json({ error: 'Unable to fetch this bill' });
+	}
+});
+
 app.get('/bills/order/:orderId', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
@@ -3935,6 +4265,77 @@ app.patch('/bills/order/:orderId/status', validateAction("07e364cc-f40d-46f3-b69
 	} catch (error: any) {
 		logger.error({ err: error }, 'update_bill_status_failed');
 		res.status(400).json({ error: String(error?.message ?? 'Unable to update bill status') });
+	}
+});
+
+/*
+	Upload a PAYMENT PROOF image and get back a URL to hand to settle.
+
+	POST /billing/upload-payment-proof
+	  body { "image_base64": "<raw or data: URL>", "content_type": "image/jpeg" }
+	  -> 200 { "payment_proof_screenshot_url": "https://…", "image_url": "https://…" }
+
+	Exists so staff no longer have to paste an image URL when settling a bill with
+	a method that needs proof (UPI screenshot, cheque, bank transfer): the client
+	uploads the picture, then sends the returned URL as `payment_proof_screenshot_url`
+	on POST /bills/order/:orderId/waiter-confirm-payment. The settle contract itself
+	is UNCHANGED — this route only produces a URL that already-valid field accepts.
+	Mirrors POST /menu/upload-image (same base64 pattern, same Supabase storage),
+	but lands in the existing private-ish "payment-proofs" bucket via uploadScreenshot.
+	Guarded by the record-payment permission, and `image_url` is echoed so a client
+	written against /menu/upload-image can reuse its parser.
+*/
+const PAYMENT_PROOF_TYPES = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+// Base64 is ~4/3 of the byte size, so ~4M characters ≈ a 3MB image — the same
+// ceiling the public guest upload (POST /qr/:slug/pay) enforces.
+const PAYMENT_PROOF_MAX_B64_CHARS = 4_000_000;
+
+/** True when the decoded bytes actually start with a JPEG/PNG/WebP signature. */
+function looksLikeImage(buf: Buffer): boolean {
+	if (buf.length < 12) { return false; }
+	if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) { return true; } // JPEG
+	if (buf[0] === 0x89 && buf.subarray(1, 4).toString("latin1") === "PNG") { return true; } // PNG
+	if (buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP") { return true; } // WebP
+	return false;
+}
+
+app.post("/billing/upload-payment-proof", validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const b64 = typeof body.image_base64 === "string"
+		? body.image_base64
+		: typeof body.screenshot_base64 === "string" ? body.screenshot_base64 : "";
+	const ctRaw = typeof body.content_type === "string" ? body.content_type : "image/jpeg";
+	const ct = ctRaw.split(";")[0]!.trim().toLowerCase();
+	if (!b64) { res.status(400).json({ error: "image_base64 is required" }); return; }
+	if (!PAYMENT_PROOF_TYPES.has(ct)) {
+		res.status(415).json({ error: "content_type must be image/jpeg, image/png or image/webp" });
+		return;
+	}
+	if (b64.length > PAYMENT_PROOF_MAX_B64_CHARS) {
+		res.status(413).json({ error: "Payment proof is too large (max ~3MB)." });
+		return;
+	}
+	// Decode once here so a corrupt/mislabelled upload is rejected with a clear
+	// 400 instead of silently landing a junk object in the bucket.
+	const cleaned = b64.includes(",") ? (b64.split(",").pop() ?? b64) : b64;
+	let decoded: Buffer;
+	try { decoded = Buffer.from(cleaned, "base64"); } catch { decoded = Buffer.alloc(0); }
+	if (decoded.length === 0 || !looksLikeImage(decoded)) {
+		res.status(400).json({ error: "image_base64 is not a readable JPEG/PNG/WebP image" });
+		return;
+	}
+	try {
+		const url = await uploadScreenshot(cleaned, ct === "image/jpg" ? "image/jpeg" : ct);
+		if (!url) { res.status(502).json({ error: "Image upload failed (storage not configured)" }); return; }
+		try {
+			await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", "Uploaded a payment proof image", Audit_log_category.Bill, { bytes: decoded.length, content_type: ct });
+		} catch (err) { logger.warn({ err }, "log_audit upload-payment-proof failed"); }
+		res.json({ payment_proof_screenshot_url: url, image_url: url });
+	} catch (err) {
+		logger.error({ err }, "payment_proof_upload_failed");
+		res.status(500).json({ error: "Unable to upload payment proof" });
 	}
 });
 
@@ -4301,16 +4702,29 @@ app.get("/audit-logs", validateAction("91b24293-7b88-4fe4-8cf5-deb6faaba4f5"), a
 	const category = (Object.values(Audit_log_category) as string[]).includes(categoryRaw) ? categoryRaw : undefined;
 	const search = typeof req.query.search === "string" ? req.query.search.slice(0, 200) : undefined;
 	const from = typeof req.query.from === "string" ? req.query.from : undefined;
-	const to = typeof req.query.to === "string" ? req.query.to : undefined;
+	// A bare YYYY-MM-DD upper bound means "through the end of that day".
+	const to = endOfDayBound(req.query.to);
+
+	// Infinite scroll needs to know when to stop, but the response has always been
+	// a bare ARRAY and both the web dashboard and the owner app parse it that way.
+	// So: the array stays the default, the paging metadata rides along in headers
+	// (always), and `?meta=1` opts into the enveloped body for new clients.
+	const wantMeta = req.query.meta === "1" || req.query.meta === "true";
 
 	try {
-		const logs = await GetAuditLogs(restaurantId, { limit, offset, category, search, from, to });
+		const page = await GetAuditLogs(restaurantId, { limit, offset, category, search, from, to });
 		// try {
 		// 	await log_audit(req, "91b24293-7b88-4fe4-8cf5-deb6faaba4f5", `Fetched audit logs`, Audit_log_category.General, { limit });
 		// } catch (err) {
 		// 	console.warn('log_audit get-audit-logs failed', err);
 		// }
-		res.json(logs);
+		res.setHeader("X-Total-Count", String(page.total));
+		res.setHeader("X-Has-More", page.has_more ? "1" : "0");
+		if (wantMeta) {
+			res.json(page);
+			return;
+		}
+		res.json(page.logs);
 	} catch (error) {
 		res.status(500).json({ error: "Unable to fetch audit logs" });
 	}
@@ -4898,9 +5312,10 @@ app.post("/restaurant/branding", validate, async (req: Request, res: Response) =
 		? body.theme_color
 		: undefined;
 	const queueShowMenu = typeof body.queue_show_menu === "boolean" ? body.queue_show_menu : undefined;
-	// Customer-page customization object. Live keys: color_primary, font,
-	// header_style, button_shape, surface_style (legacy colour keys are still
-	// accepted and stored, but drive nothing — see BRAND_LIVE_FIELDS).
+	// Customer-page customization object. Live keys are the full palette
+	// (color_primary / _secondary / _accent / _bg / _card / _text / _success /
+	// _warning / _error) plus font, header_style, button_shape and surface_style —
+	// see BRAND_LIVE_FIELDS; `brand_fields.legacy` is now empty.
 	// Passed through as-is — SetBranding sanitizes it (invalid keys dropped) and
 	// merges it onto the stored config (keys omitted here keep their value).
 	const brandConfig = body.brand_config && typeof body.brand_config === "object" ? body.brand_config : undefined;
@@ -4956,6 +5371,68 @@ function redactRestaurantSettings(settings: Awaited<ReturnType<typeof GetRestaur
 	return out;
 }
 
+// --- Restaurant timezone -----------------------------------------------------
+// The tenant's IANA zone is the DISPLAY/PARSE zone for every instant the system
+// records. Instants themselves are always stored UTC (timestamptz); the zone
+// only decides how "2026-07-29T18:30:00Z" is rendered as a wall clock, and how a
+// bare reservation wall-clock string is read back into an instant.
+//
+// The selectable list is seeded from the ICU database the Node runtime already
+// carries (Intl.supportedValuesOf), so it stays in step with whatever zones
+// Intl.DateTimeFormat will actually accept here — no bundled list to go stale
+// and no new dependency.
+//
+// It cannot be used RAW, though, and this is the trap: supportedValuesOf returns
+// only CANONICAL ids, and canonical for India is the legacy alias
+// "Asia/Calcutta". Our default — and every existing tenant's stored value — is
+// "Asia/Kolkata", which Intl accepts happily but which is NOT in that list. A
+// picker built on the raw list would therefore fail to show the value the
+// restaurant is actually on. So the stored/known-good zones are unioned in and
+// the result is sorted; aliases and their canonical twins both appear and both
+// work (they are the same zone).
+function supportedTimezones(...alsoInclude: string[]): string[] {
+	const supported = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf;
+	let list: string[] = [];
+	try {
+		const values = typeof supported === "function" ? supported("timeZone") : [];
+		if (Array.isArray(values)) {list = values;}
+	} catch {/* small-ICU build: the union below still yields a usable minimum */}
+	const merged = new Set(list);
+	// Always offered: UTC (absent from the canonical list) and the default, plus
+	// whatever the caller passes (the tenant's current zone), so the picker can
+	// always render the value that is in force.
+	for (const tz of ["UTC", "Asia/Kolkata", ...alsoInclude]) {
+		if (tz && isValidTimezone(tz)) {merged.add(tz);}
+	}
+	return [...merged].sort((a, b) => a.localeCompare(b));
+}
+
+// True when Intl will accept this zone id — the same check sanitizeTimezone
+// makes, but reported instead of silently swallowed, so a typo'd zone is a 400
+// rather than an invisible reset to Asia/Kolkata.
+function isValidTimezone(tz: string): boolean {
+	try {
+		new Intl.DateTimeFormat(undefined, { timeZone: tz });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// The zones the settings UI offers, plus the one currently in force so the picker
+// can preselect it without a second call. Deliberately NOT behind PERM_SETTINGS
+// (the zone is how every screen labels its timestamps, not a privileged value) —
+// authenticated is enough.
+app.get("/restaurant/timezones", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	// The list itself does not depend on the tenant; the current value does, and a
+	// failure to read it must not take the picker down.
+	const current = restaurantId
+		? await GetRestaurantSettings(restaurantId).then((s) => s.timezone).catch(() => "Asia/Kolkata")
+		: "Asia/Kolkata";
+	res.json({ timezones: supportedTimezones(current), current, default: "Asia/Kolkata" });
+});
+
 // Restaurant operational settings (e.g. push orders straight to kitchen vs. require approval).
 app.get("/restaurant/settings", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -4975,6 +5452,21 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
+	// Reject an unknown zone instead of letting sanitizeTimezone quietly coerce it
+	// to Asia/Kolkata: the owner would see the save succeed and every timestamp
+	// keep rendering in the wrong zone with nothing to explain it. Only validated
+	// when the caller actually sent the key — omitting it still means "unchanged".
+	// The trimmed id is written back onto the payload so that is what gets saved.
+	if (body.timezone !== undefined) {
+		const tz = typeof body.timezone === "string" ? body.timezone.trim() : "";
+		if (!tz || !isValidTimezone(tz)) {
+			res.status(400).json({
+				error: `"${String(body.timezone)}" is not a known IANA timezone. Use an id like "Asia/Kolkata" or "America/New_York" — see GET /restaurant/timezones for the full list.`,
+			});
+			return;
+		}
+		body.timezone = tz;
+	}
 	try {
 		// Snapshot before the write so the undo can restore ONLY the keys this
 		// request actually changed (never the whole settings document).
@@ -5120,7 +5612,7 @@ app.get("/qr/:slug/branding", async (req: Request, res: Response) => {
 			async () => {
 				const [profile, branding] = await Promise.all([
 					GetRestaurantProfile(slug),
-					GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, timezone: "Asia/Kolkata", require_table_otp: false, brand_config: { font: "Inter", header_style: "gradient", button_shape: "rounded", surface_style: "frosted" } })),
+					GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, timezone: "Asia/Kolkata", require_table_otp: false, brand_config: resolveBrandConfig(null, null, null), brand_palette: resolveBrandPalette(null, null, null) })),
 				]);
 				return { restaurant_name: profile?.restaurant_name ?? slug, ...branding };
 			},
@@ -5790,7 +6282,10 @@ app.delete("/campaigns/:id", async (req: Request, res: Response) => {
 
 // --- Order/item preparation timers (pause/resume, mark item served) ---------
 const ORDER_ACTION = "4ad474d4-5230-449c-874f-6a238b833bca";
-async function handleTiming(req: Request, res: Response, action: "pause" | "resume" | "serve" | "start", withItem: boolean) {
+// Barking pushes a ticket to the kitchen — a different job from taking the order.
+// It used to share "Add Orders", which every waiter needs, so waiters could bark.
+const PERM_BARK = "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63"; // Bark Order
+async function handleTiming(req: Request, res: Response, action: "pause" | "resume" | "serve" | "start" | "unserve", withItem: boolean) {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const orderId = String(req.params.id ?? "").trim();
@@ -5808,7 +6303,27 @@ async function handleTiming(req: Request, res: Response, action: "pause" | "resu
 }
 app.post("/orders/:id/pause", validateAction(ORDER_ACTION), (req, res) => handleTiming(req, res, "pause", false));
 app.post("/orders/:id/resume", validateAction(ORDER_ACTION), (req, res) => handleTiming(req, res, "resume", false));
-app.post("/orders/:id/items/:itemId/serve", validateAction(ORDER_ACTION), (req, res) => handleTiming(req, res, "serve", true));
+// The tick is a TOGGLE: tapping a served item again un-serves it (a mis-tap is
+// otherwise unrecoverable). Explicit `?undo=1` / {undo:true} forces the undo.
+// Un-serving is refused once the whole order is Served — see OrderTimingAction.
+app.post("/orders/:id/items/:itemId/serve", validateAction(ORDER_ACTION), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	const orderId = String(req.params.id ?? "").trim();
+	const itemId = String(req.params.itemId ?? "").trim();
+	let action: "serve" | "unserve" = "serve";
+	const forced = req.query?.undo === "1" || (req.body as Record<string, unknown> | undefined)?.undo === true;
+	if (forced) {
+		action = "unserve";
+	} else if (restaurantId && orderId && itemId) {
+		// Already served? then this tap means "undo".
+		try {
+			const served = await IsOrderItemServed(restaurantId, orderId, itemId);
+			if (served) {action = "unserve";}
+		} catch { /* fall through as a normal serve */ }
+	}
+	return handleTiming(req, res, action, true);
+});
+app.post("/orders/:id/items/:itemId/unserve", validateAction(ORDER_ACTION), (req, res) => handleTiming(req, res, "unserve", true));
 app.post("/orders/:id/items/:itemId/pause", validateAction(ORDER_ACTION), (req, res) => handleTiming(req, res, "pause", true));
 app.post("/orders/:id/items/:itemId/resume", validateAction(ORDER_ACTION), (req, res) => handleTiming(req, res, "resume", true));
 
@@ -5835,7 +6350,7 @@ app.post("/orders/:id/fire", validateAction(ORDER_ACTION), async (req: Request, 
 // Bark an order: the expo announces it to the kitchen — the visible step
 // between acceptance and cooking. Stamps barked_at (+ who) and (re)bases the
 // order/dish prep timers so kitchen time counts from the bark.
-app.post("/orders/:id/bark", validateAction(ORDER_ACTION), async (req: Request, res: Response) => {
+app.post("/orders/:id/bark", validateAction(PERM_BARK), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const orderId = String(req.params.id ?? "").trim();
@@ -5871,6 +6386,18 @@ app.get("/orders/timing-stats", validateAction("df75119b-e5f1-4f38-aba5-78a1cf18
 
 // Kitchen analytics: per-dish prep time, per-section (station) averages and an
 // order-level prep summary over the last `days` days (default 30, clamped 1..365).
+// Overview tab: every quick insight in ONE read. Composed from the same helpers
+// the detailed panels use, so an Overview figure can never disagree with the
+// screen it drills into.
+app.get("/analytics/overview", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
+	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
+	try { res.json(await GetOverviewInsights(restaurantId, days)); }
+	catch (err) { logger.error({ err }, "overview_insights_failed"); res.status(500).json({ error: "Unable to fetch overview insights" }); }
+});
+
 app.get("/analytics/kitchen", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -6064,12 +6591,42 @@ app.get("/waitlist", validateAction(WAITLIST_PERM), async (req: Request, res: Re
 	catch (e) { logger.error({ err: e }, "waitlist_list_failed"); res.status(500).json({ error: "Unable to fetch waitlist" }); }
 });
 
+/**
+ * Push the queue message to every browser the party subscribed from. Fire-and-
+ * forget and fully swallowed: a push outage must never fail a call/seat, exactly
+ * like AddNotification. Dead endpoints (404/410) are pruned as we go.
+ */
+async function pushWaitlistUpdate(
+	restaurantId: string,
+	waitlistId: string,
+	payload: { title: string; body: string; url?: string; tag?: string; data?: Record<string, unknown> },
+): Promise<void> {
+	try {
+		if (!isPushConfigured()) {return;}
+		const subs = await GetPushSubscriptionsForWaitlist(restaurantId, waitlistId);
+		for (const s of subs) {
+			const outcome = await sendPush({ id: s.id, endpoint: s.endpoint, p256dh: s.p256dh, auth: s.auth }, payload);
+			if (outcome === "disabled") {continue;}
+			try { await RecordPushResult(restaurantId, s.id, outcome); } catch {/* ignore */}
+		}
+	} catch (err) { logger.warn({ err }, "waitlist push failed"); }
+}
+
 app.post("/waitlist/:id/call", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
 		const entry = await CallWaitlistEntry(restaurantId, String(req.params.id));
 		try { emitRestaurant(restaurantId, "waitlist:updated", { action: "call", id: entry.id }); } catch {/* ignore */}
+		// Reach the guest even with the browser closed — this is the whole point of
+		// the queue: they walked away and need to come back now.
+		await pushWaitlistUpdate(restaurantId, entry.id, {
+			title: "We're calling you",
+			body: `${entry.name}, your table is being prepared — please come to the host desk.`,
+			url: `/queue/${encodeURIComponent(entry.token)}`,
+			tag: `queue-${entry.id}`,
+			data: { kind: "waitlist_called", waitlist_id: entry.id, token: entry.token },
+		});
 		try { await log_audit(req, WAITLIST_PERM, `Called queue party ${entry.name}`, Audit_log_category.Tables, { id: entry.id }); } catch {/* ignore */}
 		res.json(entry);
 	} catch (e: any) { logger.error({ err: e }, "waitlist_call_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to call this party") }); }
@@ -6084,18 +6641,62 @@ app.post("/waitlist/:id/seat", validateAction(WAITLIST_PERM), async (req: Reques
 	try {
 		const r = await SeatWaitlistEntry(restaurantId, String(req.params.id), tableName, extractEmployeeId(req) ?? undefined);
 		try { emitRestaurant(restaurantId, "waitlist:updated", { action: "seat" }); } catch {/* ignore */}
-		// Seating a queued party auto-places its held pre-order — that is a real new
-		// kitchen ticket, so it gets the same notification/realtime fan-out as any
-		// other order. Notified HERE (not inside SeatWaitlistEntry) so a rolled-back
-		// seat can never leave a notification for an order that does not exist.
-		if (r.placed_order_id) {
-			const seatedOrder: CreatedOrderInfo = { orderId: r.placed_order_id, table: r.table_name };
-			await notifyOrderCreated(restaurantId, seatedOrder);
-			emitOrderCreated(restaurantId, seatedOrder);
-		}
-		try { await log_audit(req, WAITLIST_PERM, `Seated queue party at ${r.table_name}`, Audit_log_category.Tables, { table: r.table_name, order: r.placed_order_id }); } catch {/* ignore */}
+		// Seating no longer places the held pre-order — it comes back as
+		// `pending_preorder` for the guest/staff to confirm (POST
+		// /waitlist/:id/preorder/confirm), which is where the order-created
+		// notification now fires. `placed_order_id` stays in the response (null) so
+		// older clients keep parsing it.
+		await pushWaitlistUpdate(restaurantId, String(req.params.id), {
+			title: "Your table is ready",
+			body: `You're seated at ${r.table_name}.${r.pending_preorder ? " Confirm the items you picked while waiting." : ""}`,
+			url: `/queue/${encodeURIComponent(r.waitlist_token)}`,
+			tag: `queue-${req.params.id}`,
+			data: { kind: "waitlist_seated", waitlist_id: r.waitlist_id, token: r.waitlist_token, table: r.table_name, pre_order_status: r.pre_order_status },
+		});
+		try { await log_audit(req, WAITLIST_PERM, `Seated queue party at ${r.table_name}`, Audit_log_category.Tables, { table: r.table_name, pre_order_status: r.pre_order_status }); } catch {/* ignore */}
 		res.json(r);
 	} catch (e: any) { logger.error({ err: e }, "waitlist_seat_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to seat this party") }); }
+});
+
+// Seated parties whose held pre-order still needs a yes/no. GET /waitlist only
+// lists waiting/called parties, so without this the un-confirmed pre-order would
+// only ever be visible in the seat response. Poll this to render a durable
+// "confirm the pre-order for T4" list.
+app.get("/waitlist/pending-preorders", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try { res.json({ entries: await GetPendingPreorders(restaurantId) }); }
+	catch (e) { logger.error({ err: e }, "waitlist_pending_preorders_failed"); res.status(500).json({ error: "Unable to fetch pending pre-orders" }); }
+});
+
+// Staff-side twins of the guest pre-order actions. Same DB functions, same
+// idempotency — a waiter standing at the table can confirm on the guest's behalf.
+app.post("/waitlist/:id/preorder/confirm", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try {
+		const r = await ConfirmWaitlistPreorder(restaurantId, { id: String(req.params.id) }, extractEmployeeId(req) ?? undefined);
+		if ("error" in r) { res.status(400).json(r); return; }
+		if (r.placed_order_id && !r.already) {
+			const placed: CreatedOrderInfo = { orderId: r.placed_order_id, table: r.table_name };
+			await notifyOrderCreated(restaurantId, placed);
+			emitOrderCreated(restaurantId, placed);
+		}
+		try { emitRestaurant(restaurantId, "waitlist:updated", { action: "preorder_confirm" }); } catch {/* ignore */}
+		try { await log_audit(req, WAITLIST_PERM, `Confirmed queue pre-order for table ${r.table_name}`, Audit_log_category.Orders, { table: r.table_name, order: r.placed_order_id }); } catch {/* ignore */}
+		res.json(r);
+	} catch (e: any) { logger.error({ err: e }, "waitlist_preorder_confirm_staff_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to confirm the pre-order") }); }
+});
+
+app.post("/waitlist/:id/preorder/decline", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try {
+		const r = await DeclineWaitlistPreorder(restaurantId, { id: String(req.params.id) });
+		if ("error" in r) { res.status(400).json(r); return; }
+		try { emitRestaurant(restaurantId, "waitlist:updated", { action: "preorder_decline" }); } catch {/* ignore */}
+		res.json(r);
+	} catch (e: any) { logger.error({ err: e }, "waitlist_preorder_decline_staff_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to update the pre-order") }); }
 });
 
 app.post("/waitlist/:id/cancel", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {

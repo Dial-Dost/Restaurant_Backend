@@ -72,7 +72,8 @@ export async function uploadImage(
     } catch {
         return null;
     }
-    const ext = contentType.toLowerCase().includes('png') ? 'png' : 'jpg';
+    const lowered = contentType.toLowerCase();
+    const ext = lowered.includes('png') ? 'png' : lowered.includes('webp') ? 'webp' : 'jpg';
     const path = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const { error } = await supabase.storage.from(bucket).upload(path, buffer, { contentType, upsert: false });
     if (error) {

@@ -58,12 +58,22 @@ export const CORE_ROLES = {
   cashier: ["9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "2393edd7-cdd9-439c-9ff3-d563d5216967", "fc57d407-4bba-442c-97a2-9e6f3c57f288", "a953d044-31ba-4e31-b96f-99304fe43dfa", "4ad474d4-5230-449c-874f-6a238b833bca"],
   // Waiter: front-of-house — place & approve orders, manage tables, assign booking
   // tables, and VIEW the menu (f4177b38…) so they can actually take orders.
-  waiter: ["4ad474d4-5230-449c-874f-6a238b833bca", "090ea8d4-e348-4e1b-9723-11131a73a085", "c7699d46-0e2f-4448-b325-8ca490a5296b", "b7f78d0f-323d-4622-8d05-aa2f82d54b2e", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610"],
-  captain: ["4ad474d4-5230-449c-874f-6a238b833bca", "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "c7699d46-0e2f-4448-b325-8ca490a5296b", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610"],
+  // "98b10bde…" = View Bill: a waiter could see the floor grid and the global
+  // order list but got 403 on GET /bill-for-table — the only read that returns a
+  // TABLE's running bill (its active orders' items merged, covers, table_total,
+  // APC vs target and the upsell suggestions). Without it the person actually
+  // standing at the table could not answer "what have they ordered / what are
+  // they spending per head", which is exactly the upsell signal. Read-only.
+  waiter: ["4ad474d4-5230-449c-874f-6a238b833bca", "090ea8d4-e348-4e1b-9723-11131a73a085", "c7699d46-0e2f-4448-b325-8ca490a5296b", "b7f78d0f-323d-4622-8d05-aa2f82d54b2e", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610", "98b10bde-802d-4a5b-a726-53a826424f79"],
+  // Captain: same gap, same read-only fix — they could CREATE a bill (9186e53e)
+  // but not read one back. Nothing else about the role changes.
+  // NOTE: barking (3f6a9c1e "Bark Order") is deliberately NOT in the waiter set —
+  // waiters take orders, the pass pushes them to the kitchen. Captains/managers keep it.
+  captain: ["4ad474d4-5230-449c-874f-6a238b833bca", "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "c7699d46-0e2f-4448-b325-8ca490a5296b", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610", "98b10bde-802d-4a5b-a726-53a826424f79", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63"],
   // "2e7b9c40…" = Review Attendance: managers previously reached GET /attendance
   // via an admin/manager role check; now that the attendance endpoints are gated
   // by that granted Action, keep managers' access by granting them the UUID here.
-  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd", "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047"],
+  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd", "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63"],
 };
 
 export enum Audit_log_category {
@@ -204,6 +214,9 @@ interface RestaurantContext {
   restaurant_name: string;
   restaurant_main_office_add: string | null;
   restaurant_logo_url: string | null;
+  /** Tenant IANA zone (default Asia/Kolkata). Accounting days are THIS zone's
+   *  calendar days — reports bucketed by UTC put late covers in the wrong day. */
+  timezone: string;
 
   outlet_id: string;
 }
@@ -331,6 +344,14 @@ interface BookingSummary {
   notes?: string | null;
   deposit?: BookingDeposit | null;
   min_spend?: number | null;
+  // When the reservation was TAKEN (as opposed to booking_date_time, which is
+  // when the guests are due). Accounting needs both — "booked 3 days ahead" vs
+  // "walked up 10 minutes before" are different records.
+  created_at?: string | null;
+  // When the booking row was last CHANGED (status move, table assignment,
+  // deposit transition, edit). Stamped by a DB trigger. NULL on rows untouched
+  // since the column was added — never backfilled.
+  updated_at?: string | null;
 }
 
 interface TableAvailability {
@@ -489,6 +510,14 @@ export interface OrderRecord {
   bill_closed_at?: string | null;
   bill_closed_by?: string | null;
   bill_id?: string | null;
+  // When the order was PLACED. Always present for rows written since the column
+  // existed; the authoritative "when did this happen" instant for tally.
+  created_at?: string | null;
+  // When the order row was last CHANGED (status move, item add/remove/split,
+  // fire, bark, settle). Stamped by a DB trigger so every write path is covered.
+  // NULL on rows that have not been touched since the column was added — never
+  // backfilled, because a fabricated edit time is worse than an absent one.
+  updated_at?: string | null;
 }
 
 export type PaymentMethod =
@@ -514,6 +543,8 @@ export type ApcZone = "red" | "yellow" | "green";
 
 export interface OrderApcInsight {
   order_id: string;
+  /** Bill (seating) this order belongs to; null while the table is still open. */
+  bill_id?: string | null;
   table_name: string;
   created_at: string;
   total: number;
@@ -1479,6 +1510,7 @@ async function resolveRestaurantContext(
       restaurant_name: string;
       restaurant_main_office_add: string | null;
       restaurant_logo_url: string | null;
+      timezone: string | null;
     }>(
       `
         select
@@ -1487,7 +1519,8 @@ async function resolveRestaurantContext(
           r.res_username as restaurant_slug,
           r.res_name as restaurant_name,
           r.main_office_add as restaurant_main_office_add,
-          r.logo as restaurant_logo_url
+          r.logo as restaurant_logo_url,
+          r.timezone as timezone
         from "Restaurant" r
         left join "Outlets" o on o.res_id = r.id
         where
@@ -1511,6 +1544,7 @@ async function resolveRestaurantContext(
         restaurant_name: row.restaurant_name,
         restaurant_main_office_add: row.restaurant_main_office_add,
         restaurant_logo_url: row.restaurant_logo_url,
+        timezone: sanitizeTimezone((row as Record<string, unknown>).timezone),
       };
     }
     // The bound/override outlet didn't resolve for this restaurant (stale or
@@ -1560,6 +1594,7 @@ async function resolveRestaurantContext(
     restaurant_name: row.restaurant_name,
     restaurant_main_office_add: row.restaurant_main_office_add,
     restaurant_logo_url: row.restaurant_logo_url,
+    timezone: sanitizeTimezone((row as Record<string, unknown>).timezone),
   };
 }
 
@@ -1680,7 +1715,31 @@ export async function AddRestaurantUser(
 
     const employeeUuid = payload.employeeId && isUuid(payload.employeeId) ? payload.employeeId : randomUUID();
 
-    const empRoles = JSON.stringify({ primary: toRole(payload.role), all: [toRole(payload.role)] });
+    // A CUSTOM role arrives as a "Roles" uuid, but toRole() only knows the built-in
+    // names and mapped anything else to "employee" — so picking a custom role while
+    // CREATING a user silently dropped it and the person got none of that role's
+    // permissions. (Assigning the same role afterwards via /roles/assign always
+    // worked, which is why some staff have it and newly-created ones don't.)
+    // Store it exactly the way AssignRoleToEmployee does: the uuid in `all`,
+    // alongside the base role that permission resolution starts from.
+    const rawRole = String(payload.role ?? "").trim();
+    let empRolesObj: { primary: string; all: string[] } = {
+      primary: toRole(payload.role),
+      all: [toRole(payload.role)],
+    };
+    if (isUuid(rawRole)) {
+      const customRole = await runQuery<{ id: string }>(
+        `select id from "Roles" where id = $1 and res_id = $2 limit 1`,
+        [rawRole, context.res_id],
+        client,
+      );
+      if (customRole[0]) {
+        empRolesObj = { primary: "employee", all: ["employee", customRole[0].id] };
+      } else {
+        throw new Error("Unknown role");
+      }
+    }
+    const empRoles = JSON.stringify(empRolesObj);
 
     try {
       await runQuery(
@@ -1835,7 +1894,8 @@ export async function AddTable(
   table_name: string,
   capacity?: number,
   max_capacity?: number,
-): Promise<{ _id: string; table_name: string; capacity: number; max_capacity: number }> {
+  section?: string | null,
+): Promise<{ _id: string; table_name: string; capacity: number; max_capacity: number; section: string | null }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   const normalized = table_name.trim();
@@ -1843,6 +1903,7 @@ export async function AddTable(
   // A max below the normal capacity is meaningless, so clamp up rather than
   // reject (the caller is told the stored value in the response).
   const maxCap = Math.max(cap, Math.round(Number(max_capacity ?? cap)) || cap);
+  const zone = normalizeTableSection(section);
 
   const existing = await runQuery<{ id: string; is_deleted: boolean }>(
     `
@@ -1865,41 +1926,44 @@ export async function AddTable(
         update "Tables"
         set is_deleted = false, is_occupied = false, num_covers = 1,
             linked_order_id = null, order_otp = null, table_name = $4, capacity = $5,
-            max_capacity = $6
+            max_capacity = $6, section = $7
         where id = $1 and res_id = $2 and outlet_id = $3
       `,
-      [existing[0].id, context.res_id, context.outlet_id, normalized, cap, maxCap],
+      [existing[0].id, context.res_id, context.outlet_id, normalized, cap, maxCap, zone],
     );
-    return { _id: existing[0].id, table_name: normalized, capacity: cap, max_capacity: maxCap };
+    return { _id: existing[0].id, table_name: normalized, capacity: cap, max_capacity: maxCap, section: zone };
   }
 
   const id = randomUUID();
   await runQuery(
     `
-      insert into "Tables" (id, created_at, res_id, outlet_id, table_name, capacity, max_capacity)
-      values ($1, now(), $2, $3, $4, $5, $6)
+      insert into "Tables" (id, created_at, res_id, outlet_id, table_name, capacity, max_capacity, section)
+      values ($1, now(), $2, $3, $4, $5, $6, $7)
     `,
-    [id, context.res_id, context.outlet_id, normalized, cap, maxCap],
+    [id, context.res_id, context.outlet_id, normalized, cap, maxCap, zone],
   );
 
-  return { _id: id, table_name: normalized, capacity: cap, max_capacity: maxCap };
+  return { _id: id, table_name: normalized, capacity: cap, max_capacity: maxCap, section: zone };
 }
 
-// Edit an existing table's seating numbers. Only the supplied fields change;
-// max_capacity is clamped up to capacity so the pair can never invert.
+// Edit an existing table's seating numbers and/or its floor section. Only the
+// supplied fields change; max_capacity is clamped up to capacity so the pair can
+// never invert. `section` follows the same "absent = leave alone" rule, with an
+// explicit null/'' meaning "move to unassigned" — this single-row update is the
+// whole cost of dragging a table between sections.
 export async function UpdateTable(
   restaurantId: string,
   table_name: string,
-  updates: { capacity?: number | null; max_capacity?: number | null },
-): Promise<{ table_name: string; capacity: number; max_capacity: number } | null> {
+  updates: { capacity?: number | null; max_capacity?: number | null; section?: string | null },
+): Promise<{ table_name: string; capacity: number; max_capacity: number; section: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   const normalized = String(table_name ?? "").trim();
   if (!normalized) {return null;}
 
-  const rows = await runQuery<{ id: string; table_name: string; capacity: unknown; max_capacity: unknown }>(
+  const rows = await runQuery<{ id: string; table_name: string; capacity: unknown; max_capacity: unknown; section: string | null }>(
     `
-      select id, table_name, capacity, max_capacity
+      select id, table_name, capacity, max_capacity, section
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
         and coalesce(is_deleted, false) = false
@@ -1914,22 +1978,156 @@ export async function UpdateTable(
     updates.capacity === undefined || updates.capacity === null
       ? Math.max(1, Math.round(parseNumeric(row.capacity) || 1))
       : Math.max(1, Math.round(Number(updates.capacity)));
+  // A table with no explicit ceiling stores NULL and falls back to `capacity` at
+  // read time. Writing a number here would silently PIN it — and because the
+  // drag-and-drop floor editor PATCHes section only, every drop was stamping
+  // max_capacity onto tables that never had one. Keep NULL as NULL unless the
+  // caller actually sent a value.
+  const storedMaxIsNull = row.max_capacity === null || row.max_capacity === undefined;
   const requestedMax =
     updates.max_capacity === undefined || updates.max_capacity === null
-      ? Math.round(parseNumeric(row.max_capacity))
+      ? (storedMaxIsNull ? null : Math.round(parseNumeric(row.max_capacity)))
       : Math.round(Number(updates.max_capacity));
-  const nextMax = requestedMax >= nextCap ? requestedMax : nextCap;
+  const nextMax = requestedMax === null ? null : (requestedMax >= nextCap ? requestedMax : nextCap);
+  // undefined = field not sent, keep what is stored. null/'' = clear it.
+  const nextSection =
+    updates.section === undefined ? normalizeTableSection(row.section) : normalizeTableSection(updates.section);
 
   await runQuery(
     `
       update "Tables"
-      set capacity = $4, max_capacity = $5
+      set capacity = $4, max_capacity = $5, section = $6
       where id = $1 and res_id = $2 and outlet_id = $3
     `,
-    [row.id, context.res_id, context.outlet_id, nextCap, nextMax],
+    [row.id, context.res_id, context.outlet_id, nextCap, nextMax, nextSection],
   );
 
-  return { table_name: row.table_name, capacity: nextCap, max_capacity: nextMax };
+  // Reads treat a null ceiling as "same as capacity", so report that to callers.
+  return { table_name: row.table_name, capacity: nextCap, max_capacity: nextMax ?? nextCap, section: nextSection };
+}
+
+// --- Floor sections ----------------------------------------------------------
+// A "section" is purely the distinct set of "Tables".section values for this
+// outlet — there is no Sections table, so listing is a group-by, renaming is one
+// UPDATE ... where section = $old, and deleting a section just clears the label
+// off its tables (the tables themselves are never touched otherwise).
+
+export interface TableSectionSummary { section: string; tables: number; seats: number }
+
+/** Every named section for the outlet + how many tables/seats sit in it. */
+export async function GetTableSections(
+  restaurantId: string,
+): Promise<{ sections: TableSectionSummary[]; unassigned: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  const rows = await runQuery<{ section: string | null; tables: number; seats: number }>(
+    `
+      -- Group case-INSENSITIVELY so this matches how rename/delete resolve a
+      -- section (lower(btrim(...))). Grouping case-sensitively split "Patio",
+      -- "patio" and "PATIO" into three rows while a rename of any one of them
+      -- swept all three — the list and the actions disagreed. min() picks a
+      -- stable display spelling.
+      select min(nullif(btrim(coalesce(section, '')), '')) as section,
+             count(*)::int as tables,
+             coalesce(sum(greatest(coalesce(capacity, 1), 1)), 0)::int as seats
+      from "Tables"
+      where res_id = $1 and outlet_id = $2
+        and coalesce(is_deleted, false) = false
+        and coalesce(is_virtual, false) = false
+      group by lower(nullif(btrim(coalesce(section, '')), ''))
+      order by 1 asc nulls first
+    `,
+    [context.res_id, context.outlet_id],
+  );
+  let unassigned = 0;
+  const sections: TableSectionSummary[] = [];
+  for (const r of rows) {
+    if (!r.section) { unassigned += Number(r.tables ?? 0); continue; }
+    sections.push({ section: r.section, tables: Number(r.tables ?? 0), seats: Number(r.seats ?? 0) });
+  }
+  return { sections, unassigned };
+}
+
+/**
+ * Does a section with this name already carry at least one live table?
+ *
+ * This is what separates "MOVE a table into an existing zone" (everyday floor
+ * work) from "CREATE a new zone" (section administration) — both are the same
+ * PATCH /table/:name write, so the route needs to know which one it is before
+ * it picks a permission. Matched exactly the way rename/delete resolve a
+ * section: case-insensitively on the trimmed label.
+ */
+export async function TableSectionExists(restaurantId: string, name: string): Promise<boolean> {
+  const target = normalizeTableSection(name);
+  if (!target) {return false;}
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  const rows = await runQuery<{ one: number }>(
+    `
+      select 1 as one
+      from "Tables"
+      where res_id = $1 and outlet_id = $2
+        and lower(btrim(coalesce(section, ''))) = lower($3)
+        and coalesce(is_deleted, false) = false
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, target],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Rename a section in place. Case-insensitive match on the old name so the
+ * caller can pass what it rendered. Returns how many tables moved; 0 means the
+ * old name held no tables (the caller decides whether that is a 404).
+ */
+export async function RenameTableSection(
+  restaurantId: string,
+  from: string,
+  to: string,
+): Promise<{ section: string; updated: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  const oldName = normalizeTableSection(from);
+  const newName = normalizeTableSection(to);
+  if (!oldName) {throw new Error("Current section name is required");}
+  if (!newName) {throw new Error("New section name is required");}
+  const rows = await runQuery<{ id: string }>(
+    `
+      update "Tables" set section = $4
+      where res_id = $1 and outlet_id = $2
+        and lower(btrim(coalesce(section, ''))) = lower($3)
+        and coalesce(is_deleted, false) = false
+      returning id
+    `,
+    [context.res_id, context.outlet_id, oldName, newName],
+  );
+  return { section: newName, updated: rows.length };
+}
+
+/**
+ * Delete a section = un-label its tables. The tables stay exactly where they
+ * are and simply become "unassigned"; nothing is ever removed from the floor.
+ */
+export async function DeleteTableSection(
+  restaurantId: string,
+  name: string,
+): Promise<{ section: string; updated: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  const target = normalizeTableSection(name);
+  if (!target) {throw new Error("Section name is required");}
+  const rows = await runQuery<{ id: string }>(
+    `
+      update "Tables" set section = null
+      where res_id = $1 and outlet_id = $2
+        and lower(btrim(coalesce(section, ''))) = lower($3)
+        and coalesce(is_deleted, false) = false
+      returning id
+    `,
+    [context.res_id, context.outlet_id, target],
+  );
+  return { section: target, updated: rows.length };
 }
 
 export type RemoveTableResult =
@@ -2076,6 +2274,44 @@ async function ensureTableOccupancyColumns(client?: PoolClient): Promise<void> {
   await ensureTableSessionsTable(client);
   });
   await ensureTableMaxCapacityColumn(client);
+  await ensureTableSectionColumn(client);
+}
+
+// Per-table SECTION (zone) name — "Garden", "AC Hall", "Rooftop". A section is
+// nothing but the set of tables carrying the same name, so moving a table
+// between sections is a one-row update and there is no join table to keep in
+// sync. NULL/'' = unassigned, which is every legacy row. Its own ensure key so
+// it still runs in a process that already ensured the older occupancy columns.
+async function ensureTableSectionColumn(client?: PoolClient): Promise<void> {
+  await ensureLazyTable("Tables.section", async () => {
+    await runQuery(
+      `
+        alter table "Tables"
+        add column if not exists section text
+      `,
+      [],
+      client,
+    );
+    await runQuery(
+      `create index if not exists tables_section_idx on "Tables" (res_id, outlet_id, section)`,
+      [],
+      client,
+    ).catch(() => {/* index is an optimisation; a locked table must not break boot */});
+  });
+}
+
+/** Longest accepted section name — a label, not free storage. */
+const TABLE_SECTION_MAX_LEN = 60;
+
+/**
+ * Normalise a section name for storage. Returns null for "unassigned" (absent,
+ * null or blank) so the column only ever holds a real label, and collapses inner
+ * whitespace so "AC  Hall" and "AC Hall" are the same section.
+ */
+function normalizeTableSection(value: unknown): string | null {
+  if (value === undefined || value === null) {return null;}
+  const cleaned = String(value).replace(/\s+/g, " ").trim().slice(0, TABLE_SECTION_MAX_LEN);
+  return cleaned.length > 0 ? cleaned : null;
 }
 
 // Per-table MAXIMUM cover count (extra chairs squeezed in) as opposed to
@@ -2154,6 +2390,52 @@ async function ensureTableSessionsTable(client?: PoolClient): Promise<void> {
     await runQuery(`drop trigger if exists table_sessions_trg on "Tables"`, [], client);
     await runQuery(`create trigger table_sessions_trg after update on "Tables" for each row execute function table_session_track()`, [], client);
     await applyTenantRls("TableSessions");
+  });
+}
+
+// --- Record timestamps (tally / accounting) ----------------------------------
+// Every money/ops table already carries a creation instant (created_at default
+// now(), or clock_in / opened_at / submitted_at). What was missing is the
+// "when did this record last CHANGE" instant on the two records that mutate in
+// place, and the instant a manual bill discount was applied:
+//
+//   Orders.updated_at    — an order's status walks Pending → Preparing → Served →
+//                          Paid → Closed and its items can be added, split, moved
+//                          or removed, all as UPDATEs of one row. Only the placing
+//                          instant (created_at) was recorded.
+//   Bookings.updated_at  — a booking's status, table and deposit all live inside
+//                          the `slot` text blob and are rewritten in place, so a
+//                          cancellation or a seating left no trace of WHEN.
+//   Bills.discount_applied_at
+//                        — a discount taken through the approval flow is dated by
+//                          DiscountRequests.decided_at, but one applied directly
+//                          (under the approval threshold) only wrote
+//                          discount_type/discount_value, with no instant at all.
+//
+// updated_at is stamped by a BEFORE UPDATE trigger rather than by each write
+// site, for the same reason table_session_track is a trigger: every existing
+// path (POS, KDS, QR, queue seating, settle, undo) and every future one is
+// covered without instrumenting each call. The column is deliberately NOT
+// backfilled — a row untouched since the column appeared reads NULL, which
+// honestly means "no recorded change", where copying created_at would invent an
+// edit that never happened.
+async function ensureRecordTimestampColumns(client?: PoolClient): Promise<void> {
+  await ensureLazyTable("record_timestamps", async () => {
+    await runQuery(`alter table "Orders" add column if not exists updated_at timestamptz`, [], client);
+    await runQuery(`alter table "Bookings" add column if not exists updated_at timestamptz`, [], client);
+    await runQuery(`alter table "Bills" add column if not exists discount_applied_at timestamptz`, [], client);
+    await runQuery(
+      `create or replace function touch_updated_at() returns trigger as $fn$
+       begin
+         new.updated_at := now();
+         return new;
+       end $fn$ language plpgsql`,
+      [], client,
+    );
+    await runQuery(`drop trigger if exists orders_touch_trg on "Orders"`, [], client);
+    await runQuery(`create trigger orders_touch_trg before update on "Orders" for each row execute function touch_updated_at()`, [], client);
+    await runQuery(`drop trigger if exists bookings_touch_trg on "Bookings"`, [], client);
+    await runQuery(`create trigger bookings_touch_trg before update on "Bookings" for each row execute function touch_updated_at()`, [], client);
   });
 }
 
@@ -2604,9 +2886,10 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; taxes: BillTaxLine[]; tax_total: number; grand_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; taxes: BillTaxLine[]; tax_total: number; grand_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
+  await ensureRecordTimestampColumns();
 
   const normalized = table_name.trim();
   if (!normalized) {
@@ -2638,12 +2921,14 @@ export async function GetBillForTable(
     coupon_code: string | null;
     payment_method: string | null;
     payment_proof_screenshot_url: string | null;
+    created_at: Date | null;
     waiter_confirmed_at: Date | null;
     admin_approved_at: Date | null;
+    discount_applied_at: Date | null;
   }>(
     `
       select b.id, b.bill_no, b.coupon_code, b.payment_method, b.payment_proof_screenshot_url,
-             b.waiter_confirmed_at, b.admin_approved_at
+             b.created_at, b.waiter_confirmed_at, b.admin_approved_at, b.discount_applied_at
       from "Bills" b
       where b.table_id = $1 and b.res_id = $2 and b.outlet_id = $3
         and b.status != 3 and b.closed_at is null
@@ -2654,9 +2939,12 @@ export async function GetBillForTable(
   );
 
   // Only ACTIVE orders (not paid/cancelled/closed) belong to the current bill.
-  const orderRows = await runQuery<{ id: string; food: unknown }>(
+  // created_at comes back so the running bill can report when the table's first
+  // and last order landed — the open-bill equivalent of a settled bill's
+  // created_at/closed_at pair.
+  const orderRows = await runQuery<{ id: string; food: unknown; created_at: Date | null }>(
     `
-      select id, food
+      select id, food, created_at
       from "Orders"
       where res_id = $1 and outlet_id = $2 and table_id = $3
         and coalesce(status::text, '1') not in ('4', '5', '7')
@@ -2778,6 +3066,19 @@ export async function GetBillForTable(
     bill_no: bill?.bill_no ?? null,
     customer: billCustomer || null,
     coupon_code: bill?.coupon_code ?? null,
+    // When each step of the OPEN bill happened. All UTC instants; the caller
+    // renders them in the restaurant's timezone (GET /restaurant/settings).
+    // Null until the bill row exists / that step is reached.
+    bill_created_at: bill?.created_at ? new Date(bill.created_at).toISOString() : null,
+    waiter_confirmed_at: bill?.waiter_confirmed_at ? new Date(bill.waiter_confirmed_at).toISOString() : null,
+    admin_approved_at: bill?.admin_approved_at ? new Date(bill.admin_approved_at).toISOString() : null,
+    discount_applied_at: bill?.discount_applied_at ? new Date(bill.discount_applied_at).toISOString() : null,
+    // The span the running bill covers: orderRows is already ordered by
+    // created_at asc, so first/last are its ends.
+    first_order_at: orderRows[0]?.created_at ? new Date(orderRows[0].created_at as Date).toISOString() : null,
+    last_order_at: orderRows.length > 0 && orderRows[orderRows.length - 1].created_at
+      ? new Date(orderRows[orderRows.length - 1].created_at as Date).toISOString()
+      : null,
   };
 }
 
@@ -2995,7 +3296,7 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; order_otp?: string | null }[] | null> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
@@ -3007,12 +3308,13 @@ export async function GetTables(
     table_name: string;
     capacity: unknown;
     max_capacity: unknown;
+    section: string | null;
     is_occupied: boolean;
     num_covers: unknown;
     order_otp: string | null;
   }>(
     `
-      select id, table_name, capacity, max_capacity,
+      select id, table_name, capacity, max_capacity, section,
              coalesce(is_occupied, false) as is_occupied,
              coalesce(num_covers, 1) as num_covers,
              order_otp
@@ -3137,6 +3439,9 @@ export async function GetTables(
       capacity: parseNumeric(row.capacity),
       // The most this table can seat with extra chairs (falls back to capacity).
       max_capacity: effectiveMaxCapacity(row.capacity, row.max_capacity),
+      // Floor section/zone this table sits in; null = unassigned. Clients group
+      // the grid by this and PATCH /table/:name to drag a table to another one.
+      section: normalizeTableSection(row.section),
       booked: bookedTables.has(row.id),
       reserved: reservedTables.has(row.id),
       occupied,
@@ -3148,9 +3453,14 @@ export async function GetTables(
       apc_status: occupied && tTotal > 0 ? apcColor(tApc, target) : "neutral",
       qr_sig: signTable(context.res_id, row.table_name),
       qr_token: encodeTableToken(context.res_id, row.table_name),
-      // Per-table ordering OTP (only meaningful while require_table_otp is ON) —
-      // staff read this off the floor grid to tell the seated guest.
-      order_otp: row.order_otp ?? null,
+      // Whether the restaurant's per-table OTP gate is ON. Clients KEY ON THIS to
+      // decide whether to render an OTP column/chip at all.
+      otp_required: requireOtp,
+      // Per-table ordering OTP — staff read this off the floor grid to tell the
+      // seated guest. NULL whenever the gate is OFF: a disabled OTP must not be
+      // shown anywhere, and a stale code left on a row from a previous ON period
+      // must not leak back into the UI when the toggle is flipped off.
+      order_otp: requireOtp ? (row.order_otp ?? null) : null,
     };
   });
 }
@@ -3468,12 +3778,14 @@ export async function GetBookingsAfterTime(
 
   const context = await requireRestaurantContext(restaurantId);
   const og = isAllOutlets() ? "true" : "false";
+  await ensureRecordTimestampColumns();
   const rows = await runQuery<{
     booking_id: string;
     customer_id: string;
     table_name: string | null;
     slot: string;
     created_at: Date;
+    updated_at: Date | null;
     num_adults: unknown;
     cust_fname: string;
     cust_lname: string;
@@ -3485,6 +3797,7 @@ export async function GetBookingsAfterTime(
         t.table_name as table_name,
         b.slot,
         b.created_at,
+        b.updated_at,
         b.num_adults,
         c."cust_Fname" as cust_fname,
         c."cust_Lname" as cust_lname
@@ -3536,6 +3849,8 @@ export async function GetBookingsAfterTime(
       notes: slot.notes ?? null,
       deposit: slot.deposit ?? null,
       min_spend: slot.min_spend ?? null,
+      created_at: row.created_at ? new Date(row.created_at).toISOString() : null,
+      updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
     };
     (end <= at ? past : upcoming).push(summary);
   }
@@ -3561,12 +3876,14 @@ export async function GetBookingSummaryById(
   booking_id: string,
 ): Promise<BookingSummary | null> {
   const context = await requireRestaurantContext(restaurantId);
+  await ensureRecordTimestampColumns();
   const rows = await runQuery<{
     booking_id: string;
     customer_id: string;
     table_name: string | null;
     slot: string;
     created_at: Date;
+    updated_at: Date | null;
     num_adults: unknown;
     cust_fname: string;
     cust_lname: string;
@@ -3578,6 +3895,7 @@ export async function GetBookingSummaryById(
         t.table_name as table_name,
         b.slot,
         b.created_at,
+        b.updated_at,
         b.num_adults,
         c."cust_Fname" as cust_fname,
         c."cust_Lname" as cust_lname
@@ -3610,6 +3928,8 @@ export async function GetBookingSummaryById(
     notes: slot.notes ?? null,
     deposit: slot.deposit ?? null,
     min_spend: slot.min_spend ?? null,
+    created_at: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
   };
 }
 
@@ -4584,10 +4904,12 @@ async function ensureValetOpsColumns(): Promise<void> {
     await runQuery(`alter table "Valet_vehicle_state" add column if not exists condition_photo_url text`);
     await runQuery(`alter table "Valet_vehicle_state" add column if not exists eta_minutes int`);
     await runQuery(
-      `insert into "Actions" (id, action_name, action_desc)
-       values ('4a7d1c9e-5b3f-4e8a-a6d2-0c9f7b3e5a18', 'Valet Key Log', 'Record which attendant holds a valet vehicle''s keys'),
-              ('8e4b2d6f-3a1c-4f7e-9b05-d2c6a8e0f413', 'Valet Ops Update', 'Update valet parking location / condition notes / retrieval ETA'),
-              ('6c2e8a4d-7f1b-4d9c-8e35-b0a4d6c2f791', 'Valet Charge to Bill', 'Post a valet parking fee onto a table''s open bill')
+      // "Actions"."group" DEFAULTS to 'Test', so every seed must name its group
+      // explicitly or the action lands in a junk category in the role editors.
+      `insert into "Actions" (id, action_name, action_desc, "group")
+       values ('4a7d1c9e-5b3f-4e8a-a6d2-0c9f7b3e5a18', 'Valet Key Log', 'Record which attendant holds a valet vehicle''s keys', 'Valet'::"Action_groups"),
+              ('8e4b2d6f-3a1c-4f7e-9b05-d2c6a8e0f413', 'Valet Ops Update', 'Update valet parking location / condition notes / retrieval ETA', 'Valet'::"Action_groups"),
+              ('6c2e8a4d-7f1b-4d9c-8e35-b0a4d6c2f791', 'Valet Charge to Bill', 'Post a valet parking fee onto a table''s open bill', 'Valet'::"Action_groups")
        on conflict (id) do nothing`,
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
   });
@@ -4906,6 +5228,38 @@ export async function AddAuditLogEntry(
 //   });
 // }
 
+/**
+ * Indexes the paged audit read depends on. "Audit_logs" shipped with no index at
+ * all beyond its primary key, so every page was a full scan + sort of the whole
+ * tenant's history — fine at a few hundred rows, quadratic pain once a busy
+ * restaurant scrolls. Created once per process (and idempotently), matching the
+ * ensure* pattern used for every other lazily-added object here.
+ */
+async function ensureAuditLogIndexes(client?: PoolClient): Promise<void> {
+  await ensureLazyTable("Audit_logs.paging_idx", async () => {
+    // Exactly the list's ORDER BY, so a page is an index scan with no sort.
+    await runQuery(
+      `create index if not exists audit_logs_tenant_paging_idx
+         on "Audit_logs" (res_id, outlet_id, created_at desc, id desc)`,
+      [], client,
+    );
+    // Category is the one filter that is not a range, and it is the default chip
+    // in the UI, so give it its own leading-column index.
+    await runQuery(
+      `create index if not exists audit_logs_tenant_category_idx
+         on "Audit_logs" (res_id, outlet_id, category, created_at desc)`,
+      [], client,
+    );
+    // The per-row "already undone?" lateral looks up additional_details->>'undo_of'.
+    await runQuery(
+      `create index if not exists audit_logs_undo_of_idx
+         on "Audit_logs" ((additional_details ->> 'undo_of'))
+       where additional_details ->> 'undo_of' is not null`,
+      [], client,
+    );
+  });
+}
+
 export interface AuditLogFilter {
   limit?: number;
   offset?: number;
@@ -4915,11 +5269,31 @@ export interface AuditLogFilter {
   to?: string;   // ISO upper bound (inclusive)
 }
 
+export interface AuditLogPage {
+  logs: AuditLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+
+/**
+ * One PAGE of audit entries plus the total matching the same filters, so an
+ * infinite-scroll client knows when to stop.
+ *
+ * ORDERING IS A TOTAL ORDER: (created_at desc, id desc). created_at alone is not
+ * unique — a single request can write several entries in the same millisecond —
+ * and Postgres is free to return equal keys in any order per query, so a
+ * created_at-only sort could hand the same row to two consecutive pages (or skip
+ * one entirely) as the client scrolled. The id tiebreak makes the sequence
+ * deterministic across requests.
+ */
 export async function GetAuditLogs(
   restaurantId: string,
   opts: AuditLogFilter = {},
-): Promise<AuditLogEntry[]> {
+): Promise<AuditLogPage> {
   const context = await requireRestaurantContext(restaurantId);
+  await ensureAuditLogIndexes();
   const safeLimit = Math.max(1, Math.min(opts.limit ?? 100, 500));
   const safeOffset = Math.max(0, Math.round(opts.offset ?? 0));
 
@@ -4935,6 +5309,23 @@ export async function GetAuditLogs(
     const p = `$${params.length}`;
     where.push(`(l.reason ILIKE ${p} OR a.action_name ILIKE ${p} OR e."emp_Fname" ILIKE ${p} OR lg.emp_username ILIKE ${p})`);
   }
+
+  // Total for the SAME filters (no limit/offset), so the client can stop scrolling.
+  // Same joins as the page query because `search` matches on the joined tables;
+  // the undo lateral is deliberately omitted — it does not affect the row count.
+  const countRows = await runQuery<{ total: string }>(
+    `
+      select count(*)::text as total
+      from "Audit_logs" l
+      join "Actions" a on a.id = l.action_id
+      left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
+      where ${where.join(" and ")}
+    `,
+    params,
+  );
+  const total = Math.max(0, Math.round(Number(countRows[0]?.total ?? 0)));
+
   params.push(safeLimit); const limIdx = `$${params.length}`;
   params.push(safeOffset); const offIdx = `$${params.length}`;
 
@@ -4979,7 +5370,9 @@ export async function GetAuditLogs(
         limit 1
       ) u on true
       where ${where.join(" and ")}
-      order by l.created_at desc
+      -- Total order (see the doc comment): created_at alone is not unique, so the
+      -- id tiebreak is what stops infinite scroll duplicating or skipping rows.
+      order by l.created_at desc, l.id desc
       limit ${limIdx} offset ${offIdx}
     `,
     params,
@@ -5012,7 +5405,7 @@ export async function GetAuditLogs(
       undo_of: typeof details?.undo_of === "string" ? details.undo_of : null,
     });
   }
-  return out;
+  return { logs: out, total, limit: safeLimit, offset: safeOffset, has_more: safeOffset + out.length < total };
 }
 
 // ========================== Audit-log undo ==================================
@@ -6365,8 +6758,8 @@ export const ISSUE_STOCK_ACTION_ID = "9c4b7d2e-6f18-4a53-b0e9-1d7a3c58f246";
 async function ensureIssueStockAction(): Promise<void> {
   await ensureLazyTable("Actions.issue_stock", async () => {
     await runQuery(
-      `insert into "Actions" (id, action_name, action_desc)
-       values ($1, 'Issue Stock', 'Ingredient issued from store to kitchen')
+      `insert into "Actions" (id, action_name, action_desc, "group")
+       values ($1, 'Issue Stock', 'Ingredient issued from store to kitchen', 'Inventory'::"Action_groups")
        on conflict (id) do nothing`,
       [ISSUE_STOCK_ACTION_ID],
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
@@ -6402,7 +6795,12 @@ export async function ensureFeaturePermissionActions(): Promise<void> {
          ('8c3f5b21-0e74-4a96-b2d8-6f1a9c4e7b53', 'Delete Orders', 'Permanently delete an order (separate from placing or editing orders)', 'Orders'::"Action_groups"),
          ('3d9e7a05-6c18-4f2b-9a41-8b5d0e3c6f72', 'Delete Menu Categories', 'Delete a menu category and its grouping', 'Menu'::"Action_groups"),
          ('7b2c9d48-3a51-4e07-8d6f-1c4e5a9b0837', 'Bulk Replace Menu', 'Replace the ENTIRE menu in one save — destructive; a partial payload removes items', 'Menu'::"Action_groups"),
-         ('5e8a1f36-9b47-42c0-a7e5-0d3b6c8f4291', 'Resolve Feedback Recovery', 'Mark a guest-recovery case resolved (a write, not a view)', 'Feedback Questions'::"Action_groups")
+         ('5e8a1f36-9b47-42c0-a7e5-0d3b6c8f4291', 'Resolve Feedback Recovery', 'Mark a guest-recovery case resolved (a write, not a view)', 'Feedback Questions'::"Action_groups"),
+         -- Section ADMIN (create a brand-new zone, rename one, un-label one) was
+         -- riding on 'Table Added'. Moving a table BETWEEN existing sections is
+         -- everyday floor work and deliberately stays on 'Table Added' — see
+         -- PERM_TABLE_SECTIONS in index.ts.
+         ('2f7c5a94-8e13-4b60-9d27-6a0f3c8e5b41', 'Manage Table Sections', 'Create, rename and remove floor sections (zones). Moving a table into an EXISTING section stays under Table Added.', 'Tables'::"Action_groups")
        on conflict (id) do nothing`,
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
   });
@@ -6549,7 +6947,7 @@ export interface StockMovementRow { id: string; inventory_id: string; item_name:
 export async function GetStockMovements(restaurantId: string, fromIso?: string, toIso?: string): Promise<StockMovementRow[]> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureStockMovementsTable();
-  const range = normalizeReportRange(fromIso, toIso);
+  const range = normalizeReportRange(fromIso, toIso, context.timezone);
   const rows = await runQuery<{ id: string; inventory_id: string; item_name: string | null; delta: number | string; kind: string; reason: string | null; vendor_id: string | null; unit_cost: number | string | null; created_at: Date }>(
     `select id, inventory_id, item_name, delta, kind, reason, vendor_id, unit_cost, created_at
        from "StockMovements"
@@ -6698,7 +7096,7 @@ export async function CreatePurchaseOrder(
 export async function GetPurchaseOrders(restaurantId: string, opts?: { status?: string; from?: string; to?: string }): Promise<PurchaseOrderRecord[]> {
   const context = await requireRestaurantContext(restaurantId);
   await ensurePurchaseOrdersTable();
-  const range = normalizeReportRange(opts?.from, opts?.to);
+  const range = normalizeReportRange(opts?.from, opts?.to, context.timezone);
   const params: unknown[] = [context.res_id, context.outlet_id, range.fromDate, range.toDate];
   let statusClause = "";
   if (opts?.status && ["draft", "ordered", "received", "cancelled"].includes(opts.status)) {
@@ -7627,6 +8025,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
   await ensureBillWorkflowColumns();
   await ensureOrderTimingColumn();
   await ensureOrderBarkColumns();
+  await ensureRecordTimestampColumns();
   const rows = await runQuery<{
     id: string;
     food: unknown;
@@ -7634,6 +8033,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
     timing: unknown;
     barked_at: Date | string | null;
     created_at: Date | string | null;
+    updated_at: Date | string | null;
     table_name: string | null;
     bill_id: string | null;
     bill_status: number | null;
@@ -7654,6 +8054,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
         o.timing,
         o.barked_at,
         o.created_at,
+        o.updated_at,
         t.table_name,
         b.bill_id,
         b.status as bill_status,
@@ -7830,6 +8231,9 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       // owner app's comparator called most pairs "equal" and Dart's unstable
       // sort scrambled the order (an old cancelled ticket floated to the top).
       created_at: row.created_at ? new Date(row.created_at).toISOString() : null,
+      // When the row last CHANGED (status move, item edit, settle). NULL means
+      // "never touched since the column existed" — see ensureRecordTimestampColumns.
+      updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
     };
 
     // include flattened and split representations if available
@@ -8107,10 +8511,25 @@ async function applyTimingForStatus(context: RestaurantContext, orderId: string,
 }
 
 // Pause/resume an order or a single item; mark an item served.
+/**
+ * Has this item's prep timer been stopped (i.e. the tick was already pressed)?
+ * Lets the serve endpoint behave as a toggle so a mis-tapped tick can be undone.
+ */
+export async function IsOrderItemServed(
+  restaurantId: string,
+  orderId: string,
+  itemId: string,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  const timing = await loadOrderTiming(context, orderId);
+  const t = timing?.items?.[itemId];
+  return Boolean(t && t.ended_at);
+}
+
 export async function OrderTimingAction(
   restaurantId: string,
   orderId: string,
-  action: "pause" | "resume" | "serve" | "start",
+  action: "pause" | "resume" | "serve" | "start" | "unserve",
   itemId?: string,
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
@@ -8119,6 +8538,22 @@ export async function OrderTimingAction(
   await assertOrderStatusEditable(context, orderId);
   // Nothing is cooking before the bark — serve/start would fake prep times.
   if (action === "serve" || action === "start") {await assertOrderBarked(context, orderId);}
+  // Un-serving is a correction for a mis-tapped tick. It is only available while
+  // the ORDER as a whole is still in progress: once the whole order has been
+  // marked Served, individual items can no longer be walked back.
+  if (action === "unserve") {
+    const statusRows = await runQuery<{ status: unknown }>(
+      `select status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [orderId, context.res_id, context.outlet_id],
+    );
+    if (!statusRows[0]) {return false;}
+    const current = String(fromOrderStatusCode(statusRows[0].status) ?? "").toLowerCase();
+    if (current !== "preparing" && current !== "pending") {
+      throw new Error(
+        "This order is already marked served — individual items can no longer be un-served.",
+      );
+    }
+  }
   const timing = await loadOrderTiming(context, orderId);
   if (!timing) {return false;}
   let target: OrderTimer;
@@ -8133,6 +8568,13 @@ export async function OrderTimingAction(
     case "resume": resumeTimer(target); break;
     case "start": startTimer(target); break;
     case "serve": startTimer(target); endTimer(target); break;
+    // Undo a serve: clear the end stamp and let the timer run again, so prep
+    // time stays honest rather than frozen at the moment of the mis-tap.
+    case "unserve": {
+      target.ended_at = null;
+      resumeTimer(target);
+      break;
+    }
     default: return false;
   }
   await saveOrderTiming(context, orderId, timing);
@@ -8190,13 +8632,34 @@ export interface KitchenSectionStat {
   p90_prep_ms: number;
   slowest_dish: { name: string; avg_prep_ms: number } | null;
 }
+// Item-wise prep time GROUPED BY KITCHEN SECTION: the same per-dish numbers as
+// by_dish, but nested under the station that cooks them so a UI can render
+// "section -> items" directly instead of re-grouping by_dish client-side (which
+// it cannot do faithfully anyway — by_dish is capped at the 40 slowest overall,
+// so a fast section could come back empty).
+export interface KitchenSectionItems {
+  section: string;
+  /** Timed items across the whole section (same number as by_section.items_timed). */
+  items_timed: number;
+  avg_prep_ms: number;
+  p90_prep_ms: number;
+  max_prep_ms: number;
+  /** How many distinct dishes the section timed, before `dishes` is capped. */
+  dishes_total: number;
+  /** The section's dishes, slowest average first, capped at 25. */
+  dishes: KitchenDishStat[];
+}
 export interface KitchenAnalytics {
   order_summary: { orders_timed: number; avg_prep_ms: number; median_prep_ms: number; p90_prep_ms: number; avg_bark_to_served_ms: number; max_prep_ms: number };
   by_dish: KitchenDishStat[];
   by_section: KitchenSectionStat[];
+  by_section_items: KitchenSectionItems[];
   period_days: number;
   generated_at: string;
 }
+
+/** Dishes listed per section in `by_section_items` — bounds the payload. */
+const KITCHEN_DISHES_PER_SECTION = 25;
 
 // Abandoned-ticket ceiling: an order/item barked but never properly served or
 // closed leaves its prep timer running for hours or days. Those are not real
@@ -8204,6 +8667,235 @@ export interface KitchenAnalytics {
 // this is treated as abandoned and excluded. Real kitchen prep is minutes; 3h is
 // a generous cutoff that only drops clearly-broken tickets.
 const KITCHEN_PREP_CEILING_MS = 3 * 60 * 60 * 1000;
+
+/** One consolidated read for the Overview tab: the numbers an owner wants at a
+ *  glance. Deliberately COMPOSED from the same helpers the detailed panels use
+ *  (menu insights, kitchen, operations, advanced) so an Overview figure can
+ *  never disagree with the screen it drills into. Read-only. */
+export interface OverviewMetric {
+  value: number;
+  previous: number;
+  /** null when there is no baseline — a change against zero is not a percentage. */
+  pct_change: number | null;
+  direction: "up" | "down" | "flat";
+  compared_to: string;
+}
+
+export interface OverviewInsights {
+  window_days: number;
+  timezone: string;
+  generated_at: string;
+  headline: {
+    revenue: OverviewMetric;
+    bills: OverviewMetric;
+    covers: OverviewMetric;
+    apc: OverviewMetric;
+    today_revenue: number;
+    yesterday_revenue: number;
+  };
+  top_dishes_by_revenue: { name: string; category: string; quantity: number; revenue: number; share_pct: number }[];
+  top_dishes_by_quantity: { name: string; category: string; quantity: number; revenue: number; share_pct: number }[];
+  slow_movers: { name: string; category: string; quantity: number; current_price: number }[];
+  top_staff: { employee_id: string; employee_name: string; orders: number; revenue: number; avg_rating: number | null; hours_worked: number | null; ranked_by: string }[];
+  kitchen: { avg_prep_ms: number; p90_prep_ms: number; slowest_section: string | null; slowest_section_avg_ms: number; slowest_dish: string | null; slowest_dish_avg_ms: number; orders_timed: number };
+  peak: { hour: number | null; hour_orders: number; hour_revenue: number; weekday: string | null; weekday_orders: number; weekday_revenue: number };
+  needs_attention: { key: string; label: string; count: number; severity: "high" | "medium" | "low"; module: string }[];
+}
+
+function overviewMetric(value: number, previous: number, windowDays: number): OverviewMetric {
+  const v = round2(Number.isFinite(value) ? value : 0);
+  const p = round2(Number.isFinite(previous) ? previous : 0);
+  return {
+    value: v,
+    previous: p,
+    pct_change: p > 0 ? round2(((v - p) / p) * 100) : null,
+    direction: v > p ? "up" : v < p ? "down" : "flat",
+    compared_to: `previous ${windowDays} days`,
+  };
+}
+
+export async function GetOverviewInsights(restaurantId: string, days = 30): Promise<OverviewInsights> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tz = context.timezone;
+  const window = Math.min(365, Math.max(1, Math.round(days) || 30));
+
+  // Composed reads — each is already outlet-scoped and already excludes
+  // cancelled orders wherever it counts sales.
+  const [menu, kitchen, ops, advanced] = await Promise.all([
+    GetMenuPerformanceInsights(restaurantId, window).catch(() => null),
+    GetKitchenAnalytics(restaurantId, window).catch(() => null),
+    GetOperationsAnalytics(restaurantId, window).catch(() => null),
+    GetAdvancedAnalytics(restaurantId, { days: window }).catch(() => null),
+  ]);
+
+  // Headline: this window vs the one immediately before it, measured in the
+  // restaurant's OWN days (bucketing by UTC put late covers in the wrong day).
+  const todayKey = dayKeyOf(new Date(), tz);
+  const curRange = dayRangeOf(todayKey, tz);
+  const curFromIso = dayRangeOf(addDaysToKey(todayKey, -(window - 1)), tz).fromIso;
+  const prevFromIso = dayRangeOf(addDaysToKey(todayKey, -(window * 2 - 1)), tz).fromIso;
+
+  // Covers are NOT on "Bills" — they live on "TableSessions" (one row per seating,
+  // covers counted once per table). Joining on the table + the session that was
+  // open when the bill was created is how the rest of the APC math sources them.
+  // NB: no silent catch here. An earlier version swallowed a bad-column error and
+  // silently reported a revenue of ZERO, which is far worse than a 500.
+  const sums = await runQuery<{ revenue: string; bills: string; covers: string; bucket: string }>(
+    `
+      select
+        coalesce(sum(b.total_amt), 0)::text as revenue,
+        count(*)::text as bills,
+        coalesce(sum(coalesce(ts.covers, 0)), 0)::text as covers,
+        case when b.created_at >= $3 then 'cur' else 'prev' end as bucket
+      from "Bills" b
+      left join lateral (
+        select ts.covers
+        from "TableSessions" ts
+        where ts.res_id = b.res_id and ts.outlet_id = b.outlet_id and ts.table_id = b.table_id
+          and ts.seated_at <= b.created_at
+        order by ts.seated_at desc
+        limit 1
+      ) ts on true
+      where b.res_id = $1 and b.outlet_id = $2
+        and b.created_at >= $4 and b.created_at < $5
+      group by 4
+    `,
+    [context.res_id, context.outlet_id, curFromIso, prevFromIso, curRange.toIso],
+  );
+  const bucket = (b: string) => sums.find((r) => r.bucket === b);
+  const cur = bucket("cur");
+  const prev = bucket("prev");
+  const curRev = parseNumeric(cur?.revenue);
+  const prevRev = parseNumeric(prev?.revenue);
+  const curBills = parseNumeric(cur?.bills);
+  const prevBills = parseNumeric(prev?.bills);
+  const curCovers = parseNumeric(cur?.covers);
+  const prevCovers = parseNumeric(prev?.covers);
+
+  const dayRevenue = async (key: string): Promise<number> => {
+    const r = dayRangeOf(key, tz);
+    const rows = await runQuery<{ v: string }>(
+      `select coalesce(sum(total_amt), 0)::text as v from "Bills"
+         where res_id = $1 and outlet_id = $2 and created_at >= $3 and created_at < $4`,
+      [context.res_id, context.outlet_id, r.fromIso, r.toIso],
+    ).catch(() => [] as { v: string }[]);
+    return round2(parseNumeric(rows[0]?.v));
+  };
+
+  // Dishes — shares are of the dishes actually counted, so they sum sensibly.
+  const dishes = menu?.top_dishes ?? [];
+  const totalRev = dishes.reduce((a, d) => a + parseNumeric(d.revenue), 0);
+  const totalQty = dishes.reduce((a, d) => a + parseNumeric(d.quantity), 0);
+  const shape = (list: typeof dishes, basis: "revenue" | "quantity") =>
+    list.slice(0, 5).map((d) => ({
+      name: String(d.name ?? ""),
+      category: String(d.category ?? ""),
+      quantity: Math.round(parseNumeric(d.quantity)),
+      revenue: round2(parseNumeric(d.revenue)),
+      share_pct: basis === "revenue"
+        ? (totalRev > 0 ? round2((parseNumeric(d.revenue) / totalRev) * 100) : 0)
+        : (totalQty > 0 ? round2((parseNumeric(d.quantity) / totalQty) * 100) : 0),
+    }));
+
+  // Staff — revenue/orders come from the same source the Staff view uses;
+  // rating and hours are attached only where they are genuinely measured.
+  const ratingByName = new Map<string, number>();
+  for (const s of (advanced?.staff ?? []) as { name?: unknown; avg_rating?: unknown }[]) {
+    const n = String(s?.name ?? "").trim().toLowerCase();
+    if (n) { ratingByName.set(n, round2(parseNumeric(s?.avg_rating))); }
+  }
+  const hoursById = new Map<string, number>();
+  for (const a of (advanced?.staff_attendance ?? []) as { employee_id?: unknown; hours_worked?: unknown }[]) {
+    const id = String(a?.employee_id ?? "");
+    if (id) { hoursById.set(id, round2(parseNumeric(a?.hours_worked))); }
+  }
+
+  const secs = [...(kitchen?.by_section ?? [])].sort((a, b) => parseNumeric(b.avg_prep_ms) - parseNumeric(a.avg_prep_ms));
+  const dsh = [...(kitchen?.by_dish ?? [])].sort((a, b) => parseNumeric(b.avg_prep_ms) - parseNumeric(a.avg_prep_ms));
+  const hours = [...(ops?.by_hour ?? [])].sort((a, b) => parseNumeric(b.orders) - parseNumeric(a.orders));
+  const wdays = [...(ops?.by_weekday ?? [])].sort((a, b) => parseNumeric(b.orders) - parseNumeric(a.orders));
+  const peakHour = hours.find((h) => parseNumeric(h.orders) > 0) ?? null;
+  const peakDay = wdays.find((d) => parseNumeric(d.orders) > 0) ?? null;
+
+  // Needs attention — only things a person can actually act on today.
+  const attention: OverviewInsights["needs_attention"] = [];
+  const countOf = async (sql: string): Promise<number> => {
+    const rows = await runQuery<{ n: string }>(sql, [context.res_id, context.outlet_id]).catch(() => [] as { n: string }[]);
+    return Math.round(parseNumeric(rows[0]?.n));
+  };
+
+  const lowStock = ((advanced?.stock_alerts ?? []) as unknown[]).length;
+  if (lowStock > 0) { attention.push({ key: "low_stock", label: "Ingredients low on stock", count: lowStock, severity: "high", module: "Inventory" }); }
+
+  const pendingDiscounts = await countOf(
+    `select count(*)::text as n from "DiscountRequests" where res_id = $1 and outlet_id = $2 and decided_at is null`,
+  );
+  if (pendingDiscounts > 0) { attention.push({ key: "pending_discounts", label: "Discount requests awaiting approval", count: pendingDiscounts, severity: "high", module: "Bills" }); }
+
+  const staleBills = await countOf(
+    `select count(*)::text as n from "Bills" where res_id = $1 and outlet_id = $2 and closed_at is null and created_at < now() - interval '1 day'`,
+  );
+  if (staleBills > 0) { attention.push({ key: "unsettled_bills", label: "Bills left open more than a day", count: staleBills, severity: "medium", module: "Accounting" }); }
+
+  const zeroSellers = (menu?.slow_movers ?? []).filter((d) => parseNumeric(d.quantity) === 0).length;
+  if (zeroSellers > 0) { attention.push({ key: "slow_movers", label: "Dishes that sold nothing this period", count: zeroSellers, severity: "low", module: "Menu" }); }
+
+  return {
+    window_days: window,
+    timezone: tz,
+    generated_at: new Date().toISOString(),
+    headline: {
+      revenue: overviewMetric(curRev, prevRev, window),
+      bills: overviewMetric(curBills, prevBills, window),
+      covers: overviewMetric(curCovers, prevCovers, window),
+      apc: overviewMetric(curCovers > 0 ? curRev / curCovers : 0, prevCovers > 0 ? prevRev / prevCovers : 0, window),
+      today_revenue: await dayRevenue(todayKey),
+      yesterday_revenue: await dayRevenue(addDaysToKey(todayKey, -1)),
+    },
+    top_dishes_by_revenue: shape([...dishes].sort((a, b) => parseNumeric(b.revenue) - parseNumeric(a.revenue)), "revenue"),
+    top_dishes_by_quantity: shape([...dishes].sort((a, b) => parseNumeric(b.quantity) - parseNumeric(a.quantity)), "quantity"),
+    slow_movers: (menu?.slow_movers ?? []).slice(0, 5).map((d) => ({
+      name: String(d.name ?? ""),
+      category: String(d.category ?? ""),
+      quantity: Math.round(parseNumeric(d.quantity)),
+      current_price: round2(parseNumeric(d.current_price)),
+    })),
+    top_staff: (menu?.top_waiters ?? []).slice(0, 5).map((w) => {
+      const name = String(w.employee_name ?? "").trim();
+      const rating = ratingByName.get(name.toLowerCase());
+      const hrs = hoursById.get(String(w.employee_id ?? ""));
+      return {
+        employee_id: String(w.employee_id ?? ""),
+        employee_name: name,
+        orders: Math.round(parseNumeric(w.orders)),
+        revenue: round2(parseNumeric(w.revenue)),
+        avg_rating: rating === undefined ? null : rating,
+        hours_worked: hrs === undefined ? null : hrs,
+        // Name the signal explicitly — an unlabelled "best" invites the owner to
+        // assume it weighs things we do not actually measure.
+        ranked_by: "revenue attributed to orders they took",
+      };
+    }),
+    kitchen: {
+      avg_prep_ms: Math.round(parseNumeric(kitchen?.order_summary?.avg_prep_ms)),
+      p90_prep_ms: Math.round(parseNumeric(kitchen?.order_summary?.p90_prep_ms)),
+      slowest_section: secs[0] ? String(secs[0].section) : null,
+      slowest_section_avg_ms: Math.round(parseNumeric(secs[0]?.avg_prep_ms)),
+      slowest_dish: dsh[0] ? String(dsh[0].name) : null,
+      slowest_dish_avg_ms: Math.round(parseNumeric(dsh[0]?.avg_prep_ms)),
+      orders_timed: Math.round(parseNumeric(kitchen?.order_summary?.orders_timed)),
+    },
+    peak: {
+      hour: peakHour ? Math.round(parseNumeric(peakHour.hour)) : null,
+      hour_orders: Math.round(parseNumeric(peakHour?.orders)),
+      hour_revenue: round2(parseNumeric(peakHour?.revenue)),
+      weekday: peakDay ? String((peakDay as { label?: unknown }).label ?? "") : null,
+      weekday_orders: Math.round(parseNumeric(peakDay?.orders)),
+      weekday_revenue: round2(parseNumeric(peakDay?.revenue)),
+    },
+    needs_attention: attention,
+  };
+}
 
 export async function GetKitchenAnalytics(restaurantId: string, days = 30): Promise<KitchenAnalytics> {
   const context = await requireRestaurantContext(restaurantId);
@@ -8355,6 +9047,30 @@ export async function GetKitchenAnalytics(restaurantId: string, days = 30): Prom
     }))
     .sort((a, b) => b.avg_prep_ms - a.avg_prep_ms);
 
+  // Item-wise prep time PER SECTION. Built off the full dishStats set (not the
+  // capped by_dish) so every section lists its own dishes, and ordered the same
+  // way as by_section so the two views line up row-for-row.
+  const dishesBySection = new Map<string, KitchenDishStat[]>();
+  for (const { section_key, ...d } of dishStats) {
+    const bucket = dishesBySection.get(section_key) ?? [];
+    bucket.push(d);
+    dishesBySection.set(section_key, bucket);
+  }
+  const by_section_items: KitchenSectionItems[] = by_section.map((s) => {
+    const dishes = dishesBySection.get(s.section) ?? [];
+    return {
+      section: s.section,
+      items_timed: s.items_timed,
+      avg_prep_ms: s.avg_prep_ms,
+      p90_prep_ms: s.p90_prep_ms,
+      max_prep_ms: s.max_prep_ms,
+      dishes_total: dishes.length,
+      // dishStats is already sorted slowest-average first, so the slice keeps the
+      // worst offenders — the ones a kitchen actually acts on.
+      dishes: dishes.slice(0, KITCHEN_DISHES_PER_SECTION),
+    };
+  });
+
   return {
     order_summary: {
       orders_timed: orderPrepMs.length,
@@ -8366,6 +9082,7 @@ export async function GetKitchenAnalytics(restaurantId: string, days = 30): Prom
     },
     by_dish,
     by_section,
+    by_section_items,
     period_days: span,
     generated_at: generatedAt,
   };
@@ -8379,8 +9096,8 @@ let fireCourseActionSeeded = false;
 async function ensureFireCourseAction(): Promise<void> {
   if (fireCourseActionSeeded) {return;}
   await runQuery(
-    `insert into "Actions" (id, action_name, action_desc)
-     values ($1, 'Fire Course', 'Fired a held course to the kitchen')
+    `insert into "Actions" (id, action_name, action_desc, "group")
+     values ($1, 'Fire Course', 'Fired a held course to the kitchen', 'Orders'::"Action_groups")
      on conflict (id) do nothing`,
     [FIRE_COURSE_ACTION_ID],
   ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
@@ -8459,8 +9176,8 @@ let barkOrderActionSeeded = false;
 async function ensureBarkOrderAction(): Promise<void> {
   if (barkOrderActionSeeded) {return;}
   await runQuery(
-    `insert into "Actions" (id, action_name, action_desc)
-     values ($1, 'Bark Order', 'Barked (announced) an order to the kitchen')
+    `insert into "Actions" (id, action_name, action_desc, "group")
+     values ($1, 'Bark Order', 'Barked (announced) an order to the kitchen', 'Orders'::"Action_groups")
      on conflict (id) do nothing`,
     [BARK_ORDER_ACTION_ID],
   ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
@@ -9471,9 +10188,17 @@ async function applyDiscountToOpenBill(
 ): Promise<string> {
   // A manual discount supersedes any applied coupon — revert the coupon first.
   await clearBillCoupon(context, tableId, client);
+  await ensureRecordTimestampColumns(client);
   const billId = await ensureOpenBillIdForTable(context, tableId, client);
+  // discount_applied_at dates the discount that is on the bill RIGHT NOW: stamped
+  // when one is put on, cleared back to NULL when it is removed (type === null),
+  // so it never outlives the discount it describes. This is the only write path —
+  // a direct discount and an approved DiscountRequests decision both land here —
+  // so both kinds of discount carry an instant.
   await runQuery(
-    `update "Bills" set discount_type = $1, discount_value = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
+    `update "Bills" set discount_type = $1, discount_value = $2,
+            discount_applied_at = case when $1::text is null then null else now() end
+      where id = $3 and res_id = $4 and outlet_id = $5`,
     [type, value, billId, context.res_id, context.outlet_id],
     client,
   );
@@ -10068,6 +10793,637 @@ export async function ReopenBill(
   });
 }
 
+// --- Closed (settled) bills: full detail + browsable list ---------------------
+// Once a bill closes, the table is freed and its orders flip to Paid/Closed, so
+// nothing in the live floor/orders reads can show it any more. These two reads
+// are the ONLY way to see a settled bill again, and they reconstruct it from the
+// same facts every settle path already writes — no new columns, no snapshotting.
+//
+// How each part is recovered:
+//   money   — "Bills".total_amt is the GRAND TOTAL charged (every settle path
+//             re-prices and snapshots it) and "Bills".tax_breakdown is the tax
+//             lines with their amounts. So the taxable base (discounted subtotal
+//             + service charge) is exactly total_amt - sum(tax amounts). That
+//             identity is authoritative and never depends on the reconstruction.
+//   items   — the session's orders: the SAME window ReopenBill uses to un-settle
+//             a bill (orders on the table settled after the PREVIOUS bill on that
+//             table closed, up to this bill's closed_at). Merged by name+price,
+//             notes joined, exactly like GetBillForTable's live bill.
+//   covers  — the "TableSessions" row (written by the table_sessions_trg trigger)
+//             that was open when the bill closed. Tables.num_covers is reset to 1
+//             on settle, so this is the only surviving guest count.
+//   people  — waiter_confirmed_by_username / admin_approved_by_username /
+//             closed_by_username are recorded verbatim by the settle workflow.
+
+export interface ClosedBillItem { name: string; price: number; quantity: number; note: string | null; line_total: number }
+
+export interface ClosedBillSummary {
+  id: string;
+  bill_no: string | null;
+  status: number;
+  table_id: string | null;
+  table_name: string | null;
+  covers: number | null;
+  grand_total: number;
+  // Genuine tax only — a "Service Charge" entry stored in the breakdown is lifted
+  // out into service_charge (see closedBillCharges), so it is never counted twice.
+  tax_total: number;
+  // What the food actually cost, after discount and before service charge + tax.
+  // INVARIANT: taxable_base + service_charge + tax_total === grand_total.
+  taxable_base: number;
+  service_charge: number;
+  service_charge_percent: number;
+  payment_method: PaymentMethod | null;
+  payment_splits: { method: string; amount: number }[];
+  discount_type: "percent" | "flat" | null;
+  discount_value: number;
+  // The money the discount actually took off. NULL in the list read, which does
+  // not reconstruct line items (a percent discount cannot be sized without the
+  // pre-discount subtotal); always a number in the detail read.
+  discount_amount: number | null;
+  coupon_code: string | null;
+  refunded: boolean;
+  refund_amount: number;
+  apc: number | null;
+  // The full money trail, all UTC instants. created_at = bill raised;
+  // waiter_confirmed_at = waiter marked the payment taken; admin_approved_at =
+  // admin approved it; closed_at = settled; refunded_at = money given back;
+  // discount_applied_at = when the discount was put on (NULL on bills discounted
+  // before that column existed, and on coupon-only bills). settled_at stays the
+  // convenience alias (closed_at, falling back to admin_approved_at).
+  created_at: string;
+  waiter_confirmed_at: string | null;
+  admin_approved_at: string | null;
+  closed_at: string | null;
+  refunded_at: string | null;
+  discount_applied_at: string | null;
+  settled_at: string | null;
+  closed_by: string | null;
+  admin_approved_by: string | null;
+  waiter_confirmed_by: string | null;
+}
+
+export interface ClosedBillDetail extends ClosedBillSummary {
+  items: ClosedBillItem[];
+  order_ids: string[];
+  orders: { id: string; created_at: string; status: string; subtotal: number; item_count: number }[];
+  items_subtotal: number;
+  discount_amount: number;
+  discounted_subtotal: number;
+  taxes: BillTaxLine[];
+  target_apc: number;
+  customer: string | null;
+  seated_at: string | null;
+  left_at: string | null;
+  waiter_confirmed_at: string | null;
+  refunded_at: string | null;
+  refunded_by: string | null;
+  refund_reason: string | null;
+  refund_ref: string | null;
+  payment_proof_screenshot_url: string | null;
+  reason: string | null;
+  created_by: string | null;
+  totals_reconciled: boolean;
+}
+
+/** Terminal order statuses that belong to a settled bill (Paid, Pending-approval, Closed). */
+const SETTLED_ORDER_STATUS_CODES = ["4", "6", "7"];
+
+/**
+ * Index matching the closed-bill list's ORDER BY. The base schema already indexes
+ * (res_id, outlet_id, closed_at), but the list sorts on the settlement moment —
+ * coalesce(closed_at, admin_approved_at, created_at) — with an id tiebreak, so it
+ * gets its own expression index. Mirrors migration 019; idempotent either way.
+ */
+async function ensureClosedBillIndexes(client?: PoolClient): Promise<void> {
+  await ensureLazyTable("Bills.settled_idx", async () => {
+    await runQuery(
+      `create index if not exists bills_res_outlet_settled_idx
+         on "Bills" (res_id, outlet_id, (coalesce(closed_at, admin_approved_at, created_at)) desc, id desc)`,
+      [], client,
+    );
+  });
+}
+
+const iso = (v: Date | string | null | undefined): string | null =>
+  v == null ? null : (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
+
+interface ClosedBillRow {
+  id: string;
+  bill_no: string | null;
+  status: number | string | null;
+  reason: string | null;
+  table_id: string | null;
+  table_name: string | null;
+  total_amt: number | string | null;
+  tax_breakdown: unknown;
+  payment_method: string | null;
+  payment_splits: unknown;
+  payment_proof_screenshot_url: string | null;
+  discount_type: string | null;
+  discount_value: number | string | null;
+  discount_applied_at: Date | null;
+  coupon_code: string | null;
+  waiter_confirmed_at: Date | null;
+  waiter_confirmed_by_username: string | null;
+  admin_approved_at: Date | null;
+  admin_approved_by_username: string | null;
+  closed_at: Date | null;
+  closed_by_username: string | null;
+  refunded_at: Date | null;
+  refunded_by_username: string | null;
+  refund_amount: number | string | null;
+  refund_reason: string | null;
+  refund_ref: string | null;
+  created_at: Date;
+  created_by_fname: string | null;
+  created_by_lname: string | null;
+  session_covers: number | null;
+  seated_at: Date | null;
+  left_at: Date | null;
+}
+
+/** The stored tax lines, tolerant of the legacy json/jsonb/string shapes. */
+function parseStoredTaxLines(raw: unknown): BillTaxLine[] {
+  let value: unknown = raw;
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return []; }
+  }
+  if (!Array.isArray(value)) {return [];}
+  return value
+    .map((t) => {
+      const o = (t ?? {}) as Record<string, unknown>;
+      return { name: String(o.name ?? "Tax"), percentage: parseNumeric(o.percentage), amount: round2(parseNumeric(o.amount)) };
+    })
+    .filter((t) => t.name.length > 0);
+}
+
+/** Columns + joins shared by the list and the detail read. */
+const CLOSED_BILL_SELECT = `
+  b.id, b.bill_no, b.status, b.reason, b.table_id, t.table_name,
+  b.total_amt, b.tax_breakdown, b.payment_method, b.payment_splits,
+  b.payment_proof_screenshot_url, b.discount_type, b.discount_value, b.discount_applied_at, b.coupon_code,
+  b.waiter_confirmed_at, b.waiter_confirmed_by_username,
+  b.admin_approved_at, b.admin_approved_by_username,
+  b.closed_at, b.closed_by_username,
+  b.refunded_at, b.refunded_by_username, b.refund_amount, b.refund_reason, b.refund_ref,
+  b.created_at,
+  e."emp_Fname" as created_by_fname, e."emp_Lname" as created_by_lname,
+  s.covers as session_covers, s.seated_at, s.left_at
+`;
+
+const CLOSED_BILL_JOINS = `
+  from "Bills" b
+  left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+  left join "Employees" e on e.id = b.emp_id and e.res_id = b.res_id and e.outlet_id = b.outlet_id
+  -- The seating this bill belonged to. Settle frees the table in the same
+  -- transaction, so the session's left_at equals closed_at; the small tolerance
+  -- covers the non-transactional release paths.
+  left join lateral (
+    select ts.covers, ts.seated_at, ts.left_at
+      from "TableSessions" ts
+     where ts.table_id = b.table_id and ts.res_id = b.res_id
+       and ts.seated_at <= b.closed_at
+       and (ts.left_at is null or ts.left_at >= b.closed_at - interval '5 seconds')
+     order by ts.seated_at desc
+     limit 1
+  ) s on true
+`;
+
+/**
+ * Split a stored tax breakdown into the SERVICE CHARGE line and the genuine tax
+ * lines.
+ *
+ * There are two ways a settled bill can carry a service charge, and both are in
+ * live data:
+ *   a) Restaurant.service_charge (a percent applied before tax) — the charge is
+ *      folded into the amount the taxes were computed on and does NOT appear in
+ *      tax_breakdown, so it has to be re-derived.
+ *   b) the tenant lists "Service Charge" as an entry in Outlets.default_tax — the
+ *      charge IS one of the stored breakdown lines. This is what csrorganics does
+ *      (its Restaurant.service_charge is 0), and it is why the detail read used to
+ *      report service_charge: 0 on a bill that plainly charged one: the implied-
+ *      charge heuristic looks for a gap between the taxable base and the
+ *      discounted subtotal, and in shape (b) there is no gap — the charge is
+ *      already inside the breakdown.
+ *
+ * Lifting the line out here (rather than leaving it in `taxes`) means the client
+ * renders it exactly once, under its own label, in BOTH shapes.
+ */
+function splitServiceChargeLine(lines: BillTaxLine[]): { service: BillTaxLine | null; taxes: BillTaxLine[] } {
+  const idx = lines.findIndex((l) => /service\s*charge/i.test(l.name));
+  if (idx < 0) {return { service: null, taxes: lines };}
+  return { service: lines[idx], taxes: lines.filter((_, i) => i !== idx) };
+}
+
+/**
+ * The money charged ABOVE the food base, split into its parts, for one stored
+ * bill. Invariant in both shapes: taxable_base + service_charge + tax_total ===
+ * grand_total, so a client can render a bill from these four numbers alone.
+ *
+ * `scPct` is Restaurant.service_charge, needed only for shape (a): there the
+ * stored total already includes the charge, so it is unwound out of the base
+ * rather than added to it.
+ */
+function closedBillCharges(
+  grand_total: number,
+  rawLines: BillTaxLine[],
+  scPct: number,
+): { taxes: BillTaxLine[]; tax_total: number; service_charge: number; service_charge_percent: number; taxable_base: number } {
+  const { service, taxes } = splitServiceChargeLine(rawLines);
+  const tax_total = round2(taxes.reduce((s, t) => s + t.amount, 0));
+  // Everything the taxes were computed on = food base + any service charge.
+  const preTax = round2(grand_total - tax_total);
+  if (service) {
+    // Shape (b): the charge is a stored line — trust it verbatim.
+    const service_charge = round2(service.amount);
+    return {
+      taxes,
+      tax_total,
+      service_charge,
+      service_charge_percent: round2(service.percentage),
+      taxable_base: round2(preTax - service_charge),
+    };
+  }
+  if (scPct > 0) {
+    // Shape (a): preTax = base * (1 + scPct/100); unwind to recover the base.
+    const base = round2(preTax / (1 + scPct / 100));
+    return { taxes, tax_total, service_charge: round2(preTax - base), service_charge_percent: round2(scPct), taxable_base: base };
+  }
+  return { taxes, tax_total, service_charge: 0, service_charge_percent: 0, taxable_base: preTax };
+}
+
+function mapClosedBillSummary(row: ClosedBillRow, scPct = 0): ClosedBillSummary {
+  const grand_total = round2(parseNumeric(row.total_amt));
+  const charges = closedBillCharges(grand_total, parseStoredTaxLines(row.tax_breakdown), scPct);
+  const { tax_total, taxable_base, service_charge, service_charge_percent } = charges;
+  const covers = row.session_covers == null ? null : Math.max(1, Math.round(parseNumeric(row.session_covers)));
+  // APC = pre-tax spend per guest, the same convention as the live floor grid.
+  // The basis is the TAXABLE BASE (what was actually charged for food, before
+  // service charge and tax) rather than the reconstructed items subtotal, so the
+  // number is identical in the list and the detail read and is available even
+  // when items cannot be rebuilt. With no discount the two are the same figure;
+  // with one, this is the lower amount the guests genuinely spent. Divide
+  // `items_subtotal` yourself for the pre-discount view (detail read only).
+  const apcBase = taxable_base;
+  return {
+    id: row.id,
+    bill_no: row.bill_no == null ? null : String(row.bill_no),
+    status: Math.round(parseNumeric(row.status)),
+    table_id: row.table_id,
+    table_name: row.table_name,
+    covers,
+    grand_total,
+    tax_total,
+    taxable_base,
+    service_charge,
+    service_charge_percent,
+    payment_method: normalizePaymentMethod(row.payment_method),
+    payment_splits: parsePaymentSplits(row.payment_splits),
+    discount_type: parseNumeric(row.discount_value) > 0 ? (row.discount_type === "flat" ? "flat" : "percent") : null,
+    discount_value: round2(parseNumeric(row.discount_value)),
+    discount_amount: null, // detail read fills this in once the items are known
+    coupon_code: row.coupon_code,
+    refunded: Boolean(row.refunded_at),
+    refund_amount: round2(parseNumeric(row.refund_amount)),
+    apc: covers && covers > 0 ? round2(apcBase / covers) : null,
+    created_at: iso(row.created_at) ?? "",
+    waiter_confirmed_at: iso(row.waiter_confirmed_at),
+    admin_approved_at: iso(row.admin_approved_at),
+    closed_at: iso(row.closed_at),
+    refunded_at: iso(row.refunded_at),
+    discount_applied_at: iso(row.discount_applied_at),
+    settled_at: iso(row.closed_at) ?? iso(row.admin_approved_at),
+    closed_by: row.closed_by_username,
+    admin_approved_by: row.admin_approved_by_username,
+    waiter_confirmed_by: row.waiter_confirmed_by_username,
+  };
+}
+
+/** The discount a stored discount_type/value produced against a subtotal. */
+function closedBillDiscount(
+  subtotal: number,
+  discountType: string | null,
+  discountValue: number,
+): { discount_type: "percent" | "flat" | null; discount_value: number; discount: number } {
+  if (!(discountValue > 0)) {return { discount_type: null, discount_value: 0, discount: 0 };}
+  const type = discountType === "flat" ? "flat" : "percent";
+  const amount = type === "flat"
+    ? round2(Math.min(discountValue, subtotal))
+    : round2((subtotal * Math.min(discountValue, 100)) / 100);
+  return { discount_type: type, discount_value: discountValue, discount: amount };
+}
+
+/**
+ * The orders that made up a closed bill: everything settled on that table
+ * between the PREVIOUS bill's close and this one's. Identical window to
+ * ReopenBill, which is the proven inverse of settlement.
+ */
+async function ordersForClosedBill(
+  context: RestaurantContext,
+  row: ClosedBillRow,
+  statusCodes: string[] = SETTLED_ORDER_STATUS_CODES,
+): Promise<{ id: string; created_at: Date; status: unknown; food: unknown }[]> {
+  if (!row.table_id || !row.closed_at) {
+    // Bills with no table session to walk back (legacy/merged rows) fall back to
+    // the single order the bill row itself points at.
+    return runQuery<{ id: string; created_at: Date; status: unknown; food: unknown }>(
+      `select o.id, o.created_at, o.status, o.food
+         from "Orders" o
+         join "Bills" b on b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
+        where b.id = $1 and b.res_id = $2 and b.outlet_id = $3`,
+      [row.id, context.res_id, context.outlet_id],
+    );
+  }
+  const prev = await runQuery<{ prev_closed: Date | string }>(
+    `select coalesce(max(closed_at), 'epoch'::timestamptz) as prev_closed
+       from "Bills"
+      where table_id = $1 and res_id = $2 and outlet_id = $3 and id <> $4
+        and closed_at is not null and closed_at <= $5`,
+    [row.table_id, context.res_id, context.outlet_id, row.id, row.closed_at],
+  );
+  return runQuery<{ id: string; created_at: Date; status: unknown; food: unknown }>(
+    `select id, created_at, status, food
+       from "Orders"
+      where res_id = $1 and outlet_id = $2 and table_id = $3
+        and coalesce(status::text, '1') = any($4::text[])
+        and created_at > $5 and created_at <= $6
+      order by created_at asc`,
+    [context.res_id, context.outlet_id, row.table_id, statusCodes, prev[0]?.prev_closed ?? new Date(0), row.closed_at],
+  );
+}
+
+interface ClosedBillItemAggregate {
+  items: ClosedBillItem[];
+  items_subtotal: number;
+  customer: string | null;
+  order_ids: string[];
+  orders: ClosedBillDetail["orders"];
+}
+
+/** Merge a set of orders into one bill's line items (by name+price), as the live bill does. */
+function aggregateClosedBillOrders(
+  orderRows: { id: string; created_at: Date; status: unknown; food: unknown }[],
+): ClosedBillItemAggregate {
+  const itemMap = new Map<string, ClosedBillItem>();
+  const orders: ClosedBillDetail["orders"] = [];
+  let customer = "";
+  let items_subtotal = 0;
+  for (const o of orderRows) {
+    const food = parseJsonObject(o.food) ?? {};
+    if (!customer) {
+      const c = String(food.customer ?? "").trim();
+      if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") {customer = c;}
+    }
+    const sub = parseNumeric(food.subtotal) > 0 ? parseNumeric(food.subtotal) : parseNumeric(food.total);
+    items_subtotal += sub;
+    const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+    for (const raw of list) {
+      const it = (raw ?? {}) as Record<string, unknown>;
+      const name = String(it.name ?? "Item");
+      const price = parseNumeric(it.price);
+      const quantity = Math.max(1, Math.round(parseNumeric(it.quantity) || 1));
+      const note = String(it.note ?? "").trim();
+      const key = `${name.toLowerCase()}@@${price}`;
+      const existing = itemMap.get(key);
+      if (existing) {
+        existing.quantity += quantity;
+        existing.line_total = round2(existing.price * existing.quantity);
+        if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
+      } else {
+        itemMap.set(key, { name, price, quantity, note: note || null, line_total: round2(price * quantity) });
+      }
+    }
+    orders.push({
+      id: o.id,
+      created_at: iso(o.created_at) ?? "",
+      status: fromOrderStatusCode(o.status),
+      subtotal: round2(sub),
+      item_count: list.length,
+    });
+  }
+  return {
+    items: [...itemMap.values()],
+    items_subtotal: round2(items_subtotal),
+    customer: customer || null,
+    order_ids: orderRows.map((o) => o.id),
+    orders,
+  };
+}
+
+/**
+ * ONE closed bill, in full: every line item with quantity and price, the
+ * subtotal, discount/coupon, service charge, each tax line, the grand total, how
+ * it was paid (including split parts), who confirmed/approved/closed it, the
+ * table, the covers, the APC and every timestamp.
+ *
+ * Returns null when the bill does not exist for this tenant. A bill that is
+ * still OPEN is returned too (closed_at null) so a caller can use one read for
+ * both — check `closed_at` / `settled_at` if that matters.
+ */
+export async function GetClosedBill(restaurantId: string, billId: string): Promise<ClosedBillDetail | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
+  await ensureTableSessionsTable();
+  await ensureRecordTimestampColumns();
+  const og = isAllOutlets() ? "true" : "false";
+  const rows = await runQuery<ClosedBillRow>(
+    `select ${CLOSED_BILL_SELECT} ${CLOSED_BILL_JOINS}
+      where b.id = $1 and b.res_id = $2 and (${og} or b.outlet_id = $3)
+      limit 1`,
+    [billId, context.res_id, context.outlet_id],
+  );
+  const row = rows[0];
+  if (!row) {return null;}
+
+  const scPct = await getServiceChargePercent(context.res_id).catch(() => 0);
+  const grandTotal = round2(parseNumeric(row.total_amt));
+  const storedLines = parseStoredTaxLines(row.tax_breakdown);
+  const charges = closedBillCharges(grandTotal, storedLines, scPct);
+  // Everything charged before genuine tax = food base + service charge. This is
+  // the one number that never depends on the reconstruction, so it is what the
+  // reconstructed items (plus whatever service charge applied) are checked
+  // against. When the breakdown stores the service charge as its own line, the
+  // split is already known and the items only have to match the food base.
+  const preTax = round2(charges.taxable_base + charges.service_charge);
+  // Shape (b): the breakdown named the charge, so the split is already known and
+  // the reconstruction only has to explain the food base.
+  const storedServiceLine = splitServiceChargeLine(storedLines).service !== null;
+
+  // `totals_reconciled` answers ONE question: do the reconstructed line items
+  // explain the amount the guest was actually charged? Ways they can:
+  //   a) the breakdown stores the service charge explicitly, so the items simply
+  //      have to equal the food base; or
+  //   b) the restaurant's CURRENT service-charge percentage closes the gap
+  //      exactly; or
+  //   c) the gap is a plausible service charge in its own right (non-negative and
+  //      no more than a quarter of the bill) — which is how bills settled while a
+  //      DIFFERENT service-charge percentage was configured still add up.
+  // Anything else (items missing, a merged-away zero bill, a pre-repricing bill)
+  // is reported as unreconciled rather than dressed up with an invented number.
+  const MAX_PLAUSIBLE_SERVICE_CHARGE_PCT = 25;
+  const evaluate = (agg: ClosedBillItemAggregate) => {
+    const d = closedBillDiscount(agg.items_subtotal, row.discount_type, parseNumeric(row.discount_value));
+    const discounted_subtotal = round2(Math.max(0, agg.items_subtotal - d.discount));
+    if (storedServiceLine) {
+      return {
+        agg, d, discounted_subtotal,
+        service_charge: charges.service_charge,
+        service_charge_percent: charges.service_charge_percent,
+        taxable_base: charges.taxable_base,
+        reconciled: agg.orders.length > 0 && Math.abs(discounted_subtotal - charges.taxable_base) <= 0.05,
+      };
+    }
+    const scFromSetting = round2((discounted_subtotal * Math.max(0, scPct)) / 100);
+    const explainedBySetting = Math.abs(round2(discounted_subtotal + scFromSetting) - preTax) <= 0.05;
+    const impliedSc = round2(preTax - discounted_subtotal);
+    const impliedPct = discounted_subtotal > 0
+      ? round2((impliedSc / discounted_subtotal) * 100)
+      : (Math.abs(impliedSc) <= 0.05 ? 0 : Number.POSITIVE_INFINITY);
+    const explainedByImplied = impliedSc >= -0.05 && impliedPct <= MAX_PLAUSIBLE_SERVICE_CHARGE_PCT;
+    const reconciled = agg.orders.length > 0 && (explainedBySetting || explainedByImplied);
+    const service_charge = explainedBySetting ? scFromSetting : Math.max(0, impliedSc);
+    const service_charge_percent = explainedBySetting
+      ? round2(Math.max(0, scPct))
+      : (discounted_subtotal > 0 && Number.isFinite(impliedPct) ? Math.max(0, impliedPct) : 0);
+    // Keep the invariant taxable_base + service_charge + tax_total === grand_total
+    // whichever branch explained the gap.
+    return { agg, d, discounted_subtotal, service_charge, service_charge_percent, taxable_base: round2(preTax - service_charge), reconciled };
+  };
+
+  // Normal case: the session's SETTLED orders. If those do not add up to the base
+  // the bill was actually charged on, retry including orders that were cancelled
+  // inside the same window — historical bills exist where an order was voided
+  // after settlement, and showing those lines is closer to the truth than showing
+  // a bill whose items do not match its total. Whichever set reconciles wins; if
+  // neither does, the settled-only set is kept and `totals_reconciled` is false.
+  let picked = evaluate(aggregateClosedBillOrders(await ordersForClosedBill(context, row)));
+  if (!picked.reconciled) {
+    const withCancelled = evaluate(
+      aggregateClosedBillOrders(await ordersForClosedBill(context, row, [...SETTLED_ORDER_STATUS_CODES, "5"])),
+    );
+    if (withCancelled.reconciled) {picked = withCancelled;}
+  }
+  const { agg, d, discounted_subtotal, service_charge, service_charge_percent, taxable_base, reconciled } = picked;
+
+  const summary = mapClosedBillSummary(row, scPct);
+  const target_apc = await getTargetApc(context).catch(() => 0);
+  // APC follows the food base this read actually settled on, so the detail agrees
+  // with itself even when the reconstruction (not the current setting) is what
+  // explained the service charge.
+  const covers = summary.covers;
+
+  return {
+    ...summary,
+    taxable_base,
+    service_charge,
+    service_charge_percent,
+    apc: covers && covers > 0 ? round2(taxable_base / covers) : null,
+    discount_type: d.discount_type,
+    discount_value: d.discount_value,
+    discount_amount: d.discount,
+    items: agg.items,
+    order_ids: agg.order_ids,
+    orders: agg.orders,
+    items_subtotal: agg.items_subtotal,
+    discounted_subtotal,
+    // Genuine tax lines only — any stored "Service Charge" entry is lifted out
+    // into `service_charge` above so a client never renders it twice.
+    taxes: charges.taxes,
+    target_apc,
+    customer: agg.customer,
+    seated_at: iso(row.seated_at),
+    left_at: iso(row.left_at),
+    waiter_confirmed_at: iso(row.waiter_confirmed_at),
+    refunded_at: iso(row.refunded_at),
+    refunded_by: row.refunded_by_username,
+    refund_reason: row.refund_reason,
+    refund_ref: row.refund_ref,
+    payment_proof_screenshot_url:
+      typeof row.payment_proof_screenshot_url === "string" ? row.payment_proof_screenshot_url : null,
+    reason: row.reason,
+    created_by: `${row.created_by_fname ?? ""} ${row.created_by_lname ?? ""}`.trim() || null,
+    totals_reconciled: reconciled,
+  };
+}
+
+export interface ClosedBillListFilter {
+  limit?: number;
+  offset?: number;
+  from?: string;
+  to?: string;
+  table?: string;
+  payment_method?: string;
+  search?: string;
+  include_open?: boolean;
+}
+
+/**
+ * Browsable, paged list of settled bills for Accounting / History, newest first.
+ * Ordering is (settled_at desc, id desc) — a total-order tiebreak, so paging can
+ * never duplicate or skip a row when two bills settle in the same millisecond.
+ */
+export async function ListClosedBills(
+  restaurantId: string,
+  opts: ClosedBillListFilter = {},
+): Promise<{ bills: ClosedBillSummary[]; total: number; limit: number; offset: number; has_more: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
+  await ensureTableSessionsTable();
+  await ensureClosedBillIndexes();
+  await ensureRecordTimestampColumns();
+  const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 50), 200));
+  const offset = Math.max(0, Math.round(opts.offset ?? 0));
+  const og = isAllOutlets() ? "true" : "false";
+
+  const where: string[] = [`b.res_id = $1`, `(${og} or b.outlet_id = $2)`];
+  const params: unknown[] = [context.res_id, context.outlet_id];
+  // Default: SETTLED bills only. `include_open` adds the bills still on the floor
+  // so one screen can show both (History wants settled; Accounting may want all).
+  if (!opts.include_open) {
+    where.push(`b.closed_at is not null`);
+  }
+  if (opts.from) { params.push(opts.from); where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) >= $${params.length}`); }
+  if (opts.to) { params.push(opts.to); where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) <= $${params.length}`); }
+  if (opts.table?.trim()) { params.push(opts.table.trim()); where.push(`lower(t.table_name) = lower($${params.length})`); }
+  if (opts.payment_method?.trim()) { params.push(opts.payment_method.trim()); where.push(`lower(coalesce(b.payment_method, '')) = lower($${params.length})`); }
+  if (opts.search?.trim()) {
+    params.push(`%${opts.search.trim()}%`);
+    const p = `$${params.length}`;
+    where.push(`(b.bill_no::text ilike ${p} or t.table_name ilike ${p} or coalesce(b.payment_method,'') ilike ${p} or coalesce(b.coupon_code,'') ilike ${p} or coalesce(b.closed_by_username,'') ilike ${p})`);
+  }
+  const whereSql = where.join(" and ");
+
+  const countRows = await runQuery<{ total: string }>(
+    `select count(*)::text as total
+       from "Bills" b
+       left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+      where ${whereSql}`,
+    params,
+  );
+  const total = Math.max(0, Math.round(Number(countRows[0]?.total ?? 0)));
+
+  params.push(limit); const limIdx = `$${params.length}`;
+  params.push(offset); const offIdx = `$${params.length}`;
+  const rows = await runQuery<ClosedBillRow>(
+    `select ${CLOSED_BILL_SELECT} ${CLOSED_BILL_JOINS}
+      where ${whereSql}
+      order by coalesce(b.closed_at, b.admin_approved_at, b.created_at) desc, b.id desc
+      limit ${limIdx} offset ${offIdx}`,
+    params,
+  );
+
+  // The list does NOT reconstruct line items (that is one extra query per bill),
+  // so `discount_amount` stays null here — a flat discount is its own value and a
+  // percent one needs the pre-discount subtotal, which only the detail read has.
+  // The service-charge percent is read ONCE for the page (not per row) so the
+  // list's charge split matches the detail read's.
+  const scPct = await getServiceChargePercent(context.res_id).catch(() => 0);
+  const bills = rows.map((row) => mapClosedBillSummary(row, scPct));
+
+  return { bills, total, limit, offset, has_more: offset + bills.length < total };
+}
+
 // --- Accounting & reporting --------------------------------------------------
 
 async function ensureExpensesTable(_client?: PoolClient): Promise<void> {
@@ -10103,36 +11459,79 @@ export interface ExpenseRecord {
 
 // Normalize a report range to whole-day UTC boundaries: [from 00:00, to+1day
 // 00:00) so the requested 'to' day is inclusive. Defaults to the last 30 days.
-function normalizeReportRange(fromInput?: string, toInput?: string): { fromIso: string; toIso: string; fromDate: string; toDate: string } {
-  let to = toInput ? new Date(toInput) : new Date();
-  if (Number.isNaN(to.getTime())) {to = new Date();}
-  let from = fromInput ? new Date(fromInput) : new Date(to.getTime() - 29 * 24 * 60 * 60 * 1000);
-  if (Number.isNaN(from.getTime())) {from = new Date(to.getTime() - 29 * 24 * 60 * 60 * 1000);}
-  const fromDay = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate()));
-  const toDayExcl = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate() + 1));
+// Calendar date (YYYY-MM-DD) of an instant AS SEEN IN `tz`.
+function dateKeyInZone(value: Date | string, tz: string): string {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) {return "";}
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((x) => x.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+// Midnight (00:00 wall clock) of a YYYY-MM-DD in `tz`, as a UTC instant.
+function zoneMidnightUtc(dateKey: string, tz: string): Date {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
+  if (!m) {return new Date(NaN);}
+  // zonedWallToUtc takes a 1-INDEXED month (it does the -1 itself). Passing a
+  // 0-indexed month here shifted every report back by a whole month.
+  return zonedWallToUtc(Number(m[1]), Number(m[2]), Number(m[3]), 0, 0, tz);
+}
+
+// Add whole days to a YYYY-MM-DD calendar key (no DST arithmetic — pure calendar).
+function addDaysToKey(dateKey: string, days: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
+  if (!m) {return dateKey;}
+  const anchor = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + days));
+  return anchor.toISOString().slice(0, 10);
+}
+
+// Normalize a report range to whole-day boundaries IN THE RESTAURANT'S ZONE:
+// [from 00:00 local, to+1day 00:00 local). Bucketing by UTC put every cover
+// served before the UTC rollover into the previous day, which is precisely the
+// kind of drift that makes a Tally export refuse to reconcile.
+function normalizeReportRange(fromInput?: string, toInput?: string, tz = "Asia/Kolkata"): { fromIso: string; toIso: string; fromDate: string; toDate: string } {
+  const now = new Date();
+  const toKey = (() => {
+    const raw = String(toInput ?? "").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {return raw;}
+    const d = raw ? new Date(raw) : now;
+    return dateKeyInZone(Number.isNaN(d.getTime()) ? now : d, tz);
+  })();
+  const fromKey = (() => {
+    const raw = String(fromInput ?? "").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {return raw;}
+    const d = raw ? new Date(raw) : null;
+    if (d && !Number.isNaN(d.getTime())) {return dateKeyInZone(d, tz);}
+    return addDaysToKey(toKey, -29);
+  })();
   return {
-    fromIso: fromDay.toISOString(),
-    toIso: toDayExcl.toISOString(),
-    fromDate: fromDay.toISOString().slice(0, 10),
-    toDate: new Date(toDayExcl.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+    fromIso: zoneMidnightUtc(fromKey, tz).toISOString(),
+    toIso: zoneMidnightUtc(addDaysToKey(toKey, 1), tz).toISOString(),
+    fromDate: fromKey,
+    toDate: toKey,
   };
 }
 
-function dayKeyOf(value: Date | string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {return "";}
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+// Which accounting DAY an instant belongs to — the restaurant's calendar day.
+function dayKeyOf(value: Date | string, tz = "Asia/Kolkata"): string {
+  return dateKeyInZone(value, tz);
 }
 
 // One UTC day as [fromIso, toIso) — built from date parts so "2026-06-15"
 // means that calendar day regardless of server timezone. Bad/missing input
 // falls back to today.
-function dayRangeOf(date?: string): { day: string; fromIso: string; toIso: string } {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date ?? "").trim());
-  const base = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : new Date();
-  const from = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate()));
-  const to = new Date(from.getTime() + 24 * 60 * 60 * 1000);
-  return { day: from.toISOString().slice(0, 10), fromIso: from.toISOString(), toIso: to.toISOString() };
+// One accounting day as [fromIso, toIso) — midnight-to-midnight in the tenant's
+// zone, so "2026-06-15" means that restaurant's 15th, not UTC's.
+function dayRangeOf(date?: string, tz = "Asia/Kolkata"): { day: string; fromIso: string; toIso: string } {
+  const raw = String(date ?? "").trim();
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : dateKeyInZone(new Date(), tz);
+  return {
+    day,
+    fromIso: zoneMidnightUtc(day, tz).toISOString(),
+    toIso: zoneMidnightUtc(addDaysToKey(day, 1), tz).toISOString(),
+  };
 }
 
 function parseTaxLines(raw: unknown): BillTaxLine[] {
@@ -10231,7 +11630,7 @@ export async function GetExpenses(restaurantId: string, fromIso?: string, toIso?
   const context = await requireRestaurantContext(restaurantId);
   const og = isAllOutlets() ? "true" : "false";
   await ensureExpensesTable();
-  const range = normalizeReportRange(fromIso, toIso);
+  const range = normalizeReportRange(fromIso, toIso, context.timezone);
   return runQuery<ExpenseRecord>(
     `select id, to_char(spent_on,'YYYY-MM-DD') as spent_on, category, vendor, amount, note, created_by, created_at
        from "Expenses"
@@ -10456,7 +11855,7 @@ export async function GetCashSessions(restaurantId: string, fromIso?: string, to
   const context = await requireRestaurantContext(restaurantId);
   const og = isAllOutlets() ? "true" : "false";
   await ensureCashSessionsTable();
-  const range = normalizeReportRange(fromIso, toIso);
+  const range = normalizeReportRange(fromIso, toIso, context.timezone);
   const rows = await runQuery<Record<string, any>>(
     `select * from "CashSessions"
        where res_id = $1 and (${og} or outlet_id = $2) and opened_at >= $3::date and opened_at < ($4::date + interval '1 day')
@@ -10480,7 +11879,7 @@ export interface SalesReport {
 
 export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<SalesReport> {
   const context = await requireRestaurantContext(restaurantId);
-  const range = normalizeReportRange(fromIso, toIso);
+  const range = normalizeReportRange(fromIso, toIso, context.timezone);
   const bills = await getSettledBills(context, range.fromIso, range.toIso);
 
   let totalSales = 0, totalTax = 0, totalRefund = 0;
@@ -10492,7 +11891,7 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     totalSales = round2(totalSales + gross);
     totalTax = round2(totalTax + tax);
     totalRefund = round2(totalRefund + b.refund_amount);
-    const day = dayKeyOf(b.settled_at);
+    const day = dayKeyOf(b.settled_at, context.timezone);
     const dd = byDay.get(day) ?? { sales: 0, tax: 0, refund: 0, bills: 0 };
     dd.sales = round2(dd.sales + gross); dd.tax = round2(dd.tax + tax); dd.refund = round2(dd.refund + b.refund_amount); dd.bills += 1;
     byDay.set(day, dd);
@@ -10538,7 +11937,7 @@ export interface GstReport {
 
 export async function GetGstReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<GstReport> {
   const context = await requireRestaurantContext(restaurantId);
-  const range = normalizeReportRange(fromIso, toIso);
+  const range = normalizeReportRange(fromIso, toIso, context.timezone);
   const bills = await getSettledBills(context, range.fromIso, range.toIso);
 
   let totalTax = 0, totalGross = 0;
@@ -10624,7 +12023,7 @@ export interface DiscountsReport {
 export async function GetDiscountsReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<DiscountsReport> {
   const context = await requireRestaurantContext(restaurantId);
   const og = isAllOutlets() ? "true" : "false";
-  const range = normalizeReportRange(fromIso, toIso);
+  const range = normalizeReportRange(fromIso, toIso, context.timezone);
   await ensureBillWorkflowColumns();
 
   const bills = await runQuery<{
@@ -10746,7 +12145,7 @@ export interface BalanceSheet {
 
 export async function GetBalanceSheet(restaurantId: string, asOf?: string): Promise<BalanceSheet> {
   const context = await requireRestaurantContext(restaurantId);
-  const range = dayRangeOf(asOf);
+  const range = dayRangeOf(asOf, context.timezone);
   const cutoffIso = range.toIso; // end of the as-of day (exclusive)
   const rid = context.res_id, oid = context.outlet_id;
 
@@ -10864,8 +12263,8 @@ async function ensureSettlementBatchesTable(): Promise<void> {
     );
     // Dedicated audit action so reconciliations show up with an honest name.
     await runQuery(
-      `insert into "Actions" (id, action_name, action_desc)
-       values ($1, 'Reconcile Settlement', 'Record the actual settlement received per payment method vs the POS expected total')
+      `insert into "Actions" (id, action_name, action_desc, "group")
+       values ($1, 'Reconcile Settlement', 'Record the actual settlement received per payment method vs the POS expected total', 'Bills'::"Action_groups")
        on conflict (id) do nothing`,
       [RECONCILE_ACTION_ID],
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
@@ -10900,7 +12299,7 @@ export interface ReconciliationRow {
 export async function GetReconciliation(restaurantId: string, date?: string): Promise<{ date: string; rows: ReconciliationRow[] }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureSettlementBatchesTable();
-  const range = dayRangeOf(date);
+  const range = dayRangeOf(date, context.timezone);
   const bills = await getSettledBills(context, range.fromIso, range.toIso);
   const expected = methodTotalsOf(bills);
   const saved = await runQuery<{ method: string; actual: number | string; status: string; note: string | null }>(
@@ -10936,7 +12335,7 @@ export async function SaveReconciliation(
   if (!Number.isFinite(actualNum) || actualNum < 0) {throw new Error("actual must be a non-negative amount");}
   const actual = round2(actualNum);
 
-  const range = dayRangeOf(input.date);
+  const range = dayRangeOf(input.date, context.timezone);
   const bills = await getSettledBills(context, range.fromIso, range.toIso);
   const expected = round2(methodTotalsOf(bills).get(method) ?? 0);
   // Within ₹1 counts as matched (rounding of split parts / bank fees paise).
@@ -11234,9 +12633,9 @@ async function ensureBillWorkflowColumns(client?: PoolClient): Promise<void> {
   // Dedicated audit actions for the discount-approval + bill re-open workflows so
   // they show up with honest names in the log (same pattern as Attendance).
   await runQuery(
-    `insert into "Actions" (id, action_name, action_desc)
-     values ('c4d2e6f8-1a3b-4c5d-8e7f-2b4a6c8d0e1f', 'Approve Discount', 'Review (approve/reject) staff bill-discount requests'),
-            ('d5e3f7a9-2b4c-4d6e-9f80-3c5b7d9e1f2a', 'Reopened bill', 'Re-open a closed bill within the allowed window')
+    `insert into "Actions" (id, action_name, action_desc, "group")
+     values ('c4d2e6f8-1a3b-4c5d-8e7f-2b4a6c8d0e1f', 'Approve Discount', 'Review (approve/reject) staff bill-discount requests', 'Bills'::"Action_groups"),
+            ('d5e3f7a9-2b4c-4d6e-9f80-3c5b7d9e1f2a', 'Reopened bill', 'Re-open a closed bill within the allowed window', 'Bills'::"Action_groups")
      on conflict (id) do nothing`,
     [],
     client,
@@ -11710,8 +13109,8 @@ export const LOYALTY_REDEEM_ACTION_ID = "5b3f9d71-2c84-47e6-9a05-8e64d1f0b923";
 async function ensureLoyaltyRedeemAction(): Promise<void> {
   await ensureLazyTable("Actions.loyalty_redeem", async () => {
     await runQuery(
-      `insert into "Actions" (id, action_name, action_desc)
-       values ($1, 'Loyalty Redeem', 'Loyalty points redeemed as a bill discount')
+      `insert into "Actions" (id, action_name, action_desc, "group")
+       values ($1, 'Loyalty Redeem', 'Loyalty points redeemed as a bill discount', 'Customer'::"Action_groups")
        on conflict (id) do nothing`,
       [LOYALTY_REDEEM_ACTION_ID],
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
@@ -13259,6 +14658,10 @@ export interface WaitlistEntry {
   status: "waiting" | "called" | "seated" | "cancelled" | "no_show";
   token: string;
   pre_order: WaitlistItem[];
+  /** Confirmation state of the held pre_order — see WaitlistPreorderStatus. */
+  pre_order_status: WaitlistPreorderStatus;
+  /** The order created when the pre-order was CONFIRMED (null otherwise). */
+  placed_order_id: string | null;
   party_members: WaitlistMember[];
   table_name: string | null;
   qr_token?: string | null;
@@ -13297,8 +14700,33 @@ async function ensureWaitlistTable(_client?: PoolClient): Promise<void> {
     if (!hasMembers[0]) {
       await runQuery(`alter table "Waitlist" add column party_members jsonb not null default '[]'::jsonb`);
     }
+    // Lazy columns: the held pre-order is no longer auto-placed on seating — it
+    // has to be CONFIRMED first (see SeatWaitlistEntry / ConfirmWaitlistPreorder).
+    // 'none' is the correct default for every historical row: they were either
+    // already placed at seat time or never had a pre-order.
+    await runQuery(`alter table "Waitlist" add column if not exists pre_order_status text not null default 'none'`);
+    await runQuery(`alter table "Waitlist" add column if not exists placed_order_id uuid`);
     await applyTenantRls("Waitlist");
   });
+}
+
+/**
+ * Lifecycle of a held pre-order, once the party is seated:
+ *   none      — nothing held (or a historical row placed under the old contract)
+ *   pending   — seated with items held, WAITING for someone to confirm
+ *   confirmed — placed as a real order (placed_order_id is set)
+ *   declined  — the guest said "let me change it": items stay on the row so the
+ *               table's order page can seed the cart from them
+ *   claimed   — a declined pre-order that the order page has already seeded, so a
+ *               refresh doesn't re-add the items
+ * NOTHING is ever deleted: if no one confirms, no order exists and the items are
+ * still on the entry.
+ */
+export type WaitlistPreorderStatus = "none" | "pending" | "confirmed" | "declined" | "claimed";
+const WAITLIST_PREORDER_STATUSES: WaitlistPreorderStatus[] = ["none", "pending", "confirmed", "declined", "claimed"];
+function normalizePreorderStatus(raw: unknown): WaitlistPreorderStatus {
+  const v = String(raw ?? "none").trim().toLowerCase() as WaitlistPreorderStatus;
+  return WAITLIST_PREORDER_STATUSES.includes(v) ? v : "none";
 }
 
 // Normalize the party_members jsonb — trims/caps every field, drops empty rows,
@@ -13409,6 +14837,8 @@ function mapWaitlist(r: Record<string, any>): WaitlistEntry {
     status,
     token: r.token,
     pre_order: pre,
+    pre_order_status: normalizePreorderStatus(r.pre_order_status),
+    placed_order_id: r.placed_order_id ?? null,
     party_members: members,
     table_name: r.table_name ?? null,
     created_at: iso(r.created_at) ?? "",
@@ -13568,6 +14998,30 @@ export async function GetWaitlist(restaurantId: string): Promise<(WaitlistEntry 
   });
 }
 
+/**
+ * Parties already SEATED whose held pre-order is still waiting on a yes/no.
+ *
+ * GetWaitlist only lists waiting/called parties, so once a party is seated their
+ * un-confirmed pre-order would vanish from the board — the staff client would
+ * only ever see it in the seat response. This is the durable list: a "confirm the
+ * pre-order for T4" queue that survives a refresh or a different device.
+ */
+export async function GetPendingPreorders(restaurantId: string): Promise<(WaitlistEntry & { minutes_since_seated: number })[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureWaitlistTable();
+  const rows = await runQuery<Record<string, any>>(
+    `select w.*, t.table_name from "Waitlist" w left join "Tables" t on t.id = w.table_id
+       where w.res_id = $1 and w.outlet_id = $2 and w.status = 'seated' and w.pre_order_status = 'pending'
+       order by w.seated_at asc nulls last`,
+    [context.res_id, context.outlet_id],
+  );
+  return rows.map((r) => {
+    const e = mapWaitlist(r);
+    const seated = e.seated_at ? new Date(e.seated_at).getTime() : Date.now();
+    return { ...e, minutes_since_seated: Math.max(0, Math.round((Date.now() - seated) / 60000)) };
+  });
+}
+
 export async function CallWaitlistEntry(restaurantId: string, id: string): Promise<WaitlistEntry> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureWaitlistTable();
@@ -13587,12 +15041,34 @@ export async function CancelWaitlistEntry(restaurantId: string, id: string, stat
   return { success: true };
 }
 
+/**
+ * Seat a queued party at a table.
+ *
+ * CONTRACT CHANGE: seating NO LONGER places the held pre-order. Those items were
+ * picked while the party stood at the door, possibly a long time ago — firing
+ * them at the kitchen the instant a table is assigned takes the decision away
+ * from the guest. Seating now returns the held pre-order as `pending_preorder`
+ * and marks the entry `pre_order_status = 'pending'`; someone must then call
+ * ConfirmWaitlistPreorder (places it, exactly as this function used to) or
+ * DeclineWaitlistPreorder (items stay on the row to seed the guest's cart).
+ *
+ * Backward-safe: `placed_order_id` is still in the response (always null now), and
+ * if nothing ever confirms, NO order is created and the items are not lost.
+ */
 export async function SeatWaitlistEntry(
   restaurantId: string,
   id: string,
   tableName: string,
   actorEmployeeId?: string | null,
-): Promise<{ success: true; placed_order_id: string | null; table_name: string }> {
+): Promise<{
+  success: true;
+  placed_order_id: string | null;
+  table_name: string;
+  waitlist_id: string;
+  waitlist_token: string;
+  pre_order_status: WaitlistPreorderStatus;
+  pending_preorder: { items: WaitlistItem[]; subtotal: number; count: number } | null;
+}> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureWaitlistTable();
   await ensureTableOccupancyColumns();
@@ -13600,16 +15076,15 @@ export async function SeatWaitlistEntry(
   if (!table) {throw new Error("A table is required to seat the party");}
 
   // The whole seat is one transaction: claim the queue entry, claim a FREE table
-  // (row-locked), occupy it, and place the held pre-order. If anything fails
-  // (e.g. the table just got taken, or AddOrder rejects), the entire thing rolls
-  // back — no half-seated party, no double-occupy, no lost pre-order.
+  // (row-locked) and occupy it. If anything fails (e.g. the table just got taken)
+  // the entire thing rolls back — no half-seated party, no double-occupy.
   return withTransaction(async (client) => {
     // 1) Atomically claim the entry — only if it is still active. Two staff seating
     //    the same party: the second claims 0 rows and aborts.
-    const claimed = await runQuery<{ party_size: number; pre_order: unknown; name: string }>(
+    const claimed = await runQuery<{ party_size: number; pre_order: unknown; name: string; token: string }>(
       `update "Waitlist" set status = 'seated', seated_at = now()
          where id = $1 and res_id = $2 and outlet_id = $3 and status in ('waiting','called')
-         returning party_size, pre_order, name`,
+         returning party_size, pre_order, name, token`,
       [id, context.res_id, context.outlet_id],
       client,
     );
@@ -13652,29 +15127,332 @@ export async function SeatWaitlistEntry(
       }
     }
 
-    // 3) Place the held pre-order, re-priced from the menu. This MUST succeed (it
-    //    runs on the same client/txn); if it throws, the whole seat rolls back.
-    let placedOrderId: string | null = null;
+    // 3) HOLD the pre-order for confirmation instead of placing it. Re-priced here
+    //    only so the caller can show the guest what it would cost RIGHT NOW;
+    //    ConfirmWaitlistPreorder re-prices again from the stored items, so a menu
+    //    price change between seat and confirm is always honoured.
+    let pending: { items: WaitlistItem[]; subtotal: number; count: number } | null = null;
+    let preStatus: WaitlistPreorderStatus = "none";
     if (preOrder.length > 0) {
       const priced = await repriceFromMenu(restaurantId, preOrder, false);
       if (priced.length > 0) {
-        const subtotal = round2(priced.reduce((s, it) => s + it.price * it.quantity, 0));
-        const settings = await GetRestaurantSettings(restaurantId).catch(() => ({ auto_push_orders: true } as any));
-        const order = await AddOrder(restaurantId, {
-          table,
-          customer: name || "Walk-in",
+        pending = {
           items: priced,
-          subtotal,
-          total: subtotal,
-          taxes: [],
-          status: settings.auto_push_orders ? "Preparing" : "Pending",
-          ...(actorEmployeeId ? { taken_by_employee_id: actorEmployeeId } : {}),
-        } as any);
-        placedOrderId = order.id;
+          subtotal: round2(priced.reduce((s, it) => s + it.price * it.quantity, 0)),
+          count: priced.reduce((s, it) => s + it.quantity, 0),
+        };
+        preStatus = "pending";
+        await runQuery(
+          `update "Waitlist" set pre_order_status = 'pending' where id = $1 and res_id = $2`,
+          [id, context.res_id],
+          client,
+        );
       }
     }
-    return { success: true as const, placed_order_id: placedOrderId, table_name: table };
+    return {
+      success: true as const,
+      // Always null now — seating never places. Kept so old clients don't break.
+      placed_order_id: null,
+      table_name: table,
+      waitlist_id: id,
+      waitlist_token: String(claimed[0].token),
+      pre_order_status: preStatus,
+      pending_preorder: pending,
+    };
   });
+}
+
+// Load a seated entry by id (staff path) or token (guest path), for the pre-order
+// confirm/decline flow. Returns null when nothing matches this tenant.
+async function loadWaitlistForPreorder(
+  context: RestaurantContext,
+  by: { id?: string; token?: string },
+  client?: PoolClient,
+): Promise<{ id: string; name: string; pre_order: unknown; pre_order_status: WaitlistPreorderStatus; placed_order_id: string | null; table_name: string | null } | null> {
+  const rows = await runQuery<Record<string, any>>(
+    by.id
+      ? `select w.id, w.name, w.pre_order, w.pre_order_status, w.placed_order_id, t.table_name
+           from "Waitlist" w left join "Tables" t on t.id = w.table_id
+          where w.id = $1 and w.res_id = $2 limit 1 for update of w`
+      : `select w.id, w.name, w.pre_order, w.pre_order_status, w.placed_order_id, t.table_name
+           from "Waitlist" w left join "Tables" t on t.id = w.table_id
+          where w.token = $1 and w.res_id = $2 limit 1 for update of w`,
+    [by.id ?? by.token, context.res_id],
+    client,
+  );
+  const r = rows[0];
+  if (!r) {return null;}
+  return {
+    id: String(r.id),
+    name: String(r.name ?? ""),
+    pre_order: r.pre_order,
+    pre_order_status: normalizePreorderStatus(r.pre_order_status),
+    placed_order_id: r.placed_order_id ?? null,
+    table_name: r.table_name ?? null,
+  };
+}
+
+/**
+ * CONFIRM a seated party's held pre-order — places it as a real order on the
+ * table, exactly as SeatWaitlistEntry used to do inline (same repricing, same
+ * auto_push_orders behaviour, same customer name).
+ *
+ * IDEMPOTENT: the row is locked and only 'pending' transitions to 'confirmed', so
+ * a double-tap (or a staff confirm racing a guest confirm) returns the SAME
+ * order id instead of ringing the kitchen twice.
+ */
+export async function ConfirmWaitlistPreorder(
+  restaurantId: string,
+  by: { id?: string; token?: string },
+  actorEmployeeId?: string | null,
+): Promise<{ success: true; placed_order_id: string | null; table_name: string; already: boolean } | { error: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureWaitlistTable();
+  return withTransaction(async (client) => {
+    const entry = await loadWaitlistForPreorder(context, by, client);
+    if (!entry) {return { error: "Queue entry not found" };}
+    if (entry.pre_order_status === "confirmed") {
+      // Already placed — hand back the same order rather than creating another.
+      return { success: true as const, placed_order_id: entry.placed_order_id, table_name: entry.table_name ?? "", already: true };
+    }
+    if (entry.pre_order_status !== "pending") {
+      return { error: "There is no pre-order waiting to be confirmed" };
+    }
+    if (!entry.table_name) {return { error: "Seat the party at a table first" };}
+
+    const held = normalizeWaitlistItems(typeof entry.pre_order === "string" ? JSON.parse(entry.pre_order || "[]") : entry.pre_order);
+    const priced = await repriceFromMenu(restaurantId, held, false);
+    if (priced.length === 0) {
+      // Every held line has since left the menu — nothing to place. Close the
+      // pre-order out rather than leaving the party stuck on "pending".
+      await runQuery(`update "Waitlist" set pre_order_status = 'none' where id = $1 and res_id = $2`, [entry.id, context.res_id], client);
+      return { error: "None of the held items are on the menu any more" };
+    }
+    const subtotal = round2(priced.reduce((s, it) => s + it.price * it.quantity, 0));
+    const settings = await GetRestaurantSettings(restaurantId).catch(() => ({ auto_push_orders: true } as any));
+    const order = await AddOrder(restaurantId, {
+      table: entry.table_name,
+      customer: entry.name || "Walk-in",
+      items: priced,
+      subtotal,
+      total: subtotal,
+      taxes: [],
+      status: settings.auto_push_orders ? "Preparing" : "Pending",
+      ...(actorEmployeeId ? { taken_by_employee_id: actorEmployeeId } : {}),
+    } as any);
+    await runQuery(
+      `update "Waitlist" set pre_order_status = 'confirmed', placed_order_id = $3 where id = $1 and res_id = $2`,
+      [entry.id, context.res_id, order.id],
+      client,
+    );
+    return { success: true as const, placed_order_id: order.id, table_name: entry.table_name, already: false };
+  });
+}
+
+/**
+ * DECLINE a held pre-order: the guest wants to change it. Nothing is placed and
+ * NOTHING IS DELETED — the items stay in `pre_order` so the table's order page
+ * can seed the guest's cart from them (see ClaimWaitlistPreorder).
+ *
+ * Only a PENDING pre-order (i.e. one the party has already been seated with) can
+ * be declined — the mirror of ConfirmWaitlistPreorder's guard. Without this a
+ * guest could decline-then-claim while still WAITING in the queue; seating would
+ * later re-arm the same items as 'pending' and staff would be asked to confirm
+ * lines the guest had already pulled into their cart, i.e. order them twice.
+ * Re-declining an already-declined pre-order is a no-op that returns the items.
+ */
+export async function DeclineWaitlistPreorder(
+  restaurantId: string,
+  by: { id?: string; token?: string },
+): Promise<{ success: true; items: WaitlistItem[] } | { error: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureWaitlistTable();
+  return withTransaction(async (client) => {
+    const entry = await loadWaitlistForPreorder(context, by, client);
+    if (!entry) {return { error: "Queue entry not found" };}
+    if (entry.pre_order_status === "confirmed") {return { error: "This pre-order has already been placed" };}
+    if (entry.pre_order_status !== "pending" && entry.pre_order_status !== "declined") {
+      return { error: "There is no pre-order waiting to be confirmed" };
+    }
+    const held = normalizeWaitlistItems(typeof entry.pre_order === "string" ? JSON.parse(entry.pre_order || "[]") : entry.pre_order);
+    if (entry.pre_order_status === "pending") {
+      await runQuery(`update "Waitlist" set pre_order_status = 'declined' where id = $1 and res_id = $2`, [entry.id, context.res_id], client);
+    }
+    return { success: true as const, items: await repriceFromMenu(restaurantId, held, false) };
+  });
+}
+
+/**
+ * The guest's order page picks up a DECLINED pre-order here: it returns the items
+ * to seed the cart with and flips the entry to 'claimed' so a page refresh does
+ * not add them a second time. Read-then-claim in one locked step.
+ *
+ * `peek: true` returns the items WITHOUT claiming (so a page can render "we saved
+ * your picks" before the guest commits).
+ */
+export async function ClaimWaitlistPreorder(
+  restaurantId: string,
+  token: string,
+  peek = false,
+): Promise<{ status: WaitlistPreorderStatus; items: WaitlistItem[]; table_name: string | null } | { error: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureWaitlistTable();
+  return withTransaction(async (client) => {
+    const entry = await loadWaitlistForPreorder(context, { token }, client);
+    if (!entry) {return { error: "Queue entry not found" };}
+    if (entry.pre_order_status !== "declined") {
+      return { status: entry.pre_order_status, items: [], table_name: entry.table_name };
+    }
+    const held = normalizeWaitlistItems(typeof entry.pre_order === "string" ? JSON.parse(entry.pre_order || "[]") : entry.pre_order);
+    const priced = await repriceFromMenu(restaurantId, held, false);
+    if (!peek) {
+      await runQuery(`update "Waitlist" set pre_order_status = 'claimed' where id = $1 and res_id = $2`, [entry.id, context.res_id], client);
+    }
+    return { status: peek ? "declined" as const : "claimed" as const, items: priced, table_name: entry.table_name };
+  });
+}
+
+// --- Web Push subscriptions --------------------------------------------------
+// A queued guest can leave the page (or lock their phone) while they wait, so the
+// "we're calling you" / "your table is ready" messages have to reach the BROWSER,
+// not just an open tab. The guest's browser hands us a push endpoint + two keys;
+// we store them against their waitlist entry and post to that endpoint when the
+// entry is called or seated. Tenant-scoped (res_id) and RLS-isolated like every
+// other table. Nothing here is ever allowed to break the queue flow — every
+// caller wraps these in try/catch, exactly like AddNotification.
+export interface PushSubscriptionRow {
+  id: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  waitlist_id: string | null;
+  waitlist_token: string | null;
+}
+
+/** Max stored endpoints per queue entry (a party may wait on a couple of phones). */
+const PUSH_SUBS_PER_ENTRY = 5;
+
+async function ensurePushSubscriptionsTable(): Promise<void> {
+  await ensureLazyTable("PushSubscriptions", async () => {
+    await runQuery(
+      `create table if not exists "PushSubscriptions" (
+         id uuid primary key,
+         res_id uuid not null,
+         outlet_id uuid,
+         waitlist_id uuid,
+         waitlist_token uuid,
+         endpoint text not null,
+         p256dh text not null,
+         auth text not null,
+         user_agent text,
+         created_at timestamptz not null default now(),
+         last_sent_at timestamptz,
+         failure_count integer not null default 0
+       )`,
+    );
+    await runQuery(`create unique index if not exists push_subscriptions_endpoint_idx on "PushSubscriptions" (endpoint)`);
+    await runQuery(`create index if not exists push_subscriptions_lookup_idx on "PushSubscriptions" (res_id, waitlist_id)`);
+    await runQuery(`create index if not exists push_subscriptions_token_idx on "PushSubscriptions" (res_id, waitlist_token)`);
+    await applyTenantRls("PushSubscriptions");
+  });
+}
+
+/**
+ * Store (or refresh) a browser push subscription for a waitlist entry. The entry
+ * is identified by the PUBLIC token the guest already holds — no session needed,
+ * and a caller can only ever attach a subscription to a queue entry whose token
+ * they know. Re-subscribing with the same endpoint updates the existing row.
+ */
+export async function SavePushSubscription(
+  restaurantId: string,
+  input: { token: string; endpoint: unknown; p256dh: unknown; auth: unknown; user_agent?: unknown },
+): Promise<{ success: true } | { error: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureWaitlistTable();
+  await ensurePushSubscriptionsTable();
+  const endpoint = String(input.endpoint ?? "").trim();
+  const p256dh = String(input.p256dh ?? "").trim();
+  const auth = String(input.auth ?? "").trim();
+  // Only a real https push service endpoint, and bounded so the column can't be
+  // used as free storage.
+  if (!/^https:\/\//i.test(endpoint) || endpoint.length > 2000) {return { error: "Invalid push endpoint" };}
+  if (!p256dh || p256dh.length > 300 || !auth || auth.length > 300) {return { error: "Invalid push keys" };}
+  const ua = String(input.user_agent ?? "").trim().slice(0, 200) || null;
+
+  const owner = await runQuery<{ id: string; outlet_id: string | null; token: string }>(
+    `select id, outlet_id, token from "Waitlist" where token = $1 and res_id = $2 and status in ('waiting','called','seated') limit 1`,
+    [String(input.token ?? ""), context.res_id],
+  );
+  if (!owner[0]) {return { error: "Your queue entry is no longer active" };}
+
+  const existing = await runQuery<{ n: number }>(
+    `select count(*)::int as n from "PushSubscriptions" where res_id = $1 and waitlist_id = $2 and endpoint <> $3`,
+    [context.res_id, owner[0].id, endpoint],
+  );
+  if (Number(existing[0]?.n ?? 0) >= PUSH_SUBS_PER_ENTRY) {return { error: "Too many devices for this queue entry" };}
+
+  await runQuery(
+    `insert into "PushSubscriptions" (id, res_id, outlet_id, waitlist_id, waitlist_token, endpoint, p256dh, auth, user_agent)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     on conflict (endpoint) do update
+       set res_id = excluded.res_id, outlet_id = excluded.outlet_id,
+           waitlist_id = excluded.waitlist_id, waitlist_token = excluded.waitlist_token,
+           p256dh = excluded.p256dh, auth = excluded.auth, user_agent = excluded.user_agent,
+           failure_count = 0`,
+    [randomUUID(), context.res_id, owner[0].outlet_id, owner[0].id, owner[0].token, endpoint, p256dh, auth, ua],
+  );
+  return { success: true };
+}
+
+/** Forget a push subscription — by endpoint, or every endpoint for a queue token. */
+export async function DeletePushSubscription(
+  restaurantId: string,
+  input: { endpoint?: unknown; token?: unknown },
+): Promise<{ success: true; removed: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensurePushSubscriptionsTable();
+  const endpoint = String(input.endpoint ?? "").trim();
+  const token = String(input.token ?? "").trim();
+  if (!endpoint && !token) {return { success: true, removed: 0 };}
+  const rows = await runQuery<{ id: string }>(
+    endpoint
+      ? `delete from "PushSubscriptions" where res_id = $1 and endpoint = $2 returning id`
+      : `delete from "PushSubscriptions" where res_id = $1 and waitlist_token = $2::uuid returning id`,
+    [context.res_id, endpoint || token],
+  );
+  return { success: true, removed: rows.length };
+}
+
+/** Every stored endpoint for a queue entry (used when calling/seating it). */
+export async function GetPushSubscriptionsForWaitlist(restaurantId: string, waitlistId: string): Promise<PushSubscriptionRow[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensurePushSubscriptionsTable();
+  const rows = await runQuery<PushSubscriptionRow>(
+    `select id, endpoint, p256dh, auth, waitlist_id, waitlist_token
+       from "PushSubscriptions" where res_id = $1 and waitlist_id = $2::uuid`,
+    [context.res_id, waitlistId],
+  );
+  return rows;
+}
+
+/**
+ * Record the outcome of a send. A push service replying 404/410 means the
+ * subscription is dead (the guest cleared site data / uninstalled) — drop it so
+ * we stop posting to a gone endpoint.
+ */
+export async function RecordPushResult(restaurantId: string, id: string, outcome: "sent" | "gone" | "failed"): Promise<void> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensurePushSubscriptionsTable();
+  if (outcome === "gone") {
+    await runQuery(`delete from "PushSubscriptions" where res_id = $1 and id = $2`, [context.res_id, id]);
+    return;
+  }
+  await runQuery(
+    outcome === "sent"
+      ? `update "PushSubscriptions" set last_sent_at = now(), failure_count = 0 where res_id = $1 and id = $2`
+      : `update "PushSubscriptions" set failure_count = failure_count + 1 where res_id = $1 and id = $2`,
+    [context.res_id, id],
+  );
 }
 
 // Auto-assign the seating employee to a table by ids (drives APC + feedback/rating
@@ -14299,6 +16077,194 @@ function kpiBand(value: number | null, dir: "lower" | "higher", b: [number, numb
   return value >= b[0] ? "blue" : value >= b[1] ? "green" : value >= b[2] ? "amber" : "red";
 }
 
+// --- Staff attendance (analytics) -------------------------------------------
+// Same shift-hours cap payroll uses, so "hours worked" here can be reconciled
+// against a payslip instead of quietly disagreeing with it.
+const ATTENDANCE_ANALYTICS_SHIFT_CAP_HOURS = 16;
+// A shift only counts as LATE past this many minutes after the baseline, so
+// normal minute-to-minute variation isn't flagged.
+const ATTENDANCE_LATE_GRACE_MIN = 15;
+// Below this many worked days there is no honest baseline to be late against.
+const ATTENDANCE_LATE_MIN_DAYS = 3;
+
+export interface StaffAttendanceStat {
+  emp_id: string;
+  name: string;
+  /** Counted (approved / legacy) shifts in the window. */
+  shifts: number;
+  hours_worked: number;
+  avg_shift_hours: number;
+  /** Distinct calendar days with at least one counted shift. */
+  days_present: number;
+  /**
+   * Days this restaurant was open (someone clocked in) on/after this person's
+   * first counted day in the window, on which they never clocked in.
+   */
+  absent_days: number;
+  /** First clock-ins later than `typical_start` + 15 min. */
+  late_shifts: number;
+  late_pct: number | null;
+  /** "HH:MM" median first clock-in — the baseline late is measured against. */
+  typical_start: string | null;
+  /** Clock-ins still awaiting admin review (they do NOT count toward hours). */
+  pending_shifts: number;
+  rejected_shifts: number;
+  currently_clocked_in: boolean;
+  /** ISO timestamp of the latest clock-out (or clock-in, if still open). */
+  last_seen: string | null;
+}
+
+export interface StaffAttendanceSummary {
+  window_days: number;
+  staff_tracked: number;
+  /** Distinct days in the window on which ANY employee clocked in. */
+  operating_days: number;
+  total_shifts: number;
+  total_hours: number;
+  avg_hours_per_staff: number;
+  pending_shifts: number;
+  late_shifts: number;
+  absent_days: number;
+}
+
+/**
+ * Per-staff attendance over the analytics window.
+ *
+ * DEFINITIONS (there is no shift roster in the product, so "late" and "absent"
+ * are derived from the attendance record itself and are stated here honestly):
+ *  - hours_worked  sum of (clock_out − clock_in), each shift capped at 16h, over
+ *                  APPROVED (or legacy NULL-status) rows only. An open shift is
+ *                  counted up to now, exactly like GetAttendanceSummary.
+ *  - typical_start the MEDIAN time-of-day of the person's own first clock-in per
+ *                  day. Needs >= 3 worked days, else null.
+ *  - late_shifts   days whose first clock-in was more than 15 min after that
+ *                  person's own typical_start. 0 whenever typical_start is null.
+ *  - absent_days   days the restaurant was open (someone clocked in) on/after
+ *                  this person's first worked day in the window, on which they
+ *                  have no counted shift. Bounded by the window, so a new hire
+ *                  is never marked absent for days before they started.
+ */
+async function getStaffAttendanceStats(
+  resId: string,
+  outletId: string,
+  outletGuard: string,
+  days: number,
+): Promise<{ rows: StaffAttendanceStat[]; summary: StaffAttendanceSummary }> {
+  await ensureAttendanceTable();
+  const rows = await runQuery<{
+    emp_id: string;
+    fname: string | null;
+    lname: string | null;
+    clock_in: Date | string;
+    clock_out: Date | string | null;
+    status: string | null;
+    day: string;
+    start_min: number | string;
+  }>(
+    `select a.emp_id, e."emp_Fname" as fname, e."emp_Lname" as lname,
+            a.clock_in, a.clock_out, a.status,
+            to_char(a.clock_in, 'YYYY-MM-DD') as day,
+            (extract(epoch from a.clock_in::time) / 60.0) as start_min
+       from "Attendance" a
+       left join "Employees" e on e.id = a.emp_id and e.res_id = a.res_id
+      where a.res_id = $1 and (${outletGuard} or a.outlet_id = $2)
+        and a.clock_in >= now() - ($3 || ' days')::interval
+      order by a.clock_in asc`,
+    [resId, outletId, String(days)],
+  ).catch(() => [] as never[]);
+
+  const nowMs = Date.now();
+  const capMs = ATTENDANCE_ANALYTICS_SHIFT_CAP_HOURS * 60 * 60 * 1000;
+  interface Acc {
+    emp_id: string; name: string; shifts: number; ms: number;
+    days: Set<string>; firstStartByDay: Map<string, number>;
+    pending: number; rejected: number; open: boolean; lastSeen: number;
+  }
+  const byEmp = new Map<string, Acc>();
+  const operatingDays = new Set<string>();
+
+  for (const r of rows) {
+    const name = [r.fname, r.lname].filter(Boolean).join(" ").trim() || "Employee";
+    const acc = byEmp.get(r.emp_id) ?? {
+      emp_id: r.emp_id, name, shifts: 0, ms: 0,
+      days: new Set<string>(), firstStartByDay: new Map<string, number>(),
+      pending: 0, rejected: 0, open: false, lastSeen: 0,
+    };
+    acc.name = name;
+    if (r.status === "rejected") { acc.rejected += 1; byEmp.set(r.emp_id, acc); continue; }
+    if (r.status === "pending") { acc.pending += 1; }
+    // An un-reviewed clock-in still means the person is physically here, so it
+    // drives currently_clocked_in / last_seen — but never hours or shift counts.
+    const inMs = new Date(r.clock_in).getTime();
+    const outMs = r.clock_out ? new Date(r.clock_out).getTime() : null;
+    if (!r.clock_out) { acc.open = true; }
+    const seen = outMs ?? inMs;
+    if (Number.isFinite(seen) && seen > acc.lastSeen) { acc.lastSeen = seen; }
+    if (r.status === "pending") { byEmp.set(r.emp_id, acc); continue; }
+
+    acc.shifts += 1;
+    acc.ms += Math.min(capMs, Math.max(0, (outMs ?? nowMs) - inMs));
+    acc.days.add(r.day);
+    operatingDays.add(r.day);
+    // rows arrive clock_in ASC, so the first row for a day IS the first clock-in.
+    const startMin = Number(r.start_min);
+    if (Number.isFinite(startMin) && !acc.firstStartByDay.has(r.day)) { acc.firstStartByDay.set(r.day, startMin); }
+    byEmp.set(r.emp_id, acc);
+  }
+
+  const openDays = [...operatingDays].sort();
+  const median = (arr: number[]): number => {
+    const s = [...arr].sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+  };
+  const hhmm = (minuteOfDay: number): string => {
+    const m = Math.max(0, Math.round(minuteOfDay)) % (24 * 60);
+    return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  };
+
+  const out: StaffAttendanceStat[] = [...byEmp.values()].map((a) => {
+    const starts = [...a.firstStartByDay.entries()].sort((x, y) => (x[0] < y[0] ? -1 : 1));
+    const baseline = starts.length >= ATTENDANCE_LATE_MIN_DAYS ? median(starts.map(([, v]) => v)) : null;
+    const late = baseline == null ? 0 : starts.filter(([, v]) => v > baseline + ATTENDANCE_LATE_GRACE_MIN).length;
+    const firstDay = starts.length ? starts[0]![0] : null;
+    const absent = firstDay == null ? 0 : openDays.filter((d) => d >= firstDay && !a.days.has(d)).length;
+    const hours = a.ms / 3_600_000;
+    return {
+      emp_id: a.emp_id,
+      name: a.name,
+      shifts: a.shifts,
+      hours_worked: round2(hours),
+      avg_shift_hours: a.shifts > 0 ? round2(hours / a.shifts) : 0,
+      days_present: a.days.size,
+      absent_days: absent,
+      late_shifts: late,
+      late_pct: baseline == null || starts.length === 0 ? null : round2((late / starts.length) * 100),
+      typical_start: baseline == null ? null : hhmm(baseline),
+      pending_shifts: a.pending,
+      rejected_shifts: a.rejected,
+      currently_clocked_in: a.open,
+      last_seen: a.lastSeen > 0 ? new Date(a.lastSeen).toISOString() : null,
+    };
+  }).sort((x, y) => y.hours_worked - x.hours_worked || x.name.localeCompare(y.name));
+
+  const totalHours = out.reduce((s, r) => s + r.hours_worked, 0);
+  return {
+    rows: out,
+    summary: {
+      window_days: days,
+      staff_tracked: out.length,
+      operating_days: openDays.length,
+      total_shifts: out.reduce((s, r) => s + r.shifts, 0),
+      total_hours: round2(totalHours),
+      avg_hours_per_staff: out.length ? round2(totalHours / out.length) : 0,
+      pending_shifts: out.reduce((s, r) => s + r.pending_shifts, 0),
+      late_shifts: out.reduce((s, r) => s + r.late_shifts, 0),
+      absent_days: out.reduce((s, r) => s + r.absent_days, 0),
+    },
+  };
+}
+
 // One consolidated pass computing the analytics-spec metrics that are derivable
 // from existing data. Everything is tenant + outlet scoped and windowed to `days`.
 export async function GetAdvancedAnalytics(
@@ -14342,6 +16308,9 @@ export async function GetAdvancedAnalytics(
     avg_rating: r.avg_rating != null ? round2(r.avg_rating) : null,
     complaint_pct: r.feedbacks > 0 ? round2((r.negatives / r.feedbacks) * 100) : 0,
   }));
+
+  // Per-staff ATTENDANCE over the same window as the rest of staff analytics.
+  const staff_attendance = await getStaffAttendanceStats(rid, oid, og, days);
 
   // Order processing time = bill time − order time, guarded to a sane 0–24h window
   // so a table left open for days doesn't blow up the average.
@@ -14894,6 +16863,10 @@ export async function GetAdvancedAnalytics(
     window_days: days,
     discounts: { total_bills: disc.total_bills, discount_bills: disc.discount_bills, utilization_pct, total_discount: round2(disc.total_discount), redemptions: disc.redemptions },
     staff, overall_avg_rating: weightedRating, overall_complaint_pct, total_feedbacks: totalFb,
+    // Attendance per staff member over the same `window_days` (see
+    // getStaffAttendanceStats for exactly how late/absent are defined).
+    staff_attendance: staff_attendance.rows,
+    attendance_summary: staff_attendance.summary,
     processing_time_min, processing_time_n: proc.n,
     suppliers, overall_on_time_pct, overall_supplier_score,
     demographics,
@@ -15093,6 +17066,7 @@ export async function GetMonthlyApcInsights(
     food: unknown;
     status: unknown;
     bill_status: number | null;
+    bill_id: string | null;
     admin_approved_at: Date | null;
     waiter_confirmed_by_username: string | null;
   }>(
@@ -15102,10 +17076,15 @@ export async function GetMonthlyApcInsights(
         o.created_at,
         o.table_id,
         t.table_name,
-        coalesce(t.num_covers, 1) as num_covers,
+        -- Covers AS OF THAT SEATING. "Tables".num_covers is the LIVE value and is
+        -- reset to 1 when a table is released, so reading it here made every
+        -- settled seating look like one cover — the month's cover count barely
+        -- moved no matter how many parties were served.
+        coalesce(ses.covers, t.num_covers, 1) as num_covers,
         o.food,
         o.status,
         b.status as bill_status,
+        b.id as bill_id,
         b.admin_approved_at,
         b.waiter_confirmed_by_username
       from "Orders" o
@@ -15114,6 +17093,16 @@ export async function GetMonthlyApcInsights(
       left join "Bills" b
         on (b.order_id = o.id or (b.table_id = o.table_id and b.closed_at is null))
         and b.res_id = o.res_id and b.outlet_id = o.outlet_id
+      -- The seating this order belongs to: the latest session started at or before
+      -- the order. Its covers survive the table being released.
+      left join lateral (
+        select ts.covers
+        from "TableSessions" ts
+        where ts.res_id = o.res_id and ts.outlet_id = o.outlet_id and ts.table_id = o.table_id
+          and ts.seated_at <= o.created_at
+        order by ts.seated_at desc
+        limit 1
+      ) ses on true
       where
         o.res_id = $1 and o.outlet_id = $2
         and o.created_at >= $3 and o.created_at < $4
@@ -15215,6 +17204,11 @@ export async function GetMonthlyApcInsights(
 
     return {
       order_id: row.id,
+      // The SEATING this order belongs to. A table's consolidated bill is one
+      // seating; covers are counted once per seating, NOT once per table for the
+      // whole period (that collapsed a table's every service into a single cover
+      // count, so settling another party at an already-used table added nothing).
+      bill_id: row.bill_id ?? null,
       table_name: row.table_name ?? String(payload.table ?? ""),
       created_at: createdAt.toISOString(),
       total: round2(total),
@@ -15256,7 +17250,12 @@ export async function GetMonthlyApcInsights(
   }
   const byTable = new Map<string, TableAgg>();
   for (const o of effectiveOrders) {
-    const key = o.table_name || o.order_id;
+    // Group by SEATING, not by table. Keying on table_name alone folded every
+    // service that table had all period into one row, so its covers were counted
+    // ONCE for the whole month — settling a second party at T1 never moved the
+    // cover count. The bill id is the seating; while a table is still open it has
+    // no closed bill yet, so fall back to the table (its one live session).
+    const key = o.bill_id ?? `open:${o.table_name || o.order_id}`;
     const agg = byTable.get(key) ?? {
       table_name: o.table_name,
       total: 0,
@@ -15267,7 +17266,8 @@ export async function GetMonthlyApcInsights(
       employee_role: o.assigned_employee_role,
     };
     agg.total = round2(agg.total + o.total);
-    agg.covers = Math.max(agg.covers, o.people_count); // covers counted once per table
+    // Once per SEATING: several orders on the same bill share its cover count.
+    agg.covers = Math.max(agg.covers, o.people_count);
     if (o.created_at > agg.created_at) {agg.created_at = o.created_at;}
     agg.employee_id ??= o.assigned_employee_id;
     agg.employee_name ??= o.assigned_employee_name;
@@ -16517,23 +18517,53 @@ export interface BrandConfig {
   // --- LIVE (drives the dark guest design) ---------------------------------
   /** Body font for the guest surfaces (BRAND_FONTS allowlist). */
   font?: string;
-  /** The brand ACCENT — the single hex the 6-stop accent ramp is derived from. */
+  /** The brand PRIMARY — the single hex the 6-stop accent ramp is derived from. */
   color_primary?: string;
+  /** Secondary/supporting accent (chips, secondary buttons). Defaults to the ramp's mid stop. */
+  color_secondary?: string;
+  /** Highlight/tertiary accent (badges, price emphasis). Defaults to the ramp's high stop. */
+  color_accent?: string;
+  /** Page shell background. Defaults to the shipped near-black #08080A. */
+  color_bg?: string;
+  /** Panel/card surface base colour (the alpha comes from surface_style). Defaults #1A1A1F. */
+  color_card?: string;
+  /** Body ink. Defaults to the shipped warm off-white #ECEAE6. */
+  color_text?: string;
+  /** Positive/confirmation colour. Defaults to the shipped green #8FB27C. */
+  color_success?: string;
+  /** Caution colour. Defaults to the shipped amber #E4C48C. */
+  color_warning?: string;
+  /** Error/destructive colour. Defaults to the shipped soft red #E0A79B. */
+  color_error?: string;
   /** Hero/header wash: accent gradient (default) or a flat accent block. */
   header_style?: "gradient" | "solid";
   /** Radius of controls/buttons/chips (--rCtrl): rounded 13px | pill 999px | square 4px. */
   button_shape?: "rounded" | "pill" | "square";
   /** Panel material of every card/sheet (--panelBg/--blur/--pbA). */
   surface_style?: "frosted" | "solid" | "tinted";
-  // --- LEGACY (stored, sanitized, but no longer drives anything) -----------
-  color_secondary?: string;
-  color_bg?: string;
-  color_text?: string;
-  color_card?: string;
+  /**
+   * Palette opt-in marker. See BRAND_PALETTE_REV: color_secondary / color_bg /
+   * color_card / color_text were accepted-but-DEAD for a long time, so tenants
+   * carry stale values that were never rendered. Those four are only APPLIED once
+   * this is >= BRAND_PALETTE_REV, which is stamped automatically the first time a
+   * caller writes a palette key under the new contract. Set by the server, not
+   * something an editor needs to think about.
+   */
+  palette_rev?: number;
 }
 
 const BRAND_HEX_RE = /^#[0-9a-fA-F]{6}$/;
-const BRAND_COLOR_KEYS = ["color_primary", "color_secondary", "color_bg", "color_text", "color_card"] as const;
+const BRAND_COLOR_KEYS = [
+  "color_primary",
+  "color_secondary",
+  "color_accent",
+  "color_bg",
+  "color_card",
+  "color_text",
+  "color_success",
+  "color_warning",
+  "color_error",
+] as const;
 export const BRAND_HEADER_STYLES: string[] = ["gradient", "solid"];
 export const BRAND_BUTTON_SHAPES: string[] = ["rounded", "pill", "square"];
 export const BRAND_SURFACE_STYLES: string[] = ["frosted", "solid", "tinted"];
@@ -16549,14 +18579,28 @@ export const BRAND_SURFACE_STYLES: string[] = ["frosted", "solid", "tinted"];
  *      solid   (rgba(18,18,21,0.94) / 0px  / 0.10)
  *      tinted  (accent-tinted glass: rgba(accShadow,0.42) / 22px / 0.18)
  */
-export const BRAND_LIVE_FIELDS: string[] = ["color_primary", "font", "header_style", "button_shape", "surface_style"];
+export const BRAND_LIVE_FIELDS: string[] = [
+  "color_primary",
+  "color_secondary",
+  "color_accent",
+  "color_bg",
+  "color_card",
+  "color_text",
+  "color_success",
+  "color_warning",
+  "color_error",
+  "font",
+  "header_style",
+  "button_shape",
+  "surface_style",
+];
 
 /**
- * Keys still accepted and stored (a tenant may have set them long ago) but which
- * the dark guest design cannot express, so they drive nothing. Editors must not
- * offer them as if they had an effect.
+ * Keys accepted and stored but which drive nothing. EMPTY since the palette was
+ * revived: every colour key is now a real role in the resolved palette (see
+ * resolveBrandPalette), so there is nothing left to hide from the editors.
  */
-export const BRAND_LEGACY_FIELDS: string[] = ["color_secondary", "color_bg", "color_text", "color_card"];
+export const BRAND_LEGACY_FIELDS: string[] = [];
 
 // Validate a customization payload down to the STORED subset: only the keys the
 // caller actually provided AND that pass validation survive (invalid colours,
@@ -16574,7 +18618,22 @@ export function sanitizeBrandConfigInput(raw: unknown): BrandConfig {
   if (s.header_style === "gradient" || s.header_style === "solid") {out.header_style = s.header_style;}
   if (s.button_shape === "rounded" || s.button_shape === "pill" || s.button_shape === "square") {out.button_shape = s.button_shape;}
   if (s.surface_style === "frosted" || s.surface_style === "solid" || s.surface_style === "tinted") {out.surface_style = s.surface_style;}
+  // Passed through only when already present — the opt-in is STAMPED ON WRITE
+  // (see brandPaletteOptIn / SetBranding), never inferred while reading, or every
+  // tenant carrying a stale colour key would opt itself in the first time it read.
+  const rev = Number(s.palette_rev);
+  if (Number.isFinite(rev) && rev >= BRAND_PALETTE_REV) {out.palette_rev = BRAND_PALETTE_REV;}
   return out;
+}
+
+/**
+ * Does this WRITE opt the tenant into the revived palette? color_primary was
+ * always live, so setting only it changes nothing about the retired keys; any
+ * other palette colour means the caller is using the new editor.
+ */
+function brandPaletteOptIn(sanitized: BrandConfig): boolean {
+  if (sanitized.palette_rev && sanitized.palette_rev >= BRAND_PALETTE_REV) {return true;}
+  return BRAND_COLOR_KEYS.some((k) => k !== "color_primary" && typeof sanitized[k] === "string");
 }
 
 // Read-time view of the stored brand_config with sane defaults applied so the
@@ -16590,20 +18649,157 @@ export function sanitizeBrandConfigInput(raw: unknown): BrandConfig {
 // nothing consumed it; the default moved to "rounded" when the key became live.
 export function resolveBrandConfig(stored: unknown, themePrimary: string | null, themeColor: string | null): BrandConfig {
   const c = sanitizeBrandConfigInput(stored);
-  const primaryFallback = themePrimary && BRAND_HEX_RE.test(themePrimary)
-    ? themePrimary
-    : themeColor && BRAND_HEX_RE.test(themeColor) ? themeColor : undefined;
-  const colorPrimary = c.color_primary ?? primaryFallback;
+  const palette = resolveBrandPalette(stored, themePrimary, themeColor);
+  // Every colour key is resolved (never absent) so the editors can prefill a real
+  // swatch for each role instead of showing an empty picker. The values ARE the
+  // shipped design when the tenant never touched them, so nothing changes visually.
   return {
     font: c.font ?? "Inter",
     header_style: c.header_style ?? "gradient",
     button_shape: c.button_shape ?? "rounded",
     surface_style: c.surface_style ?? "frosted",
-    ...(colorPrimary ? { color_primary: colorPrimary } : {}),
-    ...(c.color_secondary ? { color_secondary: c.color_secondary } : {}),
-    ...(c.color_bg ? { color_bg: c.color_bg } : {}),
-    ...(c.color_text ? { color_text: c.color_text } : {}),
-    ...(c.color_card ? { color_card: c.color_card } : {}),
+    color_primary: palette.primary,
+    color_secondary: palette.secondary,
+    color_accent: palette.accent,
+    color_bg: palette.background,
+    color_card: palette.surface,
+    color_text: palette.text,
+    color_success: palette.success,
+    color_warning: palette.warning,
+    color_error: palette.error,
+    // Echoed so an editor that saves back what it loaded keeps the opt-in (and a
+    // tenant that has not opted in yet does so by saving the resolved palette).
+    ...(c.palette_rev ? { palette_rev: c.palette_rev } : {}),
+  };
+}
+
+// --- Resolved brand PALETTE -------------------------------------------------
+// The guest surfaces (QR order page, feedback, valet, queue) all theme themselves
+// from ONE brand colour today: a 6-stop ramp derived from the accent, on a fixed
+// near-black shell. The palette below turns that into an explicit, named set of
+// roles the tenant can override individually — while every default reproduces the
+// shipped design EXACTLY, so an untouched tenant is pixel-identical.
+//
+// Defaults (see BRAND_PALETTE_DEFAULTS + the ramp):
+//   primary    color_primary   → logo-extracted theme_primary → theme_color → #ea580c
+//   secondary  color_secondary → ramp(primary).mid   (L .51, s-3)
+//   accent     color_accent    → ramp(primary).hi    (L .75, s+7)
+//   background color_bg        → #08080A  (shell bg)
+//   surface    color_card      → #1A1A1F  (frosted panel base; alpha from surface_style)
+//   text       color_text      → #ECEAE6  (body ink)
+//   success    color_success   → #8FB27C
+//   warning    color_warning   → #E4C48C
+//   error      color_error     → #E0A79B
+export interface BrandPalette {
+  primary: string;
+  secondary: string;
+  accent: string;
+  background: string;
+  surface: string;
+  text: string;
+  success: string;
+  warning: string;
+  error: string;
+}
+
+/** The ultimate fallback accent — the value the guest pages have always used. */
+export const BRAND_DEFAULT_PRIMARY = "#ea580c";
+
+/**
+ * Palette revision. color_secondary / color_bg / color_card / color_text were
+ * ACCEPTED BUT DEAD for a long time, so real tenants carry values that were never
+ * rendered (csrorganics, for instance, has a mid-grey background and a pure-black
+ * card sitting in its brand_config from an old light-theme editor). Reviving those
+ * keys blindly would have redecorated live guest pages that nobody asked to
+ * change. So the four retired keys only take effect once brand_config carries
+ * palette_rev >= this — stamped automatically the first time any palette key
+ * other than color_primary is written (see sanitizeBrandConfigInput).
+ *
+ * Nothing is lost: the old values stay in the column, and because GET returns the
+ * RESOLVED palette, an editor that saves what it loaded overwrites the stale
+ * values with the correct ones and opts in, in one round-trip.
+ */
+export const BRAND_PALETTE_REV = 2;
+
+/**
+ * Fixed defaults for the roles the accent ramp does NOT derive. These are the
+ * literal colours the shipped guest design uses today.
+ */
+export const BRAND_PALETTE_DEFAULTS: Omit<BrandPalette, "primary" | "secondary" | "accent"> = {
+  background: "#08080A",
+  surface: "#1A1A1F",
+  text: "#ECEAE6",
+  success: "#8FB27C",
+  warning: "#E4C48C",
+  error: "#E0A79B",
+};
+
+const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
+
+// h in degrees, s & l in 0..1 → #rrggbb. Mirrors the guest pages' hsl2rgb so the
+// server-derived secondary/accent land on the SAME stops the client computes.
+function brandHslHex(h: number, s: number, l: number): string {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    return l - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+  };
+  const rgb = [f(0), f(8), f(4)].map((v) => Math.max(0, Math.min(255, Math.round(v * 255))));
+  return "#" + rgb.map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+// #rrggbb → { h(deg), s(0..100) }. Falls back to the copper hue/sat.
+function brandHexToHs(hex: string): { h: number; s: number } {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec((hex ?? "").trim());
+  if (!m?.[1]) {return { h: 24, s: 38 };}
+  const n = parseInt(m[1], 16);
+  const r = ((n >> 16) & 0xff) / 255, g = ((n >> 8) & 0xff) / 255, b = (n & 0xff) / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  let h = 0, s = 0;
+  const l = (mx + mn) / 2;
+  if (mx !== mn) {
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    if (mx === r) {h = (g - b) / d + (g < b ? 6 : 0);}
+    else if (mx === g) {h = (b - r) / d + 2;}
+    else {h = (r - g) / d + 4;}
+    h *= 60;
+  }
+  return { h, s: s * 100 };
+}
+
+/**
+ * Resolve the tenant's full guest palette. `stored` is the raw brand_config jsonb;
+ * themePrimary is the logo-extracted colour and themeColor the legacy theme hex —
+ * both are only ever fallbacks for `primary`, exactly as before.
+ *
+ * Every returned value is a valid #rrggbb; nothing is ever null, so a client can
+ * theme itself from this object alone with no null-checks and no colour maths.
+ */
+export function resolveBrandPalette(stored: unknown, themePrimary: string | null, themeColor: string | null): BrandPalette {
+  const c = sanitizeBrandConfigInput(stored);
+  const primary = c.color_primary
+    ?? (themePrimary && BRAND_HEX_RE.test(themePrimary) ? themePrimary : undefined)
+    ?? (themeColor && BRAND_HEX_RE.test(themeColor) ? themeColor : undefined)
+    ?? BRAND_DEFAULT_PRIMARY;
+  const { h, s } = brandHexToHs(primary);
+  // The four keys that used to be dead only count once the tenant has opted in
+  // (see BRAND_PALETTE_REV) — otherwise a stale value from an old editor would
+  // silently redecorate a live guest page.
+  const revived = Number(c.palette_rev ?? 0) >= BRAND_PALETTE_REV;
+  const pick = (v: string | undefined) => (revived ? v : undefined);
+  return {
+    primary,
+    secondary: pick(c.color_secondary) ?? brandHslHex(h, clamp01((s - 3) / 100), 0.51),
+    // color_accent / _success / _warning / _error are NEW keys — nothing stale can
+    // exist under them, so they apply the moment they are set.
+    accent: c.color_accent ?? brandHslHex(h, clamp01((s + 7) / 100), 0.75),
+    background: pick(c.color_bg) ?? BRAND_PALETTE_DEFAULTS.background,
+    surface: pick(c.color_card) ?? BRAND_PALETTE_DEFAULTS.surface,
+    text: pick(c.color_text) ?? BRAND_PALETTE_DEFAULTS.text,
+    success: c.color_success ?? BRAND_PALETTE_DEFAULTS.success,
+    warning: c.color_warning ?? BRAND_PALETTE_DEFAULTS.warning,
+    error: c.color_error ?? BRAND_PALETTE_DEFAULTS.error,
   };
 }
 
@@ -16650,20 +18846,29 @@ export interface RestaurantSettings {
   // Rich customer-page branding (resolved with defaults — see resolveBrandConfig)
   // so the admin UI can prefill the editor.
   brand_config: BrandConfig;
+  // The RESOLVED guest palette (role -> #rrggbb, never null) derived from
+  // brand_config + the fallbacks. Clients theme from this; brand_config is what
+  // the editor writes back. See resolveBrandPalette.
+  brand_palette: BrandPalette;
   // The curated font allowlist the branding editor renders as a dropdown.
   brand_fonts: string[];
   // Which brand_config keys actually drive the guest surfaces (`live`) and which
   // are only kept for back-compat (`legacy`) — see BRAND_LIVE_FIELDS. Editors
   // render controls for `live` only; `legacy` values are still returned in
-  // brand_config when set, so nothing is lost.
+  // brand_config when set, so nothing is lost. `legacy` is now EMPTY (the whole
+  // palette was revived) but the shape is kept so no client has to change.
   brand_fields: { live: string[]; legacy: string[] };
   // Accepted values for each enum-ish live key, so the editors don't hardcode them.
   brand_field_options: { font: string[]; header_style: string[]; button_shape: string[]; surface_style: string[] };
+  // Which live keys are colours (hex) vs enums, and the default each falls back
+  // to — so an editor can render "Reset to default" without hardcoding values.
+  brand_color_fields: string[];
+  brand_field_defaults: Record<string, string>;
 }
 
 // The live/legacy split + option lists, returned by GetRestaurantSettings and
 // SetRestaurantSettings so both editors read it from one place.
-function brandFieldMeta(): Pick<RestaurantSettings, "brand_fields" | "brand_field_options"> {
+function brandFieldMeta(): Pick<RestaurantSettings, "brand_fields" | "brand_field_options" | "brand_color_fields" | "brand_field_defaults"> {
   return {
     brand_fields: { live: [...BRAND_LIVE_FIELDS], legacy: [...BRAND_LEGACY_FIELDS] },
     brand_field_options: {
@@ -16671,6 +18876,24 @@ function brandFieldMeta(): Pick<RestaurantSettings, "brand_fields" | "brand_fiel
       header_style: [...BRAND_HEADER_STYLES],
       button_shape: [...BRAND_BUTTON_SHAPES],
       surface_style: [...BRAND_SURFACE_STYLES],
+    },
+    brand_color_fields: [...BRAND_COLOR_KEYS],
+    brand_field_defaults: {
+      color_primary: BRAND_DEFAULT_PRIMARY,
+      // Derived from color_primary when unset — the literal here is the value for
+      // the DEFAULT primary, so the editor always has something to show.
+      color_secondary: resolveBrandPalette(null, null, null).secondary,
+      color_accent: resolveBrandPalette(null, null, null).accent,
+      color_bg: BRAND_PALETTE_DEFAULTS.background,
+      color_card: BRAND_PALETTE_DEFAULTS.surface,
+      color_text: BRAND_PALETTE_DEFAULTS.text,
+      color_success: BRAND_PALETTE_DEFAULTS.success,
+      color_warning: BRAND_PALETTE_DEFAULTS.warning,
+      color_error: BRAND_PALETTE_DEFAULTS.error,
+      font: "Inter",
+      header_style: "gradient",
+      button_shape: "rounded",
+      surface_style: "frosted",
     },
   };
 }
@@ -16755,6 +18978,7 @@ export async function GetRestaurantSettings(
     // is only resolved on the public branding path to keep this admin read cheap)
     // plus the curated font allowlist for the dropdown and the live/legacy split.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
+    brand_palette: resolveBrandPalette(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
     brand_fonts: [...BRAND_FONTS],
     ...brandFieldMeta(),
   };
@@ -16967,6 +19191,7 @@ export async function SetRestaurantSettings(
     // brand_config isn't written here (branding is set via SetBranding), but the
     // type requires it — echo the current stored value resolved with defaults.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
+    brand_palette: resolveBrandPalette(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
     brand_fonts: [...BRAND_FONTS],
     ...brandFieldMeta(),
   };
@@ -17084,7 +19309,7 @@ export async function ExtractLogoPalette(logoRef: string | null): Promise<{ prim
 
 export async function GetPublicBranding(
   restaurantId: string,
-): Promise<{ logo_url: string | null; theme_color: string | null; theme_primary: string | null; theme_secondary: string | null; currency: string; payment_methods: PaymentMethodConfig[]; restaurant_name: string; feedback_config: FeedbackConfig; bill_logo_svg: string; queue_show_menu: boolean; timezone: string; require_table_otp: boolean; brand_config: BrandConfig }> {
+): Promise<{ logo_url: string | null; theme_color: string | null; theme_primary: string | null; theme_secondary: string | null; currency: string; payment_methods: PaymentMethodConfig[]; restaurant_name: string; feedback_config: FeedbackConfig; bill_logo_svg: string; queue_show_menu: boolean; timezone: string; require_table_otp: boolean; brand_config: BrandConfig; brand_palette: BrandPalette }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
   const rows = await runQuery<{ logo: string | null; theme_color: string | null; currency: string | null; payment_config: unknown; feedback_config: unknown; res_name: string | null; bill_logo_svg: string | null; queue_show_menu: boolean | null; timezone: string | null; require_table_otp: boolean | null; brand_config: unknown }>(
@@ -17114,31 +19339,75 @@ export async function GetPublicBranding(
     // falls back to the logo palette / theme_color so existing tenants are
     // visually unchanged.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
+    // The RESOLVED palette (role -> hex, never null) the guest surfaces theme
+    // from. Same inputs as brand_config, one flat object with no null-checks.
+    brand_palette: resolveBrandPalette(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
   };
 }
 
 export async function SetBranding(
   restaurantId: string,
   opts: { logo_url?: string | null; theme_color?: string | null; queue_show_menu?: boolean; brand_config?: unknown },
-): Promise<{ logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: BrandConfig }> {
+): Promise<{ logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: BrandConfig; brand_palette: BrandPalette }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
   // brand_config: only touched when provided. Merge-on-omit — the sanitized
   // (provided, valid keys only) object is jsonb-concatenated onto the stored
   // one, so keys the caller didn't send keep their current value. An unset/null
   // column starts from '{}'. Invalid keys were already dropped by the sanitizer.
-  const brandConfig = opts.brand_config !== undefined ? JSON.stringify(sanitizeBrandConfigInput(opts.brand_config)) : null;
+  let brandConfig: string | null = null;
+  // Colour roles to REMOVE from the stored object. brand_config is jsonb-MERGED,
+  // so without this a role could never be reset to "derive from the accent" once
+  // set — the editor's "Auto" button would silently do nothing.
+  let clearKeys: string[] = [];
+  if (opts.brand_config !== undefined) {
+    const rawInput = (opts.brand_config ?? {}) as Record<string, unknown>;
+    const sanitized = sanitizeBrandConfigInput(opts.brand_config);
+    // Stamp the palette opt-in HERE (the write path). Reading must never stamp it
+    // — see BRAND_PALETTE_REV.
+    const optingIn = brandPaletteOptIn(sanitized);
+    if (optingIn) {sanitized.palette_rev = BRAND_PALETTE_REV;}
+
+    // A key the caller SENT but that is not a valid hex means "clear it".
+    clearKeys = BRAND_COLOR_KEYS.filter(
+      (k) => k in rawInput && typeof sanitized[k] !== "string",
+    );
+
+    // FIRST opt-in only: tenants carry colour values from the old (pre-dark)
+    // design that have been dormant for months — typically greys. Stamping
+    // palette_rev would activate them all at once and turn the guest pages grey,
+    // which is the opposite of what an owner opening the colour editor wants.
+    // So on the transition, drop every dormant role the caller is NOT setting now;
+    // those simply derive from the accent until deliberately chosen.
+    if (optingIn) {
+      const prior = await runQuery<{ rev: number | null }>(
+        `select (brand_config->>'palette_rev')::int as rev from "Restaurant" where id = $1 limit 1`,
+        [context.res_id],
+      );
+      const priorRev = Number(prior[0]?.rev ?? 0);
+      if (!Number.isFinite(priorRev) || priorRev < BRAND_PALETTE_REV) {
+        for (const k of BRAND_COLOR_KEYS) {
+          if (k === "color_primary") {continue;}
+          if (typeof sanitized[k] !== "string" && !clearKeys.includes(k)) {clearKeys.push(k);}
+        }
+      }
+    }
+    brandConfig = JSON.stringify(sanitized);
+  }
   const rows = await runQuery<{ logo: string | null; theme_color: string | null; queue_show_menu: boolean | null; brand_config: unknown }>(
     `
       update "Restaurant" set
         logo = coalesce($2, logo),
         theme_color = coalesce($3, theme_color),
         queue_show_menu = coalesce($4, queue_show_menu),
-        brand_config = case when $5::jsonb is null then brand_config else coalesce(brand_config, '{}'::jsonb) || $5::jsonb end
+        brand_config = case
+          when $5::jsonb is null then brand_config
+          else (coalesce(brand_config, '{}'::jsonb) || $5::jsonb) - $6::text[]
+        end
       where id = $1
       returning logo, theme_color, queue_show_menu, brand_config
     `,
-    [context.res_id, opts.logo_url ?? null, opts.theme_color ?? null, typeof opts.queue_show_menu === "boolean" ? opts.queue_show_menu : null, brandConfig],
+    [context.res_id, opts.logo_url ?? null, opts.theme_color ?? null, typeof opts.queue_show_menu === "boolean" ? opts.queue_show_menu : null, brandConfig, clearKeys],
   );
   const palette = await ExtractLogoPalette(rows[0]?.logo ?? null);
   return {
@@ -17146,6 +19415,7 @@ export async function SetBranding(
     theme_color: rows[0]?.theme_color ?? null,
     queue_show_menu: rows[0]?.queue_show_menu ?? true,
     brand_config: resolveBrandConfig(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
+    brand_palette: resolveBrandPalette(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
   };
 }
 
@@ -18612,9 +20882,9 @@ async function ensureAttendanceTable(_client?: PoolClient): Promise<void> {
     await runQuery(`alter table "Attendance" add column if not exists approved_at timestamptz`);
     // Dedicated audit action so approvals show up with an honest name in the log.
     await runQuery(
-      `insert into "Actions" (id, action_name, action_desc)
-       values ('e7a41c3b-5a20-4f6e-9d38-6c2b9a51f0aa', 'Approve Attendance', 'Review (approve/reject) employee clock-ins'),
-              ('b3f8d6a1-2c47-4e0b-8f5d-9e6a7c8b0d21', 'Attendance Clock Event', 'Employee clocked in or out')
+      `insert into "Actions" (id, action_name, action_desc, "group")
+       values ('e7a41c3b-5a20-4f6e-9d38-6c2b9a51f0aa', 'Approve Attendance', 'Review (approve/reject) employee clock-ins', 'Restaurant Specific'::"Action_groups"),
+              ('b3f8d6a1-2c47-4e0b-8f5d-9e6a7c8b0d21', 'Attendance Clock Event', 'Employee clocked in or out', 'Restaurant Specific'::"Action_groups")
        on conflict (id) do nothing`,
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
     await applyTenantRls("Attendance");
@@ -18715,7 +20985,7 @@ export async function GetAttendanceSummary(
 ): Promise<{ from: string; to: string; rows: AttendanceSummaryRow[]; pending: PendingClockIn[] }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureAttendanceTable();
-  const range = normalizeReportRange(fromIso, toIso);
+  const range = normalizeReportRange(fromIso, toIso, context.timezone);
   const rows = await runQuery<{ id: string; emp_id: string; clock_in: Date; clock_out: Date | null; status: string | null; fname: string | null; lname: string | null }>(
     `select a.id, a.emp_id, a.clock_in, a.clock_out, a.status, e."emp_Fname" as fname, e."emp_Lname" as lname
        from "Attendance" a
