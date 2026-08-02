@@ -101,6 +101,11 @@ import {
 	AddFeedbackEntry,
 	GetFeedbackEntries,
 	GetFeedbackSummary,
+	GetRestaurantTimezone,
+	dayKeyOf,
+	addDaysToKey,
+	weekdayOfDayKey,
+	zonedClockParts,
 	GetRecoveryTickets,
 	ResolveRecoveryTicket,
 	ClockIn,
@@ -430,7 +435,11 @@ async function log_audit(req: Request, action_id: string, action_description: st
 	if (!emp_dets) {throw new Error("Employee details not found for ID");}
 	await AddAuditLogEntry(
 		emp_dets.res_id,
-		emp_dets.outlet_id,
+		// The outlet the write actually landed on, NOT the actor's home outlet: an
+		// admin acting on another branch via the X-Outlet-Id override was leaving
+		// that branch's audit trail with no record of the change, since GetAuditLogs
+		// (and PerformAuditUndo) scope to the ACTIVE outlet.
+		extractOutletId(req),
 		employeeID,
 		action_id,
 		action_description,
@@ -9700,9 +9709,13 @@ app.post("/auth/forgot-password", rateLimit("forgot", 5, 60_000), async (req: Re
 	const slug = typeof body.restaurant === "string" ? body.restaurant.trim()
 		: typeof body.restaurantUsername === "string" ? body.restaurantUsername.trim() : "";
 	const username = typeof body.username === "string" ? body.username.trim() : "";
+	// Optional: the outlet the client picked in the pre-auth /auth/outlets picker.
+	// The same username can name different people in different outlets, so this is
+	// what tells them apart; without it the request is filed for every match.
+	const outletId = typeof body.outletId === "string" ? body.outletId.trim() : "";
 	if (!slug || !username) { res.status(400).json({ error: "restaurant and username are required" }); return; }
 	try {
-		await AddPasswordResetRequest(slug, username);
+		await AddPasswordResetRequest(slug, username, outletId || undefined);
 		// Always 200 (don't reveal whether the account exists).
 		res.json({ success: true });
 	} catch (e: any) {
@@ -9772,125 +9785,82 @@ app.get("/feedback/stats", validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53"
 
 	try {
 		const mode = String(req.query.mode ?? "daily");
+		// Every bucket below is a RESTAURANT calendar day/hour. Reading the
+		// instants with getUTC* shifted the hourly histogram by the zone offset
+		// and, when the client omitted `date`, defaulted to the wrong day during
+		// the restaurant's own late shift.
+		const tz = await GetRestaurantTimezone(auth.restaurantId);
 		const rows = await GetFeedbackEntries(auth.restaurantId, 5000);
 
-		// helper to parse ISO date (yyyy-mm-dd)
-		const parseDateISO = (s: string | undefined | null) => {
-			if (!s) {return null;}
-			const d = new Date(s);
-			if (!isNaN(d.getTime())) {return d;}
-			const parts = (s || "").split("-");
-			if (parts.length >= 3) {
-				const y = Number(parts[0]);
-				const m = Number(parts[1]) - 1;
-				const day = Number(parts[2]);
-				const dt = new Date(Date.UTC(y, m, day));
-				return dt;
-			}
-			return null;
+		// A request parameter is either an explicit YYYY-MM-DD (already a
+		// calendar day — take it as written) or an instant to be read in `tz`.
+		const dayKeyParam = (s: string | undefined | null): string | null => {
+			const raw = String(s ?? "").trim();
+			if (!raw) {return null;}
+			if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {return raw;}
+			const d = new Date(raw);
+			return isNaN(d.getTime()) ? null : dayKeyOf(d, tz);
 		};
+		const localKeys = rows
+			.map((r) => zonedClockParts((r).submitted_at ?? (r).submittedAt, tz))
+			.filter((p): p is NonNullable<typeof p> => p !== null);
 
 		if (mode === "daily") {
-			const dateParam = String(req.query.date ?? "");
-			const date = parseDateISO(dateParam) ?? new Date();
-			const targetYMD = date.toISOString().slice(0, 10);
+			const targetYMD = dayKeyParam(String(req.query.date ?? "")) ?? dayKeyOf(new Date(), tz);
 			const hours = Array.from({ length: 24 }, (_, i) => ({ hour: i, count: 0 }));
-			for (const r of rows) {
-				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
-				const s = new Date(raw);
-				if (isNaN(s.getTime())) {continue;}
-				const ymd = s.toISOString().slice(0, 10);
-				if (ymd === targetYMD) {
-					const h = s.getUTCHours();
-					if (h >= 0 && h < hours.length) {
-						const bucket = hours[h];
-						if (bucket) {bucket.count += 1;}
-					}
-				}
+			for (const p of localKeys) {
+				if (p.key !== targetYMD) {continue;}
+				const bucket = hours[p.hour];
+				if (bucket) {bucket.count += 1;}
 			}
 			return res.json({ mode: "daily", date: targetYMD, hours });
 		}
 
 		if (mode === "weekly") {
-			const weekParam = String(req.query.weekStart ?? "");
-			let weekStart = parseDateISO(weekParam) ?? new Date();
-			const day = weekStart.getUTCDay();
-			const diff = (day + 6) % 7;
-			weekStart = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() - diff));
-			const days = [] as { label: string; date: string; count: number }[];
+			const anchor = dayKeyParam(String(req.query.weekStart ?? "")) ?? dayKeyOf(new Date(), tz);
+			const startKey = addDaysToKey(anchor, -((weekdayOfDayKey(anchor) + 6) % 7));
 			const dayLabels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-			for (let i = 0; i < 7; i++) {
-				const d = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() + i));
-				days.push({ label: dayLabels[i]!, date: d.toISOString().slice(0, 10), count: 0 });
-			}
-			const startMs = Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate());
-			const endMs = startMs + 7 * 24 * 60 * 60 * 1000;
-			for (const r of rows) {
-				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
-				const s = new Date(raw);
-				if (isNaN(s.getTime())) {continue;}
-				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
-				if (t >= startMs && t < endMs) {
-					const idx = Math.floor((t - startMs) / (24 * 60 * 60 * 1000));
-					if (idx >= 0 && idx < days.length) {
-						const bucket = days[idx];
-						if (bucket) {bucket.count += 1;}
-					}
-				}
+			const days = Array.from({ length: 7 }, (_, i) => ({ label: dayLabels[i]!, date: addDaysToKey(startKey, i), count: 0 }));
+			const idxByKey = new Map(days.map((d, i) => [d.date, i]));
+			for (const p of localKeys) {
+				const idx = idxByKey.get(p.key);
+				if (idx === undefined) {continue;}
+				days[idx]!.count += 1;
 			}
 			return res.json({ mode: "weekly", weekStart: days[0]!.date, days });
 		}
 
 		if (mode === "monthly") {
 			// For monthly mode, return week buckets that cover the full calendar month of the provided start date.
-			const startParam = String(req.query.start ?? "");
-			const requested = parseDateISO(startParam) ?? new Date();
-			const year = requested.getUTCFullYear();
-			const month = requested.getUTCMonth();
-			// monthStart is first day of the month (UTC)
-			const monthStart = new Date(Date.UTC(year, month, 1));
-			const monthEnd = new Date(Date.UTC(year, month + 1, 1));
+			const anchor = dayKeyParam(String(req.query.start ?? "")) ?? dayKeyOf(new Date(), tz);
+			const year = Number(anchor.slice(0, 4));
+			const month = Number(anchor.slice(5, 7)); // 1-indexed
+			const monthStart = `${anchor.slice(0, 7)}-01`;
+			const monthEnd = month === 12 ? `${year + 1}-01-01` : `${year}-${String(month + 1).padStart(2, "0")}-01`;
 			// weekStart is the Monday on or before monthStart
-			const day0 = monthStart.getUTCDay();
-			const diff0 = (day0 + 6) % 7; // days since Monday
-			let weekStart = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth(), monthStart.getUTCDate() - diff0));
+			let weekStart = addDaysToKey(monthStart, -((weekdayOfDayKey(monthStart) + 6) % 7));
 			const weeks = [] as { start: string; end: string; label: string; count: number }[];
 			while (weekStart < monthEnd) {
-				const s = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate()));
-				const e = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + 7));
-				weeks.push({ start: s.toISOString().slice(0, 10), end: e.toISOString().slice(0, 10), label: s.toISOString().slice(5, 10), count: 0 });
-				weekStart = new Date(Date.UTC(weekStart.getUTCFullYear(), weekStart.getUTCMonth(), weekStart.getUTCDate() + 7));
+				const end = addDaysToKey(weekStart, 7);
+				weeks.push({ start: weekStart, end, label: weekStart.slice(5, 10), count: 0 });
+				weekStart = end;
 			}
 			// count events
-			for (const r of rows) {
-				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
-				const s = new Date(raw);
-				if (isNaN(s.getTime())) {continue;}
-				const t = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate());
-				for (let idx = 0; idx < weeks.length; idx++) {
-					const ws = weeks[idx]!;
-					const wsMs = Date.UTC(Number(ws.start.slice(0, 4)), Number(ws.start.slice(5, 7)) - 1, Number(ws.start.slice(8, 10)));
-					const weMs = Date.UTC(Number(ws.end.slice(0, 4)), Number(ws.end.slice(5, 7)) - 1, Number(ws.end.slice(8, 10)));
-					if (t >= wsMs && t < weMs) { weeks[idx]!.count += 1; break; }
+			for (const p of localKeys) {
+				for (const w of weeks) {
+					if (p.key >= w.start && p.key < w.end) { w.count += 1; break; }
 				}
 			}
-			return res.json({ mode: "monthly", month: `${year}-${(month + 1).toString().padStart(2, '0')}`, start: weeks[0]?.start ?? monthStart.toISOString().slice(0, 10), weeks });
+			return res.json({ mode: "monthly", month: `${year}-${String(month).padStart(2, '0')}`, start: weeks[0]?.start ?? monthStart, weeks });
 		}
 
 		if (mode === "yearly") {
-			const yearParam = Number(req.query.year ?? new Date().getUTCFullYear());
+			const yearParam = Number(req.query.year ?? dayKeyOf(new Date(), tz).slice(0, 4));
 			const months = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, label: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][i], count: 0 }));
-			for (const r of rows) {
-				const raw = (r).submitted_at ?? (r).submittedAt ?? (r).submittedAt;
-				const s = new Date(raw);
-				if (isNaN(s.getTime())) {continue;}
-				if (s.getUTCFullYear() === yearParam) {
-					const mi = s.getUTCMonth();
-					if (mi >= 0 && mi < months.length) {
-						const bucket = months[mi];
-						if (bucket) {bucket.count += 1;}
-					}
-				}
+			for (const p of localKeys) {
+				if (Number(p.key.slice(0, 4)) !== yearParam) {continue;}
+				const bucket = months[Number(p.key.slice(5, 7)) - 1];
+				if (bucket) {bucket.count += 1;}
 			}
 			return res.json({ mode: "yearly", year: yearParam, months });
 		}

@@ -660,8 +660,22 @@ export function sanitizeTimezone(raw: unknown): string {
 }
 
 // Interpret Y-M-D h:mi as wall-clock time in `tz` and return the UTC instant.
+//
+// TWO passes, deliberately. The offset is measured by asking what the wall clock
+// reads at a candidate instant — but near a DST transition the offset at the
+// NAIVE instant is not the offset at the true one, so a single pass lands on the
+// wrong side of the jump. Measured over 2025-2027: one pass put midnight an hour
+// into the PREVIOUS day for Sydney, Lord Howe, Chatham, Jerusalem and Auckland
+// (6 days each) and short by 30-60 min for Santiago and Havana — every window
+// built on it then silently dropped or misattributed that hour. Zone-less
+// arithmetic cannot see this; only re-reading the clock can.
+//
+// The residual pass converges because a second correction lands inside the same
+// offset regime as the target. Where a local time genuinely does not exist (a
+// spring-forward zone that jumps 00:00 -> 01:00, e.g. Santiago and Havana at
+// midnight) there is no exact answer and this returns the instant the clock next
+// reaches — 01:00 local — which is the conventional resolution.
 export function zonedWallToUtc(Y: number, M: number, D: number, h: number, mi: number, tz: string): Date {
-  const utc = Date.UTC(Y, M - 1, D, h, mi);
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
     hourCycle: "h23",
@@ -672,11 +686,26 @@ export function zonedWallToUtc(Y: number, M: number, D: number, h: number, mi: n
     minute: "2-digit",
     second: "2-digit",
   });
-  const p = new Map<string, string>(dtf.formatToParts(new Date(utc)).map((x) => [x.type, x.value]));
-  const g = (t: string) => Number(p.get(t) ?? 0);
-  const asUTC = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), g("second"));
-  const off = asUTC - utc;
-  return new Date(utc - off);
+  // What the wall clock in `tz` reads at `instant`, expressed as a UTC-epoch
+  // number so the two can be subtracted.
+  const wallAt = (instant: number): number => {
+    const p = new Map<string, string>(dtf.formatToParts(new Date(instant)).map((x) => [x.type, x.value]));
+    const g = (t: string) => Number(p.get(t) ?? 0);
+    return Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), g("second"));
+  };
+  const target = Date.UTC(Y, M - 1, D, h, mi);
+  const first = target - (wallAt(target) - target);
+  const residual = wallAt(first) - target;
+  if (residual === 0) {return new Date(first);}
+  const corrected = first - residual;
+  if (wallAt(corrected) === target) {return new Date(corrected);}
+  // Neither candidate reads back as the requested time, so that local time does
+  // not exist — a spring-forward gap (Santiago and Havana jump 00:00 -> 01:00,
+  // so their local midnight is skipped 3 times in 3 years). Take the LATER
+  // instant, i.e. the moment the clock next reaches the requested time. Taking
+  // the earlier one would put a day window an hour into the previous day, which
+  // is the very misattribution this function exists to prevent.
+  return new Date(Math.max(first, corrected));
 }
 
 // Parse a reservation date string. A BARE wall-clock string (YYYY-MM-DDTHH:mm
@@ -1629,6 +1658,13 @@ async function resolveRestaurantContext(
     restaurant_logo_url: row.restaurant_logo_url,
     timezone: sanitizeTimezone((row as Record<string, unknown>).timezone),
   };
+}
+
+// The tenant's IANA zone on its own, for route handlers that bucket instants
+// into the restaurant's calendar days without needing the rest of the context.
+export async function GetRestaurantTimezone(restaurantId: string): Promise<string> {
+  const context = await requireRestaurantContext(restaurantId);
+  return context.timezone;
 }
 
 async function requireRestaurantContext(
@@ -2735,9 +2771,26 @@ export async function ReleaseTable(
 
   // Close any OPEN bill too, otherwise the table stays in a payment-pending state
   // (a lingering open bill keeps payment_pending=true) and looks un-releasable.
+  //
+  // ZERO an UNPAID bill's money as part of closing it, exactly as MergeBills does.
+  // Nothing was collected — the orders above were just voided — but total_amt
+  // still holds the running PRE-TAX subtotal, and every revenue reader keys on
+  // `closed_at is not null`, so a released bill was booked as a tax-free sale and
+  // reconciliation asked staff to count cash nobody took.
+  // Zeroing at the write site rather than filtering on closed_by_username in the
+  // readers: getSettledBills alone has four callers, plus ListClosedBills and the
+  // dashboard aggregate, and any reader added later would silently reintroduce
+  // this. closed_by_username = 'released' stays as the marker for what happened.
+  // An ADMIN-APPROVED bill keeps its total: that is money the guest really paid
+  // (the guard above only refuses the not-yet-approved case), and wiping it would
+  // be the very disappearing-revenue bug that guard exists to prevent.
   await runQuery(
-    `update "Bills" set closed_at = now(), closed_by_username = 'released'
-       where res_id = $1 and outlet_id = $2 and table_id = $3 and closed_at is null`,
+    `update "Bills"
+        set closed_at = now(),
+            closed_by_username = 'released',
+            total_amt = case when admin_approved_at is null then 0 else total_amt end,
+            tax_breakdown = case when admin_approved_at is null then '[]'::json else tax_breakdown end
+      where res_id = $1 and outlet_id = $2 and table_id = $3 and closed_at is null`,
     [context.res_id, context.outlet_id, tableId],
   );
 
@@ -5370,7 +5423,11 @@ export async function GetAuditLogs(
       select count(*)::text as total
       from "Audit_logs" l
       join "Actions" a on a.id = l.action_id
-      left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      -- Deliberately NOT matched on outlet: the entry is filed against the outlet
+      -- the action was performed on, which for a cross-outlet admin is not the
+      -- actor's home outlet. Employees.id is the primary key, so id + res_id
+      -- already identifies exactly one actor.
+      left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id
       left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
       where ${where.join(" and ")}
     `,
@@ -5409,7 +5466,11 @@ export async function GetAuditLogs(
         u.id as undo_log_id
       from "Audit_logs" l
       join "Actions" a on a.id = l.action_id
-      left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id
+      -- Deliberately NOT matched on outlet: the entry is filed against the outlet
+      -- the action was performed on, which for a cross-outlet admin is not the
+      -- actor's home outlet. Employees.id is the primary key, so id + res_id
+      -- already identifies exactly one actor.
+      left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id
       left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
       -- "Already undone" is DERIVED: an undo appends a new row that back-references
       -- the original via additional_details->>'undo_of'. The original row is never touched.
@@ -7447,14 +7508,20 @@ export async function GetPayroll(restaurantId: string, period: string): Promise<
        from "PayrollProfiles" where res_id=$1 and outlet_id=$2`,
     [rid, oid],
   );
+  // The payroll month is the restaurant's month, not the UTC session's: cutting
+  // on UTC midnight paid a 02:00 local shift on the 1st into the previous month.
+  const monthFromIso = zoneMidnightUtc(`${period}-01`, context.timezone).toISOString();
+  const py = Number(period.slice(0, 4)), pm = Number(period.slice(5, 7));
+  const nextMonthKey = pm === 12 ? `${py + 1}-01-01` : `${py}-${String(pm + 1).padStart(2, "0")}-01`;
+  const monthToIso = zoneMidnightUtc(nextMonthKey, context.timezone).toISOString();
   const hours = await runQuery<{ emp_id: string; hours: number }>(
     `select emp_id, coalesce(sum(least(extract(epoch from (clock_out - clock_in))/3600, 16)), 0)::float hours
        from "Attendance"
        where res_id=$1 and outlet_id=$2 and clock_out is not null and clock_out > clock_in
          and ${ATTENDANCE_COUNTED}
-         and clock_in >= ($3 || '-01')::date and clock_in < (($3 || '-01')::date + interval '1 month')
+         and clock_in >= $3::timestamptz and clock_in < $4::timestamptz
        group by emp_id`,
-    [rid, oid, period],
+    [rid, oid, monthFromIso, monthToIso],
   );
   const payments = await runQuery<{ emp_id: string; amount: number; paid_at: Date }>(
     `select emp_id, amount::float amount, paid_at from "PayrollPayments" where res_id=$1 and outlet_id=$2 and period=$3`,
@@ -7544,7 +7611,7 @@ export async function RecordPayrollPayment(
       amount,
       category: "Payroll",
       note: `Salary ${input.period} — ${empName}${input.note ? ` (${input.note})` : ""}`,
-      spent_on: new Date().toISOString().slice(0, 10),
+      spent_on: dayKeyOf(new Date(), context.timezone),
       createdBy: input.paidBy,
     });
   } catch (err) {
@@ -12119,11 +12186,43 @@ function zoneMidnightUtc(dateKey: string, tz: string): Date {
 }
 
 // Add whole days to a YYYY-MM-DD calendar key (no DST arithmetic — pure calendar).
-function addDaysToKey(dateKey: string, days: number): string {
+export function addDaysToKey(dateKey: string, days: number): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
   if (!m) {return dateKey;}
   const anchor = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + days));
   return anchor.toISOString().slice(0, 10);
+}
+
+// Day-of-week (0 = Sunday) of a YYYY-MM-DD calendar key. Pure calendar: the key
+// already names a day, so no zone is involved.
+export function weekdayOfDayKey(dateKey: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
+  if (!m) {return 0;}
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay();
+}
+
+// Wall clock of an instant AS SEEN IN `tz`: the accounting day it belongs to plus
+// hour/minute of day and weekday. Hour-of-day and weekday charts must agree with
+// dayKeyOf about which day an order fell on, so they read the same single
+// Intl pass rather than each rolling their own.
+export function zonedClockParts(
+  value: Date | string,
+  tz: string,
+): { key: string; hour: number; minute: number; weekday: number } | null {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) {return null;}
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, hourCycle: "h23",
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((x) => x.type === t)?.value ?? "";
+  const key = `${get("year")}-${get("month")}-${get("day")}`;
+  return {
+    key,
+    hour: Number(get("hour")) % 24,
+    minute: Number(get("minute")),
+    weekday: weekdayOfDayKey(key),
+  };
 }
 
 // Normalize a report range to whole-day boundaries IN THE RESTAURANT'S ZONE:
@@ -12154,7 +12253,7 @@ function normalizeReportRange(fromInput?: string, toInput?: string, tz = "Asia/K
 }
 
 // Which accounting DAY an instant belongs to — the restaurant's calendar day.
-function dayKeyOf(value: Date | string, tz = "Asia/Kolkata"): string {
+export function dayKeyOf(value: Date | string, tz = "Asia/Kolkata"): string {
   return dateKeyInZone(value, tz);
 }
 
@@ -12245,6 +12344,28 @@ async function getSettledBills(context: RestaurantContext, fromIso: string, toIs
   }));
 }
 
+// One settled bill's stored charges, classified the SAME way the bill-detail read
+// classifies them (closedBillCharges → splitServiceChargeLine).
+//
+// A tenant may list "Service Charge" as an entry in Outlets.default_tax — that is
+// the shipped default — in which case the charge is written into
+// Bills.tax_breakdown as if it were a tax line. Summing the breakdown blindly
+// books the owner's own income as tax owed to the government, and makes the
+// accounting screen contradict the bill it is showing. Routing every report
+// through the detail read's helper is what keeps the two from drifting apart.
+function reportBillCharges(bill: SettledBill, scPct: number) {
+  return closedBillCharges(bill.total_amt, parseTaxLines(bill.tax_breakdown), scPct);
+}
+
+// The tax reversed by a refund. Refunds are recorded on the bill row without
+// rewriting total_amt or tax_breakdown, so the refunded gross AND the tax inside
+// it are both still counted in the report totals; callers net this out rather
+// than subtracting the gross refund from an already-ex-tax figure.
+function refundedTaxOf(bill: SettledBill, taxTotal: number): number {
+  if (bill.total_amt <= 0 || bill.refund_amount <= 0) {return 0;}
+  return round2((taxTotal * Math.min(bill.refund_amount, bill.total_amt)) / bill.total_amt);
+}
+
 export async function AddExpense(
   restaurantId: string,
   input: { category?: string; vendor?: string; amount: number; note?: string; spent_on?: string; createdBy?: string },
@@ -12255,11 +12376,14 @@ export async function AddExpense(
   if (amount <= 0) {throw new Error("Expense amount must be greater than zero");}
   const category = (input.category ?? "General").trim() || "General";
   const spentOn = input.spent_on && /^\d{4}-\d{2}-\d{2}$/.test(input.spent_on) ? input.spent_on : null;
+  // `current_date` follows the UTC session, so an expense keyed at 01:30 local
+  // was dated to the restaurant's yesterday and landed in the wrong day's P&L.
+  const todayKey = dayKeyOf(new Date(), context.timezone);
   const rows = await runQuery<ExpenseRecord>(
     `insert into "Expenses" (id, res_id, outlet_id, spent_on, category, vendor, amount, note, created_by)
-     values ($1, $2, $3, coalesce($4::date, current_date), $5, $6, $7, $8, $9)
+     values ($1, $2, $3, coalesce($4::date, $10::date), $5, $6, $7, $8, $9)
      returning id, to_char(spent_on,'YYYY-MM-DD') as spent_on, category, vendor, amount, note, created_by, created_at`,
-    [randomUUID(), context.res_id, context.outlet_id, spentOn, category, input.vendor?.trim() || null, amount, input.note?.trim() || null, input.createdBy ?? null],
+    [randomUUID(), context.res_id, context.outlet_id, spentOn, category, input.vendor?.trim() || null, amount, input.note?.trim() || null, input.createdBy ?? null, todayKey],
   );
   if (!rows[0]) {throw new Error("Failed to record expense");}
   return rows[0];
@@ -12508,11 +12632,16 @@ export interface SalesReport {
   from: string;
   to: string;
   total_sales: number;
+  // Genuine tax only. A service charge stored as a tax_breakdown line is lifted
+  // into total_service_charge, where it reads as the income it is.
   total_tax: number;
+  total_service_charge: number;
   total_refund: number;
+  // The share of total_tax that sits inside refunded bills (see refundedTaxOf).
+  total_refunded_tax: number;
   net_sales: number;
   bill_count: number;
-  by_day: { date: string; sales: number; tax: number; refund: number; bills: number }[];
+  by_day: { date: string; sales: number; tax: number; service_charge: number; refund: number; bills: number }[];
   by_method: { method: string; sales: number; bills: number }[];
 }
 
@@ -12520,19 +12649,26 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
   const context = await requireRestaurantContext(restaurantId);
   const range = normalizeReportRange(fromIso, toIso, context.timezone);
   const bills = await getSettledBills(context, range.fromIso, range.toIso);
+  const scPct = await getServiceChargePercent(context.res_id);
 
-  let totalSales = 0, totalTax = 0, totalRefund = 0;
-  const byDay = new Map<string, { sales: number; tax: number; refund: number; bills: number }>();
+  let totalSales = 0, totalTax = 0, totalService = 0, totalRefund = 0, totalRefundedTax = 0;
+  const byDay = new Map<string, { sales: number; tax: number; service_charge: number; refund: number; bills: number }>();
   const byMethod = new Map<string, { sales: number; bills: number }>();
   for (const b of bills) {
     const gross = b.total_amt;
-    const tax = round2(parseTaxLines(b.tax_breakdown).reduce((s, l) => s + l.amount, 0));
+    const charges = reportBillCharges(b, scPct);
+    const tax = charges.tax_total;
+    const service = charges.service_charge;
     totalSales = round2(totalSales + gross);
     totalTax = round2(totalTax + tax);
+    totalService = round2(totalService + service);
     totalRefund = round2(totalRefund + b.refund_amount);
+    totalRefundedTax = round2(totalRefundedTax + refundedTaxOf(b, tax));
     const day = dayKeyOf(b.settled_at, context.timezone);
-    const dd = byDay.get(day) ?? { sales: 0, tax: 0, refund: 0, bills: 0 };
-    dd.sales = round2(dd.sales + gross); dd.tax = round2(dd.tax + tax); dd.refund = round2(dd.refund + b.refund_amount); dd.bills += 1;
+    const dd = byDay.get(day) ?? { sales: 0, tax: 0, service_charge: 0, refund: 0, bills: 0 };
+    dd.sales = round2(dd.sales + gross); dd.tax = round2(dd.tax + tax);
+    dd.service_charge = round2(dd.service_charge + service);
+    dd.refund = round2(dd.refund + b.refund_amount); dd.bills += 1;
     byDay.set(day, dd);
     // Split-tender bills attribute each part's amount to its REAL mode (a bill
     // paid Cash+Card counts once under each mode it touched, so per-mode bill
@@ -12558,7 +12694,9 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     to: range.toDate,
     total_sales: totalSales,
     total_tax: totalTax,
+    total_service_charge: totalService,
     total_refund: totalRefund,
+    total_refunded_tax: totalRefundedTax,
     net_sales: round2(totalSales - totalRefund),
     bill_count: bills.length,
     by_day: [...byDay.entries()].filter(([d]) => d).sort((a, b) => a[0].localeCompare(b[0])).map(([date, v]) => ({ date, ...v })),
@@ -12569,8 +12707,11 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
 export interface GstReport {
   from: string;
   to: string;
+  // Turnover ex-tax: gross minus genuine tax. Service charge is part of turnover,
+  // so it stays inside this figure and is also reported on its own below.
   total_taxable: number;
   total_tax: number;
+  total_service_charge: number;
   by_rate: { name: string; percentage: number; taxable: number; tax: number }[];
 }
 
@@ -12578,12 +12719,17 @@ export async function GetGstReport(restaurantId: string, fromIso?: string, toIso
   const context = await requireRestaurantContext(restaurantId);
   const range = normalizeReportRange(fromIso, toIso, context.timezone);
   const bills = await getSettledBills(context, range.fromIso, range.toIso);
+  const scPct = await getServiceChargePercent(context.res_id);
 
-  let totalTax = 0, totalGross = 0;
+  let totalTax = 0, totalGross = 0, totalService = 0;
   const byRate = new Map<string, { name: string; percentage: number; taxable: number; tax: number }>();
   for (const b of bills) {
     totalGross = round2(totalGross + b.total_amt);
-    for (const l of parseTaxLines(b.tax_breakdown)) {
+    const charges = reportBillCharges(b, scPct);
+    totalService = round2(totalService + charges.service_charge);
+    // `charges.taxes` has the service-charge line already lifted out, so this
+    // report never lists the owner's own income as output tax.
+    for (const l of charges.taxes) {
       const key = `${l.name}@${l.percentage}`;
       const e = byRate.get(key) ?? { name: l.name, percentage: l.percentage, taxable: 0, tax: 0 };
       e.tax = round2(e.tax + l.amount);
@@ -12598,6 +12744,7 @@ export async function GetGstReport(restaurantId: string, fromIso?: string, toIso
     to: range.toDate,
     total_taxable: round2(totalGross - totalTax),
     total_tax: totalTax,
+    total_service_charge: totalService,
     by_rate: [...byRate.values()].sort((a, b) => b.tax - a.tax),
   };
 }
@@ -12607,7 +12754,11 @@ export interface ProfitAndLoss {
   to: string;
   gross_sales: number;
   refunds: number;
+  // Genuine tax net of the tax reversed by refunds — what is actually owed on.
   tax_collected: number;
+  // Service charge earned in the range. Already inside net_revenue (it is the
+  // restaurant's income, not a pass-through); broken out so it stays visible.
+  service_charge: number;
   net_revenue: number;
   total_expenses: number;
   net_profit: number;
@@ -12621,14 +12772,20 @@ export async function GetProfitAndLoss(restaurantId: string, fromIso?: string, t
   const byCat = new Map<string, number>();
   for (const e of expenses) {byCat.set(e.category, round2((byCat.get(e.category) ?? 0) + (Number(e.amount) || 0)));}
   // Tax collected is pass-through (owed to the government), so net revenue and
-  // profit are computed ex-tax.
-  const netRevenue = round2(sales.total_sales - sales.total_refund - sales.total_tax);
+  // profit are computed ex-tax. A refund reverses a tax-INCLUSIVE amount that is
+  // still counted in both total_sales and total_tax, so only the tax the
+  // restaurant actually kept may be deducted — subtracting the gross refund and
+  // the full tax made a fully refunded bill contribute minus its own tax instead
+  // of zero.
+  const taxKept = round2(sales.total_tax - sales.total_refunded_tax);
+  const netRevenue = round2(sales.total_sales - sales.total_refund - taxKept);
   return {
     from: sales.from,
     to: sales.to,
     gross_sales: sales.total_sales,
     refunds: sales.total_refund,
-    tax_collected: sales.total_tax,
+    tax_collected: taxKept,
+    service_charge: sales.total_service_charge,
     net_revenue: netRevenue,
     total_expenses: totalExpenses,
     net_profit: round2(netRevenue - totalExpenses),
@@ -13006,7 +13163,8 @@ export async function DeleteReconciliation(restaurantId: string, date: string, m
 
 // Tally-compatible voucher XML ("Import Data" envelope): one Sales voucher per
 // day of settled bills + one Payment voucher per expense. The referenced ledgers
-// (Sales Receipts, Sales Account, Output Tax, Cash, and the expense categories)
+// (Sales Receipts, Sales Account, Output Tax, Service Charge Income, Cash, and
+// the expense categories)
 // must exist in the Tally company or be created on import. Debit entries use
 // ISDEEMEDPOSITIVE=Yes with a negative amount; credits use No with a positive
 // amount (each voucher nets to zero).
@@ -13028,9 +13186,15 @@ export async function BuildTallyXml(restaurantId: string, fromIso?: string, toIs
   let vno = 1;
   for (const d of sales.by_day) {
     if (d.sales <= 0) {continue;}
-    const net = round2(d.sales - d.tax);
+    // Service charge is the restaurant's income, so it gets its own credit ledger
+    // instead of riding into Output Tax (which is a liability to the government)
+    // or silently inflating the Sales Account. The voucher still nets to zero.
+    const net = round2(d.sales - d.tax - d.service_charge);
     const taxEntry = d.tax > 0
       ? `<ALLLEDGERENTRIES.LIST><LEDGERNAME>Output Tax</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${amt(d.tax)}</AMOUNT></ALLLEDGERENTRIES.LIST>`
+      : "";
+    const serviceEntry = d.service_charge > 0
+      ? `<ALLLEDGERENTRIES.LIST><LEDGERNAME>Service Charge Income</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${amt(d.service_charge)}</AMOUNT></ALLLEDGERENTRIES.LIST>`
       : "";
     messages.push(
       `<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Sales" ACTION="Create" OBJVIEW="Invoice Voucher View">` +
@@ -13039,6 +13203,7 @@ export async function BuildTallyXml(restaurantId: string, fromIso?: string, toIs
       `<PARTYLEDGERNAME>Sales Receipts</PARTYLEDGERNAME>` +
       `<ALLLEDGERENTRIES.LIST><LEDGERNAME>Sales Receipts</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${amt(d.sales)}</AMOUNT></ALLLEDGERENTRIES.LIST>` +
       `<ALLLEDGERENTRIES.LIST><LEDGERNAME>Sales Account</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${amt(net)}</AMOUNT></ALLLEDGERENTRIES.LIST>` +
+      serviceEntry +
       taxEntry +
       `</VOUCHER></TALLYMESSAGE>`,
     );
@@ -16328,7 +16493,12 @@ export async function GetDailyRevenueSeries(
   const context = await requireRestaurantContext(restaurantId);
   const span = Math.min(90, Math.max(1, Math.round(days)));
   const now = await currentDbTime();
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (span - 1)));
+  // The chart's days are the RESTAURANT's calendar days. Bucketing by UTC booked
+  // this tenant's 01:00 IST covers on the previous day and left the current day
+  // with no bar at all; the window lower bound has to move with the keys or the
+  // first day comes out short by one UTC offset.
+  const startKey = addDaysToKey(dayKeyOf(now, context.timezone), -(span - 1));
+  const start = zoneMidnightUtc(startKey, context.timezone);
 
   const rows = await runQuery<{ created_at: Date | string; food: unknown; status: unknown }>(
     `select created_at, food, status from "Orders"
@@ -16342,7 +16512,7 @@ export async function GetDailyRevenueSeries(
     if (st === "cancelled") {continue;}
     const d = new Date(r.created_at);
     if (Number.isNaN(d.getTime())) {continue;}
-    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    const key = dayKeyOf(d, context.timezone);
     const p = parseJsonObject(r.food) ?? {};
     const total = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     const cur = byDay.get(key) ?? { revenue: 0, orders: 0 };
@@ -16353,8 +16523,7 @@ export async function GetDailyRevenueSeries(
 
   const series: { date: string; revenue: number; orders: number }[] = [];
   for (let i = 0; i < span; i++) {
-    const d = new Date(start.getTime() + i * 24 * 60 * 60 * 1000);
-    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    const key = addDaysToKey(startKey, i);
     const v = byDay.get(key) ?? { revenue: 0, orders: 0 };
     series.push({ date: key, revenue: round2(v.revenue), orders: v.orders });
   }
@@ -16363,7 +16532,8 @@ export async function GetDailyRevenueSeries(
 
 // Operational analytics from REAL orders (replaces the dashboard's hardcoded mock
 // charts): order volume + revenue bucketed by hour-of-day and by weekday over the
-// last N days. Hours/weekdays are UTC for determinism.
+// last N days, in the RESTAURANT's own timezone — a UTC hour axis named 16:00 as
+// this tenant's peak when the rush is actually 21:00 local.
 export async function GetOperationsAnalytics(
   restaurantId: string,
   days = 30,
@@ -16375,7 +16545,9 @@ export async function GetOperationsAnalytics(
   const context = await requireRestaurantContext(restaurantId);
   const span = Math.min(180, Math.max(1, Math.round(days)));
   const now = await currentDbTime();
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (span - 1)));
+  // Window starts at local midnight of the first day so the earliest day is not
+  // clipped by the zone offset.
+  const start = zoneMidnightUtc(addDaysToKey(dayKeyOf(now, context.timezone), -(span - 1)), context.timezone);
   // ALL-OUTLETS aggregate: span every outlet of the restaurant, exactly as the
   // sibling analytics endpoints do (GetKitchenAnalytics / GetAdvancedAnalytics).
   const og = isAllOutlets() ? "true" : "false";
@@ -16389,16 +16561,16 @@ export async function GetOperationsAnalytics(
   for (const r of rows) {
     const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
     if (st === "cancelled") {continue;}
-    const d = new Date(r.created_at);
-    if (Number.isNaN(d.getTime())) {continue;}
+    const local = zonedClockParts(r.created_at, context.timezone);
+    if (!local) {continue;}
     const p = parseJsonObject(r.food) ?? {};
     const total = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
-    const hb = byHour[d.getUTCHours()];
+    const hb = byHour[local.hour];
     if (hb) {
       hb.orders += 1;
       hb.revenue = round2(hb.revenue + total);
     }
-    const wb = byWeekday[d.getUTCDay()];
+    const wb = byWeekday[local.weekday];
     if (wb) {
       wb.orders += 1;
       wb.revenue = round2(wb.revenue + total);
@@ -16788,6 +16960,7 @@ async function getStaffAttendanceStats(
   outletId: string,
   outletGuard: string,
   days: number,
+  tz: string,
 ): Promise<{ rows: StaffAttendanceStat[]; summary: StaffAttendanceSummary }> {
   await ensureAttendanceTable();
   const rows = await runQuery<{
@@ -16800,16 +16973,20 @@ async function getStaffAttendanceStats(
     day: string;
     start_min: number | string;
   }>(
+    // The DB session runs in UTC, so the day key and the minute-of-day must be
+    // shifted into the restaurant's own zone: "typical start" was reading 12:18
+    // for someone who clocks in at 17:48 local, and a 01:00 local clock-in was
+    // credited to the previous day (inventing an absent day).
     `select a.emp_id, e."emp_Fname" as fname, e."emp_Lname" as lname,
             a.clock_in, a.clock_out, a.status,
-            to_char(a.clock_in, 'YYYY-MM-DD') as day,
-            (extract(epoch from a.clock_in::time) / 60.0) as start_min
+            to_char(a.clock_in at time zone $4, 'YYYY-MM-DD') as day,
+            (extract(epoch from (a.clock_in at time zone $4)::time) / 60.0) as start_min
        from "Attendance" a
        left join "Employees" e on e.id = a.emp_id and e.res_id = a.res_id
       where a.res_id = $1 and (${outletGuard} or a.outlet_id = $2)
         and a.clock_in >= now() - ($3 || ' days')::interval
       order by a.clock_in asc`,
-    [resId, outletId, String(days)],
+    [resId, outletId, String(days), tz],
   ).catch(() => [] as never[]);
 
   const nowMs = Date.now();
@@ -16949,7 +17126,7 @@ export async function GetAdvancedAnalytics(
   }));
 
   // Per-staff ATTENDANCE over the same window as the rest of staff analytics.
-  const staff_attendance = await getStaffAttendanceStats(rid, oid, og, days);
+  const staff_attendance = await getStaffAttendanceStats(rid, oid, og, days, context.timezone);
 
   // Order processing time = bill time − order time, guarded to a sane 0–24h window
   // so a table left open for days doesn't blow up the average.
@@ -17133,16 +17310,19 @@ export async function GetAdvancedAnalytics(
   // Low-stock alerts + expiring-soon (≤7 days) entries. The low-stock KPI keeps
   // counting ONLY low-quantity items; expiring rows ride along flagged.
   await ensureInventoryExpiryColumn();
+  // "Today" is the restaurant's day, not the UTC session's `current_date` — the
+  // Overview expiry panel already takes the day key as a parameter for exactly
+  // this reason, and the two panels have to agree.
   const stockRows = await runQuery<{ name: string; qty: number; low: boolean; expiring: boolean; expiry_date: unknown }>(
     `select name, "Quantity"::float qty,
             ("Quantity"::numeric <= 5) as low,
-            (expiry_date is not null and expiry_date <= current_date + 7) as expiring,
+            (expiry_date is not null and expiry_date <= $3::date + 7) as expiring,
             expiry_date
        from "Inventory"
        where res_id=$1 and (${og} or outlet_id=$2)
-         and ("Quantity"::numeric <= 5 or (expiry_date is not null and expiry_date <= current_date + 7))
+         and ("Quantity"::numeric <= 5 or (expiry_date is not null and expiry_date <= $3::date + 7))
        order by "Quantity"::numeric asc limit 40`,
-    [rid, oid],
+    [rid, oid, dayKeyOf(new Date(), context.timezone)],
   );
   const stock_alerts = stockRows.map((r) => ({
     name: r.name,
@@ -18870,13 +19050,16 @@ export async function GetOutboundMessages(
 ): Promise<{ id: string; channel: string; to_phone: string | null; body: string | null; kind: string | null; ref_id: string | null; status: string; error: string | null; provider: string | null; created_at: Date }[]> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureOutboundMessagesTable();
+  // Guest phone numbers and message bodies are per-outlet PII: one branch must not
+  // read another branch's log. RecordOutboundMessage stamps outlet_id on every row.
+  const og = isAllOutlets() ? "true" : "false";
   return runQuery(
     `select id, channel, to_phone, body, kind, ref_id, status, error, provider, created_at
        from "OutboundMessages"
-      where res_id = $1
+      where res_id = $1 and (${og} or outlet_id = $2)
       order by created_at desc
-      limit $2`,
-    [context.res_id, Math.max(1, Math.min(200, Math.round(limit)))],
+      limit $3`,
+    [context.res_id, context.outlet_id, Math.max(1, Math.min(200, Math.round(limit)))],
   );
 }
 
@@ -21900,30 +22083,46 @@ async function ensurePasswordResetTable(_client?: PoolClient): Promise<void> {
 export async function AddPasswordResetRequest(
   restaurantSlug: string,
   username: string,
+  outletId?: string,
 ): Promise<{ success: true }> {
   const uname = String(username ?? "").trim();
   if (!uname) {throw new Error("Username is required");}
-  const context = await requireRestaurantContext(restaurantSlug);
+  // Only a canonical outlet id is honoured: an unresolvable one must match no
+  // "Login" row (so nothing is filed) rather than quietly falling back to the
+  // restaurant's first outlet the way requireRestaurantContext does.
+  const wantedOutlet = isUuid(String(outletId ?? "").trim()) ? String(outletId).trim() : null;
+  const context = await requireRestaurantContext(restaurantSlug, undefined, wantedOutlet ?? undefined);
   return withTenant(
     { res_id: context.res_id, outlet_id: context.outlet_id, employeeId: "", role: "" },
     async () => {
       await ensurePasswordResetTable();
-      const rows = await runQuery<{ emp_id: string }>(
-        `select emp_id from "Login" where res_id = $1 and lower(emp_username) = lower($2) limit 1`,
-        [context.res_id, uname],
+      // Employee identity is PER-OUTLET ("Login" is unique on res_id + outlet_id +
+      // emp_username), so one username can name different people in different
+      // outlets. The outlet is therefore taken from the matched "Login" row itself:
+      // stamping the request with this (unauthenticated) request's context outlet
+      // filed a branch employee's request against the main outlet's namesake, where
+      // only the wrong admin ever saw it.
+      const rows = await runQuery<{ emp_id: string; outlet_id: string | null }>(
+        `select emp_id, outlet_id from "Login"
+          where res_id = $1 and lower(emp_username) = lower($2)
+            and ($3::uuid is null or outlet_id = $3::uuid)
+          order by outlet_id`,
+        [context.res_id, uname, wantedOutlet],
       );
-      const empId = rows[0]?.emp_id;
-      if (empId) {
+      // With no outlet supplied and the username live in more than one outlet there
+      // is nothing to tell the two people apart, so file for each: the request then
+      // always reaches the admin who can actually fulfil it, and no other.
+      for (const row of rows) {
         // Collapse duplicate pending requests for the same user.
         const existing = await runQuery<{ id: string }>(
           `select id from "PasswordResetRequests" where res_id = $1 and emp_id = $2 and status = 'pending' limit 1`,
-          [context.res_id, empId],
+          [context.res_id, row.emp_id],
         );
         if (!existing[0]) {
           await runQuery(
             `insert into "PasswordResetRequests" (id, res_id, outlet_id, emp_id, username)
                values ($1, $2, $3, $4, $5)`,
-            [randomUUID(), context.res_id, context.outlet_id, empId, uname],
+            [randomUUID(), context.res_id, row.outlet_id, row.emp_id, uname],
           );
         }
       }
@@ -21938,12 +22137,15 @@ export async function GetPasswordResetRequests(
   const context = await requireRestaurantContext(restaurantId);
   await ensurePasswordResetTable();
   const rows = await runQuery<{ id: string; emp_id: string; username: string; fname: string | null; lname: string | null; created_at: Date }>(
+    // Scoped to the ACTIVE outlet, matching SetUserPassword (which can only reset a
+    // user of that outlet): listing another branch's requests both leaked employee
+    // names and offered a dismiss the admin had no business performing.
     `select r.id, r.emp_id, r.username, e."emp_Fname" as fname, e."emp_Lname" as lname, r.created_at
        from "PasswordResetRequests" r
        left join "Employees" e on e.id = r.emp_id and e.res_id = r.res_id
-      where r.res_id = $1 and r.status = 'pending'
+      where r.res_id = $1 and r.outlet_id = $2 and r.status = 'pending'
       order by r.created_at asc`,
-    [context.res_id],
+    [context.res_id, context.outlet_id],
   );
   return rows.map((r) => ({
     id: r.id,
@@ -21959,8 +22161,8 @@ export async function ResolvePasswordResetRequest(restaurantId: string, requestI
   await ensurePasswordResetTable();
   await runQuery(
     `update "PasswordResetRequests" set status = 'dismissed', resolved_at = now()
-       where id = $1 and res_id = $2 and status = 'pending'`,
-    [requestId, context.res_id],
+       where id = $1 and res_id = $2 and outlet_id = $3 and status = 'pending'`,
+    [requestId, context.res_id, context.outlet_id],
   );
   return true;
 }
