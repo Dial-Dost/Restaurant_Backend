@@ -1219,6 +1219,39 @@ async function runQuery<TRow extends QueryResultRow = QueryResultRow>(
   return result.rows;
 }
 
+/**
+ * runQuery on the AMBIENT request's tenant connection, for the one caller that
+ * owns its table outright: index.ts's "Table_sections" zone roster.
+ *
+ * Exported rather than copied so those queries run on the same client, inside
+ * the same transaction, under the same app.res_id GUC as everything else in
+ * this file — a second pool of its own would be outside RLS's `app.res_id` and
+ * would silently read every tenant's rows. Not an invitation to move data
+ * access out of this module: anything with joins, money or a shared table
+ * belongs in a named function here.
+ */
+export async function runTenantQuery<TRow extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params: unknown[] = [],
+): Promise<TRow[]> {
+  return runQuery<TRow>(sql, params);
+}
+
+/**
+ * withTransaction for that same caller, so a write it owns and a write this
+ * module owns commit or roll back together.
+ *
+ * openTenantConnection binds the request's client at txnDepth 0 — i.e. plain
+ * autocommit — so consecutive awaits are separate transactions. Renaming a zone
+ * touches BOTH sources ("Tables".section and the "Table_sections" roster), and
+ * without this the first write had already committed by the time the second one
+ * tripped migration 023's unique index: the floor was relabelled while the
+ * caller was told the rename failed.
+ */
+export async function runTenantTransaction<T>(work: () => Promise<T>): Promise<T> {
+  return withTransaction(() => work());
+}
+
 // --- Lazy table provisioning -------------------------------------------------
 // Several feature tables are created on first use rather than in migrations. Two
 // hazards the helpers below address:
@@ -2049,13 +2082,21 @@ export async function GetTableSections(
 }
 
 /**
- * Does a section with this name already carry at least one live table?
+ * Does a section with this name already exist?
  *
  * This is what separates "MOVE a table into an existing zone" (everyday floor
  * work) from "CREATE a new zone" (section administration) — both are the same
  * PATCH /table/:name write, so the route needs to know which one it is before
  * it picks a permission. Matched exactly the way rename/delete resolve a
  * section: case-insensitively on the trimmed label.
+ *
+ * BOTH sources count, the same union GET /table-sections renders. Asking only
+ * "Tables" made an EMPTY zone — the entire point of migration 023's roster —
+ * read as non-existent, so the first drag into one was classified as a create
+ * and refused for everyone without section admin: the people who need the empty
+ * zone are exactly the ones who cannot fill it. A zone also falls back to
+ * roster-only whenever its last table is dragged out, so this is not limited to
+ * zones made by POST /table-sections.
  */
 export async function TableSectionExists(restaurantId: string, name: string): Promise<boolean> {
   const target = normalizeTableSection(name);
@@ -2069,6 +2110,11 @@ export async function TableSectionExists(restaurantId: string, name: string): Pr
       where res_id = $1 and outlet_id = $2
         and lower(btrim(coalesce(section, ''))) = lower($3)
         and coalesce(is_deleted, false) = false
+      union all
+      select 1 as one
+      from "Table_sections"
+      where res_id = $1 and outlet_id = $2
+        and lower(btrim(name)) = lower($3)
       limit 1
     `,
     [context.res_id, context.outlet_id, target],
@@ -2307,8 +2353,14 @@ const TABLE_SECTION_MAX_LEN = 60;
  * Normalise a section name for storage. Returns null for "unassigned" (absent,
  * null or blank) so the column only ever holds a real label, and collapses inner
  * whitespace so "AC  Hall" and "AC Hall" are the same section.
+ *
+ * Exported because index.ts's rename route has to decide whether a new name
+ * collides with an existing zone BEFORE it writes anything, and that decision
+ * has to be made on the exact string this function would store (trimmed,
+ * whitespace-collapsed, length-clamped) — comparing raw input would let a name
+ * that only collides after normalisation through to the unique index.
  */
-function normalizeTableSection(value: unknown): string | null {
+export function normalizeTableSection(value: unknown): string | null {
   if (value === undefined || value === null) {return null;}
   const cleaned = String(value).replace(/\s+/g, " ").trim().slice(0, TABLE_SECTION_MAX_LEN);
   return cleaned.length > 0 ? cleaned : null;
@@ -8681,6 +8733,51 @@ export interface OverviewMetric {
   compared_to: string;
 }
 
+/** One named offender behind an attention row. */
+export interface AttentionItem {
+  /** The thing itself — "T4", "Paneer Tikka", "Tomatoes". */
+  label: string;
+  /** What is wrong with it, already humanised — "2 kg left", "open 2 days". */
+  sub?: string;
+  /** Money or quantity as a RAW number; the client owns currency and rounding. */
+  value?: number;
+  /** Real record id, so a client can focus exactly this row. */
+  id?: string;
+}
+
+/** Where a row should take you. Split per client because the right destination
+ *  genuinely differs: approving a payment is an Orders-page action on the web
+ *  and a table-bill-sheet action in the Flutter app. */
+export interface AttentionDeepLink {
+  /** App module label. Must be one ModuleNavigator.canOpen() accepts, or the
+   *  tap is a silent no-op (the shell does indexOf(label) and returns on -1). */
+  module: string;
+  /** App focus target (entity_id / table / filter hints). */
+  params?: Record<string, string>;
+  /** Web path INCLUDING any query string. Only params the dashboard actually
+   *  parses appear here — an invented one would look like a working filter. */
+  href?: string;
+}
+
+export interface AttentionRow {
+  key: string;
+  label: string;
+  count: number;
+  severity: "high" | "medium" | "low";
+  /** Legacy single-label route for clients that predate deep_link. Held stable
+   *  for the four original keys even where it is known-poor, since changing it
+   *  would silently re-route old builds; deep_link carries the truth. */
+  module: string;
+  /** One line naming the real offenders — "Tomatoes (2 kg left) and 4 more".
+   *  Empty only when the row has no nameable offenders. */
+  detail: string;
+  /** Up to ATTENTION_ITEM_CAP individually meaningful entries. */
+  items: AttentionItem[];
+  /** Money at stake, when the row is about money. */
+  amount?: number;
+  deep_link: AttentionDeepLink;
+}
+
 export interface OverviewInsights {
   window_days: number;
   timezone: string;
@@ -8699,7 +8796,7 @@ export interface OverviewInsights {
   top_staff: { employee_id: string; employee_name: string; orders: number; revenue: number; avg_rating: number | null; hours_worked: number | null; ranked_by: string }[];
   kitchen: { avg_prep_ms: number; p90_prep_ms: number; slowest_section: string | null; slowest_section_avg_ms: number; slowest_dish: string | null; slowest_dish_avg_ms: number; orders_timed: number };
   peak: { hour: number | null; hour_orders: number; hour_revenue: number; weekday: string | null; weekday_orders: number; weekday_revenue: number };
-  needs_attention: { key: string; label: string; count: number; severity: "high" | "medium" | "low"; module: string }[];
+  needs_attention: AttentionRow[];
 }
 
 function overviewMetric(value: number, previous: number, windowDays: number): OverviewMetric {
@@ -8712,6 +8809,432 @@ function overviewMetric(value: number, previous: number, windowDays: number): Ov
     direction: v > p ? "up" : v < p ? "down" : "flat",
     compared_to: `previous ${windowDays} days`,
   };
+}
+
+// --- Needs attention: shaping -------------------------------------------------
+// Pure. Everything below turns already-fetched rows into the attention list, so
+// the SQL stays in one place and the wording can be exercised against real rows
+// without a live Overview request.
+
+const ATTENTION_ITEM_CAP = 4;
+
+// Grouping only — no currency symbol. The client knows the restaurant's currency;
+// the server does not want to bake one into a display string.
+const attentionMoneyFormat = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 });
+const attentionQtyFormat = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
+const fmtAttentionMoney = (n: number): string => attentionMoneyFormat.format(Math.round(n));
+const fmtAttentionQty = (n: number): string => attentionQtyFormat.format(n);
+
+/** Age the way a person says it: "12 min", "5 hrs", "2 days". */
+function attentionAge(seconds: number): string {
+  const mins = Math.max(0, Math.floor((Number.isFinite(seconds) ? seconds : 0) / 60));
+  if (mins < 60) { return `${Math.max(1, mins)} min`; }
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) { return `${hrs} hr${hrs === 1 ? "" : "s"}`; }
+  const days = Math.floor(hrs / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+/** "Tomatoes (2 kg left), Paneer (3 kg left) and 4 more" — a sentence fragment a
+ *  client can drop straight under the label. `total` is the true count, which is
+ *  what makes the "and N more" tail honest when items were capped. */
+function attentionDetail(items: AttentionItem[], total: number): string {
+  if (items.length === 0) { return ""; }
+  const parts = items.map((it) => (it.sub ? `${it.label} (${it.sub})` : it.label));
+  const rest = Math.max(0, total - parts.length);
+  if (rest > 0) { return `${parts.join(", ")} and ${rest} more`; }
+  if (parts.length === 1) { return parts[0]!; }
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+/** Worst thing first: severity, then the biggest count. */
+const ATTENTION_SEVERITY_RANK: Record<AttentionRow["severity"], number> = { high: 0, medium: 1, low: 2 };
+
+export interface AttentionStockRow {
+  barcode: string;
+  name: string;
+  /** JSON blob holding category/unit — there is no `unit` column on Inventory. */
+  description: string | null;
+  qty: number | string;
+  /** Which sub-signal this row belongs to. The three are DISJOINT and each is
+   *  capped independently, so a bucket's count and its named offenders always
+   *  come from the same set of rows. */
+  bucket: "low" | "expired" | "expiring";
+  /** Days relative to the RESTAURANT's today (negative = already expired).
+   *  Null only for a low-stock row with no expiry date. */
+  days_to_expiry: number | string | null;
+  /** Size of this row's whole bucket, counted before the per-bucket cap. */
+  bucket_count: number | string;
+}
+
+export interface AttentionDiscountRow {
+  id: string;
+  table_name: string | null;
+  discount_type: string | null;
+  discount_value: number | string | null;
+  amount: number | string | null;
+  age_secs: number | string;
+  total_count: number | string;
+  total_amount: number | string;
+}
+
+export interface AttentionBillRow {
+  id: string;
+  bill_no: string | null;
+  table_name: string | null;
+  total: number | string;
+  age_secs: number | string;
+  total_count: number | string;
+  total_amount: number | string;
+}
+
+export interface AttentionOrderRow {
+  id: string;
+  /** 8 = Pending (awaiting approval), 6 = Payment Pending Approval. */
+  status: number | string;
+  table_name: string | null;
+  total: number | string;
+  age_secs: number | string;
+  status_count: number | string;
+  status_amount: number | string;
+}
+
+export interface AttentionSources {
+  stock: AttentionStockRow[];
+  discounts: AttentionDiscountRow[];
+  bills: AttentionBillRow[];
+  /** Statuses 6 and 8 together; split by status here. */
+  orders: AttentionOrderRow[];
+  slow_movers: { name: unknown; category?: unknown; quantity: unknown; current_price?: unknown }[];
+  /** TRUE number of zero-selling dishes. `slow_movers` is a truncated preview,
+   *  so counting it would cap the total at the preview length and make "and N
+   *  more" a lie. Omitted = fall back to what the preview shows. */
+  zero_sellers_total?: number;
+}
+
+export function buildNeedsAttention(sources: AttentionSources): AttentionRow[] {
+  const rows: AttentionRow[] = [];
+  // A count with no names is exactly the complaint this feature answers, so a
+  // row that cannot name a single offender is not worth emitting at all — it
+  // would send the owner off to hunt for something we failed to identify.
+  const push = (row: AttentionRow): void => {
+    if (row.items.length === 0) { return; }
+    rows.push(row);
+  };
+
+  // --- Stock -----------------------------------------------------------------
+  // Three rows, deliberately DISJOINT, in strict precedence expired > low >
+  // expiring (the bucket CASE in the stock query is ordered to match):
+  //   • an item that is both low and expiring SOON is reported once, as low,
+  //     because restocking it also resolves the expiry. Until now the "low on
+  //     stock" count included expiring-but-well-stocked items, a plain mislabel;
+  //   • an item that has ALREADY expired is reported as expired no matter how
+  //     little of it is left. Restocking does not resolve an expiry that has
+  //     already passed — that stock has to be thrown out first — so filing it
+  //     under "low on stock" both made the expired count untrue and printed
+  //     "2 kg left" beside a reorder link for something inedible.
+  //
+  // Already-expired stock is SPLIT from expiring-soon rather than relabelled to
+  // cover both: they are different jobs. Expired stock is thrown out (and, being
+  // the oldest, it sorted first and pushed every genuinely-expiring item off the
+  // visible list); expiring stock is used up before it turns. One row cannot ask
+  // for both actions without telling the owner to do the wrong thing to half of
+  // the list.
+  //
+  // Each bucket carries its OWN count, taken from its own rows, so the count and
+  // the named offenders can never come from different sets.
+  const stockOf = (bucket: AttentionStockRow["bucket"]): AttentionStockRow[] =>
+    sources.stock.filter((r) => r.bucket === bucket);
+  const stockCount = (bucketRows: AttentionStockRow[]): number =>
+    Math.max(bucketRows.length, Math.round(parseNumeric(bucketRows[0]?.bucket_count)));
+
+  // Null/absent expiry (or an unparseable one) yields null, not "expires in NaN
+  // days" — a low row is allowed to have no expiry date at all.
+  const expiryPhrase = (value: AttentionStockRow["days_to_expiry"]): string | null => {
+    if (value === null || value === undefined) { return null; }
+    const days = Math.round(parseNumeric(value));
+    if (!Number.isFinite(days)) { return null; }
+    if (days < 0) { return `expired ${Math.abs(days)} day${Math.abs(days) === 1 ? "" : "s"} ago`; }
+    return days === 0 ? "expires today" : `expires in ${days} day${days === 1 ? "" : "s"}`;
+  };
+
+  const lowRows = stockOf("low");
+  const lowItems = lowRows
+    .sort((a, b) => parseNumeric(a.qty) - parseNumeric(b.qty))
+    .slice(0, ATTENTION_ITEM_CAP)
+    .map<AttentionItem>((r) => {
+      const qty = parseNumeric(r.qty);
+      const unit = parseInventoryDescription(r.description).unit;
+      // Carry the expiry through instead of dropping it. It is genuinely useful
+      // for the low-AND-expiring-soon rows that legitimately land here, and it
+      // is the backstop for the precedence above: should a caller ever hand this
+      // builder an already-expired row bucketed as `low`, the owner still reads
+      // "expired 91 days ago" rather than a bare quantity that means "reorder".
+      const when = expiryPhrase(r.days_to_expiry);
+      const left = qty <= 0 ? "out of stock" : `${fmtAttentionQty(qty)} ${unit} left`;
+      return {
+        label: String(r.name ?? ""),
+        sub: when ? `${left} · ${when}` : left,
+        value: round2(qty),
+        id: String(r.barcode ?? ""),
+      };
+    });
+  const lowCount = stockCount(lowRows);
+  if (lowCount > 0) {
+    push({
+      key: "low_stock",
+      label: "Ingredients low on stock",
+      count: lowCount,
+      severity: "high",
+      module: "Inventory",
+      detail: attentionDetail(lowItems, lowCount),
+      items: lowItems,
+      deep_link: {
+        module: "Inventory",
+        params: { filter: "low_stock", ...(lowItems.length === 1 && lowItems[0]!.id ? { entity_id: lowItems[0]!.id } : {}) },
+        // ?filter=low_stock is NOT parsed by the web inventory page — only
+        // ?highlightInventory=<barcode> is (use-highlight-row), so it is only
+        // sent when there is exactly one offender to point at.
+        href: lowItems.length === 1 && lowItems[0]!.id
+          ? `/dashboard/inventory?highlightInventory=${encodeURIComponent(lowItems[0]!.id)}`
+          : "/dashboard/inventory",
+      },
+    });
+  }
+
+  const stockItem = (r: AttentionStockRow): AttentionItem => {
+    const qty = parseNumeric(r.qty);
+    const unit = parseInventoryDescription(r.description).unit;
+    // Both expiry buckets are only reachable with a real expiry_date, so the
+    // null branch is unreachable here; keep the wording in one place anyway.
+    const when = expiryPhrase(r.days_to_expiry) ?? "expiry unknown";
+    return {
+      label: String(r.name ?? ""),
+      sub: `${when} · ${fmtAttentionQty(qty)} ${unit}`,
+      value: round2(qty),
+      id: String(r.barcode ?? ""),
+    };
+  };
+  const stockDeepLink = (filter: string, items: AttentionItem[]): AttentionDeepLink => ({
+    module: "Inventory",
+    params: { filter, ...(items.length === 1 && items[0]!.id ? { entity_id: items[0]!.id } : {}) },
+    href: items.length === 1 && items[0]!.id
+      ? `/dashboard/inventory?highlightInventory=${encodeURIComponent(items[0]!.id)}`
+      : "/dashboard/inventory",
+  });
+
+  // Worst first inside each bucket: most-expired, then soonest-to-expire.
+  const expiredRows = stockOf("expired");
+  const expiredItems = expiredRows
+    .sort((a, b) => parseNumeric(a.days_to_expiry) - parseNumeric(b.days_to_expiry))
+    .slice(0, ATTENTION_ITEM_CAP)
+    .map(stockItem);
+  const expiredCount = stockCount(expiredRows);
+  if (expiredCount > 0) {
+    push({
+      key: "expired_stock",
+      label: "Ingredients past their expiry date",
+      count: expiredCount,
+      severity: "high",
+      module: "Inventory",
+      detail: attentionDetail(expiredItems, expiredCount),
+      items: expiredItems,
+      deep_link: stockDeepLink("expired", expiredItems),
+    });
+  }
+
+  const expiringRows = stockOf("expiring");
+  const expiringItems = expiringRows
+    .sort((a, b) => parseNumeric(a.days_to_expiry) - parseNumeric(b.days_to_expiry))
+    .slice(0, ATTENTION_ITEM_CAP)
+    .map(stockItem);
+  const expiringCount = stockCount(expiringRows);
+  if (expiringCount > 0) {
+    push({
+      key: "expiring_stock",
+      label: "Ingredients expiring within a week",
+      count: expiringCount,
+      severity: "high",
+      module: "Inventory",
+      detail: attentionDetail(expiringItems, expiringCount),
+      items: expiringItems,
+      deep_link: stockDeepLink("expiring", expiringItems),
+    });
+  }
+
+  // --- Discount requests -----------------------------------------------------
+  const discountItems = sources.discounts.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((r) => {
+    const value = parseNumeric(r.discount_value);
+    const money = parseNumeric(r.amount);
+    const ask = String(r.discount_type ?? "").toLowerCase() === "percent"
+      ? `${fmtAttentionQty(value)}% off`
+      : `${fmtAttentionMoney(value)} off`;
+    return {
+      label: String(r.table_name ?? "").trim() || "Unassigned table",
+      sub: `${ask}${money > 0 ? ` · ${fmtAttentionMoney(money)}` : ""} · waiting ${attentionAge(parseNumeric(r.age_secs))}`,
+      value: round2(money),
+      id: String(r.id ?? ""),
+    };
+  });
+  const discountCount = Math.round(parseNumeric(sources.discounts[0]?.total_count));
+  if (discountCount > 0) {
+    const discountMoney = round2(parseNumeric(sources.discounts[0]?.total_amount));
+    push({
+      key: "pending_discounts",
+      label: "Discount requests awaiting approval",
+      count: discountCount,
+      severity: "high",
+      // "Bills" is not a module either client can open — kept only so an old
+      // build behaves exactly as it does today (a dead tap) rather than being
+      // silently re-routed. deep_link carries the destination that works.
+      module: "Bills",
+      detail: attentionDetail(discountItems, discountCount),
+      items: discountItems,
+      ...(discountMoney > 0 ? { amount: discountMoney } : {}),
+      deep_link: {
+        module: "Orders",
+        params: { filter: "discount_requests", ...(discountItems.length === 1 && discountItems[0]!.id ? { entity_id: discountItems[0]!.id } : {}) },
+        // The approvals panel is pinned above the orders grid (admin-only);
+        // ?highlightRequest=<id> is parsed there and is the notification
+        // contract's own param name.
+        href: discountItems.length === 1 && discountItems[0]!.id
+          ? `/dashboard/orders?highlightRequest=${encodeURIComponent(discountItems[0]!.id)}`
+          : "/dashboard/orders",
+      },
+    });
+  }
+
+  // --- Bills left open -------------------------------------------------------
+  const billItems = sources.bills.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((r) => {
+    const total = parseNumeric(r.total);
+    const billNo = String(r.bill_no ?? "").trim();
+    return {
+      label: String(r.table_name ?? "").trim() || (billNo ? `Bill #${billNo}` : "Unknown table"),
+      sub: `${fmtAttentionMoney(total)}${billNo ? ` · bill #${billNo}` : ""} · open ${attentionAge(parseNumeric(r.age_secs))}`,
+      value: round2(total),
+      id: String(r.id ?? ""),
+    };
+  });
+  const billCount = Math.round(parseNumeric(sources.bills[0]?.total_count));
+  if (billCount > 0) {
+    push({
+      key: "unsettled_bills",
+      label: "Bills left open more than a day",
+      count: billCount,
+      severity: "medium",
+      module: "Accounting",
+      detail: attentionDetail(billItems, billCount),
+      items: billItems,
+      // The number an owner actually reacts to: money sitting uncollected.
+      amount: round2(parseNumeric(sources.bills[0]?.total_amount)),
+      deep_link: {
+        // Neither client has an open-bills list: web /dashboard/accounting
+        // browses SETTLED bills only, and the app's accounting view does the
+        // same. An open bill is reachable through the table it belongs to, so
+        // this points at the floor plan. No filter param is parsed anywhere
+        // yet, hence the bare path.
+        module: "Tables",
+        params: { filter: "open_bill", ...(billItems.length === 1 ? { table: billItems[0]!.label } : {}) },
+        href: "/dashboard/tables",
+      },
+    });
+  }
+
+  // --- Orders / payments awaiting approval -----------------------------------
+  const orderRow = (
+    status: number,
+    key: string,
+    label: string,
+    deep: AttentionDeepLink,
+    sub: (r: AttentionOrderRow) => string,
+  ): void => {
+    const matching = sources.orders.filter((r) => Math.round(parseNumeric(r.status)) === status);
+    const count = Math.round(parseNumeric(matching[0]?.status_count));
+    if (count <= 0) { return; }
+    const items = matching.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((r) => ({
+      label: String(r.table_name ?? "").trim() || "Unknown table",
+      sub: sub(r),
+      value: round2(parseNumeric(r.total)),
+      id: String(r.id ?? ""),
+    }));
+    const money = round2(parseNumeric(matching[0]?.status_amount));
+    push({
+      key,
+      label,
+      count,
+      severity: "high",
+      module: deep.module,
+      detail: attentionDetail(items, count),
+      items,
+      ...(money > 0 ? { amount: money } : {}),
+      deep_link: {
+        ...deep,
+        params: { ...(deep.params ?? {}), ...(items.length === 1 && items[0]!.id ? { entity_id: items[0]!.id, table: items[0]!.label } : {}) },
+        // ?highlightOrder=<id> is parsed by the orders page; ?status= is not, so
+        // the multi-offender case stays a bare path.
+        href: items.length === 1 && items[0]!.id
+          ? `/dashboard/orders?highlightOrder=${encodeURIComponent(items[0]!.id)}`
+          : "/dashboard/orders",
+      },
+    });
+  };
+
+  orderRow(
+    8,
+    "orders_to_approve",
+    "Orders waiting for approval",
+    { module: "Orders", params: { status: "pending" } },
+    (r) => `${fmtAttentionMoney(parseNumeric(r.total))} · waiting ${attentionAge(parseNumeric(r.age_secs))}`,
+  );
+  orderRow(
+    6,
+    "payments_to_approve",
+    "Payments waiting for approval",
+    // The app approves a payment from the TABLE bill sheet, not the orders
+    // list; the web does it on the orders card. Hence the split destination.
+    { module: "Tables", params: { filter: "payment_pending" } },
+    (r) => `${fmtAttentionMoney(parseNumeric(r.total))} · waiting ${attentionAge(parseNumeric(r.age_secs))}`,
+  );
+
+  // --- Dishes that sold nothing ----------------------------------------------
+  // `slow_movers` arrives already truncated to a preview, so its length is a cap,
+  // not a total: counting it reported at most that many dead dishes however many
+  // the menu really has, and "and N more" under-stated the problem by exactly the
+  // amount that made it worth acting on. The true total is counted at source.
+  const dead = sources.slow_movers.filter((d) => parseNumeric(d.quantity) === 0);
+  const deadTotal = Math.max(dead.length, Math.round(parseNumeric(sources.zero_sellers_total)));
+  if (dead.length > 0) {
+    const items = dead.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((d) => {
+      const category = String(d.category ?? "").trim();
+      const price = parseNumeric(d.current_price);
+      return {
+        label: String(d.name ?? ""),
+        sub: [category, price > 0 ? fmtAttentionMoney(price) : ""].filter(Boolean).join(" · ") || undefined,
+        ...(price > 0 ? { value: round2(price) } : {}),
+      };
+    });
+    push({
+      key: "slow_movers",
+      label: "Dishes that sold nothing this period",
+      count: deadTotal,
+      severity: "low",
+      module: "Menu",
+      detail: attentionDetail(items, deadTotal),
+      items,
+      deep_link: {
+        // The menu page parses no query params on either client, so this is the
+        // plain module page. `q` is a hint for whichever client grows a search
+        // deep link first; nothing consumes it today.
+        module: "Menu",
+        params: { filter: "slow_movers", ...(items.length === 1 ? { q: items[0]!.label } : {}) },
+        href: "/dashboard/menu",
+      },
+    });
+  }
+
+  return rows.sort(
+    (a, b) => ATTENTION_SEVERITY_RANK[a.severity] - ATTENTION_SEVERITY_RANK[b.severity] || b.count - a.count,
+  );
 }
 
 export async function GetOverviewInsights(restaurantId: string, days = 30): Promise<OverviewInsights> {
@@ -8817,28 +9340,144 @@ export async function GetOverviewInsights(restaurantId: string, days = 30): Prom
   const peakHour = hours.find((h) => parseNumeric(h.orders) > 0) ?? null;
   const peakDay = wdays.find((d) => parseNumeric(d.orders) > 0) ?? null;
 
-  // Needs attention — only things a person can actually act on today.
-  const attention: OverviewInsights["needs_attention"] = [];
-  const countOf = async (sql: string): Promise<number> => {
-    const rows = await runQuery<{ n: string }>(sql, [context.res_id, context.outlet_id]).catch(() => [] as { n: string }[]);
-    return Math.round(parseNumeric(rows[0]?.n));
-  };
+  // Needs attention — only things a person can actually act on today, and each
+  // row NAMES its offenders. A bare count makes the owner tap just to learn what
+  // is wrong, which is the whole complaint this answers.
+  //
+  // These four reads sit on the Overview page load path, so they run
+  // concurrently, and none of them is wrapped in a catch: a bad column has to
+  // surface as a 500, never as a reassuring zero.
+  //
+  // Counts come from window aggregates computed BEFORE the row cap, so
+  // "and N more" stays truthful while only 4 rows cross the wire. Where one read
+  // feeds several rows, both the cap and the count are PER sub-signal — a shared
+  // cap let the loudest signal use up every slot and leave another signal with a
+  // count but nobody to name.
+  const og = isAllOutlets() ? "true" : "false";
+  await ensureInventoryExpiryColumn();
+  // Orders carry no total column — the figure exists only inside the food json.
+  // The regex guard is about MALFORMED json, not about masking a wrong column:
+  // an unparseable total contributes 0 rather than aborting the whole Overview.
+  const orderTotal =
+    `case when (o.food->>'total') ~ '^\\s*-?[0-9]+(\\.[0-9]+)?\\s*$' then (o.food->>'total')::numeric else 0 end`;
+  const attentionParams = [context.res_id, context.outlet_id];
 
-  const lowStock = ((advanced?.stock_alerts ?? []) as unknown[]).length;
-  if (lowStock > 0) { attention.push({ key: "low_stock", label: "Ingredients low on stock", count: lowStock, severity: "high", module: "Inventory" }); }
+  const [stockRows, discountRows, billRows, orderRows] = await Promise.all([
+    // Threshold 5 mirrors the Supply KPI (GetAdvancedAnalytics), so the Overview
+    // can never claim a different number than the page it links to. There is no
+    // reorder-level column anywhere in the schema to replace the hardcoded 5,
+    // and inventoryStatusFromStock() independently calls anything under 10 "Low
+    // Stock" — a disagreement worth knowing about but not worth widening here.
+    // `unit` is not a column either: it lives in the `description` JSON blob.
+    // $3 is the RESTAURANT's today, not the server's. `current_date` is the
+    // session's date (this server runs in UTC), so through the tenant's own late
+    // shift — 00:00-05:30 IST is still yesterday in UTC — stock expiring today
+    // was reported as expiring tomorrow. The tenant's day key is already derived
+    // from its IANA zone above, so it is passed down rather than recomputed with
+    // `at time zone`, which would depend on Postgres's zone catalog agreeing with
+    // Intl's.
+    //
+    // One read, three disjoint buckets, each counted and capped on its own (see
+    // buildNeedsAttention for why expired is not folded into expiring).
+    runQuery<AttentionStockRow>(
+      `select * from (
+         select barcode, name, description, "Quantity"::float as qty, bucket,
+                (expiry_date - $3::date)::int as days_to_expiry,
+                count(*) over (partition by bucket)::int as bucket_count,
+                row_number() over (
+                  partition by bucket
+                  order by case when bucket = 'low' then "Quantity"::numeric end asc nulls last,
+                           expiry_date asc nulls last, name asc
+                ) as rn
+           from (
+             select i.*,
+                    -- Expiry is tested FIRST. Testing quantity first filed every
+                    -- already-expired item that was also nearly gone under "low
+                    -- on stock" — so the "past their expiry date" row was not a
+                    -- count of expired stock, and the owner was shown "2 kg left"
+                    -- next to a reorder link for something that has to be thrown
+                    -- out. Low still beats expiring-soon (restocking resolves
+                    -- that one), but nothing outranks already expired.
+                    case when i.expiry_date < $3::date then 'expired'
+                         when i."Quantity"::numeric <= 5 then 'low'
+                         else 'expiring' end as bucket
+               from "Inventory" i
+              where i.res_id = $1 and (${og} or i.outlet_id = $2)
+                and (i."Quantity"::numeric <= 5
+                     or (i.expiry_date is not null and i.expiry_date <= $3::date + 7))
+           ) f
+       ) x where x.rn <= ${ATTENTION_ITEM_CAP}
+       order by x.bucket, x.rn`,
+      [...attentionParams, todayKey],
+    ),
+    // outlet_id is NULLABLE on DiscountRequests (unlike Bills/Orders), so a
+    // strict equality filter would silently hide any request written without one.
+    // table_name is denormalised onto the row; the Bills->Tables join is the
+    // fallback for older rows that predate it.
+    runQuery<AttentionDiscountRow>(
+      `select * from (
+         select d.id, d.discount_type, d.discount_value::float as discount_value,
+                d.amount::float as amount,
+                coalesce(nullif(d.table_name, ''), t.table_name) as table_name,
+                extract(epoch from (now() - d.created_at))::float as age_secs,
+                count(*) over ()::int as total_count,
+                coalesce(sum(coalesce(d.amount, 0)) over (), 0)::float as total_amount,
+                row_number() over (order by d.created_at asc) as rn
+           from "DiscountRequests" d
+           left join "Bills" b on b.id = d.bill_id
+           left join "Tables" t on t.id = b.table_id
+          where d.res_id = $1 and (${og} or d.outlet_id is null or d.outlet_id = $2)
+            and d.decided_at is null
+       ) x where x.rn <= ${ATTENTION_ITEM_CAP} order by x.rn`,
+      attentionParams,
+    ),
+    // Biggest money first — that is the one an owner chases. total_amt is
+    // tax-inclusive, so `amount` is what is genuinely uncollected.
+    runQuery<AttentionBillRow>(
+      `select * from (
+         select b.id, b.bill_no::text as bill_no, b.total_amt::float as total,
+                t.table_name,
+                extract(epoch from (now() - b.created_at))::float as age_secs,
+                count(*) over ()::int as total_count,
+                coalesce(sum(b.total_amt) over (), 0)::float as total_amount,
+                row_number() over (order by b.total_amt desc, b.created_at asc) as rn
+           from "Bills" b
+           left join "Tables" t on t.id = b.table_id
+          where b.res_id = $1 and (${og} or b.outlet_id = $2)
+            and b.closed_at is null and b.created_at < now() - interval '1 day'
+       ) x where x.rn <= ${ATTENTION_ITEM_CAP} order by x.rn`,
+      attentionParams,
+    ),
+    // 8 = Pending (awaiting approval), 6 = Payment Pending Approval. One trip,
+    // partitioned so each status gets its own exact count, money and top rows.
+    // The Tables join is unconditional: ~19% of orders point at soft-deleted
+    // tables, and filtering them out would drop live work off the list.
+    runQuery<AttentionOrderRow>(
+      `select * from (
+         select o.id, o.status::int as status, ${orderTotal}::float as total,
+                coalesce(nullif(t.table_name, ''), o.food->>'table') as table_name,
+                extract(epoch from (now() - o.created_at))::float as age_secs,
+                count(*) over (partition by o.status)::int as status_count,
+                coalesce(sum(${orderTotal}) over (partition by o.status), 0)::float as status_amount,
+                row_number() over (partition by o.status order by o.created_at asc) as rn
+           from "Orders" o
+           left join "Tables" t on t.id = o.table_id
+          where o.res_id = $1 and (${og} or o.outlet_id = $2) and o.status in (6, 8)
+       ) x where x.rn <= ${ATTENTION_ITEM_CAP} order by x.status, x.rn`,
+      attentionParams,
+    ),
+  ]);
 
-  const pendingDiscounts = await countOf(
-    `select count(*)::text as n from "DiscountRequests" where res_id = $1 and outlet_id = $2 and decided_at is null`,
-  );
-  if (pendingDiscounts > 0) { attention.push({ key: "pending_discounts", label: "Discount requests awaiting approval", count: pendingDiscounts, severity: "high", module: "Bills" }); }
-
-  const staleBills = await countOf(
-    `select count(*)::text as n from "Bills" where res_id = $1 and outlet_id = $2 and closed_at is null and created_at < now() - interval '1 day'`,
-  );
-  if (staleBills > 0) { attention.push({ key: "unsettled_bills", label: "Bills left open more than a day", count: staleBills, severity: "medium", module: "Accounting" }); }
-
-  const zeroSellers = (menu?.slow_movers ?? []).filter((d) => parseNumeric(d.quantity) === 0).length;
-  if (zeroSellers > 0) { attention.push({ key: "slow_movers", label: "Dishes that sold nothing this period", count: zeroSellers, severity: "low", module: "Menu" }); }
+  const attention = buildNeedsAttention({
+    stock: stockRows,
+    discounts: discountRows,
+    bills: billRows,
+    orders: orderRows,
+    slow_movers: menu?.slow_movers ?? [],
+    // menu.slow_movers is a truncated preview; this is the real number of dishes
+    // that sold nothing, so the row's count and its "and N more" are honest.
+    zero_sellers_total: menu?.zero_sellers_total,
+  });
 
   return {
     window_days: window,
@@ -17572,7 +18211,11 @@ export async function GetMenuPerformanceInsights(
   total_revenue: number;
   total_items_sold: number;
   top_dishes: DishStat[];
+  /** Preview only — the 8 worst. Never count this to size the problem. */
   slow_movers: DishStat[];
+  /** How many available dishes sold NOTHING in the period, counted before
+   *  slow_movers was truncated. Additive: no existing caller has to change. */
+  zero_sellers_total: number;
   price_suggestions: PriceSuggestion[];
   suppressed_suggestions: { count: number; items: SuppressedSuggestion[] };
   top_waiters: WaiterStat[];
@@ -17651,7 +18294,7 @@ export async function GetMenuPerformanceInsights(
 
   // Slow movers: items still on the (available) menu that sold little or nothing.
   const soldByName = new Map(dishes.map((d) => [d.name.toLowerCase(), d]));
-  const slow_movers: DishStat[] = menu
+  const slow_movers_all: DishStat[] = menu
     .filter((mi) => mi.available !== false)
     .map((mi) => {
       const sold = soldByName.get(mi.name.toLowerCase());
@@ -17664,8 +18307,11 @@ export async function GetMenuPerformanceInsights(
         current_price: mi.price,
       };
     })
-    .sort((a, b) => a.quantity - b.quantity || a.revenue - b.revenue)
-    .slice(0, 8);
+    .sort((a, b) => a.quantity - b.quantity || a.revenue - b.revenue);
+  // Counted BEFORE the preview is cut, so callers can state the size of the
+  // problem instead of the size of the list they were handed.
+  const zero_sellers_total = slow_movers_all.filter((d) => d.quantity === 0).length;
+  const slow_movers = slow_movers_all.slice(0, 8);
 
   // Price suggestions: raise prices on top-quartile sellers (demand is strong),
   // and trim prices on available-but-stagnant items to drive volume.
@@ -17897,6 +18543,7 @@ export async function GetMenuPerformanceInsights(
     total_items_sold: totalItems,
     top_dishes,
     slow_movers,
+    zero_sellers_total,
     price_suggestions: price_suggestions_capped,
     suppressed_suggestions,
     top_waiters,

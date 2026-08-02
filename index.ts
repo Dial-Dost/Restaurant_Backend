@@ -250,6 +250,9 @@ import {
 	CORE_ROLES,
 	getRestaurantIdFromUsername,
 	openTenantConnection,
+	runTenantQuery,
+	runTenantTransaction,
+	normalizeTableSection,
 	withTenant,
 	FinalizeOnlinePayment,
 	GetRestaurantRazorpayKeys,
@@ -792,6 +795,12 @@ const PERM_VALET_KEYS = "4a7d1c9e-5b3f-4e8a-a6d2-0c9f7b3e5a18"; // Valet Key Log
 // section create/rename/delete used to ride on. See TABLE_SECTION_PERM below for
 // why MOVING a table between existing sections deliberately stays on 194ce6ee.
 const PERM_TABLE_SECTIONS = "2f7c5a94-8e13-4b60-9d27-6a0f3c8e5b41"; // Manage Table Sections (Tables)
+// AUDIT LABEL ONLY — never passed to validateAction. Editing a table stays gated
+// on "Table Added" (194ce6ee…), which every floor role already holds; gating on
+// this id would strip that ability from every existing role the moment migration
+// 023 landed. Audit titles render from "Actions".action_name, so without this row
+// every move and capacity edit was filed under "Table Added" and was unfindable.
+const AUDIT_TABLE_UPDATED = "526c6b48-4036-4d0d-b617-b34acba3a1d2"; // Table Updated (Tables)
 
 // Permission gate for a specific granted Action. Admin (actions include "*")
 // always passes; any role granted this action UUID passes; everyone else 403.
@@ -3149,6 +3158,101 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	res.send(table_name);
 });
 
+// --- Floor-zone roster ("Table_sections", migration 023) ---------------------
+// "Tables".section stays the source of truth for WHICH zone a table sits in — a
+// drag is still a single-row UPDATE. These rows only record that a zone NAME
+// exists, so a zone with no tables in it survives a reload and reaches every
+// device instead of living in one browser's localStorage.
+//
+// Every statement is keyed on lower(btrim(name)) because that is how the rest of
+// the section code resolves a zone (GetTableSections / RenameTableSection); a
+// case-sensitive key here would let "Patio" and "patio" both exist while a
+// rename swept both.
+//
+// These run on the request's tenant connection, so RLS scopes them to app.res_id
+// on top of the explicit res_id/outlet_id predicates.
+
+interface ZoneScope { res_id: string; outlet_id: string }
+
+// req.auth carries the SAME res_id/outlet_id that openTenantConnection bound the
+// connection to, which is the pair resolveRestaurantContext resolves for every
+// data-layer call on this request. Null only if the route is unauthenticated,
+// which none of the section routes are.
+function zoneScope(req: Request): ZoneScope | null {
+	const res_id = req.auth?.res_id;
+	const outlet_id = req.auth?.outlet_id;
+	return res_id && outlet_id ? { res_id, outlet_id } : null;
+}
+
+async function listStoredZones(scope: ZoneScope): Promise<string[]> {
+	const rows = await runTenantQuery<{ name: string }>(
+		`select btrim(name) as name from "Table_sections"
+		  where res_id = $1 and outlet_id = $2 and btrim(name) <> ''
+		  order by lower(btrim(name))`,
+		[scope.res_id, scope.outlet_id],
+	);
+	return rows.map((r) => r.name);
+}
+
+/** Inserts the zone; returns false when one already exists under that name. */
+async function insertStoredZone(scope: ZoneScope, name: string): Promise<boolean> {
+	const rows = await runTenantQuery<{ id: string }>(
+		`insert into "Table_sections" (res_id, outlet_id, name) values ($1, $2, $3)
+		 on conflict do nothing returning id`,
+		[scope.res_id, scope.outlet_id, name],
+	);
+	return rows.length > 0;
+}
+
+/**
+ * Point the roster row at the new name. Returns how many rows moved; 0 means the
+ * zone only ever existed as a table label (created before migration 023 backfilled,
+ * or by a table drag), so the caller upserts instead — a rename must never leave
+ * the roster naming a zone that no longer exists.
+ */
+async function renameStoredZone(scope: ZoneScope, from: string, to: string): Promise<number> {
+	const rows = await runTenantQuery<{ id: string }>(
+		`update "Table_sections" set name = $4
+		  where res_id = $1 and outlet_id = $2 and lower(btrim(name)) = lower(btrim($3))
+		  returning id`,
+		[scope.res_id, scope.outlet_id, from, to],
+	);
+	return rows.length;
+}
+
+async function deleteStoredZone(scope: ZoneScope, name: string): Promise<number> {
+	const rows = await runTenantQuery<{ id: string }>(
+		`delete from "Table_sections"
+		  where res_id = $1 and outlet_id = $2 and lower(btrim(name)) = lower(btrim($3))
+		  returning id`,
+		[scope.res_id, scope.outlet_id, name],
+	);
+	return rows.length;
+}
+
+/**
+ * The table as it stands BEFORE a PATCH, so the audit reason can name what
+ * actually changed ("moved from Patio to Garden") instead of reprinting every
+ * field on every edit. Best-effort: a null snapshot degrades the wording, never
+ * the write.
+ */
+async function readTableBeforeUpdate(
+	scope: ZoneScope,
+	tableName: string,
+): Promise<{ capacity: number; max_capacity: number | null; section: string | null } | null> {
+	const rows = await runTenantQuery<{ capacity: string | number; max_capacity: number | null; section: string | null }>(
+		`select capacity, max_capacity, nullif(btrim(coalesce(section, '')), '') as section
+		   from "Tables"
+		  where res_id = $1 and outlet_id = $2 and lower(btrim(table_name)) = lower(btrim($3))
+		    and coalesce(is_deleted, false) = false
+		  limit 1`,
+		[scope.res_id, scope.outlet_id, tableName],
+	);
+	const row = rows[0];
+	if (!row) {return null;}
+	return { capacity: Number(row.capacity), max_capacity: row.max_capacity, section: row.section };
+}
+
 /*
 	Edit an existing table's seating numbers and/or floor section (same permission
 	as adding one).
@@ -3202,11 +3306,28 @@ app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b")
 	// typing a brand-new zone name here creates one (Manage Table Sections).
 	if (await requireSectionAdminForNewSection(req, res, restaurantId, section)) {return;}
 
+	const scope = zoneScope(req);
+	// Read the row first so the audit line can name the move, not just the result.
+	const before = scope ? await readTableBeforeUpdate(scope, tableName).catch((err) => {
+		logger.warn({ err }, "table_before_snapshot_failed");
+		return null;
+	}) : null;
+
 	try {
 		const updated = await UpdateTable(restaurantId, tableName, { capacity, max_capacity: maxCapacity, section });
 		if (!updated) {
 			res.status(404).json({ error: "Table not found" });
 			return;
+		}
+
+		// Typing a zone name that does not exist yet CREATES it (that is what the
+		// section-admin check above gates), so record it in the roster too — otherwise
+		// the zone would evaporate the moment its last table moved out.
+		if (scope && typeof updated.section === "string" && updated.section.trim()) {
+			await insertStoredZone(scope, updated.section.trim()).catch((err) => {
+				logger.warn({ err }, "table_section_roster_adopt_failed");
+				return false;
+			});
 		}
 
 		try {
@@ -3215,7 +3336,40 @@ app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b")
 			logger.warn({ err }, "emit table:updated failed");
 		}
 		try {
-			await log_audit(req, "194ce6ee-b867-4be3-b5f0-48c28ce0a81b", `Updated table ${updated.table_name} (capacity ${updated.capacity}, max ${updated.max_capacity}, section ${updated.section ?? "unassigned"})`, Audit_log_category.Tables, updated);
+			// A drag between zones and a capacity edit are the same PATCH, and the old
+			// line printed all three fields either way — so an audit reader could not
+			// tell which one the operator actually touched. Report only what moved.
+			const zoneLabel = (value: string | null | undefined): string => {
+				const trimmed = typeof value === "string" ? value.trim() : "";
+				return trimmed ? trimmed : "unassigned";
+			};
+			const changes: string[] = [];
+			if (before) {
+				if (updated.capacity !== before.capacity) {
+					changes.push(`capacity ${before.capacity} -> ${updated.capacity}`);
+				}
+				// max_capacity reads as "same as capacity" when unset, so compare the
+				// effective ceilings or clearing it looks like a change that never was.
+				const beforeMax = before.max_capacity ?? before.capacity;
+				if (updated.max_capacity !== beforeMax) {
+					changes.push(`max capacity ${beforeMax} -> ${updated.max_capacity}`);
+				}
+				if (zoneLabel(updated.section) !== zoneLabel(before.section)) {
+					changes.push(`moved from ${zoneLabel(before.section)} to ${zoneLabel(updated.section)}`);
+				}
+			} else {
+				// No snapshot (read failed, or the table was created mid-request): fall
+				// back to the fields the client actually sent rather than inventing a diff.
+				if (capacity !== undefined) {changes.push(`capacity ${updated.capacity}`);}
+				if (maxCapacity !== undefined) {changes.push(`max capacity ${updated.max_capacity}`);}
+				if (section !== undefined) {changes.push(`section ${zoneLabel(updated.section)}`);}
+			}
+			const reason = changes.length > 0
+				? `Updated table ${updated.table_name}: ${changes.join(", ")}`
+				// A PATCH that set every field to what it already was is still an
+				// operator action worth a line; say so instead of printing nothing.
+				: `Updated table ${updated.table_name} (no values changed)`;
+			await log_audit(req, AUDIT_TABLE_UPDATED, reason, Audit_log_category.Tables, { ...updated, before });
 		} catch (err) {
 			logger.warn({ err }, 'log_audit update-table failed');
 		}
@@ -3228,12 +3382,19 @@ app.patch("/table/:name", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b")
 });
 
 /*
-	Floor sections (zones). There is no Sections table — a section IS the set of
-	tables carrying that name, so these three routes are a group-by and two
-	one-statement label updates. Same permission as editing a table.
+	Floor sections (zones). A zone lives in TWO places and the routes below keep
+	them in step: "Tables".section says which zone each table is in (a drag is one
+	single-row UPDATE), and "Table_sections" records that the NAME exists so a zone
+	with no tables in it still exists. Before migration 023 there was no second
+	source, so "Add Section" in the web UI could not reach the server at all — it
+	wrote the new zone to localStorage, which meant no audit entry and a zone that
+	never left that one browser.
 
 	GET    /table-sections            -> { sections: [{ section, tables, seats }], unassigned }
+	POST   /table-sections            body { "name": "Garden" } -> { section, tables, seats }
 	PATCH  /table-sections/:name      body { "name": "New name" } -> { section, updated }
+	                                     409 if the new name is already a zone (both
+	                                     sources checked); never merges two zones
 	DELETE /table-sections/:name      -> { section, updated }  (tables become unassigned;
 	                                     no table is ever deleted by this route)
 	To MOVE one table, use PATCH /table/:name { section } — one row, O(1) per drop.
@@ -3254,28 +3415,125 @@ app.get("/table-sections", validateAction(TABLE_SECTION_PERM), async (req: Reque
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
-		res.json(await GetTableSections(restaurantId));
+		const roster = await GetTableSections(restaurantId);
+		const scope = zoneScope(req);
+		if (scope) {
+			// Union the two sources: zones derived from "Tables".section already carry
+			// their counts, and any roster row they don't cover is an EMPTY zone (0/0).
+			// Keyed case-insensitively, the same way rename/delete resolve a zone, so a
+			// stored "patio" never renders a second time next to a table's "Patio".
+			const seen = new Set(roster.sections.map((s) => s.section.trim().toLowerCase()));
+			for (const name of await listStoredZones(scope)) {
+				const key = name.toLowerCase();
+				if (seen.has(key)) { continue; }
+				seen.add(key);
+				roster.sections.push({ section: name, tables: 0, seats: 0 });
+			}
+			roster.sections.sort((a, b) => a.section.localeCompare(b.section, undefined, { sensitivity: "base" }));
+		}
+		res.json(roster);
 	} catch (error: any) {
 		logger.error({ err: error }, "table_sections_list_failed");
 		res.status(500).json({ error: "Unable to fetch table sections" });
 	}
 });
 
+/*
+	Create an empty zone. This is what the web "Add Section" button was missing:
+	without it a new zone was a localStorage entry, so it was never audited and
+	never reached a second device.
+*/
+app.post("/table-sections", validateAction(TABLE_SECTION_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const scope = zoneScope(req);
+	if (!scope) { res.status(400).json({ error: "Missing outlet" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const raw = typeof body.name === "string" ? body.name : typeof body.section === "string" ? body.section : "";
+	const name = raw.trim();
+	// A whitespace-only name is truthy and would create a zone nothing can ever
+	// address again — the same trap POST /add-table had to close for table names.
+	if (!name) { res.status(400).json({ error: "Section name is required" }); return; }
+
+	try {
+		// A zone can already exist as a table label without a roster row (created by a
+		// drag, or on a database that predates migration 023), so duplicates have to be
+		// checked against BOTH sources or the second create would look like it worked.
+		if (await TableSectionExists(restaurantId, name)) {
+			res.status(409).json({ error: `A section named "${name}" already exists` });
+			return;
+		}
+		if (!(await insertStoredZone(scope, name))) {
+			res.status(409).json({ error: `A section named "${name}" already exists` });
+			return;
+		}
+		const created = { section: name, tables: 0, seats: 0 };
+		try { emitRestaurant(restaurantId, "table:sections_updated", { action: "create", section: name, tables: 0 }); } catch { /* ignore realtime errors */ }
+		try { await log_audit(req, TABLE_SECTION_PERM, `Created table section ${name}`, Audit_log_category.Tables, created); } catch (err) { logger.warn({ err }, "log_audit create-section failed"); }
+		res.status(201).json(created);
+	} catch (error: any) {
+		logger.error({ err: error }, "table_section_create_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to create section") });
+	}
+});
+
 app.patch("/table-sections/:name", validateAction(TABLE_SECTION_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const scope = zoneScope(req);
+	if (!scope) { res.status(400).json({ error: "Missing outlet" }); return; }
 	const from = typeof req.params.name === "string" ? req.params.name.trim() : "";
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const to = typeof body.name === "string" ? body.name : typeof body.section === "string" ? body.section : "";
 	if (!from || !String(to).trim()) { res.status(400).json({ error: "Both the current and new section name are required" }); return; }
+	// Key both names the way the data layer stores them, so "Patio " and "Patio"
+	// (and "AC  Hall" / "AC Hall") are recognised as the same zone here too.
+	const toName = normalizeTableSection(to);
+	if (!toName) { res.status(400).json({ error: "Both the current and new section name are required" }); return; }
+	const sameZone = (normalizeTableSection(from) ?? "").toLowerCase() === toName.toLowerCase();
 	try {
-		const r = await RenameTableSection(restaurantId, from, String(to));
-		if (r.updated === 0) { res.status(404).json({ error: "Section not found" }); return; }
+		/*
+			A rename writes TWO sources — "Tables".section and the "Table_sections"
+			roster — and they have to move together. They used to be two autocommitted
+			statements: when the roster UPDATE hit migration 023's unique index the
+			route answered 400, but the floor had ALREADY been relabelled, so the
+			caller was told a rename failed that the staff could see had happened.
+			Now the collision is decided BEFORE anything is written, and both writes
+			share one transaction, so a failure leaves both sources untouched.
+
+			Colliding with an existing zone is a 409 refusal, not a silent merge:
+			"rename Patio to Garden" when Garden already exists would otherwise pour
+			Patio's tables into Garden and destroy the Patio zone, which is a floor
+			reorganisation nobody asked for and nothing can undo.
+		*/
+		const outcome = await runTenantTransaction(async () => {
+			// A pure re-spelling ("patio" -> "Patio") collides with itself; that is a
+			// rename, not a conflict.
+			if (!sameZone && await TableSectionExists(restaurantId, toName)) {
+				return { status: "conflict" as const };
+			}
+			const r = await RenameTableSection(restaurantId, from, toName);
+			const rosterRows = await renameStoredZone(scope, from, r.section);
+			// A zone with no tables in it is now a legitimate thing to rename, so 404 only
+			// when NEITHER source knew the old name.
+			if (r.updated === 0 && rosterRows === 0) { return { status: "not_found" as const }; }
+			// Tables carried the name but the roster didn't (pre-023 zone, or one created
+			// by a drag): adopt it, or the rename leaves the roster naming a dead zone.
+			if (rosterRows === 0) { await insertStoredZone(scope, r.section); }
+			return { status: "ok" as const, result: r };
+		});
+		if (outcome.status === "conflict") { res.status(409).json({ error: `A section named "${toName}" already exists` }); return; }
+		if (outcome.status === "not_found") { res.status(404).json({ error: "Section not found" }); return; }
+		const r = outcome.result;
 		try { emitRestaurant(restaurantId, "table:sections_updated", { action: "rename", from, to: r.section, tables: r.updated }); } catch { /* ignore realtime errors */ }
 		try { await log_audit(req, TABLE_SECTION_PERM, `Renamed table section ${from} to ${r.section} (${r.updated} tables)`, Audit_log_category.Tables, r); } catch (err) { logger.warn({ err }, "log_audit rename-section failed"); }
 		res.json(r);
 	} catch (error: any) {
 		logger.error({ err: error }, "table_section_rename_failed");
+		// A concurrent rename can still lose the race to the unique index after the
+		// pre-check passed. The transaction rolled it back, so nothing half-applied —
+		// report it as the collision it is rather than a generic 400.
+		if (error?.code === "23505") { res.status(409).json({ error: `A section named "${toName}" already exists` }); return; }
 		res.status(400).json({ error: String(error?.message ?? "Unable to rename section") });
 	}
 });
@@ -3283,11 +3541,14 @@ app.patch("/table-sections/:name", validateAction(TABLE_SECTION_PERM), async (re
 app.delete("/table-sections/:name", validateAction(TABLE_SECTION_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const scope = zoneScope(req);
+	if (!scope) { res.status(400).json({ error: "Missing outlet" }); return; }
 	const name = typeof req.params.name === "string" ? req.params.name.trim() : "";
 	if (!name) { res.status(400).json({ error: "Section name is required" }); return; }
 	try {
 		const r = await DeleteTableSection(restaurantId, name);
-		if (r.updated === 0) { res.status(404).json({ error: "Section not found" }); return; }
+		const rosterRows = await deleteStoredZone(scope, name);
+		if (r.updated === 0 && rosterRows === 0) { res.status(404).json({ error: "Section not found" }); return; }
 		try { emitRestaurant(restaurantId, "table:sections_updated", { action: "delete", section: r.section, tables: r.updated }); } catch { /* ignore realtime errors */ }
 		try { await log_audit(req, TABLE_SECTION_PERM, `Removed table section ${r.section} (${r.updated} tables unassigned)`, Audit_log_category.Tables, r); } catch (err) { logger.warn({ err }, "log_audit delete-section failed"); }
 		res.json(r);
