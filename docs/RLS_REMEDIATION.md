@@ -1,9 +1,37 @@
 # RLS remediation — moving the runtime off the RLS-bypassing role
 
-**Status: NOT DONE. Nothing in this document has been applied.** It is the
-plan for closing the "Row-Level Security is inert" finding. Do NOT run any of
-it against production from a shell — it needs a maintenance window and a
-staging rehearsal, and a wrong step locks the app out of its own data.
+**Status: STEPS 1-2 APPLIED. The cutover itself (steps 3-4) has NOT been done.**
+
+What is already done against production, all of it additive and reversible —
+the running app still connects as `postgres`, so nothing changed for users:
+
+- `app_runtime` and `platform_runtime` now have real passwords.
+- `grant usage on schema platform to app_runtime` — the gap that would have
+  made the plan lookup fail OPEN (every tenant silently dropping to an empty
+  plan, all limits unenforced). Verified `has_schema_privilege` false -> true.
+- `MIGRATION_DATABASE_URL` is now pinned explicitly to the owner URL in `.env`,
+  so a later repoint cannot break `npm run migrate`.
+- Ready-to-use connection URLs are parked in `.env` as `RLS_READY_APP_RUNTIME_URL`
+  and `RLS_READY_PLATFORM_RUNTIME_URL` (inactive keys; `.env` is gitignored).
+
+**Isolation was PROVEN, not assumed.** Connecting as `app_runtime` against
+production:
+
+| `app.res_id` | `select count(*) from "Menu"` |
+|---|---|
+| `00000000-…-000000000000` (bogus) | **0** |
+| `e47e69a8-…` (CSR Organics)       | **57** |
+
+As `postgres` today the bogus tenant returns 57 — that is the bug. The pooler
+also accepts `app_runtime.<project-ref>`, so the runtime pools do NOT need to
+move to the direct 5432 host, and `platform.restaurant_plan()` succeeds under
+the new grant.
+
+**What remains is the cutover, and it still wants a window.** Repointing the
+three URLs re-establishes every pooled connection, and any code path that
+forgets to set `app.res_id` will start returning zero rows instead of data —
+silently. Rollback is fast (restore the previous values, restart, ~15s, no data
+change), but it should be done when someone is watching, not unattended.
 
 ## What is actually wrong
 

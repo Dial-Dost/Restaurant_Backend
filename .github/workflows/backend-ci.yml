@@ -33,6 +33,14 @@ jobs:
           npm ci
           npm install --save-dev tsx
 
+      # Money invariants. Runs BEFORE the stack comes up because it needs neither
+      # a database nor Docker: the bill set is in memory and only `pg` is faked,
+      # so the real report readers are exercised. Placed first so a service-charge
+      # / tax regression fails the build in seconds and can never be masked by an
+      # unreachable DB or a docker-compose problem.
+      - name: Money invariants (bill totals vs report readers)
+        run: npm run test:money
+
       - name: Write .env file
         run: |
           echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env

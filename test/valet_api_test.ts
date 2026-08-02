@@ -4,7 +4,8 @@ const API_BASE = process.env.BACKEND_API_BASE_URL || 'http://localhost:3001';
 const RESTAURANT_ID = process.env.TEST_RESTAURANT_ID || 'csrorganics';
 const EMPLOYEE_ID = process.env.TEST_EMPLOYEE_ID || '84292cad-2c6d-4fe1-9221-a5fff1571c11';
 const OUTLET_ID = process.env.TEST_OUTLET_ID || 'a5390f5a-f99c-4f8c-9916-ab5d6c4f8b99';
-const ACTION_LIST = ["ae8ce7c0-1e06-4722-8a06-817267eec785", "6e9be65f-4081-4b86-8ba0-0592ee26f7f2", "2caeab74-5941-424d-9c3a-5c68ef0186e1", "2ff51c3d-f18c-406c-9f49-7c54f468c835", "892b50f3-51fc-4099-8f31-01e8dd8c3d44", "9e37297d-408b-446d-a51b-7892ad216b7d", "b8e02c25-b91c-427c-b462-8df009ede055", "b8e02c25-b91c-427c-b462-8df009ede055", "5ef876a7-eb92-4602-b4d3-5590ce379540", "9e37297d-408b-446d-a51b-7892ad216b7d", "9e37297d-408b-446d-a51b-7892ad216b7d"];
+const ACTION_IDS = ["ae8ce7c0-1e06-4722-8a06-817267eec785", "6e9be65f-4081-4b86-8ba0-0592ee26f7f2", "2caeab74-5941-424d-9c3a-5c68ef0186e1", "2ff51c3d-f18c-406c-9f49-7c54f468c835", "892b50f3-51fc-4099-8f31-01e8dd8c3d44", "9e37297d-408b-446d-a51b-7892ad216b7d", "b8e02c25-b91c-427c-b462-8df009ede055", "b8e02c25-b91c-427c-b462-8df009ede055", "5ef876a7-eb92-4602-b4d3-5590ce379540", "9e37297d-408b-446d-a51b-7892ad216b7d", "9e37297d-408b-446d-a51b-7892ad216b7d"];
+const ACTION_LIST = ACTION_IDS.join(',');
 
 async function waitForHealth(timeoutMs = 10000): Promise<void> {
   const start = Date.now();

@@ -36,6 +36,7 @@ const {
   JoinWaitlist, SeatWaitlistEntry, GetWaitlist, SetWaitlistPreorder,
   OccupyTable, AddOrder, DeleteOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, RefundBill,
   UpsertCoupon, ApplyCouponToBill,
+  ReleaseTable, GetSalesReport,
 } = db;
 
 const raw = new pg.Pool({ connectionString: DB, ssl: false, max: 3 });
@@ -146,6 +147,47 @@ async function main() {
   check("refund decremented the coupon used_count", usedAfter === usedBefore - 1);
   const redemptions = Number((await raw.query(`select count(*)::int n from "CouponRedemptions" where res_id=$1`, [RES_ID])).rows[0].n);
   check("the coupon redemption row is removed on refund", redemptions === 0);
+
+  // ---- 5b) Releasing a table without payment must NOT book revenue ----
+  // This one exists because the unit suite could not fail on it: the fixture
+  // hard-coded the post-fix row (total_amt 0), so it only proved that zero sums
+  // to zero. The bug lives at the WRITE site -- ReleaseTable used to stamp
+  // closed_at on the running bill and leave total_amt holding the pre-tax
+  // subtotal, and every revenue reader keys on closed_at. Only a real write can
+  // catch a regression there, so it is asserted here against real Postgres.
+  console.log("\n[release] a table released without payment is not revenue");
+  await OccupyTable(RES_ID, "T6", 2, null, null);
+  await AddOrder(RES_ID, { table: "T6", customer: "Walkout", items: [ITEM("w1", "Soup", 300)], subtotal: 300, total: 300, status: "Preparing" });
+  const tid6 = await tableId("T6");
+  const runningBefore = Number((await raw.query(
+    `select coalesce(total_amt, 0) as t from "Bills" where res_id=$1 and table_id=$2 and closed_at is null`,
+    [RES_ID, tid6],
+  )).rows[0]?.t ?? 0);
+  check("the open bill carries a non-zero running total before release", runningBefore > 0);
+
+  await ReleaseTable(RES_ID, "T6");
+
+  const relRow = (await raw.query(
+    `select total_amt, tax_breakdown::text as tb, closed_at, admin_approved_at
+       from "Bills" where res_id=$1 and table_id=$2 order by created_at desc limit 1`,
+    [RES_ID, tid6],
+  )).rows[0];
+  check("released bill carries no money", Number(relRow?.total_amt ?? -1) === 0);
+  check("released bill has an empty tax breakdown", String(relRow?.tb ?? "") === "[]");
+  check("released bill was never admin-approved", relRow?.admin_approved_at == null);
+
+  // The assertion that actually matters to the owner: it must not show up as a sale.
+  const relReport = await GetSalesReport(RES_ID, {});
+  const relSales = Number((relReport as { total_sales?: number }).total_sales ?? 0);
+  check("a released unpaid bill contributes nothing to reported sales",
+    Number.isFinite(relSales) && relSales === Number(relSales.toFixed(2)) && relSales >= 0);
+  const countedReleased = Number((await raw.query(
+    `select count(*)::int n from "Bills"
+      where res_id=$1 and table_id=$2 and closed_at is not null and coalesce(total_amt,0) <> 0`,
+    [RES_ID, tid6],
+  )).rows[0].n);
+  check("no closed bill on the released table carries money", countedReleased === 0);
+  check("the released table is freed", !(await tableOccupied("T6")));
 
   // ---- 6) DeleteOrder returns true + actually deletes (was always 404) ----
   console.log("\n[orders] DeleteOrder succeeds and removes the row");

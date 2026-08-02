@@ -10546,17 +10546,16 @@ export async function DeleteOrder(
 // The consolidated bill for a table = sum of all its non-cancelled orders.
 // Used so a table has exactly ONE bill that always reflects every order placed,
 // computed idempotently (re-billing or editing an order never double-counts).
-async function sumOrderTotalsForTable(
-  context: RestaurantContext,
-  tableId: string,
-  client?: PoolClient,
-): Promise<number> {
-  const rows = await runQuery<{ food: unknown; status: unknown }>(
-    `select food, status from "Orders" where res_id = $1 and outlet_id = $2 and table_id = $3`,
-    [context.res_id, context.outlet_id, tableId],
-    client,
-  );
+// Reduce a table's orders to its CURRENT occupancy's pre-tax subtotal and the
+// number of orders behind it. Kept separate from the query so the open-bill list
+// — which fetches every open table's orders in one trip — reduces them by the
+// exact same two rules rather than a lookalike copy that can drift.
+function activeOrderSubtotal(
+  rows: { food: unknown; status: unknown }[],
+): { subtotal: number; order_count: number; first_food: unknown } {
   let sum = 0;
+  let order_count = 0;
+  let first_food: unknown = null;
   for (const r of rows) {
     // Only the CURRENT occupancy counts: skip cancelled/paid/closed orders so a
     // re-occupied table never re-sums a previous session's (closed) orders.
@@ -10572,8 +10571,23 @@ async function sumOrderTotalsForTable(
     const subtotal = parseNumeric(p.subtotal);
     const total = subtotal > 0 ? subtotal : parseNumeric(p.total);
     sum += total;
+    order_count += 1;
+    if (first_food === null) {first_food = r.food;}
   }
-  return round2(sum);
+  return { subtotal: round2(sum), order_count, first_food };
+}
+
+async function sumOrderTotalsForTable(
+  context: RestaurantContext,
+  tableId: string,
+  client?: PoolClient,
+): Promise<number> {
+  const rows = await runQuery<{ food: unknown; status: unknown }>(
+    `select food, status from "Orders" where res_id = $1 and outlet_id = $2 and table_id = $3`,
+    [context.res_id, context.outlet_id, tableId],
+    client,
+  );
+  return activeOrderSubtotal(rows).subtotal;
 }
 
 // Resolve a table id by name within a tenant context.
@@ -12128,6 +12142,247 @@ export async function ListClosedBills(
   const bills = rows.map((row) => mapClosedBillSummary(row, scPct));
 
   return { bills, total, limit, offset, has_more: offset + bills.length < total };
+}
+
+// --- Open (unsettled) bills: money still on the floor -------------------------
+// The exact complement of ListClosedBills: every bill whose closed_at is null.
+// Together the two cover every bill that exists, which is the point — accounting
+// could only ever browse SETTLED bills, so "who owes me money right now" had no
+// answer on either client and the Overview's unsettled-bills row had nowhere to
+// deep-link but the floor plan.
+//
+// THE TRAP THIS READER EXISTS TO AVOID: on an open bill "Bills".total_amt is the
+// running PRE-TAX SUBTOTAL, not the grand total. Only the payment workflow
+// snapshots the charged grand total + tax lines onto the row (waiter-confirm and
+// every path that stands in for it — customer pay, Razorpay — all write
+// waiter_confirmed_at in the same statement). So reading total_amt the way the
+// settled readers do would under-report every un-confirmed bill by the whole tax
+// + service charge, which on this tenant's outlets is 15%.
+//
+// Hence two money paths, both landing in closedBillCharges:
+//   snapshotted (waiter_confirmed_at set) — trust the stored grand total + tax
+//     breakdown verbatim, exactly as the bill-detail read does.
+//   live (not yet confirmed)              — re-price from the table's active
+//     orders through computeBillCharges (the same call the settle paths make),
+//     then classify THAT result with closedBillCharges.
+// Routing both through closedBillCharges means the split between tax and service
+// charge is the one splitServiceChargeLine performs — a "Service Charge" entry in
+// Outlets.default_tax lands in the breakdown looking like a tax line, and summing
+// it as tax is the bug that misreported 31,733.92 as GST — and it means the
+// numbers here are identical to what /bills/closed will report the moment the
+// bill settles.
+//
+// A RELEASED bill (table cleared without payment) has closed_at set and its money
+// zeroed at the write site, so it is not open and never appears here; nothing in
+// this list has been settled by any definition.
+export interface OpenBillSummary {
+  id: string;
+  bill_no: string | null;
+  status: number;
+  table_id: string | null;
+  table_name: string | null;
+  covers: number | null;
+  order_count: number;
+  // INVARIANT, same as a settled bill: taxable_base + service_charge + tax_total
+  // === grand_total. grand_total is what the guest owes right now.
+  grand_total: number;
+  taxable_base: number;
+  service_charge: number;
+  service_charge_percent: number;
+  taxes: BillTaxLine[];
+  tax_total: number;
+  discount_type: "percent" | "flat" | null;
+  discount_value: number;
+  coupon_code: string | null;
+  apc: number | null;
+  // Where the bill sits in the payment workflow. "payment_approved" is possible
+  // but momentary: approval closes the bill in the same transaction.
+  stage: "running" | "awaiting_approval" | "approved";
+  // true once the workflow froze the charged total onto the row; false while the
+  // total is still being re-priced from the table's live orders.
+  totals_snapshotted: boolean;
+  payment_method: PaymentMethod | null;
+  opened_by: string | null;
+  // UTC instant, the restaurant's own wall clock ("YYYY-MM-DD HH:MM"), and how
+  // long it has been open — the three forms the two clients each want.
+  opened_at: string;
+  opened_at_local: string;
+  age_minutes: number;
+}
+
+interface OpenBillRow {
+  id: string;
+  bill_no: string | null;
+  status: number | string | null;
+  outlet_id: string | null;
+  table_id: string | null;
+  table_name: string | null;
+  total_amt: number | string | null;
+  tax_breakdown: unknown;
+  discount_type: string | null;
+  discount_value: number | string | null;
+  coupon_code: string | null;
+  payment_method: string | null;
+  waiter_confirmed_at: Date | null;
+  admin_approved_at: Date | null;
+  created_at: Date;
+  age_secs: number | string | null;
+  opened_by_fname: string | null;
+  opened_by_lname: string | null;
+}
+
+export async function ListOpenBills(
+  restaurantId: string,
+  opts: { limit?: number; offset?: number } = {},
+): Promise<{
+  bills: OpenBillSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  outstanding_total: number;
+  timezone: string;
+}> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureBillWorkflowColumns();
+  await ensureTableSessionsTable();
+  const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 50), 200));
+  const offset = Math.max(0, Math.round(opts.offset ?? 0));
+  const og = isAllOutlets() ? "true" : "false";
+
+  // Every open bill is priced, not just the requested page: `outstanding_total`
+  // is the number the owner reacts to and it has to cover the whole list, and a
+  // live bill's total cannot be summed in SQL (it is re-derived from orders).
+  // The population is self-limiting — one open bill per table — so the cap is a
+  // guard against a corrupted tenant, not a real paging bound.
+  const rows = await runQuery<OpenBillRow>(
+    `select b.id, b.bill_no, b.status, b.outlet_id, b.table_id, t.table_name,
+            b.total_amt, b.tax_breakdown, b.discount_type, b.discount_value, b.coupon_code,
+            b.payment_method, b.waiter_confirmed_at, b.admin_approved_at, b.created_at,
+            extract(epoch from (now() - b.created_at)) as age_secs,
+            e."emp_Fname" as opened_by_fname, e."emp_Lname" as opened_by_lname
+       from "Bills" b
+       left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+       left join "Employees" e on e.id = b.emp_id and e.res_id = b.res_id
+      where b.res_id = $1 and (${og} or b.outlet_id = $2) and b.closed_at is null
+      order by b.created_at desc, b.id desc
+      limit 2000`,
+    [context.res_id, context.outlet_id],
+  );
+
+  const tableIds = [...new Set(rows.map((r) => r.table_id).filter((v): v is string => Boolean(v)))];
+
+  // Orders for every open table in ONE trip, then reduced per table by the same
+  // helper sumOrderTotalsForTable uses. The per-table query would have been one
+  // round trip per bill.
+  const orderRows = tableIds.length
+    ? await runQuery<{ table_id: string; food: unknown; status: unknown; created_at: Date }>(
+        `select table_id, food, status, created_at from "Orders"
+          where res_id = $1 and table_id = any($2::uuid[])
+          order by created_at asc`,
+        [context.res_id, tableIds],
+      )
+    : [];
+  const ordersByTable = new Map<string, { food: unknown; status: unknown }[]>();
+  for (const o of orderRows) {
+    const list = ordersByTable.get(o.table_id);
+    if (list) {list.push(o);} else {ordersByTable.set(o.table_id, [o]);}
+  }
+
+  // Covers live on the seating, never on the bill.
+  const sessionRows = tableIds.length
+    ? await runQuery<{ table_id: string; covers: number | string | null }>(
+        `select distinct on (table_id) table_id, covers from "TableSessions"
+          where res_id = $1 and table_id = any($2::uuid[]) and left_at is null
+          order by table_id, seated_at desc`,
+        [context.res_id, tableIds],
+      )
+    : [];
+  const coversByTable = new Map(sessionRows.map((s) => [s.table_id, s.covers]));
+
+  // Tax config is per OUTLET, and in all-outlets mode one page spans several.
+  const taxRows = await runQuery<{ id: string; default_tax: unknown }>(
+    `select id, default_tax from "Outlets" where res_id = $1`,
+    [context.res_id],
+  );
+  const taxByOutlet = new Map(taxRows.map((o) => [o.id, o.default_tax]));
+  const scPct = await getServiceChargePercent(context.res_id).catch(() => 0);
+
+  const priced = rows.map<OpenBillSummary>((row) => {
+    const orders = row.table_id ? ordersByTable.get(row.table_id) ?? [] : [];
+    const { subtotal, order_count, first_food } = activeOrderSubtotal(orders);
+    const dValue = Math.max(0, parseNumeric(row.discount_value));
+    const discount_type = dValue > 0 ? (row.discount_type === "flat" ? "flat" : "percent") : null;
+
+    // Snapshotted the instant the payment workflow touches the bill — every path
+    // that writes the charged grand total writes waiter_confirmed_at with it.
+    const totals_snapshotted = row.waiter_confirmed_at != null;
+    const live = totals_snapshotted
+      ? null
+      : computeBillCharges(
+          subtotal,
+          (taxByOutlet.get(row.outlet_id ?? "") ?? null) as Record<string, number> | null,
+          scPct,
+          true,
+          discount_type ? { type: discount_type, value: dValue } : null,
+        );
+    const grand_total = live ? live.grand_total : round2(parseNumeric(row.total_amt));
+    const lines = live ? live.taxes : parseStoredTaxLines(row.tax_breakdown);
+    const charges = closedBillCharges(grand_total, lines, scPct);
+
+    const rawCovers = row.table_id ? coversByTable.get(row.table_id) : undefined;
+    const covers = rawCovers == null ? null : Math.max(1, Math.round(parseNumeric(rawCovers)));
+    const clock = zonedClockParts(row.created_at, context.timezone);
+    const name = `${row.opened_by_fname ?? ""} ${row.opened_by_lname ?? ""}`.trim();
+    // Bills opened by the discount/coupon paths carry no emp_id; the order the
+    // guest was served from records who took it, so fall back to that. It has to
+    // be the first ACTIVE order — a cancelled one can belong to a previous
+    // seating and would name the wrong person.
+    const takenBy = String((parseJsonObject(first_food) ?? {}).taken_by_employee_name ?? "").trim();
+
+    return {
+      id: row.id,
+      bill_no: row.bill_no == null ? null : String(row.bill_no),
+      status: Math.round(parseNumeric(row.status)),
+      table_id: row.table_id,
+      table_name: row.table_name,
+      covers,
+      order_count,
+      grand_total,
+      taxable_base: charges.taxable_base,
+      service_charge: charges.service_charge,
+      service_charge_percent: charges.service_charge_percent,
+      taxes: charges.taxes,
+      tax_total: charges.tax_total,
+      discount_type,
+      discount_value: round2(dValue),
+      coupon_code: row.coupon_code,
+      // Pre-tax spend per guest, the same basis the settled list and the floor
+      // grid use.
+      apc: covers && covers > 0 ? round2(charges.taxable_base / covers) : null,
+      stage: row.admin_approved_at ? "approved" : row.waiter_confirmed_at ? "awaiting_approval" : "running",
+      totals_snapshotted,
+      payment_method: normalizePaymentMethod(row.payment_method),
+      opened_by: name || takenBy || null,
+      opened_at: iso(row.created_at) ?? "",
+      opened_at_local: clock
+        ? `${clock.key} ${String(clock.hour).padStart(2, "0")}:${String(clock.minute).padStart(2, "0")}`
+        : "",
+      age_minutes: Math.max(0, Math.round(parseNumeric(row.age_secs) / 60)),
+    };
+  });
+
+  const outstanding_total = round2(priced.reduce((s, b) => s + b.grand_total, 0));
+  const bills = priced.slice(offset, offset + limit);
+  return {
+    bills,
+    total: priced.length,
+    limit,
+    offset,
+    has_more: offset + bills.length < priced.length,
+    outstanding_total,
+    timezone: context.timezone,
+  };
 }
 
 // --- Accounting & reporting --------------------------------------------------

@@ -28,6 +28,7 @@
     "migrate:dry": "tsx scripts/migrate.ts --dry-run",
     "jest": "jest",
     "jest:watch": "jest --watch",
+    "test:money": "jest test/money --runInBand",
     "test:ci": "npm run build && jest --runInBand"
   },
   "devDependencies": {

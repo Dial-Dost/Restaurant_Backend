@@ -45,7 +45,7 @@ async function run() {
 		'X-Restaurant-Id': RESTAURANT_ID,
 		'X-Employee-Id': EMPLOYEE_ID,
 		'X-Outlet-Id': 'a5390f5a-f99c-4f8c-9916-ab5d6c4f8b99',
-		'X-Action-List': ["0cb6768b-92ff-4848-8631-52ef9d65cf53"],
+		'X-Action-List': "0cb6768b-92ff-4848-8631-52ef9d65cf53",
 	};
 
 	const list = await fetchJson<{ items: any[] }>(`${API_BASE}/feedback?limit=5`, { headers }, 'GET /feedback failed');

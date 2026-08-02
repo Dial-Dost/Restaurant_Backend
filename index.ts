@@ -219,6 +219,7 @@ import {
 	GetBillByOrder,
 	GetClosedBill,
 	ListClosedBills,
+	ListOpenBills,
 	UpdateOutletDefaultTax,
 	AddBill,
 	ReplaceBill,
@@ -4372,6 +4373,32 @@ app.get('/bills/closed', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"),
 	} catch (err) {
 		logger.error({ err }, 'list_closed_bills_failed');
 		return res.status(500).json({ error: 'Unable to fetch closed bills' });
+	}
+});
+
+// The complement of /bills/closed: money still on the floor. Nothing else lists
+// it — accounting browses settled bills only — so this is the only answer to
+// "who owes me right now". Same permission as every other bill read.
+//
+// Paged like /audit-logs (limit/offset, X-Total-Count + X-Has-More). The body is
+// the envelope rather than that route's bare array: the array is legacy there
+// (both clients already parse it that way), and the sibling /bills/closed
+// established the envelope. `outstanding_total` covers EVERY open bill, not the
+// page — it is the figure the owner reacts to.
+app.get('/bills/open', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
+	try {
+		const page = await ListOpenBills(restaurantId, {
+			limit: clampLimit(req.query.limit, 50, 200),
+			offset: Math.max(0, Math.min(Number(req.query.offset) || 0, 100000)),
+		});
+		res.setHeader("X-Total-Count", String(page.total));
+		res.setHeader("X-Has-More", page.has_more ? "1" : "0");
+		return res.json(page);
+	} catch (err) {
+		logger.error({ err }, 'list_open_bills_failed');
+		return res.status(500).json({ error: 'Unable to fetch open bills' });
 	}
 });
 
