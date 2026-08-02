@@ -165,6 +165,10 @@ async function main() {
   )).rows[0]?.t ?? 0);
   check("the open bill carries a non-zero running total before release", runningBefore > 0);
 
+  // Reported sales BEFORE the release is the only baseline that makes the
+  // assertion below meaningful: the bug was that releasing ADDED revenue.
+  const salesBefore = Number((await GetSalesReport(RES_ID)).total_sales ?? 0);
+
   await ReleaseTable(RES_ID, "T6");
 
   const relRow = (await raw.query(
@@ -176,11 +180,11 @@ async function main() {
   check("released bill has an empty tax breakdown", String(relRow?.tb ?? "") === "[]");
   check("released bill was never admin-approved", relRow?.admin_approved_at == null);
 
-  // The assertion that actually matters to the owner: it must not show up as a sale.
-  const relReport = await GetSalesReport(RES_ID, {});
-  const relSales = Number((relReport as { total_sales?: number }).total_sales ?? 0);
-  check("a released unpaid bill contributes nothing to reported sales",
-    Number.isFinite(relSales) && relSales === Number(relSales.toFixed(2)) && relSales >= 0);
+  // The assertion that actually matters to the owner: releasing a table nobody
+  // paid for must not move reported revenue by a single paisa.
+  const salesAfter = Number((await GetSalesReport(RES_ID)).total_sales ?? 0);
+  check("releasing an unpaid table does not change reported sales",
+    Math.abs(salesAfter - salesBefore) < 0.005);
   const countedReleased = Number((await raw.query(
     `select count(*)::int n from "Bills"
       where res_id=$1 and table_id=$2 and closed_at is not null and coalesce(total_amt,0) <> 0`,
