@@ -144,21 +144,58 @@ export async function runBillingCycle(): Promise<{ generated: number; past_due: 
 		    and s.current_period_end is not null and s.current_period_end < now()`,
 	);
 	for (const s of lapsed) {
-		const periodStart = new Date(s.current_period_end);
-		const periodEnd = addMonths(periodStart, 1);
-		const ins = await platformQuery<{ id: string }>(
-			`insert into platform.invoices (res_id, plan_id, amount_cents, status, period_start, period_end, note)
-			 values ($1, $2, $3, 'pending', $4::date, $5::date, 'Auto-generated (renewal)')
-			 on conflict (res_id, period_end) do nothing
-			 returning id`,
-			[s.res_id, s.plan_id, s.price_cents ?? 0, isoDate(periodStart), isoDate(periodEnd)],
-		);
-		if (ins.length > 0) {generated++;}
-		await platformQuery(
-			`update platform.subscriptions set status = 'past_due', updated_at = now() where res_id = $1 and status = 'active'`,
-			[s.res_id],
-		);
-		past_due++;
+		// One tenant's failure must not abort the sweep — every other lapsed tenant,
+		// and the grace/suspend pass below, still have to run.
+		try {
+			const periodStart = new Date(s.current_period_end);
+			const periodEnd = addMonths(periodStart, 1);
+			const ins = await platformQuery<{ id: string }>(
+				// invoices_res_period_uniq is PARTIAL (where period_end is not null), and
+				// Postgres will not infer a partial index unless the ON CONFLICT clause
+				// repeats its predicate — without it this INSERT raised 42P10 on every
+				// run, so no tenant was ever invoiced or moved off 'active'.
+				`insert into platform.invoices (res_id, plan_id, amount_cents, status, period_start, period_end, note)
+				 values ($1, $2, $3, 'pending', $4::date, $5::date, 'Auto-generated (renewal)')
+				 on conflict (res_id, period_end) where period_end is not null do nothing
+				 returning id`,
+				[s.res_id, s.plan_id, s.price_cents ?? 0, isoDate(periodStart), isoDate(periodEnd)],
+			);
+			if (ins.length > 0) {generated++;}
+			await platformQuery(
+				`update platform.subscriptions set status = 'past_due', updated_at = now() where res_id = $1 and status = 'active'`,
+				[s.res_id],
+			);
+			past_due++;
+		} catch (err) {
+			logger.error({ err, res_id: s.res_id }, "billing_cycle_invoice_failed");
+		}
+	}
+
+	// 1b) Lapsed subscriptions with nothing to charge (free plan, or no plan yet)
+	//     are never invoiced, so nothing else would ever move their period end —
+	//     they would sit 'active' with a period end drifting further into the past.
+	//     Roll them forward to the next period that is still in the future.
+	const freeLapsed = await platformQuery<{ res_id: string; current_period_end: string }>(
+		`select s.res_id, s.current_period_end
+		   from platform.subscriptions s
+		   left join platform.plans p on p.id = s.plan_id
+		  where s.status = 'active' and coalesce(p.price_cents, 0) = 0
+		    and s.current_period_end is not null and s.current_period_end < now()`,
+	);
+	for (const s of freeLapsed) {
+		try {
+			let next = new Date(s.current_period_end);
+			const now = Date.now();
+			// Bounded: even a period end years stale converges in a few dozen steps.
+			for (let i = 0; i < 600 && next.getTime() <= now; i++) {next = addMonths(next, 1);}
+			await platformQuery(
+				`update platform.subscriptions set current_period_end = $2, updated_at = now()
+				  where res_id = $1 and status = 'active'`,
+				[s.res_id, next.toISOString()],
+			);
+		} catch (err) {
+			logger.error({ err, res_id: s.res_id }, "billing_cycle_free_rollover_failed");
+		}
 	}
 
 	// 2) Grace cutoff: past_due beyond SAAS_GRACE_DAYS → suspend (blocks login) and
