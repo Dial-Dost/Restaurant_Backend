@@ -4452,6 +4452,301 @@ export async function GetCustomerInsights(
   return { customers };
 }
 
+// --- Customer segments (server-side sort + paging) ----------------------------
+//
+// WHY THIS IS NOT JUST GetCustomerInsights WITH A LIMIT.
+//
+// GetCustomerInsights sizes spend by summing `Orders.food->>'total'` — a naive
+// sum of what was ORDERED. That figure is not what the guest paid: it ignores
+// tax, it ignores the service charge, and it ignores everything the settle path
+// does to a bill (discounts, coupons, refunds). Sorting a page of it by "most
+// spent" therefore ranks guests by a number no receipt agrees with.
+//
+// This read sizes spend from SETTLED BILLS through the same helper the bill
+// detail and every accounting report use — closedBillCharges — so:
+//   • total_spend is the TAX-INCLUSIVE grand total actually charged;
+//   • service charge is lifted OUT into its own field rather than being counted
+//     as tax (the shipped default lists "Service Charge" inside
+//     Outlets.default_tax, so a blind sum books the owner's own income as tax);
+//   • pre_tax_spend is the taxable base, the same basis APC uses.
+//
+// Bills carry no customer link, so a bill is attributed through the seating it
+// belongs to: bill -> the "TableSessions" row open when it was created -> the
+// first identified order on that table during that seating. Identity buckets
+// (cust_id > phone > name) are keyed exactly as GetCustomerInsights keys them,
+// so the two reads agree about WHO a guest is even though they disagree about
+// what that guest spent.
+//
+// KNOWN DIVERGENCE: /customers/insights still reports the order-total figure.
+// It is not changed here — the CRM page's numbers would move underneath it — but
+// the two endpoints WILL disagree, and this one is the one that matches a receipt.
+
+export type CustomerSegment = "new" | "regular" | "high-spend" | "dormant";
+export type CustomerSegmentSort = "recent" | "spend" | "visits";
+
+export interface CustomerSegmentRow {
+  customer_id: string;
+  name: string;
+  phone: string;
+  email: string | null;
+  /** Distinct RESTAURANT days on which they settled a bill. */
+  visits: number;
+  /** Tax-inclusive grand total actually charged. */
+  total_spend: number;
+  /** Service charge inside total_spend, separated out — it is the house's income,
+   *  not tax, and not part of what the food cost. */
+  total_service_charge: number;
+  total_tax: number;
+  /** Taxable base: the pre-tax, pre-service-charge basis APC is built on. */
+  pre_tax_spend: number;
+  /** total_spend / visits. */
+  avg_spend_per_visit: number;
+  last_visit: string | null;
+  days_since_last_visit: number | null;
+  bills: number;
+  avg_rating: number | null;
+  feedbacks: number;
+  segment: CustomerSegment;
+}
+
+export interface CustomerSegmentPage {
+  customers: CustomerSegmentRow[];
+  total: number;
+  has_more: boolean;
+  sort: CustomerSegmentSort;
+  segment: CustomerSegment | "all";
+  window_days: number;
+  from: string;
+  to: string;
+  timezone: string;
+  /** Counts across the WHOLE filtered set, not the page — a client must be able
+   *  to badge every segment tab without fetching every page. */
+  segment_counts: Record<CustomerSegment, number>;
+  spend_basis: string;
+}
+
+// A guest who has not been back in this long is dormant. Same 30 days
+// GetCustomerInsights uses, named so the two cannot silently drift.
+const CUSTOMER_DORMANT_DAYS = 30;
+// Visits that make someone a regular.
+const CUSTOMER_REGULAR_VISITS = 3;
+
+export async function GetCustomerSegments(
+  restaurantId: string,
+  opts: {
+    sort?: string;
+    segment?: string;
+    search?: string;
+    days?: number;
+    limit?: number;
+    offset?: number;
+  } = {},
+): Promise<CustomerSegmentPage> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tz = context.timezone;
+  const rid = context.res_id, oid = context.outlet_id;
+  const og = isAllOutlets() ? "true" : "false";
+
+  const sort: CustomerSegmentSort =
+    opts.sort === "recent" || opts.sort === "visits" ? opts.sort : "spend";
+  const wantSegment = (["new", "regular", "high-spend", "dormant"] as const)
+    .find((s) => s === opts.segment) ?? "all";
+  const search = String(opts.search ?? "").trim().toLowerCase().slice(0, 200);
+  const window = Math.min(1095, Math.max(1, Math.round(opts.days ?? 365) || 365));
+  const safeLimit = Math.max(1, Math.min(opts.limit ?? 100, 500));
+  const safeOffset = Math.max(0, Math.round(opts.offset ?? 0));
+
+  const todayKey = dayKeyOf(new Date(), tz);
+  const fromKey = addDaysToKey(todayKey, -(window - 1));
+  const fromIso = dayRangeOf(fromKey, tz).fromIso;
+  const toIso = dayRangeOf(todayKey, tz).toIso;
+
+  await ensureBillWorkflowColumns();
+  const scPct = await getServiceChargePercent(rid);
+
+  const [custRows, billRows, fbRows] = await Promise.all([
+    runQuery<{ id: string; fname: string | null; lname: string | null; phone: string | null; email: string | null }>(
+      `select id, "cust_Fname" as fname, "cust_Lname" as lname, cast(cust_ph as text) as phone, cust_email as email
+         from "Customers" where res_id = $1 and (${og} or outlet_id = $2)`,
+      [rid, oid],
+    ),
+    // Settled bills -> their seating -> the first identified order of that
+    // seating. `ident` mirrors GetCustomerInsights exactly (cust_id first, then a
+    // captured phone, then a non-"Guest" name) so the identity buckets line up.
+    runQuery<{ ident: string | null; settled_at: Date; total_amt: string; tax_breakdown: unknown }>(
+      `select i.ident, i.settled_at, i.total_amt::text, i.tax_breakdown
+         from (
+           select coalesce(b.closed_at, b.admin_approved_at) as settled_at,
+                  b.total_amt, b.tax_breakdown,
+                  (select case when o.cust_id is not null then 'c:' || o.cust_id::text
+                               else coalesce(nullif((o.food)::jsonb->>'customer_phone', ''),
+                                             nullif((o.food)::jsonb->>'customer', '')) end
+                     from "Orders" o
+                    where o.res_id = b.res_id and o.table_id = b.table_id
+                      and o.created_at >= coalesce(s.seated_at, b.created_at - interval '12 hours')
+                      and o.created_at <= b.created_at
+                      and coalesce(o.status::text, '1') <> '5'
+                    order by o.created_at asc
+                    limit 1) as ident
+             from "Bills" b
+             left join lateral (
+               select ts.seated_at
+                 from "TableSessions" ts
+                where ts.res_id = b.res_id and ts.table_id = b.table_id
+                  and (ts.outlet_id is null or ts.outlet_id = b.outlet_id)
+                  and ts.seated_at <= b.created_at
+                order by ts.seated_at desc
+                limit 1
+             ) s on true
+            where b.res_id = $1 and (${og} or b.outlet_id = $2)
+              and (b.admin_approved_at is not null or b.closed_at is not null)
+              and coalesce(b.closed_at, b.admin_approved_at) >= $3
+              and coalesce(b.closed_at, b.admin_approved_at) < $4
+         ) i
+        where i.ident is not null and lower(i.ident) <> 'guest'`,
+      [rid, oid, fromIso, toIso],
+    ),
+    runQuery<{ nm: string; avg_rating: string | null; n: string }>(
+      `select lower(trim(cust_name)) as nm, avg(overall_rating)::text as avg_rating, count(*)::text as n
+         from "Feedback_entries"
+        where res_id = $1 and (${og} or outlet_id = $2)
+          and cust_name is not null and trim(cust_name) <> ''
+        group by 1`,
+      [rid, oid],
+    ),
+  ]);
+
+  interface Money { spend: number; service: number; tax: number; base: number; bills: number; days: Set<string> }
+  const empty = (): Money => ({ spend: 0, service: 0, tax: 0, base: 0, bills: 0, days: new Set<string>() });
+  const buckets = new Map<string, Money>();
+  for (const b of billRows) {
+    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct);
+    // Same identity keying as GetCustomerInsights: a direct cust_id link, else a
+    // normalized phone when the ident has enough digits to be one, else a name.
+    let key: string;
+    const ident = String(b.ident);
+    if (ident.startsWith("c:")) {
+      key = ident;
+    } else {
+      const digits = normalizePhone(ident);
+      key = digits.length >= 7 ? `p:${digits}` : `n:${ident.trim().toLowerCase()}`;
+    }
+    const acc = buckets.get(key) ?? empty();
+    acc.spend = round2(acc.spend + round2(parseNumeric(b.total_amt)));
+    acc.service = round2(acc.service + charges.service_charge);
+    acc.tax = round2(acc.tax + charges.tax_total);
+    acc.base = round2(acc.base + charges.taxable_base);
+    acc.bills += 1;
+    // A visit is a RESTAURANT day, so two bills on one late night are one visit.
+    acc.days.add(dayKeyOf(b.settled_at, tz));
+    buckets.set(key, acc);
+  }
+
+  const fbByName = new Map(fbRows.map((r) => [r.nm, r]));
+  const todayMs = Date.parse(`${todayKey}T00:00:00Z`);
+
+  const raw = custRows.map((c) => {
+    const name = `${c.fname ?? ""} ${c.lname ?? ""}`.replace(/\s+/g, " ").trim();
+    const digits = normalizePhone(c.phone ?? "");
+    // The three buckets are disjoint (each bill lands in exactly one), so merging
+    // them cannot double-count.
+    const merged = empty();
+    for (const key of [`c:${c.id}`, digits ? `p:${digits}` : "", name ? `n:${name.toLowerCase()}` : ""]) {
+      if (!key) { continue; }
+      const b = buckets.get(key);
+      if (!b) { continue; }
+      merged.spend = round2(merged.spend + b.spend);
+      merged.service = round2(merged.service + b.service);
+      merged.tax = round2(merged.tax + b.tax);
+      merged.base = round2(merged.base + b.base);
+      merged.bills += b.bills;
+      for (const d of b.days) { merged.days.add(d); }
+    }
+    const visits = merged.days.size;
+    const last_visit = visits > 0 ? [...merged.days].sort().at(-1)! : null;
+    const days_since = last_visit == null
+      ? null
+      : Math.max(0, Math.round((todayMs - Date.parse(`${last_visit}T00:00:00Z`)) / 86_400_000));
+    const fb = fbByName.get(name.toLowerCase());
+    return {
+      customer_id: c.id,
+      name,
+      phone: c.phone ?? "",
+      email: c.email,
+      visits,
+      total_spend: merged.spend,
+      total_service_charge: merged.service,
+      total_tax: merged.tax,
+      pre_tax_spend: merged.base,
+      avg_spend_per_visit: visits > 0 ? round2(merged.spend / visits) : 0,
+      last_visit,
+      days_since_last_visit: days_since,
+      bills: merged.bills,
+      avg_rating: fb?.avg_rating == null ? null : round2(parseNumeric(fb.avg_rating)),
+      feedbacks: Math.round(parseNumeric(fb?.n)),
+    };
+  });
+
+  // High-spend = top quartile among guests who spent anything (needs >= 4
+  // spenders for a quartile to mean something) — the same rule
+  // GetCustomerInsights applies, on the corrected spend basis.
+  const spends = raw.filter((c) => c.total_spend > 0).map((c) => c.total_spend).sort((a, b) => a - b);
+  const p75 = spends.length >= 4 ? spends[Math.min(spends.length - 1, Math.floor(spends.length * 0.75))]! : Infinity;
+
+  const withSegment: CustomerSegmentRow[] = raw.map((c) => {
+    let segment: CustomerSegment = "new";
+    if (c.visits > 0 && c.last_visit) {
+      if ((c.days_since_last_visit ?? 0) > CUSTOMER_DORMANT_DAYS) { segment = "dormant"; }
+      else if (c.total_spend >= p75) { segment = "high-spend"; }
+      else if (c.visits >= CUSTOMER_REGULAR_VISITS) { segment = "regular"; }
+    }
+    return { ...c, segment };
+  });
+
+  const filtered = withSegment.filter((c) => {
+    if (wantSegment !== "all" && c.segment !== wantSegment) { return false; }
+    if (!search) { return true; }
+    return c.name.toLowerCase().includes(search)
+      || c.phone.toLowerCase().includes(search)
+      || (c.email ?? "").toLowerCase().includes(search);
+  });
+
+  // Sorted over the WHOLE filtered set before paging — the entire point of doing
+  // this here rather than letting the app re-sort whatever page it happens to
+  // hold. Every comparator ends on name so the order is total and paging can
+  // neither duplicate nor skip a row.
+  const byName = (a: CustomerSegmentRow, b: CustomerSegmentRow) => a.name.localeCompare(b.name);
+  filtered.sort((a, b) => {
+    if (sort === "recent") {
+      // Never visited sorts last, not first: "" would win a descending string
+      // compare against a real date.
+      const av = a.last_visit ?? "", bv = b.last_visit ?? "";
+      if (av !== bv) { return av < bv ? 1 : -1; }
+      return byName(a, b);
+    }
+    if (sort === "visits") { return b.visits - a.visits || b.total_spend - a.total_spend || byName(a, b); }
+    return b.total_spend - a.total_spend || b.visits - a.visits || byName(a, b);
+  });
+
+  const segment_counts: Record<CustomerSegment, number> = { new: 0, regular: 0, "high-spend": 0, dormant: 0 };
+  for (const c of filtered) { segment_counts[c.segment] += 1; }
+
+  const page = filtered.slice(safeOffset, safeOffset + safeLimit);
+  return {
+    customers: page,
+    total: filtered.length,
+    has_more: safeOffset + page.length < filtered.length,
+    sort,
+    segment: wantSegment,
+    window_days: window,
+    from: fromKey,
+    to: todayKey,
+    timezone: tz,
+    segment_counts,
+    spend_basis: "tax-inclusive grand total of settled bills; service charge reported separately (closedBillCharges)",
+  };
+}
+
 async function resolveParkingBayId(
   context: RestaurantContext,
   bayIdentifier: string,
@@ -9600,6 +9895,301 @@ export async function GetOverviewInsights(restaurantId: string, days = 30): Prom
       weekday_revenue: round2(parseNumeric(peakDay?.revenue)),
     },
     needs_attention: attention,
+  };
+}
+
+// --- Concerns -----------------------------------------------------------------
+//
+// One list of everything that needs a person today. It EXTENDS the Overview's
+// needs_attention rather than re-detecting it: the seven signals buildNeedsAttention
+// already produces (low_stock, expired_stock, expiring_stock, pending_discounts,
+// unsettled_bills, orders_to_approve, payments_to_approve, slow_movers) come
+// through GetOverviewInsights verbatim, so the Concerns screen and the Overview
+// strip can never disagree about a count. What is added here is the set of
+// concerns the strip does not cover at all.
+//
+// Every row gains two things the strip does not carry: a plain-English
+// `what_to_do`, and an `impact` used as the sort tiebreak after severity.
+
+export interface ConcernRow extends AttentionRow {
+  /** Same text as `label`. Named for this contract so a client does not have to
+   *  know that the Overview strip calls it something else. */
+  title: string;
+  /** "What do I do about it?" — one sentence, imperative, naming the action. */
+  what_to_do: string;
+  /** Money at stake when the row is about money, otherwise the count. Sorts
+   *  within a severity band so the expensive problem outranks the noisy one. */
+  impact: number;
+}
+
+/** Advice for the rows that come from buildNeedsAttention. Keyed by the row key
+ *  so the two stay coupled: a new key added there falls through to a generic
+ *  sentence that still names its module rather than shipping an empty string. */
+const CONCERN_ADVICE: Record<string, string> = {
+  low_stock: "Raise a purchase order for these ingredients today — a dish goes off the menu the moment one runs out.",
+  expired_stock: "Pull this stock off the shelf and write it off. It cannot be sold and it must not be cooked.",
+  expiring_stock: "Push these into today's specials or prep them now, before they have to be thrown away.",
+  pending_discounts: "Approve or decline each request — the table cannot settle until someone decides.",
+  unsettled_bills: "Chase these tables and close the bills. This is money already earned and not yet collected.",
+  orders_to_approve: "Approve or reject these orders now; the kitchen has not started on any of them.",
+  payments_to_approve: "Confirm the payment against the proof on each bill so the table can be released.",
+  slow_movers: "Decide per dish: re-price it, re-photograph it, or take it off the menu. Every one of these is menu space earning nothing.",
+};
+
+const concernAdvice = (row: AttentionRow): string =>
+  CONCERN_ADVICE[row.key] ?? `Open ${row.module} and clear these ${row.count}.`;
+
+export interface SubscriptionConcernInput {
+  /** platform.subscriptions.status — 'active' | 'trial' | 'past_due' | … */
+  status: string | null;
+  /** ISO; the end of the paid period. */
+  current_period_end: string | null;
+  trial_ends_at: string | null;
+  plan_name: string | null;
+}
+
+export interface ConcernsReport {
+  window_days: number;
+  timezone: string;
+  generated_at: string;
+  concerns: ConcernRow[];
+  /** Counts by severity, so a client can badge the tab without walking the list. */
+  totals: { high: number; medium: number; low: number };
+}
+
+export async function GetConcerns(
+  restaurantId: string,
+  days = 30,
+  extra: { subscription?: SubscriptionConcernInput | null } = {},
+): Promise<ConcernsReport> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tz = context.timezone;
+  const window = Math.min(365, Math.max(1, Math.round(days) || 30));
+  const rid = context.res_id, oid = context.outlet_id;
+  const og = isAllOutlets() ? "true" : "false";
+
+  const todayKey = dayKeyOf(new Date(), tz);
+  const fromIso = dayRangeOf(addDaysToKey(todayKey, -(window - 1)), tz).fromIso;
+  const toIso = dayRangeOf(todayKey, tz).toIso;
+
+  const [overview, feedbackRows, attendance, tables, poRows] = await Promise.all([
+    GetOverviewInsights(restaurantId, window),
+    // Unresolved service-recovery cases. `recovery_status = 'open'` is what
+    // AddFeedbackEntry writes for a bad visit; the NULL branch catches rows from
+    // before that column existed, where a 1-star with no ticket is plainly still
+    // unresolved. Threshold <= 3 matches the product's OWN recovery trigger
+    // (AddFeedbackEntry), not the <= 2 "negative" cut used in the analytics KPI.
+    runQuery<{ id: string; cust_name: string | null; rating: string; submitted_at: Date; fname: string | null; total_count: string; rn: string }>(
+      `select * from (
+         select f.id, f.cust_name, f.overall_rating::text as rating, f.submitted_at,
+                e."emp_Fname" as fname,
+                count(*) over ()::text as total_count,
+                row_number() over (order by f.overall_rating asc, f.submitted_at asc) as rn
+           from "Feedback_entries" f
+           left join "Employees" e on e.id = f.emp_id and e.res_id = f.res_id
+          where f.res_id = $1 and (${og} or f.outlet_id = $2)
+            and f.submitted_at >= $3 and f.submitted_at < $4
+            and f.overall_rating <= 3
+            and coalesce(f.recovery_status, 'open') <> 'resolved'
+       ) x where x.rn::int <= ${ATTENTION_ITEM_CAP} order by x.rn::int`,
+      [rid, oid, fromIso, toIso],
+    ),
+    getStaffAttendanceStats(rid, oid, og, window, tz),
+    GetTables(restaurantId),
+    // Overdue purchase orders. `expected_date` is a bare date, compared against
+    // the RESTAURANT's today ($3), never `current_date` — this server's session
+    // is UTC and would call it a day early through the tenant's late shift. A PO
+    // with no expected date is judged on age instead, so "we never set a date"
+    // cannot be used to hide a stale order forever.
+    runQuery<{ id: string; vendor_name: string | null; total_cost: string; expected_date: Date | null; ordered_at: Date | null; days_late: string; total_count: string; total_amount: string; rn: string }>(
+      `select * from (
+         select p.id, p.vendor_name, p.total_cost::text,
+                p.expected_date, p.ordered_at,
+                coalesce(($3::date - p.expected_date), extract(day from (now() - p.ordered_at))::int)::text as days_late,
+                count(*) over ()::text as total_count,
+                coalesce(sum(coalesce(p.total_cost, 0)) over (), 0)::text as total_amount,
+                row_number() over (
+                  order by coalesce(($3::date - p.expected_date), extract(day from (now() - p.ordered_at))::int) desc
+                ) as rn
+           from "PurchaseOrders" p
+          where p.res_id = $1 and (${og} or p.outlet_id is null or p.outlet_id = $2)
+            and p.status = 'ordered'
+            and (
+              (p.expected_date is not null and p.expected_date < $3::date)
+              or (p.expected_date is null and p.ordered_at is not null and p.ordered_at < now() - interval '14 days')
+            )
+       ) x where x.rn::int <= ${ATTENTION_ITEM_CAP} order by x.rn::int`,
+      [rid, oid, todayKey],
+    ),
+  ]);
+
+  const extraRows: ConcernRow[] = [];
+  const push = (
+    row: Omit<AttentionRow, "detail"> & { detail?: string },
+    what_to_do: string,
+    impact?: number,
+  ): void => {
+    // Same rule buildNeedsAttention enforces: a row that cannot name a single
+    // offender sends the owner hunting for something we failed to identify.
+    if (row.items.length === 0) { return; }
+    const detail = row.detail ?? attentionDetail(row.items, row.count);
+    extraRows.push({ ...row, detail, title: row.label, what_to_do, impact: impact ?? row.count });
+  };
+
+  // --- Unresolved low-rating feedback -----------------------------------------
+  const fbCount = Math.round(parseNumeric(feedbackRows[0]?.total_count));
+  push(
+    {
+      key: "unresolved_feedback",
+      label: "Bad reviews nobody has followed up",
+      count: fbCount,
+      severity: "high",
+      module: "Feedback",
+      items: feedbackRows.map<AttentionItem>((r) => {
+        const rating = round2(parseNumeric(r.rating));
+        const who = String(r.cust_name ?? "").trim() || "Anonymous guest";
+        const server = String(r.fname ?? "").trim();
+        return {
+          label: who,
+          sub: `${rating}/5${server ? ` · served by ${server}` : ""} · ${attentionAge((Date.now() - new Date(r.submitted_at).getTime()) / 1000)} ago`,
+          value: rating,
+          id: String(r.id ?? ""),
+        };
+      }),
+      deep_link: { module: "Feedback", params: { filter: "recovery" }, href: "/dashboard/feedback" },
+    },
+    "Call each of these guests back and record the outcome on the feedback entry. An unanswered bad review is the one that gets posted publicly.",
+  );
+
+  // --- Staff absent without leave ---------------------------------------------
+  // absent_days is already leave-aware (getStaffAttendanceStats subtracts
+  // approved leave), so anything left here is genuinely unexplained.
+  const absentees = attendance.rows.filter((r) => r.absent_days > 0).sort((a, b) => b.absent_days - a.absent_days);
+  const absentTotal = absentees.reduce((s, r) => s + r.absent_days, 0);
+  push(
+    {
+      key: "absent_without_leave",
+      label: "Staff absent with no approved leave",
+      count: absentees.length,
+      severity: "medium",
+      module: "Attendance",
+      items: absentees.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((r) => ({
+        label: r.name,
+        sub: `${r.absent_days} unexplained day${r.absent_days === 1 ? "" : "s"} of ${r.days_present + r.absent_days} open${r.leave_days > 0 ? ` · ${r.leave_days} already excused` : ""}`,
+        value: r.absent_days,
+        id: r.emp_id,
+      })),
+      deep_link: { module: "Attendance", params: { filter: "absent" }, href: "/dashboard/attendance" },
+    },
+    "Ask each person what happened, then either file the leave retrospectively or start a formal conversation. Right now the record says they simply did not turn up.",
+    absentTotal,
+  );
+
+  // --- Subscription --------------------------------------------------------
+  // Supplied by the caller: the control plane is a separate database and the
+  // tenant data plane deliberately does not reach into it.
+  const sub = extra.subscription;
+  if (sub) {
+    const periodEnd = sub.current_period_end ? Date.parse(sub.current_period_end) : NaN;
+    const status = String(sub.status ?? "").toLowerCase();
+    const lapsed = Number.isFinite(periodEnd) && periodEnd < Date.now();
+    const badStatus = status !== "" && !["active", "trial", "trialing"].includes(status);
+    if (lapsed || badStatus) {
+      const when = Number.isFinite(periodEnd) ? new Date(periodEnd).toISOString().slice(0, 10) : null;
+      push(
+        {
+          key: "subscription_lapsed",
+          label: "Subscription needs paying",
+          count: 1,
+          severity: "high",
+          module: "Billing",
+          items: [{
+            label: sub.plan_name?.trim() || "Current plan",
+            sub: [status ? `status ${status}` : "", when ? `paid up to ${when}` : ""].filter(Boolean).join(" · ") || "payment outstanding",
+            id: "subscription",
+          }],
+          deep_link: { module: "Billing", params: { filter: "due" }, href: "/dashboard/billing" },
+        },
+        "Settle the outstanding invoice from the Billing screen. Sign-in is blocked for the whole restaurant once the account flips to expired.",
+      );
+    }
+  }
+
+  // --- Tables running below the APC target ------------------------------------
+  // Live floor state, not a window aggregate: these are tables seated RIGHT NOW
+  // that can still be upsold. GetTables computes table_apc and target_apc with
+  // the same pre-tax convention used everywhere else.
+  const below = (tables ?? [])
+    .filter((t) => t.occupied && (t.table_total ?? 0) > 0 && (t.target_apc ?? 0) > 0 && (t.table_apc ?? 0) < (t.target_apc ?? 0))
+    .sort((a, b) => ((a.table_apc ?? 0) - (a.target_apc ?? 0)) - ((b.table_apc ?? 0) - (b.target_apc ?? 0)));
+  const belowGap = round2(below.reduce((s, t) => s + Math.max(0, (t.target_apc ?? 0) - (t.table_apc ?? 0)) * Math.max(1, t.covers ?? 1), 0));
+  push(
+    {
+      key: "tables_below_apc",
+      label: "Seated tables tracking under the APC target",
+      count: below.length,
+      severity: "medium",
+      module: "Tables",
+      items: below.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((t) => ({
+        label: t.table_name,
+        sub: `${fmtAttentionMoney(t.table_apc ?? 0)} per cover vs a ${fmtAttentionMoney(t.target_apc ?? 0)} target · ${t.covers ?? 1} cover${(t.covers ?? 1) === 1 ? "" : "s"}`,
+        value: round2(t.table_apc ?? 0),
+      })),
+      amount: belowGap,
+      deep_link: { module: "Tables", params: { filter: "below_apc" }, href: "/dashboard/tables" },
+    },
+    "Send a waiter to each of these tables with a dessert or drinks suggestion while the guests are still seated — after they leave this is unrecoverable.",
+    belowGap,
+  );
+
+  // --- Purchase orders past their date ----------------------------------------
+  const poCount = Math.round(parseNumeric(poRows[0]?.total_count));
+  const poMoney = round2(parseNumeric(poRows[0]?.total_amount));
+  push(
+    {
+      key: "purchase_orders_overdue",
+      label: "Purchase orders that never arrived",
+      count: poCount,
+      severity: "medium",
+      module: "Purchase Orders",
+      items: poRows.map<AttentionItem>((r) => {
+        const late = Math.max(0, Math.round(parseNumeric(r.days_late)));
+        const cost = round2(parseNumeric(r.total_cost));
+        return {
+          label: String(r.vendor_name ?? "").trim() || "Unnamed vendor",
+          sub: `${fmtAttentionMoney(cost)} · ${r.expected_date ? `${late} day${late === 1 ? "" : "s"} past due` : `ordered ${late} days ago, no delivery date set`}`,
+          value: cost,
+          id: String(r.id ?? ""),
+        };
+      }),
+      amount: poMoney,
+      deep_link: { module: "Purchase Orders", params: { filter: "overdue" }, href: "/dashboard/purchase-orders" },
+    },
+    "Call the vendor for each of these, then either receive the stock against the order or cancel it. Until one of those happens the order is holding stock levels that are not real.",
+    poMoney,
+  );
+
+  const base: ConcernRow[] = overview.needs_attention.map((row) => ({
+    ...row,
+    title: row.label,
+    what_to_do: concernAdvice(row),
+    impact: row.amount ?? row.count,
+  }));
+
+  const concerns = [...base, ...extraRows].sort(
+    (a, b) => ATTENTION_SEVERITY_RANK[a.severity] - ATTENTION_SEVERITY_RANK[b.severity] || b.impact - a.impact,
+  );
+
+  return {
+    window_days: window,
+    timezone: tz,
+    generated_at: new Date().toISOString(),
+    concerns,
+    totals: {
+      high: concerns.filter((c) => c.severity === "high").length,
+      medium: concerns.filter((c) => c.severity === "medium").length,
+      low: concerns.filter((c) => c.severity === "low").length,
+    },
   };
 }
 
@@ -17164,9 +17754,13 @@ export interface StaffAttendanceStat {
   days_present: number;
   /**
    * Days this restaurant was open (someone clocked in) on/after this person's
-   * first counted day in the window, on which they never clocked in.
+   * first counted day in the window, on which they never clocked in AND were not
+   * on approved leave.
    */
   absent_days: number;
+  /** Open days in the window covered by an APPROVED leave. These are excluded
+   *  from `absent_days` — an excused day is not an absence. */
+  leave_days: number;
   /** First clock-ins later than `typical_start` + 15 min. */
   late_shifts: number;
   late_pct: number | null;
@@ -17191,6 +17785,9 @@ export interface StaffAttendanceSummary {
   pending_shifts: number;
   late_shifts: number;
   absent_days: number;
+  /** Open days across all staff covered by an approved leave. Reported beside
+   *  absent_days so the two can be reconciled instead of guessed at. */
+  leave_days: number;
 }
 
 /**
@@ -17207,8 +17804,15 @@ export interface StaffAttendanceSummary {
  *                  person's own typical_start. 0 whenever typical_start is null.
  *  - absent_days   days the restaurant was open (someone clocked in) on/after
  *                  this person's first worked day in the window, on which they
- *                  have no counted shift. Bounded by the window, so a new hire
- *                  is never marked absent for days before they started.
+ *                  have no counted shift AND no APPROVED leave. Bounded by the
+ *                  window, so a new hire is never marked absent for days before
+ *                  they started.
+ *  - leave_days    open days in that same span covered by an approved leave.
+ *                  Subtracted from absent_days rather than merely reported
+ *                  alongside it: an excused day is not an absence, and leaving
+ *                  it in the absence count made every approved holiday read as
+ *                  unreliability. Only APPROVED leave counts — a request nobody
+ *                  has decided on yet excuses nothing.
  */
 async function getStaffAttendanceStats(
   resId: string,
@@ -17243,6 +17847,16 @@ async function getStaffAttendanceStats(
       order by a.clock_in asc`,
     [resId, outletId, String(days), tz],
   ).catch(() => [] as never[]);
+
+  // Approved leave over the same span, keyed by the SAME restaurant day keys the
+  // query above derives (`clock_in at time zone $tz`), so the two sets are
+  // directly comparable. The span is taken one day wider at the start than the
+  // attendance window so a leave that began just before it still covers the days
+  // inside it that it overlaps.
+  const nowKey = dayKeyOf(new Date(), tz);
+  const leaveByEmp = await approvedLeaveDaysByEmployee(
+    resId, outletId, outletGuard, addDaysToKey(nowKey, -Math.max(1, Math.round(days))), nowKey,
+  );
 
   const nowMs = Date.now();
   const capMs = ATTENDANCE_ANALYTICS_SHIFT_CAP_HOURS * 60 * 60 * 1000;
@@ -17299,7 +17913,12 @@ async function getStaffAttendanceStats(
     const baseline = starts.length >= ATTENDANCE_LATE_MIN_DAYS ? median(starts.map(([, v]) => v)) : null;
     const late = baseline == null ? 0 : starts.filter(([, v]) => v > baseline + ATTENDANCE_LATE_GRACE_MIN).length;
     const firstDay = starts.length ? starts[0]![0] : null;
-    const absent = firstDay == null ? 0 : openDays.filter((d) => d >= firstDay && !a.days.has(d)).length;
+    const onLeave = leaveByEmp.get(a.emp_id) ?? new Set<string>();
+    // Candidate absences first, then the excused ones removed — so `leave_days`
+    // counts only days that WOULD have been absences, never a holiday taken on a
+    // day the restaurant was shut or a day the person actually came in anyway.
+    const missed = firstDay == null ? [] : openDays.filter((d) => d >= firstDay && !a.days.has(d));
+    const excused = missed.filter((d) => onLeave.has(d)).length;
     const hours = a.ms / 3_600_000;
     return {
       emp_id: a.emp_id,
@@ -17308,7 +17927,8 @@ async function getStaffAttendanceStats(
       hours_worked: round2(hours),
       avg_shift_hours: a.shifts > 0 ? round2(hours / a.shifts) : 0,
       days_present: a.days.size,
-      absent_days: absent,
+      absent_days: missed.length - excused,
+      leave_days: excused,
       late_shifts: late,
       late_pct: baseline == null || starts.length === 0 ? null : round2((late / starts.length) * 100),
       typical_start: baseline == null ? null : hhmm(baseline),
@@ -17332,7 +17952,392 @@ async function getStaffAttendanceStats(
       pending_shifts: out.reduce((s, r) => s + r.pending_shifts, 0),
       late_shifts: out.reduce((s, r) => s + r.late_shifts, 0),
       absent_days: out.reduce((s, r) => s + r.absent_days, 0),
+      leave_days: out.reduce((s, r) => s + r.leave_days, 0),
     },
+  };
+}
+
+// --- Staff performance score -------------------------------------------------
+//
+// WEIGHTS. A composite has to say what it believes, so:
+//   APC 0.35        the only component that moves money directly, and the metric
+//                   the house already runs its floor on (target_apc is on every
+//                   table tile). It is also the hardest to fake.
+//   Rating 0.30     the only DIRECT signal of what the guest experienced. Nearly
+//                   as consequential as spend, but noisier per-head: a handful of
+//                   forms decides it, so it does not outrank APC.
+//   Attendance 0.20 a reliability FLOOR, not a performance signal — turning up on
+//                   time is table stakes, and someone can be perfectly punctual
+//                   and mediocre. Enough weight to matter, not enough to carry a
+//                   score on its own.
+//   TAT 0.15        the noisiest of the four: turnaround depends on the kitchen,
+//                   the party size and whether the guests lingered at least as
+//                   much as on the server. Real, but it gets the smallest say.
+//
+// SCALES. Rating and attendance are scored ABSOLUTELY (a 1-5 star scale and a
+// pair of fractions already mean something on their own). APC and TAT are scored
+// RELATIVE to the same window's house average, because there is no absolute
+// answer to "is ₹610 per cover good?" or "is 46 minutes a good turnaround?" —
+// that depends entirely on the restaurant. For both, being AT or BETTER THAN the
+// house average scores 100 and falling short scores proportionally; nobody is
+// rewarded for lapping the house on a metric that is partly luck of the table.
+//
+// MISSING DATA IS NEVER ZERO. A waiter with no feedback is not a zero-rated
+// waiter. An unavailable component is dropped and the remaining weights are
+// renormalised, and BOTH the nominal and the effective weights ship in the
+// payload so the app can show exactly what the number was built from. If nothing
+// at all is measurable the score is null, not 0.
+const PERFORMANCE_WEIGHTS = { apc: 0.35, rating: 0.30, attendance: 0.20, tat: 0.15 } as const;
+type PerformanceComponentKey = keyof typeof PERFORMANCE_WEIGHTS;
+
+// Presence vs punctuality inside the attendance component. Showing up at all is
+// the bigger half; punctuality only applies once there is a baseline to be late
+// against (>= 3 worked days — see ATTENDANCE_LATE_MIN_DAYS).
+const ATTENDANCE_PRESENCE_SHARE = 0.6;
+
+// A seating longer than this is not a turnaround — it is a table nobody closed.
+// Matches the 24h guard on processing time in GetAdvancedAnalytics in spirit,
+// tightened because a dining session that ran 12 hours is data entry, not service.
+const TAT_MAX_SESSION_MINUTES = 12 * 60;
+
+export interface PerformanceComponent {
+  /** The raw measurement in its own unit, or null when unavailable. */
+  value: number | null;
+  /** 0-100 contribution, or null when unavailable. */
+  score: number | null;
+  /** False = NOT MEASURED. The component is excluded from the score entirely;
+   *  it is never defaulted to zero. */
+  available: boolean;
+  unit: string;
+  /** How many observations the value rests on (bills, forms, days, sessions). */
+  sample: number;
+  /** The comparison the score was computed against, when it is a relative one. */
+  benchmark: number | null;
+  /** Plain English: what was measured, or why it could not be. */
+  note: string;
+}
+
+export interface StaffPerformanceRow {
+  employee_id: string;
+  employee_name: string;
+  role: string;
+  /** 0-100, or NULL when not one component could be measured. */
+  score: number | null;
+  components: Record<PerformanceComponentKey, PerformanceComponent>;
+  /** Renormalised over the AVAILABLE components — what actually built `score`. */
+  effective_weights: Record<PerformanceComponentKey, number>;
+  components_available: number;
+}
+
+export interface StaffPerformance {
+  window_days: number;
+  from: string;
+  to: string;
+  timezone: string;
+  generated_at: string;
+  /** The nominal weights, identical for every employee. */
+  weights: Record<PerformanceComponentKey, number>;
+  /** The house figures the relative components are scored against. */
+  benchmarks: { apc: number | null; tat_minutes: number | null; apc_basis: string };
+  rows: StaffPerformanceRow[];
+}
+
+const unavailable = (unit: string, note: string): PerformanceComponent =>
+  ({ value: null, score: null, available: false, unit, sample: 0, benchmark: null, note });
+
+/** Ratio scoring for the two relative components: at or above the benchmark is
+ *  full marks, below it is proportional. Returns null when there is no benchmark
+ *  to compare against, so the component drops out rather than inventing one. */
+function ratioScore(value: number, benchmark: number, higherIsBetter: boolean): number | null {
+  if (!(benchmark > 0) || !Number.isFinite(value) || value <= 0) { return null; }
+  const ratio = higherIsBetter ? value / benchmark : benchmark / value;
+  return round2(Math.max(0, Math.min(1, ratio)) * 100);
+}
+
+function medianOf(values: number[]): number | null {
+  if (values.length === 0) { return null; }
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  // Round BOTH branches: the odd-length case used to return the raw sample, so a
+  // TAT median shipped as 4.617594583333333 next to figures rounded everywhere
+  // else in the payload.
+  return round2(s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2);
+}
+
+/**
+ * Per-employee composite performance score AND the components behind it.
+ *
+ * Windowed to the last `days` RESTAURANT days (default 30) — dayKeyOf/dayRangeOf
+ * throughout, never `current_date`.
+ */
+export async function GetStaffPerformance(restaurantId: string, days = 30): Promise<StaffPerformance> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tz = context.timezone;
+  const window = Math.min(365, Math.max(1, Math.round(days) || 30));
+  const rid = context.res_id, oid = context.outlet_id;
+  const og = isAllOutlets() ? "true" : "false";
+
+  const todayKey = dayKeyOf(new Date(), tz);
+  const fromKey = addDaysToKey(todayKey, -(window - 1));
+  const fromIso = dayRangeOf(fromKey, tz).fromIso;
+  const toIso = dayRangeOf(todayKey, tz).toIso;
+
+  await ensureBillWorkflowColumns();
+  const scPct = await getServiceChargePercent(rid);
+
+  const [roster, billRows, feedbackRows, attendance, tatRows] = await Promise.all([
+    runQuery<{ id: string; fname: string | null; lname: string | null; emp_roles: unknown }>(
+      `select id, "emp_Fname" as fname, "emp_Lname" as lname, emp_roles
+         from "Employees" where res_id = $1 and (${og} or outlet_id = $2)`,
+      [rid, oid],
+    ),
+    // Settled bills in the window with the seating they belong to. Covers live on
+    // "TableSessions", never on "Bills" — and outlet_id is NULLABLE there (unlike
+    // Bills/Orders), so a strict equality guard would silently drop every session
+    // written without one.
+    runQuery<{ emp_id: string | null; total_amt: string; tax_breakdown: unknown; session_id: string | null; covers: string | null }>(
+      `select b.emp_id, b.total_amt::text, b.tax_breakdown, s.session_id, s.covers::text
+         from "Bills" b
+         left join lateral (
+           select ts.id as session_id, greatest(1, coalesce(ts.covers, 1)) as covers
+             from "TableSessions" ts
+            where ts.res_id = b.res_id and ts.table_id = b.table_id
+              and (ts.outlet_id is null or ts.outlet_id = b.outlet_id)
+              and ts.seated_at <= b.created_at
+            order by ts.seated_at desc
+            limit 1
+         ) s on true
+        where b.res_id = $1 and (${og} or b.outlet_id = $2)
+          and (b.admin_approved_at is not null or b.closed_at is not null)
+          and coalesce(b.closed_at, b.admin_approved_at) >= $3
+          and coalesce(b.closed_at, b.admin_approved_at) < $4`,
+      [rid, oid, fromIso, toIso],
+    ),
+    runQuery<{ emp_id: string; n: string; avg_rating: string | null }>(
+      `select emp_id, count(*)::text as n, avg(overall_rating)::text as avg_rating
+         from "Feedback_entries"
+        where res_id = $1 and (${og} or outlet_id = $2)
+          and emp_id is not null and submitted_at >= $3 and submitted_at < $4
+        group by emp_id`,
+      [rid, oid, fromIso, toIso],
+    ),
+    getStaffAttendanceStats(rid, oid, og, window, tz),
+    // Turnaround = seated_at -> left_at on "TableSessions" (the real columns; the
+    // session has no "released" column). Attributed to whoever billed the table
+    // during that seating, which is the only employee link a session has.
+    runQuery<{ emp_id: string; session_id: string; minutes: string }>(
+      `select distinct b.emp_id, ts.id as session_id,
+              (extract(epoch from (ts.left_at - ts.seated_at)) / 60.0)::text as minutes
+         from "TableSessions" ts
+         join "Bills" b
+           on b.res_id = ts.res_id and b.table_id = ts.table_id and (${og} or b.outlet_id = $2)
+          and b.emp_id is not null
+          and b.created_at >= ts.seated_at and b.created_at <= ts.left_at
+        where ts.res_id = $1 and (${og} or ts.outlet_id is null or ts.outlet_id = $2)
+          and ts.left_at is not null
+          and ts.seated_at >= $3 and ts.seated_at < $4
+          and ts.left_at > ts.seated_at
+          and ts.left_at - ts.seated_at <= ($5 || ' minutes')::interval`,
+      [rid, oid, fromIso, toIso, String(TAT_MAX_SESSION_MINUTES)],
+    ),
+  ]);
+
+  // --- APC ---------------------------------------------------------------------
+  // PRE-TAX per the house convention: the basis is `taxable_base` from
+  // closedBillCharges — the grand total with tax AND service charge lifted back
+  // out — exactly what mapClosedBillSummary divides by covers. Covers are counted
+  // ONCE PER SEATING (split bills on one table share a session), which is the
+  // same rule the floor grid and the bill detail use.
+  interface ApcAcc { base: number; bills: number; sessions: Map<string, number> }
+  const apcByEmp = new Map<string, ApcAcc>();
+  const houseApc: ApcAcc = { base: 0, bills: 0, sessions: new Map() };
+  const addBill = (acc: ApcAcc, base: number, sessionId: string | null, covers: number): void => {
+    acc.base = round2(acc.base + base);
+    acc.bills += 1;
+    if (sessionId) { acc.sessions.set(sessionId, covers); }
+  };
+  for (const b of billRows) {
+    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct);
+    const covers = Math.max(1, Math.round(parseNumeric(b.covers)));
+    // A bill with no resolvable seating contributes to NEITHER side of the
+    // division. Counting its money without its covers would inflate APC for
+    // whoever happened to own it.
+    if (!b.session_id) { continue; }
+    // The benchmark must be drawn from the SAME population it ranks. Three bill
+    // paths write emp_id = null by design (ensureOpenBillIdForTable, the merge
+    // path, the coupon path), so unattributed bills are structural, not stray
+    // data — and on this tenant a single unattributed 96k bill is 28% of the
+    // money in the window. Feeding it into the house mean while no employee can
+    // be credited for it does not just shift the scores, it REORDERS them:
+    // measured on live data, the benchmark moves 2953.24 -> 2221.35, the APC
+    // component moves ~25 points, and the top two servers swap places.
+    if (!b.emp_id) { continue; }
+    addBill(houseApc, charges.taxable_base, b.session_id, covers);
+    const acc = apcByEmp.get(b.emp_id) ?? { base: 0, bills: 0, sessions: new Map<string, number>() };
+    addBill(acc, charges.taxable_base, b.session_id, covers);
+    apcByEmp.set(b.emp_id, acc);
+  }
+  const apcOf = (acc: ApcAcc | undefined): { apc: number | null; covers: number; bills: number } => {
+    if (!acc) { return { apc: null, covers: 0, bills: 0 }; }
+    const covers = [...acc.sessions.values()].reduce((s, c) => s + c, 0);
+    return { apc: covers > 0 ? round2(acc.base / covers) : null, covers, bills: acc.bills };
+  };
+  const house = apcOf(houseApc);
+
+  // --- Rating --------------------------------------------------------------
+  const fbByEmp = new Map(feedbackRows.map((r) => [r.emp_id, r]));
+
+  // --- Attendance ----------------------------------------------------------
+  const attByEmp = new Map(attendance.rows.map((r) => [r.emp_id, r]));
+
+  // --- TAT -----------------------------------------------------------------
+  // A session billed by two people counts once for each of them; that is the
+  // honest reading of "a table they worked". Median, not mean: one table left
+  // open for hours would otherwise define everybody's turnaround.
+  const tatByEmp = new Map<string, number[]>();
+  const houseTat: number[] = [];
+  const seenSessions = new Set<string>();
+  for (const r of tatRows) {
+    const mins = parseNumeric(r.minutes);
+    if (!(mins > 0)) { continue; }
+    const list = tatByEmp.get(r.emp_id) ?? [];
+    list.push(mins);
+    tatByEmp.set(r.emp_id, list);
+    if (!seenSessions.has(r.session_id)) { seenSessions.add(r.session_id); houseTat.push(mins); }
+  }
+  const houseTatMedian = medianOf(houseTat);
+
+  const rows: StaffPerformanceRow[] = roster.map((e) => {
+    const name = [e.fname, e.lname].filter(Boolean).join(" ").trim() || "Employee";
+    const roles = parseJsonObject(e.emp_roles) ?? {};
+    const role = String((roles as { primary?: unknown }).primary ?? "").trim() || "employee";
+
+    // APC
+    const mine = apcOf(apcByEmp.get(e.id));
+    const apcComponent: PerformanceComponent = mine.apc == null
+      ? unavailable("currency per cover", "No settled bill of theirs in this window could be tied to a seating, so there are no covers to divide by.")
+      : {
+        value: mine.apc,
+        score: ratioScore(mine.apc, house.apc ?? 0, true),
+        available: house.apc != null && house.apc > 0,
+        unit: "currency per cover",
+        sample: mine.bills,
+        benchmark: house.apc,
+        note: `Pre-tax spend per cover across ${mine.bills} settled bill${mine.bills === 1 ? "" : "s"} (${mine.covers} covers), against a house average of ${house.apc ?? 0}.`,
+      };
+    // ratioScore can still return null (no house benchmark) even when the raw
+    // value exists — keep `available` and `score` telling the same story.
+    if (apcComponent.score == null) { apcComponent.available = false; }
+
+    // Rating
+    const fb = fbByEmp.get(e.id);
+    const fbCount = Math.round(parseNumeric(fb?.n));
+    const avgRating = fb?.avg_rating == null ? null : round2(parseNumeric(fb.avg_rating));
+    const ratingComponent: PerformanceComponent = avgRating == null || fbCount === 0
+      ? unavailable("stars (1-5)", "No guest feedback was attributed to them in this window — scored as excluded, NOT as zero stars.")
+      : {
+        value: avgRating,
+        // Absolute: 1 star = 0, 5 stars = 100. A star scale means the same thing
+        // in every restaurant, so there is nothing to benchmark against.
+        score: round2(Math.max(0, Math.min(1, (avgRating - 1) / 4)) * 100),
+        available: true,
+        unit: "stars (1-5)",
+        sample: fbCount,
+        benchmark: null,
+        note: `Average of ${fbCount} guest rating${fbCount === 1 ? "" : "s"}.`,
+      };
+
+    // Attendance
+    const att = attByEmp.get(e.id);
+    const consideredDays = att ? att.days_present + att.absent_days : 0;
+    let attendanceComponent: PerformanceComponent;
+    if (!att || consideredDays === 0) {
+      attendanceComponent = unavailable("% presence/punctuality", "They have no counted shift in this window, so there is nothing to measure.");
+    } else {
+      const presence = att.days_present / consideredDays;
+      // late_pct is null below ATTENDANCE_LATE_MIN_DAYS worked days: there is no
+      // honest baseline to be late against, so punctuality simply drops out and
+      // presence carries the whole component.
+      const punctuality = att.late_pct == null ? null : Math.max(0, Math.min(1, 1 - att.late_pct / 100));
+      const combined = punctuality == null
+        ? presence
+        : presence * ATTENDANCE_PRESENCE_SHARE + punctuality * (1 - ATTENDANCE_PRESENCE_SHARE);
+      attendanceComponent = {
+        value: round2(combined * 100),
+        score: round2(Math.max(0, Math.min(1, combined)) * 100),
+        available: true,
+        unit: "% presence/punctuality",
+        sample: consideredDays,
+        benchmark: null,
+        note: punctuality == null
+          ? `Present on ${att.days_present} of ${consideredDays} open days (${att.leave_days} excused by approved leave). Too few worked days for a punctuality baseline, so presence alone was used.`
+          : `Present on ${att.days_present} of ${consideredDays} open days (${att.leave_days} excused by approved leave); ${att.late_shifts} late start${att.late_shifts === 1 ? "" : "s"} against a typical ${att.typical_start}.`,
+      };
+    }
+
+    // TAT
+    const myTat = medianOf(tatByEmp.get(e.id) ?? []);
+    const tatSample = (tatByEmp.get(e.id) ?? []).length;
+    const tatComponent: PerformanceComponent = myTat == null
+      ? unavailable("minutes per table", "No completed seating in this window was billed by them, so turnaround cannot be measured.")
+      : {
+        value: myTat,
+        score: ratioScore(myTat, houseTatMedian ?? 0, false),
+        available: houseTatMedian != null && houseTatMedian > 0,
+        unit: "minutes per table",
+        sample: tatSample,
+        benchmark: houseTatMedian,
+        note: `Median seated-to-released time over ${tatSample} table${tatSample === 1 ? "" : "s"}, against a house median of ${houseTatMedian ?? 0} minutes.`,
+      };
+    if (tatComponent.score == null) { tatComponent.available = false; }
+
+    const components: Record<PerformanceComponentKey, PerformanceComponent> = {
+      apc: apcComponent,
+      rating: ratingComponent,
+      attendance: attendanceComponent,
+      tat: tatComponent,
+    };
+
+    // Renormalise over what was actually measured. Nothing measured => null, so
+    // an employee with no data is never ranked as if they had scored zero.
+    const keys = Object.keys(PERFORMANCE_WEIGHTS) as PerformanceComponentKey[];
+    const live = keys.filter((k) => components[k].available && components[k].score != null);
+    const totalWeight = live.reduce((s, k) => s + PERFORMANCE_WEIGHTS[k], 0);
+    const effective_weights = keys.reduce((acc, k) => {
+      acc[k] = live.includes(k) && totalWeight > 0 ? round2(PERFORMANCE_WEIGHTS[k] / totalWeight) : 0;
+      return acc;
+    }, {} as Record<PerformanceComponentKey, number>);
+    const score = totalWeight > 0
+      ? round2(live.reduce((s, k) => s + PERFORMANCE_WEIGHTS[k] * (components[k].score ?? 0), 0) / totalWeight)
+      : null;
+
+    return {
+      employee_id: e.id,
+      employee_name: name,
+      role,
+      score,
+      components,
+      effective_weights,
+      components_available: live.length,
+    };
+  });
+
+  // Best first; an unscoreable employee sorts last rather than as a zero.
+  rows.sort((a, b) => (b.score ?? -1) - (a.score ?? -1) || a.employee_name.localeCompare(b.employee_name));
+
+  return {
+    window_days: window,
+    from: fromKey,
+    to: todayKey,
+    timezone: tz,
+    generated_at: new Date().toISOString(),
+    weights: { ...PERFORMANCE_WEIGHTS },
+    benchmarks: {
+      apc: house.apc,
+      tat_minutes: houseTatMedian,
+      apc_basis: "pre-tax taxable base of settled bills / covers counted once per seating",
+    },
+    rows,
   };
 }
 
@@ -22098,6 +23103,435 @@ export async function GetAttendanceSummary(
     byEmp.set(r.emp_id, e);
   }
   return { from: range.fromDate, to: range.toDate, rows: [...byEmp.values()].sort((a, b) => b.minutes - a.minutes), pending };
+}
+
+// --- Employee leave ----------------------------------------------------------
+// "Attendance" records what a person DID; this records what they were EXCUSED
+// from. Without it getStaffAttendanceStats counts an approved holiday as an
+// absence, which is the one number an owner uses to judge reliability.
+//
+// Dates here are the RESTAURANT's calendar days, stored as bare `date` and
+// always computed from the tenant zone in TypeScript (dayKeyOf / addDaysToKey).
+// Nothing on this path may use Postgres `current_date`: the DB session runs in
+// UTC, so through the tenant's own late shift it names the wrong day.
+
+export type LeaveType = "sick" | "casual" | "unpaid" | "holiday";
+export type LeaveStatus = "requested" | "approved" | "rejected";
+
+// Mirrors the CHECK constraints in migration 024. Plain string unions rather
+// than a Postgres enum, matching how every other workflow state in this schema
+// is stored ("Attendance".status, "DiscountRequests".status, "PurchaseOrders"
+// .status are all text) — the only real enums here are catalogues, not row state.
+const LEAVE_TYPES: readonly LeaveType[] = ["sick", "casual", "unpaid", "holiday"];
+/** Upper bound on a single leave request — see CreateLeaveRequest for why. */
+const LEAVE_MAX_DAYS = 366;
+const LEAVE_STATUSES: readonly LeaveStatus[] = ["requested", "approved", "rejected"];
+
+export function normalizeLeaveType(raw: unknown): LeaveType | null {
+  const v = String(raw ?? "").trim().toLowerCase();
+  return (LEAVE_TYPES as readonly string[]).includes(v) ? (v as LeaveType) : null;
+}
+export function normalizeLeaveStatus(raw: unknown): LeaveStatus | null {
+  const v = String(raw ?? "").trim().toLowerCase();
+  return (LEAVE_STATUSES as readonly string[]).includes(v) ? (v as LeaveStatus) : null;
+}
+
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+export interface LeaveRecord {
+  id: string;
+  emp_id: string;
+  employee_name: string;
+  leave_type: LeaveType;
+  /** Inclusive restaurant calendar days, "YYYY-MM-DD". */
+  start_day: string;
+  end_day: string;
+  /** Inclusive day count — a single-day leave is 1, never 0. */
+  days: number;
+  status: LeaveStatus;
+  reason: string | null;
+  /** Employee id of the actor, NOT a username — see the note on the columns in
+   *  migration 024. The resolved display names ride alongside so the app never
+   *  has to render a raw uuid or make a second lookup to say who signed it off. */
+  requested_by: string | null;
+  requested_by_name: string | null;
+  decided_by: string | null;
+  decided_by_name: string | null;
+  decided_at: string | null;
+  created_at: string;
+}
+
+interface LeaveRow {
+  id: string;
+  emp_id: string;
+  fname: string | null;
+  lname: string | null;
+  leave_type: string;
+  start_day: Date | string;
+  end_day: Date | string;
+  status: string;
+  reason: string | null;
+  requested_by: string | null;
+  decided_by: string | null;
+  req_fname?: string | null;
+  req_lname?: string | null;
+  dec_fname?: string | null;
+  dec_lname?: string | null;
+  decided_at: Date | string | null;
+  created_at: Date | string;
+}
+
+// Every read below selects the two `date` columns through to_char(), so a day key
+// arrives as text and this is a passthrough. That is deliberate: node-postgres
+// parses a bare `date` into a JS Date at LOCAL midnight, not UTC midnight, so on
+// any host east of Greenwich toISOString().slice(0,10) returns the PREVIOUS day —
+// a leave filed for the 3rd came back as the 2nd. When a Date does reach here,
+// read its LOCAL components, which is the value pg actually decoded.
+const dayKeyFromDb = (v: Date | string): string => {
+  if (!(v instanceof Date)) { return String(v).slice(0, 10); }
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())}`;
+};
+
+// `date` -> 'YYYY-MM-DD' in SQL, so no zone is ever applied on the way out.
+const DAY_COLS = `to_char(l.start_day, 'YYYY-MM-DD') as start_day,
+            to_char(l.end_day, 'YYYY-MM-DD') as end_day`;
+
+const personName = (f?: string | null, l?: string | null): string | null =>
+  [f, l].filter(Boolean).join(" ").trim() || null;
+
+// requested_by / decided_by hold an employee id in a text column, so the join is
+// written uuid::text = text. Casting the OTHER way ($col::uuid) would throw on
+// any row a future writer fills with a username instead of an id, taking the
+// whole list down; this way such a row simply resolves to no name.
+const LEAVE_ACTOR_JOINS = `
+       left join "Employees" rq on rq.res_id = l.res_id and rq.id::text = l.requested_by
+       left join "Employees" dc on dc.res_id = l.res_id and dc.id::text = l.decided_by`;
+const LEAVE_ACTOR_COLS = `rq."emp_Fname" as req_fname, rq."emp_Lname" as req_lname,
+            dc."emp_Fname" as dec_fname, dc."emp_Lname" as dec_lname`;
+
+const LEAVE_SELECT_ONE = `select l.id, l.emp_id, e."emp_Fname" as fname, e."emp_Lname" as lname,
+            l.leave_type, ${DAY_COLS}, l.status, l.reason,
+            l.requested_by, l.decided_by, l.decided_at, l.created_at,
+            ${LEAVE_ACTOR_COLS}
+       from "EmployeeLeaves" l
+       left join "Employees" e on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id${LEAVE_ACTOR_JOINS}
+      where l.id = $1 and l.res_id = $2 and l.outlet_id = $3`;
+
+/** Single leave, outlet-scoped, with both actor names resolved. */
+async function readLeaveById(
+  context: RestaurantContext,
+  leaveId: string,
+): Promise<LeaveRecord | null> {
+  const rows = await runQuery<LeaveRow>(LEAVE_SELECT_ONE, [leaveId, context.res_id, context.outlet_id]);
+  return rows[0] ? mapLeaveRow(rows[0]) : null;
+}
+
+function mapLeaveRow(r: LeaveRow): LeaveRecord {
+  const start_day = dayKeyFromDb(r.start_day);
+  const end_day = dayKeyFromDb(r.end_day);
+  return {
+    id: r.id,
+    emp_id: r.emp_id,
+    employee_name: [r.fname, r.lname].filter(Boolean).join(" ").trim() || "Employee",
+    leave_type: normalizeLeaveType(r.leave_type) ?? "casual",
+    start_day,
+    end_day,
+    days: inclusiveDayCount(start_day, end_day),
+    status: normalizeLeaveStatus(r.status) ?? "requested",
+    reason: r.reason,
+    requested_by: r.requested_by,
+    requested_by_name: personName(r.req_fname, r.req_lname),
+    decided_by: r.decided_by,
+    decided_by_name: personName(r.dec_fname, r.dec_lname),
+    decided_at: iso(r.decided_at),
+    created_at: iso(r.created_at) ?? "",
+  };
+}
+
+/** Whole days from `from` to `to` INCLUSIVE. Both are zone-free day keys, so this
+ *  is plain UTC arithmetic and never lands on a DST half-day. */
+function inclusiveDayCount(fromKey: string, toKey: string): number {
+  const a = Date.parse(`${fromKey}T00:00:00Z`);
+  const b = Date.parse(`${toKey}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) { return 0; }
+  return Math.round((b - a) / 86_400_000) + 1;
+}
+
+async function ensureEmployeeLeavesTable(): Promise<void> {
+  await ensureLazyTable("EmployeeLeaves", async () => {
+    // Mirrors migration 024 so whichever runs first wins and the other is a
+    // no-op. The composite FK is the only shape Postgres accepts: "Employees" is
+    // keyed on (id, res_id, outlet_id), not on id alone.
+    await runQuery(
+      `create table if not exists "EmployeeLeaves" (
+         id uuid primary key default gen_random_uuid(),
+         created_at timestamptz not null default now(),
+         res_id uuid not null,
+         outlet_id uuid not null,
+         emp_id uuid not null,
+         leave_type text not null default 'casual'
+           check (leave_type in ('sick','casual','unpaid','holiday')),
+         start_day date not null,
+         end_day date not null,
+         status text not null default 'requested'
+           check (status in ('requested','approved','rejected')),
+         reason text,
+         requested_by text,
+         decided_by text,
+         decided_at timestamptz,
+         constraint employee_leaves_range_ordered check (end_day >= start_day)
+       )`,
+    );
+    await runQuery(
+      `create index if not exists employee_leaves_emp_day_idx
+         on "EmployeeLeaves" (res_id, outlet_id, emp_id, start_day, end_day)`,
+    );
+    await runQuery(
+      `create index if not exists employee_leaves_status_day_idx
+         on "EmployeeLeaves" (res_id, outlet_id, status, start_day, end_day)`,
+    );
+    await applyTenantRls("EmployeeLeaves");
+  });
+}
+
+/** The employee must belong to THIS tenant and THIS outlet — the composite FK in
+ *  migration 024 enforces it, but resolving first turns a would-be 500 into an
+ *  honest 400 and gives the audit line a real name. */
+async function resolveLeaveEmployee(
+  context: RestaurantContext,
+  employeeId: string,
+): Promise<{ id: string; name: string } | null> {
+  if (!isUuid(employeeId)) { return null; }
+  const rows = await runQuery<{ id: string; fname: string | null; lname: string | null }>(
+    `select id, "emp_Fname" as fname, "emp_Lname" as lname
+       from "Employees" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [employeeId, context.res_id, context.outlet_id],
+  );
+  const r = rows[0];
+  if (!r) { return null; }
+  return { id: r.id, name: [r.fname, r.lname].filter(Boolean).join(" ").trim() || "Employee" };
+}
+
+export interface LeaveFilter {
+  emp_id?: string;
+  /** Restaurant day keys. A leave is included when its range OVERLAPS [from,to];
+   *  filtering on start_day alone would hide a leave already in progress. */
+  from?: string;
+  to?: string;
+  status?: LeaveStatus;
+  limit?: number;
+  offset?: number;
+}
+
+export async function ListEmployeeLeaves(
+  restaurantId: string,
+  opts: LeaveFilter = {},
+): Promise<{ leaves: LeaveRecord[]; total: number; has_more: boolean; from: string; to: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureEmployeeLeavesTable();
+  const tz = context.timezone;
+  const safeLimit = Math.max(1, Math.min(opts.limit ?? 100, 500));
+  const safeOffset = Math.max(0, Math.round(opts.offset ?? 0));
+
+  // Default window: the 30 restaurant-days ending today, plus the next 90 — a
+  // leave list is as much about what is COMING as about what happened.
+  const todayKey = dayKeyOf(new Date(), tz);
+  const from = DAY_KEY_RE.test(String(opts.from ?? "")) ? String(opts.from) : addDaysToKey(todayKey, -29);
+  const to = DAY_KEY_RE.test(String(opts.to ?? "")) ? String(opts.to) : addDaysToKey(todayKey, 90);
+
+  const og = isAllOutlets() ? "true" : "false";
+  const where: string[] = [
+    "l.res_id = $1",
+    `(${og} or l.outlet_id = $2)`,
+    "l.start_day <= $4::date",
+    "l.end_day >= $3::date",
+  ];
+  const params: unknown[] = [context.res_id, context.outlet_id, from, to];
+  if (opts.emp_id) { params.push(opts.emp_id); where.push(`l.emp_id = $${params.length}::uuid`); }
+  if (opts.status) { params.push(opts.status); where.push(`l.status = $${params.length}`); }
+  const whereSql = where.join(" and ");
+
+  const countRows = await runQuery<{ total: string }>(
+    `select count(*)::text as total from "EmployeeLeaves" l where ${whereSql}`,
+    params,
+  );
+  const total = Math.max(0, Math.round(Number(countRows[0]?.total ?? 0)));
+
+  params.push(safeLimit); const limIdx = `$${params.length}`;
+  params.push(safeOffset); const offIdx = `$${params.length}`;
+  const rows = await runQuery<LeaveRow>(
+    `select l.id, l.emp_id, e."emp_Fname" as fname, e."emp_Lname" as lname,
+            l.leave_type, ${DAY_COLS}, l.status, l.reason,
+            l.requested_by, l.decided_by, l.decided_at, l.created_at,
+            ${LEAVE_ACTOR_COLS}
+       from "EmployeeLeaves" l
+       left join "Employees" e on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id${LEAVE_ACTOR_JOINS}
+      where ${whereSql}
+      -- Latest-starting first, then a stable id tiebreak: start_day alone is not
+      -- unique, and without the tiebreak paging duplicates and skips rows.
+      order by l.start_day desc, l.id desc
+      limit ${limIdx} offset ${offIdx}`,
+    params,
+  );
+
+  return {
+    leaves: rows.map(mapLeaveRow),
+    total,
+    has_more: safeOffset + rows.length < total,
+    from,
+    to,
+  };
+}
+
+export async function CreateLeaveRequest(
+  restaurantId: string,
+  input: { emp_id: string; leave_type?: string; start_day?: string; end_day?: string; reason?: string; requested_by?: string },
+): Promise<LeaveRecord> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureEmployeeLeavesTable();
+  const tz = context.timezone;
+
+  const employee = await resolveLeaveEmployee(context, String(input.emp_id ?? "").trim());
+  if (!employee) { throw new Error("Unknown employee for this outlet"); }
+
+  const leaveType = normalizeLeaveType(input.leave_type ?? "casual");
+  if (!leaveType) { throw new Error(`leave_type must be one of ${LEAVE_TYPES.join(", ")}`); }
+
+  // The restaurant's today, never the server's and never Postgres's.
+  const todayKey = dayKeyOf(new Date(), tz);
+  const startDay = DAY_KEY_RE.test(String(input.start_day ?? "")) ? String(input.start_day) : todayKey;
+  const endDay = DAY_KEY_RE.test(String(input.end_day ?? "")) ? String(input.end_day) : startDay;
+  const requestedDays = inclusiveDayCount(startDay, endDay);
+  if (requestedDays <= 0) { throw new Error("end_day must be on or after start_day"); }
+  // A typo in the year ("2926") was accepted as a 328,719-day leave. Approving
+  // one would mark the employee on leave effectively forever, and attendance
+  // reads that as excused absence — so the damage outlives the typo. A year is
+  // far past any real request and still leaves room for extended unpaid leave.
+  if (requestedDays > LEAVE_MAX_DAYS) {
+    throw new Error(`A leave request cannot span more than ${LEAVE_MAX_DAYS} days (asked for ${requestedDays})`);
+  }
+
+  // A day already covered by a live (requested or approved) leave must not be
+  // claimed twice: two overlapping approvals would each excuse the same absence,
+  // and the leave-day count the attendance stats subtract would be wrong.
+  const clash = await runQuery<{ id: string; start_day: Date | string; end_day: Date | string; status: string }>(
+    `select id, to_char(start_day, 'YYYY-MM-DD') as start_day,
+            to_char(end_day, 'YYYY-MM-DD') as end_day, status from "EmployeeLeaves"
+      where res_id = $1 and outlet_id = $2 and emp_id = $3
+        and status <> 'rejected'
+        and start_day <= $5::date and end_day >= $4::date
+      order by start_day asc limit 1`,
+    [context.res_id, context.outlet_id, employee.id, startDay, endDay],
+  );
+  if (clash[0]) {
+    const c = clash[0];
+    throw new Error(
+      `${employee.name} already has a ${c.status} leave covering ${dayKeyFromDb(c.start_day)} to ${dayKeyFromDb(c.end_day)}`,
+    );
+  }
+
+  const rows = await runQuery<{ id: string }>(
+    `insert into "EmployeeLeaves" (res_id, outlet_id, emp_id, leave_type, start_day, end_day, status, reason, requested_by)
+     values ($1, $2, $3, $4, $5::date, $6::date, 'requested', $7, $8)
+     returning id`,
+    [
+      context.res_id, context.outlet_id, employee.id, leaveType, startDay, endDay,
+      input.reason?.trim() || null,
+      input.requested_by?.trim() || null,
+    ],
+  );
+  const newId = rows[0]?.id;
+  if (!newId) { throw new Error("Failed to create leave request"); }
+  // Re-read through the same joined select the other two paths use, so a created
+  // leave comes back in exactly the shape a listed one does — the requester's
+  // name included, rather than the caller having to look it up.
+  const created = await readLeaveById(context, newId);
+  if (!created) { throw new Error("Failed to create leave request"); }
+  return created;
+}
+
+/**
+ * Approve or reject one leave.
+ *
+ * IDEMPOTENT: deciding a leave that already carries the target status is a
+ * no-op — the original decided_by / decided_at are preserved and `changed` comes
+ * back false. A double-tap (or a retried request) must not rewrite who signed it
+ * off or when. Flipping a decision the other way IS allowed and does re-stamp,
+ * because that is a genuine second decision by a real person.
+ */
+export async function DecideLeaveRequest(
+  restaurantId: string,
+  leaveId: string,
+  approve: boolean,
+  decidedBy?: string,
+): Promise<{ leave: LeaveRecord; changed: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureEmployeeLeavesTable();
+  const target: LeaveStatus = approve ? "approved" : "rejected";
+  if (!isUuid(leaveId)) { throw new Error("Unknown leave request"); }
+
+  const existing = await readLeaveById(context, leaveId);
+  if (!existing) { throw new Error("Unknown leave request"); }
+  if (existing.status === target) { return { leave: existing, changed: false }; }
+
+  // `status <> $4` makes the no-op case a property of the WRITE, not of the read
+  // above it. Two approvals racing each other would both pass an in-TypeScript
+  // check and the loser would silently re-stamp decided_by/decided_at with the
+  // second person's name; here exactly one row is updated and the loser reports
+  // changed:false, so the log keeps whoever actually made the decision.
+  const updated = await runQuery<{ id: string }>(
+    `update "EmployeeLeaves"
+        set status = $4, decided_by = $5, decided_at = now()
+      where id = $1 and res_id = $2 and outlet_id = $3 and status <> $4
+      returning id`,
+    [leaveId, context.res_id, context.outlet_id, target, decidedBy?.trim() || null],
+  );
+  const after = await readLeaveById(context, leaveId);
+  if (!after) { throw new Error("Unknown leave request"); }
+  return { leave: after, changed: updated.length > 0 };
+}
+
+/**
+ * Approved leave days per employee over [fromKey, toKey], as restaurant day keys.
+ *
+ * generate_series over two bare `date` columns — no zone conversion anywhere, so
+ * these keys are directly comparable with the ones getStaffAttendanceStats
+ * derives from clock_in `at time zone $tz`.
+ */
+async function approvedLeaveDaysByEmployee(
+  resId: string,
+  outletId: string,
+  outletGuard: string,
+  fromKey: string,
+  toKey: string,
+): Promise<Map<string, Set<string>>> {
+  await ensureEmployeeLeavesTable();
+  const rows = await runQuery<{ emp_id: string; day: string }>(
+    `select l.emp_id, to_char(d, 'YYYY-MM-DD') as day
+       from "EmployeeLeaves" l
+       cross join lateral generate_series(
+         greatest(l.start_day, $3::date),
+         least(l.end_day, $4::date),
+         interval '1 day'
+       ) d
+      where l.res_id = $1 and (${outletGuard} or l.outlet_id = $2)
+        and l.status = 'approved'
+        and l.start_day <= $4::date and l.end_day >= $3::date`,
+    [resId, outletId, fromKey, toKey],
+    // Deliberately NOT wrapped in a catch. ensureEmployeeLeavesTable() above
+    // creates the table when it is missing, so the only way this can throw is a
+    // real schema fault — and swallowing that would silently report every
+    // approved holiday as an absence, which is the exact bug this table exists
+    // to fix. A 500 is the honest outcome.
+  );
+  const out = new Map<string, Set<string>>();
+  for (const r of rows) {
+    const set = out.get(r.emp_id) ?? new Set<string>();
+    set.add(r.day);
+    out.set(r.emp_id, set);
+  }
+  return out;
 }
 
 // Restaurant-wide employee count (ALL outlets) for plan-limit enforcement.

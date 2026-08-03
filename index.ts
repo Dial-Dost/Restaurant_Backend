@@ -112,6 +112,10 @@ import {
 	ClockOut,
 	GetMyAttendance,
 	GetAttendanceSummary,
+	ListEmployeeLeaves,
+	CreateLeaveRequest,
+	DecideLeaveRequest,
+	normalizeLeaveStatus,
 	GetVendors,
 	AddVendor,
 	UpdateVendor,
@@ -201,6 +205,9 @@ import {
 	GetTimingStats,
 	GetKitchenAnalytics,
 	GetOverviewInsights,
+	GetStaffPerformance,
+	GetConcerns,
+	GetCustomerSegments,
 	FireOrderItems,
 	GetExpoView,
 	FIRE_COURSE_ACTION_ID,
@@ -1221,6 +1228,9 @@ const FEATURE_BY_PREFIX: [RegExp, string][] = [
 	[/^\/(valet|create_valet|update_valet|add-valet|delete-valet)/, "valet"],
 	[/^\/coupons\b/, "coupons"],
 	[/^\/attendance\b/, "attendance"],
+	// Leave IS attendance — a plan that excludes one must not hand over the other
+	// through a differently-named route.
+	[/^\/leaves\b/, "attendance"],
 ];
 app.use((req: Request, res: Response, next: NextFunction) => {
 	const features = (req.auth?.features ?? {});
@@ -4940,6 +4950,43 @@ app.get("/customers/insights", validateAction("3c530903-324c-4bbe-802b-849763518
 	}
 });
 
+// Server-side segmentation, sorting and paging for the CRM list, so the app
+// ranks the WHOLE guest book instead of re-sorting whichever page it happens to
+// hold. Same permission as the customer list it belongs beside.
+//
+// Spend here is the TAX-INCLUSIVE total actually charged on settled bills, with
+// the service charge separated out — /get-customers and /customers/insights size
+// spend from raw order totals instead, so this endpoint's figures will be higher
+// and are the ones that reconcile against a receipt. See GetCustomerSegments.
+//
+// Paged exactly like /audit-logs: bare array by default, metadata in headers,
+// ?meta=1 for the enveloped body (which also carries the segment counts).
+app.get("/customers/segments", validateAction("3c530903-324c-4bbe-802b-849763518920"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const limit = clampLimit(req.query.limit, 100, 500);
+	const offset = Math.max(0, Math.min(Number(req.query.offset) || 0, 100000));
+	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 365;
+	const wantMeta = req.query.meta === "1" || req.query.meta === "true";
+	try {
+		const page = await GetCustomerSegments(restaurantId, {
+			sort: typeof req.query.sort === "string" ? req.query.sort : undefined,
+			segment: typeof req.query.segment === "string" ? req.query.segment : undefined,
+			search: typeof req.query.search === "string" ? req.query.search : undefined,
+			days: Number.isFinite(daysRaw) ? daysRaw : 365,
+			limit,
+			offset,
+		});
+		res.setHeader("X-Total-Count", String(page.total));
+		res.setHeader("X-Has-More", page.has_more ? "1" : "0");
+		if (wantMeta) { res.json(page); return; }
+		res.json(page.customers);
+	} catch (err) {
+		logger.error({ err }, "customer_segments_failed");
+		res.status(500).json({ error: "Unable to fetch customer segments" });
+	}
+});
+
 /*
 	returns the count of bookings in a range
 	requests body must be like this
@@ -6695,6 +6742,59 @@ app.get("/analytics/overview", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182
 	catch (err) { logger.error({ err }, "overview_insights_failed"); res.status(500).json({ error: "Unable to fetch overview insights" }); }
 });
 
+// Per-employee composite performance score AND the components behind it — never
+// a bare number, so the app can always show WHY.
+//
+// Gated on the SAME analytics permission as the rest of /analytics/*. That is
+// deliberate and not a widening: /analytics/overview already returns per-employee
+// revenue, orders and average rating under this exact id (top_staff), so anyone
+// who can read this could already read the parts it is built from.
+app.get("/analytics/staff-performance", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
+	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
+	try { res.json(await GetStaffPerformance(restaurantId, days)); }
+	catch (err) { logger.error({ err }, "staff_performance_failed"); res.status(500).json({ error: "Unable to fetch staff performance" }); }
+});
+
+// Everything needing attention today, each with a severity and what to do about
+// it. Extends the Overview strip's needs_attention rather than re-detecting it,
+// so the two can never disagree — hence the same permission as the Overview.
+app.get("/analytics/concerns", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
+	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
+	try {
+		// The subscription lives in the CONTROL PLANE (a separate database), which
+		// the tenant data layer deliberately does not reach into — so it is read
+		// here and injected. Undeployed control plane => no subscription concern,
+		// which is correct: there is genuinely nothing to be behind on.
+		let subscription = null;
+		if (billingConfigured()) {
+			try {
+				const billing = await getTenantBilling(req.auth!.res_id);
+				subscription = billing.subscription
+					? {
+						status: billing.subscription.status,
+						current_period_end: billing.subscription.current_period_end,
+						trial_ends_at: billing.subscription.trial_ends_at,
+						plan_name: billing.plan?.name ?? null,
+					}
+					: null;
+			} catch (err) {
+				// A control-plane outage must not take the whole concerns list down —
+				// but it is logged, and the row is OMITTED rather than reported as
+				// "subscription fine", which would be a claim we cannot make.
+				logger.warn({ err }, "concerns_subscription_lookup_failed");
+			}
+		}
+		res.json(await GetConcerns(restaurantId, days, { subscription }));
+	}
+	catch (err) { logger.error({ err }, "concerns_failed"); res.status(500).json({ error: "Unable to fetch concerns" }); }
+});
+
 app.get("/analytics/kitchen", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -7372,6 +7472,114 @@ app.get("/attendance", validate, async (req: Request, res: Response) => {
 	try { res.json(await GetAttendanceSummary(auth.restaurantId, from, to)); }
 	catch (e) { logger.error({ err: e }, "attendance_summary_failed"); res.status(500).json({ error: "Unable to fetch attendance summary" }); }
 });
+
+// --- Employee leave ----------------------------------------------------------
+// Gated on the EXISTING 'Review Attendance' (PERM_ATTENDANCE), the same
+// permission that guards GET /attendance and the clock-in review. Whoever
+// reviews a shift is who should review a day off, and reusing it means leave
+// works for every role that can already do attendance instead of waiting on a
+// fresh grant. No new gate is minted.
+//
+// AUDIT LABELS ONLY — never passed to validateAction. See migration 025 for why
+// a leave needs its own title in the log and why that title must not become a
+// permission.
+const LEAVE_REQUESTED_ACTION = "4455a271-5610-49a3-be8e-3f2e9990170a";
+const LEAVE_REVIEWED_ACTION = "6465027f-a3a1-4851-bd8a-cc3360b67993";
+
+// Dates are the RESTAURANT's calendar days ("YYYY-MM-DD"); the resolver below
+// hands them straight through and database_supabase defaults them from the
+// tenant's own zone. Anything else is rejected rather than coerced, because a
+// half-parsed date silently selects the wrong day.
+function leaveDayParam(raw: unknown): string | undefined {
+	const v = Array.isArray(raw) ? raw[0] : raw;
+	if (typeof v !== "string") { return undefined; }
+	const s = v.trim();
+	return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : undefined;
+}
+
+// Paged exactly like /audit-logs: a bare ARRAY stays the default body (that is
+// what existing clients parse), the paging metadata always rides in headers, and
+// ?meta=1 opts into the enveloped body.
+app.get("/leaves", validate, async (req: Request, res: Response) => {
+	const auth = await enforcePermission(req, res, PERM_ATTENDANCE);
+	if (!auth) { return; }
+	const limit = clampLimit(req.query.limit, 100, 500);
+	const offset = Math.max(0, Math.min(Number(req.query.offset) || 0, 100000));
+	const empId = typeof req.query.emp_id === "string" && req.query.emp_id.trim() ? req.query.emp_id.trim() : undefined;
+	const status = normalizeLeaveStatus(req.query.status) ?? undefined;
+	const wantMeta = req.query.meta === "1" || req.query.meta === "true";
+	try {
+		const page = await ListEmployeeLeaves(auth.restaurantId, {
+			emp_id: empId,
+			from: leaveDayParam(req.query.from),
+			to: leaveDayParam(req.query.to),
+			status,
+			limit,
+			offset,
+		});
+		res.setHeader("X-Total-Count", String(page.total));
+		res.setHeader("X-Has-More", page.has_more ? "1" : "0");
+		if (wantMeta) { res.json(page); return; }
+		res.json(page.leaves);
+	} catch (e) {
+		logger.error({ err: e }, "list_leaves_failed");
+		res.status(500).json({ error: "Unable to fetch leave requests" });
+	}
+});
+
+// Filing a leave for YOURSELF needs no special permission — it is a request, not
+// a decision, exactly like clocking in. Filing one for SOMEONE ELSE does, so an
+// employee cannot book their colleague a week off.
+app.post("/leaves", validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	const me = extractEmployeeId(req);
+	if (!restaurantId || !me) { res.status(400).json({ error: "Missing identity" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const target = typeof body.emp_id === "string" && body.emp_id.trim() ? body.emp_id.trim() : me;
+	if (target !== me && !(await enforcePermission(req, res, PERM_ATTENDANCE))) { return; }
+	try {
+		const leave = await CreateLeaveRequest(restaurantId, {
+			emp_id: target,
+			leave_type: typeof body.leave_type === "string" ? body.leave_type : undefined,
+			start_day: leaveDayParam(body.start_day),
+			end_day: leaveDayParam(body.end_day),
+			reason: typeof body.reason === "string" ? body.reason : undefined,
+			// The actor's employee id. NOT the username DiscountRequests.requested_by
+			// stores — decided_by on this table is written from extractEmployeeId too,
+			// and a column holding a mix of ids and usernames is unjoinable.
+			requested_by: me,
+		});
+		try {
+			await log_audit(req, LEAVE_REQUESTED_ACTION, `Requested ${leave.leave_type} leave for ${leave.employee_name}: ${leave.start_day} to ${leave.end_day} (${leave.days} day${leave.days === 1 ? "" : "s"})`, Audit_log_category.General, { leave_id: leave.id, emp_id: leave.emp_id, leave_type: leave.leave_type, start_day: leave.start_day, end_day: leave.end_day });
+		} catch (err) { logger.warn({ err }, "log_audit leave-create failed"); }
+		res.status(201).json(leave);
+	} catch (e: any) {
+		// A clashing leave is the caller's problem to resolve, not a server fault.
+		res.status(400).json({ error: String(e?.message ?? "Unable to create leave request") });
+	}
+});
+
+async function handleLeaveDecision(req: Request, res: Response, approve: boolean): Promise<void> {
+	const auth = await enforcePermission(req, res, PERM_ATTENDANCE);
+	if (!auth) { return; }
+	const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+	if (!id) { res.status(400).json({ error: "Missing id" }); return; }
+	try {
+		const { leave, changed } = await DecideLeaveRequest(auth.restaurantId, id, approve, extractEmployeeId(req) ?? undefined);
+		// A repeat decision is a successful no-op, so it writes NO audit entry —
+		// a retried request must not fill the log with decisions nobody made.
+		if (changed) {
+			try {
+				await log_audit(req, LEAVE_REVIEWED_ACTION, `${approve ? "Approved" : "Rejected"} ${leave.leave_type} leave for ${leave.employee_name} (${leave.start_day} to ${leave.end_day})`, Audit_log_category.General, { leave_id: leave.id, emp_id: leave.emp_id, status: leave.status });
+			} catch (err) { logger.warn({ err }, "log_audit leave-review failed"); }
+		}
+		res.json({ success: true, changed, leave });
+	} catch (e: any) {
+		res.status(400).json({ error: String(e?.message ?? "Unable to review leave request") });
+	}
+}
+app.post("/leaves/:id/approve", validate, (req: Request, res: Response) => void handleLeaveDecision(req, res, true));
+app.post("/leaves/:id/reject", validate, (req: Request, res: Response) => void handleLeaveDecision(req, res, false));
 
 app.get("/restaurant/profile", validate, async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
