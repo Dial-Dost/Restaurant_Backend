@@ -4519,8 +4519,10 @@ export interface CustomerSegmentPage {
   from: string;
   to: string;
   timezone: string;
-  /** Counts across the WHOLE filtered set, not the page — a client must be able
-   *  to badge every segment tab without fetching every page. */
+  /** Counts across the whole matching population, not the page and NOT narrowed
+   *  by `segment` — a client must be able to badge every segment tab without
+   *  fetching every page, and the badges must not change when a tab is opened.
+   *  `search` does narrow them: the tabs partition what is on screen. */
   segment_counts: Record<CustomerSegment, number>;
   spend_basis: string;
 }
@@ -4530,6 +4532,52 @@ export interface CustomerSegmentPage {
 const CUSTOMER_DORMANT_DAYS = 30;
 // Visits that make someone a regular.
 const CUSTOMER_REGULAR_VISITS = 3;
+
+/** One row of the customer roster, reduced to the three things identity keying
+ *  cares about. `phone_digits` is normalizePhone output; `name_key` is the
+ *  lowercased full name. Either may be empty. */
+export interface CustomerIdentitySeed { id: string; phone_digits: string; name_key: string }
+
+/**
+ * Which identity buckets each customer row is allowed to claim.
+ *
+ * A bill is attributed to a bucket keyed `c:<cust_id>`, else `p:<phone>`, else
+ * `n:<name>`. Merging all three into one customer is only sound while a bucket
+ * belongs to exactly ONE customer — and it does not. On the live tenant four
+ * Customers rows carry the phone 9999999999 (a placeholder staff type in when a
+ * guest will not give one), two carry 1234567890 and two carry 9998887770. Under
+ * a blind merge the SAME `p:9999999999` spend is added to all four rows, so one
+ * anonymous guest's bill is reported four times over — and spend is exactly what
+ * decides the high-spend quartile, so the double count moves people between
+ * segments, not just their totals.
+ *
+ * DECISION: a shared key is claimed by NOBODY. Being unable to say which of four
+ * guests spent the money is honest; saying all four did is not, and it inflates
+ * the very number the segmentation is built on. `c:<id>` is unique by
+ * construction and is always claimed, so a bill that names a real customer is
+ * never lost — only the genuinely ambiguous ones drop out.
+ *
+ * The same rule covers shared NAMES ("Guest", two real Rahul Sharmas), which
+ * have the identical failure mode.
+ */
+export function customerIdentityKeys(
+  rows: readonly CustomerIdentitySeed[],
+): Map<string, string[]> {
+  const phoneOwners = new Map<string, number>();
+  const nameOwners = new Map<string, number>();
+  for (const r of rows) {
+    if (r.phone_digits) { phoneOwners.set(r.phone_digits, (phoneOwners.get(r.phone_digits) ?? 0) + 1); }
+    if (r.name_key) { nameOwners.set(r.name_key, (nameOwners.get(r.name_key) ?? 0) + 1); }
+  }
+  const out = new Map<string, string[]>();
+  for (const r of rows) {
+    const keys = [`c:${r.id}`];
+    if (r.phone_digits && phoneOwners.get(r.phone_digits) === 1) { keys.push(`p:${r.phone_digits}`); }
+    if (r.name_key && nameOwners.get(r.name_key) === 1) { keys.push(`n:${r.name_key}`); }
+    out.set(r.id, keys);
+  }
+  return out;
+}
 
 export async function GetCustomerSegments(
   restaurantId: string,
@@ -4551,7 +4599,7 @@ export async function GetCustomerSegments(
     opts.sort === "recent" || opts.sort === "visits" ? opts.sort : "spend";
   const wantSegment = (["new", "regular", "high-spend", "dormant"] as const)
     .find((s) => s === opts.segment) ?? "all";
-  const search = String(opts.search ?? "").trim().toLowerCase().slice(0, 200);
+  const search = (opts.search ?? "").trim().toLowerCase().slice(0, 200);
   const window = Math.min(1095, Math.max(1, Math.round(opts.days ?? 365) || 365));
   const safeLimit = Math.max(1, Math.min(opts.limit ?? 100, 500));
   const safeOffset = Math.max(0, Math.round(opts.offset ?? 0));
@@ -4645,14 +4693,21 @@ export async function GetCustomerSegments(
   const fbByName = new Map(fbRows.map((r) => [r.nm, r]));
   const todayMs = Date.parse(`${todayKey}T00:00:00Z`);
 
+  // Identity keys per customer, with any bucket that more than one customer row
+  // could claim withheld from all of them — see customerIdentityKeys.
+  const identityKeys = customerIdentityKeys(custRows.map((c) => ({
+    id: c.id,
+    phone_digits: normalizePhone(c.phone ?? ""),
+    name_key: `${c.fname ?? ""} ${c.lname ?? ""}`.replace(/\s+/g, " ").trim().toLowerCase(),
+  })));
+
   const raw = custRows.map((c) => {
     const name = `${c.fname ?? ""} ${c.lname ?? ""}`.replace(/\s+/g, " ").trim();
-    const digits = normalizePhone(c.phone ?? "");
-    // The three buckets are disjoint (each bill lands in exactly one), so merging
-    // them cannot double-count.
+    // The buckets a customer claims are disjoint (each bill lands in exactly one)
+    // AND unambiguous (a bucket two customers could claim is claimed by neither),
+    // so merging them cannot double-count.
     const merged = empty();
-    for (const key of [`c:${c.id}`, digits ? `p:${digits}` : "", name ? `n:${name.toLowerCase()}` : ""]) {
-      if (!key) { continue; }
+    for (const key of identityKeys.get(c.id) ?? []) {
       const b = buckets.get(key);
       if (!b) { continue; }
       merged.spend = round2(merged.spend + b.spend);
@@ -4663,8 +4718,9 @@ export async function GetCustomerSegments(
       for (const d of b.days) { merged.days.add(d); }
     }
     const visits = merged.days.size;
-    const last_visit = visits > 0 ? [...merged.days].sort().at(-1)! : null;
-    const days_since = last_visit == null
+    const sortedDays = [...merged.days].sort();
+    const last_visit = sortedDays.length > 0 ? sortedDays[sortedDays.length - 1] ?? null : null;
+    const days_since = last_visit === null
       ? null
       : Math.max(0, Math.round((todayMs - Date.parse(`${last_visit}T00:00:00Z`)) / 86_400_000));
     const fb = fbByName.get(name.toLowerCase());
@@ -4682,7 +4738,7 @@ export async function GetCustomerSegments(
       last_visit,
       days_since_last_visit: days_since,
       bills: merged.bills,
-      avg_rating: fb?.avg_rating == null ? null : round2(parseNumeric(fb.avg_rating)),
+      avg_rating: (fb?.avg_rating ?? null) === null ? null : round2(parseNumeric(fb?.avg_rating)),
       feedbacks: Math.round(parseNumeric(fb?.n)),
     };
   });
@@ -4691,7 +4747,9 @@ export async function GetCustomerSegments(
   // spenders for a quartile to mean something) — the same rule
   // GetCustomerInsights applies, on the corrected spend basis.
   const spends = raw.filter((c) => c.total_spend > 0).map((c) => c.total_spend).sort((a, b) => a - b);
-  const p75 = spends.length >= 4 ? spends[Math.min(spends.length - 1, Math.floor(spends.length * 0.75))]! : Infinity;
+  const p75 = spends.length >= 4
+    ? spends[Math.min(spends.length - 1, Math.floor(spends.length * 0.75))] ?? Infinity
+    : Infinity;
 
   const withSegment: CustomerSegmentRow[] = raw.map((c) => {
     let segment: CustomerSegment = "new";
@@ -4703,19 +4761,31 @@ export async function GetCustomerSegments(
     return { ...c, segment };
   });
 
-  const filtered = withSegment.filter((c) => {
-    if (wantSegment !== "all" && c.segment !== wantSegment) { return false; }
+  const matchesSearch = (c: CustomerSegmentRow): boolean => {
     if (!search) { return true; }
     return c.name.toLowerCase().includes(search)
       || c.phone.toLowerCase().includes(search)
       || (c.email ?? "").toLowerCase().includes(search);
-  });
+  };
+  // The badge population is everything the search matches, WITHOUT the segment
+  // filter — that is what makes the counts usable as tab badges. Computing them
+  // after the segment filter made every other tab read 0, which contradicts the
+  // contract on `segment_counts` and would blank the tabs the moment one is
+  // opened. Search DOES narrow them, because the tabs partition whatever the
+  // owner is currently looking at.
+  const searched = withSegment.filter(matchesSearch);
+  const segment_counts: Record<CustomerSegment, number> = { new: 0, regular: 0, "high-spend": 0, dormant: 0 };
+  for (const c of searched) { segment_counts[c.segment] += 1; }
+
+  const filtered = wantSegment === "all"
+    ? searched
+    : searched.filter((c) => c.segment === wantSegment);
 
   // Sorted over the WHOLE filtered set before paging — the entire point of doing
   // this here rather than letting the app re-sort whatever page it happens to
   // hold. Every comparator ends on name so the order is total and paging can
   // neither duplicate nor skip a row.
-  const byName = (a: CustomerSegmentRow, b: CustomerSegmentRow) => a.name.localeCompare(b.name);
+  const byName = (a: CustomerSegmentRow, b: CustomerSegmentRow): number => a.name.localeCompare(b.name);
   filtered.sort((a, b) => {
     if (sort === "recent") {
       // Never visited sorts last, not first: "" would win a descending string
@@ -4727,9 +4797,6 @@ export async function GetCustomerSegments(
     if (sort === "visits") { return b.visits - a.visits || b.total_spend - a.total_spend || byName(a, b); }
     return b.total_spend - a.total_spend || b.visits - a.visits || byName(a, b);
   });
-
-  const segment_counts: Record<CustomerSegment, number> = { new: 0, regular: 0, "high-spend": 0, dormant: 0 };
-  for (const c of filtered) { segment_counts[c.segment] += 1; }
 
   const page = filtered.slice(safeOffset, safeOffset + safeLimit);
   return {
@@ -9937,7 +10004,7 @@ const CONCERN_ADVICE: Record<string, string> = {
 };
 
 const concernAdvice = (row: AttentionRow): string =>
-  CONCERN_ADVICE[row.key] ?? `Open ${row.module} and clear these ${row.count}.`;
+  CONCERN_ADVICE[row.key] ?? `Open ${row.module} and clear these ${String(row.count)}.`;
 
 export interface SubscriptionConcernInput {
   /** platform.subscriptions.status — 'active' | 'trial' | 'past_due' | … */
@@ -9957,6 +10024,34 @@ export interface ConcernsReport {
   totals: { high: number; medium: number; low: number };
 }
 
+/**
+ * Labelling for the one concern that CANNOT span outlets.
+ *
+ * Every other source GetConcerns reads honours isAllOutlets() through the `og`
+ * guard. GetTables does not, and deliberately: it is the live floor grid, table
+ * names are only unique inside an outlet, and it lazily WRITES order_otp for the
+ * outlet it is reading. Widening it would change the POS floor for every client
+ * for the sake of one advisory row, so the row stays scoped — and in all-outlets
+ * mode it says so, in the label the owner actually reads and in a machine-
+ * readable `outlet_id` on the deep link. A number that quietly means something
+ * narrower than the rows beside it is worse than a missing one.
+ */
+export function floorConcernScope(
+  allOutlets: boolean,
+  outletName: string,
+  outletId: string,
+): { label: string; advice_suffix: string; params: Record<string, string> } {
+  const base = "Seated tables tracking under the APC target";
+  if (!allOutlets) {
+    return { label: base, advice_suffix: "", params: { filter: "below_apc" } };
+  }
+  return {
+    label: `${base} (${outletName} only)`,
+    advice_suffix: ` This count covers the ${outletName} floor only — the live floor grid is per-outlet, so switch outlet to see the others.`,
+    params: { filter: "below_apc", outlet_id: outletId },
+  };
+}
+
 export async function GetConcerns(
   restaurantId: string,
   days = 30,
@@ -9966,13 +10061,14 @@ export async function GetConcerns(
   const tz = context.timezone;
   const window = Math.min(365, Math.max(1, Math.round(days) || 30));
   const rid = context.res_id, oid = context.outlet_id;
-  const og = isAllOutlets() ? "true" : "false";
+  const allOutlets = isAllOutlets();
+  const og = allOutlets ? "true" : "false";
 
   const todayKey = dayKeyOf(new Date(), tz);
   const fromIso = dayRangeOf(addDaysToKey(todayKey, -(window - 1)), tz).fromIso;
   const toIso = dayRangeOf(todayKey, tz).toIso;
 
-  const [overview, feedbackRows, attendance, tables, poRows] = await Promise.all([
+  const [overview, feedbackRows, attendance, tables, poRows, outletNameRows] = await Promise.all([
     GetOverviewInsights(restaurantId, window),
     // Unresolved service-recovery cases. `recovery_status = 'open'` is what
     // AddFeedbackEntry writes for a bad visit; the NULL branch catches rows from
@@ -9991,7 +10087,7 @@ export async function GetConcerns(
             and f.submitted_at >= $3 and f.submitted_at < $4
             and f.overall_rating <= 3
             and coalesce(f.recovery_status, 'open') <> 'resolved'
-       ) x where x.rn::int <= ${ATTENTION_ITEM_CAP} order by x.rn::int`,
+       ) x where x.rn::int <= ${String(ATTENTION_ITEM_CAP)} order by x.rn::int`,
       [rid, oid, fromIso, toIso],
     ),
     getStaffAttendanceStats(rid, oid, og, window, tz),
@@ -10018,10 +10114,20 @@ export async function GetConcerns(
               (p.expected_date is not null and p.expected_date < $3::date)
               or (p.expected_date is null and p.ordered_at is not null and p.ordered_at < now() - interval '14 days')
             )
-       ) x where x.rn::int <= ${ATTENTION_ITEM_CAP} order by x.rn::int`,
+       ) x where x.rn::int <= ${String(ATTENTION_ITEM_CAP)} order by x.rn::int`,
       [rid, oid, todayKey],
     ),
+    // Only to NAME the outlet the floor concern below is pinned to. Skipped
+    // entirely outside all-outlets mode, where there is nothing to disambiguate.
+    allOutlets
+      ? runQuery<{ outlet_name: string | null }>(
+        `select outlet_name from "Outlets" where res_id = $1 and id = $2 limit 1`,
+        [rid, oid],
+      )
+      : Promise.resolve([] as { outlet_name: string | null }[]),
   ]);
+
+  const boundOutletName = (outletNameRows[0]?.outlet_name ?? "").trim() || "the default outlet";
 
   const extraRows: ConcernRow[] = [];
   const push = (
@@ -10047,13 +10153,13 @@ export async function GetConcerns(
       module: "Feedback",
       items: feedbackRows.map<AttentionItem>((r) => {
         const rating = round2(parseNumeric(r.rating));
-        const who = String(r.cust_name ?? "").trim() || "Anonymous guest";
-        const server = String(r.fname ?? "").trim();
+        const who = (r.cust_name ?? "").trim() || "Anonymous guest";
+        const server = (r.fname ?? "").trim();
         return {
           label: who,
-          sub: `${rating}/5${server ? ` · served by ${server}` : ""} · ${attentionAge((Date.now() - new Date(r.submitted_at).getTime()) / 1000)} ago`,
+          sub: `${String(rating)}/5${server ? ` · served by ${server}` : ""} · ${attentionAge((Date.now() - new Date(r.submitted_at).getTime()) / 1000)} ago`,
           value: rating,
-          id: String(r.id ?? ""),
+          id: r.id,
         };
       }),
       deep_link: { module: "Feedback", params: { filter: "recovery" }, href: "/dashboard/feedback" },
@@ -10075,7 +10181,7 @@ export async function GetConcerns(
       module: "Attendance",
       items: absentees.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((r) => ({
         label: r.name,
-        sub: `${r.absent_days} unexplained day${r.absent_days === 1 ? "" : "s"} of ${r.days_present + r.absent_days} open${r.leave_days > 0 ? ` · ${r.leave_days} already excused` : ""}`,
+        sub: `${String(r.absent_days)} unexplained day${r.absent_days === 1 ? "" : "s"} of ${String(r.days_present + r.absent_days)} open${r.leave_days > 0 ? ` · ${String(r.leave_days)} already excused` : ""}`,
         value: r.absent_days,
         id: r.emp_id,
       })),
@@ -10091,7 +10197,7 @@ export async function GetConcerns(
   const sub = extra.subscription;
   if (sub) {
     const periodEnd = sub.current_period_end ? Date.parse(sub.current_period_end) : NaN;
-    const status = String(sub.status ?? "").toLowerCase();
+    const status = (sub.status ?? "").toLowerCase();
     const lapsed = Number.isFinite(periodEnd) && periodEnd < Date.now();
     const badStatus = status !== "" && !["active", "trial", "trialing"].includes(status);
     if (lapsed || badStatus) {
@@ -10104,7 +10210,7 @@ export async function GetConcerns(
           severity: "high",
           module: "Billing",
           items: [{
-            label: sub.plan_name?.trim() || "Current plan",
+            label: (sub.plan_name ?? "").trim() || "Current plan",
             sub: [status ? `status ${status}` : "", when ? `paid up to ${when}` : ""].filter(Boolean).join(" · ") || "payment outstanding",
             id: "subscription",
           }],
@@ -10119,6 +10225,9 @@ export async function GetConcerns(
   // Live floor state, not a window aggregate: these are tables seated RIGHT NOW
   // that can still be upsold. GetTables computes table_apc and target_apc with
   // the same pre-tax convention used everywhere else.
+  //
+  // OUTLET GRANULARITY: see floorConcernScope.
+  const floorScope = floorConcernScope(allOutlets, boundOutletName, oid);
   const below = (tables ?? [])
     .filter((t) => t.occupied && (t.table_total ?? 0) > 0 && (t.target_apc ?? 0) > 0 && (t.table_apc ?? 0) < (t.target_apc ?? 0))
     .sort((a, b) => ((a.table_apc ?? 0) - (a.target_apc ?? 0)) - ((b.table_apc ?? 0) - (b.target_apc ?? 0)));
@@ -10126,19 +10235,19 @@ export async function GetConcerns(
   push(
     {
       key: "tables_below_apc",
-      label: "Seated tables tracking under the APC target",
+      label: floorScope.label,
       count: below.length,
       severity: "medium",
       module: "Tables",
       items: below.slice(0, ATTENTION_ITEM_CAP).map<AttentionItem>((t) => ({
         label: t.table_name,
-        sub: `${fmtAttentionMoney(t.table_apc ?? 0)} per cover vs a ${fmtAttentionMoney(t.target_apc ?? 0)} target · ${t.covers ?? 1} cover${(t.covers ?? 1) === 1 ? "" : "s"}`,
+        sub: `${fmtAttentionMoney(t.table_apc ?? 0)} per cover vs a ${fmtAttentionMoney(t.target_apc ?? 0)} target · ${String(t.covers ?? 1)} cover${(t.covers ?? 1) === 1 ? "" : "s"}`,
         value: round2(t.table_apc ?? 0),
       })),
       amount: belowGap,
-      deep_link: { module: "Tables", params: { filter: "below_apc" }, href: "/dashboard/tables" },
+      deep_link: { module: "Tables", params: floorScope.params, href: "/dashboard/tables" },
     },
-    "Send a waiter to each of these tables with a dessert or drinks suggestion while the guests are still seated — after they leave this is unrecoverable.",
+    `Send a waiter to each of these tables with a dessert or drinks suggestion while the guests are still seated — after they leave this is unrecoverable.${floorScope.advice_suffix}`,
     belowGap,
   );
 
@@ -10156,10 +10265,10 @@ export async function GetConcerns(
         const late = Math.max(0, Math.round(parseNumeric(r.days_late)));
         const cost = round2(parseNumeric(r.total_cost));
         return {
-          label: String(r.vendor_name ?? "").trim() || "Unnamed vendor",
-          sub: `${fmtAttentionMoney(cost)} · ${r.expected_date ? `${late} day${late === 1 ? "" : "s"} past due` : `ordered ${late} days ago, no delivery date set`}`,
+          label: (r.vendor_name ?? "").trim() || "Unnamed vendor",
+          sub: `${fmtAttentionMoney(cost)} · ${r.expected_date ? `${String(late)} day${late === 1 ? "" : "s"} past due` : `ordered ${String(late)} days ago, no delivery date set`}`,
           value: cost,
-          id: String(r.id ?? ""),
+          id: r.id,
         };
       }),
       amount: poMoney,
@@ -17917,7 +18026,7 @@ async function getStaffAttendanceStats(
     // Candidate absences first, then the excused ones removed — so `leave_days`
     // counts only days that WOULD have been absences, never a holiday taken on a
     // day the restaurant was shut or a day the person actually came in anyway.
-    const missed = firstDay == null ? [] : openDays.filter((d) => d >= firstDay && !a.days.has(d));
+    const missed = firstDay === null ? [] : openDays.filter((d) => d >= firstDay && !a.days.has(d));
     const excused = missed.filter((d) => onLeave.has(d)).length;
     const hours = a.ms / 3_600_000;
     return {
@@ -17990,6 +18099,53 @@ async function getStaffAttendanceStats(
 const PERFORMANCE_WEIGHTS = { apc: 0.35, rating: 0.30, attendance: 0.20, tat: 0.15 } as const;
 type PerformanceComponentKey = keyof typeof PERFORMANCE_WEIGHTS;
 
+/**
+ * Renormalise the nominal weights over the components that were actually
+ * measured, rounded to 2dp so that the parts sum to EXACTLY 1.
+ *
+ * Rounding each share on its own does not add up: apc+rating+tat (0.80 of the
+ * nominal weight) gives 0.35/0.8 = 0.4375 -> 0.44, 0.30/0.8 = 0.375 -> 0.38 and
+ * 0.15/0.8 = 0.1875 -> 0.19, a total of 1.01. The app renders each share as
+ * "Counts for X% of this score", so the owner reads percentages summing to 101%
+ * and rightly stops trusting the number.
+ *
+ * Largest remainder: floor every share to 2dp, then hand the leftover hundredths
+ * out one at a time to the shares with the biggest discarded fraction (ties go to
+ * the heavier nominal weight, so the order is deterministic and the extra
+ * hundredth lands on the component that already matters most).
+ *
+ * Components that were NOT measured get exactly 0 — they are excluded, not
+ * scored zero — and when nothing was measured every share is 0, matching the
+ * null score the caller reports.
+ */
+export function distributeEffectiveWeights<K extends string>(
+  nominal: Readonly<Record<K, number>>,
+  live: readonly K[],
+): Record<K, number> {
+  const keys = Object.keys(nominal) as K[];
+  const out = {} as Record<K, number>;
+  for (const k of keys) { out[k] = 0; }
+
+  const liveKeys = keys.filter((k) => live.includes(k));
+  const totalWeight = liveKeys.reduce((s, k) => s + nominal[k], 0);
+  if (!(totalWeight > 0)) { return out; }
+
+  // Work in hundredths so the leftover is an exact integer count, never a float.
+  const parts = liveKeys.map((k) => {
+    const exact = (nominal[k] / totalWeight) * 100;
+    const floorH = Math.floor(exact);
+    return { key: k, floorH, remainder: exact - floorH, nominal: nominal[k] };
+  });
+  let leftover = 100 - parts.reduce((s, p) => s + p.floorH, 0);
+  parts.sort((a, b) => b.remainder - a.remainder || b.nominal - a.nominal);
+  for (const p of parts) {
+    const bump = leftover > 0 ? 1 : 0;
+    leftover -= bump;
+    out[p.key] = round2((p.floorH + bump) / 100);
+  }
+  return out;
+}
+
 // Presence vs punctuality inside the attendance component. Showing up at all is
 // the bigger half; punctuality only applies once there is a baseline to be late
 // against (>= 3 worked days — see ATTENDANCE_LATE_MIN_DAYS).
@@ -18061,7 +18217,7 @@ function medianOf(values: number[]): number | null {
   // Round BOTH branches: the odd-length case used to return the raw sample, so a
   // TAT median shipped as 4.617594583333333 next to figures rounded everywhere
   // else in the payload.
-  return round2(s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2);
+  return round2(s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2);
 }
 
 /**
@@ -18210,30 +18366,31 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
   const rows: StaffPerformanceRow[] = roster.map((e) => {
     const name = [e.fname, e.lname].filter(Boolean).join(" ").trim() || "Employee";
     const roles = parseJsonObject(e.emp_roles) ?? {};
-    const role = String((roles as { primary?: unknown }).primary ?? "").trim() || "employee";
+    const rawRole = (roles as { primary?: unknown }).primary;
+    const role = (typeof rawRole === "string" ? rawRole : "").trim() || "employee";
 
     // APC
     const mine = apcOf(apcByEmp.get(e.id));
-    const apcComponent: PerformanceComponent = mine.apc == null
+    const apcComponent: PerformanceComponent = mine.apc === null
       ? unavailable("currency per cover", "No settled bill of theirs in this window could be tied to a seating, so there are no covers to divide by.")
       : {
         value: mine.apc,
         score: ratioScore(mine.apc, house.apc ?? 0, true),
-        available: house.apc != null && house.apc > 0,
+        available: house.apc !== null && house.apc > 0,
         unit: "currency per cover",
         sample: mine.bills,
         benchmark: house.apc,
-        note: `Pre-tax spend per cover across ${mine.bills} settled bill${mine.bills === 1 ? "" : "s"} (${mine.covers} covers), against a house average of ${house.apc ?? 0}.`,
+        note: `Pre-tax spend per cover across ${String(mine.bills)} settled bill${mine.bills === 1 ? "" : "s"} (${String(mine.covers)} covers), against a house average of ${String(house.apc ?? 0)}.`,
       };
     // ratioScore can still return null (no house benchmark) even when the raw
     // value exists — keep `available` and `score` telling the same story.
-    if (apcComponent.score == null) { apcComponent.available = false; }
+    if (apcComponent.score === null) { apcComponent.available = false; }
 
     // Rating
     const fb = fbByEmp.get(e.id);
     const fbCount = Math.round(parseNumeric(fb?.n));
-    const avgRating = fb?.avg_rating == null ? null : round2(parseNumeric(fb.avg_rating));
-    const ratingComponent: PerformanceComponent = avgRating == null || fbCount === 0
+    const avgRating = (fb?.avg_rating ?? null) === null ? null : round2(parseNumeric(fb?.avg_rating));
+    const ratingComponent: PerformanceComponent = avgRating === null || fbCount === 0
       ? unavailable("stars (1-5)", "No guest feedback was attributed to them in this window — scored as excluded, NOT as zero stars.")
       : {
         value: avgRating,
@@ -18244,7 +18401,7 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
         unit: "stars (1-5)",
         sample: fbCount,
         benchmark: null,
-        note: `Average of ${fbCount} guest rating${fbCount === 1 ? "" : "s"}.`,
+        note: `Average of ${String(fbCount)} guest rating${fbCount === 1 ? "" : "s"}.`,
       };
 
     // Attendance
@@ -18258,10 +18415,14 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
       // late_pct is null below ATTENDANCE_LATE_MIN_DAYS worked days: there is no
       // honest baseline to be late against, so punctuality simply drops out and
       // presence carries the whole component.
-      const punctuality = att.late_pct == null ? null : Math.max(0, Math.min(1, 1 - att.late_pct / 100));
-      const combined = punctuality == null
+      const punctuality = att.late_pct === null ? null : Math.max(0, Math.min(1, 1 - att.late_pct / 100));
+      const combined = punctuality === null
         ? presence
         : presence * ATTENDANCE_PRESENCE_SHARE + punctuality * (1 - ATTENDANCE_PRESENCE_SHARE);
+      // typical_start and late_pct are null under exactly the same condition (no
+      // baseline), so on the punctuality branch below it is always a real time —
+      // the fallback exists only because the types cannot say so.
+      const typicalStart = att.typical_start ?? "usual start";
       attendanceComponent = {
         value: round2(combined * 100),
         score: round2(Math.max(0, Math.min(1, combined)) * 100),
@@ -18269,27 +18430,27 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
         unit: "% presence/punctuality",
         sample: consideredDays,
         benchmark: null,
-        note: punctuality == null
-          ? `Present on ${att.days_present} of ${consideredDays} open days (${att.leave_days} excused by approved leave). Too few worked days for a punctuality baseline, so presence alone was used.`
-          : `Present on ${att.days_present} of ${consideredDays} open days (${att.leave_days} excused by approved leave); ${att.late_shifts} late start${att.late_shifts === 1 ? "" : "s"} against a typical ${att.typical_start}.`,
+        note: punctuality === null
+          ? `Present on ${String(att.days_present)} of ${String(consideredDays)} open days (${String(att.leave_days)} excused by approved leave). Too few worked days for a punctuality baseline, so presence alone was used.`
+          : `Present on ${String(att.days_present)} of ${String(consideredDays)} open days (${String(att.leave_days)} excused by approved leave); ${String(att.late_shifts)} late start${att.late_shifts === 1 ? "" : "s"} against a typical ${typicalStart}.`,
       };
     }
 
     // TAT
     const myTat = medianOf(tatByEmp.get(e.id) ?? []);
     const tatSample = (tatByEmp.get(e.id) ?? []).length;
-    const tatComponent: PerformanceComponent = myTat == null
+    const tatComponent: PerformanceComponent = myTat === null
       ? unavailable("minutes per table", "No completed seating in this window was billed by them, so turnaround cannot be measured.")
       : {
         value: myTat,
         score: ratioScore(myTat, houseTatMedian ?? 0, false),
-        available: houseTatMedian != null && houseTatMedian > 0,
+        available: houseTatMedian !== null && houseTatMedian > 0,
         unit: "minutes per table",
         sample: tatSample,
         benchmark: houseTatMedian,
-        note: `Median seated-to-released time over ${tatSample} table${tatSample === 1 ? "" : "s"}, against a house median of ${houseTatMedian ?? 0} minutes.`,
+        note: `Median seated-to-released time over ${String(tatSample)} table${tatSample === 1 ? "" : "s"}, against a house median of ${String(houseTatMedian ?? 0)} minutes.`,
       };
-    if (tatComponent.score == null) { tatComponent.available = false; }
+    if (tatComponent.score === null) { tatComponent.available = false; }
 
     const components: Record<PerformanceComponentKey, PerformanceComponent> = {
       apc: apcComponent,
@@ -18301,12 +18462,9 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
     // Renormalise over what was actually measured. Nothing measured => null, so
     // an employee with no data is never ranked as if they had scored zero.
     const keys = Object.keys(PERFORMANCE_WEIGHTS) as PerformanceComponentKey[];
-    const live = keys.filter((k) => components[k].available && components[k].score != null);
+    const live = keys.filter((k) => components[k].available && components[k].score !== null);
     const totalWeight = live.reduce((s, k) => s + PERFORMANCE_WEIGHTS[k], 0);
-    const effective_weights = keys.reduce((acc, k) => {
-      acc[k] = live.includes(k) && totalWeight > 0 ? round2(PERFORMANCE_WEIGHTS[k] / totalWeight) : 0;
-      return acc;
-    }, {} as Record<PerformanceComponentKey, number>);
+    const effective_weights = distributeEffectiveWeights(PERFORMANCE_WEIGHTS, live);
     const score = totalWeight > 0
       ? round2(live.reduce((s, k) => s + PERFORMANCE_WEIGHTS[k] * (components[k].score ?? 0), 0) / totalWeight)
       : null;
@@ -23128,11 +23286,11 @@ const LEAVE_MAX_DAYS = 366;
 const LEAVE_STATUSES: readonly LeaveStatus[] = ["requested", "approved", "rejected"];
 
 export function normalizeLeaveType(raw: unknown): LeaveType | null {
-  const v = String(raw ?? "").trim().toLowerCase();
+  const v = (typeof raw === "string" ? raw : "").trim().toLowerCase();
   return (LEAVE_TYPES as readonly string[]).includes(v) ? (v as LeaveType) : null;
 }
 export function normalizeLeaveStatus(raw: unknown): LeaveStatus | null {
-  const v = String(raw ?? "").trim().toLowerCase();
+  const v = (typeof raw === "string" ? raw : "").trim().toLowerCase();
   return (LEAVE_STATUSES as readonly string[]).includes(v) ? (v as LeaveStatus) : null;
 }
 
@@ -23188,9 +23346,9 @@ interface LeaveRow {
 // a leave filed for the 3rd came back as the 2nd. When a Date does reach here,
 // read its LOCAL components, which is the value pg actually decoded.
 const dayKeyFromDb = (v: Date | string): string => {
-  if (!(v instanceof Date)) { return String(v).slice(0, 10); }
+  if (!(v instanceof Date)) { return v.slice(0, 10); }
   const p = (n: number): string => String(n).padStart(2, "0");
-  return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())}`;
+  return `${String(v.getFullYear())}-${p(v.getMonth() + 1)}-${p(v.getDate())}`;
 };
 
 // `date` -> 'YYYY-MM-DD' in SQL, so no zone is ever applied on the way out.
@@ -23218,13 +23376,13 @@ const LEAVE_SELECT_ONE = `select l.id, l.emp_id, e."emp_Fname" as fname, e."emp_
        left join "Employees" e on e.id = l.emp_id and e.res_id = l.res_id and e.outlet_id = l.outlet_id${LEAVE_ACTOR_JOINS}
       where l.id = $1 and l.res_id = $2 and l.outlet_id = $3`;
 
-/** Single leave, outlet-scoped, with both actor names resolved. */
-async function readLeaveById(
-  context: RestaurantContext,
-  leaveId: string,
-): Promise<LeaveRecord | null> {
-  const rows = await runQuery<LeaveRow>(LEAVE_SELECT_ONE, [leaveId, context.res_id, context.outlet_id]);
-  return rows[0] ? mapLeaveRow(rows[0]) : null;
+/** Whole days from `from` to `to` INCLUSIVE. Both are zone-free day keys, so this
+ *  is plain UTC arithmetic and never lands on a DST half-day. */
+function inclusiveDayCount(fromKey: string, toKey: string): number {
+  const a = Date.parse(`${fromKey}T00:00:00Z`);
+  const b = Date.parse(`${toKey}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) { return 0; }
+  return Math.round((b - a) / 86_400_000) + 1;
 }
 
 function mapLeaveRow(r: LeaveRow): LeaveRecord {
@@ -23249,13 +23407,13 @@ function mapLeaveRow(r: LeaveRow): LeaveRecord {
   };
 }
 
-/** Whole days from `from` to `to` INCLUSIVE. Both are zone-free day keys, so this
- *  is plain UTC arithmetic and never lands on a DST half-day. */
-function inclusiveDayCount(fromKey: string, toKey: string): number {
-  const a = Date.parse(`${fromKey}T00:00:00Z`);
-  const b = Date.parse(`${toKey}T00:00:00Z`);
-  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) { return 0; }
-  return Math.round((b - a) / 86_400_000) + 1;
+/** Single leave, outlet-scoped, with both actor names resolved. */
+async function readLeaveById(
+  context: RestaurantContext,
+  leaveId: string,
+): Promise<LeaveRecord | null> {
+  const rows = await runQuery<LeaveRow>(LEAVE_SELECT_ONE, [leaveId, context.res_id, context.outlet_id]);
+  return rows[0] ? mapLeaveRow(rows[0]) : null;
 }
 
 async function ensureEmployeeLeavesTable(): Promise<void> {
@@ -23308,8 +23466,8 @@ async function resolveLeaveEmployee(
        from "Employees" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [employeeId, context.res_id, context.outlet_id],
   );
+  if (rows.length === 0) { return null; }
   const r = rows[0];
-  if (!r) { return null; }
   return { id: r.id, name: [r.fname, r.lname].filter(Boolean).join(" ").trim() || "Employee" };
 }
 
@@ -23337,8 +23495,9 @@ export async function ListEmployeeLeaves(
   // Default window: the 30 restaurant-days ending today, plus the next 90 — a
   // leave list is as much about what is COMING as about what happened.
   const todayKey = dayKeyOf(new Date(), tz);
-  const from = DAY_KEY_RE.test(String(opts.from ?? "")) ? String(opts.from) : addDaysToKey(todayKey, -29);
-  const to = DAY_KEY_RE.test(String(opts.to ?? "")) ? String(opts.to) : addDaysToKey(todayKey, 90);
+  const fromOpt = opts.from ?? "", toOpt = opts.to ?? "";
+  const from = DAY_KEY_RE.test(fromOpt) ? fromOpt : addDaysToKey(todayKey, -29);
+  const to = DAY_KEY_RE.test(toOpt) ? toOpt : addDaysToKey(todayKey, 90);
 
   const og = isAllOutlets() ? "true" : "false";
   const where: string[] = [
@@ -23348,8 +23507,8 @@ export async function ListEmployeeLeaves(
     "l.end_day >= $3::date",
   ];
   const params: unknown[] = [context.res_id, context.outlet_id, from, to];
-  if (opts.emp_id) { params.push(opts.emp_id); where.push(`l.emp_id = $${params.length}::uuid`); }
-  if (opts.status) { params.push(opts.status); where.push(`l.status = $${params.length}`); }
+  if (opts.emp_id) { params.push(opts.emp_id); where.push(`l.emp_id = $${String(params.length)}::uuid`); }
+  if (opts.status) { params.push(opts.status); where.push(`l.status = $${String(params.length)}`); }
   const whereSql = where.join(" and ");
 
   const countRows = await runQuery<{ total: string }>(
@@ -23358,8 +23517,8 @@ export async function ListEmployeeLeaves(
   );
   const total = Math.max(0, Math.round(Number(countRows[0]?.total ?? 0)));
 
-  params.push(safeLimit); const limIdx = `$${params.length}`;
-  params.push(safeOffset); const offIdx = `$${params.length}`;
+  params.push(safeLimit); const limIdx = `$${String(params.length)}`;
+  params.push(safeOffset); const offIdx = `$${String(params.length)}`;
   const rows = await runQuery<LeaveRow>(
     `select l.id, l.emp_id, e."emp_Fname" as fname, e."emp_Lname" as lname,
             l.leave_type, ${DAY_COLS}, l.status, l.reason,
@@ -23392,7 +23551,7 @@ export async function CreateLeaveRequest(
   await ensureEmployeeLeavesTable();
   const tz = context.timezone;
 
-  const employee = await resolveLeaveEmployee(context, String(input.emp_id ?? "").trim());
+  const employee = await resolveLeaveEmployee(context, input.emp_id.trim());
   if (!employee) { throw new Error("Unknown employee for this outlet"); }
 
   const leaveType = normalizeLeaveType(input.leave_type ?? "casual");
@@ -23400,8 +23559,9 @@ export async function CreateLeaveRequest(
 
   // The restaurant's today, never the server's and never Postgres's.
   const todayKey = dayKeyOf(new Date(), tz);
-  const startDay = DAY_KEY_RE.test(String(input.start_day ?? "")) ? String(input.start_day) : todayKey;
-  const endDay = DAY_KEY_RE.test(String(input.end_day ?? "")) ? String(input.end_day) : startDay;
+  const startOpt = input.start_day ?? "", endOpt = input.end_day ?? "";
+  const startDay = DAY_KEY_RE.test(startOpt) ? startOpt : todayKey;
+  const endDay = DAY_KEY_RE.test(endOpt) ? endOpt : startDay;
   const requestedDays = inclusiveDayCount(startDay, endDay);
   if (requestedDays <= 0) { throw new Error("end_day must be on or after start_day"); }
   // A typo in the year ("2926") was accepted as a 328,719-day leave. Approving
@@ -23409,7 +23569,7 @@ export async function CreateLeaveRequest(
   // reads that as excused absence — so the damage outlives the typo. A year is
   // far past any real request and still leaves room for extended unpaid leave.
   if (requestedDays > LEAVE_MAX_DAYS) {
-    throw new Error(`A leave request cannot span more than ${LEAVE_MAX_DAYS} days (asked for ${requestedDays})`);
+    throw new Error(`A leave request cannot span more than ${String(LEAVE_MAX_DAYS)} days (asked for ${String(requestedDays)})`);
   }
 
   // A day already covered by a live (requested or approved) leave must not be
@@ -23437,8 +23597,8 @@ export async function CreateLeaveRequest(
      returning id`,
     [
       context.res_id, context.outlet_id, employee.id, leaveType, startDay, endDay,
-      input.reason?.trim() || null,
-      input.requested_by?.trim() || null,
+      (input.reason ?? "").trim() || null,
+      (input.requested_by ?? "").trim() || null,
     ],
   );
   const newId = rows[0]?.id;
@@ -23485,7 +23645,7 @@ export async function DecideLeaveRequest(
         set status = $4, decided_by = $5, decided_at = now()
       where id = $1 and res_id = $2 and outlet_id = $3 and status <> $4
       returning id`,
-    [leaveId, context.res_id, context.outlet_id, target, decidedBy?.trim() || null],
+    [leaveId, context.res_id, context.outlet_id, target, (decidedBy ?? "").trim() || null],
   );
   const after = await readLeaveById(context, leaveId);
   if (!after) { throw new Error("Unknown leave request"); }

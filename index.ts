@@ -6772,9 +6772,10 @@ app.get("/analytics/concerns", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182
 		// here and injected. Undeployed control plane => no subscription concern,
 		// which is correct: there is genuinely nothing to be behind on.
 		let subscription = null;
-		if (billingConfigured()) {
+		const authResId = req.auth?.res_id;
+		if (billingConfigured() && authResId) {
 			try {
-				const billing = await getTenantBilling(req.auth!.res_id);
+				const billing = await getTenantBilling(authResId);
 				subscription = billing.subscription
 					? {
 						status: billing.subscription.status,
@@ -7486,15 +7487,38 @@ app.get("/attendance", validate, async (req: Request, res: Response) => {
 const LEAVE_REQUESTED_ACTION = "4455a271-5610-49a3-be8e-3f2e9990170a";
 const LEAVE_REVIEWED_ACTION = "6465027f-a3a1-4851-bd8a-cc3360b67993";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// The leave layer throws Errors whose message IS the guest-facing explanation
+// ("Rahul already has an approved leave covering …"). Anything else is a fault we
+// did not anticipate, and its stringification must not leak to the caller.
+function leaveErrorText(e: unknown, fallback: string): string {
+	const msg = e instanceof Error ? e.message.trim() : "";
+	return msg || fallback;
+}
+
 // Dates are the RESTAURANT's calendar days ("YYYY-MM-DD"); the resolver below
 // hands them straight through and database_supabase defaults them from the
 // tenant's own zone. Anything else is rejected rather than coerced, because a
 // half-parsed date silently selects the wrong day.
 function leaveDayParam(raw: unknown): string | undefined {
-	const v = Array.isArray(raw) ? raw[0] : raw;
+	const v: unknown = Array.isArray(raw) ? raw[0] : raw;
 	if (typeof v !== "string") { return undefined; }
 	const s = v.trim();
 	return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : undefined;
+}
+
+// EmployeeLeaves.emp_id is a uuid column and ListEmployeeLeaves compares it as
+// `l.emp_id = $N::uuid`, so a non-uuid filter reaches Postgres and throws 22P02 —
+// a 500 for what is plainly a bad request. Every other filter on this route is
+// already shape-checked; this one was not.
+function leaveEmpIdParam(raw: unknown): { ok: true; value?: string } | { ok: false } {
+	const v: unknown = Array.isArray(raw) ? raw[0] : raw;
+	if (v === undefined || v === null) { return { ok: true }; }
+	if (typeof v !== "string") { return { ok: false }; }
+	const s = v.trim();
+	if (!s) { return { ok: true }; }
+	return UUID_RE.test(s) ? { ok: true, value: s } : { ok: false };
 }
 
 // Paged exactly like /audit-logs: a bare ARRAY stays the default body (that is
@@ -7505,7 +7529,9 @@ app.get("/leaves", validate, async (req: Request, res: Response) => {
 	if (!auth) { return; }
 	const limit = clampLimit(req.query.limit, 100, 500);
 	const offset = Math.max(0, Math.min(Number(req.query.offset) || 0, 100000));
-	const empId = typeof req.query.emp_id === "string" && req.query.emp_id.trim() ? req.query.emp_id.trim() : undefined;
+	const emp = leaveEmpIdParam(req.query.emp_id);
+	if (!emp.ok) { res.status(400).json({ error: "emp_id must be an employee UUID" }); return; }
+	const empId = emp.value;
 	const status = normalizeLeaveStatus(req.query.status) ?? undefined;
 	const wantMeta = req.query.meta === "1" || req.query.meta === "true";
 	try {
@@ -7550,12 +7576,12 @@ app.post("/leaves", validate, async (req: Request, res: Response) => {
 			requested_by: me,
 		});
 		try {
-			await log_audit(req, LEAVE_REQUESTED_ACTION, `Requested ${leave.leave_type} leave for ${leave.employee_name}: ${leave.start_day} to ${leave.end_day} (${leave.days} day${leave.days === 1 ? "" : "s"})`, Audit_log_category.General, { leave_id: leave.id, emp_id: leave.emp_id, leave_type: leave.leave_type, start_day: leave.start_day, end_day: leave.end_day });
+			await log_audit(req, LEAVE_REQUESTED_ACTION, `Requested ${leave.leave_type} leave for ${leave.employee_name}: ${leave.start_day} to ${leave.end_day} (${String(leave.days)} day${leave.days === 1 ? "" : "s"})`, Audit_log_category.General, { leave_id: leave.id, emp_id: leave.emp_id, leave_type: leave.leave_type, start_day: leave.start_day, end_day: leave.end_day });
 		} catch (err) { logger.warn({ err }, "log_audit leave-create failed"); }
 		res.status(201).json(leave);
-	} catch (e: any) {
+	} catch (e) {
 		// A clashing leave is the caller's problem to resolve, not a server fault.
-		res.status(400).json({ error: String(e?.message ?? "Unable to create leave request") });
+		res.status(400).json({ error: leaveErrorText(e, "Unable to create leave request") });
 	}
 });
 
@@ -7574,8 +7600,8 @@ async function handleLeaveDecision(req: Request, res: Response, approve: boolean
 			} catch (err) { logger.warn({ err }, "log_audit leave-review failed"); }
 		}
 		res.json({ success: true, changed, leave });
-	} catch (e: any) {
-		res.status(400).json({ error: String(e?.message ?? "Unable to review leave request") });
+	} catch (e) {
+		res.status(400).json({ error: leaveErrorText(e, "Unable to review leave request") });
 	}
 }
 app.post("/leaves/:id/approve", validate, (req: Request, res: Response) => void handleLeaveDecision(req, res, true));
