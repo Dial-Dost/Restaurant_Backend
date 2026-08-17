@@ -14184,6 +14184,736 @@ export async function BuildTallyXml(restaurantId: string, fromIso?: string, toIs
   );
 }
 
+// --- Scheduled report delivery (migration 026) -------------------------------
+// Two tables and one background sweep. "ReportSchedules" is what the tenant
+// configures; "ReportDeliveries" is one row per (schedule, occurrence) and is
+// simultaneously the at-most-once guard, the failure record and the artifact
+// store. Everything below is split into three groups, and the middle one does
+// NOT follow the house query shape — read its header before touching it.
+
+export const REPORT_SCHEDULE_KEYS = ["sales", "pnl", "gst"] as const;
+export const REPORT_SCHEDULE_FREQUENCIES = ["daily", "weekly", "monthly"] as const;
+export const REPORT_SCHEDULE_CHANNELS = ["inbox"] as const;
+export const REPORT_SCHEDULE_FORMATS = ["csv"] as const;
+
+/** Max attempts per occurrence before the reaper marks it permanently failed. */
+export const REPORT_MAX_ATTEMPTS = 3;
+/** Consecutive failures after which a schedule disables itself. */
+export const REPORT_SCHEDULE_FAILURE_LIMIT = 5;
+
+export interface ReportScheduleRecord {
+  id: string;
+  outlet_id: string;
+  name: string;
+  report_key: string;
+  frequency: string;
+  hour_local: number;
+  minute_local: number;
+  weekday: number | null;
+  day_of_month: number | null;
+  channel: string;
+  format: string;
+  enabled: boolean;
+  last_occurrence_key: string | null;
+  last_status: string | null;
+  last_error: string | null;
+  last_run_at: Date | null;
+  consecutive_failures: number;
+  created_at: Date;
+  updated_at: Date;
+}
+
+/** The sweep's view of a live schedule. Deliberately smaller than the record the
+ *  API returns: the sweep must not depend on display fields. */
+export interface DueReportSchedule {
+  id: string;
+  outlet_id: string;
+  name: string;
+  report_key: string;
+  frequency: string;
+  hour_local: number;
+  minute_local: number;
+  weekday: number | null;
+  day_of_month: number | null;
+  channel: string;
+  format: string;
+  created_at: Date;
+}
+
+export interface RetryableReportDelivery {
+  id: string;
+  schedule_id: string;
+  outlet_id: string;
+  occurrence_key: string | null;
+  period_from: string;
+  period_to: string;
+  timezone: string;
+  attempts: number;
+  channel: string | null;
+  name: string;
+  report_key: string;
+  format: string;
+}
+
+export interface ReportDeliveryRecord {
+  id: string;
+  schedule_id: string;
+  outlet_id: string;
+  occurrence_key: string | null;
+  fire_at: Date;
+  period_from: string;
+  period_to: string;
+  timezone: string;
+  status: string;
+  attempts: number;
+  channel: string | null;
+  artifact_name: string | null;
+  artifact_bytes: number | null;
+  artifact_truncated: boolean;
+  error: string | null;
+  delivered_at: Date | null;
+  created_at: Date;
+}
+
+const SCHEDULE_COLS = `id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+         weekday, day_of_month, channel, format, enabled, last_occurrence_key,
+         last_status, last_error, last_run_at, consecutive_failures, created_at, updated_at`;
+
+function mapReportSchedule(r: Record<string, any>): ReportScheduleRecord {
+  return {
+    id: String(r.id),
+    outlet_id: String(r.outlet_id),
+    name: String(r.name ?? ""),
+    report_key: String(r.report_key),
+    frequency: String(r.frequency),
+    hour_local: Number(r.hour_local) || 0,
+    minute_local: Number(r.minute_local) || 0,
+    weekday: r.weekday === null || r.weekday === undefined ? null : Number(r.weekday),
+    day_of_month: r.day_of_month === null || r.day_of_month === undefined ? null : Number(r.day_of_month),
+    channel: String(r.channel),
+    format: String(r.format),
+    enabled: r.enabled === true,
+    last_occurrence_key: r.last_occurrence_key ?? null,
+    last_status: r.last_status ?? null,
+    last_error: r.last_error ?? null,
+    last_run_at: r.last_run_at ?? null,
+    consecutive_failures: Number(r.consecutive_failures) || 0,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+  };
+}
+
+function oneOf<T extends string>(raw: unknown, allowed: readonly T[], label: string): T {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (!(allowed as readonly string[]).includes(v)) {
+    throw new Error(`${label} must be one of ${allowed.join(", ")}`);
+  }
+  return v as T;
+}
+
+function boundedInt(raw: unknown, lo: number, hi: number, label: string): number {
+  const n = Math.round(Number(raw));
+  if (!Number.isFinite(n) || n < lo || n > hi) {
+    throw new Error(`${label} must be between ${String(lo)} and ${String(hi)}`);
+  }
+  return n;
+}
+
+/** Validate the whole shape in one place so a bad payload is a 400 with a
+ *  sentence in it, never a raw 23514 from one of migration 026's CHECKs. */
+function normalizeSchedulePayload(
+  input: Record<string, unknown>,
+  base?: ReportScheduleRecord,
+): {
+  name: string; report_key: string; frequency: string; hour_local: number;
+  minute_local: number; weekday: number | null; day_of_month: number | null;
+  channel: string; format: string; enabled: boolean;
+} {
+  const name = String(input.name ?? base?.name ?? "").trim();
+  if (!name) { throw new Error("name is required"); }
+  const frequency = oneOf(input.frequency ?? base?.frequency ?? "daily", REPORT_SCHEDULE_FREQUENCIES, "frequency");
+  return {
+    name: name.slice(0, 120),
+    report_key: oneOf(input.report_key ?? base?.report_key ?? "sales", REPORT_SCHEDULE_KEYS, "report_key"),
+    frequency,
+    hour_local: boundedInt(input.hour_local ?? base?.hour_local ?? 8, 0, 23, "hour_local"),
+    minute_local: boundedInt(input.minute_local ?? base?.minute_local ?? 0, 0, 59, "minute_local"),
+    // Only the shape the frequency actually uses is stored; the other is nulled
+    // so a schedule switched daily -> weekly can never keep a stale day_of_month
+    // that migration 026's shape CHECK would then read as valid.
+    weekday: frequency === "weekly"
+      ? boundedInt(input.weekday ?? base?.weekday ?? 1, 0, 6, "weekday")
+      : null,
+    day_of_month: frequency === "monthly"
+      ? boundedInt(input.day_of_month ?? base?.day_of_month ?? 1, 1, 28, "day_of_month")
+      : null,
+    channel: oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel"),
+    format: oneOf(input.format ?? base?.format ?? "csv", REPORT_SCHEDULE_FORMATS, "format"),
+    enabled: input.enabled === undefined ? (base?.enabled ?? true) : input.enabled !== false,
+  };
+}
+
+// --- Group 1: tenant CRUD (house shape — outlet-scoped through the context) ---
+
+export async function ListReportSchedules(restaurantId: string): Promise<ReportScheduleRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const rows = await runQuery<Record<string, any>>(
+    `select ${SCHEDULE_COLS} from "ReportSchedules"
+      where res_id = $1 and (${og} or outlet_id = $2) and archived_at is null
+      order by created_at asc`,
+    [context.res_id, context.outlet_id],
+  );
+  return rows.map(mapReportSchedule);
+}
+
+export async function GetReportSchedule(restaurantId: string, scheduleId: string): Promise<ReportScheduleRecord | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(scheduleId)) { return null; }
+  const og = isAllOutlets() ? "true" : "false";
+  const rows = await runQuery<Record<string, any>>(
+    `select ${SCHEDULE_COLS} from "ReportSchedules"
+      where id = $3 and res_id = $1 and (${og} or outlet_id = $2) and archived_at is null
+      limit 1`,
+    [context.res_id, context.outlet_id, scheduleId],
+  );
+  return rows[0] ? mapReportSchedule(rows[0]) : null;
+}
+
+export async function CreateReportSchedule(
+  restaurantId: string,
+  input: Record<string, unknown>,
+  createdBy?: string,
+): Promise<ReportScheduleRecord> {
+  const context = await requireRestaurantContext(restaurantId);
+  const p = normalizeSchedulePayload(input);
+  const rows = await runQuery<Record<string, any>>(
+    `insert into "ReportSchedules"
+       (res_id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+        weekday, day_of_month, channel, format, enabled, created_by, updated_by)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
+     returning ${SCHEDULE_COLS}`,
+    [
+      context.res_id, context.outlet_id, p.name, p.report_key, p.frequency,
+      p.hour_local, p.minute_local, p.weekday, p.day_of_month, p.channel,
+      p.format, p.enabled, (createdBy ?? "").trim() || null,
+    ],
+  );
+  const created = rows[0];
+  if (!created) { throw new Error("Failed to create report schedule"); }
+  return mapReportSchedule(created);
+}
+
+export async function UpdateReportSchedule(
+  restaurantId: string,
+  scheduleId: string,
+  input: Record<string, unknown>,
+  updatedBy?: string,
+): Promise<ReportScheduleRecord> {
+  const context = await requireRestaurantContext(restaurantId);
+  const existing = await GetReportSchedule(restaurantId, scheduleId);
+  if (!existing) { throw new Error("Unknown report schedule"); }
+  const p = normalizeSchedulePayload(input, existing);
+  // Re-enabling clears the failure streak: the owner has looked at it, and
+  // otherwise the auto-disable in TouchReportScheduleOutcome would trip again on
+  // the very next failure instead of after five.
+  const clearStreak = p.enabled && !existing.enabled;
+  const rows = await runQuery<Record<string, any>>(
+    `update "ReportSchedules"
+        set name = $4, report_key = $5, frequency = $6, hour_local = $7,
+            minute_local = $8, weekday = $9, day_of_month = $10, channel = $11,
+            format = $12, enabled = $13, updated_by = $14, updated_at = now(),
+            consecutive_failures = case when $15 then 0 else consecutive_failures end
+      where id = $3 and res_id = $1 and outlet_id = $2 and archived_at is null
+      returning ${SCHEDULE_COLS}`,
+    [
+      context.res_id, context.outlet_id, scheduleId, p.name, p.report_key,
+      p.frequency, p.hour_local, p.minute_local, p.weekday, p.day_of_month,
+      p.channel, p.format, p.enabled, (updatedBy ?? "").trim() || null, clearStreak,
+    ],
+  );
+  const updated = rows[0];
+  if (!updated) { throw new Error("Unknown report schedule"); }
+  return mapReportSchedule(updated);
+}
+
+/**
+ * The tenant-facing "delete" is an ARCHIVE, and this is the only kind there is.
+ *
+ * "ReportDeliveries" rows are the at-most-once guard as well as the history, so
+ * destroying them would let a re-created schedule re-send an occurrence that has
+ * already gone out. Migration 026 backs this with a non-cascading FK, so a hard
+ * DELETE is refused by the database too — the rule cannot be lost to a future
+ * writer who only reads the routes.
+ */
+export async function ArchiveReportSchedule(
+  restaurantId: string,
+  scheduleId: string,
+  archivedBy?: string,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(scheduleId)) { return false; }
+  const rows = await runQuery<{ id: string }>(
+    `update "ReportSchedules"
+        set archived_at = now(), enabled = false, updated_by = $4, updated_at = now()
+      where id = $3 and res_id = $1 and outlet_id = $2 and archived_at is null
+      returning id`,
+    [context.res_id, context.outlet_id, scheduleId, (archivedBy ?? "").trim() || null],
+  );
+  return rows.length > 0;
+}
+
+export async function GetReportDeliveries(
+  restaurantId: string,
+  opts: { schedule_id?: string; limit?: number } = {},
+): Promise<ReportDeliveryRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
+  const params: unknown[] = [context.res_id, context.outlet_id, limit];
+  let scheduleFilter = "";
+  if (opts.schedule_id) {
+    if (!isUuid(opts.schedule_id)) { return []; }
+    params.push(opts.schedule_id);
+    scheduleFilter = ` and schedule_id = $${String(params.length)}`;
+  }
+  const rows = await runQuery<Record<string, any>>(
+    `select id, schedule_id, outlet_id, occurrence_key, fire_at,
+            to_char(period_from, 'YYYY-MM-DD') as period_from,
+            to_char(period_to,   'YYYY-MM-DD') as period_to,
+            timezone, status, attempts, channel, artifact_name, artifact_bytes,
+            artifact_truncated, error, delivered_at, created_at
+       from "ReportDeliveries"
+      where res_id = $1 and (${og} or outlet_id = $2)${scheduleFilter}
+      order by created_at desc
+      limit $3`,
+    params,
+  );
+  return rows.map((r) => ({
+    id: String(r.id),
+    schedule_id: String(r.schedule_id),
+    outlet_id: String(r.outlet_id),
+    occurrence_key: r.occurrence_key ?? null,
+    fire_at: r.fire_at,
+    period_from: String(r.period_from),
+    period_to: String(r.period_to),
+    timezone: String(r.timezone),
+    status: String(r.status),
+    attempts: Number(r.attempts) || 0,
+    channel: r.channel ?? null,
+    artifact_name: r.artifact_name ?? null,
+    artifact_bytes: r.artifact_bytes === null || r.artifact_bytes === undefined ? null : Number(r.artifact_bytes),
+    artifact_truncated: r.artifact_truncated === true,
+    error: r.error ?? null,
+    delivered_at: r.delivered_at ?? null,
+    created_at: r.created_at,
+  }));
+}
+
+/** Scoped by res_id AND outlet, never by id alone — the artifact is the tenant's
+ *  full P&L, so GetOutboundMessages' predicate is the right precedent. */
+export async function GetReportDeliveryArtifact(
+  restaurantId: string,
+  deliveryId: string,
+): Promise<{ filename: string; mime: string; body: string } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(deliveryId)) { return null; }
+  const og = isAllOutlets() ? "true" : "false";
+  const rows = await runQuery<{ artifact_name: string | null; artifact_mime: string | null; artifact_body: string | null }>(
+    `select artifact_name, artifact_mime, artifact_body from "ReportDeliveries"
+      where id = $3 and res_id = $1 and (${og} or outlet_id = $2)
+      limit 1`,
+    [context.res_id, context.outlet_id, deliveryId],
+  );
+  const row = rows[0];
+  if (!row?.artifact_body) { return null; }
+  return {
+    filename: row.artifact_name ?? "report.csv",
+    mime: row.artifact_mime ?? "text/csv; charset=utf-8",
+    body: row.artifact_body,
+  };
+}
+
+// --- Group 2: the sweep's readers — res_id-scoped ONLY -----------------------
+//
+// READ THIS BEFORE ADDING `outlet_id = $2` TO ANYTHING BELOW.
+//
+// These three deliberately do NOT take the house shape. They are called from the
+// background sweep under withTenant({ res_id, outlet_id: "" }), where there is no
+// meaningful ambient outlet. requireRestaurantContext would fall into
+// resolveRestaurantContext's default branch, which ends
+// `order by o.created_at asc nulls last limit 1` (:1639) — so the sweep would
+// silently serve only the OLDEST outlet of every multi-outlet tenant and the
+// other branches' reports would simply never fire. RLS keys solely on app.res_id
+// (migration 003 / applyTenantRls), so res_id = $1 is complete isolation; the
+// per-occurrence outlet comes from the schedule ROW and is bound by the caller.
+
+export async function ListDueReportSchedules(resId: string, limit = 200): Promise<DueReportSchedule[]> {
+  const rows = await runQuery<Record<string, any>>(
+    `select id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+            weekday, day_of_month, channel, format, created_at
+       from "ReportSchedules"
+      where res_id = $1 and enabled = true and archived_at is null
+      order by created_at asc
+      limit $2`,
+    [resId, Math.max(1, Math.min(limit, 500))],
+  );
+  return rows.map((r) => ({
+    id: String(r.id),
+    outlet_id: String(r.outlet_id),
+    name: String(r.name ?? ""),
+    report_key: String(r.report_key),
+    frequency: String(r.frequency),
+    hour_local: Number(r.hour_local) || 0,
+    minute_local: Number(r.minute_local) || 0,
+    weekday: r.weekday === null || r.weekday === undefined ? null : Number(r.weekday),
+    day_of_month: r.day_of_month === null || r.day_of_month === undefined ? null : Number(r.day_of_month),
+    channel: String(r.channel),
+    format: String(r.format),
+    created_at: r.created_at,
+  }));
+}
+
+/** Occurrences whose lease has expired and that still have attempts left. The
+ *  schedule join is NOT filtered on `enabled`: a claimed occurrence is work that
+ *  was already accepted, and dropping it on a toggle would leave a row stuck at
+ *  'claimed' forever with nothing to explain it. */
+export async function ListRetryableReportDeliveries(resId: string, limit = 50): Promise<RetryableReportDelivery[]> {
+  const rows = await runQuery<Record<string, any>>(
+    `select d.id, d.schedule_id, d.outlet_id, d.occurrence_key,
+            to_char(d.period_from, 'YYYY-MM-DD') as period_from,
+            to_char(d.period_to,   'YYYY-MM-DD') as period_to,
+            d.timezone, d.attempts, d.channel, s.name, s.report_key, s.format
+       from "ReportDeliveries" d
+       join "ReportSchedules" s on s.id = d.schedule_id and s.res_id = d.res_id
+      where d.res_id = $1
+        and d.status in ('claimed','rendered','failed')
+        and d.attempts < $2
+        and d.next_attempt_at <= now()
+      order by d.created_at asc
+      limit $3`,
+    [resId, REPORT_MAX_ATTEMPTS, Math.max(1, Math.min(limit, 200))],
+  );
+  return rows.map((r) => ({
+    id: String(r.id),
+    schedule_id: String(r.schedule_id),
+    outlet_id: String(r.outlet_id),
+    occurrence_key: r.occurrence_key ?? null,
+    period_from: String(r.period_from),
+    period_to: String(r.period_to),
+    timezone: String(r.timezone),
+    attempts: Number(r.attempts) || 0,
+    channel: r.channel ?? null,
+    name: String(r.name ?? ""),
+    report_key: String(r.report_key),
+    format: String(r.format),
+  }));
+}
+
+/** Without this, a row that used up its attempts sits at 'claimed' forever and is
+ *  excluded from the retry scan by `attempts < 3` — invisible rather than failed.
+ *  A plain idempotent UPDATE, so two replicas running it concurrently is fine. */
+export async function ReapExhaustedReportDeliveries(resId: string): Promise<number> {
+  const rows = await runQuery<{ id: string }>(
+    `update "ReportDeliveries"
+        set status = 'failed', error = coalesce(error, 'Retries exhausted')
+      where res_id = $1 and attempts >= $2 and next_attempt_at <= now()
+        and status in ('claimed','rendered')
+      returning id`,
+    [resId, REPORT_MAX_ATTEMPTS],
+  );
+  return rows.length;
+}
+
+/**
+ * The tenant's IANA zone, read from "Restaurant" DIRECTLY.
+ *
+ * Two reasons this exists rather than the sweep calling GetRestaurantTimezone
+ * (:1665):
+ *
+ *  1) That one resolves a whole RestaurantContext, and its default branch selects
+ *     no r.timezone at all (:1617-1644) — sanitizeTimezone then turns the missing
+ *     property into a hardcoded "Asia/Kolkata" (:651-659). A background job whose
+ *     bound outlet failed to resolve would fire every tenant on IST and nothing
+ *     would say so. There is no outlet in this query, so there is no branch to
+ *     fall out of.
+ *  2) The sweep must read the zone OUTSIDE withTenant's transaction (:1474).
+ *     `timezone` is a lazy column that only migration 026 declares, so on a
+ *     database that has not run it this raises 42703 — inside a transaction that
+ *     aborts it and every following statement returns 25P02, and the catch below
+ *     would be useless. On the raw pool (autocommit) the catch is real.
+ *
+ * runQuery is module-private, which is why this reader lives here and not in
+ * report_schedules.ts.
+ *
+ * THROWS on zero rows rather than defaulting. A missing COLUMN and a missing ROW
+ * are different failures and only the first one is safe to paper over: this runs
+ * uncontexted on the shared pool, where "Restaurant"'s RLS policy is fail-open
+ * only while app.res_id is empty (migrations/003_enable_rls.sql:53-61). One
+ * pooled client whose GUC reset failed — openTenantConnection logs
+ * tenant_connection_reset_failed and releases it anyway (:1540-1544) — makes this
+ * read return nothing for every OTHER tenant, and a silent Asia/Kolkata there
+ * would run a whole tenant's reports over the wrong 24 hours while stamping
+ * ReportDeliveries.timezone with IST as though it were resolved truth, defeating
+ * the denormalisation whose only purpose (026:135-136) is to make that visible. The
+ * caller's per-tenant catch turns this into a skipped sweep for one tick.
+ */
+export async function GetTenantTimezone(resId: string): Promise<string> {
+  let rows: { timezone: string | null }[];
+  try {
+    rows = await runQuery<{ timezone: string | null }>(
+      `select timezone from "Restaurant" where id = $1 limit 1`,
+      [resId],
+    );
+  } catch (err: any) {
+    // 42703 undefined_column — migration 026 has not been applied. A tenant that
+    // could never have set a zone gets the same default sanitizeTimezone gives.
+    if (err?.code === "42703") { return sanitizeTimezone(null); }
+    throw err;
+  }
+  if (rows.length === 0) {
+    throw new Error(`Timezone unresolved: no readable "Restaurant" row for ${resId}`);
+  }
+  // A NULL column IS a default — that tenant simply never set a zone.
+  return sanitizeTimezone(rows[0].timezone);
+}
+
+/**
+ * Run the lazy schema provisioning the reporting path depends on, ONCE at boot,
+ * on the raw pool in autocommit (runQuery falls back to `pool` when there is no
+ * tenant store, :1246).
+ *
+ * This exists solely so the sweep never triggers DDL inside withTenant's real
+ * transaction (:1474). ensureLazyTable swallows 42501 in JavaScript (:1302-1311)
+ * but Postgres has already aborted the transaction by then, and every subsequent
+ * statement returns 25P02 — so the first occurrence after every deploy would fail
+ * under app_runtime, which has USAGE but not CREATE on public (002:28).
+ * Populating the per-process `ddlEnsured` set here makes the in-transaction calls
+ * pure no-ops.
+ *
+ * Each step is individually tolerated: ensureBrandingColumns has no
+ * ensureLazyTable wrapper and throws outright on a least-privilege connection,
+ * and that must not stop the other three from warming. It is belt-and-braces
+ * anyway — migration 026 declares the one column of its that the report path
+ * reads.
+ */
+export async function WarmReportingSchema(): Promise<void> {
+  const step = async (label: string, fn: () => Promise<void>) => {
+    try { await fn(); }
+    catch (err) { logger.warn({ err, label }, "warm_reporting_schema_step_failed"); }
+  };
+  await step("Bills.workflow_cols", () => ensureBillWorkflowColumns());
+  await step("Expenses", () => ensureExpensesTable());
+  await step("Notifications", () => ensureNotificationsTable());
+  await step("branding_columns", () => ensureBrandingColumns());
+}
+
+// --- Group 3: the occurrence lifecycle — the at-most-once machinery ----------
+//
+// Four writes, each taken in its OWN withTenant transaction bound to the
+// schedule's real outlet_id. The ordering guarantee is entirely in the SQL: the
+// partial unique index makes the claim at-most-once per occurrence, and the
+// `attempts = $3` compare-and-swap makes every attempt at-most-once per worker.
+// No in-process flag and no advisory lock is involved, because neither survives a
+// second replica.
+
+export async function ClaimReportOccurrence(
+  resId: string,
+  claim: {
+    schedule_id: string; outlet_id: string; occurrence_key: string | null;
+    fire_at: Date; period_from: string; period_to: string; timezone: string;
+    claimed_by: string; status: "claimed" | "abandoned"; channel: string;
+    next_attempt_at: Date;
+  },
+): Promise<string | null> {
+  const rows = await runQuery<{ id: string }>(
+    // report_deliveries_occurrence_uniq is PARTIAL (where occurrence_key is not
+    // null). Postgres will NOT infer a partial index unless the ON CONFLICT
+    // clause REPEATS its predicate; omitting it raises 42P10 on every insert.
+    // That exact omission silently stopped all platform billing — see the comment
+    // at platform/routes.ts:153-156.
+    `insert into "ReportDeliveries"
+       (res_id, outlet_id, schedule_id, occurrence_key, fire_at,
+        period_from, period_to, timezone, claimed_by, status, channel, next_attempt_at)
+     values ($1,$2,$3,$4,$5,$6::date,$7::date,$8,$9,$10,$11,$12)
+     on conflict (schedule_id, occurrence_key) where occurrence_key is not null
+       do nothing
+     returning id`,
+    [
+      resId, claim.outlet_id, claim.schedule_id, claim.occurrence_key,
+      claim.fire_at.toISOString(), claim.period_from, claim.period_to, claim.timezone,
+      claim.claimed_by, claim.status, claim.channel, claim.next_attempt_at.toISOString(),
+    ],
+  );
+  // null => another tick or another replica already owns this occurrence.
+  return rows[0]?.id ?? null;
+}
+
+/**
+ * Take the next attempt on a delivery, by optimistic compare-and-swap.
+ *
+ * `attempts = $3` IS the whole cross-replica guard. Two workers that both read
+ * attempts=0 both try to move it 0 -> 1 and exactly one UPDATE matches a row; the
+ * loser gets zero rows back and MUST return without rendering or delivering. An
+ * unconditional `attempts = attempts + 1` would let both succeed and send twice.
+ *
+ * `next_attempt_at` is set to a LEASE, not to the retry backoff. The backoff
+ * belongs on a RECORDED FAILURE (RecordReportDeliveryFailure) — writing it here
+ * would make a row this worker is still rendering eligible for another replica's
+ * retry scan five minutes from now, which is a second, slower path to the same
+ * double-send.
+ */
+export async function TakeReportDeliveryAttempt(
+  resId: string,
+  deliveryId: string,
+  expectedAttempts: number,
+  leaseUntil: Date,
+  workerId: string,
+): Promise<number | null> {
+  const rows = await runQuery<{ attempts: number }>(
+    `update "ReportDeliveries"
+        set attempts = attempts + 1,
+            next_attempt_at = $4,
+            claimed_by = $5,
+            status = case when status = 'failed' then 'claimed' else status end
+      where id = $1 and res_id = $2 and attempts = $3
+        and status in ('claimed','rendered','failed')
+      returning attempts`,
+    [deliveryId, resId, expectedAttempts, leaseUntil.toISOString(), workerId],
+  );
+  const taken = rows[0];
+  // null => another worker holds this attempt.
+  return taken ? Number(taken.attempts) : null;
+}
+
+export async function MarkReportDeliveryRendered(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  artifact: { filename: string; mime: string; body: string; bytes: number; truncated: boolean },
+): Promise<void> {
+  await runQuery(
+    // Same CAS token as every other write on this row: a worker that lost its
+    // attempt must not overwrite the winner's artifact with its own.
+    `update "ReportDeliveries"
+        set status = 'rendered', artifact_name = $4, artifact_mime = $5,
+            artifact_body = $6, artifact_bytes = $7, artifact_truncated = $8,
+            error = null
+      where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'`,
+    [
+      deliveryId, resId, attempts, artifact.filename, artifact.mime,
+      artifact.body, artifact.bytes, artifact.truncated,
+    ],
+  );
+}
+
+/**
+ * The terminal write, and the second half of the at-most-once guarantee.
+ *
+ * The compare-and-swap and AddNotification run in ONE transaction (the caller's
+ * withTenant), and zero rows THROWS, so a worker whose attempt was superseded
+ * rolls its notification back instead of committing a duplicate. Without both
+ * halves the interleaving is real: worker A takes attempt 1 and renders slowly,
+ * A's lease expires, worker B takes attempt 2 and delivers, then A finishes and
+ * delivers the same occurrence a second time.
+ *
+ * `status <> 'delivered'` is redundant given the attempts match and is kept
+ * anyway — it makes the intent readable at the row level rather than only through
+ * the token.
+ *
+ * The notification body carries NO money. GET /notifications (index.ts:5898) is
+ * gated only by the global requireAuth middleware — `validate` on that route is a
+ * no-op passthrough (index.ts:433-435) — so every authenticated employee reads
+ * the bell. The figures live in the artifact, behind the accounting permission on
+ * the download route.
+ */
+export async function DeliverReportToInbox(
+  resId: string,
+  d: {
+    deliveryId: string; attempts: number; scheduleId: string;
+    occurrenceKey: string | null; title: string; body: string;
+  },
+): Promise<void> {
+  const rows = await runQuery<{ id: string }>(
+    `update "ReportDeliveries"
+        set status = 'delivered', delivered_at = now(), error = null
+      where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'
+      returning id`,
+    [d.deliveryId, resId, d.attempts],
+  );
+  if (rows.length === 0) {
+    throw new Error("Report delivery was superseded by another attempt");
+  }
+  await AddNotification(resId, {
+    type: "report",
+    title: d.title,
+    body: d.body,
+    meta: {
+      // notificationEntityOf has no case for "report" and finds no id it knows,
+      // so it returns a null module and AddNotification leaves this one alone.
+      module: "Accounting",
+      schedule_id: d.scheduleId,
+      delivery_id: d.deliveryId,
+      occurrence_key: d.occurrenceKey,
+    },
+  });
+}
+
+export async function RecordReportDeliveryFailure(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  nextAttemptAt: Date,
+  error: string,
+): Promise<void> {
+  await runQuery(
+    // CAS on the same token: a superseded worker's error must never land on a row
+    // another worker has already delivered.
+    `update "ReportDeliveries"
+        set status = 'failed', error = $5, next_attempt_at = $4
+      where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'`,
+    [deliveryId, resId, attempts, nextAttemptAt.toISOString(), error.slice(0, 800)],
+  );
+}
+
+/**
+ * Mirror an occurrence's outcome onto the schedule card, and auto-disable a
+ * schedule that has failed five times running.
+ *
+ * These columns are DISPLAY ONLY — treating last_occurrence_key as the dedup
+ * guard would reintroduce exactly the read-modify-write race the unique index
+ * exists to remove. Auto-disabling matters because otherwise a permanently broken
+ * schedule raises a failure notification every single morning, which trains the
+ * owner to stop reading the bell.
+ */
+export async function TouchReportScheduleOutcome(
+  resId: string,
+  scheduleId: string,
+  outcome: { occurrence_key: string | null; status: string; error?: string | null },
+): Promise<{ auto_disabled: boolean }> {
+  const ok = outcome.status === "delivered";
+  const rows = await runQuery<{ consecutive_failures: number; enabled: boolean }>(
+    `update "ReportSchedules"
+        set last_occurrence_key = $3, last_status = $4, last_error = $5,
+            last_run_at = now(), updated_at = now(),
+            consecutive_failures = case when $6 then 0 else consecutive_failures + 1 end,
+            -- On failure this may only ever turn a schedule OFF. Without the
+            -- "enabled and" guard the expression RE-ENABLES a schedule the owner
+            -- has explicitly paused, the moment an already-in-flight retry
+            -- records its failure against it.
+            enabled = case when $6 then enabled
+                           else enabled and consecutive_failures + 1 < $7 end
+      where id = $2 and res_id = $1
+      returning consecutive_failures, enabled`,
+    [
+      resId, scheduleId, outcome.occurrence_key, outcome.status,
+      (outcome.error ?? "").slice(0, 800) || null, ok, REPORT_SCHEDULE_FAILURE_LIMIT,
+    ],
+  );
+  const row = rows[0];
+  return { auto_disabled: !ok && row?.enabled === false };
+}
+
 export async function AddBill(
   restaurantId: string,
   bill: {
