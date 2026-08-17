@@ -1,0 +1,1094 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+# =============================================================================
+# CuisineFlow / Restaurant Dash — AWS deployment
+#
+# WHY SAM AND NOT CDK: this is one declarative file the owner can read, diff and
+# hand to an auditor, deployed with a single `sam deploy` and no bootstrap stack,
+# no Node toolchain on the deploy machine and no synthesis step between what is
+# written here and what CloudFormation applies — CDK would buy nothing here
+# because there is no repeated resource pattern worth expressing in code.
+#
+# WHAT THIS BUILDS
+#
+#                     +-------------------------- CloudFront ------------------+
+#   Windows app   --> |  /socket.io/*  -> ALB -> ECS Fargate (always-on)       |
+#   Dashboard     --> |  /print/*      -> ALB -> ECS Fargate (always-on)       |
+#   Guest QR      --> |  /publish/*    -> ALB -> ECS Fargate (always-on)       |
+#                     |  everything else -> HTTP API -> Lambda                 |
+#                     +-------------------------------------------------------+
+#                                        |
+#            EventBridge Scheduler ------+--> Lambda (3 sweeps)
+#
+# ONE hostname for everything. That is not a nicety: the Windows app builds its
+# Socket.IO connection from the same baked-in base URL as its REST calls
+# (restaurant_owner_app/lib/services/printer_service.dart:96 ->
+# AppConfig.backendUrl), so the realtime endpoint and the API MUST share an
+# origin or printing stops working.
+#
+# There is deliberately NO VPC NAT Gateway. The Fargate task runs in a public
+# subnet with a public IP and reaches Supabase / Razorpay / Redis over the
+# internet gateway; Lambda is not VPC-attached at all. A NAT Gateway would add a
+# standing hourly charge for no capability this app needs.
+#
+# What that swap DOES cost: three billable public IPv4 addresses — two on the ALB
+# (one per AZ; an ALB requires two) and one on the Fargate task — at $0.005/hr
+# each, about $11/month, fixed, at zero traffic. Still well under NAT, but it is
+# a real line item and it is counted in deploy/README.md §7.
+# =============================================================================
+
+Description: >
+  Restaurant Dash backend on AWS: Lambda for HTTP + scheduled sweeps, one
+  always-on Fargate task for Socket.IO, fronted by a single CloudFront domain.
+
+# -----------------------------------------------------------------------------
+Parameters:
+# -----------------------------------------------------------------------------
+  LambdaImageUri:
+    Type: String
+    Description: >
+      ECR image URI for the `lambda` build target, including the tag or digest.
+      e.g. 111122223333.dkr.ecr.ap-south-1.amazonaws.com/cuisineflow:lambda-2026-08-15
+    AllowedPattern: ".+"
+
+  RealtimeImageUri:
+    Type: String
+    Description: >
+      ECR image URI for the `realtime` build target.
+      e.g. 111122223333.dkr.ecr.ap-south-1.amazonaws.com/cuisineflow:realtime-2026-08-15
+    AllowedPattern: ".+"
+
+  AppSecretArn:
+    Type: String
+    Description: >
+      ARN of the Secrets Manager secret holding every credential (see
+      deploy/README.md "Secrets"). Both the function and the task read it at
+      boot; no secret value ever appears in this template or in CloudFormation
+      parameters.
+    AllowedPattern: "^arn:aws:secretsmanager:.+"
+
+  CustomDomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. The hostname clients will use, e.g. api.cuisineflow.app. Leave
+      empty to launch on the generated *.cloudfront.net domain and attach the
+      real name later. If set, AcmCertificateArn is REQUIRED.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. ACM certificate ARN for CustomDomainName. MUST be issued in
+      us-east-1 — CloudFront reads certificates only from that region, whatever
+      region this stack is deployed to.
+
+  AllowedOrigins:
+    Type: String
+    Description: >
+      Comma-separated browser origins for CORS, read by index.ts (allowedOrigins). Include
+      the dashboard origin. e.g. https://app.cuisineflow.app
+    Default: ""
+
+  DashboardBaseUrl:
+    Type: String
+    Description: >
+      Where the dashboard (and the /feedback form inside it) is hosted. The
+      printed-bill QR and the post-payment redirect are built from this
+      (FEEDBACK_BASE_URL in routes/_shared.ts).
+    Default: ""
+
+  ReportScheduler:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Scheduled report delivery. Ships DARK. "true" sets REPORT_SCHEDULER=true
+      (which also runs WarmReportingSchema in bootstrap()) AND enables
+      the report EventBridge schedule. Turn on only after migration 026 is
+      verified in production.
+
+  ReportSweepMinutes:
+    Type: Number
+    Default: 5
+    # Minimum 2, not 1: the schedule expression is built with !Sub as
+    # "rate(N minutes)", and EventBridge requires the SINGULAR "rate(1 minute)".
+    # A value of 1 would produce an invalid expression and fail the deploy.
+    MinValue: 2
+    MaxValue: 60
+    Description: Minutes between report sweeps when ReportScheduler is "true".
+
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: >
+      HARD CAP on concurrent Lambda containers, and therefore on database
+      connections. See deploy/README.md "Problem 3" — this app needs SESSION-mode
+      pooling, so each warm container pins its own Postgres connection and there
+      is no multiplexing to hide behind. Budget:
+      LambdaReservedConcurrency + SweepReservedConcurrency + the Fargate task's
+      PG_POOL_MAX + headroom for your own psql sessions <= Supavisor pool_size.
+      ACCOUNT QUOTA: reserving concurrency subtracts from the account's
+      unreserved pool, and AWS refuses to leave fewer than 100 unreserved. A
+      mature account is at 1,000 and this (20 + 3) is nothing; some newer accounts
+      are provisioned far lower, and the deploy then fails with "decreases
+      account's UnreservedConcurrentExecutions below its minimum value". Check
+      before the first deploy — deploy/README.md §1.
+
+  SweepReservedConcurrency:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: >
+      Concurrency cap for the scheduled-sweep function. Three schedules can in
+      principle overlap (exceptions every 30 min, reports every N min, billing
+      daily), so 3 is one slot each. Counts against the same database budget.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 768, 1024, 1536, 2048]
+    Description: >
+      1024 MB is the starting point, not a tuned value. Lambda scales CPU with
+      memory, and this image imports a very large module graph at cold start
+      (~30 route modules plus database_supabase.ts at ~1.1 MB), so less memory
+      makes cold starts disproportionately slower rather than cheaper. Measure
+      Duration on cold invocations before changing it.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: >
+      CloudWatch Logs retention. The app writes one JSON line per request
+      (requestLog, index.ts:79), so ingestion is the line item most likely to
+      surprise you.
+      Set REQUEST_LOG=off in the secret to silence it.
+
+  RealtimeTaskCpu:
+    Type: String
+    Default: "512"
+    AllowedValues: ["256", "512", "1024"]
+    Description: Fargate CPU units for the always-on realtime task (1024 = 1 vCPU).
+
+  RealtimeTaskMemory:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "3072", "4096"]
+    Description: Fargate memory (MiB). Must be a legal pairing with RealtimeTaskCpu.
+
+  OriginVerifySecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      A random string CloudFront sends to the ALB as X-Origin-Verify. The ALB
+      returns 403 to anything without it, so the load balancer's public DNS name
+      cannot be used to bypass CloudFront. Generate with:
+      openssl rand -hex 32
+    MinLength: 16
+
+# -----------------------------------------------------------------------------
+Conditions:
+# -----------------------------------------------------------------------------
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref CustomDomainName, ""]]
+    - !Not [!Equals [!Ref AcmCertificateArn, ""]]
+  ReportsEnabled: !Equals [!Ref ReportScheduler, "true"]
+
+# -----------------------------------------------------------------------------
+Globals:
+# -----------------------------------------------------------------------------
+  Function:
+    Timeout: 30
+    MemorySize: !Ref LambdaMemoryMb
+    Architectures: [x86_64]
+    # X-Ray active tracing. It is on because the first weeks of a serverless
+    # migration are when you most need to see where a request's time went, and
+    # there is no box to SSH into. It is NOT free: at the ~1M requests/month the
+    # cost table assumes, expect roughly $4-5/month once the 100k free traces are
+    # used up (directional, like every figure in deploy/README.md §7). Set this to
+    # PassThrough once you are done tuning and the line item disappears.
+    Tracing: Active
+
+Resources:
+
+  # ===========================================================================
+  # Network — minimal public VPC. No NAT Gateway, no private subnets.
+  # ===========================================================================
+  # Exists only because Fargate and the ALB require subnets. Two AZs because an
+  # ALB requires at least two. Nothing in here costs money at rest.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-igw" }]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-rt" }]
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  # ===========================================================================
+  # Lambda — HTTP routes
+  # ===========================================================================
+  # TWO functions from ONE image, because the two workloads want opposite
+  # timeouts. API Gateway HTTP API caps an integration at 30 seconds, so a longer
+  # function timeout on the HTTP path would only mean paying for execution the
+  # caller already gave up on. The exception sweep, by contrast, walks every
+  # tenant in the fleet and needs minutes. Splitting also stops a slow sweep from
+  # eating the HTTP path's concurrency (and therefore its database connections).
+  BackendFunction:
+    Type: AWS::Serverless::Function
+    # Create the log group first. Otherwise Lambda auto-creates it on the first
+    # invocation with infinite retention, and the next deploy fails with
+    # "resource already exists" when CloudFormation tries to create it.
+    DependsOn: BackendFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-backend"
+      PackageType: Image
+      ImageUri: !Ref LambdaImageUri
+      ImageConfig:
+        # Matches CMD in deploy/Dockerfile (lambda target). Stated explicitly so
+        # a mis-tagged image fails at deploy rather than at the first request.
+        Command: ["build/lambda.handler"]
+      # See the LambdaReservedConcurrency parameter: this is a DATABASE limit
+      # expressed as a Lambda setting, not a cost control.
+      ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
+      Environment:
+        Variables:
+          NODE_ENV: production
+          # Everything secret is pulled from this one secret at boot by the
+          # application's own env loading. Only the ARN lives in the template.
+          APP_SECRET_ARN: !Ref AppSecretArn
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+          DASHBOARD_BASE_URL: !Ref DashboardBaseUrl
+          # index.ts:226 defaults ALLOW_RAILWAY_WILDCARD to true, which would
+          # keep accepting any *.up.railway.app origin after the migration.
+          ALLOW_RAILWAY_WILDCARD: "false"
+          # Fail closed: refuse to serve if any tenant table lost RLS
+          # (verifyTenantRlsAtBoot, called from bootstrap()).
+          ENFORCE_RLS_AT_BOOT: "true"
+          # Refuse to fall back to the process-memory session store. On Lambda
+          # that fallback is not a degradation, it is broken auth: each container
+          # would mint sessions no other container can see (auth/store.ts:113).
+          REQUIRE_REDIS: "true"
+          # No demo tenant on a real deployment (EnsureRestaurantSeed is gated
+          # on SEED_DEMO / NODE_ENV in bootstrap()).
+          SEED_DEMO: "false"
+          REPORT_SCHEDULER: !Ref ReportScheduler
+          REPORT_SWEEP_INTERVAL_MIN: !Ref ReportSweepMinutes
+          # One pg connection per warm container. See deploy/README.md "Problem 3".
+          #
+          # KNOWN COST OF THE VALUE 1, kept deliberately — read
+          # deploy/README.md "What PG_POOL_MAX=1 costs you" before changing it.
+          # bootstrap() runs detached at cold start and does two queries
+          # (ensureFeaturePermissionActions, verifyTenantRlsAtBoot) through this
+          # same one-slot pool, so the container's FIRST request queues behind
+          # them. Usually that is added latency. If the wait exceeds
+          # PG_CONNECTION_TIMEOUT_MS below, openTenantConnection
+          # (database_supabase.ts:1508-1512) falls through to the ipv4pool, which
+          # with SUPABASE_IPV4_URL unset has connectionString: undefined and tries
+          # localhost — so the request 503s ("Database unavailable") rather than
+          # merely lagging.
+          # Raising this to 2 would remove the contention and DOUBLE the
+          # worst-case connection count against the exact Supavisor pool this
+          # setting exists to protect. The README documents the trade and the
+          # SUPABASE_IPV4_URL lever if you would rather queue than 503.
+          PG_POOL_MAX: "1"
+          PLATFORM_PG_POOL_MAX: "1"
+          PG_IDLE_TIMEOUT_MS: "10000"
+          PG_CONNECTION_TIMEOUT_MS: "8000"
+          LOG_LEVEL: info
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        # Sufficient for a secret under the AWS-managed key. A customer-managed
+        # KMS key needs kms:Decrypt added here too — see RealtimeTaskRole below.
+        - Statement:
+            - Sid: ReadAppSecret
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:DescribeSecret
+              Resource: !Ref AppSecretArn
+      Events:
+        HttpApiCatchAll:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            # Path and Method are deliberately OMITTED: that is how SAM creates
+            # the API's $default route, which catches every method and every
+            # path. The route table lives in Express (279 routes in index.ts + 19
+            # from platform/routes.ts); restating it in API Gateway would
+            # guarantee the two drift apart.
+
+  # Log group declared explicitly so retention is set from day one rather than
+  # defaulting to "never expire" on an auto-created group.
+  BackendFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-backend"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ===========================================================================
+  # Lambda — the scheduled sweeps
+  # ===========================================================================
+  # Same image, same handler (lambda.ts dispatches on the event shape), different
+  # timeout and its own concurrency budget.
+  SweepFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: SweepFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sweeps"
+      PackageType: Image
+      ImageUri: !Ref LambdaImageUri
+      ImageConfig:
+        Command: ["build/lambda.handler"]
+      # The exception sweep walks every tenant in the fleet. 15 minutes is
+      # Lambda's ceiling; lambda.ts stops 20s short of whatever this is set to
+      # and logs exception_sweep_deadline_reached rather than being killed
+      # mid-tenant. If that log line starts appearing every tick, the fleet has
+      # outgrown a single serial sweep — see deploy/README.md "Scaling limits".
+      Timeout: 900
+      ReservedConcurrentExecutions: !Ref SweepReservedConcurrency
+      Environment:
+        Variables:
+          NODE_ENV: production
+          APP_SECRET_ARN: !Ref AppSecretArn
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+          DASHBOARD_BASE_URL: !Ref DashboardBaseUrl
+          ALLOW_RAILWAY_WILDCARD: "false"
+          ENFORCE_RLS_AT_BOOT: "true"
+          REQUIRE_REDIS: "true"
+          SEED_DEMO: "false"
+          # REPORT_SCHEDULER must be "true" HERE for report delivery to work at
+          # all: the flag gates WarmReportingSchema() in bootstrap(), and the
+          # sweep's lazy DDL must never run inside withTenant's transaction. It
+          # also arms the in-process 5-minute timer, which is inert on a frozen
+          # container and idempotent if it ever does fire.
+          REPORT_SCHEDULER: !Ref ReportScheduler
+          REPORT_SWEEP_INTERVAL_MIN: !Ref ReportSweepMinutes
+          # Same one-connection budget as the HTTP function. The cold-start
+          # contention noted there matters less here: a sweep has no caller
+          # waiting on a 30-second gateway timeout, so it lags rather than 503s.
+          PG_POOL_MAX: "1"
+          PLATFORM_PG_POOL_MAX: "1"
+          PG_IDLE_TIMEOUT_MS: "10000"
+          PG_CONNECTION_TIMEOUT_MS: "8000"
+          LOG_LEVEL: info
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Sid: ReadAppSecret
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:DescribeSecret
+              Resource: !Ref AppSecretArn
+
+  SweepFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-sweeps"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ===========================================================================
+  # HTTP API — the Lambda front door
+  # ===========================================================================
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      # CORS is handled by the application (index.ts:228), which varies the
+      # allowed origin per request and short-circuits OPTIONS with a 204. An API
+      # Gateway CORS config here would answer preflights BEFORE the app sees
+      # them and silently override that logic, so it is left off on purpose.
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: true
+        # Backstop only. The real limit is ReservedConcurrentExecutions above.
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+      AccessLogSettings:
+        DestinationArn: !GetAtt HttpApiLogGroup.Arn
+        Format: >-
+          {"t":"$context.requestTime","id":"$context.requestId","ip":"$context.identity.sourceIp","m":"$context.httpMethod","p":"$context.path","s":"$context.status","lat":"$context.responseLatency","ierr":"$context.integrationErrorMessage"}
+
+  HttpApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-http"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ===========================================================================
+  # EventBridge Scheduler — the three setInterval timers, externalised
+  # ===========================================================================
+  # index.ts's timers only exist while a process is alive. On Lambda there is no
+  # such process between requests, so the sweeps are driven from outside.
+  #
+  # Every sweep is idempotent, which is what makes this safe to run alongside the
+  # always-on Fargate task (which DOES still run the in-process timers, because
+  # it is the whole app started normally):
+  #   exceptions -> per-alert 24h dedupe in RunExceptionChecks; the booking
+  #                 reminder stamps reminder_sent BEFORE sending.
+  #   reports    -> (schedule_id, occurrence_key) unique index + an attempts
+  #                 compare-and-swap.
+  #   billing    -> pg_try_advisory_lock leader election + (res_id, period_end)
+  #                 dedupe from migration 007.
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeBackendFunction
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SweepFunction.Arn
+
+  # Failed scheduled invocations land here instead of vanishing. Nothing consumes
+  # it automatically — an alarm on its depth is how you find out a sweep is
+  # failing every 30 minutes.
+  SweepDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-sweep-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  SweepDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref SweepDeadLetterQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt SweepDeadLetterQueue.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  SchedulerDlqPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: SweepDlqSend
+      Roles: [!Ref SchedulerInvokeRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt SweepDeadLetterQueue.Arn
+
+  # --- Sweep 1: exception alerts + booking reminders (index.ts:595) ----------
+  ExceptionSweepSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-exception-sweep"
+      Description: >-
+        30-min tenant sweep: RunExceptionChecks (discount spikes, void streaks,
+        negative-feedback streaks) + due booking reminders.
+      FlexibleTimeWindow: { Mode: "OFF" }
+      ScheduleExpression: "rate(30 minutes)"
+      ScheduleExpressionTimezone: UTC
+      State: ENABLED
+      Target:
+        Arn: !GetAtt SweepFunction.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        # Delivered verbatim as the Lambda `event`; lambda.ts sweepFromEvent()
+        # reads `sweep` off the top level.
+        Input: '{"sweep":"exceptions"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 1800
+        DeadLetterConfig:
+          Arn: !GetAtt SweepDeadLetterQueue.Arn
+
+  # --- Sweep 2: scheduled report delivery (index.ts:624) — SHIPS DARK --------
+  ReportSweepSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-report-sweep"
+      Description: >-
+        Scheduled sales/P&L/GST report delivery. Disabled unless the
+        ReportScheduler parameter is "true", mirroring REPORT_SCHEDULER.
+      FlexibleTimeWindow: { Mode: "OFF" }
+      ScheduleExpression: !Sub "rate(${ReportSweepMinutes} minutes)"
+      ScheduleExpressionTimezone: UTC
+      State: !If [ReportsEnabled, ENABLED, DISABLED]
+      Target:
+        Arn: !GetAtt SweepFunction.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        Input: '{"sweep":"reports"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 1
+          MaximumEventAgeInSeconds: 600
+        DeadLetterConfig:
+          Arn: !GetAtt SweepDeadLetterQueue.Arn
+
+  # --- Sweep 3: daily subscription billing (platform/routes.ts:238) ----------
+  BillingSweepSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-billing-cycle"
+      Description: >-
+        Daily SaaS billing: generate renewal invoices, mark past_due, suspend
+        past the grace window. Leader-elected via pg_try_advisory_lock.
+      FlexibleTimeWindow: { Mode: "OFF" }
+      # 19:30 UTC = 01:00 IST — after close for an India-timezone tenant, so an
+      # invoice/suspension never lands mid-service.
+      ScheduleExpression: "cron(30 19 * * ? *)"
+      ScheduleExpressionTimezone: UTC
+      State: ENABLED
+      Target:
+        Arn: !GetAtt SweepFunction.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        Input: '{"sweep":"billing"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt SweepDeadLetterQueue.Arn
+
+  # ===========================================================================
+  # Always-on realtime service — the part Lambda cannot do
+  # ===========================================================================
+  RealtimeCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-realtime"
+      ClusterSettings: [{ Name: containerInsights, Value: disabled }]
+
+  RealtimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-realtime"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # The ECS AGENT's role: pull the image, write the log stream. Nothing more.
+  #
+  # It deliberately has NO secretsmanager grant. An execution role needs one only
+  # when the task definition has a `Secrets:` block for the agent to resolve into
+  # container environment variables — this one does not. The application fetches
+  # the secret itself, at boot, with the task role below (deploy/secrets.ts). A
+  # GetSecretValue here would widen the pull/log role for a capability nothing in
+  # this stack uses.
+  RealtimeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # The role the application itself runs as, separate from the pull/log role
+  # above so the container's own permissions can be audited on their own.
+  #
+  # KMS: this grant is sufficient for a secret encrypted with the AWS-managed
+  # key (aws/secretsmanager), which is what `aws secretsmanager create-secret`
+  # uses when you pass no --kms-key-id — the flow in deploy/README.md §3. If you
+  # encrypt the secret with a CUSTOMER-MANAGED key instead, GetSecretValue fails
+  # with AccessDeniedException and every container dies at boot; you must then add
+  # kms:Decrypt on that key ARN here, on RealtimeTaskRole, and on BOTH Lambda
+  # function roles above (or grant it on the key policy).
+  RealtimeTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadAppSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Ref AppSecretArn
+
+  RealtimeTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-realtime"
+      Cpu: !Ref RealtimeTaskCpu
+      Memory: !Ref RealtimeTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt RealtimeExecutionRole.Arn
+      TaskRoleArn: !GetAtt RealtimeTaskRole.Arn
+      ContainerDefinitions:
+        - Name: realtime
+          Image: !Ref RealtimeImageUri
+          Essential: true
+          PortMappings: [{ ContainerPort: 3001, Protocol: tcp }]
+          Environment:
+            - { Name: NODE_ENV,               Value: production }
+            - { Name: PORT,                   Value: "3001" }
+            - { Name: APP_SECRET_ARN,         Value: !Ref AppSecretArn }
+            - { Name: ALLOWED_ORIGINS,        Value: !Ref AllowedOrigins }
+            - { Name: DASHBOARD_BASE_URL,     Value: !Ref DashboardBaseUrl }
+            - { Name: ALLOW_RAILWAY_WILDCARD, Value: "false" }
+            - { Name: ENFORCE_RLS_AT_BOOT,    Value: "true" }
+            - { Name: REQUIRE_REDIS,          Value: "true" }
+            - { Name: SEED_DEMO,              Value: "false" }
+            # DELIBERATELY unset here even when the Lambda has it on: the report
+            # sweep runs on EventBridge. This task should spend its CPU on socket
+            # fan-out, not on generating PDFs. (The exception sweep's timer has no
+            # env gate and WILL still run here — see deploy/README.md "Changes
+            # index.ts needs", item 3. It is idempotent, so it is wasteful rather
+            # than wrong.)
+            - { Name: REPORT_SCHEDULER,       Value: "false" }
+            # This task holds long-lived socket connections and serves the print
+            # routes, so it gets a real pool rather than the Lambda's 1.
+            - { Name: PG_POOL_MAX,            Value: "5" }
+            - { Name: PLATFORM_PG_POOL_MAX,   Value: "2" }
+            - { Name: LOG_LEVEL,              Value: info }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RealtimeLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: realtime
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3001/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  RealtimeServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Realtime task — accepts traffic only from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        # Outbound to anywhere: Supabase, Redis, Razorpay, Supabase Storage, the
+        # web-push services and the ECR pull all live on the public internet.
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB for the realtime service
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        # Open to the internet at the network layer; the X-Origin-Verify listener
+        # rule below is what actually restricts callers to CloudFront. AWS
+        # publishes a com.amazonaws.global.cloudfront.origin-facing prefix list
+        # you can narrow this to — see deploy/README.md "Hardening".
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  RealtimeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 3001
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        # Socket.IO connections are long-lived. Give a draining task time to let
+        # printer agents reconnect elsewhere instead of cutting them mid-print.
+        - { Key: deregistration_delay.timeout_seconds, Value: "60" }
+        - { Key: stickiness.enabled, Value: "false" }
+
+  RealtimeAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LoadBalancerAttributes:
+        # Must exceed Socket.IO's pingInterval (30s) + pingTimeout (60s) from
+        # realtime.ts:29-30, or the ALB will cut idle WebSocket connections that
+        # the app still considers healthy.
+        - { Key: idle_timeout.timeout_seconds, Value: "120" }
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+
+  # Default action: refuse. Only requests carrying the CloudFront shared secret
+  # get through, so the ALB's public DNS name is not a second, unprotected door.
+  RealtimeListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref RealtimeAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "403"
+            ContentType: application/json
+            MessageBody: '{"error":"Direct origin access is not allowed"}'
+
+  RealtimeListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref RealtimeListener
+      Priority: 10
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values: [!Ref OriginVerifySecret]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref RealtimeTargetGroup
+
+  RealtimeService:
+    Type: AWS::ECS::Service
+    DependsOn: [RealtimeListener, RealtimeListenerRule, DefaultPublicRoute]
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-realtime"
+      Cluster: !Ref RealtimeCluster
+      TaskDefinition: !Ref RealtimeTaskDefinition
+      LaunchType: FARGATE
+      # ONE task. Scaling this to 2 is safe for realtime delivery — the Redis
+      # adapter fans out across tasks — but it also doubles the in-process
+      # exception sweep and the pg pool. Read deploy/README.md before you do it.
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # A public IP is what replaces a NAT Gateway. Without it the task has
+          # no route to Supabase, Redis or ECR, and it would need ~$32/month of
+          # NAT to get one.
+          # It is not free either: AWS bills every public IPv4 address at
+          # $0.005/hr, so this one is ~$3.65/month, and the ALB's two (one per AZ,
+          # and an ALB requires two AZs) are another ~$7.30. ~$11/month of IPv4 is
+          # structural in this design — counted in deploy/README.md §7.
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref RealtimeServiceSecurityGroup]
+      LoadBalancers:
+        - ContainerName: realtime
+          ContainerPort: 3001
+          TargetGroupArn: !Ref RealtimeTargetGroup
+
+  # ===========================================================================
+  # CloudFront — one hostname, two origins
+  # ===========================================================================
+  # Managed policy IDs below are AWS-published constants. If a deploy fails
+  # saying a policy does not exist, list the current ones with:
+  #   aws cloudfront list-cache-policies --type managed
+  #   aws cloudfront list-origin-request-policies --type managed
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} — API (Lambda) + realtime (Fargate)"
+        HttpVersion: http2
+        IPV6Enabled: true
+        # Only where the customers are. PriceClass_All would add edge locations
+        # nobody in this customer base connects from.
+        PriceClass: PriceClass_200
+        Aliases: !If [HasCustomDomain, [!Ref CustomDomainName], !Ref "AWS::NoValue"]
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        Origins:
+          - Id: httpApi
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+
+          - Id: realtimeAlb
+            DomainName: !GetAtt RealtimeAlb.DNSName
+            CustomOriginConfig:
+              # HTTP between CloudFront and the ALB. This keeps the stack free of
+              # a second ACM certificate and a DNS name for the ALB. The trade-off
+              # is real and stated plainly in deploy/README.md "Hardening":
+              # this hop is unencrypted, and session bearer tokens ride it.
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginVerifySecret
+
+        DefaultCacheBehavior:
+          TargetOriginId: httpApi
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingDisabled. This is an API; caching a tenant's bill and
+          # serving it to another tenant is the failure mode being avoided.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed-AllViewerExceptHostHeader. API Gateway rejects a Host header
+          # it does not own, so the viewer's Host must NOT be forwarded here.
+          # Authorization, cookies and query strings all still pass through.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+        CacheBehaviors:
+          # --- Socket.IO: the whole reason the Fargate task exists ------------
+          # CloudFront passes WebSocket upgrades through on a behaviour with
+          # caching disabled. The Windows printer agent connects here
+          # (printer_service.dart:96, transports ['websocket','polling']).
+          - PathPattern: /socket.io/*
+            TargetOriginId: realtimeAlb
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # Managed-AllViewer: forwards the viewer Host too, which the ALB
+            # does not mind and which keeps req.ip / logging honest.
+            OriginRequestPolicyId: 216adef6-36ac-47da-a4f8-3b0fe0ba1b9f
+
+          # --- The two routes whose emit must not be lost ---------------------
+          # POST /print/bill (routes/bills.ts:506) and POST /publish/bill
+          # (routes/bills.ts:463) both end in emitOutlet(..., 'bill:print', ...). Served
+          # from Lambda, that emit races the container freeze. Served from the
+          # task that owns the socket, it is a direct in-process delivery.
+          - PathPattern: /print/*
+            TargetOriginId: realtimeAlb
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-36ac-47da-a4f8-3b0fe0ba1b9f
+
+          - PathPattern: /publish/*
+            TargetOriginId: realtimeAlb
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-36ac-47da-a4f8-3b0fe0ba1b9f
+
+  # ===========================================================================
+  # Alarms — the minimum set that tells you the thing is broken
+  # ===========================================================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-errors"
+      AlarmDescription: >-
+        The HTTP function is throwing. Note that a handled 500 from the app's own
+        terminal error handler is NOT a Lambda error — this fires on
+        unhandled failures, cold-start crashes and timeouts.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref BackendFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-throttles"
+      AlarmDescription: >-
+        Hitting ReservedConcurrentExecutions. Requests are being rejected, and
+        raising the cap requires raising the Supavisor pool size FIRST.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Ref BackendFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Separate from the DLQ alarm on purpose: a sweep that fails and then succeeds
+  # on retry never reaches the queue, but it is still the early warning that
+  # booking reminders or invoices are becoming unreliable.
+  SweepErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-sweep-errors"
+      AlarmDescription: A scheduled sweep invocation failed or timed out.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref SweepFunction }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  RealtimeUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-realtime-unhealthy"
+      AlarmDescription: >-
+        No healthy realtime task. Printing is DOWN — the Windows agents have
+        nowhere to hold a socket.
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt RealtimeTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt RealtimeAlb.LoadBalancerFullName
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+  SweepDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-sweep-dlq"
+      AlarmDescription: >-
+        A scheduled sweep exhausted its retries. Booking reminders, exception
+        alerts or invoices are silently not happening.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt SweepDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+# -----------------------------------------------------------------------------
+Outputs:
+# -----------------------------------------------------------------------------
+  BackendUrl:
+    Description: >-
+      THE base URL. This is the value to bake into the Windows app as
+      --dart-define=BACKEND_URL, and to set as the dashboard's API base.
+    Value: !If
+      - HasCustomDomain
+      - !Sub "https://${CustomDomainName}"
+      - !Sub "https://${Distribution.DomainName}"
+
+  CloudFrontDomainName:
+    Description: CloudFront domain — point your CNAME here.
+    Value: !GetAtt Distribution.DomainName
+
+  HttpApiEndpoint:
+    Description: >-
+      Direct HTTP API endpoint. Useful for isolating "is it CloudFront or is it
+      Lambda" during an incident. Do not hand this to clients.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  RealtimeAlbDnsName:
+    Description: >-
+      Direct ALB DNS name. Returns 403 without the X-Origin-Verify header, by
+      design.
+    Value: !GetAtt RealtimeAlb.DNSName
+
+  SweepFunctionName:
+    Description: For `aws lambda invoke` when you want to run a sweep by hand.
+    Value: !Ref SweepFunction
+
+  BackendFunctionName:
+    Description: The HTTP function — the one to look at in the console for request logs.
+    Value: !Ref BackendFunction
+
+  SweepDlqUrl:
+    Description: Dead-letter queue for failed scheduled sweeps.
+    Value: !Ref SweepDeadLetterQueue

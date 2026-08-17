@@ -29,10 +29,15 @@
     "jest": "jest",
     "jest:watch": "jest --watch",
     "test:money": "jest test/money --runInBand",
-    "test:ci": "npm run build && jest --runInBand"
+    "test:ci": "npm run build && jest --runInBand",
+    "aws:build:lambda": "docker build --platform linux/amd64 -f deploy/Dockerfile --target lambda -t cuisineflow:lambda .",
+    "aws:build:realtime": "docker build --platform linux/amd64 -f deploy/Dockerfile --target realtime -t cuisineflow:realtime .",
+    "aws:validate": "sam validate --lint --template deploy/template.yaml",
+    "aws:deploy": "sam deploy --template-file deploy/template.yaml --config-file deploy/samconfig.toml"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/aws-lambda": "^8.10.162",
     "@types/express": "^5.0.3",
     "@types/jest": "^29.5.12",
     "@types/node": "^20.15.0",
@@ -49,6 +54,8 @@
     "typescript-eslint": "^8.65.0"
   },
   "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.1111.0",
+    "@codegenie/serverless-express": "^4.17.1",
     "@node-rs/argon2": "^2.0.2",
     "@openai/agents": "^0.3.0",
     "@sentry/node": "^10.62.0",

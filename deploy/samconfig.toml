@@ -1,0 +1,90 @@
+# SAM deployment configuration.
+#
+# This file holds NO secrets. Every credential lives in AWS Secrets Manager and
+# is referenced only by ARN (see deploy/README.md "Secrets"). The one sensitive
+# value that must be passed as a parameter — OriginVerifySecret — is deliberately
+# NOT stored here.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE ADDING --parameter-overrides ON THE COMMAND LINE
+# ---------------------------------------------------------------------------
+# `parameter_overrides` below is the DEFAULT VALUE of the --parameter-overrides
+# option. Passing that option on the command line REPLACES this list; it does not
+# merge with it. So this, which looks obviously right, is wrong:
+#
+#     npm run aws:deploy -- --parameter-overrides OriginVerifySecret=<hex>   # NO
+#
+# On a first deploy it fails with "Parameters: [LambdaImageUri, ...] must have
+# values". On an update it is worse and silent: the dropped parameters fall back
+# to UsePreviousValue, so the stack KEEPS THE OLD IMAGE. You edit the tag here,
+# run that command, watch a green deploy, and ship nothing.
+#
+# ---------------------------------------------------------------------------
+# HOW TO DEPLOY
+# ---------------------------------------------------------------------------
+# FIRST deploy — OriginVerifySecret has no Default, so CloudFormation must be
+# given it once. Use the fully-explicit `sam deploy` block in deploy/README.md
+# §4.4, which lists every parameter including the secret. Do not use this file
+# for the first deploy.
+#
+# EVERY LATER deploy — edit the image tags below to what you just pushed, then:
+#
+#     npm run aws:deploy
+#
+# with NO --parameter-overrides. OriginVerifySecret is absent from the list, so
+# CloudFormation retains the value already on the stack. That is exactly why it
+# is safe to leave it out, and why adding it back on the command line breaks
+# everything else.
+#
+# If you ever need to ROTATE OriginVerifySecret, you must re-list every parameter
+# in one command, because of the replace-not-merge rule above:
+#
+#     npm run aws:deploy -- --parameter-overrides \
+#       LambdaImageUri=<uri> RealtimeImageUri=<uri> AppSecretArn=<arn> \
+#       CustomDomainName= AcmCertificateArn= \
+#       AllowedOrigins=<origins> DashboardBaseUrl=<url> \
+#       ReportScheduler=false LambdaReservedConcurrency=20 LogRetentionDays=30 \
+#       OriginVerifySecret=$(openssl rand -hex 32)
+#
+# (Empty values for CustomDomainName / AcmCertificateArn keep the stack on the
+# generated *.cloudfront.net name. If you have attached a custom domain, pass the
+# real values instead — omitting them here would REMOVE the domain.)
+#
+# Edit the placeholders below before the first `npm run aws:deploy`. They are
+# REPLACE_ME on purpose: a deploy that pushes them fails on a missing ECR image
+# rather than half-deploying something plausible.
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "cuisineflow-prod"
+
+[default.deploy.parameters]
+# The region the stack lives in. Pick the one closest to the restaurants.
+region = "ap-south-1"
+
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+
+# Image URIs and the secret ARN come from the bootstrap steps in the runbook.
+# OriginVerifySecret is intentionally absent: it is set once by the first deploy
+# (README §4.4) and retained by CloudFormation thereafter. Do NOT "fix" that by
+# adding --parameter-overrides on the command line — read the header first.
+#
+# This list is complete on purpose. Every parameter the deploy needs to control
+# is here, so `npm run aws:deploy` with no flags is a full, correct deploy.
+parameter_overrides = [
+  "LambdaImageUri=111122223333.dkr.ecr.ap-south-1.amazonaws.com/cuisineflow:lambda-REPLACE_ME",
+  "RealtimeImageUri=111122223333.dkr.ecr.ap-south-1.amazonaws.com/cuisineflow:realtime-REPLACE_ME",
+  "AppSecretArn=arn:aws:secretsmanager:ap-south-1:111122223333:secret:cuisineflow/prod-REPLACE_ME",
+  "CustomDomainName=",
+  "AcmCertificateArn=",
+  "AllowedOrigins=https://app.example.com",
+  "DashboardBaseUrl=https://app.example.com",
+  "ReportScheduler=false",
+  "LambdaReservedConcurrency=20",
+  "LogRetentionDays=30",
+]
+
+tags = "app=cuisineflow env=prod"
