@@ -25205,3 +25205,263 @@ export async function EnsureRestaurantSeed(seed: RestaurantSeedInput): Promise<v
     }
   });
 }
+
+// --- Durable print jobs (migration 027) --------------------------------------
+//
+// Every statement that touches "PrintJobs" lives here, behind a named export,
+// because runQuery is module-private. The ORCHESTRATION — the TTL policy, the
+// agent-version gate, the degradation when migration 027 has not been applied —
+// lives in print_jobs.ts. These functions are the SQL and nothing else, and they
+// THROW; deciding what a failure means is the caller's job.
+//
+// THE GUARANTEE, and where each half of it actually lives:
+//
+//   at-least-once delivery  <- the row itself. It is written BEFORE the socket
+//                              emit, so a job survives an emit that reached
+//                              nobody (no `io`, empty room, replica with no
+//                              Redis adapter — all three are silent no-ops).
+//   at-most-once printing   <- ClaimPrintJobsForAgent's lease predicate plus
+//                              AckPrintJob's compare-and-swap. Neither is an
+//                              in-process flag, because neither an in-process
+//                              flag nor an advisory lock survives a second
+//                              replica.
+//
+// Nothing here reads the ambient outlet. Both the producer and the replay path
+// pass an explicit outlet_id: the producer has requireAuth's resolved
+// auth.outlet_id, and the replay path has the outlet the agent named and proved
+// membership of. resolveRestaurantContext's default branch picks the OLDEST
+// outlet when it cannot resolve one (:1639), which here would mean handing one
+// branch's receipts to another branch's till.
+
+export interface PrintJobInput {
+  outlet_id: string;
+  bill_id: string;
+  kind: "bill" | "kot";
+  /** KOT only — the kitchen station this ticket belongs to. */
+  station: string | null;
+  esc_base64: string;
+}
+
+export interface PrintJobRow {
+  id: string;
+  /** Insertion order. Only ever a tiebreaker for created_at — see migration 027. */
+  seq: string;
+  bill_id: string;
+  kind: string;
+  station: string | null;
+  esc_base64: string;
+  created_at: Date;
+  attempts: number;
+}
+
+/**
+ * Persist one print job. Returns its uuid — THE identity every other guard keys
+ * on (see the migration header for why bill_id cannot be that key).
+ *
+ * Called before the emit, never after: the row is the durable fact and the emit
+ * is the fast path. An insert that landed after a successful emit would leave a
+ * window in which the till has already printed and acked a job the backend does
+ * not yet have a row for, and that ack would be discarded as unknown.
+ */
+export async function EnqueuePrintJob(resId: string, job: PrintJobInput): Promise<string> {
+  const rows = await runQuery<{ id: string }>(
+    `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64)
+     values ($1,$2,$3,$4,$5,$6)
+     returning id`,
+    [resId, job.outlet_id, job.bill_id, job.kind, job.station, job.esc_base64],
+  );
+  const id = rows[0]?.id;
+  if (!id) { throw new Error("PrintJobs insert returned no id"); }
+  return id;
+}
+
+/**
+ * Hand this agent the outlet's outstanding jobs, oldest first, and LEASE them.
+ *
+ * THE THREE PREDICATES, none of them optional:
+ *
+ *   status in ('pending','delivered')
+ *     'acked' / 'failed' / 'expired' are terminal. Dropping this is how a bill
+ *     that already printed prints again on the next reconnect — and a till
+ *     reconnects on every WebSocket flap, so "again" means "repeatedly".
+ *
+ *   claimed_until is null or claimed_until < now()
+ *     THE LEASE. Two tills sharing one outlet both sit in the same socket room
+ *     and both resume on reconnect. Without this both claims match and the
+ *     customer gets two receipts. With it the second till's UPDATE matches zero
+ *     rows and it prints nothing — and if the first till dies mid-spool the lease
+ *     lapses and the second one picks the job up, so a crash costs at most one
+ *     late receipt rather than a lost one.
+ *
+ *   created_at > (kot cutoff | bill cutoff)
+ *     TTL enforced AT READ TIME, per kind. This is what makes the reaper pure
+ *     hygiene rather than a correctness dependency: a database whose sweep never
+ *     ran still cannot replay a stale docket. A kitchen ticket for food ordered
+ *     an hour ago is actively harmful — the kitchen cooks a dish that already
+ *     went out — so it expires far sooner than a customer bill.
+ *
+ * `for update skip locked` keeps two replicas claiming concurrently from
+ * serialising on the same rows; it is NOT the guard (the lease is), it only stops
+ * one resume blocking another.
+ *
+ * Returned rows are sorted by created_at because RETURNING has no defined order,
+ * and order matters: the N station tickets of one KOT are one logical unit, and
+ * dockets must reach the kitchen oldest-first.
+ */
+export async function ClaimPrintJobsForAgent(
+  resId: string,
+  outletId: string,
+  agentId: string,
+  cutoffs: { kot: Date; bill: Date },
+  leaseUntil: Date,
+  limit: number,
+): Promise<PrintJobRow[]> {
+  const rows = await runQuery<PrintJobRow>(
+    `with due as (
+       select id
+         from "PrintJobs"
+        where res_id = $1
+          and outlet_id = $2
+          and status in ('pending','delivered')
+          and (claimed_until is null or claimed_until < now())
+          and created_at > (case when kind = 'kot' then $3::timestamptz else $4::timestamptz end)
+        order by created_at asc, seq asc
+        limit $7
+        for update skip locked
+     )
+     update "PrintJobs" p
+        set status = 'delivered',
+            attempts = p.attempts + 1,
+            claimed_by = $5,
+            claimed_until = $6::timestamptz,
+            delivered_at = now()
+       from due
+      where p.id = due.id
+     returning p.id, p.seq, p.bill_id, p.kind, p.station, p.esc_base64, p.created_at, p.attempts`,
+    [
+      resId, outletId,
+      cutoffs.kot.toISOString(), cutoffs.bill.toISOString(),
+      agentId, leaseUntil.toISOString(), limit,
+    ],
+  );
+  // Same key as the ORDER BY above, because RETURNING does not preserve it.
+  return rows.sort((a, b) => {
+    const byTime = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+    return byTime !== 0 ? byTime : Number(a.seq) - Number(b.seq);
+  });
+}
+
+/**
+ * Terminal write, by compare-and-swap. Returns true when THIS call performed the
+ * transition, false when the row was already settled (or does not exist).
+ *
+ * `status in ('pending','delivered')` is the whole idempotency guard. A till that
+ * retries an ack it already delivered — which it will, because the ack rides an
+ * HTTP call that can fail after the paper came out — must be a no-op, not an
+ * error and not a second state change. Widening this to admit the terminal states
+ * would let a late duplicate ack overwrite ack_result and re-stamp settled_at,
+ * turning "printed at 19:04" into whatever the retry said.
+ *
+ * A 'failed' ack is TERMINAL too, deliberately. The agent only reports failure
+ * after exhausting its own retries against the physical printer; replaying to
+ * that printer on every reconnect would loop forever on a jam nobody has cleared.
+ * The row stays as the record that it never printed.
+ */
+export async function AckPrintJob(
+  resId: string,
+  jobId: string,
+  result: "printed" | "failed",
+): Promise<boolean> {
+  const rows = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set status = case when $3 = 'printed' then 'acked' else 'failed' end,
+            settled_at = now(),
+            ack_result = $3,
+            claimed_until = null
+      where id = $1 and res_id = $2
+        and status in ('pending','delivered')
+      returning id`,
+    [jobId, resId, result],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Reaper, half one: flip outstanding jobs that outlived their TTL to 'expired'.
+ *
+ * Pure hygiene — ClaimPrintJobsForAgent already refuses to replay them — but it
+ * turns "this till was offline long enough to lose receipts" into a queryable
+ * fact instead of a row that merely stopped matching a predicate.
+ *
+ * THE LEASE PREDICATE IS REPEATED HERE ON PURPOSE. A job an agent is holding
+ * right now must not be expired out from under it: the agent would spool it,
+ * report success, and find its ack rejected as already-settled — losing the one
+ * record that the receipt actually printed. Waiting out the lease costs a couple
+ * of minutes and the next sweep collects it.
+ */
+export async function ExpirePrintJobs(resId: string, cutoffs: { kot: Date; bill: Date }): Promise<number> {
+  const rows = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set status = 'expired', settled_at = now()
+      where res_id = $1
+        and status in ('pending','delivered')
+        and (claimed_until is null or claimed_until < now())
+        and created_at <= (case when kind = 'kot' then $2::timestamptz else $3::timestamptz end)
+      returning id`,
+    [resId, cutoffs.kot.toISOString(), cutoffs.bill.toISOString()],
+  );
+  return rows.length;
+}
+
+/**
+ * Reaper, half two: delete settled rows past the retention window.
+ *
+ * Keyed on settled_at, NEVER on created_at. A job that sat pending for a
+ * fortnight because its till was gone is settled ('expired') the instant the
+ * reaper first sees it, and a created_at window would delete it in that same
+ * sweep — destroying the only record that those receipts were lost, which is the
+ * entire point of the 'expired' state. `settled_at is not null` also makes it
+ * impossible to purge a live job however old the row is.
+ *
+ * Bounded by `limit` because DELETE has no LIMIT of its own and the first sweep
+ * after this ships could otherwise take one statement across a tenant's entire
+ * receipt history.
+ */
+export async function PurgeSettledPrintJobs(resId: string, olderThan: Date, limit: number): Promise<number> {
+  const rows = await runQuery<{ id: string }>(
+    `with doomed as (
+       select id
+         from "PrintJobs"
+        where res_id = $1
+          and status not in ('pending','delivered')
+          and settled_at is not null
+          and settled_at < $2::timestamptz
+        order by settled_at asc
+        limit $3
+     )
+     delete from "PrintJobs" p
+      using doomed d
+      where p.id = d.id
+     returning p.id`,
+    [resId, olderThan.toISOString(), limit],
+  );
+  return rows.length;
+}
+
+/**
+ * Does this outlet belong to this restaurant?
+ *
+ * The replay path's only authorization question. The socket handler derives
+ * res_id from the verified session (never from client input), but the outletId a
+ * client sends with `joinOutlet` is unverified — and replay READS rows, where
+ * joining a room merely subscribes to events nobody sends. RLS keys on res_id
+ * alone, so cross-TENANT is already impossible; this closes cross-OUTLET within
+ * one tenant, which RLS does not.
+ */
+export async function OutletBelongsToRestaurant(resId: string, outletId: string): Promise<boolean> {
+  const rows = await runQuery<{ id: string }>(
+    `select id from "Outlets" where id = $1 and res_id = $2 limit 1`,
+    [outletId, resId],
+  );
+  return rows.length > 0;
+}

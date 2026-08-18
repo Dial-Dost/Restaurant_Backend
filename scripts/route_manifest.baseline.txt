@@ -1,6 +1,6 @@
 # route-manifest v1
 # entry: index.ts
-# routes: 298
+# routes: 299
 # middleware: 10
 #
 # Ordered EXACTLY as Express registers them. Express matches in registration
@@ -246,77 +246,78 @@ mw08 USE     *                                                      | <inline(re
 0224 POST    /leaves/:id/reject                                     | validate                                       | 22ff5f64
 0225 GET     /restaurant/profile                                    | validate                                       | 83660ec9
 0226 GET     /auth/restaurant-login                                 | validate                                       | eb6d239a
-0227 POST    /publish/bill                                          | validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9") | 42c2b386
-0228 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 254bd583
-0229 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428
-0230 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | 2ff0be3a
-0231 POST    /bills/discount                                        | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillDiscount) | 7ac798b4
-0232 GET     /discount-requests                                     | validate                                       | 9f7efb7f
-0233 POST    /discount-requests/:id/approve                         | validate                                       | dcb2d809
-0234 POST    /discount-requests/:id/reject                          | validate                                       | 975bbe8f
-0235 GET     /coupons                                               | validate                                       | a940f3af
-0236 POST    /coupons                                               | validate                                       | 5abb16e9
-0237 DELETE  /coupons/:id                                           | validate                                       | 1f68ec00
-0238 POST    /vouchers                                              | validate                                       | 1b681630
-0239 GET     /loyalty/:phone                                        | validate                                       | 11243f55
-0240 POST    /loyalty/redeem                                        | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 83f2571e
-0241 POST    /aggregator/generate-key                               | validate                                       | 7f2a327f
-0242 POST    /aggregator/order                                      | rateLimit("aggregator", 120, 60000)            | b628fad2
-0243 POST    /bills/apply-coupon                                    | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillApplyCoupon) | c505538f
-0244 POST    /bills/item-note                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillItemNote) | 1716a034
-0245 POST    /bills/split                                           | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") -> validateBody(sBillSplit) | c5b87658
-0246 POST    /bills/merge                                           | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMerge) | 32bf4db8
-0247 POST    /bills/refund                                          | validateBody(sBillRefund)                      | d2089aa7
-0248 POST    /bills/:id/reopen                                      | validate                                       | 3fcddf24
-0249 PUT     /restaurant/profile                                    | validateAction("60d14e9c-45cc-4dc2-b017-56058cc3ae33") | a752571b
-0250 GET     /outlets                                               | validate                                       | 4e4ae9d9
-0251 GET     /outlets/rollup                                        | validateAction(OUTLET_ADMIN_PERM)              | dc7026a0
-0252 POST    /outlets                                               | validateAction(OUTLET_ADMIN_PERM)              | 3b57894a
-0253 PUT     /outlets/:id                                           | validateAction(OUTLET_ADMIN_PERM)              | c9644064
-0254 POST    /outlets/:id/active                                    | validateAction(OUTLET_ADMIN_PERM)              | 296227ee
-0255 DELETE  /outlets/:id                                           | validateAction(OUTLET_ADMIN_PERM)              | f2b979a3
-0256 GET     /outlets/default-tax                                   | validateAction("d9b3f882-d3cf-46bc-b9ce-4218e8a5c29d") | fc96ddba
-0257 PATCH   /outlets/default-tax                                   | validateAction("28fa21cc-0dba-4a0f-bf6f-387089f47bbf") | a5320645
-0258 GET     /roles                                                 | validateAction("17ba6407-b703-4403-ab59-13235966053f") | 8b1d3ea6
-0259 GET     /actions                                               | validateAction("2b6f7948-0b27-41a9-9727-c04ccc9f4db1") | b4c6af17
-0260 POST    /roles                                                 | validateAction("c0135d18-68b4-45e9-9b51-849158df6efd") | 21e6a9b4
-0261 DELETE  /roles/:id                                             | validateAction("53d0927d-00f4-48cc-a40c-51edb09826d8") | 37acdf04
-0262 POST    /roles/assign                                          | validateAction("4bf54bd9-9124-46c0-a7cc-011ea4c4e172") | c5e6cd44
-0263 POST    /roles/remove                                          | validateAction("9acc9097-4803-4be0-bb6d-fc2c5de57cf5") | c4f4d26e
-0264 GET     /table-assignments                                     | validateAction("f88657ce-0d67-4cd6-aae1-765dec10cd98") | 5ce1dd83
-0265 POST    /table-assignments/assign                              | validateAction("faf2745b-580c-4529-bbe1-033200cbcf67") | 25acf2ae
-0266 POST    /table-assignments/unassign                            | validateAction("e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7") | 1b3bc3bd
-0267 GET     /valet-bays                                            | validateAction("9e37297d-408b-446d-a51b-7892ad216b7d") | f66a980b
-0268 POST    /add-valet-bay                                         | validateAction("ae8ce7c0-1e06-4722-8a06-817267eec785") | 8b832c36
-0269 POST    /delete-valet-bay                                      | validateAction("6e9be65f-4081-4b86-8ba0-0592ee26f7f2") | 775a1e7b
-0270 POST    /update-valet-bay                                      | validateAction("2caeab74-5941-424d-9c3a-5c68ef0186e1") | 029dd5e4
-0271 POST    /set-valet-bay-current                                 | validateAction("2ff51c3d-f18c-406c-9f49-7c54f468c835") | 62026fa9
-0272 POST    /create_valet_record                                   | validateAction("892b50f3-51fc-4099-8f31-01e8dd8c3d44") | dd53c881
-0273 POST    /valet/scan-plate                                      | validateAction("892b50f3-51fc-4099-8f31-01e8dd8c3d44") | c5352105
-0274 POST    /get_valet_info                                        | validateAction("9e37297d-408b-446d-a51b-7892ad216b7d") | 106595ad
-0275 POST    /update_valet_state                                    | validateAction("b8e02c25-b91c-427c-b462-8df009ede055") | 4fbf4fb7
-0276 POST    /update_valet_bay                                      | validateAction("b8e02c25-b91c-427c-b462-8df009ede055") | bf88d397
-0277 POST    /unassign-valet-bay                                    | validateAction("5ef876a7-eb92-4602-b4d3-5590ce379540") | 3c080dc1
-0278 GET     /valet/charge-targets                                  | validateAction("9e37297d-408b-446d-a51b-7892ad216b7d") | 5f8b2cea
-0279 POST    /valet/:bookingId/ops                                  | validateAction(PERM_VALET_OPS)                 | 36593895
-0280 POST    /valet/:bookingId/keys                                 | validateAction(PERM_VALET_KEYS)                | a6febdf4
-0281 POST    /valet/:bookingId/charge                               | validateAction(PERM_VALET_CHARGE)              | e1d6c477
-0282 POST    /get_main_feedback_question                            | validate                                       | 0832e295
-0283 POST    /get_follow_up_question                                | validate                                       | 9cb3c460
-0284 POST    /feedback/dynamic-follow-up                            | validate                                       | abb8b83f
-0285 POST    /feedback/valet-checkin                                | rateLimit("valet_checkin", 10, 60000) -> validate | 023617f0
-0286 POST    /feedback/submit                                       | rateLimit("feedback", 20, 60000)               | 95dc942a
-0287 GET     /restaurant/users                                      | validateAction("92cb8236-1039-4b47-a66f-6c7c8b0144ae") | 9bdcaf24
-0288 POST    /restaurant/users                                      | validateAction("58fdfca7-7a97-439b-aeb2-00e4395a9a30") | 4aea539c
-0289 DELETE  /restaurant/users                                      | validateAction("a978f15d-1043-417a-b07b-05f6bddad875") | ed1b704a
-0290 POST    /restaurant/users/password                             | -                                              | fb8fc8bd
-0291 GET     /restaurant/password-requests                          | -                                              | 81bdca70
-0292 POST    /restaurant/password-requests/:id/dismiss              | -                                              | e36b7498
-0293 POST    /auth/forgot-password                                  | rateLimit("forgot", 5, 60000)                  | ab341c3a
-0294 GET     /feedback                                              | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 767583d6
-0295 GET     /feedback/recovery                                     | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 8f48f2c8
-0296 POST    /feedback/recovery/:id/resolve                         | validateAction(PERM_FEEDBACK_RESOLVE)          | 16a83e2b
-0297 GET     /feedback/summary                                      | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 42e1a52a
-0298 GET     /feedback/stats                                        | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 90fe5f75
+0227 POST    /publish/bill                                          | validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9") | 253376ee
+0228 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | b7a63b53
+0229 POST    /print/ack                                             | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sPrintAck) | 365e3415
+0230 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428
+0231 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | 2ff0be3a
+0232 POST    /bills/discount                                        | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillDiscount) | 7ac798b4
+0233 GET     /discount-requests                                     | validate                                       | 9f7efb7f
+0234 POST    /discount-requests/:id/approve                         | validate                                       | dcb2d809
+0235 POST    /discount-requests/:id/reject                          | validate                                       | 975bbe8f
+0236 GET     /coupons                                               | validate                                       | a940f3af
+0237 POST    /coupons                                               | validate                                       | 5abb16e9
+0238 DELETE  /coupons/:id                                           | validate                                       | 1f68ec00
+0239 POST    /vouchers                                              | validate                                       | 1b681630
+0240 GET     /loyalty/:phone                                        | validate                                       | 11243f55
+0241 POST    /loyalty/redeem                                        | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 83f2571e
+0242 POST    /aggregator/generate-key                               | validate                                       | 7f2a327f
+0243 POST    /aggregator/order                                      | rateLimit("aggregator", 120, 60000)            | b628fad2
+0244 POST    /bills/apply-coupon                                    | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillApplyCoupon) | c505538f
+0245 POST    /bills/item-note                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillItemNote) | 1716a034
+0246 POST    /bills/split                                           | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") -> validateBody(sBillSplit) | c5b87658
+0247 POST    /bills/merge                                           | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMerge) | 32bf4db8
+0248 POST    /bills/refund                                          | validateBody(sBillRefund)                      | d2089aa7
+0249 POST    /bills/:id/reopen                                      | validate                                       | 3fcddf24
+0250 PUT     /restaurant/profile                                    | validateAction("60d14e9c-45cc-4dc2-b017-56058cc3ae33") | a752571b
+0251 GET     /outlets                                               | validate                                       | 4e4ae9d9
+0252 GET     /outlets/rollup                                        | validateAction(OUTLET_ADMIN_PERM)              | dc7026a0
+0253 POST    /outlets                                               | validateAction(OUTLET_ADMIN_PERM)              | 3b57894a
+0254 PUT     /outlets/:id                                           | validateAction(OUTLET_ADMIN_PERM)              | c9644064
+0255 POST    /outlets/:id/active                                    | validateAction(OUTLET_ADMIN_PERM)              | 296227ee
+0256 DELETE  /outlets/:id                                           | validateAction(OUTLET_ADMIN_PERM)              | f2b979a3
+0257 GET     /outlets/default-tax                                   | validateAction("d9b3f882-d3cf-46bc-b9ce-4218e8a5c29d") | fc96ddba
+0258 PATCH   /outlets/default-tax                                   | validateAction("28fa21cc-0dba-4a0f-bf6f-387089f47bbf") | a5320645
+0259 GET     /roles                                                 | validateAction("17ba6407-b703-4403-ab59-13235966053f") | 8b1d3ea6
+0260 GET     /actions                                               | validateAction("2b6f7948-0b27-41a9-9727-c04ccc9f4db1") | b4c6af17
+0261 POST    /roles                                                 | validateAction("c0135d18-68b4-45e9-9b51-849158df6efd") | 21e6a9b4
+0262 DELETE  /roles/:id                                             | validateAction("53d0927d-00f4-48cc-a40c-51edb09826d8") | 37acdf04
+0263 POST    /roles/assign                                          | validateAction("4bf54bd9-9124-46c0-a7cc-011ea4c4e172") | c5e6cd44
+0264 POST    /roles/remove                                          | validateAction("9acc9097-4803-4be0-bb6d-fc2c5de57cf5") | c4f4d26e
+0265 GET     /table-assignments                                     | validateAction("f88657ce-0d67-4cd6-aae1-765dec10cd98") | 5ce1dd83
+0266 POST    /table-assignments/assign                              | validateAction("faf2745b-580c-4529-bbe1-033200cbcf67") | 25acf2ae
+0267 POST    /table-assignments/unassign                            | validateAction("e97a2c5d-d83d-48e3-bdea-ef0c3a1c51a7") | 1b3bc3bd
+0268 GET     /valet-bays                                            | validateAction("9e37297d-408b-446d-a51b-7892ad216b7d") | f66a980b
+0269 POST    /add-valet-bay                                         | validateAction("ae8ce7c0-1e06-4722-8a06-817267eec785") | 8b832c36
+0270 POST    /delete-valet-bay                                      | validateAction("6e9be65f-4081-4b86-8ba0-0592ee26f7f2") | 775a1e7b
+0271 POST    /update-valet-bay                                      | validateAction("2caeab74-5941-424d-9c3a-5c68ef0186e1") | 029dd5e4
+0272 POST    /set-valet-bay-current                                 | validateAction("2ff51c3d-f18c-406c-9f49-7c54f468c835") | 62026fa9
+0273 POST    /create_valet_record                                   | validateAction("892b50f3-51fc-4099-8f31-01e8dd8c3d44") | dd53c881
+0274 POST    /valet/scan-plate                                      | validateAction("892b50f3-51fc-4099-8f31-01e8dd8c3d44") | c5352105
+0275 POST    /get_valet_info                                        | validateAction("9e37297d-408b-446d-a51b-7892ad216b7d") | 106595ad
+0276 POST    /update_valet_state                                    | validateAction("b8e02c25-b91c-427c-b462-8df009ede055") | 4fbf4fb7
+0277 POST    /update_valet_bay                                      | validateAction("b8e02c25-b91c-427c-b462-8df009ede055") | bf88d397
+0278 POST    /unassign-valet-bay                                    | validateAction("5ef876a7-eb92-4602-b4d3-5590ce379540") | 3c080dc1
+0279 GET     /valet/charge-targets                                  | validateAction("9e37297d-408b-446d-a51b-7892ad216b7d") | 5f8b2cea
+0280 POST    /valet/:bookingId/ops                                  | validateAction(PERM_VALET_OPS)                 | e89c8430
+0281 POST    /valet/:bookingId/keys                                 | validateAction(PERM_VALET_KEYS)                | a6febdf4
+0282 POST    /valet/:bookingId/charge                               | validateAction(PERM_VALET_CHARGE)              | e1d6c477
+0283 POST    /get_main_feedback_question                            | validate                                       | 0832e295
+0284 POST    /get_follow_up_question                                | validate                                       | 9cb3c460
+0285 POST    /feedback/dynamic-follow-up                            | validate                                       | abb8b83f
+0286 POST    /feedback/valet-checkin                                | rateLimit("valet_checkin", 10, 60000) -> validate | 023617f0
+0287 POST    /feedback/submit                                       | rateLimit("feedback", 20, 60000)               | 95dc942a
+0288 GET     /restaurant/users                                      | validateAction("92cb8236-1039-4b47-a66f-6c7c8b0144ae") | 9bdcaf24
+0289 POST    /restaurant/users                                      | validateAction("58fdfca7-7a97-439b-aeb2-00e4395a9a30") | 4aea539c
+0290 DELETE  /restaurant/users                                      | validateAction("a978f15d-1043-417a-b07b-05f6bddad875") | ed1b704a
+0291 POST    /restaurant/users/password                             | -                                              | fb8fc8bd
+0292 GET     /restaurant/password-requests                          | -                                              | 81bdca70
+0293 POST    /restaurant/password-requests/:id/dismiss              | -                                              | e36b7498
+0294 POST    /auth/forgot-password                                  | rateLimit("forgot", 5, 60000)                  | ab341c3a
+0295 GET     /feedback                                              | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 767583d6
+0296 GET     /feedback/recovery                                     | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 8f48f2c8
+0297 POST    /feedback/recovery/:id/resolve                         | validateAction(PERM_FEEDBACK_RESOLVE)          | 16a83e2b
+0298 GET     /feedback/summary                                      | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 42e1a52a
+0299 GET     /feedback/stats                                        | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 90fe5f75
 mw09 USE     *                                                      | <inline(err,req,res,next)>                     | 1687165a
 mw10 USE     *                                                      | <inline(err,req,res,_next)>                    | 3e5181dc

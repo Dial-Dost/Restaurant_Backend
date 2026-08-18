@@ -8,6 +8,7 @@ import { z } from "zod";
 import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetClosedBill, GetEmployeeDetailsFromEmpID, GetMenuItems, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, computeBillCharges } from "../database_supabase.js";
 import { buildKotBase64, buildReceiptBase64 } from "../escpos.js";
 import { logger } from "../observability.js";
+import { ackPrintJob, enqueuePrintJob, printJobPayload } from "../print_jobs.js";
 import { emitOutlet, emitRestaurant } from "../realtime.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, endOfDayBound, enforceAdmin, enforceRoles, extractEmployeeId, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, validate, validateAction, validateBody } from "./_shared.js";
@@ -28,6 +29,14 @@ const sBillMerge = z.object({ from_table: z.string(), to_table: z.string() }).pa
 const sBillRefund = z.object({ bill_id: z.string().optional(), table_name: z.string().optional() }).passthrough()
 	.refine((b) => (typeof b.bill_id === "string" && b.bill_id.trim().length > 0) || (typeof b.table_name === "string" && b.table_name.trim().length > 0),
 		{ message: "bill_id or table_name is required" });
+// The printer agent's receipt for one print job. `jobId` is the SERVER-generated
+// "PrintJobs".id it was handed, never a bill id — see migration 027's header for
+// why bill_id cannot be the identity here. .uuid() so a malformed id is a clean
+// 400 rather than a 22P02 surfacing as a 500 from the data layer.
+const sPrintAck = z.object({
+	jobId: z.string().uuid(),
+	result: z.enum(["printed", "failed"]),
+}).passthrough();
 
 /*
 	Upload a PAYMENT PROOF image and get back a URL to hand to settle.
@@ -492,9 +501,18 @@ app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9")
 			return;
 		}
 
-		// Emit to outlet-specific room; send billId and base64 payload
-		emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
-		res.json({ success: true });
+		// PERSIST, THEN EMIT. The row is the durable fact and the emit is the fast
+		// path — emitOutlet cannot report whether anything received it (an empty
+		// room is a successful no-op), so the row is the only thing that survives a
+		// till whose socket is down. A null jobId means durability is unavailable
+		// (migration 027 not applied); the emit still goes out, exactly as before.
+		const jobId = await enqueuePrintJob(restaurantId, {
+			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
+		});
+		emitOutlet(restaurantId, outletId, 'bill:print', printJobPayload({
+			billId, escBase64, kind: "bill", jobId, publishedAt: new Date().toISOString(),
+		}));
+		res.json({ success: true, jobId });
 	} catch (err) {
 		logger.error({ err }, 'publish_bill_failed');
 		res.status(500).json({ error: 'Unable to publish bill' });
@@ -557,8 +575,18 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 				kind: "kot",
 			}, cols);
 			const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
+			// ONE DURABLE JOB PER STATION TICKET, all sharing this one billId. That
+			// sharing is precisely why the job uuid — not billId — is the identity
+			// every downstream guard keys on: deduplicating on billId would print the
+			// first station's docket and silently drop every other kitchen's.
 			for (const t of tickets) {
-				emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64: t.escBase64, station: t.station, kind: "kot", publishedAt: new Date().toISOString() });
+				const jobId = await enqueuePrintJob(restaurantId, {
+					outlet_id: outletId, bill_id: billId, kind: "kot", station: t.station, esc_base64: t.escBase64,
+				});
+				emitOutlet(restaurantId, outletId, 'bill:print', printJobPayload({
+					billId, escBase64: t.escBase64, kind: "kot", station: t.station, jobId,
+					publishedAt: new Date().toISOString(),
+				}));
 			}
 			try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed KOT for table ${tableName} (${tickets.length} station ticket(s))`, Audit_log_category.Bill, { table: tableName, kind, stations: tickets.map((t) => t.station) }); } catch {/* ignore */}
 			res.json({ success: true, billId, tickets: tickets.length, stations: tickets.map((t) => t.station) });
@@ -603,12 +631,57 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 				: null,
 		}, cols);
 		const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
-		emitOutlet(restaurantId, outletId, 'bill:print', { billId, escBase64, publishedAt: new Date().toISOString() });
+		// billId is STABLE ACROSS REPRINTS, so each reprint deliberately becomes its
+		// OWN job row. A waiter who asks for a second copy must get one.
+		const jobId = await enqueuePrintJob(restaurantId, {
+			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
+		});
+		emitOutlet(restaurantId, outletId, 'bill:print', printJobPayload({
+			billId, escBase64, kind: "bill", jobId, publishedAt: new Date().toISOString(),
+		}));
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${includeServiceCharge ? "" : " (no service charge)"}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: !includeServiceCharge }); } catch {/* ignore */}
-		res.json({ success: true, billId });
+		res.json({ success: true, billId, jobId });
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');
 		res.status(500).json({ error: String(err?.message ?? 'Unable to print') });
+	}
+});
+
+/*
+	The printer agent reports what it did with one job.
+
+	POST /print/ack  body { "jobId": "<uuid>", "result": "printed" | "failed" }
+	  -> 200 { "success": true, "duplicate": false }
+
+	AN HTTP ROUTE RATHER THAN A SOCKET.IO ACK CALLBACK, deliberately. A Socket.IO
+	ack is scoped to one emit on one connection: if the socket drops between
+	delivery and acknowledgement — which is exactly the failure this whole change
+	exists to survive — the callback is discarded and can never be retried. An HTTP
+	ack is retryable over a fresh channel, works while the socket is down, rides the
+	existing requireAuth path so the write lands under the right RLS context, and is
+	testable without standing up a socket server.
+
+	A DUPLICATE IS A 200, NOT AN ERROR. The ack can fail after the paper has come
+	out, so a correct agent retries; punishing the retry teaches it not to retry,
+	which loses the acks that matter. `duplicate: true` simply says the job was
+	already settled.
+
+	Gated on the EXISTING print permission (4ad474d4…) rather than a new one:
+	whoever may print may confirm a print, and minting a new Action id would strip
+	the capability from every role that exists today. (Migration 025's rule.)
+*/
+app.post('/print/ack', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), validateBody(sPrintAck), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: 'Missing restaurantId' }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const jobId = String(body.jobId ?? "").trim();
+	const result = body.result === "failed" ? "failed" : "printed";
+	try {
+		const outcome = await ackPrintJob(restaurantId, jobId, result);
+		res.json({ success: true, duplicate: outcome.duplicate });
+	} catch (err: any) {
+		logger.error({ err }, 'print_ack_failed');
+		res.status(500).json({ error: String(err?.message ?? 'Unable to record print ack') });
 	}
 });
 

@@ -85,22 +85,46 @@ Every mutating route expects a `restaurantId` via header `x-restaurant-id`, quer
 
 ## Continuous Integration
 
-This repository ships with `.github/workflows/backend-ci.yml` which runs on pushes and pull requests to `main`:
+All CI lives in a single workflow, `.github/workflows/ci.yml`, which runs on pushes to
+`main`/`master` and on pull requests. It has two jobs:
 
-1. Checkout + install dependencies with `npm ci`.
-2. Build the TypeScript project.
-3. Start the compiled server in the background.
-4. Poll `/health` to confirm Postgres connectivity (uses `SUPABASE_DIRECT_URL` secret).
-5. Run the allocation, overlap, threshold, and Jest suites.
+**`backend`** — runs on the runner against ephemeral `postgres:16` / `redis:7` service containers:
 
-### Required Secrets for CI
+1. `npm ci`.
+2. `npm run test:money` — money invariants (no database, no Docker; fails in seconds).
+3. `npm run build` — TypeScript typecheck.
+4. `npx jest --runInBand` — unit tests.
+5. `npm run migrate && npm run test:isolation` — the migration chain plus the tenant-isolation regression.
+6. `npm run test:integration` — end-to-end money/flow tests against the throwaway Postgres.
 
-| Secret | Use |
-| ------ | --- |
-| `SUPABASE_DIRECT_URL` | Direct Postgres connection string for CI. |
-| `DATABASE_URL` | Optional alias for tools expecting this key. |
+**`docker`** — container packaging smoke test: builds `Dockerfile.node` and `Dockerfile.python`,
+applies migrations to a throwaway Postgres, brings the compose stack up, and polls `/health`
+(which returns 503 when the database is unreachable, so a 200 proves the built image boots on
+pruned production `node_modules` *and* reached its database). The throwaway datastores come from
+the CI-only override `.github/docker-compose.ci.yml`.
 
-The workflow automatically waits for `/health`; ensure the Postgres user has permissions to read/write required tables.
+### Required Secrets for CI: none
+
+**CI must never be given a production credential, and today references no repository secret at
+all.** Every database URL in the workflow is a literal pointing at a service container that is
+destroyed when the job ends.
+
+This is deliberate and load-bearing. A previous workflow (`backend-ci.yml`, deleted 2026-08-18)
+set `RESTAURANT_ID: csrorganics` — a live tenant — and pointed `SUPABASE_DIRECT_URL`,
+`DATABASE_URL` and `DIRECT_URL` at the production Supabase secret, then ran write-capable API
+tests against it on every push and every pull request. Do not reintroduce a production
+connection string, a real tenant slug, or `NODE_ENV=test`/`development` for the compose stack —
+see the header comment in `ci.yml` for why each of those is dangerous.
+
+### Known coverage gap
+
+`test/valet_api_test.ts` and `test/feedback_api_test.ts` do not run automatically. They
+authenticate with `X-Restaurant-Id` / `X-Action-List` headers, but the backend moved to
+session-only bearer-token auth, so every authenticated call in them now returns 401 — they have
+been contributing no verification since that refactor. They are gated behind a
+`workflow_dispatch` input (`run_api_tests`) until they are rewritten onto the existing
+`test/_auth.ts` login helper; the `ci.yml` step comment spells out exactly what that rewrite
+involves.
 
 ## Repository Hygiene
 

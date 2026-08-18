@@ -4,6 +4,7 @@ import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { getSession } from "./auth/sessions.js";
 import { logger } from "./observability.js";
+import { resumeJitterMs, resumePrintJobsForAgent } from "./print_jobs.js";
 
 export let io: Server | null = null;
 
@@ -83,7 +84,12 @@ export async function initRealtime(httpServer: HttpServer) {
       return;
     }
 
+    // Captured as consts because the joinOutlet closure below outlives this
+    // scope's narrowing of `session` (a `let`, so TypeScript re-widens it inside a
+    // nested function).
     const resId = session.res_id;
+    const employeeId = session.employeeId;
+    const role = session.role;
     socket.join(`restaurant:${resId}`);
 
     // All room operations are pinned to the caller's own restaurant.
@@ -95,12 +101,41 @@ export async function initRealtime(httpServer: HttpServer) {
       if (rid === resId) {socket.leave(`restaurant:${resId}`);}
     });
 
+    // THE RECONNECT HOOK. The printer agent re-emits joinOutlet on every connect
+    // AND every reconnect, so this is already the exact moment a till comes back —
+    // no new client-side trigger had to be invented for replay.
     socket.on("joinOutlet", (payload: any) => {
       const o = payload && typeof payload.outletId === 'string' ? payload.outletId : null;
+      // ADDITIVE and optional. A build that predates durable printing sends no
+      // version and is never replayed to (resumePrintJobsForAgent's interlock):
+      // it has no per-job dedup and no way to ack, so replaying to it would
+      // reprint the outstanding backlog on every socket flap, forever.
+      const rawVersion = payload && typeof payload.agentVersion === 'string' ? payload.agentVersion.trim() : "";
+      const agentVersion = rawVersion.length > 0 ? rawVersion : null;
       if (o) {
         socket.join(`restaurant:${resId}:outlet:${o}`);
         socket.emit('joinedOutlet', { restaurantId: resId, outletId: o });
         logger.info(`Socket ${socket.id} joined restaurant:${resId}:outlet:${o}`);
+        // Deliberately NOT awaited and deliberately jittered. The room join must
+        // be immediate (live printing depends on it) and a fleet-wide reconnect
+        // must not turn into a fleet-wide simultaneous query. Errors are swallowed
+        // inside resumePrintJobsForAgent; the catch here only covers a scheduling
+        // failure so an unhandled rejection can never take the process down.
+        const timer = setTimeout(() => {
+          void resumePrintJobsForAgent({
+            resId,
+            outletId: o,
+            // socket.id is stable for this connection and changes on reconnect,
+            // which is exactly the identity a lease wants: diagnostic in
+            // claimed_by, and never reused by a socket that has gone away.
+            agentId: socket.id,
+            agentVersion,
+            employeeId,
+            role,
+            deliver: (p) => { socket.emit('bill:print', p); },
+          }).catch((err: unknown) => { logger.error({ err }, "print_resume_dispatch_failed"); });
+        }, resumeJitterMs());
+        timer.unref?.();
       }
     });
 

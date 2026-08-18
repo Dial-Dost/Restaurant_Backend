@@ -11,6 +11,7 @@ import { closePlatformPool } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
 import { closeRealtime, initRealtime } from "./realtime.js";
 import { runReportScheduleSweep } from "./report_schedules.js";
+import { runPrintJobReaperSweep } from "./print_jobs.js";
 import { extractBearerToken, isAllOutletsSentinel, normalizeRole, rawRequestedOutletId, sendDueBookingReminders } from "./routes/_shared.js";
 import { registerGuestOrderingRoutes, registerGuestWaitlistAndPaymentRoutes, registerGuestBrandingRoute } from "./routes/guest.js";
 import { registerWhatsAppWebhookRoutes } from "./routes/webhooks.js";
@@ -629,6 +630,43 @@ async function bootstrap(): Promise<void> {
 		logger.info("✅ Scheduled report sweep armed");
 	} else {
 		logger.info("Scheduled report sweep disabled (set REPORT_SCHEDULER=true)");
+	}
+
+	// Print-job reaper: mark outstanding jobs that outlived their TTL 'expired',
+	// then delete settled rows past the retention window.
+	//
+	// ARMED BY DEFAULT, unlike the report sweep above, because it is pure hygiene
+	// and cannot mis-send anything: the TTL that stops a stale kitchen docket ever
+	// replaying is the read-time predicate inside ClaimPrintJobsForAgent, not this
+	// timer. What it does buy is a bounded table and a queryable record of receipts
+	// that were never delivered. On a database that has not run migration 027 it
+	// bails out on the first tenant with one loud log line and stays a no-op.
+	//
+	// Same replica posture as the two sweeps above: no leader lock exists on the
+	// tenant pool, and none is needed — both statements are idempotent and two
+	// replicas racing them converge. The flag only stops one slow sweep stacking on
+	// the next tick.
+	if (process.env.PRINT_JOB_REAPER !== "false") {
+		let printReaperRunning = false;
+		const printReaperSweep = async () => {
+			if (printReaperRunning) {return;}
+			printReaperRunning = true;
+			try {
+				await runPrintJobReaperSweep();
+			} catch (err) {
+				logger.warn({ err }, "print_job_reaper_failed");
+			} finally {
+				printReaperRunning = false;
+			}
+		};
+		const printReaperTimer = setInterval(
+			() => void printReaperSweep(),
+			Math.max(1, Number(process.env.PRINT_JOB_REAPER_INTERVAL_MIN) || 15) * 60_000,
+		);
+		printReaperTimer.unref?.();
+		logger.info("✅ Print job reaper armed");
+	} else {
+		logger.info("Print job reaper disabled (PRINT_JOB_REAPER=false)");
 	}
 
 	// Graceful shutdown: Railway (and most platforms) send SIGTERM on deploy. Drain
