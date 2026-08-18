@@ -1,0 +1,63 @@
+# ============================================================================
+# CI-ONLY docker-compose override. NEVER used outside GitHub Actions.
+#
+# Purpose: give the compose stack a THROWAWAY Postgres + Redis that live and die
+# with the CI job, so `docker compose up` can never reach the production
+# database. The deleted `.github/workflows/backend-ci.yml` used to hand the
+# production Supabase credentials to these same containers on every push.
+#
+# Usage (paths resolve relative to the FIRST -f file, i.e. the repo root):
+#   docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml up -d
+#
+# Do NOT add this file to a production deploy, and do NOT move it into
+# .github/workflows/ — GitHub tries to parse every .yml in that directory as a
+# workflow and would fail.
+# ============================================================================
+services:
+  # Throwaway database. Reachable as `postgres:5432` from the other compose
+  # containers, and as `localhost:5432` from the runner (published below) so the
+  # runner-side `npm run migrate` can apply the schema before the app boots.
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: restaurant
+    ports:
+      - "5432:5432"
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d restaurant"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Session store. auth/store.ts falls back to an in-memory store when REDIS_URL
+  # is unset, but the real thing keeps CI shaped like production.
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  python:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The base file sets `restart: unless-stopped`, which makes a crash-looping
+    # container silently succeed `up -d`. In CI a crash must fail the job.
+    restart: "no"
+
+  node:
+    depends_on:
+      # Merged with the base file's `python: service_healthy`.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"

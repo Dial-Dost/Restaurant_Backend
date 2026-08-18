@@ -1,9 +1,57 @@
+# =============================================================================
+# CI — runs ONLY against ephemeral, throwaway infrastructure.
+#
+# WHY THIS FILE IS SHAPED THIS WAY. DO NOT UNDO IT.
+#
+# This repository serves REAL, PAYING restaurants. Until 2026-08-18 a second
+# workflow, `.github/workflows/backend-ci.yml`, ran on every push to main and
+# every pull request with:
+#     RESTAURANT_ID: csrorganics            <- a LIVE production tenant
+#     SUPABASE_DIRECT_URL / DATABASE_URL / DIRECT_URL  <- all three set to the
+#                                              production Supabase repo secret
+# It wrote those production credentials into `.env`, brought the full
+# docker-compose stack up against them, and ran write-capable API tests. That
+# workflow has been DELETED and its one piece of unique coverage (the Docker
+# images build and the built image boots healthy) now lives in the `docker` job
+# below, pointed at a throwaway database.
+#
+# RULES for anyone editing any workflow in this directory:
+#   1. NEVER reference a Supabase repo secret, or any other production
+#      credential, from a job that runs tests. Grepping this directory for a
+#      Supabase secret reference must return NOTHING — and today no workflow
+#      here references ANY repository secret at all. Keep it that way: zero
+#      secrets is the property that makes reaching production impossible,
+#      rather than merely unintended.
+#   2. NEVER set RESTAURANT_ID (or TEST_RESTAURANT_ID) to a real tenant slug.
+#      `csrorganics` is a real restaurant. Use an obviously-throwaway value.
+#   3. Every database URL in this file must point at a service container or a
+#      compose container that is destroyed when the job ends.
+#   4. NEVER set NODE_ENV=test or NODE_ENV=development for the compose stack.
+#      Dockerfile.node:41 bakes NODE_ENV=production, and that is the ONLY thing
+#      currently disabling the demo seed:
+#          index.ts:487  shouldSeedDemo = SEED_DEMO === "true" || NODE_ENV !== "production"
+#      On an EXISTING tenant that seed is not a no-op — EnsureRestaurantSeed
+#      unconditionally runs `update "Login" set emp_pass = <hash("admin123")>`
+#      (database_supabase.ts:~25172) and overwrites the restaurant/outlet
+#      profile. Against production that silently resets the owner's password.
+#      Keep NODE_ENV alone and keep the database throwaway.
+# =============================================================================
 name: CI
 
 on:
   push:
     branches: [main, master]
   pull_request:
+  # Manual runs only, so the opt-in valet/feedback HTTP tests in the `docker`
+  # job below can be exercised deliberately. They never run automatically.
+  workflow_dispatch:
+    inputs:
+      run_api_tests:
+        description: >-
+          Run the valet + feedback HTTP tests. CURRENTLY EXPECTED TO FAIL —
+          see the "Valet + feedback HTTP API tests" step for why.
+        type: boolean
+        default: false
 
 jobs:
   backend:
@@ -31,6 +79,9 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+    # Literal values only — no `secrets.*`. These point at the ephemeral service
+    # containers above, which are destroyed when the job ends. `@localhost` also
+    # makes database_supabase.ts:113 skip SSL, which a plain postgres:16 needs.
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/restaurant
       SUPABASE_DIRECT_URL: postgres://postgres:postgres@localhost:5432/restaurant
@@ -49,6 +100,15 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      # Money invariants. Runs FIRST because it needs neither a database nor
+      # Docker: the bill set is in memory and only `pg` is faked, so the real
+      # report readers are exercised. Placed first so a service-charge / tax
+      # regression fails the build in seconds and can never be masked by an
+      # unreachable DB or a docker problem. (The full jest run below repeats it;
+      # this step exists for the fast, unambiguous signal.)
+      - name: Money invariants (bill totals vs report readers)
+        run: npm run test:money
 
       - name: Typecheck
         run: npm run build
@@ -72,3 +132,153 @@ jobs:
       # waitlist seat (transaction + double-seat/occupied-table guards).
       - name: Integration tests (real Postgres)
         run: npm run test:integration
+
+  # ===========================================================================
+  # Container packaging smoke test.
+  #
+  # This is the ONLY coverage the deleted backend-ci.yml had that the `backend`
+  # job above does not: that Dockerfile.node and Dockerfile.python actually
+  # build, and that the compiled `build/index.js` boots on pruned production
+  # node_modules and answers /health. That catches a broken Dockerfile, a
+  # runtime dependency stripped by `npm prune --omit=dev`, a missing tsx for
+  # migrations, or a uv sync failure — none of which the runner-side jobs see.
+  #
+  # /health returns 503 when the database is unreachable (routes/misc.ts:58-64),
+  # so a 200 here also proves the container reached its database. That database
+  # is the throwaway Postgres from .github/docker-compose.ci.yml — NEVER a
+  # production one.
+  # ===========================================================================
+  docker:
+    runs-on: ubuntu-latest
+
+    env:
+      # Node 22 matches Dockerfile.node's runtime, so the runner-side migrate
+      # runs on the same major version as the image.
+      COMPOSE_FILES: -f docker-compose.yml -f .github/docker-compose.ci.yml
+      BACKEND_API_BASE_URL: http://localhost:3001
+      # Runner-side view of the throwaway DB (published by the CI override).
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/restaurant
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Container-facing environment. LITERALS ONLY — no `secrets.*` appears
+      # anywhere in this file, which is what makes it structurally impossible
+      # for this workflow to reach production.
+      #
+      #  * host is `postgres` (the compose service), not localhost: inside a
+      #    container localhost is the container itself.
+      #  * `?sslmode=disable` is REQUIRED. database_supabase.ts:113 only skips
+      #    SSL for @localhost/@127.0.0.1/@[::1]; any other host defaults to SSL,
+      #    which a plain postgres:16 does not speak. psycopg honours it too.
+      #  * QR_SIGNING_SECRET must be explicit: qr_signing.ts refuses to boot on
+      #    the published dev fallback, and the image sets NODE_ENV=production so
+      #    the ALLOW_DEV_QR_SECRET escape hatch is unavailable.
+      #  * NODE_ENV and SEED_DEMO are deliberately NOT set. See the header.
+      - name: Write CI .env (throwaway credentials only)
+        run: |
+          cat > .env <<'EOF'
+          DATABASE_URL=postgres://postgres:postgres@postgres:5432/restaurant?sslmode=disable
+          SUPABASE_DIRECT_URL=postgres://postgres:postgres@postgres:5432/restaurant?sslmode=disable
+          DIRECT_URL=postgres://postgres:postgres@postgres:5432/restaurant?sslmode=disable
+          REDIS_URL=redis://redis:6379
+          QR_SIGNING_SECRET=ci-only-non-secret-qr-key-for-tests
+          EOF
+          echo "Wrote .env with $(wc -l < .env) throwaway settings (no secrets)."
+
+
+      # Bring up ONLY the throwaway datastores first, so migrations can create
+      # the schema before the app containers boot into it.
+      - name: Start throwaway Postgres + Redis
+        run: docker compose $COMPOSE_FILES up -d --wait postgres redis
+
+      - name: Apply migrations to the throwaway Postgres
+        run: npm run migrate
+
+      # GEMINI_API_KEY is intentionally absent. It is read only inside
+      # generate_questions() (Python_servers/questions.py:136), which is an
+      # APScheduler job registered for 02:00 and never runs during a CI job;
+      # without it the function logs and returns. The Node routes
+      # /get_main_feedback_question and /get_follow_up_question return a static
+      # fallback question when Python is unreachable, so no CI path needs a key.
+      - name: Build images and start the stack
+        run: docker compose $COMPOSE_FILES up -d --build
+
+      # Generous budget: the images are cold and Dockerfile.node's own
+      # healthcheck has a 40s start period. The old workflow allowed 20s.
+      - name: Wait for /health (proves the built image boots and reaches its DB)
+        run: |
+          for i in $(seq 1 90); do
+            if curl -sSf "$BACKEND_API_BASE_URL/health" > /dev/null 2>&1; then
+              echo "Backend healthy after ~$((i * 2))s"
+              curl -sS "$BACKEND_API_BASE_URL/health"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Backend did not become healthy within 180s"
+          exit 1
+
+      # -----------------------------------------------------------------------
+      # OPT-IN ONLY. Never runs on push or pull_request.
+      #
+      # HONEST STATUS: these two suites (test/valet_api_test.ts,
+      # test/feedback_api_test.ts) CANNOT PASS TODAY, against this stack or any
+      # other. They authenticate with X-Restaurant-Id / X-Employee-Id /
+      # X-Action-List headers, but the backend moved to session-only auth:
+      # index.ts:104 rejects any non-PUBLIC_PATHS request without a bearer token,
+      # and routes/_shared.ts:67 reads permissions from req.auth, never a header.
+      # X-Action-List is dead in application code — it now appears only in these
+      # test files. So:
+      #   * valet_api_test.ts:50  POST /create_valet_record -> 401, exit 1
+      #   * feedback_api_test.ts:51 GET /feedback?limit=5   -> 401, exit 1
+      #
+      # COVERAGE LOST BY NOT RUNNING THESE AUTOMATICALLY: the valet and feedback
+      # HTTP surfaces. In practice that coverage was ALREADY zero — every
+      # assertion past the first authenticated call has been unreachable since
+      # the session-auth refactor. The old workflow was red (or ignored), not
+      # green. Nothing that was passing has been switched off.
+      #
+      # TO RESTORE IT (small, mechanical, and worth doing): rewrite both files
+      # onto the existing helper test/_auth.ts — `login()` + `authHeaders()`,
+      # exactly as test/tenant_isolation_test.ts already does — seed a
+      # throwaway tenant the way test/integration/money_integration_test.ts:78
+      # does (`ITest ${randomUUID().slice(0,8)}`), and take res_id / outlet_id /
+      # employeeId from the login response. The hardcoded UUIDs at
+      # valet_api_test.ts:5-6 are PRODUCTION row ids and must be deleted; a
+      # freshly seeded tenant generates its own. No fixture data is needed —
+      # migrations/000_base_schema.sql already creates Parking_Bays,
+      # Valet_vehicle_state, Valet_vehicle_meta and feedback_questions.
+      # Once that lands, move this step out of the `if:` gate.
+      #
+      # The test files are deliberately left UNMODIFIED and UNDELETED.
+      # -----------------------------------------------------------------------
+      - name: Valet + feedback HTTP API tests (opt-in; currently failing by design)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_api_tests == 'true'
+        env:
+          # Throwaway slugs. NEVER `csrorganics` — that is a live tenant, and it
+          # is what both test files fall back to when these are unset.
+          RESTAURANT_ID: citestthrowaway
+          TEST_RESTAURANT_ID: citestthrowaway
+        run: |
+          echo "NOTE: these suites are expected to fail with 401 until they are"
+          echo "rewritten onto test/_auth.ts. See the comment above this step."
+          npm run test:feedback_api
+          npm run test:valet_api
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker compose $COMPOSE_FILES logs --no-color --tail=200
+
+      # `down -v` also drops the throwaway database volume.
+      - name: Tear down
+        if: always()
+        run: docker compose $COMPOSE_FILES down -v --remove-orphans
