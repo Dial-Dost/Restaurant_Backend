@@ -7,7 +7,7 @@ import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
 import { EnsureRestaurantSeed, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
-import { closePlatformPool } from "./platform/db.js";
+import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
 import { closeRealtime, initRealtime } from "./realtime.js";
 import { runReportScheduleSweep } from "./report_schedules.js";
@@ -549,6 +549,28 @@ async function bootstrap(): Promise<void> {
 	// any tenant table is missing RLS, so a turnkey deploy never silently serves
 	// traffic without DB-enforced multi-tenant isolation.
 	await verifyTenantRlsAtBoot();
+
+	// Migration 028 banner. The archive route refuses outright when the 'archived'
+	// arm is missing from platform.restaurant_status (platform/routes.ts), so the
+	// feature can never half-work — but the operator only finds out when they click
+	// Archive. Say it at boot instead, because the container deploy path does NOT
+	// apply migrations: Dockerfile.node's CMD is `node build/index.js`, not
+	// `npm run start:prod` (the only script that chains `npm run migrate`).
+	//
+	// A WARNING, not a hard failure: every other feature works fine without 028, so
+	// refusing to boot over it would take a whole fleet down to protect one button.
+	if (platformDbConfigured()) {
+		try {
+			const support = await archivedStatusSupported();
+			if (support.supported) {
+				logger.info("✅ Tenant archiving available (migration 028 applied)");
+			} else {
+				logger.error({ reason: support.reason }, archivedStatusUnsupportedMessage(support.reason));
+			}
+		} catch (error) {
+			logger.warn({ err: error }, "Could not check migration 028 (tenant archiving)");
+		}
+	}
 
 	// Same createServer + initRealtime, at the same point in the sequence — just
 	// reached through the memoised helper above, so a serverless entrypoint that

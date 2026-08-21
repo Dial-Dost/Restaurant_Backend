@@ -5,17 +5,15 @@
 import type { Express, Request, Response } from "express";
 import { z } from "zod";
 import { createSession, destroySession, getSession } from "../auth/sessions.js";
-import { AuthenticateRestaurantEmployee, EnsureRestaurantSeed, GetRestaurantAccountStatus, GetRestaurantOutletsPublic, GetRestaurantPlan, GetRestaurantUsers, getRestaurantIdFromUsername } from "../database_supabase.js";
+import { AuthenticateRestaurantEmployee, GetRestaurantAccountStatus, GetRestaurantOutletsPublic, GetRestaurantPlan, getRestaurantIdFromUsername } from "../database_supabase.js";
 import { logger } from "../observability.js";
-import { startTrialIfMissing } from "../platform/tenant_billing.js";
+// Seeding a tenant is shared with the operator console's POST /platform/restaurants
+// — see provisioning.ts for why it is not duplicated in either route module.
+import { normalizeRestaurantSlug, provisionRestaurant, RestaurantExistsError } from "../provisioning.js";
 import { extractBearerToken, extractRestaurantUsername, passwordPolicyError, rateLimit, validate, validateBody } from "./_shared.js";
 
 
 // (extractActionList removed — permissions now come from the verified session.)
-
-function normalizeRestaurantSlug(value: string): string {
-	return value.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
 
 const registerRestaurantSchema = z.object({
 	restaurantName: z.string().trim().min(1).max(120),
@@ -52,39 +50,15 @@ app.post("/auth/register-restaurant", rateLimit("register", 5, 60_000), validate
 	}
 
 	try {
-		try {
-			await GetRestaurantUsers(restaurantId);
-			res.status(409).json({ error: `Restaurant \"${restaurantName}\" is already registered.` });
-			return;
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (!message.includes("Unknown restaurant id")) {
-				throw error;
-			}
-		}
-
-		await EnsureRestaurantSeed({
-			id: restaurantId,
-			name: restaurantName,
-			admin: {
-				employeeId: adminEmployeeId,
-				name: adminName,
-				password,
-			},
-			tables: [],
+		// The existence pre-check, the seed and the trial all live in
+		// provisionRestaurant so the operator console runs the identical sequence.
+		await provisionRestaurant({
+			restaurantName,
+			slug: restaurantId,
+			adminName,
+			adminUsername: adminEmployeeId,
+			password,
 		});
-
-		// Start a trial on the default plan for the new tenant (best-effort; the
-		// operator can reassign the plan in the platform console). Disable with
-		// SAAS_AUTO_TRIAL=false.
-		if (process.env.SAAS_AUTO_TRIAL !== "false") {
-			try {
-				const newResId = await getRestaurantIdFromUsername(restaurantId);
-				if (newResId) {await startTrialIfMissing(newResId, Number(process.env.SAAS_TRIAL_DAYS || 14));}
-			} catch (e) {
-				logger.warn({ err: e }, "start_trial_failed");
-			}
-		}
 
 		res.status(201).json({
 			restaurantId,
@@ -96,6 +70,17 @@ app.post("/auth/register-restaurant", rateLimit("register", 5, 60_000), validate
 			},
 		});
 	} catch (error) {
+		if (error instanceof RestaurantExistsError) {
+			res.status(409).json({ error: `Restaurant \"${restaurantName}\" is already registered.` });
+			return;
+		}
+		// Two callers racing the pre-check both reach the INSERT; the loser trips
+		// Restaurant_res_username_key. That is the same "already taken" answer, not
+		// a server fault.
+		if ((error as { code?: string } | null)?.code === "23505") {
+			res.status(409).json({ error: `Restaurant \"${restaurantName}\" is already registered.` });
+			return;
+		}
 		logger.error({ err: error }, "register_restaurant_failed");
 		res.status(500).json({ error: "Unable to register restaurant" });
 	}
@@ -147,14 +132,20 @@ app.post("/auth/employee-login", rateLimit("login", 15, 60_000), validate, async
 			res.status(401).json({ error: "Invalid employee ID or password." });
 			return;
 		}
-		// Block sign-in for suspended / expired restaurant accounts.
+		// Block sign-in for archived / suspended / expired restaurant accounts. The
+		// gate is unchanged — anything that is not 'active' is refused; only the
+		// message distinguishes them. 'archived' is a tenant the operator closed
+		// (migration 028); it is not coming back on its own, so say so plainly
+		// rather than implying a payment would fix it.
 		const accountStatus = await GetRestaurantAccountStatus(user.res_id);
 		if (accountStatus !== "active") {
 			res.status(403).json({
 				error:
-					accountStatus === "expired"
-						? "This restaurant's subscription has expired. Please contact support."
-						: "This restaurant account is suspended. Please contact support.",
+					accountStatus === "archived"
+						? "This restaurant account has been closed. Please contact support."
+						: accountStatus === "expired"
+							? "This restaurant's subscription has expired. Please contact support."
+							: "This restaurant account is suspended. Please contact support.",
 			});
 			return;
 		}

@@ -16,7 +16,7 @@ import { z } from "zod";
 import { destroyAllForEmployee } from "../auth/sessions.js";
 import { getStore } from "../auth/store.js";
 import type { CustomerDemographics } from "../database_supabase.js";
-import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetRestaurantLogoRaw, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
+import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import { emitRestaurant } from "../realtime.js";
@@ -460,6 +460,53 @@ export function passwordPolicyError(pw: string): string | null {
 		return "Password must contain both letters and numbers.";
 	}
 	return null;
+}
+
+// --- The guest/partner write gate -------------------------------------------
+//
+// THE FAILURE THIS CLOSES. index.ts:306 exempts the whole /qr/ prefix from the
+// tenant auth gate, and /aggregator/order is in PUBLIC_PATHS (:297), so those
+// handlers resolve a tenant straight from the URL slug (or an API key) and
+// proceed. Nothing on that surface has ever read account_status. An ARCHIVED
+// restaurant therefore kept accepting guest QR orders, coupon applications,
+// payments, reservations, waitlist joins and Swiggy/Zomato intake — while the
+// operator console showed it as gone and, crucially, while NOBODY COULD SIGN IN
+// TO COOK OR SETTLE any of it, because archiving revokes every session and blocks
+// every login. Orders accumulate against bills that can never be closed.
+//
+// WHY IT GATES EVERY NON-ACTIVE STATUS, not just 'archived'. Suspended and
+// expired tenants are locked out of their own POS by the same login gate
+// (routes/auth.ts:141), so guest orders land in exactly the same unsettleable
+// pile. A gate that special-cased 'archived' would be a second lifecycle rule to
+// keep in sync with platform.restaurant_status, and the first one to drift.
+// past_due WITHIN grace still reads 'active' (migrations/011_billing_grace.sql:21),
+// so a merely-late tenant keeps trading — this only bites tenants who are already
+// shut out of their own dashboard.
+//
+// IT IS ADDITIVE AND FAILS OPEN. GetRestaurantAccountStatus returns 'active' when
+// the control plane is not deployed or the lookup errors (database_supabase.ts:
+// 24829-24835), so a deployment without the platform schema, or a blip, behaves
+// exactly as before rather than closing every restaurant's QR ordering.
+export async function restaurantAcceptsGuestWrites(resId: string): Promise<boolean> {
+	return (await GetRestaurantAccountStatus(resId)) === "active";
+}
+
+/**
+ * The guest-facing half of the gate. Answers 404 with the SAME body the unknown-
+ * slug branch of every /qr/ handler already returns, and reports whether the
+ * caller should stop.
+ *
+ * WHY 404 AND NOT 403. The response is read by a stranger holding a printed QR
+ * code, and it is the tenant's dignity being spent: "Restaurant not found" is
+ * what a guest can act on (this menu is dead), whereas "suspended" broadcasts a
+ * restaurant's billing trouble to its own customers. It also needs no client
+ * change — the guest pages already handle this exact 404 — and it can never
+ * surface as a 500.
+ */
+export async function refuseGuestWriteIfClosed(res: Response, resId: string): Promise<boolean> {
+	if (await restaurantAcceptsGuestWrites(resId)) {return false;}
+	res.status(404).json({ error: "Restaurant not found" });
+	return true;
 }
 
 // Clamp a client-supplied ?limit= to a sane range so a huge/negative value can't

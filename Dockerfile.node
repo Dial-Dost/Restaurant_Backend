@@ -86,4 +86,11 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
 # Alternatively on Railway, set a release/pre-deploy command of
 # "npm run migrate" and keep the start command as "npm start"; either path
 # guarantees migrations land before the server accepts requests.
+#
+# THIS IS NOT OPTIONAL FOR MIGRATION 028 (tenant archiving). Because this CMD does
+# not run migrations, 028_restaurant_archived_status.sql must be applied by the
+# release step BEFORE this image serves traffic. Until it is, the operator
+# console's Archive button is refused with a 503 naming the migration, and the
+# server logs an error banner at boot. See platform/db.ts (archivedStatusSupported)
+# and docs/DEPLOY_ORDER.md.
 CMD ["node", "build/index.js"]

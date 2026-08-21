@@ -12,7 +12,7 @@ import { emitRestaurant } from "../realtime.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isPushConfigured, pushPublicKey } from "../web_push.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { GetCustomerIdOrCreateCustomer, emitOrderCreated, feedbackUrlForTable, fetchWithTimeout, linkOrderToCustomer, notifyOrderCreated, optionalMobile10, queueBookingConfirm, rateLimit, requireMobile10, resolveRazorpayKeys, safeClientError, timingSafeStrEqual } from "./_shared.js";
+import { GetCustomerIdOrCreateCustomer, emitOrderCreated, feedbackUrlForTable, fetchWithTimeout, linkOrderToCustomer, notifyOrderCreated, optionalMobile10, queueBookingConfirm, rateLimit, refuseGuestWriteIfClosed, requireMobile10, resolveRazorpayKeys, safeClientError, timingSafeStrEqual } from "./_shared.js";
 
 
 // Resolve the table for a public QR request. Prefers the opaque ?t= token; falls
@@ -93,6 +93,14 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 		res.status(404).json({ error: "Restaurant not found" });
 		return;
 	}
+
+	// THE GUEST WRITE GATE. A restaurant the operator archived (or the platform
+	// suspended) has no live sessions and nobody who can sign in, so an order
+	// accepted here can never be cooked, billed or settled — it just accrues
+	// against a bill no one can close. Refused as "Restaurant not found", the same
+	// answer an unknown slug gets. See routes/_shared.ts for the full argument,
+	// including why it fails open when the control plane is absent.
+	if (await refuseGuestWriteIfClosed(res, resId)) {return;}
 
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const tableName = resolveQrTable(resId, body);
@@ -273,6 +281,9 @@ app.post("/qr/:slug/coupon", rateLimit("coupon", 20, 60_000), async (req: Reques
 	let resId: string | null = null;
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	// Guest write gate (see /qr/:slug/order): applying a coupon rewrites an open
+	// bill's total, which nobody can settle on a closed restaurant.
+	if (await refuseGuestWriteIfClosed(res, resId)) {return;}
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const tableName = resolveQrTable(resId, body);
 	const code = typeof body.code === "string" ? body.code.trim() : "";
@@ -291,6 +302,10 @@ app.post("/qr/:slug/pay", rateLimit("qr_pay", 15, 60_000), async (req: Request, 
 	let resId: string | null = null;
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	// Guest write gate (see /qr/:slug/order). This is a guest DECLARING a payment
+	// for staff to approve — on a closed restaurant no one ever will, so the guest
+	// would be told "paid" against a bill that stays open forever.
+	if (await refuseGuestWriteIfClosed(res, resId)) {return;}
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const tableName = resolveQrTable(resId, body);
 	const method = typeof body.payment_method === "string" ? body.payment_method.trim() : "";
@@ -381,6 +396,9 @@ app.post("/qr/:slug/reserve", rateLimit("qr_reserve", 8, 60_000), async (req: Re
 	let resId: string | null = null;
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	// Guest write gate (see /qr/:slug/order): a table booked at a closed restaurant
+	// is a guest who turns up to a locked door.
+	if (await refuseGuestWriteIfClosed(res, resId)) {return;}
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const name = typeof body.name === "string" ? body.name.trim() : "";
 	const rawPhone = typeof body.phone === "string" ? body.phone.trim() : "";
@@ -557,6 +575,9 @@ app.post("/qr/:slug/waitlist/join", rateLimit("waitlist", 12, 60_000), async (re
 	let resId: string | null = null;
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	// Guest write gate (see /qr/:slug/order): joining a queue nobody is calling
+	// from is worse than being told the restaurant isn't there.
+	if (await refuseGuestWriteIfClosed(res, resId)) {return;}
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const name = typeof body.name === "string" ? body.name.trim() : "";
 	// Phone stays optional on a walk-in join (staff can call the party by name),
@@ -654,6 +675,12 @@ app.post("/qr/:slug/waitlist/:token/preorder/confirm", rateLimit("waitlist", 20,
 	let resId: string | null = null;
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	// This is the ONE token-scoped waitlist route that places a real order:
+	// ConfirmWaitlistPreorder calls AddOrder. The sibling token routes (decline,
+	// claim, member, cancel) move no money and create no ticket, so they stay open
+	// deliberately — a queued party must always be able to cancel. Without this
+	// line a diner could still put a live order into an archived restaurant.
+	if (await refuseGuestWriteIfClosed(res, resId)) {return;}
 	try {
 		const r = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => ConfirmWaitlistPreorder(slug, { token: String(req.params.token) }));
 		if ("error" in r) { res.status(400).json(r); return; }
@@ -742,6 +769,12 @@ app.post("/qr/:slug/razorpay/create", async (req: Request, res: Response) => {
 	let resId: string | null = null;
 	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
 	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	// Guest write gate (see /qr/:slug/order). This STARTS a card/UPI payment, so it
+	// is the right half of the Razorpay pair to refuse: no new money is taken.
+	// /qr/:slug/razorpay/verify below is deliberately NOT gated — it finishes a
+	// payment the guest has ALREADY made, and refusing it would take their money
+	// and record nothing.
+	if (await refuseGuestWriteIfClosed(res, resId)) {return;}
 	const keys = await resolveRazorpayKeys(slug, resId);
 	if (!keys) { res.status(503).json({ error: "Online payment isn't set up for this restaurant" }); return; }
 	const tableName = resolveQrTable(resId, (req.body ?? {}) as Record<string, unknown>);

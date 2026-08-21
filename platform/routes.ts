@@ -1,7 +1,18 @@
+import { randomBytes } from "node:crypto";
 import type { Express, NextFunction, Request, Response } from "express";
 import { hashPassword, verifyPassword } from "../auth/password.js";
 import { destroyAllForRestaurant } from "../auth/sessions.js";
-import { platformQuery, platformDbConfigured, withPlatformAdvisoryLock } from "./db.js";
+import { CountOpenBillsForRestaurant } from "../database_supabase.js";
+import { normalizeRestaurantSlug, provisionRestaurant, RestaurantExistsError } from "../provisioning.js";
+import { passwordPolicyError, rateLimit } from "../routes/_shared.js";
+import {
+	platformQuery,
+	platformDbConfigured,
+	withPlatformAdvisoryLock,
+	withPlatformTransaction,
+	archivedStatusSupported,
+	archivedStatusUnsupportedMessage,
+} from "./db.js";
 import { applyScheduledDowngrades, markInvoicePaidAndActivate, activateSubscriptionPlan } from "./tenant_billing.js";
 import {
 	createPlatformSession,
@@ -91,6 +102,58 @@ async function audit(
 	} catch (err) {
 		logger.error({ err }, "platform_audit_failed");
 	}
+}
+
+// The subscription statuses platform.subscriptions.status may hold. Shared by the
+// assignment route (which validates operator input against it) and the restore
+// route (which will only put back a status from this set), so the two can never
+// disagree about what a legal status is.
+const SUBSCRIPTION_STATUSES = new Set(["trial", "active", "past_due", "suspended", "cancelled", "expired"]);
+
+// The subscription statuses platform.restaurant_status maps to something OTHER
+// than 'active' (migrations/011_billing_grace.sql:18-20, unchanged by 028), i.e.
+// the ones that make routes/auth.ts refuse a login. Restore reads this to tell the
+// operator when a tenant is un-archived but still locked out. Kept next to
+// SUBSCRIPTION_STATUSES so the two lists are read — and updated — together.
+const LOGIN_BLOCKING_SUBSCRIPTION_STATUSES = new Set(["suspended", "cancelled", "expired"]);
+
+// Archive's subscription cancel, written once and used by BOTH the fresh-archive
+// path and the re-assertion path so they can never drift apart.
+//
+// `status <> 'cancelled'` makes it a no-op on an already-cancelled subscription,
+// and `returning res_id` reports whether it actually changed anything — which is
+// how the re-assertion branch knows it caught a subscription that had been moved
+// back off 'cancelled' while the tenant was archived.
+//
+// REQUIRED, not best-effort. runBillingCycle selects purely on
+// platform.subscriptions.status and never reads account_status, so a departed
+// tenant left on a priced 'active' subscription keeps generating monthly invoices
+// forever — and after SAAS_GRACE_DAYS "suspends" an already-archived one, muddying
+// the audit story. 'cancelled' is an existing accepted status and every billing
+// predicate excludes it.
+const CANCEL_SUBSCRIPTION_SQL =
+	`update platform.subscriptions set status = 'cancelled', updated_at = now()
+	  where res_id = $1 and status <> 'cancelled' returning res_id`;
+
+// A first-login credential for a restaurant the OPERATOR created. Generated
+// server-side and returned exactly once, in the 201 body: the operator reads it
+// to the owner, who changes it in Settings. It is never stored anywhere but the
+// argon2 hash EnsureRestaurantSeed writes, never logged, and never put in the
+// audit detail. Lost before handover => reset-owner-password.
+//
+// The create route deliberately does NOT accept a password. Note that
+// reset-owner-password (below) still accepts anything >= 4 characters — do not
+// copy that floor here; this asserts the tenant's OWN policy instead, so an
+// operator-created owner is never weaker than a self-registered one.
+function generateTemporaryPassword(): string {
+	// base64url of 18 bytes = 24 characters. The alphabet is [A-Za-z0-9_-], so it
+	// almost always satisfies "letters and digits" — but "almost always" is not a
+	// guarantee, hence the check rather than an assumption.
+	for (let i = 0; i < 20; i++) {
+		const candidate = randomBytes(18).toString("base64url");
+		if (!passwordPolicyError(candidate)) {return candidate;}
+	}
+	throw new Error("Unable to generate a temporary password that meets the password policy");
 }
 
 // Per-IP brute-force guard for the platform login (10 attempts / minute).
@@ -342,6 +405,197 @@ export function registerPlatformRoutes(app: Express): void {
 		}
 	});
 
+	// Operator-driven onboarding: create a tenant on the customer's behalf, with a
+	// slug the operator controls and (optionally) the plan they just sold.
+	//
+	// The seeding itself is NOT done here. platform_runtime holds no INSERT on
+	// "Restaurant" and no grants at all on "Outlets"/"Employees"/"Login"
+	// (migrations/004_platform_schema.sql:75), all of which are additionally under
+	// fail-closed RLS — so this cannot be written with platformQuery. It goes
+	// through provisionRestaurant, the same function POST /auth/register-restaurant
+	// uses, which runs on the tenant pool as app_runtime. No new grant, no new
+	// SECURITY DEFINER function, and no second copy of the creation logic.
+	//
+	// Rate limited on its OWN bucket: sharing the public "register" bucket would
+	// 429 an operator onboarding a chain and would let operator traffic eat the
+	// public allowance. The real guard is requirePlatformAuth.
+	app.post("/platform/restaurants", requirePlatformAuth, rateLimit("platform-create-restaurant", 20, 60_000), async (req: Request, res: Response) => {
+		const body = (req.body ?? {}) as Record<string, unknown>;
+		const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+		const resName = str(body.res_name);
+		const ownerName = str(body.owner_name);
+		const ownerUsername = str(body.owner_username);
+		const planId = typeof body.plan_id === "string" && body.plan_id.trim() ? body.plan_id.trim() : null;
+
+		if (!resName || !ownerName || !ownerUsername) {
+			res.status(400).json({ error: "res_name, owner_name and owner_username are required" });
+			return;
+		}
+		if (resName.length > 120 || ownerName.length > 120 || ownerUsername.length > 120) {
+			res.status(400).json({ error: "res_name, owner_name and owner_username must be 120 characters or fewer" });
+			return;
+		}
+
+		// The slug is the operator's to choose (a colliding or ugly derived slug is
+		// exactly why this route exists), but it must survive normalization
+		// unchanged — the value is written raw to res_username while every lookup
+		// reads lower(res_username), and it is baked into every printed QR URL, so a
+		// slug the operator cannot retype is a slug nobody can support.
+		const supplied = str(body.res_username);
+		const slug = supplied ? normalizeRestaurantSlug(supplied) : normalizeRestaurantSlug(resName);
+		if (!slug) {
+			res.status(400).json({ error: "res_username must contain letters or numbers" });
+			return;
+		}
+		if (supplied && supplied !== slug) {
+			res.status(400).json({ error: `res_username must be lowercase letters and digits only — did you mean "${slug}"?` });
+			return;
+		}
+
+		const profile = {
+			...(str(body.address) ? { address: str(body.address) } : {}),
+			...(str(body.phone) ? { phone: str(body.phone) } : {}),
+			...(str(body.email) ? { email: str(body.email) } : {}),
+			...(str(body.hours) ? { hours: str(body.hours) } : {}),
+		};
+
+		// Validate plan_id BEFORE anything is written. activateSubscriptionPlan runs
+		// AFTER the seed has committed and outside any transaction, so a bad plan_id
+		// used to answer 400 with the restaurant, its outlet, its owner and its
+		// "Login" row already created — and the generated temporary password
+		// discarded, never returned. The operator saw a validation error, retried,
+		// and got 409 slug already taken, with nothing telling them the tenant
+		// existed or that recovery was reset-owner-password. Checking first turns
+		// the common case (a typo, or a stale plan picker) into a clean 400 with
+		// nothing created. The 23503 handler below stays as the backstop for a plan
+		// deleted between this read and the assignment.
+		if (planId) {
+			let known: boolean | null = null;   // null = could not determine
+			try {
+				known = (await platformQuery<{ id: string }>(
+					`select id from platform.plans where id = $1 limit 1`,
+					[planId],
+				)).length > 0;
+			} catch (err) {
+				// 22P02 is "invalid input syntax for type uuid" — the operator sent
+				// something that is not a plan id at all, which is an unknown plan, not
+				// an outage. Any other error means the control plane is genuinely
+				// unreachable; leave `known` null and let the create proceed exactly as
+				// it did before, so a transient blip does not block onboarding.
+				if ((err as { code?: string } | null)?.code === "22P02") { known = false; }
+				else { logger.warn({ err, plan_id: planId }, "platform_create_plan_precheck_failed"); }
+			}
+			if (known === false) {
+				res.status(400).json({ error: "Unknown plan_id" });
+				return;
+			}
+		}
+
+		const temporaryPassword = generateTemporaryPassword();
+		// Everything after provisionRestaurant returns runs against a tenant that
+		// ALREADY EXISTS and whose owner password is this (unpersisted) string, so a
+		// failure past this point must never read as "nothing happened".
+		let seeded = false;
+		try {
+			const created = await provisionRestaurant({
+				restaurantName: resName,
+				slug,
+				adminName: ownerName,
+				adminUsername: ownerUsername,
+				password: temporaryPassword,
+				...(Object.keys(profile).length > 0 ? { profile } : {}),
+				// An operator with a signed plan gets that plan, not a trial. With no
+				// plan named, fall back to the same trial self-serve signup starts.
+				startTrial: planId === null,
+			});
+			seeded = true;
+
+			// Every console action keys on "Restaurant".id, so a null here would hand
+			// back a tenant the operator cannot manage. provisionRestaurant's read-back
+			// is best-effort on the TENANT pool; platform_runtime has SELECT on
+			// "Restaurant" (004:75), so try once more on this pool before giving up.
+			let resId = created.res_id;
+			if (!resId) {
+				const found = await platformQuery<{ id: string }>(
+					`select id from "Restaurant" where lower(res_username) = lower($1) limit 1`,
+					[created.res_username],
+				);
+				resId = found[0]?.id ?? null;
+			}
+			if (!resId) {
+				// The tenant WAS created — a retry will 409 on the slug. Say so, rather
+				// than pretending nothing happened.
+				logger.error({ res_username: created.res_username }, "platform_create_restaurant_id_unresolved");
+				res.status(500).json({ error: `Restaurant "${slug}" was created but its id could not be read back. Find it in the restaurant list and set the owner password there.` });
+				return;
+			}
+
+			// A plan the operator already sold: activate it now (1-month period), the
+			// same transition "Record payment" performs.
+			if (planId) {
+				await activateSubscriptionPlan(resId, planId);
+			}
+
+			await audit(req.platformAdmin!.adminId, "restaurant.create", resId, {
+				res_username: created.res_username,
+				res_name: resName,
+				owner_username: ownerUsername,
+				plan_id: planId,
+			});
+
+			res.status(201).json({
+				restaurant: { id: resId, res_username: created.res_username, res_name: resName },
+				owner: {
+					username: ownerUsername,
+					// Shown ONCE. There is no forced-change-on-first-login mechanism in
+					// this codebase, so the operator must tell the owner to change it.
+					temporary_password: temporaryPassword,
+				},
+			});
+		} catch (err) {
+			if (err instanceof RestaurantExistsError) {
+				res.status(409).json({ error: `The slug "${slug}" is already taken. Choose a different res_username.`, res_username: slug });
+				return;
+			}
+			// Two callers racing the existence pre-check both reach the INSERT; the
+			// loser trips Restaurant_res_username_key. With a hand-typed slug that is
+			// a normal correctable outcome, so it answers 409 like the check above
+			// rather than a 500.
+			if ((err as { code?: string } | null)?.code === "23505") {
+				res.status(409).json({ error: `The slug "${slug}" is already taken. Choose a different res_username.`, res_username: slug });
+				return;
+			}
+			// A plan deleted between the pre-check above and activateSubscriptionPlan.
+			// The seed has already COMMITTED by then and the temporary password is
+			// gone, so answering a bare "Unknown plan_id" sends the operator into a
+			// retry that 409s on the slug with nothing explaining why. Say what
+			// happened and how to finish, exactly as the id-unresolved branch above
+			// already does.
+			if ((err as { code?: string } | null)?.code === "23503") {
+				logger.error({ err, res_username: slug, plan_id: planId }, "platform_create_plan_assignment_failed");
+				res.status(400).json({
+					error: seeded
+						? `Unknown plan_id. Restaurant "${slug}" WAS created, but no plan could be assigned to it. Find it in the restaurant list, assign a plan, and set the owner password there — the temporary password from this request was not saved.`
+						: "Unknown plan_id",
+					...(seeded ? { restaurant_created: true, res_username: slug } : {}),
+				});
+				return;
+			}
+			if (seeded) {
+				// Same reasoning for every other late failure: the tenant exists.
+				logger.error({ err, res_username: slug }, "platform_create_restaurant_failed_after_seed");
+				res.status(500).json({
+					error: `Restaurant "${slug}" was created, but the rest of the setup failed. Find it in the restaurant list, check its plan, and set the owner password there — the temporary password from this request was not saved.`,
+					restaurant_created: true,
+					res_username: slug,
+				});
+				return;
+			}
+			logger.error({ err }, "platform_create_restaurant_failed");
+			res.status(500).json({ error: "Unable to create restaurant" });
+		}
+	});
+
 	app.get("/platform/restaurants/:id", requirePlatformAuth, async (req: Request, res: Response) => {
 		try {
 			const rows = await platformQuery(
@@ -406,12 +660,25 @@ export function registerPlatformRoutes(app: Express): void {
 	app.post("/platform/restaurants/:id/activate", requirePlatformAuth, async (req: Request, res: Response) => {
 		const resId = req.params.id!;
 		try {
+			// Refuse to lift an ARCHIVE. This write used to be unconditional, which
+			// meant the wrong button produced a tenant that is live and trading again
+			// while its subscription stays 'cancelled' — i.e. unbilled, and with no
+			// record of what its plan had been. Restore exists to undo both halves.
 			const rows = await platformQuery<{ id: string }>(
-				`update "Restaurant" set account_status = 'active' where id = $1 returning id`,
+				`update "Restaurant" set account_status = 'active'
+				  where id = $1 and coalesce(account_status, 'active') <> 'archived' returning id`,
 				[resId],
 			);
 			if (!rows[0]) {
-				res.status(404).json({ error: "Restaurant not found" });
+				const current = await platformQuery<{ account_status: string | null }>(
+					`select account_status from "Restaurant" where id = $1 limit 1`,
+					[resId],
+				);
+				if (!current[0]) {
+					res.status(404).json({ error: "Restaurant not found" });
+					return;
+				}
+				res.status(409).json({ error: "This restaurant is archived. Use Restore to bring it back." });
 				return;
 			}
 			await audit(req.platformAdmin!.adminId, "restaurant.activate", resId, null);
@@ -419,6 +686,294 @@ export function registerPlatformRoutes(app: Express): void {
 		} catch (err) {
 			logger.error({ err }, "platform_activate_failed");
 			res.status(500).json({ error: "Unable to activate restaurant" });
+		}
+	});
+
+	// --- Tenant removal: ARCHIVE, and its exact inverse ---------------------
+	//
+	// THERE IS NO DELETE ROUTE, AND THERE MUST NOT BE ONE. Every tenant table —
+	// "Orders", "Bills" (with their tax_breakdown), "Audit_logs",
+	// "Feedback_entries", "Customers", "Employees", "Outlets" — declares
+	// `res_id ... ON DELETE CASCADE` to "Restaurant"(id)
+	// (migrations/000_base_schema.sql:433-477). So `delete from "Restaurant"
+	// where id = $1` is one statement that erases a tenant's entire statutory
+	// financial history, irrecoverably. Removing a restaurant means this flag
+	// plus a cancelled subscription; not a single row is deleted or rewritten.
+	//
+	// Archive touches exactly TWO columns — "Restaurant".account_status and
+	// platform.subscriptions.status — which is the property that makes restore
+	// honest: it only has to put those two back.
+	app.post("/platform/restaurants/:id/archive", requirePlatformAuth, async (req: Request, res: Response) => {
+		const resId = req.params.id!;
+		const body = (req.body ?? {}) as Record<string, unknown>;
+		const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 500) : null;
+		try {
+			// RELEASE GATE. Nothing reads account_status = 'archived' until migration
+			// 028 replaces platform.restaurant_status; before that this route writes a
+			// flag that the login gate, the guest-write gate and the report sweep all
+			// ignore, so the console would say "Archived" while the tenant kept trading
+			// and kept taking QR orders. Refuse rather than lie — the full argument,
+			// and why the container deploy path does not apply it, is in platform/db.ts.
+			const support = await archivedStatusSupported();
+			if (!support.supported) {
+				logger.error({ res_id: resId, reason: support.reason }, "platform_archive_blocked_migration_028_missing");
+				res.status(503).json({
+					error: archivedStatusUnsupportedMessage(support.reason),
+					migration_required: "028_restaurant_archived_status.sql",
+				});
+				return;
+			}
+
+			const current = await platformQuery<{ account_status: string | null }>(
+				`select account_status from "Restaurant" where id = $1 limit 1`,
+				[resId],
+			);
+			if (!current[0]) {
+				res.status(404).json({ error: "Restaurant not found" });
+				return;
+			}
+
+			// Best-effort, on the tenant pool (the control plane cannot read "Bills").
+			// Runs BEFORE the transaction opens: it is a different pool, and holding a
+			// platform connection open across a tenant round trip would stretch the
+			// transaction for no benefit. Recorded because archiving mid-service
+			// strands an unsettled bill: the row stays open, the table stays occupied,
+			// and nobody can log in to settle it. NOT auto-settled — inventing a
+			// settlement for money that may never have been collected writes a false
+			// financial record, which is strictly worse.
+			let openBills: number | null = null;
+			try {
+				openBills = await CountOpenBillsForRestaurant(resId);
+			} catch (err) {
+				logger.warn({ err, res_id: resId }, "platform_archive_open_bills_unavailable");
+			}
+
+			// ONE CLIENT, ONE TRANSACTION. These writes used to be separate
+			// platformQuery calls, i.e. separate pooled connections. If the
+			// subscription cancel failed after the flag was written, the tenant was
+			// archived but still on a priced 'active' subscription — invoiced monthly
+			// forever — and no audit row existed, so restore had lost its recovery data
+			// too. The retry then short-circuited on "already archived" and repaired
+			// none of it. Now the flag, the cancel and the recovery row commit together
+			// or not at all.
+			const outcome = await withPlatformTransaction(async (tx) => {
+				// FOR UPDATE: two operators clicking Archive at the same moment would
+				// otherwise both read 'active' and both write a recovery row, and the
+				// second would record the POST-archive values ('archived' / 'cancelled')
+				// — destroying the only way back. The lock serialises them, so the
+				// second one sees 'archived' and takes the re-assertion branch below.
+				const locked = await tx<{ account_status: string | null }>(
+					`select account_status from "Restaurant" where id = $1 for update`,
+					[resId],
+				);
+				if (!locked[0]) { return { kind: "missing" as const }; }
+				const priorStatus = locked[0].account_status ?? "active";
+
+				const priorSub = await tx<{ status: string | null; plan_id: string | null }>(
+					`select status, plan_id from platform.subscriptions where res_id = $1 limit 1`,
+					[resId],
+				);
+
+				// The SAME statement restore reads, so the two can never disagree about
+				// which row is the recovery row. Its presence means a previous archive
+				// of this tenant committed and its pre-archive subscription status is
+				// already on record.
+				const recovery = await tx<{ detail: Record<string, unknown> | null }>(
+					`select detail from platform.audit
+					  where target_res_id = $1 and action = 'restaurant.archive'
+					  order by created_at desc limit 1`,
+					[resId],
+				);
+
+				// RE-ASSERTION, NOT A SHORT-CIRCUIT. An already-archived tenant with a
+				// recovery row is fully archived — but its subscription can have been
+				// moved off 'cancelled' since, because PUT /platform/restaurants/:id/
+				// subscription writes it without looking at account_status. That
+				// silently resumes invoicing a departed tenant, so re-cancel it.
+				// Deliberately WITHOUT a second recovery row: a second one would record
+				// 'archived' / 'cancelled' as the prior state and restore would then put
+				// the tenant back cancelled, i.e. still locked out.
+				if (priorStatus === "archived" && recovery.length > 0) {
+					const recancelled = await tx<{ res_id: string }>(CANCEL_SUBSCRIPTION_SQL, [resId]);
+					return { kind: "already" as const, subscription_recancelled: recancelled.length > 0 };
+				}
+
+				// Either a fresh archive, or a REPAIR: flagged 'archived' with no
+				// recovery row, which is exactly what a partial write (or a row flipped
+				// by hand) leaves behind. Repairing is sound because the two cases are
+				// the same situation — the cancel never happened, so the subscription
+				// still holds its genuine pre-archive status, and recording it now
+				// recovers precisely the information the failed attempt would have.
+				await tx(`update "Restaurant" set account_status = 'archived' where id = $1`, [resId]);
+				await tx<{ res_id: string }>(CANCEL_SUBSCRIPTION_SQL, [resId]);
+
+				// Written INSIDE the transaction, and NOT through audit() (which swallows
+				// its own failures), because for archive this row is not a log line — it
+				// is restore's only recovery data. If it cannot be written the archive
+				// must not commit: an unrecoverable archive is worse than a refused one.
+				await tx(
+					`insert into platform.audit (admin_id, action, target_res_id, detail) values ($1, $2, $3, $4)`,
+					[
+						req.platformAdmin!.adminId,
+						"restaurant.archive",
+						resId,
+						JSON.stringify({
+							reason,
+							prev_account_status: priorStatus,
+							prev_sub_status: priorSub[0]?.status ?? null,
+							prev_plan_id: priorSub[0]?.plan_id ?? null,
+							open_bills: openBills,
+							// Present only when this call finished a previous attempt's
+							// work, so the normal detail shape is untouched.
+							...(priorStatus === "archived" ? { repaired: true } : {}),
+						}),
+					],
+				);
+				return { kind: priorStatus === "archived" ? ("repaired" as const) : ("archived" as const) };
+			});
+
+			if (outcome.kind === "missing") {
+				res.status(404).json({ error: "Restaurant not found" });
+				return;
+			}
+
+			// AFTER the commit and outside it: revocation is Redis, not Postgres, so it
+			// cannot join the transaction. The ordering is still right — the flag is
+			// committed before the tokens are dropped, so a login racing the gap is
+			// already refused by routes/auth.ts. It is idempotent, and every branch runs
+			// it, because an archived tenant must never have a live session.
+			await destroyAllForRestaurant(resId);
+
+			if (outcome.kind === "already") {
+				res.json({
+					ok: true,
+					account_status: "archived",
+					already_archived: true,
+					open_bills: openBills,
+					subscription_recancelled: outcome.subscription_recancelled,
+				});
+				return;
+			}
+			res.json({
+				ok: true,
+				account_status: "archived",
+				open_bills: openBills,
+				...(outcome.kind === "repaired" ? { already_archived: true, repaired: true } : {}),
+			});
+		} catch (err) {
+			logger.error({ err }, "platform_archive_failed");
+			res.status(500).json({ error: "Unable to archive restaurant" });
+		}
+	});
+
+	// The inverse of archive. Restores to a KNOWN state, not a guessed one:
+	// blindly setting the subscription back to 'active' would resume billing for a
+	// tenant who left while on 'trial' or 'past_due'.
+	app.post("/platform/restaurants/:id/restore", requirePlatformAuth, async (req: Request, res: Response) => {
+		const resId = req.params.id!;
+		try {
+			// Same transaction argument as archive: putting account_status back while
+			// the subscription rollback lands on a different pooled connection can
+			// leave a tenant 'active' but still 'cancelled' — which
+			// platform.restaurant_status maps to 'suspended', so "restored" staff still
+			// cannot sign in. Both writes and the audit row move together.
+			const outcome = await withPlatformTransaction(async (tx) => {
+				const locked = await tx<{ account_status: string | null }>(
+					`select account_status from "Restaurant" where id = $1 for update`,
+					[resId],
+				);
+				if (!locked[0]) { return { kind: "missing" as const }; }
+				if (locked[0].account_status !== "archived") { return { kind: "not_archived" as const }; }
+
+				// audit() swallows its own insert failures elsewhere, and a row can
+				// predate this route, so the recovery row may legitimately be missing —
+				// degrade to "left cancelled, re-assign the plan" rather than throwing,
+				// which would strand the tenant archived with no way back.
+				const lastArchive = await tx<{ detail: Record<string, unknown> | null }>(
+					`select detail from platform.audit
+					  where target_res_id = $1 and action = 'restaurant.archive'
+					  order by created_at desc limit 1`,
+					[resId],
+				);
+				const prevSubStatus = lastArchive[0]?.detail?.["prev_sub_status"];
+
+				await tx(`update "Restaurant" set account_status = 'active' where id = $1`, [resId]);
+
+				let restoredSubStatus: string | null = null;
+				if (typeof prevSubStatus === "string" && SUBSCRIPTION_STATUSES.has(prevSubStatus)) {
+					// `and status = 'cancelled'` so a subscription an operator re-assigned
+					// while the tenant was archived is never clobbered by this rollback.
+					const restored = await tx<{ status: string }>(
+						`update platform.subscriptions set status = $2, updated_at = now()
+						  where res_id = $1 and status = 'cancelled' returning status`,
+						[resId, prevSubStatus],
+					);
+					restoredSubStatus = restored[0]?.status ?? null;
+				}
+
+				// The tenant is un-archived either way. Whether it can actually TRADE
+				// depends on where its subscription ended up, because
+				// platform.restaurant_status maps 'cancelled' / 'suspended' / 'expired'
+				// to a non-active status and the login gate refuses all of them. Read it
+				// back and say so plainly, rather than answering a bare
+				// `subscription_status: null` that reads as "nothing to do" — the
+				// degraded case is a tenant marked Active in the console whose staff
+				// still cannot sign in, with no signal anywhere that a plan must be
+				// re-assigned.
+				const live = await tx<{ status: string | null }>(
+					`select status from platform.subscriptions where res_id = $1 limit 1`,
+					[resId],
+				);
+				const liveStatus = live[0]?.status ?? null;
+				const blocked = liveStatus !== null && LOGIN_BLOCKING_SUBSCRIPTION_STATUSES.has(liveStatus);
+
+				// Sessions are NOT restored — the tenant's staff sign in again.
+				await tx(
+					`insert into platform.audit (admin_id, action, target_res_id, detail) values ($1, $2, $3, $4)`,
+					[
+						req.platformAdmin!.adminId,
+						"restaurant.restore",
+						resId,
+						JSON.stringify({ restored_sub_status: restoredSubStatus }),
+					],
+				);
+				return {
+					kind: "restored" as const,
+					restoredSubStatus,
+					subscriptionStatus: liveStatus,
+					requiresPlanAssignment: blocked,
+				};
+			});
+
+			if (outcome.kind === "missing") {
+				res.status(404).json({ error: "Restaurant not found" });
+				return;
+			}
+			if (outcome.kind === "not_archived") {
+				res.status(409).json({ error: "This restaurant is not archived. Use Activate to lift a suspension." });
+				return;
+			}
+			res.json({
+				ok: true,
+				account_status: "active",
+				// Unchanged field, unchanged meaning: the status this call ROLLED BACK,
+				// or null when it rolled nothing back.
+				subscription_status: outcome.restoredSubStatus,
+				// New, and the point of the two below: what the subscription actually is
+				// now, and whether that leaves the tenant locked out.
+				current_subscription_status: outcome.subscriptionStatus,
+				requires_plan_assignment: outcome.requiresPlanAssignment,
+				...(outcome.requiresPlanAssignment
+					? {
+						warning:
+							`This restaurant is no longer archived, but its subscription is '${String(outcome.subscriptionStatus)}', ` +
+							"so its staff still cannot sign in. Assign a plan to finish restoring it.",
+					}
+					: {}),
+			});
+		} catch (err) {
+			logger.error({ err }, "platform_restore_failed");
+			res.status(500).json({ error: "Unable to restore restaurant" });
 		}
 	});
 
@@ -509,9 +1064,8 @@ export function registerPlatformRoutes(app: Express): void {
 		const resId = req.params.id!;
 		const body = (req.body ?? {}) as Record<string, unknown>;
 		const status = typeof body.status === "string" ? body.status.trim() : "active";
-		const allowed = new Set(["trial", "active", "past_due", "suspended", "cancelled", "expired"]);
-		if (!allowed.has(status)) {
-			res.status(400).json({ error: `invalid status; one of ${[...allowed].join(", ")}` });
+		if (!SUBSCRIPTION_STATUSES.has(status)) {
+			res.status(400).json({ error: `invalid status; one of ${[...SUBSCRIPTION_STATUSES].join(", ")}` });
 			return;
 		}
 		try {
@@ -673,12 +1227,16 @@ export function registerPlatformRoutes(app: Express): void {
 		}
 		try {
 			const rows = await platformQuery<{
-				total: number; active: number; suspended: number; new_this_week: number;
+				total: number; active: number; suspended: number; archived: number; new_this_week: number;
 			}>(
+				// `archived` is counted explicitly: without it those tenants land in
+				// `total` and in neither bucket, so the fleet numbers stop adding up the
+				// first time an operator archives someone.
 				`select
 				   count(*)::int as total,
 				   count(*) filter (where coalesce(account_status, 'active') = 'active')::int as active,
 				   count(*) filter (where account_status = 'suspended')::int as suspended,
+				   count(*) filter (where account_status = 'archived')::int as archived,
 				   count(*) filter (where created_at > now() - interval '7 days')::int as new_this_week
 				 from "Restaurant"`,
 			);

@@ -5,7 +5,7 @@ import type { Express, Request, Response } from "express";
 import { AddAggregatorOrder, AddNotification, Audit_log_category, GenerateAggregatorKey, GetRestaurantIdByAggregatorKey, withTenant } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
-import { enforceAdmin, extractRestaurantId, log_audit, rateLimit, safeClientError, validate } from "./_shared.js";
+import { enforceAdmin, extractRestaurantId, log_audit, rateLimit, restaurantAcceptsGuestWrites, safeClientError, validate } from "./_shared.js";
 
 
 export function registerAggregatorRoutes(app: Express): void {
@@ -34,6 +34,19 @@ app.post('/aggregator/order', rateLimit("aggregator", 120, 60_000), async (req: 
 	let resId: string | null = null;
 	try { resId = await GetRestaurantIdByAggregatorKey(key); } catch { resId = null; }
 	if (!resId) { res.status(401).json({ error: "Invalid aggregator key" }); return; }
+	// The same write gate the guest QR surface uses (routes/_shared.ts). Without
+	// it, an ARCHIVED restaurant's Swiggy/Zomato middleware keeps injecting orders
+	// into a kitchen nobody can sign in to — the key is still valid, so the intake
+	// never stops on its own.
+	//
+	// 403 rather than the guest surface's 404: the caller here is a partner
+	// integration with a valid credential, not a stranger with a printed QR. It has
+	// logs and an operator, so a diagnosable refusal is worth more than the
+	// discretion a 404 buys a departed restaurant in front of its own customers.
+	if (!(await restaurantAcceptsGuestWrites(resId))) {
+		res.status(403).json({ error: "This restaurant is not accepting orders." });
+		return;
+	}
 	const source = body.source === "zomato" ? "zomato" : body.source === "swiggy" ? "swiggy" : null;
 	const externalId = typeof body.external_id === "string" || typeof body.external_id === "number" ? String(body.external_id).trim() : "";
 	const items = Array.isArray(body.items) ? body.items : [];

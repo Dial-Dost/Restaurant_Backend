@@ -24835,6 +24835,27 @@ export async function GetRestaurantAccountStatus(resId: string): Promise<string>
   }
 }
 
+// How many bills a restaurant currently has OPEN — a table still trading, whose
+// money has not been collected. The operator console reads this before archiving
+// a tenant, because archiving revokes every login: an open bill at that moment is
+// stranded, and the floor state freezes with it. Same predicate the POS uses for
+// "the single open bill for this table" (:3038) — status 3 is voided, closed_at
+// is stamped at settlement.
+//
+// Runs on the TENANT pool: platform_runtime holds no grant on "Bills" and RLS is
+// fail-closed there, so the control plane cannot count these on its own
+// connection. res_id-scoped with an empty outlet_id is correct here — this counts
+// the whole restaurant, and RLS keys solely on app.res_id.
+export async function CountOpenBillsForRestaurant(resId: string): Promise<number> {
+  return withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
+    const rows = await runQuery<{ n: number }>(
+      `select count(*)::int as n from "Bills" where res_id = $1 and status != 3 and closed_at is null`,
+      [resId],
+    );
+    return Number(rows[0]?.n ?? 0);
+  });
+}
+
 export interface RestaurantPlan {
   features: Record<string, unknown>;
   limits: Record<string, unknown>;
