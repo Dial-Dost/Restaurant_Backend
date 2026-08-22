@@ -26,6 +26,13 @@
 #      `csrorganics` is a real restaurant. Use an obviously-throwaway value.
 #   3. Every database URL in this file must point at a service container or a
 #      compose container that is destroyed when the job ends.
+#   4a. `.github/workflows/deploy.yml` INVOKES this file via `workflow_call` and
+#      will not deploy unless every job here is green. Adding that trigger is the
+#      only change deploy.yml made to this file — no job, env value or command
+#      below was altered, and the zero-secrets property is unchanged: a reusable
+#      workflow does not inherit the caller's `environment` secrets, so the
+#      production deploy key stays invisible to everything in this file. If you
+#      remove `workflow_call:` from the trigger list, the deploy pipeline breaks.
 #   4. NEVER set NODE_ENV=test or NODE_ENV=development for the compose stack.
 #      Dockerfile.node:41 bakes NODE_ENV=production, and that is the ONLY thing
 #      currently disabling the demo seed:
@@ -42,6 +49,12 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # Lets deploy.yml run this exact suite as the gate in front of a production
+  # deploy, instead of forking or re-implementing it. Purely additive: no job
+  # below behaves differently, and `github.event_name` is still the CALLER's
+  # event (`push`), so the opt-in step at the bottom of the `docker` job stays
+  # off exactly as it does today.
+  workflow_call:
   # Manual runs only, so the opt-in valet/feedback HTTP tests in the `docker`
   # job below can be exercised deliberately. They never run automatically.
   workflow_dispatch:
@@ -95,7 +108,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
 
       - name: Install
@@ -109,6 +122,26 @@ jobs:
       # this step exists for the fast, unambiguous signal.)
       - name: Money invariants (bill totals vs report readers)
         run: npm run test:money
+
+      # Express matches routes in REGISTRATION ORDER, so reordering two routes,
+      # or letting a broad path shadow a narrow one, is a silent behaviour change
+      # that no unit test sees. scripts/route_manifest.ts re-derives the live
+      # order from source and diffs it against the committed baseline; exit 2
+      # means drift (its own docblock, line 69). Until now it was run by hand,
+      # which means it was run when someone remembered to.
+      #
+      # Sits here with the other fast signals for the same reason test:money
+      # does: it needs neither a database nor Docker. It never imports, boots or
+      # executes the app, opens no socket and touches no database — it only
+      # parses source — so it cannot be masked by an unreachable DB or a docker
+      # problem, and it fails in seconds.
+      #
+      # If this fails and the route change was INTENTIONAL, regenerate the
+      # baseline deliberately and review the diff:
+      #     npx tsx scripts/route_manifest.ts --out scripts/route_manifest.baseline.txt
+      # (--out is the form the script itself documents at scripts/route_manifest.ts:63)
+      - name: Route manifest (Express registration order must not drift)
+        run: npm run test:routes
 
       - name: Typecheck
         run: npm run build

@@ -22,6 +22,7 @@
     "test:feedback_api": "tsx test/feedback_api_test.ts",
     "test:password": "tsx test/password_hashing_test.ts",
     "test:isolation": "tsx test/tenant_isolation_test.ts",
+    "test:routes": "tsx scripts/route_manifest.ts --check scripts/route_manifest.baseline.txt",
     "platform:create-admin": "tsx scripts/create-platform-admin.ts",
     "push:vapid-keys": "tsx scripts/generate-vapid-keys.ts",
     "migrate": "tsx scripts/migrate.ts",
