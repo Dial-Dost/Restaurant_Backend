@@ -1,0 +1,813 @@
+# =============================================================================
+# Deploy (production) — Restaurant_Backend
+#
+# Push to main -> CI (incl. the route-manifest gate) -> Gate A (does this push
+# add SQL?) -> build both images -> push to GHCR -> move the :prod tag -> ask
+# the VPS wrapper to converge -> poll -> restore the tag and roll back if it
+# does not come back.
+#
+# THE PUSH TRIGGER IS NOT ENABLED IN THIS COMMIT. This file is
+# workflow_dispatch-only until a second, trigger-only commit — see the `on:`
+# block below for why and for what has to happen first.
+#
+# READ THIS BEFORE EDITING — the server side is fixed and this file must match it
+# -----------------------------------------------------------------------------
+# The CI identity can cause EXACTLY ONE program to run on the box:
+# /usr/local/sbin/rd-deploy (root-owned 0755, granted by a wildcard-free sudoers
+# line). Its ENTIRE vocabulary is:
+#
+#     rd-deploy status                 -> docker compose ps
+#     rd-deploy logs [service]         -> docker compose logs --tail 100
+#     rd-deploy check-migrations       -> reports pending migrations, applies none
+#     rd-deploy deploy [service]       -> exit 65 if a migration is pending, else
+#                                         docker compose up -d [service]
+#     rd-deploy rollback [service]     -> docker compose up -d --force-recreate
+#
+# Any other first argument exits 64. `service` must be one of
+# backend | dashboard | python | valkey | (omitted). There are NO digest
+# arguments, NO --git-sha, NO --force-window, NO file paths and NO image
+# reference of any kind. Add one and the wrapper answers 64.
+#
+# HOW NEW CODE ACTUALLY REACHES THE BOX
+# -----------------------------------------------------------------------------
+# The wrapper only runs `compose up -d`, so it deploys whatever the compose file
+# on the box already references. The box has no git access, the compose file is
+# not in git, and the wrapper takes no path. The registry is therefore the only
+# transport, and the deployment pointer is a TAG:
+#
+#     /opt/restaurant-dash/docker-compose.yml must reference
+#         backend:  image: ghcr.io/dial-dost/restaurant_backend:prod
+#         python:   image: ghcr.io/dial-dost/restaurant_python:prod
+#     and BOTH services must carry  pull_policy: always
+#
+# This workflow owns that tag. It pushes an immutable digest, re-points :prod at
+# it, then asks the wrapper to converge. `pull_policy: always` is the load-bearing
+# half: without it `compose up -d` reuses the image already on disk and this
+# pipeline is a silent no-op that still reports green. The "was it actually
+# recreated?" assertion below exists to catch exactly that.
+#
+# Because CI owns the tag, rollback is real even though `rd-deploy rollback` is
+# only `up -d --force-recreate`: we re-point :prod back to the previous digest
+# FIRST, then ask for the force-recreate. Every failure path restores the tag, so
+# :prod always names what production is running.
+#
+# THIS WORKFLOW NEVER APPLIES A MIGRATION and holds no database credential.
+# See deploy/vps/README.md for secrets, outstanding server setup, manual deploys
+# and manual rollback.
+# =============================================================================
+name: Deploy (production)
+
+# TRIGGER — DELIBERATELY workflow_dispatch ONLY IN THIS COMMIT.
+#
+# The push trigger:
+#
+#     push:
+#       branches: [main]
+#
+# is added back in a SECOND, trigger-only commit, once BOTH of these are true:
+#
+#   1. the outstanding server-side steps in deploy/vps/README.md are finished
+#      (forced command installed, compose following :prod with pull_policy:
+#      always, GHCR login, .env.migrate) — install.sh exits 0 on the box; and
+#   2. one dispatched deploy has been watched end to end BY HAND, outside
+#      service hours, and the stack came back healthy.
+#
+# Enabling push here would make the merge commit that lands this file the first
+# live exercise of a path nobody has ever run: no dry run, at whatever time of
+# day the merge happens, against restaurants taking orders. Dispatch-only means
+# a human picks the moment.
+#
+# Nothing downstream depends on the event type. `concurrency`, the job graph and
+# every `needs:` behave identically on a dispatched run; Gate A below already
+# detects a non-push event and skips, deferring to the authoritative server-side
+# gate (exit 65), which still runs.
+on:
+  workflow_dispatch:
+
+# Never cancel a deploy mid-flight. A newer push queues behind the running one.
+# NOTE: concurrency groups are PER-REPOSITORY. This cannot serialise a backend
+# deploy against a Restaurant_Dashboard_UI deploy. See deploy/vps/README.md,
+# "Cross-repo ordering", for what that costs and what the dashboard does about it.
+concurrency:
+  group: production-deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BACKEND_REPO: ghcr.io/dial-dost/restaurant_backend
+  PYTHON_REPO: ghcr.io/dial-dost/restaurant_python
+  PROD_TAG: prod
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The existing CI suite, unchanged and not forked: money invariants, typecheck,
+  # unit tests, the route-manifest gate (npm run test:routes), migration chain +
+  # tenant isolation, real-Postgres integration tests, container smoke test.
+  # It runs on Node 22 and holds no secret. Do not weaken it here.
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  # ---------------------------------------------------------------------------
+  # Build BOTH production images and push them to GHCR by digest.
+  #
+  # Building here rather than on the box is what makes rollback cheap: rolling
+  # back becomes re-pointing a tag, not a `tsc` build on a 2-vCPU box at the exact
+  # moment the site is down. It also keeps the tested artifact and the deployed
+  # artifact the same bytes.
+  #
+  # :sha-<commit> is immutable provenance. :main is only a BuildKit cache hint.
+  # Neither is what production follows — that is :prod, moved in the deploy job.
+  # ---------------------------------------------------------------------------
+  build_push:
+    name: Build and push images
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      backend_digest: ${{ steps.build.outputs.backend_digest }}
+      python_digest: ${{ steps.build.outputs.python_digest }}
+    steps:
+      # SHA-PINNED. This job builds the bytes that ship to production, so a
+      # third-party action here is arbitrary code inside the image. `v4` is a
+      # LIGHTWEIGHT, force-moved tag: whoever can move it can change what this
+      # job runs. Pin the commit; keep the human-readable version in the
+      # comment. Bump both together, never one.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Build and push restaurant_backend and restaurant_python
+        id: build
+        env:
+          DOCKER_BUILDKIT: '1'
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Everything except the final digest goes to stderr, so the function's
+          # stdout is exactly one line and safe to capture.
+          build_and_push () {
+            local repo="$1" dockerfile="$2" digest cache=()
+            if docker pull -q "$repo:main" >/dev/null 2>&1; then
+              cache=(--cache-from "$repo:main")
+            fi
+            docker build \
+              --file "$dockerfile" \
+              --build-arg BUILDKIT_INLINE_CACHE=1 \
+              "${cache[@]}" \
+              --label "org.opencontainers.image.revision=$SHA" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              --tag "$repo:sha-$SHA" \
+              --tag "$repo:main" \
+              . >&2
+            docker push "$repo:sha-$SHA" >&2
+            docker push "$repo:main" >&2
+            digest="$(docker image inspect "$repo:sha-$SHA" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+            case "$digest" in
+              sha256:*) ;;
+              *) echo "could not resolve a registry digest for $repo:sha-$SHA (got '$digest')" >&2; return 1 ;;
+            esac
+            printf '%s' "$digest"
+          }
+
+          BACKEND_DIGEST="$(build_and_push "$BACKEND_REPO" Dockerfile.node)"
+          PYTHON_DIGEST="$(build_and_push "$PYTHON_REPO" Dockerfile.python)"
+
+          echo "backend_digest=$BACKEND_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "python_digest=$PYTHON_DIGEST" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Images built (not yet deployed — :prod still points elsewhere)"
+            echo
+            echo '```'
+            echo "$BACKEND_REPO@$BACKEND_DIGEST"
+            echo "$PYTHON_REPO@$PYTHON_DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # GATE A — zero-credential pending-migration check.
+  #
+  # Does THIS push carry SQL? If so, refuse BEFORE the :prod tag moves and before
+  # any SSH connection is opened. This gate holds no database URL and makes no
+  # network call; it is a git diff.
+  #
+  # It runs AFTER build_push on purpose: the migration has to be applied from the
+  # image that carries it (migrations/ is baked into Dockerfile.node), so the
+  # operator needs the new digest in the instructions. Gating earlier would name
+  # an image that does not exist yet.
+  #
+  # It cannot see a migration added in an earlier push that nobody applied. That
+  # is what the server-side gate (exit 65) is for. Two gates on purpose: this one
+  # is cheap, that one is true.
+  # ---------------------------------------------------------------------------
+  migration_gate:
+    name: Pending migration gate (Gate A)
+    needs: build_push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Refuse to deploy a push that carries a migration
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          BACKEND_DIGEST: ${{ needs.build_push.outputs.backend_digest }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" != "push" ]; then
+            echo "Gate A skipped: this is a $EVENT run, which has no previous commit to diff."
+            echo "This is also the intended way to RE-RUN a deploy after applying a migration"
+            echo "by hand. The server-side gate is authoritative and still runs."
+            exit 0
+          fi
+          if [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "::notice::Gate A skipped (no previous commit recorded). Server-side gate still applies."
+            exit 0
+          fi
+          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "::notice::Gate A skipped ($BEFORE is not in this clone — force-push or squash). Server-side gate still applies."
+            exit 0
+          fi
+
+          CHANGED="$(git diff --name-only --diff-filter=ACMR "$BEFORE" "$AFTER" -- migrations/ | grep -E '\.sql$' || true)"
+          if [ -z "$CHANGED" ]; then
+            echo "No migration files changed in this push."
+            exit 0
+          fi
+
+          {
+            echo "## Deploy refused: this push carries migration SQL"
+            echo
+            echo "Migrations are a **manual release step** on this project. The production"
+            echo "database has no PITR, so nothing in this pipeline will ever apply schema"
+            echo "changes for you. Nothing was deployed and \`:prod\` has NOT been moved."
+            echo
+            echo "Files added or changed by this push:"
+            echo
+            echo '```'
+            echo "$CHANGED"
+            echo '```'
+            echo
+            echo "SSH to the VPS and, **as root**, apply the migration from the image this run"
+            echo "built — \`migrations/\` is baked into the image, so running it from the"
+            echo "currently-deployed image would apply the OLD file set:"
+            echo
+            echo '```sh'
+            echo "docker run --rm --env-file /opt/restaurant-dash/.env.migrate \\"
+            echo "    $BACKEND_REPO@$BACKEND_DIGEST \\"
+            echo "    npm run migrate"
+            echo '```'
+            echo
+            echo "Watch it finish. Then re-run this workflow from the **Actions tab**"
+            echo "(Run workflow) — a \`workflow_dispatch\` run skips Gate A, which is exactly"
+            echo "why it exists; re-running the *push* would just fail here again."
+            echo
+            echo "See \`docs/DEPLOY_ORDER.md\` and \`deploy/vps/README.md\` (Applying a migration)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::Pending migration(s) in this push — deploy refused, :prod untouched. Apply them manually, then re-run this workflow from the Actions tab. Files:"
+          echo "$CHANGED"
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # The only job that can see a secret.
+  #
+  # `environment: production` is the single highest-value control in this design.
+  # Environment secrets are not readable by a run on a feature branch or a pull
+  # request; repository secrets are. Configure the environment with deployment
+  # branch = main only. See deploy/vps/README.md.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to production VPS
+    needs: [build_push, migration_gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Configure SSH (host key pinned; never StrictHostKeyChecking=no)
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
+            echo "::error::secret DEPLOY_SSH_KEY is not set on the 'production' environment."
+            exit 1
+          fi
+          if [ -z "${SSH_KNOWN_HOSTS:-}" ]; then
+            echo "::error::variable SSH_KNOWN_HOSTS is not set. Refusing to connect without a pinned host key — disabling host verification would let anyone on the runner's network path collect the deploy key."
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Log in to GHCR (needed to read and move the :prod tag)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Move :prod, converge the stack, verify, roll back on failure
+        id: deploy
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          PUBLIC_HEALTH_URL: ${{ vars.PUBLIC_HEALTH_URL }}
+          BACKEND_DIGEST: ${{ needs.build_push.outputs.backend_digest }}
+          PYTHON_DIGEST: ${{ needs.build_push.outputs.python_digest }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          # GitHub runs `run:` blocks as `bash -e {0}`, so errexit is ON unless it
+          # is explicitly turned off — and `set -uo pipefail` does NOT turn it off.
+          # This whole step is built around inspecting exit codes (65 = pending
+          # migration, 64 = bad arguments, 255 = ssh transport). With errexit left
+          # on, the first `rd ...` that returns non-zero would kill the step before
+          # a single line of that handling ran, and every failure would surface as
+          # a bare "Process completed with exit code 65".
+          set +e
+          : "${DEPLOY_HOST:?variable DEPLOY_HOST is not set}"
+          : "${DEPLOY_USER:?variable DEPLOY_USER is not set}"
+          PORT="${DEPLOY_PORT:-22}"
+
+          HEALTH_TIMEOUT=210     # Dockerfile.node start-period is 40s, plus pull, plus margin
+          HEALTH_INTERVAL=6
+
+          # -------------------------------------------------------------------
+          # The ONLY way this workflow talks to the box. Every call must be a
+          # sentence the wrapper's grammar accepts or it comes back 64. ssh itself
+          # returns 255 on a transport failure; that is not a wrapper exit code
+          # and must never be mistaken for one.
+          # -------------------------------------------------------------------
+          rd () {
+            ssh -i ~/.ssh/id_deploy \
+                -o IdentitiesOnly=yes \
+                -o StrictHostKeyChecking=yes \
+                -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+                -o BatchMode=yes \
+                -o ConnectTimeout=20 \
+                -p "$PORT" \
+                "$DEPLOY_USER@$DEPLOY_HOST" \
+                "$@"
+          }
+
+          summary () { printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; }
+          block () { summary ''; summary '```'; cat "$1" >> "$GITHUB_STEP_SUMMARY"; summary '```'; summary ''; }
+          fail () { local code="$1"; shift; echo "::error::$*"; exit "$code"; }
+
+          # ---- exit 127 -------------------------------------------------------
+          # 127 is NOT one of rd-deploy's codes (64 / 65) and NOT ssh's transport
+          # code (255). It is a LOGIN SHELL's "command not found": ssh
+          # authenticated, got a session, and tried to run a program literally
+          # named `check-migrations` / `deploy` / `status`. That is what happens
+          # while the SSH forced command is not yet in place — either
+          # /home/deploy/.ssh/authorized_keys is missing its
+          # command="/usr/local/sbin/rd-entry" prefix, or rd-entry itself is
+          # absent or not executable. The wrapper is never reached, so nothing on
+          # the box was inspected and nothing was changed.
+          #
+          # It needs a case of its own EVERYWHERE an rd exit code is read.
+          # Without one it lands in a generic non-zero branch and, at the first
+          # call site, gets printed under a PENDING MIGRATION heading — a flat
+          # misdiagnosis that sends someone hunting a migration that does not
+          # exist while the real fault is that the server side was never
+          # finished.
+          not_installed () { # "<the rd sentence that came back 127>"
+            summary "## Deploy aborted — the deploy account is not locked down yet (exit 127)"
+            summary ""
+            summary "\`ssh $DEPLOY_USER@$DEPLOY_HOST $1\` returned **127 = command not found**. That is"
+            summary "the login shell's exit code, not one of \`rd-deploy\`'s: the SSH forced command is"
+            summary "not installed, so sshd ran \`$1\` as a program name and no such program exists."
+            summary ""
+            summary "**Nothing is known about migrations from this run** — the question was never"
+            summary "asked. Nothing on the box was changed."
+            summary ""
+            summary "Finish the server side, as root on the VPS:"
+            summary ""
+            summary '```sh'
+            summary "scp -r deploy/vps root@<host>:/tmp/rd-vps"
+            summary "ssh root@<host> 'bash /tmp/rd-vps/install.sh /tmp/rd-vps/ci-deploy.pub'"
+            summary '```'
+            summary ""
+            summary "Then prove it from your workstation before re-running this workflow:"
+            summary ""
+            summary '```sh'
+            summary "ssh -i ci-deploy $DEPLOY_USER@<host> status     # should print compose ps"
+            summary "ssh -i ci-deploy $DEPLOY_USER@<host>            # MUST be refused (no shell)"
+            summary '```'
+            summary ""
+            summary "If the forced command IS installed, then \`rd-deploy\` itself hit a missing binary"
+            summary "inside the wrapper — run \`sudo -n /usr/local/sbin/rd-deploy status\` on the box."
+            summary ""
+            summary "See \`deploy/vps/README.md\`, *The exact authorized_keys line*, and"
+            summary "\`deploy/vps/install.sh\`."
+          }
+
+          # ---- registry helpers ----------------------------------------------
+          # :prod is the deployment pointer. Reading it BEFORE moving it is the
+          # only rollback target that exists — the wrapper keeps no history.
+          tag_digest () { # repo -> sha256:... or empty when the tag does not exist
+            local d
+            d="$(docker buildx imagetools inspect "$1:$PROD_TAG" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+            case "$d" in
+              sha256:*) printf '%s' "$d" ;;
+              *) printf '' ;;
+            esac
+          }
+          point_tag () { # repo digest
+            echo "  $1:$PROD_TAG -> $2"
+            docker buildx imagetools create --tag "$1:$PROD_TAG" "$1@$2"
+          }
+
+          PREV_BACKEND="$(tag_digest "$BACKEND_REPO")"
+          PREV_PYTHON="$(tag_digest "$PYTHON_REPO")"
+          FIRST_RUN=0
+          if [ -z "$PREV_BACKEND" ] || [ -z "$PREV_PYTHON" ]; then FIRST_RUN=1; fi
+
+          echo "previous :prod  backend=${PREV_BACKEND:-<none>}  python=${PREV_PYTHON:-<none>}"
+          echo "new             backend=$BACKEND_DIGEST  python=$PYTHON_DIGEST"
+
+          restore_tags () {
+            if [ "$FIRST_RUN" -eq 1 ]; then
+              echo "No previous :prod digest existed — nothing to restore."
+              return 0
+            fi
+            echo "Restoring :prod to the previous digests."
+            point_tag "$BACKEND_REPO" "$PREV_BACKEND" || return 1
+            point_tag "$PYTHON_REPO" "$PREV_PYTHON" || return 1
+          }
+
+          # ---- status parsing --------------------------------------------------
+          # `rd-deploy status` is `docker compose ps`. That is the whole signal
+          # available to CI: the wrapper exposes no health endpoint and no digest.
+          # A service missing from `compose ps` is a service that is down.
+          svc_line () { grep -E "(^|[[:space:]])$1([[:space:]]|\$)" "$2" | head -n1 || true; }
+
+          # 0 healthy | 1 still starting | 2 definitely broken | 3 absent
+          svc_verdict () {
+            local line
+            line="$(svc_line "$1" "$2")"
+            if [ -z "$line" ]; then return 3; fi
+            case "$line" in
+              *"(unhealthy)"*)                return 2 ;;
+              *Restarting*|*restarting*)      return 2 ;;
+              *Exit*|*exited*|*Dead*|*dead*)  return 2 ;;
+              *"(healthy)"*)                  return 0 ;;
+              *"health: starting"*)           return 1 ;;
+              *Up*|*running*)                 return 0 ;;   # no HEALTHCHECK declared
+              *)                              return 1 ;;
+            esac
+          }
+
+          wait_healthy () {
+            local deadline=$(( SECONDS + HEALTH_TIMEOUT )) svc rc all_ok src
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              rd status > status.txt 2>&1; src=$?
+              if [ "$src" -ne 0 ]; then
+                # 127 is the login shell, not the wrapper. Retrying for
+                # HEALTH_TIMEOUT seconds cannot make an uninstalled forced
+                # command appear, and burning the whole budget on it hides the
+                # cause behind a "did not become healthy" timeout.
+                if [ "$src" -eq 127 ]; then
+                  echo "  'status' came back 127 (command not found): the SSH forced command is not installed, so polling can never succeed. Not retrying."
+                  sed -n '1,40p' status.txt
+                  return 1
+                fi
+                echo "  (status call failed with $src; retrying)"
+                sleep "$HEALTH_INTERVAL"; continue
+              fi
+              all_ok=1
+              for svc in "$@"; do
+                svc_verdict "$svc" status.txt; rc=$?
+                case "$rc" in
+                  0) ;;
+                  2) echo "  service '$svc' is broken:"; sed -n '1,40p' status.txt; return 1 ;;
+                  3) echo "  service '$svc' is not in 'compose ps' at all:"; sed -n '1,40p' status.txt; return 1 ;;
+                  *) all_ok=0 ;;
+                esac
+              done
+              if [ "$all_ok" -eq 1 ]; then return 0; fi
+              sleep "$HEALTH_INTERVAL"
+            done
+            echo "  services did not become healthy within ${HEALTH_TIMEOUT}s:"
+            sed -n '1,40p' status.txt
+            return 1
+          }
+
+          # A container that was NOT recreated has a long uptime in `compose ps`.
+          # That is the one observable proof that `pull_policy: always` is present
+          # in the compose file. Without it, `up -d` reuses the local image and
+          # this pipeline is a silent no-op that still reports green.
+          assert_recreated () {
+            local line n unit
+            line="$(svc_line "$1" "$2")"
+            if ! printf '%s' "$line" | grep -qE 'Up (Less than a second|About a minute|[0-9]+ (second|minute|hour|day|week|month)s?)'; then
+              echo "::warning::could not parse an uptime for '$1' out of 'compose ps'; skipping the recreation assertion."
+              return 0
+            fi
+            if printf '%s' "$line" | grep -qE 'Up (Less than a second|[0-9]+ seconds?|About a minute)'; then
+              return 0
+            fi
+            n="$(printf '%s' "$line" | sed -nE 's/.*Up ([0-9]+) (second|minute|hour|day|week|month)s?.*/\1/p')"
+            unit="$(printf '%s' "$line" | sed -nE 's/.*Up [0-9]+ (second|minute|hour|day|week|month)s?.*/\1/p')"
+            if [ "$unit" = minute ] && [ -n "$n" ] && [ "$n" -le 5 ]; then return 0; fi
+            echo "::error::service '$1' reports '$(printf '%s' "$line" | grep -oE 'Up [^(]*')' — it was NOT recreated by this deploy."
+            echo "::error::Almost certainly /opt/restaurant-dash/docker-compose.yml is missing 'pull_policy: always' on this service, so 'docker compose up -d' reused the image already on disk and your new code did not ship. See deploy/vps/README.md, 'Switch compose to follow the :prod tag'."
+            return 1
+          }
+
+          # ====================================================================
+          # 1. Move the deployment pointer.
+          # ====================================================================
+          echo "== moving the :prod tag"
+          if ! point_tag "$BACKEND_REPO" "$BACKEND_DIGEST"; then
+            fail 1 "could not move $BACKEND_REPO:$PROD_TAG. Nothing was deployed."
+          fi
+          if ! point_tag "$PYTHON_REPO" "$PYTHON_DIGEST"; then
+            restore_tags || true
+            fail 1 "could not move $PYTHON_REPO:$PROD_TAG. Tags restored; nothing was deployed."
+          fi
+
+          # ====================================================================
+          # 2. Ask the server for the authoritative migration state.
+          #    `check-migrations` applies nothing — that is the whole point.
+          # ====================================================================
+          echo "== rd-deploy check-migrations"
+          rd check-migrations > migrations.txt 2>&1
+          mrc=$?
+          cat migrations.txt
+          if [ "$mrc" -eq 255 ]; then
+            restore_tags || true
+            summary "### SSH transport failure"; block migrations.txt
+            fail 1 "could not reach $DEPLOY_USER@$DEPLOY_HOST:$PORT. Tags restored; nothing was deployed."
+          fi
+          if [ "$mrc" -eq 127 ]; then
+            # MUST stay above the generic non-zero branch below, which announces
+            # a PENDING MIGRATION. 127 means the question was never asked.
+            restore_tags || true
+            not_installed "check-migrations"
+            summary "What came back instead:"
+            block migrations.txt
+            fail 127 "EXIT 127 = COMMAND NOT FOUND — NOT a pending migration. The SSH forced command (/usr/local/sbin/rd-entry) is not installed on $DEPLOY_HOST, so 'check-migrations' was run as a shell command and no such program exists. The wrapper was never reached. Tags restored; nothing was deployed. Finish deploy/vps/install.sh on the box — see the job summary."
+          fi
+          if [ "$mrc" -ne 0 ]; then
+            restore_tags || true
+            summary "## Deploy refused — the production database has pending migration(s)"
+            summary ""
+            summary "\`rd-deploy check-migrations\` exited $mrc. Its output:"
+            block migrations.txt
+            summary "Nothing was deployed and \`:prod\` has been restored to the previous digest."
+            summary ""
+            summary "Apply them yourself, **as root on the VPS**, from the image this run built —"
+            summary "\`migrations/\` is baked into the image, so running it from the currently"
+            summary "deployed image would apply the OLD file set:"
+            summary ""
+            summary '```sh'
+            summary "docker run --rm --env-file /opt/restaurant-dash/.env.migrate \\"
+            summary "    $BACKEND_REPO@$BACKEND_DIGEST \\"
+            summary "    npm run migrate"
+            summary '```'
+            summary ""
+            summary "Then re-run this workflow from the Actions tab."
+            fail "$mrc" "PENDING MIGRATION — nothing deployed, :prod restored. The migration names are in the job summary above; apply them as root on the VPS, then re-run this workflow."
+          fi
+
+          # ====================================================================
+          # 3. Converge. One service at a time, never a bare `deploy` (which is
+          #    `compose up -d` across the whole stack, valkey included). Skip
+          #    python when its digest did not change: bouncing the sidecar for
+          #    nothing is avoidable churn during service.
+          # ====================================================================
+          DEPLOYED_SERVICES=(backend)
+          if [ "$PYTHON_DIGEST" != "$PREV_PYTHON" ]; then
+            DEPLOYED_SERVICES=(python backend)
+            echo "== rd-deploy deploy python"
+            rd deploy python > deploy-python.txt 2>&1
+            prc=$?
+            cat deploy-python.txt
+          else
+            echo "python digest unchanged — not bouncing that service."
+            prc=0
+          fi
+
+          if [ "$prc" -eq 0 ]; then
+            echo "== rd-deploy deploy backend"
+            rd deploy backend > deploy-backend.txt 2>&1
+            prc=$?
+            cat deploy-backend.txt
+          fi
+
+          case "$prc" in
+            0) ;;
+            127)
+              # ABOVE 65 ON PURPOSE. An uninstalled forced command is not a
+              # migration, and 127 must never be rendered as one.
+              restore_tags || true
+              not_installed "deploy <service>"
+              summary "What came back instead:"
+              [ -f deploy-python.txt ] && { summary "\`rd-deploy deploy python\`:"; block deploy-python.txt; }
+              [ -f deploy-backend.txt ] && { summary "\`rd-deploy deploy backend\`:"; block deploy-backend.txt; }
+              fail 127 "EXIT 127 = COMMAND NOT FOUND — NOT a pending migration and NOT a wrapper refusal. The SSH forced command (/usr/local/sbin/rd-entry) is not installed on $DEPLOY_HOST. Tags restored; nothing was deployed. See the job summary."
+              ;;
+            65)
+              # ORDER IS LOAD-BEARING — DO NOT PUT restore_tags BACK ON TOP.
+              #
+              # `check-migrations` answers about the image the box is pointed at,
+              # and the box follows the :prod tag. Restoring the tag first puts
+              # :prod back on the PREVIOUS image, whose migrations are applied by
+              # definition — so the re-check would print "nothing pending"
+              # underneath a heading that says PENDING MIGRATION, and the
+              # operator would be told to apply a migration the diagnostic
+              # immediately below it denies exists.
+              #
+              # So: ask while :prod still names the image that actually refused,
+              # THEN restore. `fail` below is the only exit from this branch and
+              # it is downstream of restore_tags, so the tag is restored on every
+              # path out of here.
+              summary "## Deploy refused by the server — pending migration"
+              summary ""
+              summary "The wrapper's own gate fired (exit 65) even though \`check-migrations\` passed a"
+              summary "moment earlier. Re-asking for the names, with \`:prod\` still pointing at the"
+              summary "image that refused:"
+              rd check-migrations > migrations2.txt 2>&1
+              m2rc=$?
+              block migrations2.txt
+              if [ "$m2rc" -eq 127 ]; then not_installed "check-migrations"; fi
+              # Only now is it safe to move the pointer back.
+              restore_tags || true
+              summary "Nothing was deployed; \`:prod\` restored. Apply as root on the VPS:"
+              summary ""
+              summary '```sh'
+              summary "docker run --rm --env-file /opt/restaurant-dash/.env.migrate \\"
+              summary "    $BACKEND_REPO@$BACKEND_DIGEST \\"
+              summary "    npm run migrate"
+              summary '```'
+              summary ""
+              summary "Then re-run this workflow from the Actions tab."
+              fail 65 "PENDING MIGRATION (server gate, exit 65) — nothing deployed, :prod restored. See the job summary for the migration names and the exact command to run."
+              ;;
+            64)
+              restore_tags || true
+              fail 64 "The wrapper rejected the command (exit 64 = bad arguments). This is a pipeline bug, not an app failure: this workflow sent a sentence the grammar does not accept. rd-deploy accepts status | logs [svc] | check-migrations | deploy [svc] | rollback [svc] with svc in backend|dashboard|python|valkey, and the rd-entry forced command in front of it is deliberately NARROWER: no valkey, and deploy/rollback must name a service. See deploy/vps/rd-entry and deploy/vps/WRAPPER_CONTRACT.md."
+              ;;
+            255)
+              restore_tags || true
+              fail 1 "SSH transport failure during the deploy call. The stack may or may not have converged — run 'rd-deploy status' on the box before re-running."
+              ;;
+            *)
+              # Any other non-zero. Do not fall through to verification and
+              # quietly decide it was fine: the wrapper said no.
+              restore_tags || true
+              summary "### Deploy call failed — exit $prc"
+              [ -f deploy-python.txt ] && { summary "\`rd-deploy deploy python\`:"; block deploy-python.txt; }
+              [ -f deploy-backend.txt ] && { summary "\`rd-deploy deploy backend\`:"; block deploy-backend.txt; }
+              fail "$prc" "'rd-deploy deploy' exited $prc. :prod restored; see the job summary."
+              ;;
+          esac
+
+          # ====================================================================
+          # 4. Verify. `compose up -d` returns as soon as the container starts, so
+          #    nothing above proves the app came back.
+          # ====================================================================
+          echo "== verifying"
+          rd status > status0.txt 2>&1 || true
+          cat status0.txt
+
+          RECREATED_OK=1
+          for s in "${DEPLOYED_SERVICES[@]}"; do
+            assert_recreated "$s" status0.txt || RECREATED_OK=0
+          done
+
+          HEALTHY=0
+          if [ "$RECREATED_OK" -eq 1 ] && wait_healthy "${DEPLOYED_SERVICES[@]}"; then
+            HEALTHY=1
+          fi
+
+          # Optional public probe through cloudflared. A supplement only: the
+          # tunnel being down is not something an image rollback can fix, so it
+          # never triggers a rollback on its own.
+          if [ "$HEALTHY" -eq 1 ] && [ -n "${PUBLIC_HEALTH_URL:-}" ]; then
+            if code="$(curl -fsS -o body.txt -w '%{http_code}' --max-time 15 "$PUBLIC_HEALTH_URL" 2>/dev/null)"; then
+              echo "public probe $PUBLIC_HEALTH_URL -> $code"
+              head -c 400 body.txt; echo
+              if ! grep -q '"ok":[[:space:]]*true' body.txt; then
+                echo "::warning::$PUBLIC_HEALTH_URL answered $code but database.ok is not true. Containers are up; the app reports itself degraded."
+              fi
+            else
+              echo "::warning::could not reach $PUBLIC_HEALTH_URL from the runner. Containers are healthy on the box, so this is most likely cloudflared rather than this deploy. NOT rolling back — an image rollback cannot fix a broken tunnel. Check: journalctl -u cloudflared."
+            fi
+          fi
+
+          if [ "$HEALTHY" -eq 1 ]; then
+            summary "### Production deploy (backend) — OK"
+            summary ""
+            summary '```'
+            summary "backend  $BACKEND_REPO@$BACKEND_DIGEST"
+            summary "python   $PYTHON_REPO@$PYTHON_DIGEST"
+            summary "git      $GIT_SHA"
+            summary "rollback target (previous :prod):"
+            summary "  backend  ${PREV_BACKEND:-<none — this was the first run>}"
+            summary "  python   ${PREV_PYTHON:-<none — this was the first run>}"
+            summary '```'
+            summary ""
+            summary "\`compose ps\` after the swap:"
+            block status0.txt
+            echo "::notice::Deploy succeeded; backend is healthy."
+            exit 0
+          fi
+
+          # ====================================================================
+          # 5. It did not come back. Collect evidence, then roll back.
+          # ====================================================================
+          echo "== HEALTH CHECK FAILED — collecting logs"
+          rd logs backend > logs-backend.txt 2>&1 || true
+          tail -n 60 logs-backend.txt || true
+          summary "### Production deploy (backend) — FAILED"
+          summary ""
+          summary "\`compose ps\`:"; block status0.txt
+          summary "\`rd-deploy logs backend\` (last 100 lines):"; block logs-backend.txt
+
+          if [ "$FIRST_RUN" -eq 1 ]; then
+            # FIRST-RUN SAFETY. :prod did not exist before this run, so there is
+            # no previous digest anywhere and `rd-deploy rollback` would only
+            # force-recreate the same bad image. Do NOT run it: the stack is at
+            # least up, and repeated recreation only adds downtime.
+            summary "> **No rollback was attempted.** \`:prod\` did not exist before this run, so there"
+            summary "> is no previous digest to go back to. The stack was left as it is rather than"
+            summary "> force-recreating the same failing image."
+            summary ""
+            summary "Recover by hand — pick a known-good digest from GHCR and point \`:prod\` at it:"
+            summary ""
+            summary '```sh'
+            summary "# on your workstation, logged in to ghcr.io"
+            summary "docker buildx imagetools create --tag $BACKEND_REPO:prod $BACKEND_REPO:sha-<older-commit>"
+            summary "docker buildx imagetools create --tag $PYTHON_REPO:prod  $PYTHON_REPO:sha-<older-commit>"
+            summary "# then, on the VPS"
+            summary "sudo /usr/local/sbin/rd-deploy rollback backend"
+            summary '```'
+            fail 1 "FIRST DEPLOY FAILED ITS HEALTH CHECK AND THERE IS NO ROLLBACK TARGET. :prod had no previous value. The stack was NOT force-recreated. See the job summary for how to point :prod at a known-good digest by hand."
+          fi
+
+          echo "== rolling back: restore :prod, then rd-deploy rollback"
+          if ! restore_tags; then
+            fail 1 "ROLLBACK FAILED at the registry step — could not restore :prod. Production is running the new, unhealthy image. SSH in and run 'sudo rd-deploy status'."
+          fi
+
+          RB_RC=0
+          for s in "${DEPLOYED_SERVICES[@]}"; do
+            echo "== rd-deploy rollback $s"
+            rd rollback "$s" > "rollback-$s.txt" 2>&1 || RB_RC=$?
+            cat "rollback-$s.txt"
+            summary "\`rd-deploy rollback $s\`:"; block "rollback-$s.txt"
+            # Unreachable in practice (a 127 would have stopped this run at the
+            # first rd call), but every site that reads an rd exit code names
+            # 127 explicitly rather than folding it into "rollback also failed".
+            [ "$RB_RC" -eq 127 ] && not_installed "rollback $s"
+          done
+
+          if [ "$RB_RC" -eq 0 ] && wait_healthy "${DEPLOYED_SERVICES[@]}"; then
+            rd status > status1.txt 2>&1 || true
+            summary "Rolled back. \`compose ps\` now:"; block status1.txt
+            summary ""
+            summary "Production is running the PREVIOUS images:"
+            summary ""
+            summary '```'
+            summary "backend  $BACKEND_REPO@$PREV_BACKEND"
+            summary "python   $PYTHON_REPO@$PREV_PYTHON"
+            summary '```'
+            fail 70 "Deploy failed its health checks and was ROLLED BACK. Production is running the previous images. This build is red on purpose — fix forward, do not re-run."
+          fi
+
+          rd status > status1.txt 2>&1 || true
+          summary "\`compose ps\` after the failed rollback:"; block status1.txt
+          fail 71 "ROLLBACK ALSO FAILED. PRODUCTION MAY BE DOWN. Do not re-run this workflow — further automated churn destroys the evidence. SSH in: 'sudo rd-deploy status', 'sudo rd-deploy logs backend', 'journalctl -u cloudflared'."
+
+      - name: Wipe the deploy key from the runner
+        if: always()
+        run: shred -u ~/.ssh/id_deploy 2>/dev/null || rm -f ~/.ssh/id_deploy

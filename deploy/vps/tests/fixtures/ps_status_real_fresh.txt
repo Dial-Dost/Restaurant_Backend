@@ -1,0 +1,4 @@
+backend	Up 8 seconds (healthy)
+dashboard	Up 15 hours (healthy)
+python	Up 9 seconds (healthy)
+valkey	Up 29 hours (healthy)

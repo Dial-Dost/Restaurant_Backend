@@ -1,0 +1,2 @@
+NAME                        IMAGE                                          COMMAND                  SERVICE     CREATED          STATUS                    PORTS
+restaurant-dash-backend-1   ghcr.io/dial-dost/restaurant_backend:prod      "node ./build/index.…"   backend     6 days ago       Up 6 days (healthy)       127.0.0.1:3001->3001/tcp

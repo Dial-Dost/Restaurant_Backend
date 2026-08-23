@@ -1,0 +1,32 @@
+# /etc/sudoers.d/restaurant-deploy      root:root 0440
+#
+# REFERENCE COPY. This is what is ALREADY INSTALLED on the production VPS.
+# install.sh VERIFIES it and refuses to overwrite it — a sudoers file is a
+# security boundary, and silently rewriting one from a git checkout is exactly
+# the class of change that should require a human at a root shell.
+#
+# To install it deliberately on a NEW box:
+#     install -o root -g root -m 0440 restaurant-deploy.sudoers \
+#             /etc/sudoers.d/restaurant-deploy
+#     visudo -c
+#
+# ONE command. NO argument wildcard. This is deliberate.
+#
+# The obvious version of this file — `deploy ALL=(root) NOPASSWD: /usr/bin/docker
+# compose *` — is equivalent to granting a root shell. sudo's `*` matches across
+# spaces, so that single pattern also authorises:
+#
+#     docker compose run -v /:/host --privileged backend sh   # host filesystem
+#     docker compose exec backend env                          # every prod secret
+#
+# Argument wildcards in sudoers are not a security boundary. So there are no
+# arguments here at all: sudo authorises the program, and /usr/local/sbin/rd-deploy
+# validates its own arguments against its own grammar (see WRAPPER_CONTRACT.md).
+#
+# PRECONDITIONS, both checked by install.sh:
+#   * /usr/local/sbin and /usr/local/sbin/rd-deploy must be root-owned and NOT
+#     writable by `deploy`. If `deploy` can write either one, this line IS root.
+#   * `deploy` must NOT be in the docker group. Membership of that group is root
+#     by another route and would make this whole file pointless.
+
+deploy ALL=(root) NOPASSWD: /usr/local/sbin/rd-deploy

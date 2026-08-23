@@ -69,3 +69,47 @@ write and no new column. Rolling back is re-running `011_billing_grace.sql`,
 which replaces the same signature. Any restaurant already flagged `'archived'`
 then reverts to reading as `'active'` — so roll the *code* back with it, or the
 silent-trading failure above returns.
+
+---
+
+## How CI enforces this
+
+Since the CI/CD pipeline landed, "apply migrations manually" is no longer a
+convention you have to remember — it is a gate that stops the deploy.
+
+`.github/workflows/deploy.yml` and the VPS wrapper `/usr/local/sbin/rd-deploy`
+between them will **never** apply a migration. They detect pending ones and
+refuse. (The wrapper is **not** in this repository and deliberately is not
+shipped from it — it is root-owned on the box and installing it from a git
+checkout would overwrite a vetted security boundary. The grammar this pipeline
+is written against is recorded in `deploy/vps/WRAPPER_CONTRACT.md`.)
+
+* **Gate A**, in CI, after the images are built: does this push add or change
+  anything under `migrations/`? If so the deploy is refused and the job summary
+  names the files and prints the exact `docker run ... npm run migrate` command,
+  using the digest of the image just built. Gate A needs two commits to diff, so
+  it evaluates on **push runs only** and skips on `workflow_dispatch` — which is
+  also how you re-run a deploy after applying a migration by hand. Until the
+  push trigger is enabled (`deploy.yml` ships dispatch-only in its first commit,
+  see the `on:` block there), Gate A always skips and Gate B is the only gate.
+* **Gate B**, on the VPS inside `rd-deploy`, before any container is swapped:
+  `npm run migrate:dry` executed **inside the new image**, against
+  `/opt/restaurant-dash/.env.migrate` (root-only, never in GitHub). Pending
+  migrations abort the deploy with exit 65, having changed nothing. This one is
+  authoritative — it catches a migration added in an earlier push that nobody
+  applied, which Gate A cannot see.
+
+Two details that matter and are easy to get wrong:
+
+* **Run the migration from the NEW image.** `migrations/` is baked into
+  `Dockerfile.node`, so `npm run migrate` inside the currently-deployed
+  container compares the *old* file set and reports success without doing
+  anything. Gate B runs the dry run in the new image for exactly this reason.
+* **`--dry-run` is not strictly read-only.** `scripts/migrate.ts` issues
+  `create table if not exists schema_migrations` before it lists anything, so a
+  SELECT-only role fails the gate. `MIGRATION_DATABASE_URL` must be the
+  owner/migration role — as this document already says, `app_runtime` and
+  `platform_runtime` intentionally lack DDL privileges.
+
+Full runbook, including how to apply a migration and re-run the deploy:
+`deploy/vps/README.md`.

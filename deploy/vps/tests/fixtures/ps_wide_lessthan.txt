@@ -1,0 +1,2 @@
+NAME                        IMAGE                                          COMMAND                  SERVICE     CREATED          STATUS                                  PORTS
+restaurant-dash-backend-1   ghcr.io/dial-dost/restaurant_backend:prod      "node ./build/index.…"   backend     1 second ago     Up Less than a second (health: starting)

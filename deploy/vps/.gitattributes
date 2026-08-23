@@ -1,0 +1,12 @@
+# These files are executed by bash ON A LINUX SERVER. A CRLF checkout makes the
+# shebang `#!/bin/bash\r`, which fails at exec time with a "bad interpreter"
+# error that names an invisible character. Force LF regardless of the
+# contributor's core.autocrlf setting.
+rd-entry    text eol=lf
+install.sh  text eol=lf
+*.sudoers   text eol=lf
+
+# Same reason: the parser test and its fixtures are byte-compared on Linux, and
+# the fixtures encode tabs and end-of-line positions on purpose.
+tests/*.sh          text eol=lf
+tests/fixtures/*    text eol=lf

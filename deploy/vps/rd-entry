@@ -1,0 +1,135 @@
+#!/bin/bash
+# =============================================================================
+# rd-entry — the forced command for the CI deploy SSH key.
+#
+# Installed in ~deploy/.ssh/authorized_keys as ONE line (see install.sh, and
+# README.md "The exact authorized_keys line"):
+#
+#   restrict,command="/usr/local/sbin/rd-entry" ssh-ed25519 AAAA... ci-deploy
+#
+# This is what collapses the blast radius of a leaked DEPLOY_SSH_KEY. Without it,
+# that key is shell access to a box holding live restaurant data. With it, the
+# key's ENTIRE vocabulary is: read status, read logs, ask whether migrations are
+# pending, ask for a deploy, ask for a rollback. It cannot get a shell, cannot
+# forward a port to Valkey or the database, and cannot cat an env file.
+#
+# The client's command arrives in $SSH_ORIGINAL_COMMAND and is UNTRUSTED input.
+# It is never eval'd, never passed to `sh -c`, and never word-split by the shell
+# into a command line. It is character-whitelisted, then split into an argv
+# array, then handed to `sudo -n /usr/local/sbin/rd-deploy`, which re-validates
+# every argument itself.
+#
+# The grammar below mirrors the one /usr/local/sbin/rd-deploy already enforces
+# (see WRAPPER_CONTRACT.md). Duplicated deliberately: two independent checks, so
+# one mistake is not automatically a hole. If the wrapper's grammar ever changes,
+# change this file, WRAPPER_CONTRACT.md and both deploy.yml files together.
+#
+# IT IS THE WRAPPER'S GRAMMAR MINUS TWO THINGS, AND MUST NEVER BE WIDER:
+#
+#   * no `valkey`. The wrapper accepts it; neither deploy.yml has ever sent it.
+#     valkey is the shared cache — the one service whose restart is felt by
+#     every till in every restaurant at once.
+#   * no bare `deploy` / `rollback`. Without a service argument those are
+#     `compose up -d [--force-recreate]` across the WHOLE stack. The backend
+#     workflow sends `deploy python` then `deploy backend`; the dashboard
+#     workflow sends `deploy dashboard`. Nothing legitimate needs the bare form,
+#     and requiring the argument means a leaked key cannot bounce the entire
+#     stack in one call.
+#
+# Both narrowings only ever turn an ACCEPT into a 64. Anything this file accepts
+# is still re-validated by the wrapper, so widening it here would not widen the
+# wrapper — but narrowing it here does genuinely shrink what a leaked
+# DEPLOY_SSH_KEY can reach, which is the whole reason this file exists.
+#
+# Must be root:root 0755 in a directory the `deploy` user cannot write.
+# =============================================================================
+set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+EX_USAGE=64
+
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+# Both must tolerate being unset: `set -u` would otherwise abort before any
+# validation runs, and sshd is not the only way this file can be invoked.
+peer="${SSH_CONNECTION:-}"
+peer="${peer%% *}"
+
+reject() {
+  logger -t rd-entry -- "REJECTED from ${peer:-unknown}: $*" 2>/dev/null || true
+  printf 'rd-entry: %s\n' "$*" >&2
+  exit "$EX_USAGE"
+}
+
+if [ -z "$cmd" ]; then
+  reject "interactive sessions are not permitted on this account"
+fi
+
+# Reject anything with an embedded newline before the line-oriented grep below
+# ever sees it (grep would otherwise validate only the first line).
+if [ "$(printf '%s' "$cmd" | wc -l)" -ne 0 ]; then
+  reject "refused (embedded newline)"
+fi
+
+if [ "${#cmd}" -gt 64 ]; then
+  reject "refused (over-long command)"
+fi
+
+# Whitelist, not blacklist. The entire grammar is lowercase words and hyphens
+# separated by single spaces — no digests, no flags, no paths. So there is no
+# quote, no '$', no backtick, no ';', no '/', no '.', and nothing to smuggle.
+if ! printf '%s' "$cmd" | LC_ALL=C grep -qE '^[a-z]+(-[a-z]+)*( [a-z]+)?$'; then
+  reject "refused (does not match the allowed grammar)"
+fi
+
+# Safe to word-split now: the charset above contains no IFS character other than
+# the space, and no shell metacharacter at all.
+read -r -a args <<<"$cmd"
+if [ "${#args[@]}" -lt 1 ] || [ "${#args[@]}" -gt 2 ]; then
+  reject "refused (expected one verb and at most one service)"
+fi
+
+verb="${args[0]}"
+svc="${args[1]:-}"
+
+# The vocabulary /usr/local/sbin/rd-deploy accepts, MINUS valkey and minus the
+# bare deploy/rollback (see the header). Anything else would come back 64 from
+# the wrapper anyway; rejecting it here keeps the wrapper from ever seeing it and
+# makes the refusal auditable in syslog.
+case "$verb" in
+  status|check-migrations)
+    [ -z "$svc" ] || reject "refused ('$verb' takes no service argument)"
+    ;;
+  # Read-only. A bare `logs` (the whole stack) changes nothing and is left
+  # accepted; `logs valkey` is not, per the narrowing above.
+  logs)
+    if [ -n "$svc" ]; then
+      case "$svc" in
+        backend|dashboard|python) ;;
+        valkey) reject "refused (valkey is out of this key's vocabulary)" ;;
+        *) reject "refused (unknown service '$svc')" ;;
+      esac
+    fi
+    ;;
+  # A service argument is MANDATORY here. See the narrowing note in the header:
+  # a bare deploy/rollback is the whole stack, valkey included, and no workflow
+  # ever sends one.
+  deploy|rollback)
+    if [ -z "$svc" ]; then
+      reject "refused ('$verb' requires a service: backend, dashboard or python)"
+    fi
+    case "$svc" in
+      backend|dashboard|python) ;;
+      valkey) reject "refused (valkey is out of this key's vocabulary)" ;;
+      *) reject "refused (unknown service '$svc')" ;;
+    esac
+    ;;
+  *)
+    reject "refused (unknown verb '$verb')"
+    ;;
+esac
+
+logger -t rd-entry -- "ACCEPTED from ${peer:-unknown}: $cmd" 2>/dev/null || true
+
+exec sudo -n /usr/local/sbin/rd-deploy "${args[@]}"

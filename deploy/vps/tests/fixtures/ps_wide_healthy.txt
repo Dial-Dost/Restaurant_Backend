@@ -1,0 +1,5 @@
+NAME                        IMAGE                                          COMMAND                  SERVICE     CREATED          STATUS                    PORTS
+restaurant-dash-backend-1   ghcr.io/dial-dost/restaurant_backend:prod      "node ./build/index.…"   backend     52 seconds ago   Up 51 seconds (healthy)   127.0.0.1:3001->3001/tcp
+restaurant-dash-dashboard-1 ghcr.io/dial-dost/restaurant_dashboard:prod    "node server.js"         dashboard   3 days ago       Up 3 days (healthy)       127.0.0.1:9002->3000/tcp
+restaurant-dash-python-1    ghcr.io/dial-dost/restaurant_python:prod       "uvicorn app:app --h…"   python      52 seconds ago   Up 50 seconds (healthy)   8000/tcp
+restaurant-dash-valkey-1    valkey/valkey:8-alpine                         "docker-entrypoint.s…"   valkey      3 days ago       Up 3 days (healthy)       6379/tcp
