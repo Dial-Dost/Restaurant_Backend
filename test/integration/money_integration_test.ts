@@ -74,7 +74,10 @@ async function main() {
   await EnsureRestaurantSeed({
     name: `ITest ${randomUUID().slice(0, 8)}`,
     admin: { employeeId: "admin", name: "Admin", password: "test1234" },
-    tables: ["T1", "T2", "T3", "T4", "T5"].map((n) => ({ name: n, capacity: 4 })),
+    // T6 included: the release-without-payment section below occupies it, and a
+    // missing table surfaces as "Table not found" from OccupyTable — which reads
+    // like a product bug rather than a seed that is one row short.
+    tables: ["T1", "T2", "T3", "T4", "T5", "T6"].map((n) => ({ name: n, capacity: 4 })),
   });
   RES_ID = (await raw.query(`select id from "Restaurant" order by created_at desc limit 1`)).rows[0].id;
   console.log("seeded res_id:", RES_ID);
