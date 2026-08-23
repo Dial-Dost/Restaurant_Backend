@@ -1341,6 +1341,48 @@ jobs:
           # poll WAS replaced, and one that restarted once before settling is not a
           # reason to red-light a deploy. PUBLIC_OK -ne 0 accepts both "probed and
           # answering" and "not probed"; only a probe that RAN and FAILED blocks.
+          # A commit that lands in NEITHER image is a legitimate success, not a
+          # failure. Measured on the first push-triggered run (32650108769): it
+          # changed only .github/workflows/deploy.yml, so both builds were full
+          # cache hits, nothing was recreated, and the run went red — while the
+          # box WAS on the pushed commit and healthy. Every docs/, deploy/ or
+          # workflow commit would do the same, and a pipeline that red-lights
+          # routine commits teaches people to ignore red, which costs more than
+          # it protects.
+          #
+          # This is narrow on purpose, and is NOT "green means shipped" being
+          # weakened. All four must hold: the tree is at github.sha, it MOVED
+          # there this run, and EVERY updated service was positively MEASURED as
+          # not-recreated on both sides of the update. A service we merely could
+          # not measure lands in UNMEASURED, not UNCHANGED, so it can never
+          # satisfy this and still exits 72.
+          NOOP_OK=0
+          if [ "$HEALTHY" -eq 1 ] && [ "$REV_OK" -eq 1 ] && [ "$REV_MOVED" -eq 1 ] \
+             && [ "$REPLACED_OK" -eq 0 ] && [ "${#UPDATED[@]}" -gt 0 ] \
+             && [ "${#UNCHANGED[@]}" -eq "${#UPDATED[@]}" ] && [ "$PUBLIC_OK" -ne 0 ]; then
+            NOOP_OK=1
+          fi
+
+          if [ "$HEALTHY" -eq 1 ] && [ "$REV_OK" -eq 1 ] && [ "$NOOP_OK" -eq 1 ] && [ "$PUBLIC_OK" -ne 0 ]; then
+            summary "### Production deploy (backend) — OK, nothing to rebuild"
+            summary ""
+            summary '```'
+            summary "revision   ${BEFORE_REV:0:12} -> ${AFTER_REV:0:12}   (= github.sha)"
+            summary "rebuilt    <none> — every updated service was a cache hit"
+            summary "unchanged  ${UNCHANGED[*]}"
+            summary '```'
+            summary ""
+            summary "The box moved to this commit and every service is healthy, but nothing in"
+            summary "it lands in either image — a \`docs/\`, \`deploy/\`, \`.github/\` or otherwise"
+            summary "\`.dockerignore\`d change. Each updated service's uptime was read on BOTH"
+            summary "sides of the update and had not reset, so this is measured, not assumed."
+            summary ""
+            summary "Production is running the same images as before this run, and is on the"
+            summary "commit you pushed."
+            echo "::notice::Deploy OK at $GIT_SHA — nothing to rebuild (${UNCHANGED[*]} were cache hits); containers healthy and the box is on this commit."
+            exit 0
+          fi
+
           if [ "$HEALTHY" -eq 1 ] && [ "$REV_OK" -eq 1 ] && [ "$REPLACED_OK" -eq 1 ] && [ "$PUBLIC_OK" -ne 0 ]; then
             summary "### Production deploy (backend) — OK"
             summary ""
