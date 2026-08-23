@@ -1,0 +1,4 @@
+backend	Up 2 years (healthy)
+dashboard	Up 5 weeks (healthy)
+python	Up 3 months (healthy)
+valkey	Up 6 days (healthy)

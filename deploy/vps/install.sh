@@ -20,8 +20,14 @@
 #   * /etc/sudoers.d/restaurant-deploy      — same reasoning.
 #   * docker-compose.yml, any .env file, public/downloads — never touched.
 #
-# It also does NOT log in to GHCR for you and does NOT create .env.migrate.
+# It also does NOT create .env.migrate and does NOT install the repo deploy keys.
 # Both hold credentials; both are deliberate human steps. See README.md.
+#
+# (There is no registry login to perform. The transport is GIT: the box holds
+# read-only clones and builds them locally. An earlier revision of this file
+# verified GHCR images, pull_policy and a /root/.docker credential — every one of
+# those checks now FAILS on a correctly-configured box, which is worse than no
+# check, so they were replaced with the git-transport equivalents below.)
 # =============================================================================
 set -euo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -70,14 +76,37 @@ else
     *) bad "/usr/local/sbin is $dirperm. If '$DEPLOY_USER' can write that directory, the sudoers line IS root." ;;
   esac
 
-  # Probe the grammar the two deploy.yml workflows are written against. These
-  # calls change nothing: an unknown verb and an unknown service both just exit.
+  # Probe the grammar the two deploy.yml workflows are written against. Every
+  # call here is REJECTED by design, so none of them changes anything: each is a
+  # sentence the wrapper must refuse.
   set +e
   "$WRAPPER" __contract_probe__ >/dev/null 2>&1; rc_verb=$?
   "$WRAPPER" deploy __contract_probe__ >/dev/null 2>&1; rc_svc=$?
+  # `update` is the verb CI actually sends, and its two narrowings carry real
+  # weight: a bare `update` would rebuild and bounce the WHOLE stack in one call,
+  # and `update valkey` is meaningless (upstream image, no repo to build from).
+  # Both must be refusals, not surprises performed with root authority.
+  "$WRAPPER" update >/dev/null 2>&1; rc_bare=$?
+  "$WRAPPER" update valkey >/dev/null 2>&1; rc_valkey=$?
   set -e
   [ "$rc_verb" -eq 64 ] && ok "unknown verb -> 64" || bad "unknown verb -> $rc_verb, expected 64. The wrapper's grammar has changed; deploy.yml will misreport failures. Reconcile it with WRAPPER_CONTRACT.md before deploying."
   [ "$rc_svc"  -eq 64 ] && ok "unknown service -> 64" || bad "unknown service -> $rc_svc, expected 64. Same problem as above."
+  [ "$rc_bare" -eq 64 ] && ok "bare 'update' -> 64 (cannot bounce the whole stack in one call)" || bad "bare 'update' -> $rc_bare, expected 64. A leaked CI key could rebuild and restart every service at once."
+  [ "$rc_valkey" -eq 64 ] && ok "'update valkey' -> 64 (no repo to build from)" || bad "'update valkey' -> $rc_valkey, expected 64. valkey is the shared cache — the one service whose restart is felt by every till at once."
+
+  # `revision` is how the pipeline PROVES a deploy landed. If it is missing, the
+  # workflow's revision assertion can never pass and every deploy reports as
+  # unproven. Read-only.
+  set +e
+  rev_out="$("$WRAPPER" revision 2>/dev/null)"; rc_rev=$?
+  set -e
+  if [ "$rc_rev" -ne 0 ]; then
+    bad "'revision' exited $rc_rev. deploy.yml uses it to prove the deployed commit; without it every run fails its own proof. Reconcile the wrapper with WRAPPER_CONTRACT.md."
+  elif ! printf '%s' "$rev_out" | grep -qE '^Restaurant_Backend[[:space:]]+[0-9a-f]{40}$'; then
+    bad "'revision' did not print a 40-char sha for Restaurant_Backend. deploy.yml parses this output; a format change silently breaks the deploy proof."
+  else
+    ok "'revision' reports 40-char shas (the pipeline's proof that a deploy landed)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -156,31 +185,75 @@ COMPOSE="$APP_DIR/docker-compose.yml"
 if [ ! -r "$COMPOSE" ]; then
   bad "$COMPOSE not readable — wrong box?"
 else
-  if grep -qE '^[[:space:]]*build:' "$COMPOSE"; then
-    bad "$COMPOSE still has a build: section. The box must PULL, not build: a 'next build' on 2 vCPU next to live POS traffic is the thing this pipeline exists to avoid."
+  # TRANSPORT IS GIT, NOT A REGISTRY. This block used to assert the opposite —
+  # no build: section, three ghcr.io/...:prod images, pull_policy: always, a root
+  # ghcr.io credential — because the pipeline was originally designed around
+  # GHCR. That design needed a registry token on the box, and GitHub has no API
+  # to mint one, so it could not be completed without a human. The box now holds
+  # real read-only clones and builds locally. Every one of those old checks would
+  # FAIL on a correctly-configured box, which is worse than no check at all.
+  if ! grep -qE '^[[:space:]]*build:' "$COMPOSE"; then
+    bad "$COMPOSE has no build: section. Transport is git: the box builds from local clones. Without build:, 'compose up -d' has no way to turn new source into a new image."
   else
-    ok "no build: section"
+    ok "compose builds from local context (git transport)"
   fi
-  # THE load-bearing check. Without pull_policy: always, 'compose up -d' reuses
-  # the image already on disk and every deploy is a silent no-op that CI reports
-  # as green.
-  # Every one of the three application services must follow :prod. Checking
-  # them individually is the point: the earlier version of this loop grepped a
-  # fixed (backend|python|dashboard) alternation and `break`ed on the first
-  # match, so ONE repointed service made it print that all three were, and a
-  # service still pinned to :main or to a digest would never ship again while
-  # CI stayed green.
-  missing_tag=""
-  for svc in backend python dashboard; do
-    if ! grep -qE "^[[:space:]]*image:[[:space:]]*[\"']?ghcr\.io/dial-dost/restaurant_${svc}:prod[\"']?[[:space:]]*(#.*)?$" "$COMPOSE"; then
-      missing_tag="$missing_tag $svc"
+
+  # Each application service must build from the repo that actually contains it.
+  # Checked individually and by name: a loop that greps a fixed alternation and
+  # breaks on the first match reports all three healthy when only one is right —
+  # that exact bug was found here once already.
+  missing_ctx=""
+  for pair in "backend:Restaurant_Backend" "python:Restaurant_Backend" "dashboard:Restaurant_Dashboard_UI"; do
+    svc="${pair%%:*}"; want="${pair##*:}"
+    # The service's own block, up to the next top-level service key.
+    if ! awk -v s="$svc" '
+          $0 ~ "^[[:space:]]{2}"s":[[:space:]]*$" {inblk=1; next}
+          inblk && /^[[:space:]]{2}[a-z_-]+:[[:space:]]*$/ {inblk=0}
+          inblk {print}' "$COMPOSE" | grep -qE "context:[[:space:]]*\./${want}[[:space:]]*$"; then
+      missing_ctx="$missing_ctx $svc"
     fi
   done
-  if [ -z "$missing_tag" ]; then
-    ok "all three services follow ghcr.io/dial-dost/restaurant_{backend,python,dashboard}:prod"
+  if [ -z "$missing_ctx" ]; then
+    ok "backend+python build from ./Restaurant_Backend, dashboard from ./Restaurant_Dashboard_UI"
   else
-    bad "these services do NOT follow the :prod tag:$missing_tag. Each needs 'image: ghcr.io/dial-dost/restaurant_<svc>:prod'; a service left on another tag or a digest will never receive a deploy while CI still reports success. See README.md, 'Switch compose to follow the :prod tag'."
+    bad "wrong or missing build context for:$missing_ctx. A service building from the wrong clone would deploy another repo's code."
   fi
+
+  # The clones themselves. `update` does `git fetch && reset --hard`, so if these
+  # are plain copies rather than checkouts the deploy fetches nothing and ships
+  # whatever is already on disk — green, and stale forever.
+  for pair in "Restaurant_Backend:gh-backend" "Restaurant_Dashboard_UI:gh-dashboard"; do
+    d="${pair%%:*}"; alias_host="${pair##*:}"
+    if [ ! -d "$APP_DIR/$d/.git" ]; then
+      bad "$APP_DIR/$d is not a git checkout. 'update' cannot pull into it; clone it with git clone $alias_host:Dial-Dost/$d.git"
+      continue
+    fi
+    if ! git -C "$APP_DIR/$d" ls-remote --exit-code origin >/dev/null 2>&1; then
+      bad "$APP_DIR/$d cannot reach its remote — the read-only deploy key is missing, revoked, or ~/.ssh/config lacks the '$alias_host' alias. Every deploy would fail at the fetch."
+      continue
+    fi
+    ok "$d is a git checkout and its deploy key authenticates"
+
+    # On main. `update` resets to FETCH_HEAD of origin/main, so a checkout parked
+    # on another branch or on a detached HEAD is a box that quietly disagrees
+    # with what the pipeline thinks it deployed.
+    br="$(git -C "$APP_DIR/$d" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    if [ "$br" = "main" ]; then
+      ok "$d is on main"
+    else
+      bad "$d is on '$br', not main. 'update' fetches origin/main; leaving it here makes the deployed revision disagree with the branch the pipeline reports."
+    fi
+
+    # Clean tree. `update` does `reset --hard`, so anything local here is
+    # DESTROYED on the next deploy without warning. That is correct for a deploy
+    # target — but if someone has been hand-editing this box, they should learn
+    # it now rather than by losing the edit mid-incident.
+    if [ -z "$(git -C "$APP_DIR/$d" status --porcelain 2>/dev/null)" ]; then
+      ok "$d working tree is clean"
+    else
+      bad "$d has local modifications. 'update' runs 'git reset --hard' and will DESTROY them on the next deploy. Commit them upstream or discard them deliberately: git -C $APP_DIR/$d status"
+    fi
+  done
 
   # ---- command:/entrypoint: override guard --------------------------------
   # An override on an APPLICATION service replaces the image's CMD, and that is
@@ -242,24 +315,50 @@ else
   else
     ok "no 'start:prod' anywhere in the compose file"
   fi
-  n_pull="$(grep -cE '^[[:space:]]*pull_policy:[[:space:]]*always' "$COMPOSE" || true)"
-  if [ "${n_pull:-0}" -ge 3 ]; then
-    ok "pull_policy: always present $n_pull times (backend, python, dashboard)"
+  # (The pull_policy: always check that stood here is gone with GHCR. Its job —
+  # "prove a deploy cannot silently reuse the on-disk image" — is now done by
+  # `update` rebuilding, and by the workflow asserting the container's uptime
+  # actually reset. Keeping a registry check here would fail on a correct box.)
+fi
+
+# The bind-mount SOURCE, which lives inside the dashboard clone — not at
+# $APP_DIR/public. The old path here never existed, so this check failed on
+# every run and was pure noise. Release artifacts are ~110 MB and are served to
+# every till that asks for an update; an empty directory 404s all of them, which
+# has happened once already.
+DL="$APP_DIR/Restaurant_Dashboard_UI/public/downloads"
+if [ -d "$DL" ] && [ -n "$(ls -A "$DL" 2>/dev/null)" ]; then
+  ok "public/downloads present and non-empty ($(ls -A "$DL" | wc -l) file(s), read-only bind-mount source)"
+else
+  bad "$DL is missing or empty — every till checking for an app update would get a 404."
+fi
+
+# The forced command is what makes a leaked DEPLOY_SSH_KEY survivable. Without
+# it that key is an ordinary shell account on a box holding live restaurant data
+# and the production .env, so this is checked as a hard failure, not a warning.
+AK=/home/deploy/.ssh/authorized_keys
+if [ ! -r "$AK" ]; then
+  bad "$AK not readable — the CI key is not installed."
+elif ! grep -q 'command="/usr/local/sbin/rd-entry"' "$AK"; then
+  bad "$AK has no forced command. A leaked DEPLOY_SSH_KEY would be a SHELL on this box, able to read $APP_DIR/Restaurant_Backend/.env. Prefix the key with: restrict,command=\"/usr/local/sbin/rd-entry\""
+elif [ ! -x /usr/local/sbin/rd-entry ]; then
+  bad "authorized_keys points at /usr/local/sbin/rd-entry but it is missing or not executable — every CI connection would exit 127."
+else
+  # Prove it actually refuses, rather than trusting that the line is present.
+  # Two distinct refusals, because they fail for different reasons and a boundary
+  # that only stops one of them is not a boundary. An arbitrary command tests the
+  # character whitelist; an EMPTY SSH_ORIGINAL_COMMAND is what an interactive
+  # `ssh deploy@host` sends, and that is the one that hands over a shell.
+  arb_ok=0; int_ok=0
+  SSH_ORIGINAL_COMMAND='cat /etc/shadow' /usr/local/sbin/rd-entry >/dev/null 2>&1 || arb_ok=1
+  env -u SSH_ORIGINAL_COMMAND /usr/local/sbin/rd-entry >/dev/null 2>&1 || int_ok=1
+  if [ "$arb_ok" -ne 1 ]; then
+    bad "/usr/local/sbin/rd-entry ACCEPTED an arbitrary command. The boundary is open."
+  elif [ "$int_ok" -ne 1 ]; then
+    bad "/usr/local/sbin/rd-entry ACCEPTED an interactive session (empty SSH_ORIGINAL_COMMAND). A leaked DEPLOY_SSH_KEY would be a SHELL on this box."
   else
-    bad "pull_policy: always appears $n_pull time(s); expected at least 3. WITHOUT IT EVERY DEPLOY IS A SILENT NO-OP: 'docker compose up -d' will reuse the image already on disk and CI will still go green."
+    ok "forced command refuses both an arbitrary command and an interactive session"
   fi
-fi
-
-if [ -d "$APP_DIR/public/downloads" ] && [ -n "$(ls -A "$APP_DIR/public/downloads" 2>/dev/null)" ]; then
-  ok "public/downloads present and non-empty (read-only bind-mount source)"
-else
-  bad "public/downloads is missing or empty — the dashboard would 404 on the installer downloads."
-fi
-
-if [ -r /root/.docker/config.json ] && grep -q 'ghcr.io' /root/.docker/config.json 2>/dev/null; then
-  ok "root has a ghcr.io credential"
-else
-  bad "root is not logged in to ghcr.io, so 'compose up -d' cannot pull. docker login ghcr.io with a READ-ONLY token (read:packages) scoped to the three packages."
 fi
 
 if systemctl is-active --quiet cloudflared 2>/dev/null; then

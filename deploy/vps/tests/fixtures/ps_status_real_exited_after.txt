@@ -1,0 +1,4 @@
+backend	Exited (1) 3 seconds ago
+dashboard	Up 15 hours (healthy)
+python	Up 8 seconds (healthy)
+valkey	Up 29 hours (healthy)

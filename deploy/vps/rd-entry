@@ -9,9 +9,10 @@
 #
 # This is what collapses the blast radius of a leaked DEPLOY_SSH_KEY. Without it,
 # that key is shell access to a box holding live restaurant data. With it, the
-# key's ENTIRE vocabulary is: read status, read logs, ask whether migrations are
-# pending, ask for a deploy, ask for a rollback. It cannot get a shell, cannot
-# forward a port to Valkey or the database, and cannot cat an env file.
+# key's ENTIRE vocabulary is: read status, read the deployed git revision, read
+# logs, ask whether migrations are pending, ask for an update (pull + rebuild),
+# ask for a deploy, ask for a rollback. It cannot get a shell, cannot forward a
+# port to Valkey or the database, and cannot cat an env file.
 #
 # The client's command arrives in $SSH_ORIGINAL_COMMAND and is UNTRUSTED input.
 # It is never eval'd, never passed to `sh -c`, and never word-split by the shell
@@ -29,12 +30,19 @@
 #   * no `valkey`. The wrapper accepts it; neither deploy.yml has ever sent it.
 #     valkey is the shared cache — the one service whose restart is felt by
 #     every till in every restaurant at once.
-#   * no bare `deploy` / `rollback`. Without a service argument those are
-#     `compose up -d [--force-recreate]` across the WHOLE stack. The backend
-#     workflow sends `deploy python` then `deploy backend`; the dashboard
-#     workflow sends `deploy dashboard`. Nothing legitimate needs the bare form,
-#     and requiring the argument means a leaked key cannot bounce the entire
-#     stack in one call.
+#   * no bare `update` / `deploy` / `rollback`. Without a service argument those
+#     are the WHOLE stack — `compose build && up -d [--force-recreate]`. CI sends
+#     `update python` then `update backend` from the backend repo, and
+#     `update dashboard` from the dashboard repo. Nothing legitimate needs the
+#     bare form, and requiring the argument means a leaked key cannot bounce
+#     every till in every restaurant in one call.
+#
+# WHY CI SENDS `update` AND NEVER `deploy`: the transport is git. The box holds
+# real clones of both repos and docker-compose.yml builds them as LOCAL BUILD
+# CONTEXTS, so `deploy` (= `up -d`, no rebuild) would converge on the image
+# already on disk and ship nothing while the pipeline reported success. `update`
+# is the verb that fetches and rebuilds. `deploy` is kept in the grammar for a
+# human converging the stack after editing compose by hand.
 #
 # Both narrowings only ever turn an ACCEPT into a 64. Anything this file accepts
 # is still re-validated by the wrapper, so widening it here would not widen the
@@ -98,7 +106,7 @@ svc="${args[1]:-}"
 # the wrapper anyway; rejecting it here keeps the wrapper from ever seeing it and
 # makes the refusal auditable in syslog.
 case "$verb" in
-  status|check-migrations)
+  status|check-migrations|revision)
     [ -z "$svc" ] || reject "refused ('$verb' takes no service argument)"
     ;;
   # Read-only. A bare `logs` (the whole stack) changes nothing and is left
@@ -115,7 +123,10 @@ case "$verb" in
   # A service argument is MANDATORY here. See the narrowing note in the header:
   # a bare deploy/rollback is the whole stack, valkey included, and no workflow
   # ever sends one.
-  deploy|rollback)
+  # `update` is the real deploy path: it pulls the repo and REBUILDS. It carries
+  # the same mandatory-service rule and, in the wrapper, additionally refuses a
+  # bare form and `valkey` (which has no repo to build from).
+  deploy|rollback|update)
     if [ -z "$svc" ]; then
       reject "refused ('$verb' requires a service: backend, dashboard or python)"
     fi

@@ -106,6 +106,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Runs FIRST, before the toolchain is even installed, because it needs
+      # nothing but bash and takes milliseconds.
+      #
+      # deploy.yml reads production's health, whether a container was actually
+      # recreated, and whether a rollback had anything to roll back to, out of
+      # the text that `sudo /usr/local/sbin/rd-deploy status` and
+      # `... rd-deploy rollback` print. That wrapper lives on the VPS and is NOT
+      # in this repository, so its output format is an UNDECLARED DEPENDENCY that
+      # nothing else in this tree would notice changing. The script extracts the
+      # parser functions straight out of deploy.yml at run time — never a retyped
+      # copy, which would drift — and runs them against captured fixtures.
+      #
+      # It is wired in here so the guard cannot rot. Every bug it now pins was
+      # found by reading rather than by a failing test: an uptime wording the box
+      # prints today (`Up About an hour`) that the parser could not read, and for
+      # which it silently SKIPPED the recreation assertion; and a
+      # no-rollback-target detector that fired on a rollback which had worked.
+      # Do not loosen it — re-capture the fixtures instead.
+      - name: Deploy parser guard (rd-deploy output format)
+        run: bash deploy/vps/tests/test_status_parser.sh
+
+      # Separate from the parser guard because they catch different failures, and
+      # the second one shipped: a new image that crash-loops on boot was scored
+      # "not recreated", took the no-rollback branch, and exited leaving the bad
+      # build running while reporting that nothing had shipped. Reverting only
+      # that one gate line reintroduces it with the parser guard still green —
+      # measured. This pins the routing decision itself.
+      - name: Deploy routing guard (does a crash-loop roll back?)
+        run: bash deploy/vps/tests/test_deploy_routing.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

@@ -1,0 +1,6 @@
+WARN[0000] /opt/restaurant-dash/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion
+restored restaurant-dash-dashboard:previous
+ Container restaurant-dash-dashboard-1  Recreating
+ Container restaurant-dash-dashboard-1  Recreated
+ Container restaurant-dash-dashboard-1  Starting
+ Container restaurant-dash-dashboard-1  Started

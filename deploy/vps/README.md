@@ -3,35 +3,34 @@
 Covers **both** repositories. `Restaurant_Dashboard_UI/deploy/README.md` points
 here, because the server-side wrapper this documents serves both.
 
-Nothing in this directory has ever run against production. Treat the first
-deploy as a change to a live system serving real restaurants, and do it outside
-service hours.
+The pipeline has never run against production from CI. Both workflows are
+`workflow_dispatch`-only until one deploy has been watched end to end by hand,
+outside service hours. Treat the first run as a change to a live system serving
+real restaurants.
 
 ---
 
-## READ THIS FIRST: the stale production secrets are still unrotated
+## READ THIS FIRST: the stale production secrets
 
 `.github/workflows/ci.yml` records, in its own header, that the deleted
 `backend-ci.yml` pointed `RESTAURANT_ID: csrorganics` — a live, paying tenant —
 at the production Supabase credentials held as **repository secrets**. That
-workflow is gone. **The secrets are not.** Deleting a workflow deletes the use,
-not the secret. As of this writing they have **not** been rotated.
+workflow is gone. **Deleting a workflow deletes the use, not the secret.**
 
 Two facts, unsoftened:
 
 1. **Those production database credentials are one pull request away for
-   everyone with write access, and have been for weeks.** A workflow triggered by
-   `pull_request` from a same-repo branch receives repository secrets. Anyone who
-   can push a branch can add a workflow that prints them. That is default GitHub
-   behaviour, not a hypothetical.
+   everyone with write access.** A workflow triggered by `pull_request` from a
+   same-repo branch receives repository secrets. Anyone who can push a branch can
+   add a workflow that prints them. That is default GitHub behaviour, not a
+   hypothetical.
 
-2. **This pipeline raises the stakes considerably.** Until now the worst case was
-   a leak of database credentials. Once a deploy pipeline exists, the same
-   one-PR exfiltration also yields the ability to ship code to production. You
-   would be putting a key to the house in a drawer you already know is unlocked.
+2. **This pipeline raises the stakes.** Until now the worst case was a leak of
+   database credentials. With a deploy pipeline, the same one-PR exfiltration
+   also yields the ability to ship code to production.
 
-**Sequencing is not negotiable: rotate and delete the stale Supabase repository
-secrets BEFORE either deploy workflow merges, not after.**
+**Rotate and delete the stale Supabase repository secrets BEFORE either deploy
+workflow's push trigger is enabled.**
 
 ```sh
 gh secret list --repo Dial-Dost/Restaurant_Backend        # see what is still there
@@ -42,115 +41,330 @@ Rotating means issuing new credentials in Supabase and retiring the old ones.
 Deleting the GitHub secret alone leaves a live credential that has been exposed
 to every workflow run in the repository's history.
 
-The new deploy key is deliberately **not** a repository secret. It lives in a
-GitHub **Environment** named `production`, which a workflow running on a feature
-branch or a pull request cannot read. That property is the single
-highest-value control in this design, and it is why both deploy workflows carry
-`environment: production` on their deploy job.
+The deploy key is deliberately **not** a repository secret. It lives in a GitHub
+**Environment** named `production`, which a workflow running on a feature branch
+or a pull request cannot read, and whose deployment branches are restricted to
+`main`. That property is the single highest-value control in this design, and it
+is why both deploy jobs carry `environment: production`.
 
 ---
 
-## How new code actually reaches the box
+## How new code reaches the box
 
-This is the part that had to be rewritten from the draft, so read it before
-anything else.
+**The transport is git. There is no registry in this pipeline.**
 
-`/usr/local/sbin/rd-deploy` is the **only** program the CI identity can cause to
-run. Its whole vocabulary is `status`, `logs [service]`, `check-migrations`,
-`deploy [service]`, `rollback [service]` — see
-[`WRAPPER_CONTRACT.md`](./WRAPPER_CONTRACT.md). It accepts **no image reference,
-no digest, no file path and no flag**. `deploy` is `docker compose up -d`.
+An earlier design built images in CI, pushed them to GHCR by digest, and moved a
+`:prod` tag that the box's compose file followed. It is gone: GHCR needed a
+long-lived read credential in *root's* docker config on the VPS, and it could not
+be created without a human at a keyboard. Everything that design implied —
+`pull_policy: always`, `:prod`, digests, `docker login`, `packages: write` — has
+been deleted from the workflows rather than left commented out.
 
-Given that, plus: the box has **no git access** (deploy keys are disabled
-org-wide), and `docker-compose.yml` exists **only** on the box and is not in git —
-there is exactly one honest answer:
+What is on the box instead:
 
-> **The registry is the transport, and a mutable tag is the deployment pointer.**
-> CI pushes an immutable digest to GHCR, moves `ghcr.io/…:prod` to it, and then
-> asks the wrapper to converge. The wrapper deploys "whatever `:prod` is", and CI
-> decides what `:prod` is.
-
-That requires **a one-time change to `docker-compose.yml` on the server**
-(see [Switch compose to follow the `:prod` tag](#4-switch-compose-to-follow-the-prod-tag)).
-There is no way around it and no wrapper capability that substitutes for it.
-
-Two consequences worth internalising:
-
-* **`pull_policy: always` is load-bearing.** Compose's default pull policy is
-  `missing`. Without `always`, `docker compose up -d` sees the `:prod` tag
-  already present on disk, reuses it, changes nothing — and CI reports green.
-  A silent no-op deploy is the worst failure mode this design has, so both
-  workflows assert afterwards that the container was actually *recreated* (by
-  reading the uptime out of `compose ps`) and fail loudly, naming this cause, if
-  it was not.
-* **Rollback is real only because CI owns the tag.** `rd-deploy rollback` is
-  `docker compose up -d --force-recreate`; on its own it re-converges on the same
-  tag and gives you the *same image back*. It restarts a container, it does not
-  go back a version. The workflows make it a genuine rollback by re-pointing
-  `:prod` to the previous digest **first**, then asking for the force-recreate.
-  Every failure path restores the tag, so `:prod` always names what production is
-  running.
-
-### What the pipeline still cannot prove
-
-`compose ps` prints the image **tag**, and `/health` carries no revision, so
-**CI cannot prove which digest is live.** It proves the container was recreated
-and is healthy. To prove the digest, on the box:
-
-```sh
-cd /opt/restaurant-dash
-docker inspect -f '{{.Image}}' "$(docker compose ps -q backend)"
-docker image ls --digests | grep restaurant_backend
 ```
+/opt/restaurant-dash/
+├── docker-compose.yml            # NOT in git. Builds the two dirs below as
+│                                 # LOCAL BUILD CONTEXTS (build: ./Restaurant_Backend …)
+├── Restaurant_Backend/           # real git clone, on main, clean, READ-ONLY deploy key
+├── Restaurant_Dashboard_UI/      # real git clone, on main, clean, READ-ONLY deploy key
+└── .env, .env.migrate, public/downloads/ …
+```
+
+So a deploy is: **the box fetches the repo and rebuilds.** CI holds no image, no
+digest and no registry credential. The only secret either workflow can see is an
+SSH key pinned to a forced command.
+
+`valkey` is an upstream image and has no repo. It is never deployed by CI, and
+`rd-entry` refuses to name it at all.
+
+### `update`, never `deploy`
+
+`rd-deploy deploy` is `compose up -d` with **no rebuild**. Against a
+local-context compose file it converges on the image already on disk — the same
+image — so a pipeline built on `deploy` would report success having shipped
+nothing. Both workflows send `update <service>`, which fetches and rebuilds.
+
+`deploy` remains in the grammar for a human converging the stack after editing
+compose by hand. **If you ever see `deploy` in a workflow file, that is the bug.**
+
+### What this costs, stated plainly
+
+**The production box now compiles its own deploys.** `tsc`, the python image and
+`next build` all run on a 2-vCPU VPS next to live POS traffic, with real memory
+pressure, and the build is now *inside* the deploy window instead of before it.
+The dashboard is the worst of the three: its builder stage installs
+`build-essential`/`g++`/`libvips-dev` and runs a full `next build`.
+
+That is a genuine regression against the registry design, and it is the price of
+not needing a registry credential. Consequences to plan around:
+
+* **Deploy outside service hours.** Both deploy jobs are `timeout-minutes: 60`.
+* A build failure now surfaces as a non-zero `update`, with the build output
+  captured into the job summary.
+* Rollback is still fast — it is a container swap, not a rebuild.
+
+### Build args live on the box now
+
+For the dashboard this is load-bearing and easy to miss. `next.config.ts`'s
+`/backend-api` rewrite and every `NEXT_PUBLIC_*` value are baked into the
+standalone build manifest **at build time**, and the build now happens on the
+box. Those values therefore come from `docker-compose.yml` on the VPS, which is
+not in git and which CI cannot read or set.
+
+`vars.NEXT_PUBLIC_BACKEND_URL` and `vars.BACKEND_INTERNAL_URL` are consequently
+**inert** — no workflow reads them any more. The old CI-side guard that refused a
+`localhost` backend URL has been deleted rather than left in place, because it
+can no longer see the value it was checking and a check that cannot fail is worse
+than no check.
+
+If a guest page breaks after a deploy, look at the `build:` args in
+`/opt/restaurant-dash/docker-compose.yml` first. What the dashboard workflow
+still asserts is repository *content*: `Dockerfile` must keep
+`ARG BACKEND_INTERNAL_URL`, and `.dockerignore` must keep excluding
+`public/downloads`.
+
+---
+
+## How a run proves it actually shipped
+
+This is the heart of the design. **A pipeline that reports success without
+shipping is the specific failure it exists to prevent**, and with a
+local-context build there are two independent ways for that to happen. So there
+are two independent proofs, and a green run needs both:
+
+| Proof | Reads | Proves | Does **not** prove |
+|---|---|---|---|
+| **revision** | `rd-deploy revision` must equal `github.sha` afterwards | the code reached the box | that anything was rebuilt — `update` resets the tree *before* its migration gate, so an exit-65 run leaves the tree on the new commit with the old containers running |
+| **recreation** | `rd-deploy status` snapshotted **before** the first `update` and again after; the uptime must have **reset** | a new image is running | which commit built it |
+
+If either fails, the run exits **72** and **no rollback is attempted**. That is
+deliberate: `rollback` swaps the running image for `:previous`, so if this run
+never replaced the image, the thing running *is* `:previous` and rolling back
+would move production to the build before that — backwards, over a deploy that
+never happened. **Never roll back what was never rolled forward.**
+
+### The exception, and it is the important one
+
+"Recreation failed" is **not** one outcome. It is three, and exit 72 covers only
+two of them:
+
+| The post-update `status` line for an updated service | What that is | Where the run goes |
+|---|---|---|
+| an uptime that is **older** than the before-reading | *measured* not recreated | **72**, no rollback. This is the only case in which a summary may say the image was not replaced |
+| `Restarting` / `Exited` / `Created` | **replaced and broken** — a recognised not-running state, carrying no duration because nothing is up | the **health-failure path**: collect that service's logs, `rollback`, poll again. Exit 70/71/74 |
+| absent, or a wording the parser does not recognise | **could not be measured** | **72**, no rollback, under its own heading — the run says it could not tell, and never that nothing shipped |
+
+The middle row is a fix, and it replaced a genuinely dangerous bug. Those three
+states carry no duration, so a version of `assert_recreated` that only asked
+"did the uptime reset?" scored a container **crash-looping on the image just
+built** as *not recreated* — and the exit-72 gate sits above the rollback
+section. A crash-looping production deploy therefore exited 72 having called
+`rollback` **zero** times, collected **no** logs, and printed *"NOT ONE of
+python backend was recreated … so no new image reached production. No rollback
+was attempted, on purpose … the thing running now IS `:previous`"*. Every clause
+of that was false. `Restarting`, `Exited` and `Created` are **recognised**
+states, not unreadable ones, and the difference between "it is not running" and
+"I could not read this line" is now the difference between rolling back and
+standing still.
+
+### What is still unproven
+
+`revision` reads the **working tree**, not the image. A run can therefore prove
+that the box is on this commit and that a new container is running, but not that
+this container was built *from that tree* — a `docker compose build` that
+silently reused a stale layer would satisfy both. Closing that gap means putting
+the revision into the image (the label already exists) and exposing it on
+`/health`; that remains the single highest-value follow-up.
+
+### Why recreation is a comparison, not an age
+
+The obvious version of proof 2 — "the container must report an uptime of five
+minutes or less" — is wrong twice over on this box, and both were measured, not
+guessed.
+
+**It punishes a slow build.** The window is measured *after* `update backend`
+returns, and `update` runs `tsc` and a docker build on 2 vCPUs beside live POS
+traffic. That routinely takes longer than five minutes; the workflow's own
+`timeout-minutes: 60` concedes as much. So the rule red-lighted deploys that had
+worked.
+
+**It cannot read what the box prints.** Docker's `HumanDuration` says
+`Up About an hour` for a container between 60 and 90 minutes old, and the old
+regex did not list it — nor `N years`. An unparseable duration took a branch that
+printed a `::warning::` and **returned success**, which means the assertion could
+silently switch itself off. That is not theoretical: `rd-deploy status` on the
+box today returns
+
+```
+backend		Up 32 hours (healthy)
+dashboard	Up About an hour (healthy)
+python		Up 46 hours (healthy)
+valkey		Up 46 hours (healthy)
+```
+
+So proof 2 is now a **comparison**: snapshot `status` before the first `update`,
+read it again after, and look for the uptime **reset**. A container that was not
+replaced can only get older; one that was replaced starts from zero. That is
+immune to a build of any length and to any wording. Anything the parser cannot
+read now **fails**, never passes — `deploy/vps/tests/test_status_parser.sh` pins
+both properties, and `ci.yml` runs it.
+
+### Not every service has to move
+
+The rule is **at least one** updated service must show the reset. A service that
+did not is named in a `::notice::` and printed in the success summary under
+`unchanged`, and the summary never claims nothing shipped while the backend did.
+
+**Do not re-derive that rule from "a cache-hit rebuild does not recreate."
+Measured on this box, it does.** `buildx` 0.36.1 stamps a provenance attestation
+into every build, so a rebuild with **no source change at all** still produces a
+new image id:
+
+```
+image id before                    sha256:129c9f26d3403a54be6
+image id after rebuild, no change  sha256:389d5ce34d2de9f0d45
+```
+
+and `up -d` then swaps the container. Confirmed live: `rd-deploy update python`
+with nothing touched in the python image took that container's uptime from
+46 hours to 12 seconds.
+
+An earlier version of this section said the opposite, with a number attached —
+that `Dockerfile.python:32-33` copies only `pyproject.toml`, `README.md` and
+`Python_servers/`, so a TypeScript-only commit rebuilds python to an identical
+image id and requiring every service to move would have red-lighted "roughly 92%
+of real backend deploys". The Dockerfile part is true; **the conclusion drawn
+from it is not true on this box**, and the 92% figure described a machine this is
+not. It has been removed rather than softened.
+
+The at-least-one rule stays, and not as a leftover. It does not depend on that
+behaviour in either direction, it survives a `buildx` that stops stamping
+provenance or a compose that starts skipping identical images, and it is what
+keeps a build longer than any fixed "younger than N minutes" window from
+red-lighting a deploy that worked.
+
+### The genuinely benign way to fail proof 2 — and why it is rarer than it looks
+
+A commit that changes nothing that lands in **any** image — docs, `.github/`,
+`deploy/`, anything in `.dockerignore` — could in principle rebuild every service
+to an identical image id, leaving compose nothing to recreate, and the run goes
+red with exit 72. That would be the pipeline telling the truth: nothing shipped,
+because nothing needed to.
+
+Given the buildx behaviour above, **treat it as the less likely explanation, not
+the default one.** On this box even an unchanged rebuild normally recreates, so
+nothing moving is itself worth a look at the `update` output. The 72 summary
+enumerates the causes in that order and rules "the box was already on this
+commit" in or out from the before/after revisions it prints.
+
+### A no-op re-dispatch is red, and says so in its own words
+
+Nothing used to assert that the revision **moved**. Re-dispatching a commit the
+box is already on printed `revision aaaa -> aaaa (= github.sha)` and reported
+success on a run that changed nothing anywhere.
+
+Now the workflows track `REV_MOVED` separately from `REV_OK`, and the case where
+the revision was already correct, did not move, and nothing was recreated gets
+its own heading — **NOTHING CHANGED** — instead of `CANNOT BE PROVEN`. It is
+still exit 72, deliberately: the one promise this pipeline makes is that a green
+run means code shipped. But the summary says plainly that the box was already on
+this commit, that **every updated service's uptime was read on both sides of the
+update and had not reset**, that production is unchanged and healthy (or is not,
+and why that is not this run's doing), and that nothing was rolled back.
+
+That heading is now gated on the measurement actually having been taken. It used
+to be reachable when the post-update `status` call merely **timed out** — every
+service then landed in "could not measure", the tree was already at `github.sha`
+from the `update` that *had* succeeded, and the run printed *"every rebuild was a
+pure cache hit … No container's uptime reset"* about a container it had never
+looked at. Runs that could not measure now get their own heading, **COULD NOT BE
+MEASURED**, which says what failed, what is still known (the `update` calls
+returned 0; the health poll did or did not see the service healthy), and gives
+the three commands that settle it on the box. Same exit code, different sentence:
+*measured no* and *could not measure* must never read the same.
+
+The distinction that matters: a re-run **after applying a migration by hand** also
+finds the revision already correct — the refused run reset the tree before exiting
+65 — but it *does* rebuild and recreate. That is a real deploy and reports success,
+with `revision ... UNCHANGED` spelled out in the summary.
 
 ---
 
 ## What the pipeline does, step by step
 
-**`Restaurant_Backend` on push to `main`:**
+**`Restaurant_Backend`:**
 
 1. **ci** — `ci.yml` via `workflow_call`, unchanged and secret-free: money
    invariants, typecheck, unit tests, the route-manifest gate
    (`npm run test:routes`), migration chain, tenant isolation, real-Postgres
-   integration tests, container smoke test. Node 22.
-2. **build_push** — builds `Dockerfile.node` and `Dockerfile.python`, pushes
-   `:sha-<commit>` (immutable provenance) and `:main` (BuildKit cache only), and
-   outputs both digests. **`:prod` is not touched here.**
-3. **migration_gate (Gate A)** — a `git diff` over `migrations/`. Zero
-   credentials, no network call. If this push adds SQL, the run stops here with
-   the exact `docker run … npm run migrate` command, and `:prod` never moves.
-4. **deploy** (`environment: production`) — moves `:prod` → asks
-   `check-migrations` → `deploy python` (skipped when its digest is unchanged) →
-   `deploy backend` → asserts recreation → polls `status` until `(healthy)` →
-   optional public probe. On any failure it restores `:prod`, runs
-   `rd-deploy rollback`, and fails red.
+   integration tests, container smoke test. Node 22. A red CI makes the deploy
+   job **unreachable**.
+2. **migration_gate (Gate A)** — a `git diff` over `migrations/`. Zero
+   credentials, no network call. If this push adds SQL the run stops here and the
+   box is never contacted.
+3. **deploy** (`environment: production`, and `if: github.ref ==
+   'refs/heads/main'` so the branch restriction is visible in the file and not
+   only in Settings) — `revision` (baseline) → `status` (**the baseline snapshot
+   the recreation proof compares against; a failure to read it refuses the deploy
+   outright, while the box is still untouched**) → `check-migrations` →
+   `update python` → `update backend` → `revision` (proof) → `status` (compared
+   against the baseline) → health poll → public probe of
+   `https://api.dialdost.com/health`. On failure: the logs of **whichever service
+   is actually unhealthy**, then `rollback backend`, `rollback python`.
 
-**`Restaurant_Dashboard_UI` on push to `main`:** the same shape, minus the
-migration gate, plus a precondition that the **backend is already healthy**
-before it will touch anything.
+**`Restaurant_Dashboard_UI`:** the same shape, minus Gate A (this repo ships no
+SQL), plus a **preflight** job asserting the Dockerfile and `.dockerignore`, plus
+a precondition that the **backend is already healthy** before it will touch
+anything. It probes `https://experiosolutions.dialdost.com/login`.
+
+### Why the backend deploys `python` before `backend`
+
+Both come out of the same clone and the same working tree, so the first `update`
+is the one that fetches and resets; the second finds the tree already at
+`FETCH_HEAD` and only rebuilds its own service. Order matters anyway:
+
+* the **first** `update` is the one that can be refused (65, or 64 on a grammar
+  bug). Spending that refusal on the sidecar means the API every till talks to
+  has not been rebuilt or bounced when it happens;
+* `backend` depends on `python`, not the reverse. The dependency goes up first,
+  so the new backend never talks to an old sidecar;
+* `backend` is the publicly observable service and the one the dashboard proxies
+  to — last means the riskiest swap is the one the health poll is watching;
+* if the python build fails, the backend has not been touched and restaurants
+  keep taking orders.
+
+Rollback runs in the **reverse** order — `backend` first — so the API is back on
+a known-good build before the sidecar is touched.
+
+Unlike the registry design, `python` is **not** skipped when nothing about it
+changed: there is no digest to compare before the build exists, and inferring a
+skip from a path diff would depend on the box's previous SHA being an ancestor of
+this commit, which a force-push or squash breaks.
 
 ### The two migration gates, and why there are two
 
 | | Gate A (CI) | The server gate |
 |---|---|---|
-| Where | GitHub runner | inside `rd-deploy deploy`, exit 65 |
+| Where | GitHub runner | inside `rd-deploy update`, exit 65 |
 | Credential | none | `.env.migrate`, root-only, never leaves the box |
 | Detects | migrations added *by this push* | anything the *database* has not applied |
 | Misses | a migration from an earlier push nobody applied | nothing |
-| Cost | a `git diff` | one command on the box |
+| When it fires | before the box is contacted at all | **after the working tree has already been reset** |
 
-Gate A exists to fail *before* `:prod` moves and before an SSH connection is
-opened. The server gate is the true one. **Neither ever applies a migration.**
+Gate A exists to fail before an SSH connection is opened. The server gate is the
+true one. **Neither ever applies a migration.**
 
 A `workflow_dispatch` run skips Gate A deliberately — that is how you re-run a
-deploy after applying a migration by hand. Re-running the *push* would just fail
-at Gate A again.
+deploy after applying a migration by hand.
+
+The workflows also run `check-migrations` *before* `update`. That catches a
+migration left unapplied by an **earlier** release, while the tree is still
+untouched, which is a strictly better place to stop.
 
 ---
 
 ## Secrets and variables
-
-Every secret the workflows read, named exactly as it appears in the YAML.
 
 ### `secrets.DEPLOY_SSH_KEY` — **environment** secret on `production`, both repos
 
@@ -159,48 +373,47 @@ The **private** half of the ed25519 keypair whose public half is in
 
 **What it grants:** an SSH session to the `deploy` account that is immediately
 replaced by the forced command `/usr/local/sbin/rd-entry`. Its entire vocabulary
-is `status`, `logs [svc]`, `check-migrations`, `deploy [svc]`, `rollback [svc]`.
-It cannot open a shell, cannot forward a port to Valkey or Postgres, cannot read
-an env file, cannot run `docker` (the `deploy` user is not in the docker group),
-and cannot run any program other than `rd-deploy`.
+is `status`, `revision`, `logs [svc]`, `check-migrations`, and
+`update|deploy|rollback <svc>` with `svc` in `backend|dashboard|python`. It
+cannot open a shell, cannot forward a port to Valkey or Postgres, cannot read an
+env file, cannot run `docker` (the `deploy` user is not in the docker group), and
+cannot run any program other than `rd-deploy`.
 
 It must be an **environment** secret, not a repository secret, so a workflow on a
 feature branch or a PR cannot read it.
 
-### `secrets.GITHUB_TOKEN` — automatic, you do not create it
-
-Used to `docker login ghcr.io`. Grants push of the image and the ability to move
-the `:prod` tag, via `permissions: packages: write` on the two jobs that need it.
-It is ephemeral and scoped to the run.
+There is **no `secrets.GITHUB_TOKEN` use and no `packages:` permission** in
+either deploy workflow any more. Nothing in this pipeline talks to a registry.
 
 ### Repository variables — both repos
 
-These are `vars.*`, not secrets. None is confidential; the risk in each is its
-*absence* or a wrong value, not its disclosure.
+`vars.*`, not secrets. None is confidential; the risk in each is its *absence* or
+a wrong value, not its disclosure.
 
 | Name | Value | Notes |
 |---|---|---|
-| `DEPLOY_HOST` | the VPS address | not a secret |
+| `DEPLOY_HOST` | `103.212.120.44` | not a secret |
 | `DEPLOY_USER` | `deploy` | the restricted identity |
 | `DEPLOY_PORT` | `22` | may be omitted; defaults to 22 |
-| `SSH_KNOWN_HOSTS` | output of `ssh-keyscan` below | the workflow **refuses to run** without it. Never `StrictHostKeyChecking=no` — that would let anyone on the runner's network path collect the deploy key |
+| `SSH_KNOWN_HOSTS` | output of `ssh-keyscan` | the workflow **refuses to run** without it. Never `StrictHostKeyChecking=no` — that would let anyone on the runner's network path present their own host key and collect the deploy key |
 
-### Repository variables — `Restaurant_Backend` only
+### Optional per-repo overrides
 
-| Name | Value |
-|---|---|
-| `PUBLIC_HEALTH_URL` | optional. The public `…/health` URL through cloudflared. Used only as a supplementary probe; a failure here **warns**, it never triggers a rollback, because an image rollback cannot fix a broken tunnel |
+Both have a live default baked into the workflow's `env:` block, so neither has
+to be set; a `vars.` value wins if you need to change the URL without a commit.
 
-### Repository variables — `Restaurant_Dashboard_UI` only
+| Repo | Name | Default in the workflow |
+|---|---|---|
+| `Restaurant_Backend` | `PUBLIC_HEALTH_URL` | `https://api.dialdost.com/health` |
+| `Restaurant_Dashboard_UI` | `PUBLIC_DASHBOARD_URL` | `https://experiosolutions.dialdost.com/login` |
 
-All three are baked into the image at build time.
+A public probe that never answers is exit **73**: the run goes red, but it does
+**not** roll back, because the containers are healthy on the box and an image
+swap cannot fix ingress.
 
-| Name | Value |
-|---|---|
-| `NEXT_PUBLIC_BACKEND_URL` | the **public origin guests reach** — the cloudflared hostname. Do not guess it; read it from the running image or the cloudflared config. The build fails if it is empty or contains `localhost` |
-| `BACKEND_INTERNAL_URL` | `http://backend:3001` (the compose service name; defaults to this if unset) |
-| `NEXT_PUBLIC_FEEDBACK_FORM_URL` | leave unset unless the feedback form is hosted off-origin |
-| `PUBLIC_DASHBOARD_URL` | optional public probe URL, e.g. the `/login` page |
+`NEXT_PUBLIC_BACKEND_URL`, `NEXT_PUBLIC_FEEDBACK_FORM_URL` and
+`BACKEND_INTERNAL_URL` are **no longer read by any workflow** — see *Build args
+live on the box now*. Leave them or delete them; they do nothing here.
 
 ### Creating the key and the host pin
 
@@ -213,13 +426,9 @@ gh secret set DEPLOY_SSH_KEY --env production --repo Dial-Dost/Restaurant_Backen
 gh secret set DEPLOY_SSH_KEY --env production --repo Dial-Dost/Restaurant_Dashboard_UI < ci-deploy
 
 # Host key pin.
-ssh-keyscan -p 22 <host> > known_hosts.txt
+ssh-keyscan -p 22 103.212.120.44 > known_hosts.txt
 gh variable set SSH_KNOWN_HOSTS --repo Dial-Dost/Restaurant_Backend      < known_hosts.txt
 gh variable set SSH_KNOWN_HOSTS --repo Dial-Dost/Restaurant_Dashboard_UI < known_hosts.txt
-
-gh variable set DEPLOY_HOST --repo Dial-Dost/Restaurant_Backend --body '<host>'
-gh variable set DEPLOY_USER --repo Dial-Dost/Restaurant_Backend --body 'deploy'
-# ...and the same for the dashboard repo.
 ```
 
 Configure the `production` environment in **both** repos with *deployment
@@ -228,167 +437,104 @@ click before every production deploy.
 
 ### The exact `authorized_keys` line
 
-Install this as the **only** line in `/home/deploy/.ssh/authorized_keys`
-(`deploy:deploy`, mode `0600`), with `<PUBKEY>` replaced by the full contents of
-`ci-deploy.pub`:
+Installed as the **only** line in `/home/deploy/.ssh/authorized_keys`
+(`deploy:deploy`, mode `0600`):
 
 ```
-restrict,command="/usr/local/sbin/rd-entry" ssh-ed25519 AAAA...<PUBKEY>... ci-deploy
+restrict,command="/usr/local/sbin/rd-entry" ssh-ed25519 AAAA...<PUBKEY>... github-actions-deploy
 ```
 
 `restrict` implies `no-port-forwarding`, `no-agent-forwarding`,
 `no-X11-forwarding`, `no-pty` and `no-user-rc`, and automatically picks up any
-future restriction OpenSSH adds. `command=` means the client's own command line is
-never executed: it arrives in `$SSH_ORIGINAL_COMMAND`, and `rd-entry`
+future restriction OpenSSH adds. `command=` means the client's own command line
+is never executed: it arrives in `$SSH_ORIGINAL_COMMAND`, and `rd-entry`
 character-whitelists it, splits it into an argv array without ever invoking a
 shell, checks it against the same grammar `rd-deploy` enforces, and `exec`s
 `sudo -n /usr/local/sbin/rd-deploy`.
 
-`install.sh` writes this line for you if you pass it the public key file.
+**This is installed and was proven with the real private key**: an interactive
+session, `cat /opt/restaurant-dash/.env` and a bare `deploy` were all refused,
+while `status` and `revision` worked; 25 hostile inputs all came back 64.
 
-> **This is not yet configured on the box.** The `deploy` user currently has its
-> own public key in its `authorized_keys` with no forced command. Until this line
-> replaces it, that key is an ordinary shell account.
+Both workflows still handle exit **127** at every call site anyway. A 127 today
+would mean the forced command has been *removed* — a change to the security
+boundary, not an unfinished install — and the workflows say exactly that.
 
 ---
 
-## One-time server setup still outstanding
+## The state of the box
 
-Ordered. Steps 1–4 must all be done before the first pipeline run.
+Everything in this list is **done**. It is recorded so that a future change is a
+visible change, and so the failure output can name what should be true.
 
-### 1. Install the forced command
+1. **The forced command** — `/usr/local/sbin/rd-entry`, root-owned 0755, wired
+   into `authorized_keys` as above. Proven.
+2. **The wrapper** — `/usr/local/sbin/rd-deploy`, root-owned 0755, reached
+   through a wildcard-free sudoers grant. Its grammar, including `update` and
+   `revision`, is in [`WRAPPER_CONTRACT.md`](./WRAPPER_CONTRACT.md).
+3. **The two clones** — `/opt/restaurant-dash/Restaurant_Backend` and
+   `.../Restaurant_Dashboard_UI`, on `main`, clean, fetched with per-repo
+   **read-only** deploy keys.
+4. **Compose builds from local context** — `docker-compose.yml` builds those two
+   directories. It is not in git.
+5. **The migration credential** — `/opt/restaurant-dash/.env.migrate`, root-only,
+   holding `MIGRATION_DATABASE_URL` for the **owner/migration role**, not
+   `app_runtime` (which intentionally lacks DDL privileges). `check-migrations`
+   reads it; nothing in CI ever sees it.
 
-```sh
-scp -r deploy/vps ci-deploy.pub root@<host>:/tmp/rd-vps
-ssh root@<host> 'bash /tmp/rd-vps/install.sh /tmp/rd-vps/ci-deploy.pub'
-```
-
-`install.sh` writes only `/usr/local/sbin/rd-entry` and the `authorized_keys`
-line. It **verifies** `rd-deploy`, the sudoers fragment, compose, the bind mount,
-the GHCR credential and cloudflared — and refuses to write any of them. It exits
-non-zero listing anything unfinished.
-
-### 2. GHCR read credentials for root (deliberately not a GitHub secret)
-
-`rd-deploy` runs `docker compose` as root, so **root's** docker config is what
-pulls. `secrets.GITHUB_TOKEN` is ephemeral and cannot help here.
-
-```sh
-# On the VPS, as root. Use a token with read:packages ONLY.
-printf '%s' '<READ_ONLY_TOKEN>' | docker login ghcr.io -u <github-user> --password-stdin
-```
-
-The three packages must be visible to that token: either make
-`restaurant_backend`, `restaurant_python` and `restaurant_dashboard` internal/
-public in the org, or grant the token read access to each.
-
-Without this, `compose up -d` cannot pull and every deploy fails at the pull.
-
-### 3. The migration credential
-
-`rd-deploy check-migrations` needs a database credential that never leaves the
-box.
+To re-verify, on the VPS:
 
 ```sh
-# /opt/restaurant-dash/.env.migrate    root:root 0600
-MIGRATION_DATABASE_URL=postgresql://<owner-role>:<pw>@<host>:<port>/<db>
-```
-
-Owner/migration role, **not** `app_runtime` — `app_runtime` intentionally lacks
-DDL privileges. Nothing in CI ever sees this file; CI sees an exit code and the
-wrapper's own output.
-
-### 4. Switch compose to follow the `:prod` tag
-
-**This is the change that makes the whole pipeline work, and it is the only file
-edit required on the server.** `/opt/restaurant-dash/docker-compose.yml`, for the
-three application services (leave `valkey` alone):
-
-```yaml
-  backend:
-    image: ghcr.io/dial-dost/restaurant_backend:prod
-    pull_policy: always          # WITHOUT THIS EVERY DEPLOY IS A SILENT NO-OP
-    # ...everything else unchanged: restart: always, the 127.0.0.1:3001 publish,
-    #    env_file, depends_on. Remove any `build:` key.
-
-  python:
-    image: ghcr.io/dial-dost/restaurant_python:prod
-    pull_policy: always
-
-  dashboard:
-    image: ghcr.io/dial-dost/restaurant_dashboard:prod
-    pull_policy: always
-    # DO NOT TOUCH the public/downloads bind mount. It stays read-only:
-    #   - ./public/downloads:/app/public/downloads:ro
-```
-
-Do not change the port publishes (`127.0.0.1:3001`, `127.0.0.1:9002`), the
-`restart: always` policies, or the `public/downloads` mount. `install.sh` checks
-for the `:prod` references and counts at least three `pull_policy: always` lines.
-
-### 5. Seed the `:prod` tags before the first run
-
-Optional but strongly recommended: it is what gives the very first pipeline run a
-rollback target.
-
-```sh
-# On your workstation, logged in to ghcr.io. Build/push the CURRENTLY RUNNING code
-# once by hand from the commit that is live, then:
-docker buildx imagetools create --tag ghcr.io/dial-dost/restaurant_backend:prod   ghcr.io/dial-dost/restaurant_backend:sha-<live-commit>
-docker buildx imagetools create --tag ghcr.io/dial-dost/restaurant_python:prod    ghcr.io/dial-dost/restaurant_python:sha-<live-commit>
-docker buildx imagetools create --tag ghcr.io/dial-dost/restaurant_dashboard:prod ghcr.io/dial-dost/restaurant_dashboard:sha-<live-commit>
-```
-
-Then `sudo rd-deploy deploy backend` once, by hand, and confirm the stack is
-healthy on registry images before CI ever runs. See
-[First-run safety](#first-run-safety) for what happens if you skip this.
-
-### 6. Verify before you trust it
-
-```sh
-# On the box, as root — proves the wrapper works at all:
 sudo /usr/local/sbin/rd-deploy status
-
-# As the deploy user, through sudo — proves the sudoers grant works:
-sudo -u deploy sudo -n /usr/local/sbin/rd-deploy status
-
-# From your workstation, through SSH — proves the forced command works:
-ssh -i ci-deploy deploy@<host> status
-ssh -i ci-deploy deploy@<host> check-migrations
-
-# And prove the key CANNOT do anything else. EVERY ONE of these must fail:
-ssh -i ci-deploy deploy@<host>                                   # no shell
-ssh -i ci-deploy deploy@<host> 'cat /opt/restaurant-dash/.env'   # no file read
-ssh -i ci-deploy deploy@<host> 'docker ps'                       # unknown verb
-ssh -i ci-deploy deploy@<host> 'deploy; sh'                      # charset reject
-ssh -i ci-deploy -L 6379:127.0.0.1:6379 deploy@<host> status     # no forwarding
-sudo -u deploy docker ps                                          # not in docker group
+sudo /usr/local/sbin/rd-deploy revision
+sudo -u deploy sudo -n /usr/local/sbin/rd-deploy status      # the sudoers grant
+git -C /opt/restaurant-dash/Restaurant_Backend status --short --branch
+git -C /opt/restaurant-dash/Restaurant_Dashboard_UI status --short --branch
 ```
 
----
+And from a workstation, proving the key can do that and nothing else — **every
+one of these must fail**:
 
-## First-run safety
+```sh
+ssh -i ci-deploy deploy@103.212.120.44 revision                     # works
+ssh -i ci-deploy deploy@103.212.120.44                              # no shell
+ssh -i ci-deploy deploy@103.212.120.44 'cat /opt/restaurant-dash/.env'
+ssh -i ci-deploy deploy@103.212.120.44 'docker ps'                  # unknown verb
+ssh -i ci-deploy deploy@103.212.120.44 update                       # bare update
+ssh -i ci-deploy deploy@103.212.120.44 'update valkey'
+ssh -i ci-deploy deploy@103.212.120.44 'deploy; sh'                 # charset reject
+ssh -i ci-deploy -L 6379:127.0.0.1:6379 deploy@103.212.120.44 status # no forwarding
+sudo -u deploy docker ps                                             # not in docker group
+```
 
-On the very first pipeline run, `:prod` may not exist in GHCR yet. Both workflows
-detect this (`FIRST_RUN`) and behave as follows:
+`install.sh` in this directory checks all of the above and is current for the
+git transport. It verifies, and does not assume:
 
-* The tag is **created** pointing at the new build, so the deploy can proceed.
-* There is **no rollback target**, because there is no previous digest anywhere —
-  the wrapper keeps no history and `rd-deploy rollback` would only force-recreate
-  the *same failing image*.
-* So if the health check fails on a first run, the workflow **does not call
-  `rollback`**. It leaves the stack as it is — up, on the new image — rather than
-  churning it, prints the `compose ps` output and the last 100 log lines, and
-  fails with the exact commands to point `:prod` at a known-good digest by hand.
+* both clones exist, are **on `main`**, have **clean working trees**, and their
+  read-only deploy keys authenticate (`git ls-remote`);
+* `docker-compose.yml` builds `./Restaurant_Backend` (backend, python) and
+  `./Restaurant_Dashboard_UI` (dashboard) as local contexts;
+* the wrapper refuses an unknown verb, an unknown service, a **bare `update`**
+  and **`update valkey`** — each with 64 — and that `revision` prints 40-char
+  shas, since the pipeline's deploy proof parses that output;
+* `rd-entry` is installed as a forced command and refuses **both** an arbitrary
+  command and an **interactive session** (empty `SSH_ORIGINAL_COMMAND` — the one
+  that would hand over a shell);
+* `.env.migrate` is present and root-only; `public/downloads` is non-empty;
+  no `command:`/`entrypoint:` override on an application service and no
+  `start:prod` anywhere; sudoers is wildcard-free and `visudo -c` is clean;
+  `deploy` is not in the docker group; `cloudflared` is up.
 
-**The stack is never left down by this path**, because the failure mode is "the
-new container is running but unhealthy", and repeatedly recreating it would only
-add outage. Seeding `:prod` first (step 5 above) removes the situation entirely.
+It **writes only** `/usr/local/sbin/rd-entry` and the `authorized_keys` line. It
+will not create `rd-deploy` or the sudoers file — those are the security
+boundary and live only on the box (see `WRAPPER_CONTRACT.md`). Running it is
+idempotent.
 
-The other first-run hazard is a compose file that still lacks
-`pull_policy: always`: `up -d` would then quietly do nothing. That is what the
-recreation assertion catches — it fails the build with that exact diagnosis
-instead of reporting a green deploy that never happened.
+> Earlier revisions of that file verified the **registry** transport —
+> `image: ghcr.io/…:prod`, `pull_policy: always`, a `/root/.docker` credential.
+> Every one of those checks fails on a correctly-configured box now, which is
+> worse than no check at all, so they were replaced rather than deleted. If you
+> are reading an old copy, that is why.
 
 ---
 
@@ -397,166 +543,266 @@ instead of reporting a green deploy that never happened.
 The pipeline will **never** do this. The production database has no PITR, so an
 auto-applied migration is an unrecoverable event a health check cannot see.
 
-1. Push the migration. Gate A stops the run and prints the digest.
-2. On the VPS, as root, from the image that carries the SQL (`migrations/` is
-   baked into the image, so running it from the *deployed* image would apply the
-   OLD file set):
+The awkward part of the git transport is that the SQL has to reach the box before
+it can be applied, and the only thing allowed to fetch is `update` — which
+refuses to build while a migration is pending. Use that refusal:
 
-   ```sh
-   docker run --rm --env-file /opt/restaurant-dash/.env.migrate \
-       ghcr.io/dial-dost/restaurant_backend@sha256:<digest-from-the-summary> \
-       npm run migrate
-   ```
+```sh
+# On the VPS, as root.
 
-3. Watch it finish.
-4. Re-run the workflow from the **Actions tab** (Run workflow). A
-   `workflow_dispatch` run skips Gate A; the server gate still runs.
+# 1. Fetches and resets the tree to main, THEN refuses with 65 without building.
+#    That refusal is the point: the new migrations/ are now on disk and no
+#    container has been touched.
+sudo /usr/local/sbin/rd-deploy update backend ; echo "expect 65, got $?"
+
+# 2. Name what is pending.
+sudo /usr/local/sbin/rd-deploy check-migrations
+
+# 3. Apply it with the CURRENTLY DEPLOYED image, overlaying the new migration
+#    files read-only. Nothing here rebuilds anything, so the :previous rollback
+#    target is left alone.
+docker run --rm --env-file /opt/restaurant-dash/.env.migrate \
+    -v /opt/restaurant-dash/Restaurant_Backend/migrations:/app/migrations:ro \
+    restaurant-dash-backend:latest npm run migrate
+
+# 4. Confirm.
+sudo /usr/local/sbin/rd-deploy check-migrations   # must come back clean
+```
+
+**Two assumptions in step 3, both cheap to check first**, and neither has been
+exercised against this box yet:
+
+```sh
+docker image inspect -f '{{.Config.WorkingDir}}' restaurant-dash-backend:latest   # expect /app
+```
+
+and that `npm run migrate` reads `migrations/` relative to that working
+directory. Verify both **the first time**, deliberately, before trusting this
+recipe.
+
+The obvious alternative — `docker compose build backend` and then run `migrate`
+from the fresh image — is **worse**, and not only because it burns a build:
+building tags `restaurant-dash-backend:latest` with the *new* code, so the
+subsequent `update` would tag that as `:previous` and your rollback target would
+become the very build you are trying to be able to escape from.
+
+Then re-run the deploy workflow from the **Actions tab**. A `workflow_dispatch`
+run skips Gate A; the server gate still runs, and now passes.
 
 ---
 
 ## Triggering a manual deploy
 
 * **From GitHub:** Actions → *Deploy (production)* → **Run workflow** on `main`.
-  This rebuilds from the current `main`, so it is also how you re-deploy after
-  applying a migration.
-* **On the box, without GitHub** (the images must already be in GHCR and `:prod`
-  must already point where you want):
+  This is also how you re-deploy after applying a migration.
+* **On the box, without GitHub:**
 
   ```sh
   sudo /usr/local/sbin/rd-deploy check-migrations
-  sudo /usr/local/sbin/rd-deploy deploy backend
+  sudo /usr/local/sbin/rd-deploy update python
+  sudo /usr/local/sbin/rd-deploy update backend
+  sudo /usr/local/sbin/rd-deploy revision      # confirm it is the commit you meant
   sudo /usr/local/sbin/rd-deploy status
   ```
 
-  Use `deploy dashboard` / `deploy python` for the others. Avoid a bare
-  `rd-deploy deploy` — that is `compose up -d` across the whole stack, valkey
-  included.
+  Use `update dashboard` for the dashboard. **Do not use `deploy`** unless you
+  specifically want "converge without rebuilding" — for example after editing
+  `docker-compose.yml` by hand. `deploy` will not ship new code.
 
 ---
 
-## Rolling back by hand
-
-`rd-deploy rollback` alone is **not** a version rollback — it is
-`compose up -d --force-recreate` and will hand you the same image back. A real
-rollback is two steps, and the first one is in the registry:
+## Rolling back
 
 ```sh
-# 1. On your workstation, logged in to ghcr.io. Find the digest you want:
-docker buildx imagetools inspect ghcr.io/dial-dost/restaurant_backend:prod
-#    ...and point :prod back at a known-good build:
-docker buildx imagetools create \
-    --tag ghcr.io/dial-dost/restaurant_backend:prod \
-    ghcr.io/dial-dost/restaurant_backend:sha-<good-commit>
-docker buildx imagetools create \
-    --tag ghcr.io/dial-dost/restaurant_python:prod \
-    ghcr.io/dial-dost/restaurant_python:sha-<good-commit>
-
-# 2. On the VPS, converge onto it:
-sudo /usr/local/sbin/rd-deploy rollback backend
+sudo /usr/local/sbin/rd-deploy rollback backend    # then python, if it was updated
 sudo /usr/local/sbin/rd-deploy status
 sudo /usr/local/sbin/rd-deploy logs backend
 ```
 
-The successful-deploy job summary prints the previous digests under
-*"rollback target"* — that is the value to put back.
+`rollback` retags `<image>:previous` back to `:latest` and force-recreates, so
+unlike the old wrapper it **does** revert the running code. Two limits, and the
+workflows print both in their failure output:
 
-If the site is still down after a rollback, stop automating. Check
-`journalctl -u cloudflared` (the tunnel is the only ingress; no image rollback
-fixes it) and `docker compose -f /opt/restaurant-dash/docker-compose.yml ps`.
+1. **It does not touch the git working tree.** After a rollback,
+   `rd-deploy revision` still reads the bad commit, and **the next `update` of
+   that service — a workflow re-run, or someone shipping an unrelated fix —
+   rebuilds it and puts it straight back into production.** The image rollback is
+   a stopgap. The durable fix is:
+
+   ```sh
+   git revert <bad-sha> && git push      # then dispatch the workflow
+   ```
+
+2. **There is no `:previous` on a service's first `update`.** The wrapper warns
+   on stderr that the code is *not* reverted and force-recreates the same image
+   anyway. That is a restart, not a rollback. The workflows detect that warning
+   and exit **74** rather than claiming a revert happened — but the detection
+   reads the wrapper's *wording*, so if that wording ever changes it goes quiet.
+   Read the captured output in the job summary, not just the headline.
+
+There is **no combined rollback across the two repos.** Rolling the backend back
+does not roll the dashboard back.
+
+If the site is still down after a rollback, stop automating. Check the ingress
+(`journalctl -u cloudflared`) — no image rollback fixes the tunnel — and
+`docker compose -f /opt/restaurant-dash/docker-compose.yml ps`.
 
 ### Exit codes you will see in Actions
 
 | Code | Source | Meaning | What to do |
 |---|---|---|---|
-| `0` | — | deployed and healthy | nothing |
-| `64` | wrapper | bad arguments | a **pipeline bug** — the workflow sent a sentence `rd-deploy` does not accept |
-| `65` | wrapper | pending migration, **nothing deployed**, `:prod` restored | apply it, re-run from the Actions tab |
+| `0` | — | deployed, proven, healthy, publicly reachable | nothing |
+| `1` | workflow | ssh transport failure (ssh's own 255, remapped) | if it happened during `update`, **the build kept running on the box**: check `revision` and `status` before re-running |
+| `64` | wrapper / `rd-entry` | bad arguments | a **pipeline bug** — the workflow sent a sentence the grammar does not accept. Nothing on the box changed; re-running will not help |
+| `65` | wrapper | pending migration, nothing built | apply it (above). **The working tree has already moved** if the 65 came from `update` |
 | `69` | dashboard workflow | the backend was already unhealthy | fix or roll back the backend first; nothing was deployed |
-| `70` | workflow | health checks failed, **rolled back** | service is fine on the previous image; fix forward, do not re-run |
-| `71` | workflow | **rollback also failed** | page a human; do not re-run |
-| `255` | ssh | transport failure, not a wrapper code | check the host, then `rd-deploy status` before re-running |
+| `70` | workflow | unhealthy, **image rolled back**. Reached by a service that went unhealthy *and* by one whose post-update `status` line was `Restarting`/`Exited`/`Created` — a recognised not-running state is a health failure, not a failure to measure | production is on the previous build. **Revert the commit on `main`** — do not re-run |
+| `71` | workflow | either the `rollback` **call** failed, or it succeeded and the service **still** did not come back. The summary and the error message say which | page a human; do not re-run. If the call succeeded and production is still down, the fault is probably not in these images |
+| `72` | workflow | **the deploy could not be proven, and production was not observed broken.** Three distinct summaries share this code: **CANNOT BE PROVEN** (wrong revision, or every updated service *measured* as not recreated), **NOTHING CHANGED** (the no-op re-dispatch — box already on `github.sha`, revision did not move, every service measured as not recreated), and **COULD NOT BE MEASURED** (the post-update `status` call failed, a service was absent, or its line was in an unrecognised format). Also the pre-flight refusals: baseline `status` or `revision` unreadable. **It does *not* cover a service that came back `Restarting`/`Exited`/`Created`** — that is a replaced-and-broken deploy and goes to the rollback path (70/71/74) | read the summary and check which of the three it is. No rollback was attempted: either nothing was observed to have replaced the image, or the containers are healthy |
+| `73` | workflow | shipped and healthy on the box, but the public URL never answered | check ingress/tunnel, then DNS, then TLS. Not a rollback situation |
+| `74` | workflow | **no `:previous` existed**, so the container was force-recreated on the same image and the code was NOT reverted — whether or not it came back healthy | revert the commit on `main` and dispatch again. Healthy here means "the failing commit passed on the retry", not "reverted" |
+| `127` | login shell | the forced command did not run | **treat as a security event**: the `authorized_keys` restriction or `rd-entry` has been removed |
 
 ---
 
 ## Cross-repo ordering
 
-**The two repos deploy independently and nothing serialises them.** Stated
-plainly because the earlier draft claimed a `flock` inside `rd-deploy` that does
-not exist.
+**The two repos deploy independently and nothing serialises them.**
 
 * GitHub `concurrency:` groups are **per-repository**. `production-deploy-backend`
   and `production-deploy-dashboard` cannot see each other.
-* The installed wrapper takes no lock.
+* The wrapper takes no lock.
 
-What is actually in place, and what it does and does not cover:
+What is in place, and what it does and does not cover:
 
 * The dashboard workflow **refuses to deploy unless the `backend` service is
-  already healthy** in `compose ps`. That catches a backend that is down,
-  restarting, or mid-swap.
+  already healthy** (exit 69). That catches a backend that is down, restarting or
+  mid-swap.
 * It does **not** catch a backend that is healthy right now and swaps a second
-  later. Two pushes landing within the same minute can interleave.
+  later.
 
 **Consequences of an interleave**, in order of likelihood:
 
-1. The dashboard ships code that calls a backend endpoint that has not been
-   deployed yet (or vice versa) → 404s or broken guest pages until the other
-   deploy lands, typically a couple of minutes.
-2. Two concurrent `docker compose up -d` invocations on the same project can
-   collide on shared resources and one may error out. Each targets a different
-   service, so this does not corrupt anything, but it can leave a deploy
-   half-applied and reported red.
-3. There is **no combined rollback.** Rolling the backend back does not roll the
-   dashboard back.
+1. The dashboard ships code calling a backend endpoint that has not deployed yet
+   (or vice versa) → 404s or broken guest pages until the other deploy lands.
+2. Two concurrent `docker compose` invocations on the same project can collide on
+   shared resources and one may error out. **This matters more than it used to:**
+   both now run a *build*, so they also compete for CPU and memory on a 2-vCPU
+   box, and an out-of-memory kill during a build is a realistic outcome.
+3. There is no combined rollback.
 
-**Mitigation, which is procedural rather than technical: ship API contract
-changes expand/contract.** Add the field in the backend and release it, then
-consume it in the dashboard and release. Two deploys, decided by a person who
-understands the contract. Do not push both repos at once.
+**Mitigation, procedural rather than technical: ship API contract changes
+expand/contract.** Add the field in the backend and release, then consume it in
+the dashboard and release. Do not push both repos at once.
 
 If you want this enforced rather than agreed, the minimal change is a `flock` at
-the top of `/usr/local/sbin/rd-deploy` on the server (`exec 9>/var/lock/rd-deploy;
-flock -w 900 9 || exit 75`). **The pipeline does not assume it exists** and will
-keep working exactly as it does today if you never add it — but the second
-deploy would then wait rather than race, and you would want to add `75` to the
-exit-code table above.
+the top of `/usr/local/sbin/rd-deploy` (`exec 9>/var/lock/rd-deploy; flock -w 900
+9 || exit 75`). **The pipeline does not assume it exists** and keeps working
+exactly as it does today if you never add it — but the second deploy would wait
+rather than race, and you would want `75` in the table above.
 
 ---
 
 ## What is deliberately not automated
 
 * **Applying migrations.** No PITR; see above.
-* **Refreshing `public/downloads`.** Shipping a 94 MB APK to every restaurant is
-  a release decision, not a side effect of a code push. It stays a deliberate
-  `scp` and a read-only bind mount.
+* **Refreshing `public/downloads`.** Shipping a 94 MB APK to every restaurant is a
+  release decision, not a side effect of a code push. It stays a deliberate `scp`
+  and a read-only bind mount.
 * **Editing `docker-compose.yml`, any `.env`, or anything else on the box.** The
-  wrapper cannot, and the CI identity cannot ask it to.
-* **Pruning images.** Do not run `docker system prune -af` from a cron. It
-  deletes the rollback target and you find out at the worst possible moment.
-  Prune by hand, keeping at least the digest behind `:prod` and the one before it.
-* **Deploying during service.** The draft had a `PEAK_WINDOWS` /
-  `--force-window` mechanism; the installed wrapper has neither, so it has been
-  removed rather than faked. Time your pushes.
+  wrapper cannot, and the CI identity cannot ask it to. This includes every
+  dashboard build arg.
+* **Pruning images.** Do not run `docker system prune -af` from a cron: it deletes
+  the `:previous` tags, which are now the *entire* rollback mechanism. You find
+  out at the worst possible moment. Prune by hand, keeping `:latest` and
+  `:previous` for all three services.
+* **Deploying during service.** There is no peak-window mechanism in the wrapper,
+  and the builds now run on the production box. Time your deploys.
+* **Enabling the `push:` trigger.** Both workflows are `workflow_dispatch`-only
+  until one deploy has been watched end to end by hand.
+
+---
+
+## Tests that guard this
+
+```sh
+bash deploy/vps/tests/test_status_parser.sh
+```
+
+**`ci.yml` runs it on every push and every pull request**, as the first step of
+the `backend` job — before the toolchain is installed, because it needs nothing
+but bash. A guard nobody runs is not a guard.
+
+The wrapper is not in this repository, so the exact text of `rd-deploy status`,
+`rd-deploy revision` and `rd-deploy rollback` is an **undeclared dependency** of
+both workflows. That script extracts `svc_line`, `rev_of`, `svc_verdict`,
+`uptime_secs`, `noprev_warned`, `restored_previous` and `assert_recreated`
+straight out of `.github/workflows/deploy.yml` at run time — never a retyped copy,
+which would drift — and runs them against captured fixtures in `tests/fixtures/`.
+
+What it pins, beyond "the format has not changed":
+
+* **the whole of docker's `HumanDuration` vocabulary**, `Up About an hour` and
+  `N years` included, against a fixture captured byte-for-byte from the live box;
+* **that unreadable input FAILS.** `assert_recreated` must never return 0 on a
+  line it could not parse. It used to, and that silently disabled the recreation
+  proof;
+* **that recreation is the RESET, not an age.** A fixture pair whose "after" is
+  an hour old still counts as recreated when the "before" was two years old,
+  which is what makes the proof survive a slow build;
+* **that a rollback which WORKED is not mistaken for one with no target.**
+  `rollback_restored.txt` carries both a compose `WARN[0000]` banner and the word
+  "previous" — the two things the old detector keyed on — and must not trip it.
+
+Every one of those was found by reading, not by a failing test. **Do not loosen
+this script**; re-capture the fixtures instead.
 
 ---
 
 ## Known gaps, honestly
 
-1. **The stale Supabase repository secrets are still unrotated.** Top of this
-   file. Rotate before merging either workflow.
-2. **The forced command is not installed yet.** Until the `authorized_keys` line
-   above is in place, the `deploy` key is an ordinary shell account.
-3. **The pipeline cannot prove which digest is live** — only that the container
-   was recreated and is healthy. Adding a revision field to `/health` (the image
-   is already labelled `org.opencontainers.image.revision`) would close this and
-   is the single highest-value follow-up.
-4. **`check-migrations` runs on the server against whatever compose resolves.**
-   The workflow moves `:prod` *before* calling it, so with `pull_policy: always`
-   it should see the new migration set. Verify this once, deliberately, on the
-   first release that carries SQL: confirm `check-migrations` names the new file
-   rather than passing clean. If it passes clean on a push that Gate A flagged,
-   the wrapper is checking the *running* container, and Gate A is the only real
-   protection you have.
-5. **No cross-repo serialisation.** See above.
-6. **`:prod` is a mutable tag.** Anyone with `packages: write` on the org can
-   move it. The immutable record of what shipped is `:sha-<commit>` plus the job
-   summary of the run.
+1. **The stale Supabase repository secrets.** Top of this file. Rotate before
+   enabling either push trigger.
+2. ~~**`install.sh` is stale**~~ — **fixed.** It now verifies the git transport:
+   both clones on `main` with clean trees and authenticating deploy keys, the
+   compose build contexts, the wrapper's refusal of a bare `update` and
+   `update valkey`, `revision`'s output format, and `rd-entry` refusing both an
+   arbitrary command and an interactive session. It still writes only `rd-entry`
+   and the `authorized_keys` line, and still refuses to create `rd-deploy` or
+   the sudoers file.
+
+   What remains unproven is narrower: its checks are read-only assertions about
+   configuration, not a test that a deploy *works*. Only a real dispatch shows
+   that.
+3. **The pipeline cannot prove the running image was built from the deployed
+   tree** — only that the tree is at this commit and that a new container is
+   running. Putting the revision in `/health` closes it and is the highest-value
+   follow-up.
+4. **The apply-a-migration command above has not been run on this box.** Its two
+   assumptions (WORKDIR `/app`, `migrations/` read relative to it) are checkable
+   in one command; do that the first time rather than in an incident.
+5. **The no-`:previous` detection still reads the wrapper's warning text**, and
+   that is now the *only* remaining direction of error. It matches the sentence
+   the wrapper actually prints (`no previous image for` / `code is NOT
+   reverted`), case-sensitively, on ASCII-only fragments.
+
+   The failure it used to have was the opposite one and far more likely: the
+   detector matched any line containing `warn` **and** any line containing
+   `previous`, and **both are true of a rollback that succeeded** — docker compose
+   v2 prints `WARN[0000] ...` on essentially every invocation, and the wrapper's
+   success line is `restored restaurant-dash-<svc>:previous`. Every working
+   rollback was therefore reported as exit 74, "the code was NOT reverted", and
+   because that branch sat *above* the post-rollback health check, the
+   verification never ran at all. The branch now sits **below** it, so a rollback
+   that demonstrably restored health can never be reported as no rollback.
+
+   What remains: if someone rewords the wrapper, a genuine no-target restart could
+   be reported as a rollback. That needs a human to edit `rd-deploy` first, the
+   captured output is always in the summary, and
+   `tests/fixtures/rollback_noprev.txt` fails the parser test the moment the
+   sentence changes.
+6. **No cross-repo serialisation**, and the two builds now compete for the same
+   2 vCPUs. See above.
+7. **`update` deploys whatever `main` points at when it runs**, not the commit
+   that triggered the workflow. A push landing mid-deploy is caught after the
+   fact by the revision proof (exit 72), not prevented.
