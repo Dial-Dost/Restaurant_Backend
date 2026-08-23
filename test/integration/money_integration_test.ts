@@ -81,7 +81,11 @@ async function main() {
 
   // ---- 1) Waitlist: atomic seat + guards ----
   console.log("\n[waitlist] atomic seat + double-seat + occupied-table guards");
-  const a = await JoinWaitlist(RES_ID, { name: "Walk-in A", phone: "+10000000001", party_size: 2 });
+  // 10 digits, no country code. These were "+10000000001" — a US-shaped number
+  // that normalizeMobile10() rejects: it strips to 11 digits, and "1" is not a
+  // peelable prefix (only 0091 / 91 / a trunk 0 are). The product rule is an
+  // Indian 10-digit mobile, so the fixture was wrong, not the validator.
+  const a = await JoinWaitlist(RES_ID, { name: "Walk-in A", phone: "9000000001", party_size: 2 });
   check("join returns a token + position >= 1", !!a.token && a.position >= 1);
   await SetWaitlistPreorder(RES_ID, a.token, [{ id: "ghost", name: "Free Steak", price: 0, quantity: 3 }]);
   const seat = await SeatWaitlistEntry(RES_ID, a.id, "T1");
@@ -93,7 +97,7 @@ async function main() {
   try { await SeatWaitlistEntry(RES_ID, a.id, "T2"); } catch (e: any) { rejected = /no longer in the queue/i.test(String(e?.message)); }
   check("double-seat of the same party is rejected", rejected);
   check("T2 not occupied by the rejected double-seat", !(await tableOccupied("T2")));
-  const b = await JoinWaitlist(RES_ID, { name: "Walk-in B", phone: "+10000000002", party_size: 2 });
+  const b = await JoinWaitlist(RES_ID, { name: "Walk-in B", phone: "9000000002", party_size: 2 });
   let blocked = false;
   try { await SeatWaitlistEntry(RES_ID, b.id, "T1"); } catch (e: any) { blocked = /already occupied/i.test(String(e?.message)); }
   check("seating onto occupied T1 is blocked", blocked);
