@@ -137,23 +137,28 @@ name: Deploy (production)
 
 # TRIGGER — DELIBERATELY workflow_dispatch ONLY IN THIS COMMIT.
 #
-# The push trigger:
+# The push trigger is ON, added in this second, trigger-only commit. The
+# precondition it was withheld for has been met: run 32649217390 was dispatched
+# by hand against live production and observed end to end —
 #
-#     push:
-#       branches: [main]
+#     CI green -> Gate A -> update python -> update backend -> proof -> healthy
+#     "Deploy succeeded at 38be891. Recreated: backend. Not recreated: python.
+#      Containers healthy; public probe answering."
 #
-# is added back in a SECOND, trigger-only commit, once one dispatched deploy has
-# been watched end to end BY HAND, outside service hours, and the stack came back
-# healthy. The git transport has never been driven from CI. Enabling push here
-# would make the merge commit that lands this file the first live exercise of a
-# path nobody has ever run, at whatever time of day the merge happens, against
-# restaurants taking orders. Dispatch-only means a human picks the moment.
+# That run also exercised the partial-recreation case for real: python was a
+# cache hit and did NOT recreate, and the pipeline reported it as a notice
+# rather than failing, because backend did. Worth knowing, because an earlier
+# measurement on this box suggested every rebuild yields a new image id (buildx
+# stamps a provenance attestation) — that is NOT reliable, and a design that
+# assumed it would have failed this deploy.
 #
 # Nothing downstream depends on the event type. `concurrency`, the job graph and
-# every `needs:` behave identically on a dispatched run; Gate A below detects a
+# every `needs:` behave identically on a dispatched run; Gate A detects a
 # non-push event and skips, deferring to the authoritative server-side gate
 # (exit 65), which still runs inside `update`.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 # Never cancel a deploy mid-flight. A cancelled run can leave the box's working
