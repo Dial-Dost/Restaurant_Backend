@@ -36,7 +36,7 @@ const {
   JoinWaitlist, SeatWaitlistEntry, GetWaitlist, SetWaitlistPreorder,
   OccupyTable, AddOrder, DeleteOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, RefundBill,
   UpsertCoupon, ApplyCouponToBill,
-  ReleaseTable, GetSalesReport,
+  ReleaseTable, GetSalesReport, SetBillDiscount,
 } = db;
 
 const raw = new pg.Pool({ connectionString: DB, ssl: false, max: 3 });
@@ -165,6 +165,19 @@ async function main() {
   console.log("\n[release] a table released without payment is not revenue");
   await OccupyTable(RES_ID, "T6", 2, null, null);
   await AddOrder(RES_ID, { table: "T6", customer: "Walkout", items: [ITEM("w1", "Soup", 300)], subtotal: 300, total: 300, status: "Preparing" });
+  // Materialise the running bill, because occupying a table and adding orders
+  // does NOT create one: AddOrder syncs "the table's open bill (if one exists)"
+  // and GetBillForTable returns `bill_id: string | null`, deriving the running
+  // total from the orders themselves. A "Bills" row appears only when some
+  // operation needs one — ensureOpenBillIdForTable, reached here by clearing a
+  // discount, which is the cheapest product action that materialises it without
+  // moving any money (it inserts with sumOrderTotalsForTable already applied).
+  //
+  // Without this the section asserted a precondition the flow never establishes
+  // and died on it, so the release assertion below — the one that actually
+  // guards the revenue bug — had never run.
+  await SetBillDiscount(RES_ID, "T6", null, 0);
+
   const tid6 = await tableId("T6");
   const runningBefore = Number((await raw.query(
     `select coalesce(total_amt, 0) as t from "Bills" where res_id=$1 and table_id=$2 and closed_at is null`,
