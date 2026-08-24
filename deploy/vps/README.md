@@ -407,9 +407,25 @@ to be set; a `vars.` value wins if you need to change the URL without a commit.
 | `Restaurant_Backend` | `PUBLIC_HEALTH_URL` | `https://api.dialdost.com/health` |
 | `Restaurant_Dashboard_UI` | `PUBLIC_DASHBOARD_URL` | `https://experiosolutions.dialdost.com/login` |
 
-A public probe that never answers is exit **73**: the run goes red, but it does
+A public probe that genuinely fails — timeouts, connection failures, 5xx, or
+any mix of those with 403s — is exit **73**: the run goes red, but it does
 **not** roll back, because the containers are healthy on the box and an image
 swap cannot fix ingress.
+
+One case is carved out. If **every** attempt in the window answers an instant
+`403`, the probe is **BLINDED**, not failed: Cloudflare bot protection is
+challenging curl from the GitHub runner. Measured 2026-08-18: both deploys
+exited 73 on a pure-403 wall (20/20 attempts, ~120ms each, from the first
+second) while the same URLs served 200 in ~0.5s to every other client, and a
+live-swap reproduction with an external probe every 2s scored 150/150 at 200.
+A tunnel that is actually down answers 52x/530 or times out — never a clean
+instant 403. A pure-403 wall therefore does **not** exit 73: the run reports
+"probe BLINDED" with a `::warning::`, prints the per-attempt HTTP codes, and
+is judged on the on-box evidence (revision proof, recreation proof, health
+poll). The **durable fix** is a **Cloudflare WAF skip rule** for the two probe
+paths (`/health` on the API host, `/login` on the dashboard host) so the
+runner is served the origin again — that needs Cloudflare dashboard access
+and cannot be shipped from these repos.
 
 `NEXT_PUBLIC_BACKEND_URL`, `NEXT_PUBLIC_FEEDBACK_FORM_URL` and
 `BACKEND_INTERNAL_URL` are **no longer read by any workflow** — see *Build args
@@ -659,7 +675,7 @@ If the site is still down after a rollback, stop automating. Check the ingress
 | `70` | workflow | unhealthy, **image rolled back**. Reached by a service that went unhealthy *and* by one whose post-update `status` line was `Restarting`/`Exited`/`Created` — a recognised not-running state is a health failure, not a failure to measure | production is on the previous build. **Revert the commit on `main`** — do not re-run |
 | `71` | workflow | either the `rollback` **call** failed, or it succeeded and the service **still** did not come back. The summary and the error message say which | page a human; do not re-run. If the call succeeded and production is still down, the fault is probably not in these images |
 | `72` | workflow | **the deploy could not be proven, and production was not observed broken.** Three distinct summaries share this code: **CANNOT BE PROVEN** (wrong revision, or every updated service *measured* as not recreated), **NOTHING CHANGED** (the no-op re-dispatch — box already on `github.sha`, revision did not move, every service measured as not recreated), and **COULD NOT BE MEASURED** (the post-update `status` call failed, a service was absent, or its line was in an unrecognised format). Also the pre-flight refusals: baseline `status` or `revision` unreadable. **It does *not* cover a service that came back `Restarting`/`Exited`/`Created`** — that is a replaced-and-broken deploy and goes to the rollback path (70/71/74) | read the summary and check which of the three it is. No rollback was attempted: either nothing was observed to have replaced the image, or the containers are healthy |
-| `73` | workflow | shipped and healthy on the box, but the public URL never answered | check ingress/tunnel, then DNS, then TLS. Not a rollback situation |
+| `73` | workflow | shipped and healthy on the box, but the public URL genuinely never answered: timeouts, connection failures or 5xx — including any **mix** of those with 403s. A **pure-403 wall is not this exit**: every attempt answering an instant 403 means Cloudflare bot protection is challenging the runner, and the run is reported as probe **BLINDED** (a `::warning::`, per-attempt codes in the summary, judged on the on-box evidence) instead of red | check ingress/tunnel, then DNS, then TLS — the per-attempt HTTP codes are in the job summary. Not a rollback situation. If 403s keep appearing in the codes, add the Cloudflare WAF skip rule for the probe paths (needs dashboard access) |
 | `74` | workflow | **no `:previous` existed**, so the container was force-recreated on the same image and the code was NOT reverted — whether or not it came back healthy | revert the commit on `main` and dispatch again. Healthy here means "the failing commit passed on the retry", not "reverted" |
 | `127` | login shell | the forced command did not run | **treat as a security event**: the `authorized_keys` restriction or `rd-entry` has been removed |
 
@@ -806,3 +822,15 @@ this script**; re-capture the fixtures instead.
 7. **`update` deploys whatever `main` points at when it runs**, not the commit
    that triggered the workflow. A push landing mid-deploy is caught after the
    fact by the revision proof (exit 72), not prevented.
+8. **The public probe can be BLINDED by Cloudflare bot protection**, and the
+   durable fix cannot be shipped from these repos. Measured 2026-08-18: both
+   deploys exited 73 with every probe attempt answered by an instant 403 while
+   the same URLs served 200 to every other client throughout — the edge was
+   challenging curl from the GitHub runner, not reporting an outage. The
+   workflows now classify a **pure-403 wall** as "probe BLINDED" (`PUBLIC_OK=2`,
+   a `::warning::`, run judged on the on-box evidence) rather than exit 73; any
+   mix of 403s with timeouts/connection failures/5xx still fails 73. Until a
+   **Cloudflare WAF skip rule** is added for the probe paths (`/health` on the
+   API host, `/login` on the dashboard host) — which needs Cloudflare dashboard
+   access — no run can observe production from outside the box, so a real
+   outage that Cloudflare masks with 403s at the edge would go unprobed.

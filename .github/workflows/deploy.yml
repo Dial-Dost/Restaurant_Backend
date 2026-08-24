@@ -868,17 +868,41 @@ jobs:
 
           # Public probe through the real ingress. Retried, because one curl from a
           # GitHub runner is not evidence of an outage.
+          #
+          # THE PROBE CLASSIFIES WHAT IT SAW, because "no 2xx" has two causes with
+          # opposite meanings. Measured 2026-08-24: both production deploys exited
+          # 73 while the same URLs served 200 in ~0.5s to every other client —
+          # every probe attempt got an instant 403 (~120ms, 20/20) from the very
+          # first second of the window. That is Cloudflare bot protection
+          # challenging curl from a GitHub Azure runner, not an outage: a tunnel
+          # that is ACTUALLY down answers 52x/530 or times out, and never a clean
+          # instant 403. So:
+          #
+          #   rc 0  answered 2xx — reachable, exactly as before
+          #   rc 1  timeouts / connection failures / 5xx — or ANY mix of those
+          #         with 403s. A genuine failure to answer; only a PURE-403 wall
+          #         is ever reclassified.
+          #   rc 2  EVERY attempt answered 403 — the probe is BLINDED by edge
+          #         security and observed nothing about the site either way.
+          #
+          # Every attempt's HTTP code is recorded, in order, in PUBLIC_CODES, so
+          # the caller can print the evidence the classification rests on.
           wait_public () { # <url>
-            local deadline=$(( SECONDS + PUBLIC_TIMEOUT )) code
+            local deadline=$(( SECONDS + PUBLIC_TIMEOUT )) code only403=1
+            PUBLIC_CODES=""
             while [ "$SECONDS" -lt "$deadline" ]; do
               code="$(curl -sS -o public-body.txt -w '%{http_code}' --max-time 15 "$1" 2>public-err.txt)"
+              PUBLIC_CODES="${PUBLIC_CODES:+$PUBLIC_CODES }${code:-000}"
               case "${code:-000}" in
                 2*) echo "  $1 -> $code"; return 0 ;;
+                403) ;;
+                *) only403=0 ;;
               esac
               echo "  $1 -> ${code:-no response} (retrying)"
               [ -s public-err.txt ] && sed -n '1,2p' public-err.txt
               sleep "$PUBLIC_INTERVAL"
             done
+            if [ -n "$PUBLIC_CODES" ] && [ "$only403" -eq 1 ]; then return 2; fi
             return 1
           }
 
@@ -1285,14 +1309,20 @@ jobs:
           # with ZERO curl calls made — a reported observation that was never made.
           #
           #   1 = probed, answered 2xx     0 = probed, never answered
-          #   2 = NOT probed, and PUBLIC_WHY says why
+          #   2 = NOT probed — or probed and BLINDED (PUBLIC_BLINDED=1) — and
+          #       PUBLIC_WHY says why. A pure-403 wall lands here, not in 0: it
+          #       is edge security challenging THIS CLIENT, not an observation
+          #       of the site, so the run is judged on the on-box evidence.
           PUBLIC_OK=2
+          PUBLIC_BLINDED=0
           PUBLIC_WHY="no PUBLIC_HEALTH_URL is configured for this workflow, so nothing was probed"
           if [ -n "${PUBLIC_HEALTH_URL:-}" ]; then
             if [ "$HEALTHY" -eq 1 ]; then
               PUBLIC_OK=1
               echo "== public probe $PUBLIC_HEALTH_URL"
-              if wait_public "$PUBLIC_HEALTH_URL"; then
+              wait_public "$PUBLIC_HEALTH_URL"; prc=$?
+              echo "probe attempt codes: ${PUBLIC_CODES:-<no attempts>}"
+              if [ "$prc" -eq 0 ]; then
                 head -c 400 public-body.txt; echo
                 # WHAT /health REALLY RETURNS (routes/misc.ts): 200 with
                 #   {"status":"ok","uptime":..,"database":{"ok":true,..},"realtime":{..}}
@@ -1313,6 +1343,16 @@ jobs:
                 if ! grep -qE '"status"[[:space:]]*:[[:space:]]*"ok"' public-body.txt; then
                   echo "::warning::$PUBLIC_HEALTH_URL answered 2xx but the body is not this backend's /health payload (no \"status\":\"ok\"). Something else is answering on that URL — an ingress splash page, a cached error page, or a different app. The containers are healthy on the box, so this is not rolled back; check the tunnel/ingress and DNS."
                 fi
+              elif [ "$prc" -eq 2 ]; then
+                # A PURE-403 WALL. Every attempt was challenged at the edge; the
+                # probe is blinded, and blinded is NOT "not answering" — the same
+                # URL was serving every other client throughout the incident this
+                # was measured on. State 2, so the run is judged on the on-box
+                # evidence instead of red-lighting a healthy deploy.
+                PUBLIC_OK=2
+                PUBLIC_BLINDED=1
+                PUBLIC_WHY="every attempt was answered with an instant 403 (attempt codes: $PUBLIC_CODES) — the runner IP is being challenged by Cloudflare bot protection, so the probe is blinded by edge security and observed nothing about the site either way"
+                echo "::warning::Public probe BLINDED, not failed: $PUBLIC_HEALTH_URL answered 403 to every attempt — Cloudflare bot protection is challenging curl from this GitHub runner, so the probe cannot see the site and this run is judged on the on-box evidence. The durable fix is a Cloudflare WAF skip rule for the probe path, which needs Cloudflare dashboard access — see deploy/vps/README.md (exit code 73)."
               else
                 PUBLIC_OK=0
               fi
@@ -1327,11 +1367,15 @@ jobs:
             case "$PUBLIC_OK" in
               1) printf '%s\n' "answering" ;;
               0) printf '%s\n' "NOT answering" ;;
-              *) printf '%s\n' "not probed — $PUBLIC_WHY" ;;
+              *) if [ "$PUBLIC_BLINDED" -eq 1 ]; then
+                   printf '%s\n' "BLINDED — $PUBLIC_WHY"
+                 else
+                   printf '%s\n' "not probed — $PUBLIC_WHY"
+                 fi ;;
             esac
           }
 
-          echo "proof: revision_read=$REV_READ revision_ok=$REV_OK revision_moved=$REV_MOVED recreated_ok=$RECREATED_OK replaced_ok=$REPLACED_OK healthy=$HEALTHY public_ok=$PUBLIC_OK"
+          echo "proof: revision_read=$REV_READ revision_ok=$REV_OK revision_moved=$REV_MOVED recreated_ok=$RECREATED_OK replaced_ok=$REPLACED_OK healthy=$HEALTHY public_ok=$PUBLIC_OK public_blinded=$PUBLIC_BLINDED"
           echo "       recreated=[${RECREATED[*]:-<none>}] measured-not-recreated=[${UNCHANGED[*]:-<none>}]"
           echo "       replaced-and-broken=[${BROKEN[*]:-<none>}] broken-per-health-poll=[${BROKEN_LATE[*]:-<none>}] could-not-measure=[${UNMEASURED[*]:-<none>}]"
 
@@ -1438,8 +1482,16 @@ jobs:
               summary ""
             fi
             if [ "$PUBLIC_OK" -eq 2 ]; then
-              summary "**No public probe was made** — $PUBLIC_WHY. Nothing in this run observed the"
-              summary "service from outside the box."
+              if [ "$PUBLIC_BLINDED" -eq 1 ]; then
+                summary "**The public probe was BLINDED, not failed** — $PUBLIC_WHY."
+                summary "Nothing in this run observed the service from outside the box; the verdict"
+                summary "above rests on the on-box evidence. The durable fix is a Cloudflare WAF"
+                summary "skip rule for the probe path (needs Cloudflare dashboard access — see"
+                summary "deploy/vps/README.md, exit code 73)."
+              else
+                summary "**No public probe was made** — $PUBLIC_WHY. Nothing in this run observed the"
+                summary "service from outside the box."
+              fi
               summary ""
             fi
             summary "\`rd-deploy status\` after the swap:"
@@ -1469,7 +1521,8 @@ jobs:
           # ABOVE the exit-72 gate, because that gate now takes every remaining
           # HEALTHY=1 run. Guarded on PUBLIC_OK -eq 0 — a probe that RAN and never
           # answered — so it can no longer be reached by a run that made no probe
-          # at all, and on REV_OK/REPLACED_OK so its opening sentence about what
+          # at all, nor by one whose probe was BLINDED by a pure-403 wall (that
+          # is state 2, judged on the on-box evidence), and on REV_OK/REPLACED_OK so its opening sentence about what
           # shipped is something this run actually established.
           if [ "$HEALTHY" -eq 1 ] && [ "$PUBLIC_OK" -eq 0 ] && [ "$REV_OK" -eq 1 ] && [ "$REPLACED_OK" -eq 1 ]; then
             summary "### Production deploy (backend) — shipped, but NOT reachable from the internet"
@@ -1481,6 +1534,12 @@ jobs:
             summary "**Nothing was rolled back, deliberately.** The application is healthy on the"
             summary "box; what is broken is the path between the internet and it, and swapping the"
             summary "image cannot fix that. Rolling back here would add an outage to an outage."
+            summary ""
+            summary "Every attempt's HTTP code, in order: \`${PUBLIC_CODES:-<none>}\`. (A window"
+            summary "where EVERY attempt answered 403 does not land here — that is Cloudflare bot"
+            summary "protection challenging the runner, reported as probe BLINDED, state 2. Any mix"
+            summary "of 403s with timeouts, connection failures or 5xx is a genuine failure and"
+            summary "does.)"
             summary ""
             summary "Check, in this order: the ingress/tunnel service on the box"
             summary "(\`journalctl -u cloudflared\`), then DNS, then TLS. Last curl:"
