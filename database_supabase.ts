@@ -40,6 +40,7 @@ import {
 // Re-exported so existing importers of these from "./database_supabase.js" keep working.
 export { round2, computeBillTaxes, computeBillCharges, computeCouponDiscount, computeBillSplit } from "./billing_math.js";
 export type { BillTaxLine, BillDiscount } from "./billing_math.js";
+import { SIM_WINDOW_DAYS, type SimulationRawStats } from "./simulation_math.js";
 import { logger } from "./observability.js";
 
 export const CORE_ROLES = {
@@ -19978,6 +19979,112 @@ export async function GetMonthlyHistory(
     });
   }
   return { months, series }; // newest first
+}
+
+// --- What-if simulator baseline -----------------------------------------------
+// Raw 30-day aggregates for the Simulation section (routes/simulation.ts). This
+// function only MEASURES; every default/fallback decision lives in the pure
+// simulation_math.ts (buildBaseline) so it stays jest-testable without a tenant.
+//
+// Money basis: the settled-bill taxable_base (pre-tax, pre-service-charge) via
+// closedBillCharges — the SAME basis as APC — never the tax-inclusive total_amt.
+// Covers come from the seating (TableSessions lateral, as in the APC engine and
+// the segments report): the live "Tables".num_covers is reset on release and
+// would undercount every settled bill to one cover.
+export async function GetSimulationRawStats(restaurantId: string): Promise<SimulationRawStats> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const rid = context.res_id, oid = context.outlet_id;
+  await ensureBillWorkflowColumns();
+  await ensureExpensesTable();
+  await ensureTableSessionsTable();
+  await ensurePayrollTables();
+
+  const now = await currentDbTime();
+  const fromIso = new Date(now.getTime() - SIM_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const toIso = now.toISOString();
+  const scPct = await getServiceChargePercent(rid);
+
+  // Settled bills in the window (same settle predicate as getSettledBills) with
+  // the covers of the seating each bill closed.
+  const billRows = await runQuery<{ total_amt: number | string | null; tax_breakdown: unknown; covers: number }>(
+    `select b.total_amt, b.tax_breakdown, coalesce(s.covers, 1)::int as covers
+       from "Bills" b
+       left join lateral (
+         select ts.covers
+           from "TableSessions" ts
+          where ts.res_id = b.res_id and ts.table_id = b.table_id
+            and (ts.outlet_id is null or ts.outlet_id = b.outlet_id)
+            and ts.seated_at <= b.created_at
+          order by ts.seated_at desc
+          limit 1
+       ) s on true
+      where b.res_id = $1 and (${og} or b.outlet_id = $2)
+        and (b.admin_approved_at is not null or b.closed_at is not null)
+        and coalesce(b.closed_at, b.admin_approved_at) >= $3
+        and coalesce(b.closed_at, b.admin_approved_at) < $4`,
+    [rid, oid, fromIso, toIso],
+  );
+  let pretaxTotal = 0, coversTotal = 0;
+  for (const b of billRows) {
+    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct);
+    pretaxTotal = round2(pretaxTotal + Math.max(0, charges.taxable_base));
+    coversTotal += Math.max(1, Math.round(parseNumeric(b.covers)) || 1);
+  }
+
+  // Seat-to-settle turnaround, same filters as GetMonthlyHistory's TAT series
+  // (finished, sane-duration, real-table sessions only).
+  const tatRows = await runQuery<{ avg_min: number | null }>(
+    `select avg(extract(epoch from (s.left_at - s.seated_at))/60)::float avg_min
+       from "TableSessions" s
+       left join "Tables" t on t.id = s.table_id and t.res_id = s.res_id
+      where s.res_id=$1 and (${og} or s.outlet_id=$2) and s.left_at is not null
+        and s.seated_at >= $3 and s.left_at > s.seated_at and s.left_at - s.seated_at <= interval '6 hours'
+        and coalesce(t.is_virtual, false) = false`,
+    [rid, oid, fromIso],
+  );
+
+  const staffRows = await runQuery<{ n: number }>(
+    `select count(*)::int n from "Employees" where res_id=$1 and (${og} or outlet_id=$2)`,
+    [rid, oid],
+  );
+  const tableRows = await runQuery<{ n: number }>(
+    `select count(*)::int n from "Tables" where res_id=$1 and (${og} or outlet_id=$2) and coalesce(is_virtual, false) = false`,
+    [rid, oid],
+  );
+
+  // Window expenses by category; simulation_math classifies them food/labour/fixed.
+  // spent_on is a date, so the window edge is a UTC day boundary — a one-day skew
+  // versus the tenant timezone is immaterial for a 30-day what-if baseline.
+  const expenseRows = await runQuery<{ category: string | null; amount: number }>(
+    `select category, coalesce(sum(amount), 0)::float amount
+       from "Expenses"
+      where res_id = $1 and (${og} or outlet_id = $2) and spent_on >= $3::date
+      group by category`,
+    [rid, oid, fromIso],
+  );
+
+  // Configured monthly wage bill — the labour fallback when no labour expenses
+  // are recorded. Hourly profiles are excluded: without rostered hours their
+  // monthly cost is unknowable, and guessing here would fake a "measured" figure.
+  const payrollRows = await runQuery<{ total: number }>(
+    `select coalesce(sum(base_salary + allowances), 0)::float total
+       from "PayrollProfiles"
+      where res_id = $1 and (${og} or outlet_id = $2) and pay_type = 'monthly'`,
+    [rid, oid],
+  );
+
+  return {
+    window_days: SIM_WINDOW_DAYS,
+    bill_count: billRows.length,
+    pretax_revenue_total: round2(pretaxTotal),
+    covers_total: coversTotal,
+    avg_tat_min: tatRows[0]?.avg_min ?? null,
+    staff_count: staffRows[0]?.n ?? 0,
+    table_count: tableRows[0]?.n ?? 0,
+    expense_categories: expenseRows.map((r) => ({ category: r.category ?? "", amount: round2(parseNumeric(r.amount)) })),
+    payroll_monthly_wage_bill: round2(parseNumeric(payrollRows[0]?.total)),
+  };
 }
 
 export async function GetMonthlyApcInsights(

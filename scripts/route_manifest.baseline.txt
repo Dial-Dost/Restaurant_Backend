@@ -1,6 +1,6 @@
 # route-manifest v1
 # entry: index.ts
-# routes: 302
+# routes: 304
 # middleware: 10
 #
 # Ordered EXACTLY as Express registers them. Express matches in registration
@@ -322,5 +322,7 @@ mw08 USE     *                                                      | <inline(re
 0300 POST    /feedback/recovery/:id/resolve                         | validateAction(PERM_FEEDBACK_RESOLVE)          | 16a83e2b
 0301 GET     /feedback/summary                                      | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 42e1a52a
 0302 GET     /feedback/stats                                        | validateAction("0cb6768b-92ff-4848-8631-52ef9d65cf53") | 90fe5f75
+0303 GET     /simulation/baseline                                   | validateAction(ANALYTICS_ACTION)               | 0ab6139c
+0304 POST    /simulation/run                                        | validateAction(ANALYTICS_ACTION)               | 28bd324c
 mw09 USE     *                                                      | <inline(err,req,res,next)>                     | 1687165a
 mw10 USE     *                                                      | <inline(err,req,res,_next)>                    | 3e5181dc
