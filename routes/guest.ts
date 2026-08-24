@@ -172,7 +172,15 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 			// SECURITY: never bill at client-sent prices. Re-price every line from the
 			// menu (floor mode keeps modifier upcharges that are >= the menu base);
 			// items with no current menu match are dropped.
-			const priced = await repriceFromMenu(slug, items, true);
+			let priced: Awaited<ReturnType<typeof repriceFromMenu>>;
+			try {
+				priced = await repriceFromMenu(slug, items, true);
+			} catch {
+				// A TRANSIENT menu-read failure (pool exhaustion, statement timeout)
+				// must not read as "your items are gone" — nothing was priced at
+				// all. Fail the order with a retryable message instead.
+				throw new Error("We couldn't load the menu to confirm prices — please try again in a moment.");
+			}
 			if (priced.length === 0) {throw new Error("None of those items are available right now. Please refresh the menu.");}
 			const pricedSubtotal = Math.round(priced.reduce((s, it) => s + it.price * it.quantity, 0) * 100) / 100;
 			// When the restaurant disables auto-push, customer orders land as

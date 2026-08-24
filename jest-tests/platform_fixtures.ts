@@ -115,6 +115,43 @@ export interface BillRow {
 export interface OrderRow { id: string; res_id: string; outlet_id: string; food: string }
 export interface AuditLogRow { id: string; res_id: string; action: string }
 
+/** One "Waitlist" row plus `table_name`, the column the queue reads join in
+ *  from "Tables" (modelled inline — the fixture has no Tables store). pre_order
+ *  and party_members are kept as TEXT exactly as the pg driver may hand jsonb
+ *  back; mapWaitlist parses both forms. */
+export interface WaitlistRow {
+  id: string;
+  created_at: Date;
+  res_id: string;
+  outlet_id: string | null;
+  token: string;
+  name: string;
+  phone: string | null;
+  party_size: number;
+  status: string;
+  table_id: string | null;
+  table_name: string | null;
+  pre_order: string;
+  pre_order_status: string;
+  placed_order_id: string | null;
+  party_members: string;
+  called_at: Date | null;
+  seated_at: Date | null;
+}
+
+/** One "Menu" row as GetMenuItems selects it — price and availability live in
+ *  the JSON `description` column (parseMenuDescription's contract). */
+export interface MenuRow {
+  id: string;
+  created_at: Date;
+  res_id: string;
+  outlet_id: string | null;
+  name: string;
+  description: string;
+  sub_category: string | null;
+  main_category: string | null;
+}
+
 export interface PlatformAdminRow { id: string; email: string; active: boolean }
 export interface PlanRow { id: string; code: string; name: string; price_cents: number; active: boolean; created_at: Date }
 export interface SubscriptionRow {
@@ -159,12 +196,18 @@ interface Store {
   subscriptions: SubscriptionRow[];
   invoices: InvoiceRow[];
   platformAudit: PlatformAuditRow[];
+  waitlists: WaitlistRow[];
+  menuRows: MenuRow[];
   /** Every "Restaurant" INSERT throws 23505 — two callers racing the pre-check. */
   failRestaurantInsert: boolean;
   /** Every "Login" INSERT throws — the seed dying halfway through. */
   failLoginInsert: boolean;
   /** The "Bills" count throws — the tenant pool unreachable from the archive route. */
   failBillsCount: boolean;
+  /** The "Menu" read throws — models the pool-exhaustion / statement-timeout
+   *  failures measured in production, which repriceFromMenu used to swallow
+   *  into "drop every line" (wiping held waitlist pre-orders). */
+  failMenuRead: boolean;
   /** The subscription cancel throws — archive's SECOND write failing mid-flight. */
   failSubscriptionCancel: boolean;
   /** The platform.audit insert throws — archive's THIRD write failing mid-flight. */
@@ -200,9 +243,12 @@ function freshStore(): Store {
     subscriptions: [],
     invoices: [],
     platformAudit: [],
+    waitlists: [],
+    menuRows: [],
     failRestaurantInsert: false,
     failLoginInsert: false,
     failBillsCount: false,
+    failMenuRead: false,
     failSubscriptionCancel: false,
     failAuditInsert: false,
     migration028Applied: true,
@@ -222,6 +268,7 @@ export function auditLogs(): AuditLogRow[] { return store.auditLogs; }
 export function subscriptions(): SubscriptionRow[] { return store.subscriptions; }
 export function invoices(): InvoiceRow[] { return store.invoices; }
 export function platformAudit(): PlatformAuditRow[] { return store.platformAudit; }
+export function waitlists(): WaitlistRow[] { return store.waitlists; }
 
 export function restaurantBySlug(slug: string): RestaurantRow | undefined {
   return store.restaurants.find((r) => r.res_username.toLowerCase() === slug.toLowerCase());
@@ -233,6 +280,8 @@ export function subscriptionFor(resId: string): SubscriptionRow | undefined {
 export function breakRestaurantInsert(): void { store.failRestaurantInsert = true; }
 export function breakLoginInsert(): void { store.failLoginInsert = true; }
 export function breakBillsCount(): void { store.failBillsCount = true; }
+export function breakMenuRead(): void { store.failMenuRead = true; }
+export function healMenuRead(): void { store.failMenuRead = false; }
 export function breakSubscriptionCancel(): void { store.failSubscriptionCancel = true; }
 export function healSubscriptionCancel(): void { store.failSubscriptionCancel = false; }
 export function breakAuditInsert(): void { store.failAuditInsert = true; }
@@ -301,6 +350,69 @@ export function addAuditLog(over: Partial<AuditLogRow> & { res_id: string }): Au
   return row;
 }
 
+/** Seed an outlet. The guest flows resolve the DEFAULT outlet (oldest row), and
+ *  GetMenuItems is outlet-scoped, so waitlist tests need at least one. */
+export function addOutlet(over: Partial<OutletRow> & { res_id: string }): OutletRow {
+  const n = store.nextId++;
+  const row: OutletRow = {
+    id: `outlet-${String(n)}`,
+    created_at: new Date("2024-01-01T00:00:00Z"),
+    oultet_username: `outlet${String(n)}`,
+    outlet_name: `Outlet ${String(n)}`,
+    outlet_add: null,
+    outlet_main_ph: null,
+    outlet_working_hours: null,
+    ...over,
+  };
+  store.outlets.push(row);
+  return row;
+}
+
+/** Seed a menu item the way the schema stores it: price/availability inside the
+ *  JSON description column. */
+export function addMenuItem(over: { res_id: string; outlet_id: string | null; name: string; price: number; available?: boolean; id?: string }): MenuRow {
+  const n = store.nextId++;
+  const row: MenuRow = {
+    id: over.id ?? `menu-${String(n)}`,
+    created_at: new Date("2024-01-02T00:00:00Z"),
+    res_id: over.res_id,
+    outlet_id: over.outlet_id,
+    name: over.name,
+    description: JSON.stringify({ price: over.price, available: over.available !== false }),
+    sub_category: null,
+    main_category: null,
+  };
+  store.menuRows.push(row);
+  return row;
+}
+
+/** Seed a queue entry directly (the join route works too, but most pre-order
+ *  tests need a party already in a specific state). */
+export function addWaitlistEntry(over: Partial<WaitlistRow> & { res_id: string }): WaitlistRow {
+  const n = store.nextId++;
+  const row: WaitlistRow = {
+    id: `wl-${String(n)}`,
+    created_at: new Date(),
+    outlet_id: null,
+    token: `wtok-${String(n)}`,
+    name: "Walk-in",
+    phone: "9000000001",
+    party_size: 2,
+    status: "waiting",
+    table_id: null,
+    table_name: null,
+    pre_order: "[]",
+    pre_order_status: "none",
+    placed_order_id: null,
+    party_members: "[]",
+    called_at: null,
+    seated_at: null,
+    ...over,
+  };
+  store.waitlists.push(row);
+  return row;
+}
+
 // ---------------------------------------------------------------------------
 // platform.restaurant_status — read out of the migration, not re-typed here
 // ---------------------------------------------------------------------------
@@ -366,9 +478,14 @@ function requireShape(q: string, fragment: string, why: string): void {
 const NO_DESTRUCTIVE_SQL = /^(delete|truncate|drop)\b/i;
 
 type Undo = () => void;
+/** Journal entries are undos or savepoint markers, so ROLLBACK TO can undo
+ *  exactly the writes made since the savepoint. withTransaction nested inside
+ *  withTenant (every guest waitlist pre-order mutation) runs on savepoints, and
+ *  "a failed confirm must not half-commit" is a property under test. */
+type JournalEntry = Undo | { savepoint: string };
 
 class FakeClient {
-  private undo: Undo[] = [];
+  private undo: JournalEntry[] = [];
   private depth = 0;
 
   async query(sql: string, params: unknown[] = []): Promise<{ rows: unknown[] }> {
@@ -376,11 +493,38 @@ class FakeClient {
     if (/^begin$/i.test(q)) { this.depth++; if (this.depth === 1) { this.undo = []; } return { rows: [] }; }
     if (/^commit$/i.test(q)) { this.depth = Math.max(0, this.depth - 1); if (this.depth === 0) { this.undo = []; } return { rows: [] }; }
     if (/^rollback$/i.test(q)) {
-      for (const u of this.undo.reverse()) { u(); }
+      for (const u of [...this.undo].reverse()) { if (typeof u === "function") { u(); } }
       this.undo = []; this.depth = 0;
       return { rows: [] };
     }
+    let sp = /^savepoint (\S+)$/i.exec(q);
+    if (sp) { this.undo.push({ savepoint: sp[1]! }); return { rows: [] }; }
+    sp = /^release savepoint (\S+)$/i.exec(q);
+    if (sp) {
+      const at = this.findSavepoint(sp[1]!);
+      // Its writes now belong to the enclosing transaction; only the marker goes.
+      if (at >= 0) { this.undo.splice(at, 1); }
+      return { rows: [] };
+    }
+    sp = /^rollback to savepoint (\S+)$/i.exec(q);
+    if (sp) {
+      const at = this.findSavepoint(sp[1]!);
+      if (at >= 0) {
+        const undone = this.undo.splice(at + 1);
+        for (const u of undone.reverse()) { if (typeof u === "function") { u(); } }
+      }
+      return { rows: [] };
+    }
     return { rows: dispatch(q, params, (u) => { if (this.depth > 0) { this.undo.push(u); } }) };
+  }
+
+  /** Latest marker with this name (savepoints can be re-declared). */
+  private findSavepoint(name: string): number {
+    for (let i = this.undo.length - 1; i >= 0; i--) {
+      const e = this.undo[i];
+      if (typeof e !== "function" && e!.savepoint === name) { return i; }
+    }
+    return -1;
   }
 
   release(): void { /* pooled clients are reusable here */ }
@@ -830,6 +974,77 @@ function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): unk
     };
     store.invoices.push(row);
     return [{ id: row.id }];
+  }
+
+  // --- "Menu" (GetMenuItems — repriceFromMenu's pricing authority) ---------
+  if (/^select m\.id, m\.name, m\.description/i.test(q) && /from "Menu" m/i.test(q)) {
+    if (store.failMenuRead) {
+      // The production failure this models: statement timeout / pool exhaustion
+      // at read time. A pg-style coded error, so safeClientError masks it.
+      throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014", severity: "ERROR" });
+    }
+    const [resId, outletId] = params as [string, string | null];
+    return store.menuRows
+      .filter((m) => m.res_id === resId && m.outlet_id === outletId)
+      .sort((a, b) => b.created_at.getTime() - a.created_at.getTime())
+      .map((m) => ({ id: m.id, name: m.name, description: m.description, sub_category: m.sub_category, main_category: m.main_category }));
+  }
+
+  // --- "Waitlist" ----------------------------------------------------------
+  // Lazy DDL (ensureWaitlistTable / applyTenantRls): the real database has
+  // already applied these; modelled as no-ops so the flow is drivable.
+  if (/^create table if not exists "Waitlist"/i.test(q)) { return []; }
+  if (/^create (unique )?index if not exists waitlist_/i.test(q)) { return []; }
+  if (/^select column_name from information_schema\.columns where table_schema = 'public' and table_name = 'Waitlist'/i.test(q)) { return [{ column_name: 'party_members' }]; }
+  if (/^alter table "Waitlist" add column/i.test(q)) { return []; }
+  if (/^do \$\$ declare predicate text/i.test(q)) { return []; }
+
+  // GetWaitlistEntryByToken — the guest queue page's poll.
+  if (/^select w\.\*, t\.table_name from "Waitlist" w left join "Tables" t on t\.id = w\.table_id where w\.token = \$1/i.test(q)) {
+    const [token, resId] = params as [string, string];
+    const w = store.waitlists.find((x) => x.token === token && x.res_id === resId);
+    return w ? [{ ...w }] : [];
+  }
+  // waitlistPosition
+  if (/^select count\(\*\)::int as n from "Waitlist"/i.test(q)) {
+    const [resId, outletId, createdAt] = params as [string, string | null, string | Date];
+    const t0 = new Date(createdAt as string).getTime();
+    const n = store.waitlists.filter(
+      (x) => x.res_id === resId && x.outlet_id === outletId && x.status === "waiting" && x.created_at.getTime() < t0,
+    ).length;
+    return [{ n }];
+  }
+  // SetWaitlistPreorder — the ONLY statement that persists a guest's staged picks.
+  if (/^update "Waitlist" set pre_order = \$1::jsonb/i.test(q)) {
+    requireShape(q, "status in ('waiting','called')",
+      "a pre-order may only be staged while the party is still active in the queue; without the predicate a cancelled/seated entry could be rewritten");
+    const [preJson, token, resId] = params as [string, string, string];
+    const w = store.waitlists.find((x) => x.token === token && x.res_id === resId && (x.status === "waiting" || x.status === "called"));
+    if (!w) { return []; }
+    const before = w.pre_order;
+    journal(() => { w.pre_order = before; });
+    w.pre_order = String(preJson);
+    return [{ id: w.id }];
+  }
+  // loadWaitlistForPreorder — staff (id) and guest (token) forms share the shape.
+  if (/^select w\.id, w\.name, w\.pre_order, w\.pre_order_status, w\.placed_order_id, t\.table_name from "Waitlist" w/i.test(q)) {
+    const [key, resId] = params as [string, string];
+    const w = store.waitlists.find((x) => (x.id === key || x.token === key) && x.res_id === resId);
+    return w
+      ? [{ id: w.id, name: w.name, pre_order: w.pre_order, pre_order_status: w.pre_order_status, placed_order_id: w.placed_order_id, table_name: w.table_name }]
+      : [];
+  }
+  // pre_order_status transitions (pending/confirmed/declined/claimed/none).
+  const preStatus = /^update "Waitlist" set pre_order_status = '([a-z]+)'(, placed_order_id = \$3)? where id = \$1 and res_id = \$2$/i.exec(q);
+  if (preStatus) {
+    const [id, resId, placedId] = params as [string, string, string | undefined];
+    const w = store.waitlists.find((x) => x.id === id && x.res_id === resId);
+    if (!w) { return []; }
+    const before = { status: w.pre_order_status, placed: w.placed_order_id };
+    journal(() => { w.pre_order_status = before.status; w.placed_order_id = before.placed; });
+    w.pre_order_status = preStatus[1]!;
+    if (preStatus[2]) { w.placed_order_id = placedId ?? null; }
+    return [];
   }
 
   throw new Error(`platform fixture: unhandled query\n  ${q.slice(0, 300)}`);

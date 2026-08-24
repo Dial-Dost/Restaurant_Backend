@@ -16,7 +16,12 @@ const pool = connectionString
 	? new Pool({
 		connectionString,
 		ssl: { rejectUnauthorized: false },
-		max: Math.max(1, Number(process.env.PLATFORM_PG_POOL_MAX) || 5),
+		// Default 2, not 5: the control plane serves only the operator console and
+		// the billing scheduler. Production's session-mode pooler allows 15 clients
+		// per role, and this pool is budgeted alongside the tenant pools in
+		// database_supabase.ts (8 primary + 3 ipv4 fallback + 2 here = 13 of 15) —
+		// see the sizing rationale there before raising any of the three.
+		max: Math.max(1, Number(process.env.PLATFORM_PG_POOL_MAX) || 2),
 		idleTimeoutMillis: Math.max(0, Number(process.env.PG_IDLE_TIMEOUT_MS) || 30_000),
 		connectionTimeoutMillis: Math.max(0, Number(process.env.PG_CONNECTION_TIMEOUT_MS) || 10_000),
 	})

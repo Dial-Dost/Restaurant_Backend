@@ -264,8 +264,9 @@ keeps them as sibling calls, matching `index.ts`.
 #### The database
 
 Every warm Lambda container opens its own `pg` pool. At 100 concurrent
-containers with the default `PG_POOL_MAX=10` that is up to 1,000 connections
-against a Postgres that permits a small fraction of that. Supabase's transaction
+containers with even the default `PG_POOL_MAX=8` (10 before the 2026-08-24
+pool-exhaustion incident) that is up to 800 connections against a Postgres that
+permits a small fraction of that. Supabase's transaction
 pooler is the normal answer.
 
 **This application cannot use transaction-mode pooling as written.** Two reasons,

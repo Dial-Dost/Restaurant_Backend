@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { EnsureRestaurantSeed, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -203,6 +203,15 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
 		res.once("close", release);
 		conn.run(() => { next(); });
 	} catch (err) {
+		if (err instanceof DbBusyError) {
+			// Pool saturation: already logged as a WARN with live pool counts at the
+			// acquire site (logPoolSaturation), so no error-level stack here. This is
+			// a retryable condition, and saying so lets clients back off briefly
+			// instead of treating it as an outage.
+			res.setHeader("Retry-After", "2");
+			res.status(503).json({ error: "Server busy", details: err.message, retryable: true });
+			return;
+		}
 		logger.error({ err }, "tenant_connection_open_failed");
 		res.status(503).json({ error: "Database unavailable" });
 	}

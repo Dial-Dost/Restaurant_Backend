@@ -116,8 +116,30 @@ function pgSslFor(cs: string | undefined): false | { rejectUnauthorized: boolean
 }
 
 // Pool sizing is env-driven so the per-replica connection budget can be tuned to
-// (db_max_connections - headroom) / replica_count. Defaults are conservative.
-const POOL_MAX = Math.max(1, Number(process.env.PG_POOL_MAX) || 10);
+// (db_max_connections - headroom) / replica_count.
+//
+// WHY THESE DEFAULTS. Production connects through Supabase's SESSION-mode pooler
+// (Supavisor), which caps this role at pool_size = 15 sessions. Once 15 exist,
+// every further connect is refused with a FATAL "max clients reached in session
+// mode" — and because requireAuth opens a session-scoped connection per request,
+// that error at auth time fails EVERY module at once (the 2026-08-24 standstill).
+// So everything this process can open must sum comfortably under 15:
+//
+//   primary tenant pool   PG_POOL_MAX           default 8
+//   ipv4 fallback pool    PG_IPV4_POOL_MAX      default 3   (same role, same DB —
+//                         it counts against the SAME 15. It exists for hosts that
+//                         cannot reach the primary URL, not as a second capacity
+//                         tier; acquireTenantClient no longer falls through to it
+//                         on saturation, only on genuine connectivity failures)
+//   platform pool         PLATFORM_PG_POOL_MAX  default 2   (platform/db.ts —
+//                         separate platform_runtime role, likely its own server
+//                         side pool, but counted here to stay safe)
+//
+// Worst case 8 + 3 + 2 = 13 of 15, leaving 2 sessions of headroom for
+// `npm run migrate` / check-migrations and deploy overlap. Raise PG_POOL_MAX only
+// together with the pooler's pool_size.
+const POOL_MAX = Math.max(1, Number(process.env.PG_POOL_MAX) || 8);
+const IPV4_POOL_MAX = Math.max(1, Number(process.env.PG_IPV4_POOL_MAX) || 3);
 const POOL_IDLE_TIMEOUT_MS = Math.max(0, Number(process.env.PG_IDLE_TIMEOUT_MS) || 30_000);
 const POOL_CONN_TIMEOUT_MS = Math.max(0, Number(process.env.PG_CONNECTION_TIMEOUT_MS) || 10_000);
 
@@ -132,7 +154,7 @@ const pool = new Pool({
 const ipv4pool = new Pool({
   connectionString: ipv4FallbackString,
   ssl: pgSslFor(ipv4FallbackString),
-  max: POOL_MAX,
+  max: IPV4_POOL_MAX,
   idleTimeoutMillis: POOL_IDLE_TIMEOUT_MS,
   connectionTimeoutMillis: POOL_CONN_TIMEOUT_MS,
 });
@@ -170,6 +192,92 @@ export async function closePools(): Promise<void> {
 }
 
 let isipv4Fallback = false;
+
+// --- Pool acquisition --------------------------------------------------------
+// Thrown when a client cannot be checked out because every slot is busy (local
+// pool saturated, or the session-mode pooler's 15-slot cap is hit). Carries
+// status 503 so the terminal express handler — and requireAuth's catch — surface
+// it as a clean "busy, retry shortly" instead of a generic 500. Retryable by the
+// client; NOT a bug in the request that carried it.
+export class DbBusyError extends Error {
+  /** Read by index.ts's terminal error handler (`err.status`). */
+  status = 503;
+  constructor() {
+    super("The server is handling too many requests right now — please retry shortly.");
+    this.name = "DbBusyError";
+  }
+}
+
+// Saturation (all slots busy) vs a genuine connectivity failure. The distinction
+// decides whether we (a) reject 503-busy without touching the ipv4 fallback pool,
+// or (b) try the fallback path. Getting this wrong was the 2026-08-24 cascade:
+// a burst saturated the primary pool, every timed-out acquire fell through to the
+// ipv4 fallback pool, which opened up to POOL_MAX MORE sessions of the same role
+// against the same pooler — blowing through Supavisor's 15-slot cap and turning
+// "some requests briefly queue" into FATAL "max clients reached" for everyone.
+function isPoolSaturationError(err: unknown): boolean {
+  const e = err as { message?: unknown; code?: unknown } | null;
+  const msg = String(e?.message ?? "");
+  // pg-pool's bounded acquire: connectionTimeoutMillis elapsed with every local
+  // slot checked out.
+  if (/timeout exceeded when trying to connect/i.test(msg)) {return true;}
+  // Supavisor session mode: all pool_size slots are taken server-side.
+  if (/max clients reached/i.test(msg)) {return true;}
+  // Postgres itself: too_many_connections.
+  if (e?.code === "53300") {return true;}
+  return false;
+}
+
+// One WARN per saturation event, with live counts from BOTH pools, so the next
+// incident is diagnosable from a single log line (how many open, how many idle,
+// how many callers queued) instead of dozens of bare FATALs.
+function logPoolSaturation(where: string, err: unknown): void {
+  const counts = (p: Pool) => ({ total: p.totalCount, idle: p.idleCount, waiting: p.waitingCount });
+  logger.warn(
+    {
+      pool: where,
+      err: (err as { message?: unknown } | null)?.message ?? String(err),
+      primary: { ...counts(pool), max: POOL_MAX },
+      ipv4: { ...counts(ipv4pool), max: IPV4_POOL_MAX },
+    },
+    "pg_pool_saturated — rejecting request with 503 busy",
+  );
+}
+
+/**
+ * Check out a tenant-pool client. Saturation of the primary pool rejects with
+ * DbBusyError (503) IMMEDIATELY — it must never fall through to the ipv4 pool,
+ * which is the same role against the same database and would only push the
+ * session pooler past its cap (see isPoolSaturationError). Only a genuine
+ * connectivity failure (unreachable host, DNS, refused socket) tries the
+ * fallback. Acquisition is already bounded by connectionTimeoutMillis, so a
+ * burst degrades into a short queue and then a clean 503, never a FATAL.
+ */
+async function acquireTenantClient(): Promise<PoolClient> {
+  let primaryErr: unknown;
+  try {
+    const client = await pool.connect();
+    isipv4Fallback = false;
+    return client;
+  } catch (err) {
+    primaryErr = err;
+  }
+  if (isPoolSaturationError(primaryErr)) {
+    logPoolSaturation("primary", primaryErr);
+    throw new DbBusyError();
+  }
+  try {
+    const client = await ipv4pool.connect();
+    isipv4Fallback = true;
+    return client;
+  } catch (fallbackErr) {
+    if (isPoolSaturationError(fallbackErr)) {
+      logPoolSaturation("ipv4-fallback", fallbackErr);
+      throw new DbBusyError();
+    }
+    throw fallbackErr;
+  }
+}
 
 // --- Tenant context (multi-tenant isolation) ---------------------------------
 // Every authenticated request runs inside withTenant(), which checks out one pg
@@ -1294,22 +1402,58 @@ export async function runTenantTransaction<T>(work: () => Promise<T>): Promise<T
 // DDL: in that mode the schema is expected to come from migrations, so an
 // insufficient-privilege error is treated as "already provisioned".
 const ddlEnsured = new Set<string>();
+// First-call concurrency guard: N requests racing the same un-ensured key must
+// produce ONE DDL run, not N. ALTER TABLE takes an ACCESS EXCLUSIVE lock, so N
+// concurrent runs against a hot table (Tables, Outlets, Orders) serialize into a
+// lock convoy — each holding a pooled session while it waits — which is exactly
+// how a burst turns into statement timeouts and pool exhaustion. Late arrivals
+// await the first caller's in-flight promise instead of starting their own run.
+const ddlInFlight = new Map<string, Promise<void>>();
 
 function isInsufficientPrivilege(err: any): boolean {
   return err?.code === "42501"; // insufficient_privilege (e.g. not the table owner)
 }
 
 // Run a lazy table's DDL once per process. `key` is the logical table group.
+// Schema, once ensured, cannot un-happen while the process lives — so success is
+// memoized forever; a FAILED run clears the in-flight slot and leaves the key
+// un-ensured, so the next request retries rather than running forever degraded.
 async function ensureLazyTable(key: string, run: () => Promise<void>): Promise<void> {
   if (ddlEnsured.has(key)) {return;}
+  const inFlight = ddlInFlight.get(key);
+  if (inFlight) {return inFlight;}
+  const attempt = (async () => {
+    try {
+      await run();
+    } catch (err) {
+      if (!isInsufficientPrivilege(err)) {throw err;}
+      // Running as app_runtime: schema comes from migrations; nothing to do.
+    }
+    ddlEnsured.add(key);
+  })();
+  ddlInFlight.set(key, attempt);
   try {
-    await run();
-  } catch (err) {
-    if (!isInsufficientPrivilege(err)) {throw err;}
-    // Running as app_runtime: schema comes from migrations; nothing to do.
+    await attempt;
+  } finally {
+    ddlInFlight.delete(key);
   }
-  ddlEnsured.add(key);
 }
+
+// Test seam (jest only — no runtime path calls this). The 2026-08-24 stall was
+// caused by private functions (ensureOutletColumns inside the settle
+// transaction, the pool-acquire fallback cascade), so the regression tests need
+// direct handles on them without exporting each as public API. Mirrors the
+// resetArchivedStatusSupportCache precedent in platform/db.ts.
+export const __poolHygieneTestSeam = {
+  resetDdlMemo(): void {
+    ddlEnsured.clear();
+    ddlInFlight.clear();
+  },
+  ensureLazyTable,
+  ensureOutletColumns: (client?: PoolClient): Promise<void> => ensureOutletColumns(client),
+  ensureFeedbackColumns: (client?: PoolClient): Promise<void> => ensureFeedbackColumns(client),
+  isPoolSaturationError,
+};
 
 // Make a lazily-created tenant table fail-closed under RLS the instant it exists,
 // matching migration 003's policy form exactly. Idempotent. `tableName` is an
@@ -1426,18 +1570,7 @@ async function withTransaction<T>(work: (client: PoolClient) => Promise<T>): Pro
     }
   }
 
-  let client;
-  try {
-    client = await pool.connect();
-    isipv4Fallback = false;
-  }
-  catch (error) {
-    client = await ipv4pool.connect();
-    isipv4Fallback = true;
-  }
-  if (!client) {
-    throw new Error("Failed to acquire database client");
-  }
+  const client = await acquireTenantClient();
   try {
     await client.query("BEGIN");
     const value = await work(client);
@@ -1462,14 +1595,9 @@ export async function withTenant<T>(ctx: TenantContext, work: () => Promise<T>):
     return work();
   }
 
-  let client: PoolClient;
-  try {
-    client = await pool.connect();
-    isipv4Fallback = false;
-  } catch {
-    client = await ipv4pool.connect();
-    isipv4Fallback = true;
-  }
+  // Acquisition only — the transactional shape below (BEGIN, txn-local
+  // set_config, work, COMMIT/ROLLBACK, release) is deliberately untouched.
+  const client = await acquireTenantClient();
 
   try {
     await client.query("BEGIN");
@@ -1504,22 +1632,24 @@ export async function openTenantConnection(ctx: TenantContext): Promise<{
   run: <T>(fn: () => T) => T;
   release: () => Promise<void>;
 }> {
-  let client: PoolClient;
+  const client = await acquireTenantClient();
   try {
-    client = await pool.connect();
-    isipv4Fallback = false;
-  } catch {
-    client = await ipv4pool.connect();
-    isipv4Fallback = true;
+    await client.query(
+      `select
+        set_config('app.res_id', $1, false),
+        set_config('app.outlet_id', $2, false),
+        set_config('app.employee_id', $3, false),
+        set_config('app.role', $4, false)`,
+      [ctx.res_id ?? "", ctx.outlet_id ?? "", ctx.employeeId ?? "", ctx.role ?? ""],
+    );
+  } catch (err) {
+    // The client was checked out but never handed to the caller — without this
+    // release it would leak from the pool forever (a slow, invisible drain of
+    // the 15-slot session budget). Passing the error destroys the connection
+    // rather than recycling one whose GUC state is unknown.
+    client.release(err as Error);
+    throw err;
   }
-  await client.query(
-    `select
-      set_config('app.res_id', $1, false),
-      set_config('app.outlet_id', $2, false),
-      set_config('app.employee_id', $3, false),
-      set_config('app.role', $4, false)`,
-    [ctx.res_id ?? "", ctx.outlet_id ?? "", ctx.employeeId ?? "", ctx.role ?? ""],
-  );
   let released = false;
   return {
     run: (fn) => tenantStorage.run({ client, ctx, txnDepth: 0 }, fn),
@@ -4388,8 +4518,10 @@ export async function GetCustomerInsights(
     buckets.set(key, list);
   }
 
+  // Whitespace collapsed to match the JS-side key exactly — see the same
+  // normalization in GetCustomerSegments' feedback read.
   const fbRows = await runQuery<{ nm: string; avg_rating: number | null; n: number }>(
-    `select lower(trim(cust_name)) as nm, avg(overall_rating)::float as avg_rating, count(*)::int as n
+    `select lower(regexp_replace(trim(cust_name), '\\s+', ' ', 'g')) as nm, avg(overall_rating)::float as avg_rating, count(*)::int as n
        from "Feedback_entries"
       where res_id = $1 and (${og} or outlet_id = $2) and cust_name is not null and trim(cust_name) <> ''
       group by 1`,
@@ -4478,6 +4610,14 @@ export async function GetCustomerInsights(
 // so the two reads agree about WHO a guest is even though they disagree about
 // what that guest spent.
 //
+// When NO order in the seating carried an identity (staff-typed orders with no
+// phone are the norm), the seating's own BOOKING claims the bill instead:
+// Bookings.cust_id is a real FK, and a guest who reserved, sat at the booked
+// table and settled there IS that seating's customer. See bookingIdentForBill
+// for the exact window rule and the ambiguity guard (two different guests'
+// bookings over one seating -> nobody claims it, same honesty rule as
+// customerIdentityKeys).
+//
 // KNOWN DIVERGENCE: /customers/insights still reports the order-total figure.
 // It is not changed here — the CRM page's numbers would move underneath it — but
 // the two endpoints WILL disagree, and this one is the one that matches a receipt.
@@ -4505,6 +4645,12 @@ export interface CustomerSegmentRow {
   last_visit: string | null;
   days_since_last_visit: number | null;
   bills: number;
+  /** Bookings this guest has EVER made (count of "Bookings" rows linked by
+   *  cust_id) — derived read-time from the source table on every request, so a
+   *  booking made a second ago is already counted. Not windowed: it answers
+   *  "how many times has this guest booked with us", the same all-time question
+   *  /get-customers' booking_count answers. */
+  bookings_made: number;
   avg_rating: number | null;
   feedbacks: number;
   segment: CustomerSegment;
@@ -4580,6 +4726,82 @@ export function customerIdentityKeys(
   return out;
 }
 
+/** One booking, reduced to what bill attribution needs: whose it is, which
+ *  table it holds, and the decoded slot window. `start` is the slot's ISO
+ *  start; `duration_minutes` its length; `status` the slot's booking status
+ *  as stored (any casing). */
+export interface BookingAttributionRow {
+  cust_id: string;
+  table_id: string;
+  start: string;
+  duration_minutes: number;
+  status: string | null;
+}
+
+// A cancelled or no-show booking never sat anyone, so it can never claim a
+// bill. Matched loosely because the status is free text in the slot blob
+// ("Cancelled", "cancel", "No Show", "no_show", "NoShow" all occur).
+const NON_SEATING_BOOKING_STATUS = /cancel|no[\s_-]?show/i;
+
+// The same seating fallback the order-identity SQL uses when no TableSessions
+// row recorded when the party sat down: assume the seating began at most this
+// long before the bill was raised.
+const BILL_SEATING_FALLBACK_HOURS = 12;
+
+/**
+ * Read-time fallback identity for a settled bill whose seating produced no
+ * identified order.
+ *
+ * WHY: the primary attribution walks bill -> seating -> first order carrying a
+ * cust_id / phone / name. Staff-typed dine-in orders usually carry NONE of
+ * those, so a guest who reserved a table, was seated on it and settled there
+ * showed a lifetime spend of zero — the strongest link in the schema
+ * (Bookings.cust_id, an actual FK) was never consulted. This helper is that
+ * consultation, applied read-time so it also repairs history.
+ *
+ * RULE: a booking claims the bill when it is on the SAME table, its status
+ * still stands (not cancelled / no-show), and its booked window
+ * [start, start + duration] overlaps the seating window
+ * [seated_at (or bill.created_at − 12h), bill.created_at].
+ *
+ * AMBIGUITY: if bookings from TWO different customers both match, NOBODY
+ * claims the bill — the identical honesty rule customerIdentityKeys applies to
+ * a shared phone. Being unable to say which guest paid is honest; picking one
+ * is not, and spend decides the high-spend quartile. Several matching bookings
+ * from the SAME customer are fine (a double-booked regular is still one guest).
+ *
+ * Returns the `c:<cust_id>` bucket key, or null when no booking (or no
+ * unambiguous booking) covers the seating.
+ */
+export function bookingIdentForBill(
+  bill: { table_id: string | null; created_at: Date | string; seated_at: Date | string | null },
+  bookings: readonly BookingAttributionRow[],
+): string | null {
+  if (!bill.table_id) { return null; }
+  const seatEnd = new Date(bill.created_at).getTime();
+  if (!Number.isFinite(seatEnd)) { return null; }
+  const seatedAt = bill.seated_at === null ? NaN : new Date(bill.seated_at).getTime();
+  const seatStart = Number.isFinite(seatedAt)
+    ? seatedAt
+    : seatEnd - BILL_SEATING_FALLBACK_HOURS * 3_600_000;
+
+  const claimants = new Set<string>();
+  for (const b of bookings) {
+    if (b.table_id !== bill.table_id || !b.cust_id) { continue; }
+    if (b.status !== null && NON_SEATING_BOOKING_STATUS.test(b.status)) { continue; }
+    const start = new Date(b.start).getTime();
+    if (!Number.isFinite(start)) { continue; }
+    const minutes = Number.isFinite(b.duration_minutes) && b.duration_minutes > 0 ? b.duration_minutes : 120;
+    const end = start + minutes * 60_000;
+    // Window overlap, not containment: a late party's booking begins before the
+    // seating, an early one after — both are still that seating's booking.
+    if (start <= seatEnd && end >= seatStart) { claimants.add(b.cust_id); }
+  }
+  if (claimants.size !== 1) { return null; }
+  const only = [...claimants][0]!;
+  return `c:${only}`;
+}
+
 export async function GetCustomerSegments(
   restaurantId: string,
   opts: {
@@ -4613,7 +4835,7 @@ export async function GetCustomerSegments(
   await ensureBillWorkflowColumns();
   const scPct = await getServiceChargePercent(rid);
 
-  const [custRows, billRows, fbRows] = await Promise.all([
+  const [custRows, billRows, fbRows, bookingRows] = await Promise.all([
     runQuery<{ id: string; fname: string | null; lname: string | null; phone: string | null; email: string | null }>(
       `select id, "cust_Fname" as fname, "cust_Lname" as lname, cast(cust_ph as text) as phone, cust_email as email
          from "Customers" where res_id = $1 and (${og} or outlet_id = $2)`,
@@ -4622,11 +4844,15 @@ export async function GetCustomerSegments(
     // Settled bills -> their seating -> the first identified order of that
     // seating. `ident` mirrors GetCustomerInsights exactly (cust_id first, then a
     // captured phone, then a non-"Guest" name) so the identity buckets line up.
-    runQuery<{ ident: string | null; settled_at: Date; total_amt: string; tax_breakdown: unknown }>(
-      `select i.ident, i.settled_at, i.total_amt::text, i.tax_breakdown
+    // Bills whose seating produced NO identified order (ident null, or the
+    // literal placeholder "guest") are kept: their identity is resolved below
+    // from the seating's booking, so table_id / created_at / seated_at ride
+    // along for that.
+    runQuery<{ ident: string | null; table_id: string | null; bill_created_at: Date; seated_at: Date | null; settled_at: Date; total_amt: string; tax_breakdown: unknown }>(
+      `select i.ident, i.table_id::text as table_id, i.bill_created_at, i.seated_at, i.settled_at, i.total_amt::text, i.tax_breakdown
          from (
            select coalesce(b.closed_at, b.admin_approved_at) as settled_at,
-                  b.total_amt, b.tax_breakdown,
+                  b.total_amt, b.tax_breakdown, b.table_id, b.created_at as bill_created_at, s.seated_at,
                   (select case when o.cust_id is not null then 'c:' || o.cust_id::text
                                else coalesce(nullif((o.food)::jsonb->>'customer_phone', ''),
                                              nullif((o.food)::jsonb->>'customer', '')) end
@@ -4651,29 +4877,65 @@ export async function GetCustomerSegments(
               and (b.admin_approved_at is not null or b.closed_at is not null)
               and coalesce(b.closed_at, b.admin_approved_at) >= $3
               and coalesce(b.closed_at, b.admin_approved_at) < $4
-         ) i
-        where i.ident is not null and lower(i.ident) <> 'guest'`,
+         ) i`,
       [rid, oid, fromIso, toIso],
     ),
+    // Whitespace is collapsed exactly as the JS side collapses the customer's
+    // own name ("A  B" and "A B" are the same person), so the two keys can
+    // never disagree about spacing.
     runQuery<{ nm: string; avg_rating: string | null; n: string }>(
-      `select lower(trim(cust_name)) as nm, avg(overall_rating)::text as avg_rating, count(*)::text as n
+      `select lower(regexp_replace(trim(cust_name), '\\s+', ' ', 'g')) as nm, avg(overall_rating)::text as avg_rating, count(*)::text as n
          from "Feedback_entries"
         where res_id = $1 and (${og} or outlet_id = $2)
           and cust_name is not null and trim(cust_name) <> ''
         group by 1`,
       [rid, oid],
     ),
+    // The whole booking book for the tenant, for two read-time derivations:
+    // bookings_made per guest, and the booking-window fallback that attributes
+    // an order-less seating's bill (see bookingIdentForBill). The slot window
+    // lives in a JSON text blob only decodeSlot understands, so rows come back
+    // whole and are decoded here — same as every other slot reader.
+    runQuery<{ cust_id: string; table_id: string; slot: string | null; created_at: Date }>(
+      `select cust_id::text as cust_id, table_id::text as table_id, slot, created_at
+         from "Bookings" where res_id = $1 and (${og} or outlet_id = $2)`,
+      [rid, oid],
+    ),
   ]);
+
+  // Decoded booking windows for the bill fallback, and the per-guest all-time
+  // booking count — both straight off the source table, never a stored counter.
+  const bookingWindows: BookingAttributionRow[] = bookingRows.map((b) => {
+    const slot = decodeSlot(b.slot, b.created_at);
+    return {
+      cust_id: b.cust_id,
+      table_id: b.table_id,
+      start: slot.start,
+      duration_minutes: slot.duration,
+      status: slot.status ?? null,
+    };
+  });
+  const bookingsByCust = new Map<string, number>();
+  for (const b of bookingRows) { bookingsByCust.set(b.cust_id, (bookingsByCust.get(b.cust_id) ?? 0) + 1); }
 
   interface Money { spend: number; service: number; tax: number; base: number; bills: number; days: Set<string> }
   const empty = (): Money => ({ spend: 0, service: 0, tax: 0, base: 0, bills: 0, days: new Set<string>() });
   const buckets = new Map<string, Money>();
   for (const b of billRows) {
+    // No order in the seating named anyone (or only the "guest" placeholder):
+    // fall back to the seating's booking. A bill neither an order nor a booking
+    // can identify is skipped — it belongs to no guest this read can name.
+    const ident = b.ident !== null && b.ident.trim().toLowerCase() !== "guest"
+      ? b.ident
+      : bookingIdentForBill(
+          { table_id: b.table_id, created_at: b.bill_created_at, seated_at: b.seated_at },
+          bookingWindows,
+        );
+    if (ident === null) { continue; }
     const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct);
     // Same identity keying as GetCustomerInsights: a direct cust_id link, else a
     // normalized phone when the ident has enough digits to be one, else a name.
     let key: string;
-    const ident = String(b.ident);
     if (ident.startsWith("c:")) {
       key = ident;
     } else {
@@ -4739,6 +5001,7 @@ export async function GetCustomerSegments(
       last_visit,
       days_since_last_visit: days_since,
       bills: merged.bills,
+      bookings_made: bookingsByCust.get(c.id) ?? 0,
       avg_rating: (fb?.avg_rating ?? null) === null ? null : round2(parseNumeric(fb?.avg_rating)),
       feedbacks: Math.round(parseNumeric(fb?.n)),
     };
@@ -17261,9 +17524,16 @@ function normalizeWaitlistItems(raw: unknown): WaitlistItem[] {
 // it's >= the menu base (so modifier upcharges on the staff/QR order path survive);
 // otherwise the exact menu price is used. Items with no current menu match are
 // DROPPED (they can't be billed). Must run inside the tenant context.
+//
+// THROWS when the menu cannot be READ at all (transient DB failure — pool
+// exhaustion, statement timeout). The old `.catch(() => [])` turned a read
+// error into "drop every line", which silently WIPED guests' held waitlist
+// pre-orders while reporting success. An empty menu still drops everything —
+// items that don't exist can't be billed — but a read error must surface so
+// callers fail loudly (and retryably) instead of losing the guest's picks.
 export async function repriceFromMenu(restaurantId: string, items: WaitlistItem[], floorOnly = false): Promise<WaitlistItem[]> {
   if (!Array.isArray(items) || items.length === 0) {return [];}
-  const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
+  const menu = await GetMenuItems(restaurantId);
   if (menu.length === 0) {return [];}
   const byId = new Map(menu.map((m) => [String(m.id), m]));
   const byName = new Map(menu.map((m) => [m.name.trim().toLowerCase(), m]));
@@ -17623,7 +17893,13 @@ export async function SeatWaitlistEntry(
     let pending: { items: WaitlistItem[]; subtotal: number; count: number } | null = null;
     let preStatus: WaitlistPreorderStatus = "none";
     if (preOrder.length > 0) {
-      const priced = await repriceFromMenu(restaurantId, preOrder, false);
+      // Seating must NEVER fail (or silently forget the pre-order) because the
+      // menu couldn't be read right now: fall back to the items as staged —
+      // they were already repriced from the menu when the guest saved them —
+      // and let ConfirmWaitlistPreorder re-price again at confirm time.
+      let priced: WaitlistItem[];
+      try { priced = await repriceFromMenu(restaurantId, preOrder, false); }
+      catch { priced = preOrder; }
       if (priced.length > 0) {
         pending = {
           items: priced,
@@ -17767,7 +18043,13 @@ export async function DeclineWaitlistPreorder(
     if (entry.pre_order_status === "pending") {
       await runQuery(`update "Waitlist" set pre_order_status = 'declined' where id = $1 and res_id = $2`, [entry.id, context.res_id], client);
     }
-    return { success: true as const, items: await repriceFromMenu(restaurantId, held, false) };
+    // These items only seed the guest's cart (never billed directly — /order
+    // re-prices from the live menu). A menu read failure falls back to the
+    // held items so the guest's "I'll change it at the table" is never blocked.
+    let items: WaitlistItem[];
+    try { items = await repriceFromMenu(restaurantId, held, false); }
+    catch { items = held; }
+    return { success: true as const, items };
   });
 }
 
@@ -17793,7 +18075,12 @@ export async function ClaimWaitlistPreorder(
       return { status: entry.pre_order_status, items: [], table_name: entry.table_name };
     }
     const held = normalizeWaitlistItems(typeof entry.pre_order === "string" ? JSON.parse(entry.pre_order || "[]") : entry.pre_order);
-    const priced = await repriceFromMenu(restaurantId, held, false);
+    // Cart seed only (the /order page re-prices everything it submits): if the
+    // menu can't be read right now, hand back the held items rather than
+    // consuming the pre-order with an empty item list.
+    let priced: WaitlistItem[];
+    try { priced = await repriceFromMenu(restaurantId, held, false); }
+    catch { priced = held; }
     if (!peek) {
       await runQuery(`update "Waitlist" set pre_order_status = 'claimed' where id = $1 and res_id = $2`, [entry.id, context.res_id], client);
     }
@@ -17944,16 +18231,103 @@ export async function RecordPushResult(restaurantId: string, id: string, outcome
   );
 }
 
+// --- Waiter assignment policy ------------------------------------------------
+// Definitions this file (and its tests) rely on:
+//
+//   * "Clocked in right now" = the employee has an OPEN "Attendance" shift —
+//     clock_out IS NULL and the shift was not rejected. A PENDING clock-in
+//     counts: the person is physically on the floor; admin approval is payroll
+//     bookkeeping, not presence.
+//
+//   * "This outlet uses attendance" = at least one Attendance row has EVER been
+//     recorded for the outlet. THE DEGRADE RULE: a restaurant that does not use
+//     the attendance module at all must NOT lose the ability to assign anyone —
+//     when nobody has ever clocked in for the outlet, every eligibility check
+//     below answers "eligible", i.e. the pre-attendance behaviour. Do not
+//     "tighten" this to a same-day or rolling-window check: one long-forgotten
+//     clock-in from months ago switching the gate on forever is exactly as
+//     surprising, so the gate keys on EVER-used, and an outlet that stops using
+//     attendance keeps the gate (their choice to stop clocking in).
+interface WaiterEligibility {
+  exists: boolean;
+  /** Any of the employee's roles is `admin`. */
+  isAdmin: boolean;
+  /** The outlet has recorded at least one clock-in EVER. */
+  attendanceInUse: boolean;
+  /** Open, non-rejected Attendance shift right now. */
+  clockedIn: boolean;
+}
+
+async function getWaiterEligibility(
+  context: RestaurantContext,
+  employeeId: string,
+  client?: PoolClient,
+): Promise<WaiterEligibility> {
+  await ensureAttendanceTable(client);
+  const rows = await runQuery<{ emp_roles: unknown; attendance_in_use: boolean; clocked_in: boolean }>(
+    `
+      select
+        e.emp_roles as emp_roles,
+        exists (
+          select 1 from "Attendance" a
+           where a.res_id = $2 and a.outlet_id = $3
+        ) as attendance_in_use,
+        exists (
+          select 1 from "Attendance" a
+           where a.res_id = $2 and a.outlet_id = $3 and a.emp_id = e.id
+             and a.clock_out is null
+             and (a.status is null or a.status <> 'rejected')
+        ) as clocked_in
+      from "Employees" e
+      where e.id = $1 and e.res_id = $2 and e.outlet_id = $3
+      limit 1
+    `,
+    [employeeId, context.res_id, context.outlet_id],
+    client,
+  );
+  const row = rows[0];
+  if (!row) {return { exists: false, isAdmin: false, attendanceInUse: false, clockedIn: false };}
+  const roles = parseEmployeeRoles(row.emp_roles);
+  const isAdmin = [roles.primary, ...roles.all].some((r) => String(r).trim().toLowerCase() === "admin");
+  return { exists: true, isAdmin, attendanceInUse: row.attendance_in_use === true, clockedIn: row.clocked_in === true };
+}
+
 // Auto-assign the seating employee to a table by ids (drives APC + feedback/rating
-// attribution). Best-effort — call only with a real Employees.id (UUID). Upserts
-// so re-seating replaces the assignment; created_at refreshed so the latest wins.
+// attribution). Best-effort — call only with a real Employees.id (UUID).
+//
+// POLICY (from the Gaia production session, punch-list issues 3 + 7). This is
+// the AUTO path — occupy-table and waitlist seating. It:
+//
+//   * fills a VACANT slot only (`on conflict do nothing`). An assignment already
+//     on the table — explicit or auto — is NEVER overwritten here. The shipped
+//     bug: this was `do update`, and the dashboard's order flow calls
+//     /occupy-table around every order save, so an admin placing/linking an
+//     order silently re-assigned the table to the ADMIN, clobbering explicit
+//     waiter assignments on table after table. Explicit assignment stays the
+//     job of AssignTableToEmployee, which deliberately keeps `do update`.
+//
+//   * never assigns an ADMIN. An admin occupying a table from the dashboard is
+//     operating the POS on the floor's behalf, not serving the table; the old
+//     behaviour made the admin the "waiter" of every table they touched. A
+//     table with no defensible waiter now stays unassigned (feedback and APC
+//     already handle a null waiter, and GetTableFeedbackContext has its own
+//     latest-order fallback).
+//
+//   * is attendance-aware: when this outlet uses attendance, only an employee
+//     clocked in RIGHT NOW may be auto-assigned. An outlet where nobody has
+//     ever clocked in keeps the old everyone-eligible behaviour (see the
+//     degrade rule on getWaiterEligibility).
 async function assignTableById(context: RestaurantContext, tableId: string, employeeId: string, client?: PoolClient): Promise<void> {
   await ensureTableAssignmentsTable(client);
+  const actor = await getWaiterEligibility(context, employeeId, client);
+  if (!actor.exists) {return;}
+  if (actor.isAdmin) {return;}
+  if (actor.attendanceInUse && !actor.clockedIn) {return;}
   await runQuery(
     `insert into "Table_assignments" (id, created_at, res_id, outlet_id, table_id, employee_id)
      values ($1, now(), $2, $3, $4, $5)
      on conflict (res_id, outlet_id, table_id)
-     do update set employee_id = excluded.employee_id, created_at = now()`,
+     do nothing`,
     [randomUUID(), context.res_id, context.outlet_id, tableId, employeeId],
     client,
   );
@@ -17989,13 +18363,29 @@ export async function AssignTableToEmployee(
       throw new Error("Employee not found");
     }
 
+    // Attendance gate, enforced HERE in the data layer so it is the source of
+    // truth for every caller (owner app, dashboard, raw API) — the picker being
+    // filtered client-side is presentation, not enforcement. When this outlet
+    // uses attendance, only staff clocked in right now are assignable. THE
+    // DEGRADE RULE: an outlet where nobody has EVER clocked in is exempt —
+    // restaurants that don't use attendance keep full assignment ability (see
+    // getWaiterEligibility).
+    const eligibility = await getWaiterEligibility(context, employee.id, client);
+    if (eligibility.attendanceInUse && !eligibility.clockedIn) {
+      const name = `${employee.fname ?? ""} ${employee.lname ?? ""}`.trim() || employee.username;
+      throw new Error(`${name} is not clocked in — only staff who are clocked in can be assigned to a table`);
+    }
+
     const assignmentId = randomUUID();
+    // EXPLICIT assignment: deliberately `do update` — a human choosing a waiter
+    // always wins, including over a previous assignment. Contrast with the auto
+    // path (assignTableById), which only ever fills a vacant slot.
     await runQuery(
       `
         insert into "Table_assignments" (id, created_at, res_id, outlet_id, table_id, employee_id)
         values ($1, now(), $2, $3, $4, $5)
         on conflict (res_id, outlet_id, table_id)
-        do update set employee_id = excluded.employee_id
+        do update set employee_id = excluded.employee_id, created_at = now()
       `,
       [assignmentId, context.res_id, context.outlet_id, table.id, employee.id],
       client,
@@ -18079,6 +18469,86 @@ export async function GetTableAssignments(
     employee_name: `${row.fname} ${row.lname}`.trim(),
     employee_role: row.role_primary ?? "employee",
   }));
+}
+
+/** One row of the waiter picker. Field names mirror GetRestaurantUsers so the
+ *  owner app's assign dialog renders either source unchanged. */
+export interface AssignableEmployee {
+  employee_id: string;
+  employee_Username: string;
+  emp_Fname: string;
+  emp_Lname: string | null;
+  role: string;
+  clocked_in: boolean;
+}
+
+// The server-side source of truth for WHO MAY BE ASSIGNED A TABLE right now —
+// the list every assignment picker must be fed from (punch-list issue 7:
+// filtering only in the UI is not enforcement; AssignTableToEmployee re-checks
+// the same rule on write).
+//
+//   * Outlet uses attendance (>= 1 clock-in EVER): only employees clocked in
+//     right now — open, non-rejected shift (see getWaiterEligibility).
+//   * Outlet has NEVER recorded a clock-in: every employee, i.e. the behaviour
+//     from before attendance existed. THE DEGRADE RULE — a restaurant that
+//     ignores the attendance module must not lose the ability to assign anyone.
+//
+// `attendance_in_use` is returned so a picker can explain an EMPTY list ("no
+// one is clocked in") instead of looking broken.
+export async function GetAssignableEmployees(
+  restaurantId: string,
+): Promise<{ attendance_in_use: boolean; employees: AssignableEmployee[] }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureAttendanceTable();
+
+  const inUseRows = await runQuery<{ in_use: boolean }>(
+    `select exists (select 1 from "Attendance" a where a.res_id = $1 and a.outlet_id = $2) as in_use`,
+    [context.res_id, context.outlet_id],
+  );
+  const attendanceInUse = inUseRows[0]?.in_use === true;
+
+  const rows = await runQuery<{
+    employee_id: string;
+    emp_username: string | null;
+    fname: string | null;
+    lname: string | null;
+    role_primary: string | null;
+    clocked_in: boolean;
+  }>(
+    `
+      select
+        e.id as employee_id,
+        l.emp_username as emp_username,
+        e."emp_Fname" as fname,
+        e."emp_Lname" as lname,
+        e.emp_roles->>'primary' as role_primary,
+        exists (
+          select 1 from "Attendance" a
+           where a.res_id = e.res_id and a.outlet_id = e.outlet_id and a.emp_id = e.id
+             and a.clock_out is null
+             and (a.status is null or a.status <> 'rejected')
+        ) as clocked_in
+      from "Employees" e
+      left join "Login" l
+        on l.emp_id = e.id and l.res_id = e.res_id and l.outlet_id = e.outlet_id
+      where e.res_id = $1 and e.outlet_id = $2
+      order by e."emp_Fname" asc
+    `,
+    [context.res_id, context.outlet_id],
+  );
+
+  const employees = rows
+    .filter((row) => !attendanceInUse || row.clocked_in === true)
+    .map((row) => ({
+      employee_id: row.employee_id,
+      employee_Username: row.emp_username ?? "",
+      emp_Fname: String(row.fname ?? row.emp_username ?? "").trim(),
+      emp_Lname: row.lname ?? null,
+      role: row.role_primary ?? "employee",
+      clocked_in: row.clocked_in === true,
+    }));
+
+  return { attendance_in_use: attendanceInUse, employees };
 }
 
 // The waiter currently assigned to a specific table. Returns the Employees.id
@@ -18266,14 +18736,22 @@ export async function GetOperationsAnalytics(
 
 // --- Multi-outlet management -------------------------------------------------
 
-let outletColumnsEnsured = false;
+// MEMOIZED VIA ensureLazyTable — the old private boolean skipped the memo
+// whenever a transaction client was passed, which is precisely how every
+// settlement re-ran these two ALTER TABLEs INSIDE the bill-settle transaction
+// (nextBillNo below is called with the settle txn's client from six paths).
+// ALTER TABLE wants an ACCESS EXCLUSIVE lock on "Outlets" while concurrent
+// settles hold bill_seq row locks: under load that convoy hit the statement
+// timeout mid-settle and held pooled sessions until the pooler's 15-slot cap
+// FATAL'd the whole tenant (the 2026-08-24 stall). Schema cannot un-happen
+// while the process lives, so once is enough — with or without a client.
 async function ensureOutletColumns(client?: PoolClient): Promise<void> {
-  if (outletColumnsEnsured && !client) {return;}
-  await runQuery(`alter table "Outlets" add column if not exists is_active boolean not null default true`, [], client);
-  // Per-outlet running invoice counter — each outlet keeps its own sequential
-  // bill (invoice) number series, as GST expects per place of business.
-  await runQuery(`alter table "Outlets" add column if not exists bill_seq integer not null default 0`, [], client);
-  if (!client) {outletColumnsEnsured = true;}
+  await ensureLazyTable("Outlets.outlet_cols", async () => {
+    await runQuery(`alter table "Outlets" add column if not exists is_active boolean not null default true`, [], client);
+    // Per-outlet running invoice counter — each outlet keeps its own sequential
+    // bill (invoice) number series, as GST expects per place of business.
+    await runQuery(`alter table "Outlets" add column if not exists bill_seq integer not null default 0`, [], client);
+  });
 }
 
 // Atomically allocate the next sequential bill number for the outlet. The
@@ -23623,9 +24101,15 @@ export async function GetRestaurantUserRole(
   return row ? toRole(row.role_primary) : null;
 }
 
-let feedbackColsEnsured = false;
+// Same memo-bypass hazard as ensureOutletColumns had (a passed client skipped
+// the boolean), fixed the same way. No current caller passes a client, but the
+// signature invites one, and this DDL block ALTERs a column TYPE — far too heavy
+// to ever re-run inside a request. ensureLazyTable memoizes it unconditionally.
 async function ensureFeedbackColumns(client?: PoolClient): Promise<void> {
-  if (feedbackColsEnsured && !client) {return;}
+  await ensureLazyTable("Feedback_entries.feedback_cols", () => ensureFeedbackColumnsDdl(client));
+}
+
+async function ensureFeedbackColumnsDdl(client?: PoolClient): Promise<void> {
   // Service-recovery: low-rating feedback becomes an internal ticket staff resolve.
   await runQuery(`alter table "Feedback_entries" add column if not exists recovery_status text`, [], client);
   await runQuery(`alter table "Feedback_entries" add column if not exists recovery_resolved_at timestamptz`, [], client);
@@ -23650,7 +24134,6 @@ async function ensureFeedbackColumns(client?: PoolClient): Promise<void> {
     [],
     client,
   );
-  if (!client) {feedbackColsEnsured = true;}
 }
 
 export async function AddFeedbackEntry(

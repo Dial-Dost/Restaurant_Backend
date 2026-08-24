@@ -2,7 +2,7 @@
  * Which waiter is assigned to which table.
  */
 import type { Express, Request, Response } from "express";
-import { AssignTableToEmployee, GetTableAssignments, UnassignTableEmployee } from "../database_supabase.js";
+import { AssignTableToEmployee, GetAssignableEmployees, GetTableAssignments, UnassignTableEmployee } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { enforceRoles, validateAction } from "./_shared.js";
 
@@ -21,6 +21,24 @@ app.get("/table-assignments", validateAction("f88657ce-0d67-4cd6-aae1-765dec10cd
 	} catch (error) {
 		logger.error({ err: error }, "get_table_assignments_failed");
 		res.status(500).json({ error: "Unable to fetch table assignments" });
+	}
+});
+
+// Who may be assigned a table RIGHT NOW — the roster every assignment picker
+// must be fed from. Attendance-filtered server-side (clocked-in staff only)
+// with the never-clocked-in degrade rule; POST /table-assignments/assign
+// re-enforces the same rule on write. Same read gate as the assignment list.
+app.get("/table-assignments/assignable", validateAction("f88657ce-0d67-4cd6-aae1-765dec10cd98"), async (req: Request, res: Response) => {
+	const auth = await enforceRoles(req, res, ["admin", "employee"]);
+	if (!auth) {
+		return;
+	}
+
+	try {
+		res.json(await GetAssignableEmployees(auth.restaurantId));
+	} catch (error) {
+		logger.error({ err: error }, "get_assignable_employees_failed");
+		res.status(500).json({ error: "Unable to fetch assignable employees" });
 	}
 });
 
