@@ -99,8 +99,30 @@ describe("issue 3 — explicit assignments are durable, admins are never default
     expect(listed[0].employee_id).toBe("asha");
   });
 
-  test("occupying a waiterless table as the admin does NOT hand the table to the admin", async () => {
+  // The rule the owner asked for: whoever SEATS the party is its server until
+  // someone reassigns the table — an owner working the floor included. An
+  // earlier revision refused admins outright and left tables unassigned.
+  test("seating a party as the admin DOES credit the admin — whoever seats, serves", async () => {
     await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, ADMIN_EMP_ID);
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(ADMIN_EMP_ID);
+  });
+
+  // REGRESSION (the shipped bug this whole area exists for). /occupy-table is
+  // sent by the order flow around every order save, so an admin saving an order
+  // used to silently become the waiter of a table someone else was serving.
+  // Only the free -> occupied transition is a seating; a re-occupy is not.
+  test("REGRESSION: an admin's order-save occupy of an ALREADY-seated table changes nothing", async () => {
+    await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
+    await db.OccupyTable(RESTAURANT_SLUG, "T1", null, "order-9", ADMIN_EMP_ID);
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER1_ID);
+  });
+
+  // And with NO waiter on the table either: an order save is not a seating, so
+  // it must not hand the table to whoever happened to save the order.
+  test("REGRESSION: an order-save occupy of an already-seated, waiterless table assigns nobody", async () => {
+    await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
+    await db.UnassignTableEmployee(RESTAURANT_SLUG, "T1");
+    await db.OccupyTable(RESTAURANT_SLUG, "T1", null, "order-9", ADMIN_EMP_ID);
     expect(assignments()).toHaveLength(0);
   });
 
@@ -159,11 +181,16 @@ describe("issue 7 — attendance-aware assignability", () => {
 
   test("auto-assign never picks a not-clocked-in actor", async () => {
     addAttendance({ emp_id: WAITER1_ID, status: "approved" });
-    // Binu is not clocked in: occupying must not make him the waiter.
+    // Binu is not clocked in: seating must not make him the waiter.
     await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER2_ID);
     expect(assignments()).toHaveLength(0);
-    // Asha (clocked in) occupying does.
-    await db.OccupyTable(RESTAURANT_SLUG, "T1", null, null, WAITER1_ID);
+  });
+
+  test("a clocked-in actor seating a free table DOES become its waiter", async () => {
+    addAttendance({ emp_id: WAITER1_ID, status: "approved" });
+    // A SEPARATE seating, not a re-occupy of the table above: only the
+    // free -> occupied transition is a seating, so the table must start free.
+    await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
     expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER1_ID);
   });
 

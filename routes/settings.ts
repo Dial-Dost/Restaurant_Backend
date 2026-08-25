@@ -293,6 +293,13 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 			feedback_config: body.feedback_config !== undefined ? body.feedback_config : undefined,
 			bill_logo_svg: body.bill_logo_svg !== undefined ? body.bill_logo_svg : undefined,
 			bill_paper_width: body.bill_paper_width !== undefined ? body.bill_paper_width : undefined,
+			// Printed-bill header identity + the custom sentence above the bill QR.
+			// Presence-checked, not truthiness-checked: sending "" is how an owner
+			// CLEARS a field (and clearing bill_qr_note restores the built-in valet
+			// line), so an empty string has to reach the data layer.
+			bill_legal_name: body.bill_legal_name !== undefined ? body.bill_legal_name : undefined,
+			bill_gstin: body.bill_gstin !== undefined ? body.bill_gstin : undefined,
+			bill_qr_note: body.bill_qr_note !== undefined ? body.bill_qr_note : undefined,
 			kitchen_sections: Array.isArray(body.kitchen_sections) ? body.kitchen_sections : undefined,
 			inventory_categories: Array.isArray(body.inventory_categories) ? body.inventory_categories : undefined,
 			timezone: typeof body.timezone === "string" ? body.timezone : undefined,

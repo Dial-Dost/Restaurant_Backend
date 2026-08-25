@@ -10,10 +10,39 @@ const GS = 0x1d;
 
 export interface ReceiptItem { name: string; quantity: number; price: number; note?: string; station?: string | null }
 export interface ReceiptTax { name: string; percentage: number; amount: number }
+
+/**
+ * The sentence printed above the feedback/valet QR when the tenant has not set
+ * their own. It is the EXACT text this renderer hardcoded before `qrNote`
+ * existed, so a restaurant that never opens the setting sees no change at all.
+ */
+export const DEFAULT_BILL_QR_NOTE = "For calling Valet kindly scan the below QR code";
+
+/**
+ * Cap on a tenant's custom QR note.
+ *
+ * Chosen against the NARROW paper, not the wide one: 120 characters wraps to at
+ * most 4 lines on 58mm/32-col and 3 on 80mm/48-col. That is long enough for a
+ * real two-sentence instruction ("Scan to rate us and call your valet — your
+ * feedback goes straight to the owner.") and short enough that it cannot push
+ * the QR itself off a short tail of paper or bury the service-charge
+ * disclaimer that follows it.
+ */
+export const BILL_QR_NOTE_MAX = 120;
+
 export interface ReceiptOptions {
   restaurantName: string;
-  // Outlet address line, printed under the name.
+  // Registered legal entity behind the trading name (e.g. "NAVKRISH
+  // HOSPITALITY LLP"), printed under the restaurant name. Omitted entirely when
+  // the tenant has not set one — never an empty line.
+  legalName?: string | null;
+  // Outlet address, printed under the name. Newlines in the stored value are
+  // honoured as hard line breaks; each resulting line is then word-wrapped to
+  // the paper width.
   address?: string | null;
+  // Tax registration number, printed as "GSTN : <value>". A tenant with no
+  // GSTIN prints a clean receipt — no label, no blank line.
+  gstin?: string | null;
   table: string;
   covers: number;
   items: ReceiptItem[];
@@ -36,9 +65,52 @@ export interface ReceiptOptions {
   // KOT only: the kitchen station/zone this ticket is for. When set, it is
   // printed in the header so a per-station split ticket is self-identifying.
   station?: string | null;
+
+  // --- KOT header (all optional; each line is omitted when unknown) ---------
+  //
+  // These are all PRE-RESOLVED by the caller and printed verbatim. The renderer
+  // holds no clock, no timezone and no counter — same division of labour as the
+  // money fields above, and for the same reason: a second, independent
+  // derivation in the renderer is how a printed ticket comes to disagree with
+  // the one the system thinks it issued.
+
+  // The day-scoped Kitchen Order Ticket number, allocated by
+  // kot_numbers.ts:allocateKotNumber. Null when numbering is unavailable
+  // (migration 029 unapplied) — the ticket then prints with no "KOT - n" line
+  // rather than a misleading one.
+  kotNo?: number | null;
+  // Printing date AND time, ALREADY FORMATTED IN THE RESTAURANT'S ZONE
+  // ("DD/MM/YY HH:mm", from kot_numbers.ts:kotStamp). Falls back to the server
+  // clock only when absent, which is what every ticket did before this field.
+  printedAt?: string | null;
+  // The top context line — "Running Table" for a physical table, the channel for
+  // a virtual takeaway/delivery one (kot_numbers.ts:kotOrderContext).
+  orderContext?: string | null;
+  // "Dine In" / "Takeaway" / "Delivery (Swiggy)" … (kot_numbers.ts:serviceModeLabel).
+  serviceMode?: string | null;
+  // Floor section the table sits in ("Tables".section), printed as the value of
+  // the service-mode line so the kitchen knows where the food is going.
+  section?: string | null;
+  // The waiter the table is assigned to, and the captain over it. Both come from
+  // GetTableFeedbackContext; the captain line is printed only when that
+  // employee's role actually is captain/manager, never as a duplicate label.
+  assignedTo?: string | null;
+  captain?: string | null;
+  // The bill's grand total, AS THE BILLING LAYER COMPUTED IT.
+  //
+  // When present it is printed verbatim and NOTHING is recomputed or rounded
+  // here: the renderer's job is to show the number the guest is actually
+  // charged, and a second rounding in the renderer is how a printed total comes
+  // to disagree with the settled one. When absent the legacy path below still
+  // derives and whole-rupee-rounds a total, so callers that predate this field
+  // keep their exact present behaviour.
+  grandTotal?: number | null;
   // When set (bill only), prints a "scan to rate" QR code linking to the
   // feedback form for the waiter who handled this table.
   feedbackUrl?: string | null;
+  // Per-restaurant sentence printed above that QR. Blank/absent falls back to
+  // DEFAULT_BILL_QR_NOTE; anything longer than BILL_QR_NOTE_MAX is truncated.
+  qrNote?: string | null;
   // Raw ESC/POS bytes for a logo raster (GS v 0 …), prepended centered at the
   // top. Built server-side from the restaurant's PNG/SVG bill logo.
   logo?: Buffer | null;
@@ -129,6 +201,24 @@ function wrapText(text: string, maxLen: number): string[] {
   return lines.length ? lines : [""];
 }
 
+// A stored address is one text field that owners fill in with real line breaks
+// ("12 Mantri Square\n2nd Floor\nMalleshwaram, Bengaluru 560003"). Honour those
+// as hard breaks and word-wrap each resulting line to the paper width, so the
+// printed address keeps the shape the owner typed instead of reflowing into one
+// blob. Blank lines are dropped so a trailing newline never prints as a gap.
+function addressLines(address: string, width: number): string[] {
+  return String(address ?? "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .flatMap((l) => wrapText(l, width));
+}
+
+/** A header field prints only when the tenant actually has one. */
+function present(v: string | null | undefined): string {
+  return String(v ?? "").trim();
+}
+
 // width defaults to 48 columns (80mm paper), matching the web printable bill.
 // Pass 32 for 58mm printers.
 export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
@@ -152,10 +242,39 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   raw(ESC, 0x21, 0x30); // double width + height
   line(opts.restaurantName || "Receipt");
   raw(ESC, 0x21, 0x00); // normal
-  if (isKot) {line("** KITCHEN ORDER **");}
-  if (isKot && opts.station?.trim()) {line(`[ ${opts.station.trim().toUpperCase()} ]`);}
-  if (!isKot && opts.address) {
-    for (const l of wrapText(opts.address, width)) {line(l);}
+  if (isKot) {
+    // Context first, then the ticket's own identity — the order the reference
+    // thermal KOT prints them in, and the order a chef reads them in: what kind
+    // of order this is, that it IS a kitchen ticket, when it was fired, and
+    // which number to call it by.
+    const context = present(opts.orderContext);
+    if (context) {line(context);}
+    raw(ESC, 0x45, 0x01); // bold
+    line("KOT");
+    raw(ESC, 0x45, 0x00);
+    // Restaurant-zone stamp when the caller resolved one. The server-clock
+    // fallback is what every ticket printed before kotStamp existed, kept so a
+    // caller that has not been updated still prints a time rather than nothing.
+    line(present(opts.printedAt) || new Date().toLocaleString());
+    // Omitted rather than faked when numbering is unavailable — a ticket with no
+    // number is honest, a ticket with the wrong number is not.
+    if (typeof opts.kotNo === "number" && Number.isFinite(opts.kotNo) && opts.kotNo > 0) {
+      line(`KOT - ${Math.round(opts.kotNo)}`);
+    }
+    if (opts.station?.trim()) {line(`[ ${opts.station.trim().toUpperCase()} ]`);}
+  }
+  if (!isKot) {
+    // Legal entity, address, tax registration — EACH ONLY WHEN THE TENANT HAS
+    // ONE. A restaurant with no GSTIN must get a clean receipt, not a stray
+    // "GSTN :" label with nothing after it, and no blank line where a field
+    // would have been.
+    const legalName = present(opts.legalName);
+    if (legalName) {
+      for (const l of wrapText(legalName, width)) {line(l);}
+    }
+    for (const l of addressLines(present(opts.address), width)) {line(l);}
+    const gstin = present(opts.gstin);
+    if (gstin) {line(`GSTN : ${gstin}`);}
   }
   line(sep);
 
@@ -167,23 +286,81 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   }
   const now = new Date().toLocaleString();
   if (isKot) {
-    line(twoCol(`Table: ${opts.table}`, `${opts.covers} cover(s)`, width));
-    line(now);
+    // WHERE the food is going. The service-mode line carries the floor section
+    // as its value when there is one ("Dine In: FRONT"); with no section
+    // configured the mode stands alone rather than repeating itself.
+    const mode = present(opts.serviceMode) || "Dine In";
+    const section = present(opts.section);
+    line(section ? `${mode}: ${section}` : mode);
+    line(`Table No: ${opts.table || "N/A"}`);
+    // Covers, counted ONCE PER TABLE ("Tables".num_covers) — the same number the
+    // bill divides by for APC, so the kitchen and the till never disagree about
+    // how many people are sitting there. Printed only when the table actually
+    // records covers: defaulting an unknown count to 1 told the kitchen a
+    // party size nobody had entered.
+    const covers = Math.round(Number(opts.covers) || 0);
+    if (covers > 0) {line(`Persons - ${covers}`);}
+    // WHO is looking after it. Each line only when that person is known; an
+    // unassigned table prints neither, instead of two empty labels.
+    const assignedTo = present(opts.assignedTo);
+    const captain = present(opts.captain);
+    if (assignedTo || captain) {
+      line(sep);
+      if (assignedTo) {line(`Assign to: ${assignedTo}`);}
+      if (captain) {line(`Captain: ${captain}`);}
+    }
   } else {
-    line(twoCol(`Date: ${now}`, `Dine In: ${opts.table || "N/A"}`, width));
-    line(twoCol(`Bill No.: ${opts.billNo ?? ""}`, `Cashier: ${opts.cashier ?? ""}`, width));
+    // The SAME restaurant-zone stamp the KOT uses. This used to be
+    // `new Date().toLocaleString()` — the SERVER's zone and locale, which on a
+    // UTC host prints a US-format timestamp and, between 00:00 and 05:30 IST,
+    // the WRONG CALENDAR DATE on a receipt that carries the tenant's GSTIN.
+    line(twoCol(`Date: ${present(opts.printedAt) || now}`, `Dine In: ${opts.table || "N/A"}`, width));
+    // Each label only when its value is known — same rule the header block
+    // obeys. A tenant with no bill series and no named cashier printed two
+    // bare labels ("Bill No.:" / "Cashier:") with nothing after them.
+    const billNo = present(opts.billNo);
+    const cashier = present(opts.cashier);
+    if (billNo && cashier) {
+      line(twoCol(`Bill No.: ${billNo}`, `Cashier: ${cashier}`, width));
+    } else if (billNo) {
+      line(`Bill No.: ${billNo}`);
+    } else if (cashier) {
+      line(`Cashier: ${cashier}`);
+    }
   }
   line(sep);
 
   // --- Items ----------------------------------------------------------------
   if (isKot) {
-    // Kitchen ticket: quantity + name (+ note), no prices.
-    for (const it of opts.items) {
+    // Kitchen ticket: a NUMBERED line per dish with the quantity right-aligned
+    // in its own column, and never a price. The numbering is what lets the pass
+    // call a line out loud ("hold 3 on 26") and what makes a short docket
+    // countable at a glance; the qty column is what stops a long dish name
+    // pushing the one number the chef needs off the end of the line.
+    const COL_NO = 4;
+    const COL_QTY = width >= 48 ? 6 : 4;
+    const COL_ITEM = Math.max(8, width - COL_NO - COL_QTY);
+    const pad = (s: string, n: number) => s.length >= n ? s : s + " ".repeat(n - s.length);
+    const padL = (s: string, n: number) => s.length >= n ? s : " ".repeat(n - s.length) + s;
+    line(pad("No.", COL_NO) + pad("Item", COL_ITEM) + padL("Qty", COL_QTY));
+    line(sep);
+    let totalQty = 0;
+    for (const [idx, it] of opts.items.entries()) {
       const qty = Math.max(1, Math.round(Number(it.quantity) || 1));
-      for (const [i, l] of wrapText(`${qty} x ${it.name}`, width).entries()) {line(i === 0 ? l : `   ${l}`);}
+      totalQty += qty;
+      const nameLines = wrapText(it.name, COL_ITEM - 1);
+      line(pad(`${idx + 1}`, COL_NO) + pad(nameLines[0] ?? "", COL_ITEM) + padL(String(qty), COL_QTY));
+      // Continuations and notes hang under the ITEM column, so the No. and Qty
+      // columns stay a clean vertical run down the docket.
+      for (let i = 1; i < nameLines.length; i++) {line(" ".repeat(COL_NO) + (nameLines[i] ?? ""));}
+      // The one thing on a KOT that is more important than the dish name.
       const note = String(it.note ?? "").trim();
-      if (note) {line(`  * ${note}`);}
+      if (note) {
+        for (const l of wrapText(`* ${note}`, COL_ITEM - 1)) {line(" ".repeat(COL_NO) + l);}
+      }
     }
+    line(sep);
+    line(twoCol("Total Qty", String(totalQty), width));
     line(sep);
   } else {
     // Column layout: Item | Qty | Price | Total (sums to `width`). At 80mm/48-col
@@ -232,17 +409,33 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   if (sc) {line(twoCol(`Service Charge (${sc.percent}%)`, sc.optedOut ? "Opted-out" : Number(sc.amount).toFixed(2), width));}
   for (const t of taxLines) {line(twoCol(`${t.name} (${t.percentage}%)`, Number(t.amount).toFixed(2), width));}
 
-  // Grand total = subtotal − discount + service charge + taxes, then round to the
-  // nearest whole unit (round-off shown explicitly), matching the web bill.
-  const preRound = Number(opts.total) - discountAmt + (sc ? Number(sc.amount) : 0) + taxLines.reduce((s, t) => s + Number(t.amount || 0), 0);
-  const grand = Math.round(preRound);
-  const roundOff = grand - preRound;
-
+  // THE GRAND TOTAL IS NOT COMPUTED HERE WHEN THE CALLER SUPPLIES ONE.
+  //
+  // The billing layer (computeBillCharges -> GetBillForTable.grand_total) is the
+  // single authority on what the guest owes, and it is what settle records
+  // against the bill. This renderer printing its own arithmetic on top of that —
+  // in particular the whole-rupee Math.round below — is how a bill of 797.55
+  // came to be SETTLED at 797.55 and PRINTED as 798. So when `grandTotal` is
+  // given it is printed exactly as received, with no round-off line, because
+  // there is no rounding left to disclose.
+  //
+  // The legacy branch is kept verbatim for callers that pass no grandTotal, so
+  // nothing that has not been migrated changes behaviour.
   line(sep);
-  line(twoCol("Round off", (roundOff > 0 ? "+" : "") + roundOff.toFixed(2), width));
-  raw(ESC, 0x45, 0x01); // bold
-  line(twoCol("Grand Total:", money(grand), width));
-  raw(ESC, 0x45, 0x00);
+  const supplied = Number(opts.grandTotal);
+  if (opts.grandTotal != null && Number.isFinite(supplied)) {
+    raw(ESC, 0x45, 0x01); // bold
+    line(twoCol("Grand Total:", money(supplied), width));
+    raw(ESC, 0x45, 0x00);
+  } else {
+    const preRound = Number(opts.total) - discountAmt + (sc ? Number(sc.amount) : 0) + taxLines.reduce((s, t) => s + Number(t.amount || 0), 0);
+    const grand = Math.round(preRound);
+    const roundOff = grand - preRound;
+    line(twoCol("Round off", (roundOff > 0 ? "+" : "") + roundOff.toFixed(2), width));
+    raw(ESC, 0x45, 0x01); // bold
+    line(twoCol("Grand Total:", money(grand), width));
+    raw(ESC, 0x45, 0x00);
+  }
   line(sep);
 
   // --- Footer (centered): thanks, valet/feedback QR, disclaimer -------------
@@ -250,7 +443,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   line("Thanks");
   if (opts.feedbackUrl) {
     line(sep);
-    line("For calling Valet kindly scan the below QR code");
+    // The tenant's own sentence when they have set one, otherwise the valet
+    // line this receipt has always carried.
+    const note = present(opts.qrNote).slice(0, BILL_QR_NOTE_MAX) || DEFAULT_BILL_QR_NOTE;
+    for (const l of wrapText(note, width)) {line(l);}
     text("\n");
     parts.push(escposQr(opts.feedbackUrl, 6));
     text("\n");

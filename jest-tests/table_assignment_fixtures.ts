@@ -254,7 +254,12 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
   // --- Tables reads/writes (OccupyTable / resolveTableByName) --------------
   if (s.includes("select id, capacity, max_capacity")) {
     const t = store.tables.find((x) => lower(x.table_name) === lower(params[2]));
-    return { rows: t ? [{ id: t.id, capacity: t.capacity, max_capacity: t.max_capacity }] : [] };
+    // is_occupied is part of this read and MUST be modelled: OccupyTable uses
+    // the free -> occupied transition to tell a real seating from the order
+    // flow's incidental re-occupy, and auto-assign hangs off that distinction.
+    // Omitting it here made every occupy look like a seating, so the fake
+    // silently disagreed with production about the one thing under test.
+    return { rows: t ? [{ id: t.id, capacity: t.capacity, max_capacity: t.max_capacity, is_occupied: t.is_occupied }] : [] };
   }
   if (s.includes('update "tables"') && s.includes("is_occupied = true")) {
     const t = store.tables.find((x) => x.id === str(params[0]));

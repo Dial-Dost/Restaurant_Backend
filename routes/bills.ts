@@ -5,8 +5,9 @@
  */
 import type { Express, Request, Response } from "express";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetClosedBill, GetEmployeeDetailsFromEmpID, GetMenuItems, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, computeBillCharges } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetClosedBill, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMenuItems, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, computeBillCharges, dayKeyOf } from "../database_supabase.js";
 import { buildKotBase64, buildReceiptBase64 } from "../escpos.js";
+import { allocateKotNumber, kotOrderContext, kotStamp, kotTicketKey, serviceModeLabel } from "../kot_numbers.js";
 import { logger } from "../observability.js";
 import { ackPrintJob, enqueuePrintJob, printJobPayload } from "../print_jobs.js";
 import { emitOutlet, emitRestaurant } from "../realtime.js";
@@ -565,14 +566,62 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 				for (const m of menu) {if (m.station) {stationByName.set(m.name.trim().toLowerCase(), m.station);}}
 			} catch {/* menu unavailable — items fall under a single General ticket */}
 			const kotItems = bill.items.map((it) => ({ ...it, station: stationByName.get(String(it.name).trim().toLowerCase()) ?? null }));
+
+			// THE KOT HEADER, resolved here and printed verbatim by the renderer.
+			//
+			// The zone is the tenant's own ("Restaurant".timezone). Everything
+			// dated on this ticket — the printing stamp AND the business day the
+			// number belongs to — is derived from that one value, so a ticket
+			// fired at 01:00 IST reads 01:00 and counts as the night it was
+			// actually cooked, on a backend hosted in UTC.
+			const tz = settings.timezone || 'Asia/Kolkata';
+			const firedAt = new Date();
+			// Neither lookup is allowed to take the kitchen down: an unresolvable
+			// table or waiter costs a header line, not the docket.
+			const [tableCtx, waiterCtx] = await Promise.all([
+				GetKotTableContext(restaurantId, tableName).catch(() => null),
+				GetTableFeedbackContext(restaurantId, tableName).catch(() => null),
+			]);
+			const serviceMode = serviceModeLabel(tableCtx?.order_type);
+			// Covers come from the TABLE (num_covers, counted once per table), the
+			// same number the bill divides by for APC.
+			const covers = tableCtx?.covers ?? bill.covers ?? 1;
+			// "Assign to:" is whoever the table is assigned to; "Captain:" prints
+			// only when that person's role really is captain/manager, so a plain
+			// waiter's table does not grow a second identical line.
+			const waiterName = (waiterCtx?.employee_name ?? '').trim();
+			const waiterRole = (waiterCtx?.employee_role ?? '').trim().toLowerCase();
+
+			// ONE NUMBER FOR THE WHOLE KOT, allocated BEFORE the per-station split
+			// so all N dockets of one order carry the same "KOT - n" and the expo
+			// can pair them. A reprint of the same table with the same items
+			// resolves to the number already on paper instead of burning a new
+			// one; a null means migration 029 is unapplied and the ticket prints
+			// unnumbered rather than failing.
+			const businessDay = dayKeyOf(firedAt, tz);
+			const kot = tableCtx
+				? await allocateKotNumber(
+					restaurantId,
+					kotTicketKey({ outletId, businessDay, tableId: tableCtx.table_id, items: kotItems }),
+					firedAt,
+				)
+				: null;
+
 			const tickets = buildKotBase64({
 				restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
 				table: tableName,
-				covers: bill.covers ?? 1,
+				covers,
 				items: kotItems,
 				total: charges.subtotal,
 				currency: settings.currency ?? "₹",
 				kind: "kot",
+				kotNo: kot?.kot_no ?? null,
+				printedAt: kotStamp(firedAt, tz),
+				orderContext: kotOrderContext(tableCtx?.is_virtual === true, serviceMode),
+				serviceMode,
+				section: tableCtx?.section ?? null,
+				assignedTo: waiterName || null,
+				captain: waiterName && (waiterRole === 'captain' || waiterRole === 'manager') ? waiterName : null,
 			}, cols);
 			const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
 			// ONE DURABLE JOB PER STATION TICKET, all sharing this one billId. That
@@ -588,8 +637,15 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 					publishedAt: new Date().toISOString(),
 				}));
 			}
-			try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed KOT for table ${tableName} (${tickets.length} station ticket(s))`, Audit_log_category.Bill, { table: tableName, kind, stations: tickets.map((t) => t.station) }); } catch {/* ignore */}
-			res.json({ success: true, billId, tickets: tickets.length, stations: tickets.map((t) => t.station) });
+			// The KOT number goes in the audit line and the response: it is the
+			// handle a manager uses to find this ticket afterwards, and `reused`
+			// distinguishes a genuine second order from a reprint of the first.
+			const kotLabel = kot ? `KOT-${kot.kot_no}${kot.reused ? ' (reprint)' : ''}` : 'KOT';
+			try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kotLabel} for table ${tableName} (${tickets.length} station ticket(s))`, Audit_log_category.Bill, { table: tableName, kind, stations: tickets.map((t) => t.station), kot_no: kot?.kot_no ?? null, business_day: kot?.business_day ?? null, reprint: kot?.reused ?? null }); } catch {/* ignore */}
+			res.json({
+				success: true, billId, tickets: tickets.length, stations: tickets.map((t) => t.station),
+				kot_no: kot?.kot_no ?? null, business_day: kot?.business_day ?? null, reprint: kot?.reused ?? false,
+			});
 			return;
 		}
 		// The kitchen ticket returned above; everything below is the customer bill,
@@ -611,7 +667,13 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			: (!includeServiceCharge && scPercent > 0 ? { percent: scPercent, amount: 0, optedOut: true } : null);
 		const escBase64 = buildReceiptBase64({
 			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+			// Legal entity + GSTIN are tenant settings, not profile fields: they are
+			// statutory identifiers for the business, not per-outlet contact details.
+			// Both are "" when unset and the renderer prints nothing for "", so a
+			// tenant that has configured neither gets exactly today's header.
+			legalName: settings.bill_legal_name ?? null,
 			address: profile?.outlet_add ?? null,
+			gstin: settings.bill_gstin ?? null,
 			table: tableName,
 			covers: bill.covers ?? 1,
 			items: bill.items,
@@ -621,10 +683,23 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			cashier: cashier || null,
 			discount: charges.discount > 0 ? { amount: charges.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
 			serviceCharge,
+			// The breakdown the billing layer produced for THIS bill — one line per
+			// tax the outlet actually has configured in Outlets.default_tax, each
+			// with its own label and percentage (so a tenant on SGST 2.5% + CGST 2.5%
+			// prints two lines, and a tenant on a single GST line prints one). The
+			// renderer prints them; it does not invent, merge or split them.
 			taxes: charges.taxes,
+			// PRINT WHAT THE BILLING LAYER COMPUTED. computeBillCharges is the single
+			// authority on the tax-inclusive total, and it is the same number settle
+			// records against the bill. Handing it over means the renderer has nothing
+			// left to round — see the grandTotal note in escpos.ts.
+			grandTotal: charges.grand_total,
 			currency: settings.currency ?? "₹",
 			kind,
 			feedbackUrl,
+			// The tenant's own sentence above the QR; "" falls back to the built-in
+			// valet line inside the renderer, so an unconfigured tenant is unchanged.
+			qrNote: settings.bill_qr_note ?? null,
 			logo,
 			serviceChargeNote: isBill && charges.service_charge > 0
 				? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."

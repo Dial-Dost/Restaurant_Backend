@@ -147,7 +147,7 @@ mw08 USE     *                                                      | <inline(re
 0125 POST    /restaurant/branding                                   | validate                                       | 4c39a341
 0126 GET     /restaurant/timezones                                  | validate                                       | 0e348d83
 0127 GET     /restaurant/settings                                   | validate                                       | 6b4af499
-0128 POST    /restaurant/settings                                   | validate                                       | e287510e
+0128 POST    /restaurant/settings                                   | validate                                       | 67b45c8e
 0129 GET     /messages                                              | validate                                       | 3e965d1e
 0130 POST    /messages/run-reminders                                | validate                                       | 5e6cd93a
 0131 GET     /notifications                                         | validate                                       | be9fe12c
@@ -250,7 +250,7 @@ mw08 USE     *                                                      | <inline(re
 0228 GET     /restaurant/profile                                    | validate                                       | 83660ec9
 0229 GET     /auth/restaurant-login                                 | validate                                       | eb6d239a
 0230 POST    /publish/bill                                          | validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9") | 253376ee
-0231 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | b7a63b53
+0231 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 98b845a3
 0232 POST    /print/ack                                             | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sPrintAck) | 365e3415
 0233 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428
 0234 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | 2ff0be3a

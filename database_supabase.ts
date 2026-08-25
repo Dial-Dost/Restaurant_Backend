@@ -28,6 +28,10 @@ import sharp from "sharp";
 import { downloadFile } from "./storage_bucket_supabase.js";
 import { signTable, encodeTableToken } from "./qr_signing.js";
 import { MOBILE_10_ERROR, normalizeMobile10 } from "./phone_validation.js";
+// The renderer owns the QR-note default and its length cap, so the settings
+// layer serves the same two values every print path already obeys rather than
+// keeping a second copy that could drift.
+import { BILL_QR_NOTE_MAX, DEFAULT_BILL_QR_NOTE } from "./escpos.js";
 import {
   round2,
   computeBillTaxes,
@@ -2737,9 +2741,9 @@ export async function OccupyTable(
   // silently resets a table's covers back to 1.
   const coversParam = typeof num_covers === "number" && num_covers >= 1 ? Math.round(num_covers) : null;
 
-  const rows = await runQuery<{ id: string; capacity: unknown; max_capacity: unknown }>(
+  const rows = await runQuery<{ id: string; capacity: unknown; max_capacity: unknown; is_occupied: boolean }>(
     `
-      select id, capacity, max_capacity
+      select id, capacity, max_capacity, coalesce(is_occupied, false) as is_occupied
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
         and coalesce(is_deleted, false) = false
@@ -2756,6 +2760,13 @@ export async function OccupyTable(
   }
 
   const tableId = rows[0].id;
+  // Was this call the one that actually SEATED the party? /occupy-table is sent
+  // both by a human seating guests AND by the order flow around every order
+  // save, and only the first is a seating. The free -> occupied transition is
+  // what separates them, and it is why the auto-assign below can safely credit
+  // whoever made the call: an order save on an already-occupied table never
+  // reaches it.
+  const wasVacant = rows[0].is_occupied !== true;
 
   const updatedRows = await runQuery<{ is_occupied: boolean; num_covers: number; linked_order_id: string | null }>(
     `
@@ -2773,8 +2784,10 @@ export async function OccupyTable(
   await ensureTableOtpOnOccupy(context, tableId);
 
   // Seating a guest auto-assigns the acting employee to the table so APC and
-  // feedback ratings are attributed to whoever is serving it. Best-effort.
-  if (actorEmployeeId && isUuid(actorEmployeeId)) {
+  // feedback ratings are attributed to whoever is serving it. Best-effort, and
+  // ONLY on the seating itself (see wasVacant) — never on the order flow's
+  // incidental re-occupy of a table that is already seated.
+  if (wasVacant && actorEmployeeId && isUuid(actorEmployeeId)) {
     try {
       await assignTableById(context, tableId, actorEmployeeId);
     } catch (err) {
@@ -6329,6 +6342,12 @@ const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; null
   feedback_config: { column: "feedback_config", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(mergeFeedbackConfig(v))) },
   bill_logo_svg: { column: "bill_logo_svg", cast: "text", nullable: true, toDb: (v) => { const s = v == null ? "" : sanitizeBillLogoSvg(v); return s ? s : null; } },
   bill_paper_width: { column: "bill_paper_width", cast: "text", nullable: true, toDb: (v) => (v === "58mm" || v === "80mm" ? v : null) },
+  // Bill-header identity + custom QR note. Each reads back as "" when unset, so
+  // an undo to the unset state must write a real NULL, not the empty string —
+  // hence `s ? s : null`, matching bill_logo_svg above.
+  bill_legal_name: { column: "bill_legal_name", cast: "text", nullable: true, toDb: (v) => { const s = sanitizeBillHeaderField(v); return s ? s : null; } },
+  bill_gstin: { column: "bill_gstin", cast: "text", nullable: true, toDb: (v) => { const s = sanitizeBillHeaderField(v); return s ? s : null; } },
+  bill_qr_note: { column: "bill_qr_note", cast: "text", nullable: true, toDb: (v) => { const s = sanitizeBillQrNote(v); return s ? s : null; } },
   kitchen_sections: { column: "kitchen_sections", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(sanitizeKitchenSections(v))) },
   inventory_categories: { column: "inventory_categories", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(sanitizeInventoryCategories(v))) },
   timezone: { column: "timezone", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? sanitizeTimezone(v) : null) },
@@ -18306,12 +18325,13 @@ async function getWaiterEligibility(
 //     waiter assignments on table after table. Explicit assignment stays the
 //     job of AssignTableToEmployee, which deliberately keeps `do update`.
 //
-//   * never assigns an ADMIN. An admin occupying a table from the dashboard is
-//     operating the POS on the floor's behalf, not serving the table; the old
-//     behaviour made the admin the "waiter" of every table they touched. A
-//     table with no defensible waiter now stays unassigned (feedback and APC
-//     already handle a null waiter, and GetTableFeedbackContext has its own
-//     latest-order fallback).
+//   * credits WHOEVER SEATED THE PARTY, admins included. An earlier revision
+//     refused admins outright, because the shipped bug made the admin the
+//     "waiter" of every table they touched — but that came from the incidental
+//     order-save occupies, not from admins as such, and the callers now gate on
+//     the free -> occupied transition so only a real seating reaches here. An
+//     owner who seats a party IS that party's server until someone reassigns
+//     the table, and refusing to record that left tables stubbornly unassigned.
 //
 //   * is attendance-aware: when this outlet uses attendance, only an employee
 //     clocked in RIGHT NOW may be auto-assigned. An outlet where nobody has
@@ -18321,7 +18341,6 @@ async function assignTableById(context: RestaurantContext, tableId: string, empl
   await ensureTableAssignmentsTable(client);
   const actor = await getWaiterEligibility(context, employeeId, client);
   if (!actor.exists) {return;}
-  if (actor.isAdmin) {return;}
   if (actor.attendanceInUse && !actor.clockedIn) {return;}
   await runQuery(
     `insert into "Table_assignments" (id, created_at, res_id, outlet_id, table_id, employee_id)
@@ -18768,6 +18787,183 @@ async function nextBillNo(context: RestaurantContext, client?: PoolClient): Prom
     client,
   );
   return rows[0]?.bill_seq ?? 1;
+}
+
+// --- Kitchen Order Ticket numbers (migration 029) ----------------------------
+
+export interface KotNumberAllocation {
+  /** The number to print. 1-based, restarts at 1 each business day. */
+  kot_no: number;
+  /** The restaurant-zone calendar day it belongs to (YYYY-MM-DD). */
+  business_day: string;
+  /** True when this ticket_key already had a number — i.e. this is a reprint. */
+  reused: boolean;
+}
+
+/**
+ * Allocate (or re-read) the KOT number for one kitchen ticket.
+ *
+ * FOUR PROPERTIES, and each one is a specific line below rather than a hope:
+ *
+ *  1. UNIQUE PER (tenant, outlet, business day). "KotCounters" is keyed on
+ *     exactly that triple and "KotTickets" carries a matching unique constraint
+ *     on (res_id, outlet_id, business_day, kot_no).
+ *
+ *  2. RESETS AT THE RESTAURANT'S MIDNIGHT, not the server's. The day key comes
+ *     from dateKeyInZone(at, context.timezone) — the tenant's own IANA zone,
+ *     the same function the revenue reports bucket on. A Bangalore kitchen
+ *     still plating at 01:30 IST gets the NEW day's number 1, and a UTC-hosted
+ *     backend does not roll the counter over at 05:30 in the middle of dinner.
+ *
+ *  3. GAPLESS UNDER CONCURRENCY. Step 2 takes a row lock on the day's counter
+ *     and holds it for the rest of the transaction, so every allocation for one
+ *     outlet-day is serialised. The bump and the memo insert are inside that
+ *     same transaction: if the caller's work later fails, BOTH roll back and
+ *     the number is not burnt. This is the one place the pattern deliberately
+ *     departs from nextBillNo, whose bare `update … returning` is atomic but
+ *     cannot also make the reprint check race-free (a concurrent duplicate
+ *     print would bump the counter, discover the memo, and leave a hole).
+ *
+ *  4. IDEMPOTENT FOR A REPRINT. The memo lookup at step 3 runs AFTER the lock,
+ *     so under READ COMMITTED it sees a racing duplicate's committed row and
+ *     returns the SAME number instead of allocating a second one.
+ *
+ * Throws 42P01/42501 when migration 029 is unapplied. That is deliberate and is
+ * handled one layer up (kot_numbers.ts), which degrades to an unnumbered ticket
+ * rather than failing the print — the same rule print_jobs.ts applies for 027.
+ */
+export async function AllocateKotNumber(
+  restaurantId: string,
+  ticketKey: string,
+  at: Date = new Date(),
+): Promise<KotNumberAllocation> {
+  const context = await requireRestaurantContext(restaurantId);
+  const key = String(ticketKey ?? "").trim();
+  if (!key) {throw new Error("A KOT ticket key is required");}
+  const businessDay = dateKeyInZone(at, context.timezone);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDay)) {
+    throw new Error(`Could not resolve a business day for timezone ${context.timezone}`);
+  }
+  const scope = [context.res_id, context.outlet_id, businessDay];
+
+  return withTransaction(async (client) => {
+    // 1. Make sure the day's counter row exists, so step 2 has something to
+    //    lock. `do nothing` — a concurrent seeder winning this race is the
+    //    normal case at the first ticket of the day, not an error.
+    await runQuery(
+      `insert into "KotCounters" (res_id, outlet_id, business_day)
+         values ($1, $2, $3::date)
+         on conflict (res_id, outlet_id, business_day) do nothing`,
+      scope,
+      client,
+    );
+
+    // 2. THE SERIALISATION POINT. Everything below runs under this row lock.
+    await runQuery(
+      `select seq from "KotCounters"
+         where res_id = $1 and outlet_id = $2 and business_day = $3::date
+         for update`,
+      scope,
+      client,
+    );
+
+    // 3. Reprint? Read under the lock so a duplicate that raced us — and has
+    //    since committed — is visible rather than half-visible.
+    const existing = await runQuery<{ kot_no: number }>(
+      `select kot_no from "KotTickets"
+         where res_id = $1 and outlet_id = $2 and ticket_key = $3
+         limit 1`,
+      [context.res_id, context.outlet_id, key],
+      client,
+    );
+    const prior = existing[0]?.kot_no;
+    if (prior != null) {
+      return { kot_no: Number(prior), business_day: businessDay, reused: true };
+    }
+
+    // 4. Genuinely new ticket — take the next number.
+    const bumped = await runQuery<{ seq: number }>(
+      `update "KotCounters" set seq = seq + 1, updated_at = now()
+         where res_id = $1 and outlet_id = $2 and business_day = $3::date
+         returning seq`,
+      scope,
+      client,
+    );
+    const kotNo = Number(bumped[0]?.seq ?? 0);
+    if (!Number.isFinite(kotNo) || kotNo < 1) {
+      throw new Error("KOT counter did not allocate a number");
+    }
+
+    // 5. Memoise it, so the next print of this same ticket reuses it.
+    await runQuery(
+      `insert into "KotTickets" (res_id, outlet_id, business_day, kot_no, ticket_key)
+         values ($1, $2, $3::date, $4, $5)`,
+      [...scope, kotNo, key],
+      client,
+    );
+
+    return { kot_no: kotNo, business_day: businessDay, reused: false };
+  });
+}
+
+/**
+ * Everything the KOT header needs about a table that GetBillForTable does not
+ * already return: which service channel the ticket belongs to, the floor
+ * section, and whether the "table" is one of the hidden virtual rows that back a
+ * takeaway/delivery order.
+ *
+ * order_type lives in the ORDER's `food` JSON (AddOrder writes it, defaulting to
+ * "dine_in"), never on "Tables" — so it is read from the table's most recent
+ * ACTIVE order, using the same status filter GetBillForTable uses to decide
+ * which orders are on the running bill. A table whose orders have all been
+ * settled reports no channel and falls back to dine-in.
+ */
+export async function GetKotTableContext(
+  restaurantId: string,
+  tableName: string,
+): Promise<{ table_id: string; table_name: string; section: string | null; covers: number; is_virtual: boolean; order_type: string } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  const normalized = String(tableName ?? "").trim();
+  if (!normalized) {return null;}
+
+  const rows = await runQuery<{
+    id: string;
+    table_name: string;
+    section: string | null;
+    num_covers: unknown;
+    is_virtual: boolean | null;
+    latest_food: unknown;
+  }>(
+    `
+      select t.id, t.table_name, t.section,
+             coalesce(t.num_covers, 1) as num_covers,
+             coalesce(t.is_virtual, false) as is_virtual,
+             (select o.food from "Orders" o
+               where o.res_id = t.res_id and o.outlet_id = t.outlet_id and o.table_id = t.id
+                 and coalesce(o.status::text, '1') not in ('4', '5', '7')
+               order by o.created_at desc
+               limit 1) as latest_food
+      from "Tables" t
+      where t.res_id = $1 and t.outlet_id = $2 and lower(t.table_name) = lower($3)
+        and coalesce(t.is_deleted, false) = false
+      limit 1
+    `,
+    [context.res_id, context.outlet_id, normalized],
+  );
+
+  const row = rows[0];
+  if (!row) {return null;}
+  const food = parseJsonObject(row.latest_food) ?? {};
+  const orderType = String((food as Record<string, unknown>).order_type ?? "").trim().toLowerCase() || "dine_in";
+  return {
+    table_id: row.id,
+    table_name: row.table_name,
+    section: String(row.section ?? "").trim() || null,
+    covers: Math.max(1, Number(row.num_covers ?? 1) || 1),
+    is_virtual: row.is_virtual === true,
+    order_type: orderType,
+  };
 }
 
 export interface OutletRecord {
@@ -21590,6 +21786,17 @@ async function ensureBrandingColumns(): Promise<void> {
   // Thermal paper width: '58mm' (32 cols) or '80mm' (48 cols, default). Drives the
   // printed-bill column layout + logo raster width.
   await runQuery(`alter table "Restaurant" add column if not exists bill_paper_width text`);
+  // Printed-bill header identity. All three are OPTIONAL and print only when
+  // set, because they are legal/statutory fields no tenant should be forced to
+  // invent: bill_legal_name is the registered entity behind the trading name
+  // ("NAVKRISH HOSPITALITY LLP") and bill_gstin is the GST registration shown
+  // as "GSTN : …". A tenant with neither prints a clean receipt.
+  await runQuery(`alter table "Restaurant" add column if not exists bill_legal_name text`);
+  await runQuery(`alter table "Restaurant" add column if not exists bill_gstin text`);
+  // The sentence printed above the bill's feedback/valet QR. NULL means "use the
+  // built-in valet line", so an existing tenant's receipt is byte-identical
+  // until they deliberately set their own.
+  await runQuery(`alter table "Restaurant" add column if not exists bill_qr_note text`);
   // Whether the walk-in queue page shows the menu / pre-order. Some restaurants
   // want a pure "queue position only" experience — default true (show it).
   await runQuery(`alter table "Restaurant" add column if not exists queue_show_menu boolean default true`);
@@ -22397,6 +22604,16 @@ export interface RestaurantSettings {
   feedback_config: FeedbackConfig;
   bill_logo_svg: string;
   bill_paper_width: "58mm" | "80mm";
+  // Printed-bill header identity — empty string when unset, and an unset field
+  // prints nothing at all (see escpos.ts). See ensureBrandingColumns.
+  bill_legal_name: string;
+  bill_gstin: string;
+  // Custom sentence above the bill's feedback/valet QR. Empty = use the
+  // built-in default, which is returned alongside as bill_qr_note_default so an
+  // editor can show it as placeholder text without hardcoding it.
+  bill_qr_note: string;
+  bill_qr_note_default: string;
+  bill_qr_note_max: number;
   queue_show_menu?: boolean;
   // Managed kitchen sections (ordered) — see sanitizeKitchenSections.
   kitchen_sections: string[];
@@ -22485,13 +22702,59 @@ function normalizeMsgProvider(raw: unknown): "none" | "twilio" | "meta" {
   return v === "twilio" || v === "meta" ? v : "none";
 }
 
+/**
+ * Bill-header identity fields (legal entity, GSTIN).
+ *
+ * Collapsed to a single line and length-capped because they are printed into a
+ * fixed-width thermal header: 120 chars wraps to at most 4 lines on the narrow
+ * 58mm paper, which is already generous for a registered name, and a stray
+ * newline pasted from a certificate must not silently become a page of header.
+ * Newlines in the ADDRESS are meaningful and are preserved elsewhere — these
+ * two fields are single-value identifiers, so they are not.
+ */
+function sanitizeBillHeaderField(raw: unknown, max = 120): string {
+  return String(raw ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+/**
+ * The tenant's custom QR sentence. Capped at the renderer's own limit so the
+ * value that is stored is exactly the value that prints — a setting the owner
+ * can save but that the printer would then silently truncate is worse than one
+ * that refuses the extra characters at save time.
+ */
+function sanitizeBillQrNote(raw: unknown): string {
+  return String(raw ?? "").replace(/\s+/g, " ").trim().slice(0, BILL_QR_NOTE_MAX);
+}
+
+/**
+ * The bill-header slice of RestaurantSettings, built in ONE place so the read
+ * and the write path can never disagree about what an unset column reads back
+ * as. An unset column is "" — the renderer treats "" as absent and prints
+ * nothing, which is what makes a tenant with no GSTIN get a clean receipt.
+ *
+ * The default note and the cap ride along so an editor can show the built-in
+ * sentence as placeholder text and enforce the same limit the printer does,
+ * without either client hardcoding a copy that drifts.
+ */
+function billHeaderSettings(
+  row: { bill_legal_name?: string | null; bill_gstin?: string | null; bill_qr_note?: string | null } | undefined,
+): Pick<RestaurantSettings, "bill_legal_name" | "bill_gstin" | "bill_qr_note" | "bill_qr_note_default" | "bill_qr_note_max"> {
+  return {
+    bill_legal_name: sanitizeBillHeaderField(row?.bill_legal_name),
+    bill_gstin: sanitizeBillHeaderField(row?.bill_gstin),
+    bill_qr_note: sanitizeBillQrNote(row?.bill_qr_note),
+    bill_qr_note_default: DEFAULT_BILL_QR_NOTE,
+    bill_qr_note_max: BILL_QR_NOTE_MAX,
+  };
+}
+
 export async function GetRestaurantSettings(
   restaurantId: string,
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
-    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, queue_show_menu, kitchen_sections, inventory_categories, timezone, require_table_otp, theme_color, brand_config from "Restaurant" where id = $1 limit 1`,
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
+    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, bill_legal_name, bill_gstin, bill_qr_note, queue_show_menu, kitchen_sections, inventory_categories, timezone, require_table_otp, theme_color, brand_config from "Restaurant" where id = $1 limit 1`,
     [context.res_id],
   );
   const taxRows = await runQuery<{ default_tax: unknown }>(
@@ -22531,6 +22794,7 @@ export async function GetRestaurantSettings(
     feedback_config: mergeFeedbackConfig(rows[0]?.feedback_config),
     bill_paper_width: rows[0]?.bill_paper_width === "58mm" ? "58mm" : "80mm",
     bill_logo_svg: rows[0]?.bill_logo_svg ?? "",
+    ...billHeaderSettings(rows[0]),
     queue_show_menu: rows[0]?.queue_show_menu ?? true,
     kitchen_sections: sanitizeKitchenSections(rows[0]?.kitchen_sections),
     inventory_categories: sanitizeInventoryCategories(rows[0]?.inventory_categories),
@@ -22549,7 +22813,7 @@ export async function GetRestaurantSettings(
 
 export async function SetRestaurantSettings(
   restaurantId: string,
-  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean },
+  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; bill_legal_name?: unknown; bill_gstin?: unknown; bill_qr_note?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean },
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
@@ -22632,7 +22896,14 @@ export async function SetRestaurantSettings(
   const timezone = typeof opts.timezone === "string" && opts.timezone.trim() ? sanitizeTimezone(opts.timezone) : null;
   // Per-table OTP gate: only written when a boolean is sent (null leaves it as-is).
   const requireTableOtp = typeof opts.require_table_otp === "boolean" ? opts.require_table_otp : null;
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
+  // Printed-bill header identity + the custom QR sentence. All three follow the
+  // bill_logo_svg idiom exactly: only written when the key is PRESENT, and an
+  // empty string CLEARS the column (nullif below) rather than storing a blank
+  // that would print as a stray label. Omitting the key leaves it unchanged.
+  const billLegalName = opts.bill_legal_name !== undefined ? sanitizeBillHeaderField(opts.bill_legal_name) : null;
+  const billGstin = opts.bill_gstin !== undefined ? sanitizeBillHeaderField(opts.bill_gstin) : null;
+  const billQrNote = opts.bill_qr_note !== undefined ? sanitizeBillQrNote(opts.bill_qr_note) : null;
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
     `update "Restaurant" set
        auto_push_orders = coalesce($2, auto_push_orders),
        currency = coalesce($3, currency),
@@ -22661,9 +22932,12 @@ export async function SetRestaurantSettings(
        kitchen_sections = coalesce($26::jsonb, kitchen_sections),
        timezone = coalesce($27, timezone),
        inventory_categories = coalesce($28::jsonb, inventory_categories),
-       require_table_otp = coalesce($29, require_table_otp)
+       require_table_otp = coalesce($29, require_table_otp),
+       bill_legal_name = case when $30::text is null then bill_legal_name else nullif($30, '') end,
+       bill_gstin = case when $31::text is null then bill_gstin else nullif($31, '') end,
+       bill_qr_note = case when $32::text is null then bill_qr_note else nullif($32, '') end
      where id = $1
-     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone, require_table_otp, theme_color, brand_config`,
+     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone, require_table_otp, bill_legal_name, bill_gstin, bill_qr_note, theme_color, brand_config`,
     [
       context.res_id,
       typeof opts.auto_push_orders === "boolean" ? opts.auto_push_orders : null,
@@ -22694,6 +22968,9 @@ export async function SetRestaurantSettings(
       timezone,
       inventoryCategories,
       requireTableOtp,
+      billLegalName,
+      billGstin,
+      billQrNote,
     ],
   );
   // First messaging save: mint the webhook secret (Meta hub.verify_token +
@@ -22747,6 +23024,7 @@ export async function SetRestaurantSettings(
     feedback_config: mergeFeedbackConfig(rows[0]?.feedback_config),
     bill_paper_width: rows[0]?.bill_paper_width === "58mm" ? "58mm" : "80mm",
     bill_logo_svg: rows[0]?.bill_logo_svg ?? "",
+    ...billHeaderSettings(rows[0]),
     kitchen_sections: sanitizeKitchenSections(rows[0]?.kitchen_sections),
     inventory_categories: sanitizeInventoryCategories(rows[0]?.inventory_categories),
     timezone: sanitizeTimezone(rows[0]?.timezone),
