@@ -43,6 +43,27 @@ import {
 } from "./billing_math.js";
 // Re-exported so existing importers of these from "./database_supabase.js" keep working.
 export { round2, computeBillTaxes, computeBillCharges, computeCouponDiscount, computeBillSplit } from "./billing_math.js";
+import {
+  BRAND_CLEARABLE_ENUM_KEYS,
+  BRAND_COLOR_KEYS,
+  BRAND_FONTS,
+  BRAND_HEX_RE,
+  BRAND_PALETTE_REV,
+  brandFieldMeta,
+  brandPaletteOptIn,
+  resolveBrandConfig,
+  resolveBrandPalette,
+  resolveBrandPaletteDetailed,
+  sanitizeBrandConfigInput,
+  type BrandConfig,
+  type BrandContrastAdjustment,
+  type BrandFieldMeta,
+  type BrandPalette,
+} from "./brand_theme.js";
+// Same pattern for the guest branding/theme rules (see brand_theme.ts): the
+// whole module is re-exported so routes and tests can keep importing the brand
+// helpers from here.
+export * from "./brand_theme.js";
 export type { BillTaxLine, BillDiscount } from "./billing_math.js";
 import { SIM_WINDOW_DAYS, type SimulationRawStats } from "./simulation_math.js";
 import {
@@ -6480,7 +6501,7 @@ const UNDO_BRANDING_COLUMNS: Record<string, { column: string; cast: string; toDb
 // Lazy: BRAND_COLOR_KEYS is declared further down the module.
 let undoBrandConfigKeys: Set<string> | null = null;
 function isUndoBrandConfigKey(key: string): boolean {
-  if (!undoBrandConfigKeys) {undoBrandConfigKeys = new Set<string>(["font", "header_style", "button_shape", "surface_style", ...BRAND_COLOR_KEYS]);}
+  if (!undoBrandConfigKeys) {undoBrandConfigKeys = new Set<string>(["font", "header_style", "button_shape", "surface_style", ...BRAND_CLEARABLE_ENUM_KEYS, ...BRAND_COLOR_KEYS]);}
   return undoBrandConfigKeys.has(key);
 }
 
@@ -22448,333 +22469,10 @@ export function sanitizeInventoryCategories(raw: unknown): string[] {
 }
 
 // --- Rich customer-page branding (brand_config) ----------------------------
-//
-// LIVE vs LEGACY -----------------------------------------------------------
-// The customer-facing surfaces (QR order page, feedback + valet) are a committed
-// premium DARK design: a near-black #08080A shell, animated accent orbs and
-// frosted-glass panels, themed entirely from a 6-stop accent RAMP derived from
-// one brand colour. That design can honour an accent, a body font, the hero wash
-// and the control/panel shape — it CANNOT honour an arbitrary page background,
-// body-text colour or card colour without destroying its own contrast and glass
-// material, and it no longer needs an independent secondary colour (the ramp
-// derives accMid/accDeep from the accent).
-//
-// So brand_config keys are split into two sets, both still accepted on write and
-// never dropped from storage:
-//   LIVE   — actually drives the guest UI (see BRAND_LIVE_FIELDS)
-//   LEGACY — kept for back-compat / future use, drives nothing (BRAND_LEGACY_FIELDS)
-// Both lists are returned by GET /restaurant/settings as `brand_fields` so the
-// editors can stop rendering dead controls without hardcoding the split.
-//
-// Curated font allowlist the customer-facing pages may use — a small, safe set
-// the UIs render as a dropdown. Anything outside this list is dropped on write
-// (the page then uses its default/system font). Kept as a plain string[] so it
-// can be returned verbatim to the clients as `brand_fonts`.
-export const BRAND_FONTS: string[] = [
-  "Inter",
-  "Poppins",
-  "Playfair Display",
-  "Montserrat",
-  "Lato",
-  "Nunito",
-  "Oswald",
-  "Roboto Slab",
-  "DM Sans",
-  "Merriweather",
-];
-
-// A tenant's customer-page customization. Every key is optional at the storage
-// layer (only provided, valid keys are persisted); the read layer applies sane
-// defaults (see resolveBrandConfig).
-export interface BrandConfig {
-  // --- LIVE (drives the dark guest design) ---------------------------------
-  /** Body font for the guest surfaces (BRAND_FONTS allowlist). */
-  font?: string;
-  /** The brand PRIMARY — the single hex the 6-stop accent ramp is derived from. */
-  color_primary?: string;
-  /** Secondary/supporting accent (chips, secondary buttons). Defaults to the ramp's mid stop. */
-  color_secondary?: string;
-  /** Highlight/tertiary accent (badges, price emphasis). Defaults to the ramp's high stop. */
-  color_accent?: string;
-  /** Page shell background. Defaults to the shipped near-black #08080A. */
-  color_bg?: string;
-  /** Panel/card surface base colour (the alpha comes from surface_style). Defaults #1A1A1F. */
-  color_card?: string;
-  /** Body ink. Defaults to the shipped warm off-white #ECEAE6. */
-  color_text?: string;
-  /** Positive/confirmation colour. Defaults to the shipped green #8FB27C. */
-  color_success?: string;
-  /** Caution colour. Defaults to the shipped amber #E4C48C. */
-  color_warning?: string;
-  /** Error/destructive colour. Defaults to the shipped soft red #E0A79B. */
-  color_error?: string;
-  /** Hero/header wash: accent gradient (default) or a flat accent block. */
-  header_style?: "gradient" | "solid";
-  /** Radius of controls/buttons/chips (--rCtrl): rounded 13px | pill 999px | square 4px. */
-  button_shape?: "rounded" | "pill" | "square";
-  /** Panel material of every card/sheet (--panelBg/--blur/--pbA). */
-  surface_style?: "frosted" | "solid" | "tinted";
-  /**
-   * Palette opt-in marker. See BRAND_PALETTE_REV: color_secondary / color_bg /
-   * color_card / color_text were accepted-but-DEAD for a long time, so tenants
-   * carry stale values that were never rendered. Those four are only APPLIED once
-   * this is >= BRAND_PALETTE_REV, which is stamped automatically the first time a
-   * caller writes a palette key under the new contract. Set by the server, not
-   * something an editor needs to think about.
-   */
-  palette_rev?: number;
-}
-
-const BRAND_HEX_RE = /^#[0-9a-fA-F]{6}$/;
-const BRAND_COLOR_KEYS = [
-  "color_primary",
-  "color_secondary",
-  "color_accent",
-  "color_bg",
-  "color_card",
-  "color_text",
-  "color_success",
-  "color_warning",
-  "color_error",
-] as const;
-export const BRAND_HEADER_STYLES: string[] = ["gradient", "solid"];
-export const BRAND_BUTTON_SHAPES: string[] = ["rounded", "pill", "square"];
-export const BRAND_SURFACE_STYLES: string[] = ["frosted", "solid", "tinted"];
-
-/**
- * Keys the guest surfaces actually consume. Editors should render exactly these.
- *  - color_primary  → the accent ramp (acc/accHi/accMid/accDeep/accShadow/onAcc)
- *  - font           → guest body font
- *  - header_style   → hero wash: "gradient" (accent → near-black) | "solid" (flat accent)
- *  - button_shape   → control radius --rCtrl: rounded 13px | pill 9999px | square 4px
- *  - surface_style  → panel material --panelBg/--blur/--pbA:
- *      frosted (rgba(26,26,31,0.55) / 22px / 0.12)  ← the shipped look
- *      solid   (rgba(18,18,21,0.94) / 0px  / 0.10)
- *      tinted  (accent-tinted glass: rgba(accShadow,0.42) / 22px / 0.18)
- */
-export const BRAND_LIVE_FIELDS: string[] = [
-  "color_primary",
-  "color_secondary",
-  "color_accent",
-  "color_bg",
-  "color_card",
-  "color_text",
-  "color_success",
-  "color_warning",
-  "color_error",
-  "font",
-  "header_style",
-  "button_shape",
-  "surface_style",
-];
-
-/**
- * Keys accepted and stored but which drive nothing. EMPTY since the palette was
- * revived: every colour key is now a real role in the resolved palette (see
- * resolveBrandPalette), so there is nothing left to hide from the editors.
- */
-export const BRAND_LEGACY_FIELDS: string[] = [];
-
-// Validate a customization payload down to the STORED subset: only the keys the
-// caller actually provided AND that pass validation survive (invalid colours,
-// unknown fonts and bad enums are silently dropped). Returning just the valid
-// provided keys lets SetBranding merge-on-omit (jsonb ||) without a bad value
-// ever landing in the column.
-export function sanitizeBrandConfigInput(raw: unknown): BrandConfig {
-  const s = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const out: BrandConfig = {};
-  if (typeof s.font === "string" && BRAND_FONTS.includes(s.font.trim())) {out.font = s.font.trim();}
-  for (const key of BRAND_COLOR_KEYS) {
-    const v = s[key];
-    if (typeof v === "string" && BRAND_HEX_RE.test(v.trim())) {out[key] = v.trim();}
-  }
-  if (s.header_style === "gradient" || s.header_style === "solid") {out.header_style = s.header_style;}
-  if (s.button_shape === "rounded" || s.button_shape === "pill" || s.button_shape === "square") {out.button_shape = s.button_shape;}
-  if (s.surface_style === "frosted" || s.surface_style === "solid" || s.surface_style === "tinted") {out.surface_style = s.surface_style;}
-  // Passed through only when already present — the opt-in is STAMPED ON WRITE
-  // (see brandPaletteOptIn / SetBranding), never inferred while reading, or every
-  // tenant carrying a stale colour key would opt itself in the first time it read.
-  const rev = Number(s.palette_rev);
-  if (Number.isFinite(rev) && rev >= BRAND_PALETTE_REV) {out.palette_rev = BRAND_PALETTE_REV;}
-  return out;
-}
-
-/**
- * Does this WRITE opt the tenant into the revived palette? color_primary was
- * always live, so setting only it changes nothing about the retired keys; any
- * other palette colour means the caller is using the new editor.
- */
-function brandPaletteOptIn(sanitized: BrandConfig): boolean {
-  if (sanitized.palette_rev && sanitized.palette_rev >= BRAND_PALETTE_REV) {return true;}
-  return BRAND_COLOR_KEYS.some((k) => k !== "color_primary" && typeof sanitized[k] === "string");
-}
-
-// Read-time view of the stored brand_config with sane defaults applied so the
-// UIs never have to null-check a key. color_primary falls back to the extracted
-// logo primary (themePrimary) then theme_color, so tenants that only ever set a
-// theme colour look exactly as before. Legacy colours the tenant never set stay
-// absent (they drive nothing either way — see BRAND_LEGACY_FIELDS).
-//
-// The LIVE enum defaults are exactly the shipped dark design, so a tenant that
-// never touched branding keeps today's guest page pixel-for-pixel:
-// header_style "gradient", button_shape "rounded" (--rCtrl 13px) and
-// surface_style "frosted". NOTE: button_shape used to default to "pill" while
-// nothing consumed it; the default moved to "rounded" when the key became live.
-export function resolveBrandConfig(stored: unknown, themePrimary: string | null, themeColor: string | null): BrandConfig {
-  const c = sanitizeBrandConfigInput(stored);
-  const palette = resolveBrandPalette(stored, themePrimary, themeColor);
-  // Every colour key is resolved (never absent) so the editors can prefill a real
-  // swatch for each role instead of showing an empty picker. The values ARE the
-  // shipped design when the tenant never touched them, so nothing changes visually.
-  return {
-    font: c.font ?? "Inter",
-    header_style: c.header_style ?? "gradient",
-    button_shape: c.button_shape ?? "rounded",
-    surface_style: c.surface_style ?? "frosted",
-    color_primary: palette.primary,
-    color_secondary: palette.secondary,
-    color_accent: palette.accent,
-    color_bg: palette.background,
-    color_card: palette.surface,
-    color_text: palette.text,
-    color_success: palette.success,
-    color_warning: palette.warning,
-    color_error: palette.error,
-    // Echoed so an editor that saves back what it loaded keeps the opt-in (and a
-    // tenant that has not opted in yet does so by saving the resolved palette).
-    ...(c.palette_rev ? { palette_rev: c.palette_rev } : {}),
-  };
-}
-
-// --- Resolved brand PALETTE -------------------------------------------------
-// The guest surfaces (QR order page, feedback, valet, queue) all theme themselves
-// from ONE brand colour today: a 6-stop ramp derived from the accent, on a fixed
-// near-black shell. The palette below turns that into an explicit, named set of
-// roles the tenant can override individually — while every default reproduces the
-// shipped design EXACTLY, so an untouched tenant is pixel-identical.
-//
-// Defaults (see BRAND_PALETTE_DEFAULTS + the ramp):
-//   primary    color_primary   → logo-extracted theme_primary → theme_color → #ea580c
-//   secondary  color_secondary → ramp(primary).mid   (L .51, s-3)
-//   accent     color_accent    → ramp(primary).hi    (L .75, s+7)
-//   background color_bg        → #08080A  (shell bg)
-//   surface    color_card      → #1A1A1F  (frosted panel base; alpha from surface_style)
-//   text       color_text      → #ECEAE6  (body ink)
-//   success    color_success   → #8FB27C
-//   warning    color_warning   → #E4C48C
-//   error      color_error     → #E0A79B
-export interface BrandPalette {
-  primary: string;
-  secondary: string;
-  accent: string;
-  background: string;
-  surface: string;
-  text: string;
-  success: string;
-  warning: string;
-  error: string;
-}
-
-/** The ultimate fallback accent — the value the guest pages have always used. */
-export const BRAND_DEFAULT_PRIMARY = "#ea580c";
-
-/**
- * Palette revision. color_secondary / color_bg / color_card / color_text were
- * ACCEPTED BUT DEAD for a long time, so real tenants carry values that were never
- * rendered (csrorganics, for instance, has a mid-grey background and a pure-black
- * card sitting in its brand_config from an old light-theme editor). Reviving those
- * keys blindly would have redecorated live guest pages that nobody asked to
- * change. So the four retired keys only take effect once brand_config carries
- * palette_rev >= this — stamped automatically the first time any palette key
- * other than color_primary is written (see sanitizeBrandConfigInput).
- *
- * Nothing is lost: the old values stay in the column, and because GET returns the
- * RESOLVED palette, an editor that saves what it loaded overwrites the stale
- * values with the correct ones and opts in, in one round-trip.
- */
-export const BRAND_PALETTE_REV = 2;
-
-/**
- * Fixed defaults for the roles the accent ramp does NOT derive. These are the
- * literal colours the shipped guest design uses today.
- */
-export const BRAND_PALETTE_DEFAULTS: Omit<BrandPalette, "primary" | "secondary" | "accent"> = {
-  background: "#08080A",
-  surface: "#1A1A1F",
-  text: "#ECEAE6",
-  success: "#8FB27C",
-  warning: "#E4C48C",
-  error: "#E0A79B",
-};
-
-const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
-
-// h in degrees, s & l in 0..1 → #rrggbb. Mirrors the guest pages' hsl2rgb so the
-// server-derived secondary/accent land on the SAME stops the client computes.
-function brandHslHex(h: number, s: number, l: number): string {
-  const a = s * Math.min(l, 1 - l);
-  const f = (n: number) => {
-    const k = (n + h / 30) % 12;
-    return l - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
-  };
-  const rgb = [f(0), f(8), f(4)].map((v) => Math.max(0, Math.min(255, Math.round(v * 255))));
-  return "#" + rgb.map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-
-// #rrggbb → { h(deg), s(0..100) }. Falls back to the copper hue/sat.
-function brandHexToHs(hex: string): { h: number; s: number } {
-  const m = /^#?([0-9a-fA-F]{6})$/.exec((hex ?? "").trim());
-  if (!m?.[1]) {return { h: 24, s: 38 };}
-  const n = parseInt(m[1], 16);
-  const r = ((n >> 16) & 0xff) / 255, g = ((n >> 8) & 0xff) / 255, b = (n & 0xff) / 255;
-  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-  let h = 0, s = 0;
-  const l = (mx + mn) / 2;
-  if (mx !== mn) {
-    const d = mx - mn;
-    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
-    if (mx === r) {h = (g - b) / d + (g < b ? 6 : 0);}
-    else if (mx === g) {h = (b - r) / d + 2;}
-    else {h = (r - g) / d + 4;}
-    h *= 60;
-  }
-  return { h, s: s * 100 };
-}
-
-/**
- * Resolve the tenant's full guest palette. `stored` is the raw brand_config jsonb;
- * themePrimary is the logo-extracted colour and themeColor the legacy theme hex —
- * both are only ever fallbacks for `primary`, exactly as before.
- *
- * Every returned value is a valid #rrggbb; nothing is ever null, so a client can
- * theme itself from this object alone with no null-checks and no colour maths.
- */
-export function resolveBrandPalette(stored: unknown, themePrimary: string | null, themeColor: string | null): BrandPalette {
-  const c = sanitizeBrandConfigInput(stored);
-  const primary = c.color_primary
-    ?? (themePrimary && BRAND_HEX_RE.test(themePrimary) ? themePrimary : undefined)
-    ?? (themeColor && BRAND_HEX_RE.test(themeColor) ? themeColor : undefined)
-    ?? BRAND_DEFAULT_PRIMARY;
-  const { h, s } = brandHexToHs(primary);
-  // The four keys that used to be dead only count once the tenant has opted in
-  // (see BRAND_PALETTE_REV) — otherwise a stale value from an old editor would
-  // silently redecorate a live guest page.
-  const revived = Number(c.palette_rev ?? 0) >= BRAND_PALETTE_REV;
-  const pick = (v: string | undefined) => (revived ? v : undefined);
-  return {
-    primary,
-    secondary: pick(c.color_secondary) ?? brandHslHex(h, clamp01((s - 3) / 100), 0.51),
-    // color_accent / _success / _warning / _error are NEW keys — nothing stale can
-    // exist under them, so they apply the moment they are set.
-    accent: c.color_accent ?? brandHslHex(h, clamp01((s + 7) / 100), 0.75),
-    background: pick(c.color_bg) ?? BRAND_PALETTE_DEFAULTS.background,
-    surface: pick(c.color_card) ?? BRAND_PALETTE_DEFAULTS.surface,
-    text: pick(c.color_text) ?? BRAND_PALETTE_DEFAULTS.text,
-    success: c.color_success ?? BRAND_PALETTE_DEFAULTS.success,
-    warning: c.color_warning ?? BRAND_PALETTE_DEFAULTS.warning,
-    error: c.color_error ?? BRAND_PALETTE_DEFAULTS.error,
-  };
-}
+// The types, allowlists, preset schemes, contrast guard and palette resolution
+// live in brand_theme.ts — a PURE module (the billing_math.ts pattern) so jest
+// can exercise the resolution invariants without dragging in the pg pool.
+// Everything is re-exported above so existing import sites keep working.
 
 export interface RestaurantSettings {
   auto_push_orders: boolean;
@@ -22842,44 +22540,19 @@ export interface RestaurantSettings {
   // palette was revived) but the shape is kept so no client has to change.
   brand_fields: { live: string[]; legacy: string[] };
   // Accepted values for each enum-ish live key, so the editors don't hardcode them.
-  brand_field_options: { font: string[]; header_style: string[]; button_shape: string[]; surface_style: string[] };
+  brand_field_options: BrandFieldMeta["brand_field_options"];
   // Which live keys are colours (hex) vs enums, and the default each falls back
   // to — so an editor can render "Reset to default" without hardcoding values.
   brand_color_fields: string[];
   brand_field_defaults: Record<string, string>;
+  // The preset scheme catalogue (id/label/hint + preview swatches) so both
+  // editors render the picker from server truth — see BRAND_SCHEMES.
+  brand_schemes: BrandFieldMeta["brand_schemes"];
+  // Any WCAG clamp the palette resolver applied (empty when readable as-is) so
+  // the editors can tell the owner their text colour was corrected.
+  brand_contrast: BrandContrastAdjustment[];
 }
 
-// The live/legacy split + option lists, returned by GetRestaurantSettings and
-// SetRestaurantSettings so both editors read it from one place.
-function brandFieldMeta(): Pick<RestaurantSettings, "brand_fields" | "brand_field_options" | "brand_color_fields" | "brand_field_defaults"> {
-  return {
-    brand_fields: { live: [...BRAND_LIVE_FIELDS], legacy: [...BRAND_LEGACY_FIELDS] },
-    brand_field_options: {
-      font: [...BRAND_FONTS],
-      header_style: [...BRAND_HEADER_STYLES],
-      button_shape: [...BRAND_BUTTON_SHAPES],
-      surface_style: [...BRAND_SURFACE_STYLES],
-    },
-    brand_color_fields: [...BRAND_COLOR_KEYS],
-    brand_field_defaults: {
-      color_primary: BRAND_DEFAULT_PRIMARY,
-      // Derived from color_primary when unset — the literal here is the value for
-      // the DEFAULT primary, so the editor always has something to show.
-      color_secondary: resolveBrandPalette(null, null, null).secondary,
-      color_accent: resolveBrandPalette(null, null, null).accent,
-      color_bg: BRAND_PALETTE_DEFAULTS.background,
-      color_card: BRAND_PALETTE_DEFAULTS.surface,
-      color_text: BRAND_PALETTE_DEFAULTS.text,
-      color_success: BRAND_PALETTE_DEFAULTS.success,
-      color_warning: BRAND_PALETTE_DEFAULTS.warning,
-      color_error: BRAND_PALETTE_DEFAULTS.error,
-      font: "Inter",
-      header_style: "gradient",
-      button_shape: "rounded",
-      surface_style: "frosted",
-    },
-  };
-}
 
 // Basic sanitization for an uploaded SVG logo: cap the size and strip the
 // script/event-handler vectors so a stored logo can't run code where it's
@@ -23008,7 +22681,10 @@ export async function GetRestaurantSettings(
     // is only resolved on the public branding path to keep this admin read cheap)
     // plus the curated font allowlist for the dropdown and the live/legacy split.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
-    brand_palette: resolveBrandPalette(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
+    ...(() => {
+      const detailed = resolveBrandPaletteDetailed(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null);
+      return { brand_palette: detailed.palette, brand_contrast: detailed.contrast };
+    })(),
     brand_fonts: [...BRAND_FONTS],
     ...brandFieldMeta(),
   };
@@ -23235,7 +22911,10 @@ export async function SetRestaurantSettings(
     // brand_config isn't written here (branding is set via SetBranding), but the
     // type requires it — echo the current stored value resolved with defaults.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
-    brand_palette: resolveBrandPalette(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
+    ...(() => {
+      const detailed = resolveBrandPaletteDetailed(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null);
+      return { brand_palette: detailed.palette, brand_contrast: detailed.contrast };
+    })(),
     brand_fonts: [...BRAND_FONTS],
     ...brandFieldMeta(),
   };
@@ -23392,7 +23071,7 @@ export async function GetPublicBranding(
 export async function SetBranding(
   restaurantId: string,
   opts: { logo_url?: string | null; theme_color?: string | null; queue_show_menu?: boolean; brand_config?: unknown },
-): Promise<{ logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: BrandConfig; brand_palette: BrandPalette }> {
+): Promise<{ logo_url: string | null; theme_color: string | null; queue_show_menu: boolean; brand_config: BrandConfig; brand_palette: BrandPalette; brand_contrast: BrandContrastAdjustment[] }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
   // brand_config: only touched when provided. Merge-on-omit — the sanitized
@@ -23416,6 +23095,13 @@ export async function SetBranding(
     clearKeys = BRAND_COLOR_KEYS.filter(
       (k) => k in rawInput && typeof sanitized[k] !== "string",
     );
+    // The scheme/font_scale/card_shape keys clear the same way (sent as null →
+    // removed, so the editors' "back to default" genuinely resets them). The
+    // older enum keys keep their ignore-invalid behaviour — see
+    // BRAND_CLEARABLE_ENUM_KEYS.
+    clearKeys.push(...BRAND_CLEARABLE_ENUM_KEYS.filter(
+      (k) => k in rawInput && typeof (sanitized as Record<string, unknown>)[k] !== "string",
+    ));
 
     // FIRST opt-in only: tenants carry colour values from the old (pre-dark)
     // design that have been dormant for months — typically greys. Stamping
@@ -23454,12 +23140,16 @@ export async function SetBranding(
     [context.res_id, opts.logo_url ?? null, opts.theme_color ?? null, typeof opts.queue_show_menu === "boolean" ? opts.queue_show_menu : null, brandConfig, clearKeys],
   );
   const palette = await ExtractLogoPalette(rows[0]?.logo ?? null);
+  const detailed = resolveBrandPaletteDetailed(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null);
   return {
     logo_url: rows[0]?.logo ?? null,
     theme_color: rows[0]?.theme_color ?? null,
     queue_show_menu: rows[0]?.queue_show_menu ?? true,
     brand_config: resolveBrandConfig(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
-    brand_palette: resolveBrandPalette(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
+    brand_palette: detailed.palette,
+    // Surfaces the WCAG clamp (if any) to the editor that just saved, so it can
+    // explain why the served text colour differs from the stored one.
+    brand_contrast: detailed.contrast,
   };
 }
 

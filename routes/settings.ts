@@ -186,10 +186,14 @@ app.post("/restaurant/branding", validate, async (req: Request, res: Response) =
 	const queueShowMenu = typeof body.queue_show_menu === "boolean" ? body.queue_show_menu : undefined;
 	// Customer-page customization object. Live keys are the full palette
 	// (color_primary / _secondary / _accent / _bg / _card / _text / _success /
-	// _warning / _error) plus font, header_style, button_shape and surface_style —
-	// see BRAND_LIVE_FIELDS; `brand_fields.legacy` is now empty.
+	// _warning / _error) plus font, header_style, button_shape, surface_style and
+	// the preset generation: scheme, font_scale, card_shape — see
+	// BRAND_LIVE_FIELDS; `brand_fields.legacy` is now empty.
 	// Passed through as-is — SetBranding sanitizes it (invalid keys dropped) and
-	// merges it onto the stored config (keys omitted here keep their value).
+	// merges it onto the stored config (keys omitted here keep their value;
+	// colour roles and the three new enum keys sent as null are CLEARED). The
+	// response carries brand_contrast when the WCAG guard adjusted the text
+	// colour, so the editors can tell the owner.
 	const brandConfig = body.brand_config && typeof body.brand_config === "object" ? body.brand_config : undefined;
 	try {
 		if (!logoUrl && typeof body.logo_base64 === "string" && body.logo_base64.length > 0) {
