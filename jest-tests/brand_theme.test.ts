@@ -1,6 +1,8 @@
 import { describe, test, expect } from "@jest/globals";
 import {
   BRAND_CONTRAST_MIN,
+  BRAND_GRADIENT_ANGLE_DEFAULTS,
+  BRAND_GRADIENT_KEYS,
   BRAND_PALETTE_DEFAULTS,
   BRAND_SCHEMES,
   BRAND_SCHEME_IDS,
@@ -8,6 +10,7 @@ import {
   brandFieldMeta,
   contrastRatio,
   resolveBrandConfig,
+  resolveBrandGradients,
   resolveBrandPalette,
   resolveBrandPaletteDetailed,
   sanitizeBrandConfigInput,
@@ -159,6 +162,22 @@ describe("resolveBrandConfig + field meta", () => {
     }
   });
 
+  test("gradient config round-trips as a fixed point too", () => {
+    const stored = {
+      color_primary: "#2563EB",
+      header_grad_from: "#112233",
+      header_grad_to: "#334455",
+      header_grad_angle: 120,
+      bg_grad_from: "#0A0A0C",
+      bg_grad_to: "#1B1B22",
+    };
+    const once = resolveBrandConfig(stored, null, null);
+    const twice = resolveBrandConfig(sanitizeBrandConfigInput(once), null, null);
+    const { palette_rev: _a, ...vOnce } = once;
+    const { palette_rev: _b, ...vTwice } = twice;
+    expect(vTwice).toEqual(vOnce);
+  });
+
   test("field meta advertises the new knobs and the scheme catalogue", () => {
     const meta = brandFieldMeta();
     for (const key of ["scheme", "font_scale", "card_shape"]) {
@@ -175,5 +194,92 @@ describe("resolveBrandConfig + field meta", () => {
     }
     // The scheme catalogue previews mirror the shipped defaults for classic.
     expect(BRAND_SCHEMES.find((s) => s.id === "classic")!.preview).toEqual(BRAND_PALETTE_DEFAULTS);
+  });
+});
+
+// --- Gradient controls -------------------------------------------------------
+describe("brand gradients", () => {
+  test("ABSENT gradient keys are the legacy contract: nothing resolves, nothing leaks", () => {
+    expect(resolveBrandGradients(null)).toEqual({});
+    expect(resolveBrandGradients({})).toEqual({});
+    // resolveBrandConfig must NOT invent gradient keys for an untouched tenant —
+    // a resolved-in default would pin every tenant to today's derived wash.
+    const c = resolveBrandConfig(null, null, null) as Record<string, unknown>;
+    for (const k of BRAND_GRADIENT_KEYS) {expect(k in c).toBe(false);}
+    // …and the palette itself is still the legacy guard's bit-for-bit default.
+    expect(resolveBrandPalette({ header_grad_angle: 45 }, null, null)).toEqual(resolveBrandPalette(null, null, null));
+  });
+
+  test("sanitizer: hex stops and numeric angles survive, junk is dropped, angles normalise", () => {
+    expect(sanitizeBrandConfigInput({
+      header_grad_from: "#112233", header_grad_to: " #334455 ", header_grad_angle: 120,
+    })).toEqual({ header_grad_from: "#112233", header_grad_to: "#334455", header_grad_angle: 120 });
+    // Junk of every shape — bad hex, numeric strings, NaN, objects — is dropped
+    // (prototype-pollution style payloads included).
+    expect(sanitizeBrandConfigInput({
+      header_grad_from: "red", button_grad_to: "#12345", bg_grad_from: 0x112233,
+      header_grad_angle: "120", button_grad_angle: NaN, bg_grad_angle: { valueOf: () => 90 },
+    })).toEqual({});
+    // Angles wrap into 0..359 so storage never carries "540deg" or "-30deg".
+    expect(sanitizeBrandConfigInput({ bg_grad_angle: 540 })).toEqual({ bg_grad_angle: 180 });
+    expect(sanitizeBrandConfigInput({ bg_grad_angle: -30 })).toEqual({ bg_grad_angle: 330 });
+    expect(sanitizeBrandConfigInput({ bg_grad_angle: 360 })).toEqual({ bg_grad_angle: 0 });
+  });
+
+  test("a gradient activates only with BOTH stops; the angle alone does nothing", () => {
+    expect(resolveBrandGradients({ header_grad_from: "#112233" })).toEqual({});
+    expect(resolveBrandGradients({ header_grad_to: "#112233", header_grad_angle: 90 })).toEqual({});
+    expect(resolveBrandGradients({ header_grad_from: "#112233", header_grad_to: "#334455" }))
+      .toEqual({ header: { from: "#112233", to: "#334455", angle: BRAND_GRADIENT_ANGLE_DEFAULTS.header_grad_angle } });
+  });
+
+  test("angles default per surface to the shipped wash directions", () => {
+    const g = resolveBrandGradients({
+      header_grad_from: "#112233", header_grad_to: "#334455",
+      button_grad_from: "#556677", button_grad_to: "#778899",
+      bg_grad_from: "#0A0A0C", bg_grad_to: "#1B1B22",
+    });
+    expect(g.header!.angle).toBe(150);
+    expect(g.button!.angle).toBe(180);
+    expect(g.background!.angle).toBe(180);
+  });
+
+  test("header/button gradients never touch the palette; a bg gradient joins the text clamp", () => {
+    const base = resolveBrandPaletteDetailed(null, null, null);
+    const withDecor = resolveBrandPaletteDetailed({
+      header_grad_from: "#FFFFFF", header_grad_to: "#EEEEEE",
+      button_grad_from: "#FFFFFF", button_grad_to: "#EEEEEE",
+    }, null, null);
+    expect(withDecor.palette).toEqual(base.palette);
+    expect(withDecor.contrast).toEqual([]);
+    // A light shell whose wash stop sits almost ON the near-white text: the
+    // WORST ground is that stop, the guard clamps the text dark enough to read
+    // on EVERY ground and names the gradient as the failing one.
+    const d = resolveBrandPaletteDetailed({
+      color_bg: "#F6F4EF", color_card: "#FFFFFF", color_text: "#F0EFEA", palette_rev: 2,
+      bg_grad_from: "#F6F4EF", bg_grad_to: "#EFEEE9",
+    }, null, null);
+    expect(d.contrast).toHaveLength(1);
+    expect(d.contrast[0]!.against).toBe("background gradient");
+    for (const ground of ["#F6F4EF", "#FFFFFF", "#EFEEE9"]) {
+      expect(contrastRatio(d.palette.text, ground)).toBeGreaterThanOrEqual(BRAND_CONTRAST_MIN);
+    }
+    // Readable stops leave the text untouched (the guard stays silent).
+    const ok = resolveBrandPaletteDetailed({ bg_grad_from: "#08080A", bg_grad_to: "#101014" }, null, null);
+    expect(ok.contrast).toEqual([]);
+    expect(ok.palette.text).toBe(base.palette.text);
+  });
+
+  test("field meta: gradient keys are live and the editor table matches the key constants", () => {
+    const meta = brandFieldMeta();
+    for (const k of BRAND_GRADIENT_KEYS) {expect(meta.brand_fields.live).toContain(k);}
+    const flat = meta.brand_gradient_fields.flatMap((g) => [g.from, g.to, g.angle]);
+    expect([...flat].sort()).toEqual([...BRAND_GRADIENT_KEYS].sort());
+    for (const g of meta.brand_gradient_fields) {
+      expect(meta.brand_field_defaults[g.angle]).toBe(String(g.angle_default));
+      // Stops have NO default on purpose: absent = the shipped derived wash.
+      expect(meta.brand_field_defaults[g.from]).toBeUndefined();
+      expect(meta.brand_field_defaults[g.to]).toBeUndefined();
+    }
   });
 });

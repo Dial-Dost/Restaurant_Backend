@@ -100,6 +100,29 @@ export interface BrandConfig {
    * something an editor needs to think about.
    */
   palette_rev?: number;
+
+  // --- Gradient controls -----------------------------------------------------
+  // Each gradient is a pair of hex stops plus an optional angle (degrees). A
+  // gradient is ACTIVE only when BOTH stops are present — a lone stop or a lone
+  // angle paints nothing, so a half-cleared tenant can never render a broken
+  // wash. All nine keys are NEW (nothing stale can exist under them), so they
+  // apply the moment they are set and need no palette_rev gate; ABSENT keys
+  // reproduce the shipped derived output bit-for-bit.
+  /** Hero/header wash: explicit stops replacing the derived accent wash. */
+  header_grad_from?: string;
+  header_grad_to?: string;
+  /** Hero wash direction in degrees. Default 150 — the shipped wash's angle. */
+  header_grad_angle?: number;
+  /** Accent CTA/button fill (same stop twice = a solid button). */
+  button_grad_from?: string;
+  button_grad_to?: string;
+  /** Button fill direction. Default 180 — the shipped vertical accHi→accMid fall. */
+  button_grad_angle?: number;
+  /** Page background wash painted over the solid color_bg shell. */
+  bg_grad_from?: string;
+  bg_grad_to?: string;
+  /** Background wash direction. Default 180 (top → bottom). */
+  bg_grad_angle?: number;
 }
 
 export const BRAND_HEX_RE = /^#[0-9a-fA-F]{6}$/;
@@ -114,6 +137,33 @@ export const BRAND_COLOR_KEYS = [
   "color_warning",
   "color_error",
 ] as const;
+// The gradient stop keys (hex-validated like the colour roles) and their angle
+// keys (integer degrees, normalised into 0..359). Grouped per surface so the
+// editors can be BUILT from this table instead of hardcoding key names — see
+// BRAND_GRADIENT_FIELDS in brandFieldMeta().
+export const BRAND_GRADIENT_STOP_KEYS = [
+  "header_grad_from",
+  "header_grad_to",
+  "button_grad_from",
+  "button_grad_to",
+  "bg_grad_from",
+  "bg_grad_to",
+] as const;
+export const BRAND_GRADIENT_ANGLE_KEYS = [
+  "header_grad_angle",
+  "button_grad_angle",
+  "bg_grad_angle",
+] as const;
+export const BRAND_GRADIENT_KEYS: string[] = [...BRAND_GRADIENT_STOP_KEYS, ...BRAND_GRADIENT_ANGLE_KEYS];
+// The angle each surface renders with when the tenant set stops but no angle.
+// header 150 / button 180 are the literal angles the shipped derived washes use,
+// so "same stops, no angle" sits exactly where the design already points.
+export const BRAND_GRADIENT_ANGLE_DEFAULTS = {
+  header_grad_angle: 150,
+  button_grad_angle: 180,
+  bg_grad_angle: 180,
+} as const;
+
 export const BRAND_HEADER_STYLES: string[] = ["gradient", "solid"];
 export const BRAND_BUTTON_SHAPES: string[] = ["rounded", "pill", "square"];
 export const BRAND_SURFACE_STYLES: string[] = ["frosted", "solid", "tinted"];
@@ -229,6 +279,7 @@ export const BRAND_LIVE_FIELDS: string[] = [
   "button_shape",
   "surface_style",
   "card_shape",
+  ...BRAND_GRADIENT_KEYS,
 ];
 
 /**
@@ -257,6 +308,16 @@ export function sanitizeBrandConfigInput(raw: unknown): BrandConfig {
   for (const key of BRAND_COLOR_KEYS) {
     const v = s[key];
     if (typeof v === "string" && BRAND_HEX_RE.test(v.trim())) {out[key] = v.trim();}
+  }
+  for (const key of BRAND_GRADIENT_STOP_KEYS) {
+    const v = s[key];
+    if (typeof v === "string" && BRAND_HEX_RE.test(v.trim())) {out[key] = v.trim();}
+  }
+  for (const key of BRAND_GRADIENT_ANGLE_KEYS) {
+    const v = s[key];
+    // Angles are numbers only (no numeric strings — same strictness as the enum
+    // keys) and normalised into 0..359 so storage never carries "540deg".
+    if (typeof v === "number" && Number.isFinite(v)) {out[key] = ((Math.round(v) % 360) + 360) % 360;}
   }
   if (s.header_style === "gradient" || s.header_style === "solid") {out.header_style = s.header_style;}
   if (s.button_shape === "rounded" || s.button_shape === "pill" || s.button_shape === "square") {out.button_shape = s.button_shape;}
@@ -324,6 +385,11 @@ export function resolveBrandConfig(stored: unknown, themePrimary: string | null,
     // Echoed so an editor that saves back what it loaded keeps the opt-in (and a
     // tenant that has not opted in yet does so by saving the resolved palette).
     ...(c.palette_rev ? { palette_rev: c.palette_rev } : {}),
+    // Gradient keys pass through ONLY when stored: unlike the colour roles they
+    // have no derived value to prefill — ABSENT is the contract for "render the
+    // shipped derived wash", and resolving one in would pin every tenant to it.
+    ...Object.fromEntries(BRAND_GRADIENT_KEYS.filter((k) => (c as Record<string, unknown>)[k] !== undefined)
+      .map((k) => [k, (c as Record<string, unknown>)[k]])),
   };
 }
 
@@ -436,21 +502,28 @@ export interface BrandContrastAdjustment {
   requested: string;
   /** The value actually served to the guest pages. */
   applied: string;
-  /** The ground the requested value failed against ("background" | "surface"). */
-  against: "background" | "surface";
+  /**
+   * The ground the requested value failed WORST against. "background gradient"
+   * means one of the tenant's bg_grad_from/_to stops — with a background wash,
+   * text must clear AA against every ground it can sit on, so the guard
+   * validates against the WORST stop too.
+   */
+  against: "background" | "surface" | "background gradient";
   /** Worst requested-vs-ground ratio, rounded to 2dp. */
   ratio: number;
   /** The minimum the guard enforces (BRAND_CONTRAST_MIN). */
   minimum: number;
 }
 
-// Clamp `text` so min(contrast vs bg, contrast vs surface) >= 4.5. Keeps the
-// requested hue/saturation and walks lightness AWAY from the background; if no
-// lightness of that hue can pass (e.g. a dark page with white cards), falls back
-// to whichever of white/near-black maximises the worst-pair ratio. Deterministic
+// Clamp `text` so min(contrast vs bg, contrast vs surface, contrast vs every
+// extra ground — e.g. the background-gradient stops) >= 4.5. Keeps the requested
+// hue/saturation and walks lightness AWAY from the background; if no lightness
+// of that hue can pass (e.g. a dark page with white cards), falls back to
+// whichever of white/near-black maximises the worst-pair ratio. Deterministic
 // on purpose — same inputs, same palette, testable.
-function clampTextContrast(text: string, background: string, surface: string): { applied: string; changed: boolean; worst: number } {
-  const worstOf = (t: string) => Math.min(contrastRatio(t, background), contrastRatio(t, surface));
+function clampTextContrast(text: string, background: string, surface: string, extraGrounds: string[] = []): { applied: string; changed: boolean; worst: number } {
+  const grounds = [background, surface, ...extraGrounds];
+  const worstOf = (t: string) => Math.min(...grounds.map((g) => contrastRatio(t, g)));
   const requestedWorst = worstOf(text);
   if (requestedWorst >= BRAND_CONTRAST_MIN) {return { applied: text, changed: false, worst: requestedWorst };}
   const { h, s, l } = brandHexToHsl(text);
@@ -502,14 +575,26 @@ export function resolveBrandPaletteDetailed(
   const background = pick(c.color_bg) ?? scheme?.background ?? BRAND_PALETTE_DEFAULTS.background;
   const surface = pick(c.color_card) ?? scheme?.surface ?? BRAND_PALETTE_DEFAULTS.surface;
   const requestedText = pick(c.color_text) ?? scheme?.text ?? BRAND_PALETTE_DEFAULTS.text;
-  const clamp = clampTextContrast(requestedText, background, surface);
+  // A background WASH paints over the shell, so text sits on its stops too: the
+  // guard must clear AA against every ground, including the worst gradient stop.
+  const bgGrad = resolveBrandGradients(c).background;
+  const grounds: { label: BrandContrastAdjustment["against"]; hex: string }[] = [
+    { label: "background", hex: background },
+    { label: "surface", hex: surface },
+    ...(bgGrad ? [
+      { label: "background gradient" as const, hex: bgGrad.from },
+      { label: "background gradient" as const, hex: bgGrad.to },
+    ] : []),
+  ];
+  const clamp = clampTextContrast(requestedText, background, surface, bgGrad ? [bgGrad.from, bgGrad.to] : []);
+  const worstGround = grounds.reduce((a, b) => (contrastRatio(requestedText, a.hex) <= contrastRatio(requestedText, b.hex) ? a : b));
   const contrast: BrandContrastAdjustment[] = clamp.changed
     ? [{
         role: "text",
         requested: requestedText,
         applied: clamp.applied,
-        against: contrastRatio(requestedText, background) <= contrastRatio(requestedText, surface) ? "background" : "surface",
-        ratio: Math.round(Math.min(contrastRatio(requestedText, background), contrastRatio(requestedText, surface)) * 100) / 100,
+        against: worstGround.label,
+        ratio: Math.round(Math.min(...grounds.map((g) => contrastRatio(requestedText, g.hex))) * 100) / 100,
         minimum: BRAND_CONTRAST_MIN,
       }]
     : [];
@@ -533,6 +618,38 @@ export function resolveBrandPalette(stored: unknown, themePrimary: string | null
   return resolveBrandPaletteDetailed(stored, themePrimary, themeColor).palette;
 }
 
+// --- Resolved brand GRADIENTS -----------------------------------------------
+// The tenant's explicit gradient washes, resolved from the stored config. A
+// surface appears here ONLY when both of its stops are stored (the activation
+// rule — see the BrandConfig fields); everything else stays undefined, which the
+// guest pages read as "render the shipped derived wash". The angle falls back to
+// the surface's shipped angle (BRAND_GRADIENT_ANGLE_DEFAULTS), so "stops without
+// an angle" points exactly where the design already points.
+export interface BrandGradient {
+  from: string;
+  to: string;
+  angle: number;
+}
+export interface BrandGradients {
+  header?: BrandGradient;
+  button?: BrandGradient;
+  background?: BrandGradient;
+}
+
+export function resolveBrandGradients(stored: unknown): BrandGradients {
+  const c = sanitizeBrandConfigInput(stored);
+  const grad = (from: string | undefined, to: string | undefined, angle: number | undefined, dflt: number): BrandGradient | undefined =>
+    from && to ? { from, to, angle: angle ?? dflt } : undefined;
+  const out: BrandGradients = {};
+  const header = grad(c.header_grad_from, c.header_grad_to, c.header_grad_angle, BRAND_GRADIENT_ANGLE_DEFAULTS.header_grad_angle);
+  const button = grad(c.button_grad_from, c.button_grad_to, c.button_grad_angle, BRAND_GRADIENT_ANGLE_DEFAULTS.button_grad_angle);
+  const background = grad(c.bg_grad_from, c.bg_grad_to, c.bg_grad_angle, BRAND_GRADIENT_ANGLE_DEFAULTS.bg_grad_angle);
+  if (header) {out.header = header;}
+  if (button) {out.button = button;}
+  if (background) {out.background = background;}
+  return out;
+}
+
 // The live/legacy split + option lists + preset scheme metadata, returned by
 // GetRestaurantSettings and SetRestaurantSettings so both editors read it all
 // from one place instead of hardcoding any of it.
@@ -550,6 +667,13 @@ export interface BrandFieldMeta {
   brand_color_fields: string[];
   brand_field_defaults: Record<string, string>;
   brand_schemes: BrandSchemeMeta[];
+  /**
+   * The gradient surfaces and the exact keys each one is edited through, so the
+   * editors (web + app) BUILD their gradient controls from this table instead of
+   * hardcoding key names — a surface added here grows a control everywhere
+   * without a client hardcoding a thing.
+   */
+  brand_gradient_fields: { id: string; label: string; from: string; to: string; angle: string; angle_default: number }[];
 }
 
 export function brandFieldMeta(): BrandFieldMeta {
@@ -584,7 +708,17 @@ export function brandFieldMeta(): BrandFieldMeta {
       scheme: "classic",
       font_scale: "medium",
       card_shape: "rounded",
+      // Angles only: the stops have NO default on purpose — an absent gradient
+      // is the contract for "render the shipped derived wash".
+      header_grad_angle: String(BRAND_GRADIENT_ANGLE_DEFAULTS.header_grad_angle),
+      button_grad_angle: String(BRAND_GRADIENT_ANGLE_DEFAULTS.button_grad_angle),
+      bg_grad_angle: String(BRAND_GRADIENT_ANGLE_DEFAULTS.bg_grad_angle),
     },
     brand_schemes: BRAND_SCHEMES.map((s) => ({ ...s, preview: { ...s.preview } })),
+    brand_gradient_fields: [
+      { id: "header", label: "Header wash", from: "header_grad_from", to: "header_grad_to", angle: "header_grad_angle", angle_default: BRAND_GRADIENT_ANGLE_DEFAULTS.header_grad_angle },
+      { id: "button", label: "Buttons", from: "button_grad_from", to: "button_grad_to", angle: "button_grad_angle", angle_default: BRAND_GRADIENT_ANGLE_DEFAULTS.button_grad_angle },
+      { id: "background", label: "Page background", from: "bg_grad_from", to: "bg_grad_to", angle: "bg_grad_angle", angle_default: BRAND_GRADIENT_ANGLE_DEFAULTS.bg_grad_angle },
+    ],
   };
 }

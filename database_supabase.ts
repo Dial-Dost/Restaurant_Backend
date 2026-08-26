@@ -47,6 +47,7 @@ import {
   BRAND_CLEARABLE_ENUM_KEYS,
   BRAND_COLOR_KEYS,
   BRAND_FONTS,
+  BRAND_GRADIENT_KEYS,
   BRAND_HEX_RE,
   BRAND_PALETTE_REV,
   brandFieldMeta,
@@ -23101,6 +23102,12 @@ export async function SetBranding(
     // BRAND_CLEARABLE_ENUM_KEYS.
     clearKeys.push(...BRAND_CLEARABLE_ENUM_KEYS.filter(
       (k) => k in rawInput && typeof (sanitized as Record<string, unknown>)[k] !== "string",
+    ));
+    // Gradient keys too: sent-but-invalid (null included) DELETES the stored
+    // key. Absent must stay absent — a cleared gradient tenant renders the
+    // shipped derived wash again and follows any future evolution of it.
+    clearKeys.push(...BRAND_GRADIENT_KEYS.filter(
+      (k) => k in rawInput && (sanitized as Record<string, unknown>)[k] === undefined,
     ));
 
     // FIRST opt-in only: tenants carry colour values from the old (pre-dark)
