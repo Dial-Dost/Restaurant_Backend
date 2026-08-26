@@ -45,6 +45,26 @@ import {
 export { round2, computeBillTaxes, computeBillCharges, computeCouponDiscount, computeBillSplit } from "./billing_math.js";
 export type { BillTaxLine, BillDiscount } from "./billing_math.js";
 import { SIM_WINDOW_DAYS, type SimulationRawStats } from "./simulation_math.js";
+import {
+  computeStockStatus,
+  inventoryStatusOf,
+  parseUnit,
+  sanitizeReorderLevel,
+  type InventoryStatus,
+  type ReorderLevel,
+  type ThresholdBasis,
+} from "./inventory_units.js";
+// Re-exported so route/handler code and tests reach the ONE unit-aware stock
+// rule through the data layer rather than growing a second copy of it.
+export {
+  computeStockStatus,
+  convertQuantity,
+  inventoryStatusOf,
+  parseUnit,
+  DEFAULT_REORDER_BASE,
+  LEGACY_LOW_STOCK_THRESHOLD,
+} from "./inventory_units.js";
+export type { InventoryStatus, ReorderLevel, ThresholdBasis, UnitDimension } from "./inventory_units.js";
 import { logger } from "./observability.js";
 
 export const CORE_ROLES = {
@@ -538,8 +558,18 @@ export interface InventoryItemRecord {
   category: string;
   stock: number;
   unit: string;
-  status: "In Stock" | "Low Stock" | "Out of Stock";
+  status: InventoryStatus;
   expiry_date: string | null; // "YYYY-MM-DD" when set
+  /** Reorder level the OWNER set, in `reorder_unit`; null = none set. */
+  reorder_level: number | null;
+  /** Unit `reorder_level` is denominated in (normally the item's own unit). */
+  reorder_unit: string | null;
+  /** The threshold actually applied, in the ITEM'S unit — what `status` was
+   *  decided against. Clients render this so a badge is always explicable. */
+  reorder_applied: number;
+  /** Where `reorder_applied` came from: the item, the per-dimension default,
+   *  or the legacy `< 10` rule for a unit we cannot classify. */
+  reorder_basis: ThresholdBasis;
 }
 
 export interface MenuItemRecord {
@@ -950,31 +980,65 @@ function parseEmployeeRoles(raw: unknown): EmployeeRolesPayload {
   };
 }
 
-function inventoryStatusFromStock(stock: number): InventoryItemRecord["status"] {
-  if (stock <= 0) {return "Out of Stock";}
-  if (stock < 10) {return "Low Stock";}
-  return "In Stock";
+// Per-item inventory metadata as stored. "Inventory" has no unit, reorder or
+// threshold COLUMN — the schema is (barcode, res_id, outlet_id) + name +
+// "Quantity" + description — so `unit` has always lived in this JSON blob, and
+// the reorder level now lives beside it. A column would need a migration, and
+// this pipeline refuses to deploy while one is pending; the blob costs nothing
+// and keeps the level next to the unit that gives it meaning.
+interface InventoryMeta {
+  category: string;
+  unit: string;
+  reorder_level: number | null;
+  reorder_unit: string | null;
 }
 
-function encodeInventoryDescription(payload: { category?: string; unit?: string }): string {
-  return JSON.stringify({
+const DEFAULT_INVENTORY_META = (): InventoryMeta => ({ category: "General", unit: "pcs", reorder_level: null, reorder_unit: null });
+
+function encodeInventoryDescription(payload: { category?: string; unit?: string; reorder_level?: number | null; reorder_unit?: string | null }): string {
+  const unit = payload.unit?.trim() || "pcs";
+  const level = sanitizeReorderLevel(payload.reorder_level);
+  const out: Record<string, unknown> = {
     category: payload.category?.trim() || "General",
-    unit: payload.unit?.trim() || "pcs",
-  });
+    unit,
+  };
+  // Written only when set, so an item without a level round-trips to exactly
+  // the two-key blob every existing row already holds.
+  if (level != null) {
+    out.reorder_level = level;
+    out.reorder_unit = (payload.reorder_unit ?? "").toString().trim() || unit;
+  }
+  return JSON.stringify(out);
 }
 
-function parseInventoryDescription(description: string | null): { category: string; unit: string } {
+function parseInventoryDescription(description: string | null): InventoryMeta {
   if (!description) {
-    return { category: "General", unit: "pcs" };
+    return DEFAULT_INVENTORY_META();
   }
   const parsed = parseJsonObject(description);
   if (!parsed) {
-    return { category: "General", unit: "pcs" };
+    return DEFAULT_INVENTORY_META();
   }
+  const unit = String(parsed.unit ?? "pcs") || "pcs";
+  const level = sanitizeReorderLevel(parsed.reorder_level);
   return {
     category: String(parsed.category ?? "General") || "General",
-    unit: String(parsed.unit ?? "pcs") || "pcs",
+    unit,
+    reorder_level: level,
+    // A stored level with no stored unit predates nothing — it simply means the
+    // level was typed in the item's own unit, which is how the forms present it.
+    reorder_unit: level == null ? null : (String(parsed.reorder_unit ?? "").trim() || unit),
   };
+}
+
+/** The reorder level of a row, in the shape the units module compares against. */
+function reorderOf(meta: InventoryMeta): ReorderLevel | null {
+  return meta.reorder_level == null ? null : { value: meta.reorder_level, unit: meta.reorder_unit };
+}
+
+/** THE stock rule, for every caller in this file. Delegates to inventory_units. */
+function inventoryStatusFromRow(quantity: unknown, meta: InventoryMeta): ReturnType<typeof computeStockStatus> {
+  return computeStockStatus(quantity, meta.unit, reorderOf(meta));
 }
 
 export interface MenuModifierGroup {
@@ -7289,16 +7353,26 @@ export async function GetInventoryItems(restaurantId: string): Promise<Inventory
   );
 
   return rows.map((row) => {
-    const qty = Math.max(0, Math.round(parseNumeric(row.quantity)));
+    // NOT rounded. Stock is a numeric column and the movement endpoints
+    // (receive/wastage/issue) already write fractions; rounding on read turned
+    // 2.5 kg into "3 kg" and 0.4 kg into "0" -- i.e. into "Out of Stock". That
+    // was survivable while everything was counted in whole pieces and is not
+    // survivable now that a kg/litre item's whole working range is fractional.
+    const qty = Math.max(0, parseNumeric(row.quantity));
     const meta = parseInventoryDescription(row.description);
+    const verdict = inventoryStatusFromRow(qty, meta);
     return {
       id: row.barcode,
       name: row.name,
       category: meta.category,
       stock: qty,
       unit: meta.unit,
-      status: inventoryStatusFromStock(qty),
+      status: verdict.status,
       expiry_date: formatDateOnly(row.expiry_date),
+      reorder_level: meta.reorder_level,
+      reorder_unit: meta.reorder_unit,
+      reorder_applied: verdict.threshold,
+      reorder_basis: verdict.basis,
     };
   });
 }
@@ -7332,10 +7406,34 @@ export async function UpsertInventoryItem(
     category?: string;
     stock: number;
     unit?: string;
+    /** undefined = leave whatever is stored alone; null = clear it. */
+    reorder_level?: number | null;
+    reorder_unit?: string | null;
   },
 ): Promise<{ id: string }> {
   const context = await requireRestaurantContext(restaurantId);
   const barcode = (item.id?.trim() || randomUUID()).slice(0, 128);
+
+  // MERGE, never blind-overwrite. `description` is one JSON blob holding
+  // category + unit + reorder level, and this upsert replaces it wholesale: a
+  // caller that does not send `reorder_level` (every client built before this
+  // field existed) would otherwise silently wipe a level the owner set. Same
+  // failure mode as the full-menu replace that once erased 56 items' images and
+  // recipes, so it gets the same treatment -- read the stored blob first and
+  // only change the keys this call actually carries.
+  let stored: InventoryMeta | null = null;
+  if (item.id?.trim()) {
+    const existing = await runQuery<{ description: string | null }>(
+      `select description from "Inventory" where res_id = $1 and outlet_id = $2 and barcode = $3 limit 1`,
+      [context.res_id, context.outlet_id, barcode],
+    );
+    if (existing.length > 0) {stored = parseInventoryDescription(existing[0]!.description);}
+  }
+  const unit = item.unit?.trim() || stored?.unit || "pcs";
+  const reorderLevel = item.reorder_level === undefined ? (stored?.reorder_level ?? null) : item.reorder_level;
+  const reorderUnit = item.reorder_level === undefined
+    ? (stored?.reorder_unit ?? null)
+    : (item.reorder_unit ?? unit);
 
   await runQuery(
     `
@@ -7354,12 +7452,66 @@ export async function UpsertInventoryItem(
       item.name.trim(),
       context.res_id,
       context.outlet_id,
-      encodeInventoryDescription({ category: item.category, unit: item.unit }),
-      Math.max(0, Math.round(item.stock)),
+      encodeInventoryDescription({ category: item.category ?? stored?.category, unit, reorder_level: reorderLevel, reorder_unit: reorderUnit }),
+      // Fractions kept (see GetInventoryItems): 2.5 kg is a real level, and
+      // rounding it here silently moved stock the owner never moved.
+      Math.max(0, parseNumeric(item.stock)),
     ],
   );
 
   return { id: barcode };
+}
+
+/**
+ * Set (or clear, with null) ONE item's reorder level, without touching its
+ * quantity.
+ *
+ * Deliberately separate from UpsertInventoryItem: that path writes "Quantity"
+ * from the form, so reusing it to change a threshold would stamp a stale stock
+ * figure over any receive/wastage/issue that landed while the dialog was open.
+ * A threshold edit must never move stock. Mirrors SetInventoryExpiry, which
+ * exists for the same reason.
+ *
+ * The level is stored in the item's OWN unit unless a unit is given, and a unit
+ * from another dimension is rejected loudly rather than stored to be silently
+ * ignored later.
+ */
+export async function SetInventoryReorderLevel(
+  restaurantId: string,
+  inventoryId: string,
+  reorderLevel: number | null,
+  reorderUnit?: string | null,
+): Promise<{ success: true; reorder_level: number | null; reorder_unit: string | null }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const id = inventoryId.trim();
+  const rows = await runQuery<{ description: string | null }>(
+    `select description from "Inventory" where res_id = $1 and outlet_id = $2 and barcode = $3 limit 1`,
+    [context.res_id, context.outlet_id, id],
+  );
+  if (rows.length === 0) {throw new Error("Inventory item not found");}
+  const meta = parseInventoryDescription(rows[0]!.description);
+
+  const level = reorderLevel == null ? null : sanitizeReorderLevel(reorderLevel);
+  if (reorderLevel != null && level == null) {
+    throw new Error("reorder_level must be a positive number");
+  }
+  const unit = (reorderUnit ?? "").toString().trim() || meta.unit;
+  if (level != null) {
+    const itemDim = parseUnit(meta.unit).dimension;
+    const levelDim = parseUnit(unit).dimension;
+    // Only a genuine cross-dimension request is refused. An unclassifiable unit
+    // on either side is fine as long as the two spellings match -- "3 handfuls"
+    // against "5 handfuls" is a sound comparison and the units module makes it.
+    if (itemDim !== "unknown" && levelDim !== "unknown" && itemDim !== levelDim) {
+      throw new Error(`Reorder level in ${unit} cannot be compared with stock in ${meta.unit}`);
+    }
+  }
+
+  await runQuery(
+    `update "Inventory" set description = $4 where res_id = $1 and outlet_id = $2 and barcode = $3`,
+    [context.res_id, context.outlet_id, id, encodeInventoryDescription({ category: meta.category, unit: meta.unit, reorder_level: level, reorder_unit: unit })],
+  );
+  return { success: true, reorder_level: level, reorder_unit: level == null ? null : unit };
 }
 
 export async function DeleteInventoryItem(
@@ -9530,6 +9682,11 @@ function overviewMetric(value: number, previous: number, windowDays: number): Ov
 
 const ATTENTION_ITEM_CAP = 4;
 
+// How far ahead the expiring-soon bucket looks. Was inlined in the stock query
+// as `expiry_date <= $3::date + 7`; now that bucketing happens in TypeScript it
+// lives here so the window is stated once.
+const ATTENTION_EXPIRING_DAYS = 7;
+
 // Grouping only — no currency symbol. The client knows the restaurant's currency;
 // the server does not want to bake one into a display string.
 const attentionMoneyFormat = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 });
@@ -9565,18 +9722,14 @@ const ATTENTION_SEVERITY_RANK: Record<AttentionRow["severity"], number> = { high
 export interface AttentionStockRow {
   barcode: string;
   name: string;
-  /** JSON blob holding category/unit — there is no `unit` column on Inventory. */
+  /** JSON blob holding category, unit and the per-item reorder level — none of
+   *  the three is a COLUMN on Inventory, which is why bucketing cannot happen
+   *  in SQL (see buildNeedsAttention). */
   description: string | null;
   qty: number | string;
-  /** Which sub-signal this row belongs to. The three are DISJOINT and each is
-   *  capped independently, so a bucket's count and its named offenders always
-   *  come from the same set of rows. */
-  bucket: "low" | "expired" | "expiring";
   /** Days relative to the RESTAURANT's today (negative = already expired).
-   *  Null only for a low-stock row with no expiry date. */
+   *  Null when the item carries no expiry date at all. */
   days_to_expiry: number | string | null;
-  /** Size of this row's whole bucket, counted before the per-bucket cap. */
-  bucket_count: number | string;
 }
 
 export interface AttentionDiscountRow {
@@ -9636,7 +9789,8 @@ export function buildNeedsAttention(sources: AttentionSources): AttentionRow[] {
 
   // --- Stock -----------------------------------------------------------------
   // Three rows, deliberately DISJOINT, in strict precedence expired > low >
-  // expiring (the bucket CASE in the stock query is ordered to match):
+  // expiring (applied by the bucketing loop below — it used to be a CASE in the
+  // stock query, which could not see a unit and so could not judge "low"):
   //   • an item that is both low and expiring SOON is reported once, as low,
   //     because restocking it also resolves the expiry. Until now the "low on
   //     stock" count included expiring-but-well-stocked items, a plain mislabel;
@@ -9655,10 +9809,42 @@ export function buildNeedsAttention(sources: AttentionSources): AttentionRow[] {
   //
   // Each bucket carries its OWN count, taken from its own rows, so the count and
   // the named offenders can never come from different sets.
-  const stockOf = (bucket: AttentionStockRow["bucket"]): AttentionStockRow[] =>
-    sources.stock.filter((r) => r.bucket === bucket);
-  const stockCount = (bucketRows: AttentionStockRow[]): number =>
-    Math.max(bucketRows.length, Math.round(parseNumeric(bucketRows[0]?.bucket_count)));
+  // WHERE THE BUCKETING HAPPENS, AND WHY IT MOVED OUT OF SQL.
+  //
+  // "Low" is not a fact about a number, it is a fact about a quantity AND its
+  // unit AND that item's reorder level — and the unit and the level both live
+  // inside the `description` JSON blob, invisible to a SQL predicate. The old
+  // `"Quantity"::numeric <= 5` therefore called 5000 mg of potato (five grams)
+  // perfectly stocked and 5 kg of the same potato "low", and it disagreed with
+  // the inventory page's own `< 10` on top of that. Two copies of one rule, both
+  // unit-blind.
+  //
+  // Now the query hands over the tenant's stock rows and ONE rule
+  // (inventory_units.computeStockStatus, the same call the inventory list and
+  // the Supply KPI make) decides here. The counts are exact because every row is
+  // present — no window function needed — and the feed can no longer contradict
+  // the page it links to.
+  interface BucketedStock { row: AttentionStockRow; days: number | null; ratio: number }
+  const buckets: Record<"low" | "expired" | "expiring", BucketedStock[]> = { low: [], expired: [], expiring: [] };
+  for (const row of sources.stock) {
+    const meta = parseInventoryDescription(row.description);
+    const verdict = inventoryStatusFromRow(row.qty, meta);
+    const rawDays = row.days_to_expiry;
+    const days = rawDays === null || rawDays === undefined || !Number.isFinite(Number(rawDays))
+      ? null
+      : Math.round(parseNumeric(rawDays));
+    // Precedence expired > low > expiring, unchanged (see the note above).
+    if (days !== null && days < 0) {
+      buckets.expired.push({ row, days, ratio: verdict.ratio });
+    } else if (verdict.status !== "In Stock") {
+      buckets.low.push({ row, days, ratio: verdict.ratio });
+    } else if (days !== null && days <= ATTENTION_EXPIRING_DAYS) {
+      buckets.expiring.push({ row, days, ratio: verdict.ratio });
+    }
+  }
+  const stockOf = (bucket: "low" | "expired" | "expiring"): AttentionStockRow[] =>
+    buckets[bucket].map((b) => b.row);
+  const stockCount = (bucketRows: AttentionStockRow[]): number => bucketRows.length;
 
   // Null/absent expiry (or an unparseable one) yields null, not "expires in NaN
   // days" — a low row is allowed to have no expiry date at all.
@@ -9671,8 +9857,13 @@ export function buildNeedsAttention(sources: AttentionSources): AttentionRow[] {
   };
 
   const lowRows = stockOf("low");
+  // Ranked by how far below its OWN reorder level each item has fallen, not by
+  // raw quantity. Sorting a mixed-unit list by the bare number is the original
+  // bug in a different costume: it puts "3 kg" (nearly out) below "5000 mg"
+  // (five grams, effectively gone) purely because 3 < 5000.
+  const lowRatio = new Map(buckets.low.map((b) => [b.row, b.ratio]));
   const lowItems = lowRows
-    .sort((a, b) => parseNumeric(a.qty) - parseNumeric(b.qty))
+    .sort((a, b) => (lowRatio.get(a) ?? 0) - (lowRatio.get(b) ?? 0) || String(a.name ?? "").localeCompare(String(b.name ?? "")))
     .slice(0, ATTENTION_ITEM_CAP)
     .map<AttentionItem>((r) => {
       const qty = parseNumeric(r.qty);
@@ -10064,7 +10255,10 @@ export async function GetOverviewInsights(restaurantId: string, days = 30): Prom
   // "and N more" stays truthful while only 4 rows cross the wire. Where one read
   // feeds several rows, both the cap and the count are PER sub-signal — a shared
   // cap let the loudest signal use up every slot and leave another signal with a
-  // count but nobody to name.
+  // count but nobody to name. The STOCK read is the exception: its buckets depend
+  // on each item's unit and reorder level, which live in a JSON blob no SQL
+  // predicate can read, so it returns every row uncapped and buildNeedsAttention
+  // counts and caps there instead (exactly, not by window estimate).
   const og = isAllOutlets() ? "true" : "false";
   await ensureInventoryExpiryColumn();
   // Orders carry no total column — the figure exists only inside the food json.
@@ -10075,12 +10269,21 @@ export async function GetOverviewInsights(restaurantId: string, days = 30): Prom
   const attentionParams = [context.res_id, context.outlet_id];
 
   const [stockRows, discountRows, billRows, orderRows] = await Promise.all([
-    // Threshold 5 mirrors the Supply KPI (GetAdvancedAnalytics), so the Overview
-    // can never claim a different number than the page it links to. There is no
-    // reorder-level column anywhere in the schema to replace the hardcoded 5,
-    // and inventoryStatusFromStock() independently calls anything under 10 "Low
-    // Stock" — a disagreement worth knowing about but not worth widening here.
-    // `unit` is not a column either: it lives in the `description` JSON blob.
+    // NO bucketing, NO threshold and NO cap in SQL any more. Whether an item is
+    // low depends on its unit and its reorder level, and BOTH live inside the
+    // `description` JSON blob — there is no unit, reorder or threshold column
+    // anywhere in the schema — so a SQL predicate physically cannot decide it.
+    // The old `"Quantity"::numeric <= 5` here (and the `< 10` on the inventory
+    // page) were two unit-blind copies of one rule that disagreed with each
+    // other; buildNeedsAttention now classifies every row through the single
+    // rule in inventory_units, which also makes the per-bucket counts exact
+    // instead of window-function estimates taken before a cap.
+    //
+    // This reads the tenant's whole stock list rather than a filtered slice.
+    // The previous predicate was non-sargable anyway (a cast on "Quantity"), so
+    // the scan is the same one; only the rows crossing the wire grow, and a
+    // restaurant holds tens to a few hundred SKUs, not millions.
+    //
     // $3 is the RESTAURANT's today, not the server's. `current_date` is the
     // session's date (this server runs in UTC), so through the tenant's own late
     // shift — 00:00-05:30 IST is still yesterday in UTC — stock expiring today
@@ -10088,38 +10291,11 @@ export async function GetOverviewInsights(restaurantId: string, days = 30): Prom
     // from its IANA zone above, so it is passed down rather than recomputed with
     // `at time zone`, which would depend on Postgres's zone catalog agreeing with
     // Intl's.
-    //
-    // One read, three disjoint buckets, each counted and capped on its own (see
-    // buildNeedsAttention for why expired is not folded into expiring).
     runQuery<AttentionStockRow>(
-      `select * from (
-         select barcode, name, description, "Quantity"::float as qty, bucket,
-                (expiry_date - $3::date)::int as days_to_expiry,
-                count(*) over (partition by bucket)::int as bucket_count,
-                row_number() over (
-                  partition by bucket
-                  order by case when bucket = 'low' then "Quantity"::numeric end asc nulls last,
-                           expiry_date asc nulls last, name asc
-                ) as rn
-           from (
-             select i.*,
-                    -- Expiry is tested FIRST. Testing quantity first filed every
-                    -- already-expired item that was also nearly gone under "low
-                    -- on stock" — so the "past their expiry date" row was not a
-                    -- count of expired stock, and the owner was shown "2 kg left"
-                    -- next to a reorder link for something that has to be thrown
-                    -- out. Low still beats expiring-soon (restocking resolves
-                    -- that one), but nothing outranks already expired.
-                    case when i.expiry_date < $3::date then 'expired'
-                         when i."Quantity"::numeric <= 5 then 'low'
-                         else 'expiring' end as bucket
-               from "Inventory" i
-              where i.res_id = $1 and (${og} or i.outlet_id = $2)
-                and (i."Quantity"::numeric <= 5
-                     or (i.expiry_date is not null and i.expiry_date <= $3::date + 7))
-           ) f
-       ) x where x.rn <= ${ATTENTION_ITEM_CAP}
-       order by x.bucket, x.rn`,
+      `select barcode, name, description, "Quantity"::float as qty,
+              (expiry_date - $3::date)::int as days_to_expiry
+         from "Inventory"
+        where res_id = $1 and (${og} or outlet_id = $2)`,
       [...attentionParams, todayKey],
     ),
     // outlet_id is NULLABLE on DiscountRequests (unlike Bills/Orders), so a
@@ -11058,7 +11234,6 @@ export async function UpdateOrderItemsSplit(
   return true;
 }
 
-const LOW_STOCK_THRESHOLD = 5;
 // Auto-deduct inventory for sold items per their menu recipe; notify on low stock.
 async function consumeInventory(restaurantId: string, context: RestaurantContext, soldItems: unknown[]): Promise<void> {
   if (!Array.isArray(soldItems) || soldItems.length === 0) {return;}
@@ -11080,24 +11255,37 @@ async function consumeInventory(restaurantId: string, context: RestaurantContext
   // order transaction, which lengthened lock-hold time with menu complexity).
   const invIds = [...deltas.keys()];
   const amounts = invIds.map((k) => deltas.get(k) ?? 0);
-  const rows = await runQuery<{ name: string; quantity: number; inv_id: string; delta: number }>(
+  // `description` rides along because the low test needs the item's unit and
+  // reorder level, and neither is a column.
+  type DeductedRow = { name: string; quantity: number; inv_id: string; delta: number; description: string | null };
+  const rows = await runQuery<DeductedRow>(
     `update "Inventory" inv
         set "Quantity" = greatest(0, coalesce(inv."Quantity", 0) - d.delta)
        from unnest($1::text[], $2::numeric[]) as d(inv_id, delta)
       where inv.barcode = d.inv_id and inv.res_id = $3 and inv.outlet_id = $4
-      returning inv.name as name, inv."Quantity" as quantity, d.inv_id as inv_id, d.delta as delta`,
+      returning inv.name as name, inv."Quantity" as quantity, inv.description as description,
+                d.inv_id as inv_id, d.delta as delta`,
     [invIds, amounts, context.res_id, context.outlet_id],
-  ).catch(() => [] as { name: string; quantity: number; inv_id: string; delta: number }[]);
+  ).catch(() => [] as DeductedRow[]);
   for (const row of rows) {
     const newQty = parseNumeric(row.quantity);
     const delta = parseNumeric(row.delta);
-    // Notify only when crossing below the threshold (avoids per-order spam).
-    if (newQty <= LOW_STOCK_THRESHOLD && newQty + delta > LOW_STOCK_THRESHOLD) {
+    const meta = parseInventoryDescription(row.description);
+    // Same rule as the badge and the concerns feed, applied on both sides of the
+    // deduction, so the ping fires exactly when the item CROSSES into low and
+    // never once per order after that. The bare `<= 5` this replaces was
+    // unit-blind: it stayed silent as a mg-denominated item drained to nothing
+    // and pinged every kg-denominated item that was perfectly well stocked.
+    const after = inventoryStatusFromRow(newQty, meta);
+    const before = inventoryStatusFromRow(newQty + delta, meta);
+    if (after.status !== "In Stock" && before.status === "In Stock") {
       try {
         await AddNotification(restaurantId, {
           type: "stock",
           title: `Low stock: ${row.name}`,
-          body: `${Math.round(newQty)} left — reorder soon`,
+          // States the level it fell under, in the item's own unit, so the ping
+          // explains itself instead of asserting a bare number.
+          body: `${fmtAttentionQty(newQty)} ${meta.unit} left (reorder at ${fmtAttentionQty(after.threshold)} ${meta.unit})`,
           meta: { inventory_id: row.inv_id },
         });
       } catch {/* ignore */}
@@ -20136,23 +20324,38 @@ export async function GetAdvancedAnalytics(
   // "Today" is the restaurant's day, not the UTC session's `current_date` — the
   // Overview expiry panel already takes the day key as a parameter for exactly
   // this reason, and the two panels have to agree.
-  const stockRows = await runQuery<{ name: string; qty: number; low: boolean; expiring: boolean; expiry_date: unknown }>(
-    `select name, "Quantity"::float qty,
-            ("Quantity"::numeric <= 5) as low,
+  // `low` is no longer a SQL predicate. It depends on the item's unit and its
+  // reorder level, both of which sit inside the `description` JSON blob, so the
+  // read hands over the tenant's stock and the SAME rule the inventory badge and
+  // the Overview feed use decides here. Without this the Supply KPI counted
+  // 5 kg of potato as low and 5000 mg of it as fine.
+  const stockRows = await runQuery<{ barcode: string; name: string; qty: number; description: string | null; expiring: boolean; expiry_date: unknown }>(
+    `select barcode, name, "Quantity"::float qty, description,
             (expiry_date is not null and expiry_date <= $3::date + 7) as expiring,
             expiry_date
        from "Inventory"
-       where res_id=$1 and (${og} or outlet_id=$2)
-         and ("Quantity"::numeric <= 5 or (expiry_date is not null and expiry_date <= $3::date + 7))
-       order by "Quantity"::numeric asc limit 40`,
+       where res_id=$1 and (${og} or outlet_id=$2)`,
     [rid, oid, dayKeyOf(new Date(), context.timezone)],
   );
-  const stock_alerts = stockRows.map((r) => ({
-    name: r.name,
-    qty: r.qty,
-    ...(r.expiring ? { expiring: true as const, expiry_date: formatDateOnly(r.expiry_date) } : {}),
-  }));
-  const lowStockCount = stockRows.filter((r) => r.low).length;
+  const stockJudged = stockRows.map((r) => {
+    const meta = parseInventoryDescription(r.description);
+    const verdict = inventoryStatusFromRow(r.qty, meta);
+    return { row: r, meta, low: verdict.status !== "In Stock", ratio: verdict.ratio };
+  });
+  const lowStockCount = stockJudged.filter((r) => r.low).length;
+  // Alerts keep their old contract (low OR expiring-soon, worst first, 40 max).
+  // "Worst" is now the ratio to the item's own reorder level rather than the raw
+  // quantity — across mixed units the bare number ranks nothing meaningfully.
+  const stock_alerts = stockJudged
+    .filter((r) => r.low || r.row.expiring)
+    .sort((a, b) => a.ratio - b.ratio)
+    .slice(0, 40)
+    .map((r) => ({
+      name: r.row.name,
+      qty: r.row.qty,
+      unit: r.meta.unit,
+      ...(r.row.expiring ? { expiring: true as const, expiry_date: formatDateOnly(r.row.expiry_date) } : {}),
+    }));
 
   // --- Food cost: actual issuance vs revenue, and vs theoretical recipe cost ---
   // Actual = Σ |issued qty| × snapshotted unit cost in the window (kind='issue').

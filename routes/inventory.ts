@@ -3,7 +3,7 @@
  * and category renames.
  */
 import type { Express, Request, Response } from "express";
-import { Audit_log_category, DeleteInventoryItem, GetInventoryItems, GetRestaurantSettings, GetStockMovements, GetVendorPriceHistory, ISSUE_STOCK_ACTION_ID, IssueStock, ReceiveStock, RecordWastage, RenameInventoryCategory, SetInventoryExpiry, SetRestaurantSettings, UpsertInventoryItem } from "../database_supabase.js";
+import { Audit_log_category, DeleteInventoryItem, GetInventoryItems, GetRestaurantSettings, GetStockMovements, GetVendorPriceHistory, ISSUE_STOCK_ACTION_ID, IssueStock, ReceiveStock, RecordWastage, RenameInventoryCategory, SetInventoryExpiry, SetInventoryReorderLevel, SetRestaurantSettings, UpsertInventoryItem } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { INV_MANAGE, INV_VIEW, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
 
@@ -86,6 +86,21 @@ app.post("/inventory", validateAction("dfe2cde8-c159-4685-b015-ec7b0d4386eb"), a
 		return;
 	}
 
+	// `reorder_level` is tri-state on purpose and must stay that way: ABSENT means
+	// "leave whatever is stored alone" (every client built before this field
+	// existed sends nothing, and must not wipe a level the owner set), null means
+	// "clear it", a number means "set it". The data layer merges on the same
+	// three cases.
+	const hasReorder = Object.prototype.hasOwnProperty.call(body, "reorder_level");
+	const rawReorder = body.reorder_level;
+	const reorderLevel = !hasReorder
+		? undefined
+		: (rawReorder === null || rawReorder === "" ? null : Number(rawReorder));
+	if (reorderLevel !== undefined && reorderLevel !== null && !(Number.isFinite(reorderLevel) && reorderLevel > 0)) {
+		res.status(400).json({ error: "reorder_level must be a positive number or null" });
+		return;
+	}
+
 	try {
 		const result = await UpsertInventoryItem(restaurantId, {
 			id: typeof body.id === "string" ? body.id : undefined,
@@ -93,6 +108,8 @@ app.post("/inventory", validateAction("dfe2cde8-c159-4685-b015-ec7b0d4386eb"), a
 			category: typeof body.category === "string" ? body.category : undefined,
 			stock,
 			unit: typeof body.unit === "string" ? body.unit : undefined,
+			...(reorderLevel === undefined ? {} : { reorder_level: reorderLevel }),
+			...(typeof body.reorder_unit === "string" ? { reorder_unit: body.reorder_unit } : {}),
 		});
 		await log_audit(req, "dfe2cde8-c159-4685-b015-ec7b0d4386eb", `Upserted inventory item ${name} with stock ${stock}`, Audit_log_category.Inventory);
 		res.status(201).json(result);
@@ -178,6 +195,32 @@ app.post("/inventory/expiry", validateAction(INV_MANAGE), async (req: Request, r
 		try { await log_audit(req, INV_MANAGE, expiry ? `Set expiry ${expiry}` : "Cleared expiry", Audit_log_category.Inventory, { inventory_id }); } catch {/* ignore */}
 		res.json({ success: true });
 	} catch (e: any) { logger.error({ err: e }, "set_expiry_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to set expiry") }); }
+});
+// Set (or clear, with null) ONE item's reorder level. Separate from
+// POST /inventory because that route writes "Quantity" from the form: routing a
+// threshold edit through it would stamp a stale stock figure over any
+// receive/wastage/issue that landed while the dialog was open. Mirrors
+// /inventory/expiry, which is separate for exactly the same reason.
+app.post("/inventory/reorder-level", validateAction(INV_MANAGE), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const b = (req.body ?? {}) as Record<string, unknown>;
+	const inventory_id = typeof b.inventory_id === "string" ? b.inventory_id.trim() : "";
+	if (!inventory_id) { res.status(400).json({ error: "inventory_id is required" }); return; }
+	const raw = b.reorder_level;
+	const level = raw === null || raw === undefined || raw === "" ? null : Number(raw);
+	if (level !== null && !(Number.isFinite(level) && level > 0)) {
+		res.status(400).json({ error: "reorder_level must be a positive number or null" });
+		return;
+	}
+	const unit = typeof b.reorder_unit === "string" ? b.reorder_unit : undefined;
+	try {
+		const r = await SetInventoryReorderLevel(restaurantId, inventory_id, level, unit);
+		try {
+			await log_audit(req, INV_MANAGE, level === null ? "Cleared reorder level" : `Set reorder level ${level} ${r.reorder_unit ?? ""}`.trim(), Audit_log_category.Inventory, { inventory_id });
+		} catch {/* ignore */}
+		res.json(r);
+	} catch (e: any) { logger.error({ err: e }, "set_reorder_level_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to set reorder level") }); }
 });
 app.get("/inventory/movements", validateAction(INV_VIEW), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
