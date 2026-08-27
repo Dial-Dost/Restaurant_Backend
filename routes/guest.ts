@@ -5,12 +5,13 @@
  */
 import type { Express, Request, Response } from "express";
 import { createHmac, randomUUID } from "crypto";
-import { AddBooking, AddNotification, AddOrder, AddWaitlistMember, AllocateBestTable, ApplyCouponToBill, CancelWaitlistByToken, CheckCoupon, ClaimWaitlistPreorder, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, DeletePushSubscription, FinalizeOnlinePayment, GetBillForTable, GetBookingSummaryById, GetMenuCategories, GetMenuItems, GetPublicBranding, GetRestaurantProfile, GetRestaurantSettings, GetWaitlistEntryByToken, JoinWaitlist, SavePushSubscription, SetWaitlistPreorder, SubmitCustomerPayment, UpdateBookingDeposit, VerifyTableOtp, getRestaurantIdFromUsername, parseWallClockInZone, repriceFromMenu, resolveBrandConfig, resolveBrandPalette, withTenant } from "../database_supabase.js";
+import { AddBooking, AddNotification, AddOrder, AddWaitlistMember, AllocateBestTable, ApplyCouponToBill, CancelWaitlistByToken, CheckCoupon, ClaimWaitlistPreorder, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, DeletePushSubscription, FinalizeOnlinePayment, GetBillForTable, GetBookingSummaryById, GetMenuCategories, GetMenuItems, GetPublicBranding, GetQueueMenu, GetRestaurantProfile, GetVisiblePosters, GetRestaurantSettings, GetWaitlistEntryByToken, JoinWaitlist, SavePushSubscription, SetWaitlistPreorder, SubmitCustomerPayment, UpdateBookingDeposit, VerifyTableOtp, getRestaurantIdFromUsername, parseWallClockInZone, repriceFromMenu, badgeCoveredAllergens, resolveBrandConfig, resolveBrandPalette, resolveMenuBadges, withTenant } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { decodeTableToken, verifyTable } from "../qr_signing.js";
 import { emitRestaurant } from "../realtime.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isPushConfigured, pushPublicKey } from "../web_push.js";
+import type { GuestPoster } from "../posters.js";
 import type { CreatedOrderInfo } from "./_shared.js";
 import { GetCustomerIdOrCreateCustomer, emitOrderCreated, feedbackUrlForTable, fetchWithTimeout, linkOrderToCustomer, notifyOrderCreated, optionalMobile10, queueBookingConfirm, rateLimit, refuseGuestWriteIfClosed, requireMobile10, resolveRazorpayKeys, safeClientError, timingSafeStrEqual } from "./_shared.js";
 
@@ -47,12 +48,27 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 	}
 	try {
 		const data = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
-			const [items, categories, profile, branding] = await Promise.all([
+			const [items, categories, profile, branding, posters] = await Promise.all([
 				GetMenuItems(slug),
 				GetMenuCategories(slug),
 				GetRestaurantProfile(slug),
-				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: resolveBrandConfig(null, null, null), brand_palette: resolveBrandPalette(null, null, null) })),
+				GetPublicBranding(slug).catch(() => ({ logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: resolveBrandConfig(null, null, null), brand_palette: resolveBrandPalette(null, null, null), menu_badges: [] })),
+				// Promotional posters, DEGRADING TO NONE on any read failure — the
+				// same shape GetPublicBranding above already uses, and a deliberate
+				// contrast with repriceFromMenu, whose `.catch(() => [])` on the MENU
+				// read is the 2026-08-24 pre-order bug (jest-tests/waitlist_preorder).
+				// The distinction is what the empty value MEANS: an empty menu is a
+				// destroyed order, while no posters is precisely the page every
+				// restaurant without posters already gets. Failing the whole menu load
+				// because a decoration could not be read would be the real regression.
+				GetVisiblePosters(slug).catch((err: unknown) => {
+					logger.warn({ err, slug }, "qr_menu_posters_failed");
+					return [] as GuestPoster[];
+				}),
 			]);
+			// Resolved once for the whole payload, so a dish can never disagree with
+			// the legend rendered above it.
+			const badgeCatalogue = branding.menu_badges ?? [];
 			return {
 				restaurant_name: profile?.restaurant_name ?? slug,
 				logo_url: branding.logo_url,
@@ -74,8 +90,30 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				// null, defaults reproducing the shipped design exactly. Guest pages
 				// should theme from THIS and stop deriving colours themselves.
 				brand_palette: branding.brand_palette,
+				// The tenant's ENABLED badge catalogue (id/label/kind, in tenant order).
+				// Empty for every restaurant that never configured any, which is why an
+				// unconfigured tenant renders no badges at all rather than a shipped
+				// default set. Guest pages map an item's badge ids through this for
+				// labels and styling — see menu_badges.ts.
+				menu_badges: badgeCatalogue,
+				// Allergen tags a derived safety badge already speaks for. The guest card
+				// subtracts these from its plain allergen chip row, so "nuts" is never
+				// printed twice — once loudly as a badge and once quietly as a chip.
+				badge_allergens: badgeCoveredAllergens(badgeCatalogue),
 				categories,
-				items,
+				// Items carry RESOLVED badges: tagged ids filtered to the enabled
+				// catalogue, unioned with the allergen-derived safety badges, ordered
+				// alert -> diet -> promo. Resolved HERE rather than in each guest client
+				// so there is one rule for what a diner is told about a dish.
+				items: items.map((it) => ({
+					...it,
+					badges: resolveMenuBadges(badgeCatalogue, it.badges, it.allergens).map((b) => b.id),
+				})),
+				// OMITTED, not sent as [], when the restaurant has no poster showing
+				// today. That is the contract the tests pin: a tenant without posters
+				// gets the payload it got before this feature existed, byte for byte,
+				// which is the same rule brand_config follows for an absent key.
+				...(posters.length > 0 ? { posters } : {}),
 			};
 		});
 		res.json(data);
@@ -576,6 +614,93 @@ app.post("/qr/:slug/reserve/verify-deposit", rateLimit("qr_reserve", 12, 60_000)
 
 
 export function registerGuestWaitlistAndPaymentRoutes(app: Express): void {
+
+// THE QUEUE PRE-ORDER MENU. Deliberately its own endpoint rather than a block
+// inside /qr/:slug/menu: a dish the kitchen keeps off the pre-order list must be
+// ABSENT from what the queue page is served, while staying fully orderable on
+// the dine-in QR menu — one payload cannot honestly be both. Everything the
+// queue page needs to paint itself ships here (branding + palette + the filtered
+// menu), so it is one round trip, and an older client that still reads
+// /qr/:slug/menu keeps working untouched.
+app.get("/qr/:slug/queue-menu", async (req: Request, res: Response) => {
+	const slug = String(req.params.slug ?? "").trim();
+	let resId: string | null = null;
+	try { resId = await getRestaurantIdFromUsername(slug); } catch { resId = null; }
+	if (!resId) { res.status(404).json({ error: "Restaurant not found" }); return; }
+	try {
+		const data = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
+			// GetPublicBranding already carries res_name, so unlike /qr/:slug/menu
+			// this route does not also load the restaurant profile — the queue page
+			// only needs the display name, and one fewer query is one fewer way for
+			// a guest waiting at the door to see a spinner.
+			const [queue, branding, posters] = await Promise.all([
+				GetQueueMenu(slug),
+				GetPublicBranding(slug).catch(() => ({ restaurant_name: slug, logo_url: null, theme_color: null, theme_primary: null, theme_secondary: null, currency: "₹", payment_methods: [], queue_show_menu: true, require_table_otp: false, brand_config: resolveBrandConfig(null, null, null), brand_palette: resolveBrandPalette(null, null, null), menu_badges: [] })),
+				// Posters, on the SAME terms as /qr/:slug/menu — degrade to none on a
+				// read failure, omit when empty.
+				//
+				// This route is newer than the poster feature, and the queue page
+				// switched its fetch here without the poster dependency coming with
+				// it: the page kept both poster slots and rendered them permanently
+				// empty, because it prefers /queue-menu and only falls back to /menu
+				// on a 404. A guest queuing at the door saw no promotions at all
+				// while the same restaurant's table menu showed them.
+				GetVisiblePosters(slug).catch((err: unknown) => {
+					logger.warn({ err, slug }, "queue_menu_posters_failed");
+					return [] as GuestPoster[];
+				}),
+			]);
+			// Resolved once for the whole payload — see /qr/:slug/menu. A guest
+			// deciding a PRE-ORDER has exactly the same right to "contains nuts" as
+			// one at a table, so the queue payload carries the same badges.
+			const badgeCatalogue = branding.menu_badges ?? [];
+			return {
+				restaurant_name: branding.restaurant_name || slug,
+				logo_url: branding.logo_url,
+				theme_color: branding.theme_color,
+				theme_primary: branding.theme_primary,
+				theme_secondary: branding.theme_secondary,
+				currency: branding.currency,
+				brand_config: branding.brand_config,
+				brand_palette: branding.brand_palette,
+				// The master on/off is still queue_show_menu (branding); the config
+				// below only decides WHAT and HOW once the menu is shown at all.
+				queue_show_menu: queue.queue_show_menu,
+				// PRESENTATION ONLY. The selection lists stay on the server: telling a
+				// guest "menu-3 is excluded" would name a dish they were never shown,
+				// and the ordering is already baked into `categories` below. Absent
+				// keys come back as the shipped defaults, so the page never
+				// null-checks — "" for the copy means "use your own localised line".
+				queue_menu: {
+					headline: queue.config.headline,
+					intro: queue.config.intro,
+					show_prices: queue.config.show_prices,
+				},
+				// Lets the page tell "this restaurant has no menu loaded" (apologise)
+				// apart from "this restaurant deliberately offers nothing to
+				// pre-order" (say nothing at all).
+				configured: queue.configured,
+				// The enabled badge catalogue + the allergen tags a derived badge already
+				// states, exactly as /qr/:slug/menu returns them.
+				menu_badges: badgeCatalogue,
+				badge_allergens: badgeCoveredAllergens(badgeCatalogue),
+				categories: queue.categories,
+				items: queue.items.map((it) => ({
+					...it,
+					badges: resolveMenuBadges(badgeCatalogue, it.badges, it.allergens).map((b) => b.id),
+				})),
+				// Omitted entirely when there are none — the same contract
+				// /qr/:slug/menu uses, so a restaurant without posters gets a
+				// byte-identical payload to the one it gets today.
+				...(posters.length > 0 ? { posters } : {}),
+			};
+		});
+		res.json(data);
+	} catch (err) {
+		logger.error({ err }, "qr_queue_menu_failed");
+		res.status(500).json({ error: "Unable to load menu" });
+	}
+});
 
 // --- Public waitlist / queue (walk-ins, no session) ---
 app.post("/qr/:slug/waitlist/join", rateLimit("waitlist", 12, 60_000), async (req: Request, res: Response) => {

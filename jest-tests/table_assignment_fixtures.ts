@@ -65,18 +65,29 @@ export interface AssignmentFix {
   created_at: Date;
 }
 
+/** One row of "TableSessions". In production these are written by the
+ *  table_sessions_trg DB trigger on every occupy/release, which is why no
+ *  application code inserts them; the fixture writes them at the same two
+ *  moments so clearStaleTableAssignment sees the timeline it sees live. */
+export interface SessionFix {
+  table_id: string;
+  seated_at: Date;
+  left_at: Date | null;
+}
+
 interface Store {
   employees: EmployeeFix[];
   tables: TableFix[];
   attendance: AttendanceFix[];
   /** keyed by table_id — mirrors idx_table_assignments_unique. */
   assignments: Map<string, AssignmentFix>;
+  sessions: SessionFix[];
 }
 
 let store: Store = freshStore();
 
 function freshStore(): Store {
-  return { employees: [], tables: [], attendance: [], assignments: new Map() };
+  return { employees: [], tables: [], attendance: [], assignments: new Map(), sessions: [] };
 }
 
 export function resetStore(): void {
@@ -110,6 +121,39 @@ export function addAttendance(a: Partial<AttendanceFix> & { emp_id: string }): v
 /** Current assignment rows, for assertions. */
 export function assignments(): AssignmentFix[] {
   return [...store.assignments.values()];
+}
+
+/** Seed an assignment row with an EXPLICIT created_at, so a test can place it
+ *  either side of a session's left_at — the one thing that separates a stale
+ *  assignment from a deliberate pre-assignment. */
+export function seedAssignment(tableId: string, employeeId: string, createdAt: Date): void {
+  store.assignments.set(tableId, {
+    id: `seed-${tableId}`,
+    table_id: tableId,
+    employee_id: employeeId,
+    created_at: createdAt,
+  });
+}
+
+/** End a table's occupancy the way the DB trigger does — flip it free and stamp
+ *  left_at on the open session — WITHOUT clearing the assignment. That is
+ *  deliberately a release path that FORGOT to unassign, which is the only way a
+ *  stale assignment can survive into the next party's seating. Modelling the
+ *  forgetful case is the point: the well-behaved paths are already covered by
+ *  UnassignTableEmployee. */
+export function endOccupancy(tableId: string, leftAt: Date): void {
+  const t = store.tables.find((x) => x.id === tableId);
+  if (t) {
+    t.is_occupied = false;
+    t.num_covers = 1;
+    t.linked_order_id = null;
+  }
+  const open = store.sessions.filter((x) => x.table_id === tableId && x.left_at === null).pop();
+  if (open) {
+    open.left_at = leftAt;
+    return;
+  }
+  store.sessions.push({ table_id: tableId, seated_at: new Date(leftAt.getTime() - 3_600_000), left_at: leftAt });
 }
 
 export function assignedEmployeeFor(tableId: string): string | null {
@@ -175,17 +219,39 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
       if (/do\s+update/.test(s)) {
         existing.employee_id = str(employeeId);
         if (s.includes("created_at = now()")) {existing.created_at = new Date();}
+        // `do update` writes a row, so RETURNING yields it.
+        return { rows: s.includes("returning") ? [{ id: existing.id }] : [] };
       }
-      // `do nothing` — keep the existing row untouched.
+      // `do nothing` — keep the existing row untouched, and return ZERO rows.
+      // That empty result is the entire signal assignTableById uses to tell
+      // "this table is now yours" from "someone already has it", so a fixture
+      // that returned the kept row here would hide a real regression.
       return { rows: [] };
     }
-    store.assignments.set(str(tableId), {
+    const row = {
       id: str(id),
       table_id: str(tableId),
       employee_id: str(employeeId),
       created_at: new Date(),
-    });
-    return { rows: [] };
+    };
+    store.assignments.set(str(tableId), row);
+    return { rows: s.includes("returning") ? [{ id: row.id }] : [] };
+  }
+
+  // clearStaleTableAssignment — the stale sweep. Modelled with the REAL rule
+  // (created_at earlier than the last COMPLETED session's left_at) rather than
+  // an unconditional delete, so a test cannot pass because the fixture is more
+  // eager than the SQL: a deliberate pre-assignment made while the table stood
+  // free must survive this branch.
+  if (s.includes('delete from "table_assignments"') && s.includes('"tablesessions"')) {
+    const tableId = str(params[2]);
+    const existing = store.assignments.get(tableId);
+    const lastLeft = store.sessions
+      .filter((x) => x.table_id === tableId && x.left_at !== null)
+      .reduce<Date | null>((max, x) => (max === null || (x.left_at as Date) > max ? (x.left_at as Date) : max), null);
+    if (!existing || lastLeft === null || existing.created_at >= lastLeft) {return { rows: [] };}
+    store.assignments.delete(tableId);
+    return { rows: [{ id: existing.id, employee_id: existing.employee_id }] };
   }
 
   if (s.includes('delete from "table_assignments"')) {
@@ -193,6 +259,14 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     const existing = store.assignments.get(tableId);
     if (existing) {store.assignments.delete(tableId);}
     return { rows: existing && s.includes("returning") ? [{ id: existing.id }] : [] };
+  }
+
+  // getTableAssignee — names the waiter that a `do nothing` conflict kept, so
+  // the outcome can say WHO instead of just "already assigned".
+  if (s.includes('from "table_assignments" a') && s.includes('join "employees" e')) {
+    const a = store.assignments.get(str(params[2]));
+    const e = a ? store.employees.find((x) => x.id === a.employee_id) : undefined;
+    return { rows: a && e ? [{ employee_id: e.id, fname: e.fname, lname: e.lname }] : [] };
   }
 
   if (s.includes('from "table_assignments" ta')) {
@@ -226,6 +300,10 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     return {
       rows: [{
         emp_roles: emp.roles,
+        // The name rides along on this read so an outcome can say WHO without a
+        // second query — see WaiterEligibility.name.
+        fname: emp.fname,
+        lname: emp.lname,
         attendance_in_use: outletUsesAttendance(),
         clocked_in: isClockedIn(emp.id),
       }],
@@ -264,10 +342,15 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
   if (s.includes('update "tables"') && s.includes("is_occupied = true")) {
     const t = store.tables.find((x) => x.id === str(params[0]));
     if (!t) {return { rows: [] };}
+    const wasFree = t.is_occupied !== true;
     t.is_occupied = true;
     const covers = params[3];
     t.num_covers = covers == null ? Math.max(1, t.num_covers) : Math.max(1, Number(covers));
     t.linked_order_id = params[4] == null ? null : str(params[4]);
+    // Stand in for table_sessions_trg: a free -> occupied transition opens a
+    // session. Its left_at (stamped by endOccupancy) is what tells a stale
+    // assignment from a deliberate pre-assignment.
+    if (wasFree) {store.sessions.push({ table_id: t.id, seated_at: new Date(), left_at: null });}
     return { rows: [{ is_occupied: t.is_occupied, num_covers: t.num_covers, linked_order_id: t.linked_order_id }] };
   }
   if (s.includes("select id, table_name") && s.includes('from "tables"')) {

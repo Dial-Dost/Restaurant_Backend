@@ -65,6 +65,45 @@ import {
 // whole module is re-exported so routes and tests can keep importing the brand
 // helpers from here.
 export * from "./brand_theme.js";
+// The queue pre-order menu rules (which dishes a queuing walk-in may pick, and
+// how the list presents itself). Pure module, re-exported wholesale for the same
+// reason brand_theme.js is — routes and tests reach the ONE gate through here.
+import {
+  buildQueueMenu,
+  isQueueMenuConfigured,
+  isQueueMenuItemAllowed,
+  queueMenuClearKeys,
+  resolveQueueMenuConfig,
+  sanitizeQueueMenuConfigInput,
+  type QueueMenuConfig,
+  type ResolvedQueueMenuConfig,
+} from "./queue_menu.js";
+export * from "./queue_menu.js";
+// Configurable menu badges (catalogue + per-item tags + the resolution rule).
+// Pure module, re-exported wholesale for the same reason brand_theme.js is.
+import {
+  MENU_BADGE_PRESETS,
+  MENU_BADGE_PROTECTED_KINDS,
+  enabledMenuBadges,
+  isDerivedMenuBadge,
+  sanitizeMenuBadgeCatalogue,
+  sanitizeMenuBadgeIds,
+  type MenuBadge,
+} from "./menu_badges.js";
+export * from "./menu_badges.js";
+// Guest-menu posters (validation, the day-grained schedule predicate and the
+// guest projection). Pure module, re-exported wholesale for the same reason
+// brand_theme.js is.
+import {
+  POSTER_MAX_STORED,
+  posterWindowError,
+  sanitizePosterPatch,
+  visiblePosters,
+  type GuestPoster,
+  type PosterPatch,
+  type PosterRecord,
+} from "./posters.js";
+export * from "./posters.js";
 export type { BillTaxLine, BillDiscount } from "./billing_math.js";
 import { SIM_WINDOW_DAYS, type SimulationRawStats } from "./simulation_math.js";
 import {
@@ -615,6 +654,12 @@ export interface MenuItemRecord {
   // (that column is NOT a plain description — see encodeMenuDescription).
   // `undefined` on write = keep the stored value; "" / null = clear it.
   blurb?: string | null;
+  // Configurable badge tags — ids into the restaurant's badge catalogue
+  // ("Restaurant".menu_badges), e.g. ["must_try", "jain"]. Stored as `badges`
+  // inside the same description JSON blob; `undefined` on write = keep the
+  // stored tags, [] = clear them. Allergen-derived safety badges are NOT tagged
+  // here — see menu_badges.ts.
+  badges?: string[];
   // Price history, maintained server-side (ignored on write — see
   // stampPriceHistory). Absent/null on items whose price never changed since
   // the feature landed. Drives the menu-insights convergence guards.
@@ -1142,7 +1187,7 @@ export function sanitizeMenuBlurb(raw: unknown): string {
   return text.slice(0, 500).trim();
 }
 
-function encodeMenuDescription(payload: { price: number; image_url?: string | null; available?: boolean; modifiers?: unknown; recipe?: unknown; station?: unknown; allergens?: unknown; blurb?: string | null; price_updated_at?: string | null; price_baseline?: number | null }): string {
+function encodeMenuDescription(payload: { price: number; image_url?: string | null; available?: boolean; modifiers?: unknown; recipe?: unknown; station?: unknown; allergens?: unknown; blurb?: string | null; badges?: unknown; price_updated_at?: string | null; price_baseline?: number | null }): string {
   const out: Record<string, unknown> = { price: Number.isFinite(payload.price) ? payload.price : 0 };
   const img = typeof payload.image_url === "string" ? payload.image_url.trim() : "";
   if (img) {out.image_url = img;}
@@ -1161,6 +1206,12 @@ function encodeMenuDescription(payload: { price: number; image_url?: string | nu
   // stored value in first.
   const blurb = sanitizeMenuBlurb(payload.blurb);
   if (blurb) {out.blurb = blurb;}
+  // Badge tags (omitted when empty, so an untagged item's blob is unchanged
+  // byte-for-byte from before badges existed). Same preserve-on-omit contract as
+  // every other key here: the callers merge the stored value in first, so a
+  // price edit or a drag-reorder can never strip a dish's badges.
+  const badges = sanitizeMenuBadgeIds(payload.badges);
+  if (badges.length > 0) {out.badges = badges;}
   // Price history (both optional, both absent on legacy rows) — see
   // stampPriceHistory. Only ever written when a price actually changed.
   const priceUpdatedAt = typeof payload.price_updated_at === "string" ? payload.price_updated_at.trim() : "";
@@ -1172,9 +1223,9 @@ function encodeMenuDescription(payload: { price: number; image_url?: string | nu
   return JSON.stringify(out);
 }
 
-interface ParsedMenuDescription { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[]; blurb: string; price_updated_at: string | null; price_baseline: number | null }
+interface ParsedMenuDescription { price: number; image_url: string | null; available: boolean; modifiers: MenuModifierGroup[]; recipe: RecipeItem[]; station: string | null; allergens: string[]; blurb: string; badges: string[]; price_updated_at: string | null; price_baseline: number | null }
 
-const emptyMenuDescription = (): ParsedMenuDescription => ({ price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [], blurb: "", price_updated_at: null, price_baseline: null });
+const emptyMenuDescription = (): ParsedMenuDescription => ({ price: 0, image_url: null, available: true, modifiers: [], recipe: [], station: null, allergens: [], blurb: "", badges: [], price_updated_at: null, price_baseline: null });
 
 function parseMenuDescription(description: string | null): ParsedMenuDescription {
   if (!description) {return emptyMenuDescription();}
@@ -1194,6 +1245,7 @@ function parseMenuDescription(description: string | null): ParsedMenuDescription
     station: typeof parsed.station === "string" && parsed.station.trim() ? parsed.station.trim() : null,
     allergens: sanitizeAllergens(parsed.allergens),
     blurb: sanitizeMenuBlurb(parsed.blurb),
+    badges: sanitizeMenuBadgeIds(parsed.badges),
     price_updated_at: priceUpdatedAt,
     price_baseline: baseline > 0 ? baseline : null,
   };
@@ -1842,6 +1894,7 @@ async function resolveRestaurantContext(
     restaurant_name: string;
     restaurant_main_office_add: string | null;
     restaurant_logo_url: string | null;
+    timezone: string | null;
   }>(
     `
       select
@@ -1850,7 +1903,18 @@ async function resolveRestaurantContext(
         r.res_username as restaurant_slug,
         r.res_name as restaurant_name,
         r.main_office_add as restaurant_main_office_add,
-        r.logo as restaurant_logo_url
+        r.logo as restaurant_logo_url,
+        -- WAS MISSING, and the omission was invisible: the return below reads
+        -- the timezone off this row through a Record<string, unknown> cast, so a
+        -- column that was never selected read back as undefined and
+        -- sanitizeTimezone quietly substituted the Asia/Kolkata default. The
+        -- outlet-bound branch above always selected it, so the bug only bit the
+        -- paths that resolve a restaurant WITHOUT a bound outlet — which is every
+        -- public /qr/ request (withTenant passes outlet_id: ""). Any tenant not
+        -- actually in IST therefore had every guest-side calendar decision made
+        -- in the wrong zone. Poster scheduling is a calendar decision made on
+        -- exactly that path, so it cannot be correct until this is.
+        r.timezone as timezone
       from "Restaurant" r
       left join "Outlets" o on o.res_id = r.id
       where
@@ -2221,6 +2285,10 @@ export async function AddTable(
       `,
       [existing[0].id, context.res_id, context.outlet_id, normalized, cap, maxCap, zone],
     );
+    // The revived row is a NEW table as far as service goes, so it starts with
+    // no waiter. RemoveTable already clears the assignment; this is the other
+    // half of the same guarantee, for rows soft-deleted before that fix shipped.
+    await unassignTableById(context, existing[0].id);
     return { _id: existing[0].id, table_name: normalized, capacity: cap, max_capacity: maxCap, section: zone };
   }
 
@@ -2494,6 +2562,13 @@ export async function RemoveTable(
     `,
     [table.id, context.res_id, context.outlet_id],
   );
+
+  // A table that is going away takes its waiter assignment with it, on BOTH
+  // branches below. The soft-delete branch matters most: AddTable revives a
+  // same-named soft-deleted row by id, so an assignment left behind here would
+  // come back attached to the revived table and the first party seated at it
+  // would keep a waiter nobody chose.
+  await unassignTableById(context, table.id);
 
   if (history[0]?.has_history) {
     await runQuery(
@@ -2812,7 +2887,16 @@ export async function OccupyTable(
   num_covers: number | null = null,
   linkedOrderId?: string | null,
   actorEmployeeId?: string | null,
-): Promise<{ table_id: string; is_occupied: boolean; num_covers: number; linked_order_id?: string | null }> {
+): Promise<{
+  table_id: string;
+  is_occupied: boolean;
+  num_covers: number;
+  linked_order_id?: string | null;
+  /** What this call did about the table's waiter, or null when it was not a
+   *  seating at all (the order flow's re-occupy of an already-seated table).
+   *  Additive — older clients ignore it. */
+  assignment: TableAssignmentOutcome | null;
+}> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
 
@@ -2873,11 +2957,31 @@ export async function OccupyTable(
   // feedback ratings are attributed to whoever is serving it. Best-effort, and
   // ONLY on the seating itself (see wasVacant) — never on the order flow's
   // incidental re-occupy of a table that is already seated.
-  if (wasVacant && actorEmployeeId && isUuid(actorEmployeeId)) {
-    try {
-      await assignTableById(context, tableId, actorEmployeeId);
-    } catch (err) {
-      logger.warn({ err: (err as any)?.message ?? err }, "auto-assign table on occupy failed");
+  //
+  // The outcome rides back out in the response so a seating that assigned NOBODY
+  // says so at the host stand. The old code returned nothing and logged nothing,
+  // which is why this surfaced as an owner report days later rather than as a
+  // message on the screen of the person who had just seated the party.
+  let assignment: TableAssignmentOutcome | null = null;
+  if (wasVacant) {
+    // A new party must never inherit the previous party's waiter.
+    await clearStaleTableAssignment(context, tableId);
+    if (actorEmployeeId && isUuid(actorEmployeeId)) {
+      try {
+        assignment = await assignTableById(context, tableId, actorEmployeeId, "seated_by");
+      } catch (err) {
+        logger.warn(
+          { err: (err as any)?.message ?? err, res_id: context.res_id, outlet_id: context.outlet_id, table_id: tableId, employee_id: actorEmployeeId },
+          "auto-assign table on occupy failed",
+        );
+        assignment = failedAssignmentOutcome(err);
+      }
+    } else {
+      // Not a failure: a guest QR occupy has no staff session to credit. Logged
+      // at info and reported anyway, so "this table has no waiter" always has a
+      // stated reason.
+      logger.info({ res_id: context.res_id, outlet_id: context.outlet_id, table_id: tableId }, "table_auto_assign_skipped_no_actor");
+      assignment = noActorAssignmentOutcome();
     }
   }
 
@@ -2887,6 +2991,7 @@ export async function OccupyTable(
     is_occupied: result?.is_occupied ?? true,
     num_covers: result?.num_covers ?? coversParam ?? 1,
     linked_order_id: result?.linked_order_id ?? null,
+    assignment,
   };
 }
 
@@ -4415,6 +4520,13 @@ export async function UpdateBookingStatus(
            where id = any($1::uuid[]) and res_id = $2 and outlet_id = $3 and coalesce(is_deleted, false) = false`,
         [tableIds, context.res_id, context.outlet_id],
       );
+      // The party is gone, so their waiter assignments end with the occupancy —
+      // same rule as ReleaseTable. Without this the next party to sit at one of
+      // these tables inherits this booking's waiter, because auto-assign will
+      // not overwrite an existing row.
+      for (const releasedId of tableIds) {
+        await unassignTableById(context, releasedId);
+      }
     } catch (err) {
       logger.warn({ err }, "release_table_on_unseat_failed");
     }
@@ -8542,6 +8654,7 @@ export async function GetMenuItems(restaurantId: string): Promise<MenuItemRecord
       station: parsed.station,
       allergens: parsed.allergens,
       blurb: parsed.blurb,
+      badges: parsed.badges,
       price_updated_at: parsed.price_updated_at,
       price_baseline: parsed.price_baseline,
     };
@@ -8596,7 +8709,7 @@ export async function UpsertMenuItem(
   // from the stored row instead of being reset — a partial client (e.g. a price
   // edit or drag-reorder) must never silently wipe recipes/modifiers/images.
   // An explicit null/[] still clears the field.
-  let merged = { image_url: item.image_url, available: item.available, modifiers: item.modifiers as unknown, recipe: item.recipe as unknown, station: item.station as unknown, allergens: item.allergens as unknown, blurb: item.blurb as string | null | undefined };
+  let merged = { image_url: item.image_url, available: item.available, modifiers: item.modifiers as unknown, recipe: item.recipe as unknown, station: item.station as unknown, allergens: item.allergens as unknown, blurb: item.blurb as string | null | undefined, badges: item.badges as unknown };
   // Price history is derived from the STORED row (never trusted from the
   // client), so an existing item is always read back — a full-menu save that
   // moves a price must stamp it exactly like PATCH /menu/:id/price does.
@@ -8620,6 +8733,7 @@ export async function UpsertMenuItem(
         station: item.station === undefined ? existing.station : item.station,
         allergens: item.allergens === undefined ? existing.allergens : item.allergens,
         blurb: item.blurb === undefined ? existing.blurb : item.blurb,
+        badges: item.badges === undefined ? existing.badges : item.badges,
       };
       history = stampPriceHistory(existing, round2(Number(item.price) || 0), new Date().toISOString());
     }
@@ -8644,7 +8758,7 @@ export async function UpsertMenuItem(
       context.res_id,
       context.outlet_id,
       item.name.trim(),
-      encodeMenuDescription({ price: item.price, image_url: merged.image_url, available: merged.available, modifiers: merged.modifiers, recipe: merged.recipe, station: merged.station, allergens: merged.allergens, blurb: merged.blurb, price_updated_at: history.price_updated_at, price_baseline: history.price_baseline }),
+      encodeMenuDescription({ price: item.price, image_url: merged.image_url, available: merged.available, modifiers: merged.modifiers, recipe: merged.recipe, station: merged.station, allergens: merged.allergens, blurb: merged.blurb, badges: merged.badges, price_updated_at: history.price_updated_at, price_baseline: history.price_baseline }),
       ids.main_cat_id,
       ids.sub_cat_id,
       "15 mins",
@@ -8842,6 +8956,219 @@ export async function RenameMenuStation(
     }
     return { updated };
   });
+}
+
+// --- Configurable menu badges ------------------------------------------------
+// The CATALOGUE lives on "Restaurant".menu_badges (restaurant-wide, jsonb — the
+// kitchen_sections/inventory_categories precedent); the TAGS live per item in
+// Menu.description.badges. The rules that turn the two into what a guest sees
+// are in menu_badges.ts. NULL column = empty catalogue = no badges anywhere.
+
+/**
+ * Thrown instead of quietly dropping a dietary/safety badge that dishes still
+ * carry. Removing "Bestseller" costs a sticker; removing "Jain" from forty
+ * dishes removes a claim a diner was relying on, and it looks identical in the
+ * editor. So the write is refused with the counts, and the caller has to say
+ * explicitly that it means to release those items (see SetMenuBadgeCatalogue).
+ */
+export class MenuBadgeSafetyError extends Error {
+  public badges: { id: string; label: string; kind: string; items: number }[];
+  constructor(message: string, badges: { id: string; label: string; kind: string; items: number }[]) {
+    super(message);
+    this.name = "MenuBadgeSafetyError";
+    this.badges = badges;
+  }
+}
+
+/** The tenant's badge catalogue, in tenant order. [] when never configured. */
+export async function GetMenuBadgeCatalogue(restaurantId: string, client?: PoolClient): Promise<MenuBadge[]> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  await ensureBrandingColumns();
+  const rows = await runQuery<{ menu_badges: unknown }>(
+    `select menu_badges from "Restaurant" where id = $1 limit 1`,
+    [context.res_id],
+    client,
+  );
+  return sanitizeMenuBadgeCatalogue(parseJsonArray(rows[0]?.menu_badges));
+}
+
+/**
+ * Count, ACROSS EVERY OUTLET of the restaurant, how many menu items carry each
+ * of `ids` as a tag. Restaurant-wide because the catalogue is: a badge removed
+ * at head office must not silently strip a claim from another outlet's menu.
+ */
+async function countMenuBadgeTags(
+  resId: string,
+  ids: string[],
+  client?: PoolClient,
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>(ids.map((id) => [id, 0]));
+  if (ids.length === 0) {return counts;}
+  const rows = await runQuery<{ description: string | null }>(
+    `select description from "Menu" where res_id = $1`,
+    [resId],
+    client,
+  );
+  for (const row of rows) {
+    for (const id of sanitizeMenuBadgeIds(parseJsonObject(row.description)?.badges)) {
+      if (counts.has(id)) {counts.set(id, (counts.get(id) ?? 0) + 1);}
+    }
+  }
+  return counts;
+}
+
+/**
+ * Strip `ids` from every item that carries them, restaurant-wide. Writes ONLY
+ * the description column with the parsed blob spread back in (the
+ * RenameMenuStation idiom), so an untag cannot touch an image, a recipe or a
+ * price — the failure mode that once erased 56 dishes.
+ */
+async function releaseMenuBadgeTags(resId: string, ids: string[], client?: PoolClient): Promise<number> {
+  if (ids.length === 0) {return 0;}
+  const drop = new Set(ids);
+  const rows = await runQuery<{ id: string; res_id: string; outlet_id: string | null; description: string | null }>(
+    `select id, res_id, outlet_id, description from "Menu" where res_id = $1`,
+    [resId],
+    client,
+  );
+  let updated = 0;
+  for (const row of rows) {
+    const parsed = parseJsonObject(row.description);
+    const current = sanitizeMenuBadgeIds(parsed?.badges);
+    const kept = current.filter((id) => !drop.has(id));
+    if (kept.length === current.length) {continue;}
+    const blob: Record<string, unknown> = { ...(parsed ?? {}) };
+    // Omit the key entirely when nothing is left, so an item that ends up
+    // untagged is byte-identical to one that was never tagged.
+    if (kept.length > 0) {blob.badges = kept;} else {delete blob.badges;}
+    await runQuery(
+      `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id is not distinct from $3`,
+      [row.id, row.res_id, row.outlet_id, JSON.stringify(blob)],
+      client,
+    );
+    updated += 1;
+  }
+  return updated;
+}
+
+/**
+ * Replace the badge catalogue. The incoming array is the whole catalogue (order
+ * included — it is what the editors drag and what every surface renders within
+ * a kind), sanitized by sanitizeMenuBadgeCatalogue.
+ *
+ * THE GUARD. A badge that disappears from the catalogue — or is disabled —
+ * stops rendering, and any item still tagged with it keeps an id nothing
+ * resolves. For `promo` that is exactly the intent. For a PROTECTED kind
+ * (dietary / non-derived alert) it is a silent loss of a claim, so the write is
+ * refused with per-badge item counts unless `releaseTagged` is set, in which
+ * case the same transaction UNTAGS those items first — so the catalogue and the
+ * items can never disagree about what is being claimed.
+ *
+ * Allergen-DERIVED alert badges are deliberately exempt: their fact lives in the
+ * item's allergen list, not in a tag, so removing the badge only demotes it back
+ * to the plain allergen chip row. Nothing is lost, so nothing is refused.
+ */
+export async function SetMenuBadgeCatalogue(
+  restaurantId: string,
+  next: unknown,
+  opts?: { releaseTagged?: boolean },
+): Promise<{ badges: MenuBadge[]; released: number }> {
+  await ensureBrandingColumns();
+  const catalogue = sanitizeMenuBadgeCatalogue(next);
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const stored = await GetMenuBadgeCatalogue(restaurantId, client);
+    const nextById = new Map(catalogue.map((b) => [b.id, b]));
+
+    // Protected badges that are going away or going dark, and are TAGGED rather
+    // than derived (a derived one carries no tag to lose — see the doc above).
+    const atRisk = stored.filter((b) =>
+      MENU_BADGE_PROTECTED_KINDS.includes(b.kind)
+      && !isDerivedMenuBadge(b)
+      && b.enabled
+      && !(nextById.get(b.id)?.enabled ?? false));
+
+    let released = 0;
+    if (atRisk.length > 0) {
+      const counts = await countMenuBadgeTags(context.res_id, atRisk.map((b) => b.id), client);
+      const carrying = atRisk
+        .map((b) => ({ id: b.id, label: b.label, kind: b.kind as string, items: counts.get(b.id) ?? 0 }))
+        .filter((b) => b.items > 0);
+      if (carrying.length > 0) {
+        if (!opts?.releaseTagged) {
+          throw new MenuBadgeSafetyError(
+            `${carrying.map((b) => `"${b.label}" is on ${String(b.items)} item${b.items === 1 ? "" : "s"}`).join(", ")}. Remove the badge from those dishes first, or confirm releasing them.`,
+            carrying,
+          );
+        }
+        released = await releaseMenuBadgeTags(context.res_id, carrying.map((b) => b.id), client);
+      }
+    }
+
+    await runQuery(
+      `update "Restaurant" set menu_badges = $2::jsonb where id = $1`,
+      [context.res_id, JSON.stringify(catalogue)],
+      client,
+    );
+    return { badges: catalogue, released };
+  });
+}
+
+/**
+ * Bulk-tag: set the badge list of one or more items in a single transaction.
+ * Like releaseMenuBadgeTags this rewrites ONLY the badges key of each item's
+ * description blob and spreads everything else back untouched, so tagging a
+ * dish cannot disturb its image, kitchen section, modifiers, recipe, allergens,
+ * description or price history. That is the whole reason this is its own
+ * function rather than a loop over UpsertMenuItem, and it is why the tagging UI
+ * never has to load (or re-send) the rest of an item.
+ *
+ * Unknown ids are accepted and stored — the catalogue is the tenant's to change,
+ * and rendering already drops ids it cannot resolve.
+ */
+export async function SetMenuItemBadges(
+  restaurantId: string,
+  updates: { id: string; badges: string[] }[],
+): Promise<{ updated: number }> {
+  const wanted = new Map<string, string[]>();
+  for (const u of updates) {
+    const id = typeof u?.id === "string" ? u.id.trim() : "";
+    // Only real uuids reach the `= any($3::uuid[])` predicate; anything else
+    // would abort the whole statement with 22P02 and lose the valid rows too.
+    if (isUuid(id)) {wanted.set(id, sanitizeMenuBadgeIds(u.badges));}
+  }
+  if (wanted.size === 0) {return { updated: 0 };}
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const rows = await runQuery<{ id: string; description: string | null }>(
+      `select id, description from "Menu" where res_id = $1 and outlet_id = $2 and id = any($3::uuid[])`,
+      [context.res_id, context.outlet_id, Array.from(wanted.keys())],
+      client,
+    );
+    let updated = 0;
+    for (const row of rows) {
+      const next = wanted.get(row.id) ?? [];
+      const parsed = parseJsonObject(row.description);
+      const current = sanitizeMenuBadgeIds(parsed?.badges);
+      // Skip no-op rows so a "save" that changed three dishes writes three rows,
+      // not the whole menu.
+      if (current.length === next.length && current.every((id, i) => id === next[i])) {continue;}
+      const blob: Record<string, unknown> = { ...(parsed ?? {}) };
+      if (next.length > 0) {blob.badges = next;} else {delete blob.badges;}
+      await runQuery(
+        `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
+        [row.id, context.res_id, context.outlet_id, JSON.stringify(blob)],
+        client,
+      );
+      updated += 1;
+    }
+    return { updated };
+  });
+}
+
+/** The starter set the editors offer. Server-owned so no client hardcodes it. */
+export function GetMenuBadgePresets(): MenuBadge[] {
+  return MENU_BADGE_PRESETS.map((b) => ({ ...b }));
 }
 
 // Rename an inventory category ACROSS the inventory: every item whose stored
@@ -17047,6 +17374,14 @@ export async function CloseBillByOrder(
           [billTableId, context.res_id, context.outlet_id],
           client,
         );
+        // The party has paid and left, so the table's waiter assignment is
+        // finished with it. Missing this let the assignment outlive the
+        // occupancy, and auto-assign KEEPS an existing row (`on conflict do
+        // nothing`), so the next party silently inherited the previous party's
+        // waiter — wrong APC, wrong feedback attribution, no warning anywhere.
+        // Every sibling settle/release path already did this; only this one had
+        // been missed.
+        await unassignTableById(context, billTableId, client);
         await softDeleteIfVirtual(context, billTableId, client);
       }
     }
@@ -17906,8 +18241,13 @@ export async function SetWaitlistPreorder(restaurantId: string, token: string, i
   const context = await requireRestaurantContext(restaurantId);
   await ensureWaitlistTable();
   // Re-price every line from the authoritative menu (a guest must not set prices);
-  // unknown items are dropped — they can't be billed.
-  const normalized = await repriceFromMenu(restaurantId, normalizeWaitlistItems(items), false);
+  // unknown items are dropped — they can't be billed. Then apply the tenant's
+  // QUEUE menu rule: a dish kept off the pre-order list must be refused here and
+  // not only hidden by the page, or an API caller (or a stale browser tab that
+  // still holds the old payload) could stage it anyway. Same drop-the-line
+  // treatment as an unknown item — see filterToQueueMenu.
+  const priced = await repriceFromMenu(restaurantId, normalizeWaitlistItems(items), false);
+  const normalized = await filterToQueueMenu(restaurantId, priced);
   const rows = await runQuery<{ id: string }>(
     `update "Waitlist" set pre_order = $1::jsonb where token = $2 and res_id = $3 and status in ('waiting','called') returning id`,
     [JSON.stringify(normalized), token, context.res_id],
@@ -18056,6 +18396,9 @@ export async function SeatWaitlistEntry(
   waitlist_token: string;
   pre_order_status: WaitlistPreorderStatus;
   pending_preorder: { items: WaitlistItem[]; subtotal: number; count: number } | null;
+  /** What seating did about the table's waiter — the host needs to see this in
+   *  the same breath as "Seated at T4". Additive; older clients ignore it. */
+  assignment: TableAssignmentOutcome | null;
 }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureWaitlistTable();
@@ -18107,12 +18450,24 @@ export async function SeatWaitlistEntry(
     // Seating from the queue mints the table's ordering code when the gate is on.
     await ensureTableOtpOnOccupy(context, tableId, client);
     await runQuery(`update "Waitlist" set table_id = $1 where id = $2 and res_id = $3`, [tableId, id, context.res_id], client);
+    // Seating from the queue is unambiguously a seating — the table was asserted
+    // FREE above — so the actor is the seater, and any assignment left on this
+    // table by a previous occupancy is stale.
+    await clearStaleTableAssignment(context, tableId, client);
+    let assignment: TableAssignmentOutcome | null = null;
     if (actorEmployeeId && isUuid(actorEmployeeId)) {
       try {
-        await assignTableById(context, tableId, actorEmployeeId, client);
+        assignment = await assignTableById(context, tableId, actorEmployeeId, "seated_by", client);
       } catch (err) {
-        logger.warn({ err: (err as any)?.message ?? err }, "waitlist seat assign failed");
+        logger.warn(
+          { err: (err as any)?.message ?? err, res_id: context.res_id, outlet_id: context.outlet_id, table_id: tableId, employee_id: actorEmployeeId },
+          "waitlist seat assign failed",
+        );
+        assignment = failedAssignmentOutcome(err);
       }
+    } else {
+      logger.info({ res_id: context.res_id, outlet_id: context.outlet_id, table_id: tableId }, "table_auto_assign_skipped_no_actor");
+      assignment = noActorAssignmentOutcome();
     }
 
     // 3) HOLD the pre-order for confirmation instead of placing it. Re-priced here
@@ -18152,6 +18507,7 @@ export async function SeatWaitlistEntry(
       waitlist_token: String(claimed[0].token),
       pre_order_status: preStatus,
       pending_preorder: pending,
+      assignment,
     };
   });
 }
@@ -18477,6 +18833,33 @@ export async function RecordPushResult(restaurantId: string, id: string, outcome
 //     clock-in from months ago switching the gate on forever is exactly as
 //     surprising, so the gate keys on EVER-used, and an outlet that stops using
 //     attendance keeps the gate (their choice to stop clocking in).
+//
+//   * WHAT THE GATE IS FOR, restated after it caused a production failure of its
+//     own. It decides WHO THE SYSTEM MAY PICK. The issue it was built for —
+//     "employees who aren't clocked in should not show up as an option to be
+//     assigned or be automatically assigned" — is about CANDIDATES: names in a
+//     picker, and the old behaviour of defaulting a table to the admin. A
+//     clock-in row is EVIDENCE OF PRESENCE, and the gate exists because for a
+//     candidate the system has no other evidence to go on.
+//
+//     It is NOT a rule about who may be credited when presence is established
+//     some other way. Someone who just walked a party to a table and marked it
+//     occupied is demonstrably on the floor — that act is stronger evidence than
+//     the row would have been. Applying the gate to them suppressed EVERY
+//     auto-assign at an outlet with 6 Attendance rows ever recorded and nobody
+//     clocked in at the time, silently, for weeks. `TableAssignSource` is where
+//     that line is drawn; see assignTableById.
+//
+//   * WHY "EVER" IS STILL THE RIGHT TEST, having reconsidered it. The temptation
+//     is to narrow it (attendance used TODAY, or in the last N days) so that one
+//     abandoned experiment stops arming the gate forever. Rejected, because a
+//     window makes the rule TIME-DEPENDENT: the same roster would be assignable
+//     at 11:00 and refused at 11:01 as the last row aged out, and staff would
+//     watch the picker empty itself mid-service with nothing having changed.
+//     "EVER" is stable and explainable in one sentence ("this outlet uses
+//     attendance"), and the damage a window was meant to undo came from the gate
+//     reaching the SEATER — fixed at the source, where the wrong thing was
+//     actually happening, rather than by loosening the gate for everyone.
 interface WaiterEligibility {
   exists: boolean;
   /** Any of the employee's roles is `admin`. */
@@ -18485,6 +18868,8 @@ interface WaiterEligibility {
   attendanceInUse: boolean;
   /** Open, non-rejected Attendance shift right now. */
   clockedIn: boolean;
+  /** Display name ("Asha K"), so callers can say WHO without a second query. */
+  name: string;
 }
 
 async function getWaiterEligibility(
@@ -18493,10 +18878,12 @@ async function getWaiterEligibility(
   client?: PoolClient,
 ): Promise<WaiterEligibility> {
   await ensureAttendanceTable(client);
-  const rows = await runQuery<{ emp_roles: unknown; attendance_in_use: boolean; clocked_in: boolean }>(
+  const rows = await runQuery<{ emp_roles: unknown; fname: string | null; lname: string | null; attendance_in_use: boolean; clocked_in: boolean }>(
     `
       select
         e.emp_roles as emp_roles,
+        e."emp_Fname" as fname,
+        e."emp_Lname" as lname,
         exists (
           select 1 from "Attendance" a
            where a.res_id = $2 and a.outlet_id = $3
@@ -18515,10 +18902,16 @@ async function getWaiterEligibility(
     client,
   );
   const row = rows[0];
-  if (!row) {return { exists: false, isAdmin: false, attendanceInUse: false, clockedIn: false };}
+  if (!row) {return { exists: false, isAdmin: false, attendanceInUse: false, clockedIn: false, name: "" };}
   const roles = parseEmployeeRoles(row.emp_roles);
   const isAdmin = [roles.primary, ...roles.all].some((r) => String(r).trim().toLowerCase() === "admin");
-  return { exists: true, isAdmin, attendanceInUse: row.attendance_in_use === true, clockedIn: row.clocked_in === true };
+  return {
+    exists: true,
+    isAdmin,
+    attendanceInUse: row.attendance_in_use === true,
+    clockedIn: row.clocked_in === true,
+    name: `${row.fname ?? ""} ${row.lname ?? ""}`.trim(),
+  };
 }
 
 // Auto-assign the seating employee to a table by ids (drives APC + feedback/rating
@@ -18543,23 +18936,233 @@ async function getWaiterEligibility(
 //     owner who seats a party IS that party's server until someone reassigns
 //     the table, and refusing to record that left tables stubbornly unassigned.
 //
-//   * is attendance-aware: when this outlet uses attendance, only an employee
-//     clocked in RIGHT NOW may be auto-assigned. An outlet where nobody has
-//     ever clocked in keeps the old everyone-eligible behaviour (see the
-//     degrade rule on getWaiterEligibility).
-async function assignTableById(context: RestaurantContext, tableId: string, employeeId: string, client?: PoolClient): Promise<void> {
+//   * is attendance-aware FOR PICKED CANDIDATES ONLY — see `source` below and
+//     the policy note above WaiterEligibility. The clocked-in rule guards who
+//     the SYSTEM may choose; it must not veto crediting the person who actually
+//     performed the seating, which is what it used to do.
+//
+// AND IT IS NEVER SILENT. Both of the old early returns were a bare `return;`:
+// no log line, no response field. An outlet where auto-assign fired on every
+// seating and one where it fired on none looked identical from the outside,
+// which is how "waiters are not getting auto-assigned" survived 48 hours of
+// logs without producing a single warning. Every path out of this function now
+// logs its reason with the ids AND hands the caller a TableAssignmentOutcome to
+// show at the host stand.
+async function assignTableById(
+  context: RestaurantContext,
+  tableId: string,
+  employeeId: string,
+  source: TableAssignSource,
+  client?: PoolClient,
+): Promise<TableAssignmentOutcome> {
   await ensureTableAssignmentsTable(client);
+  const ids = { res_id: context.res_id, outlet_id: context.outlet_id, table_id: tableId, employee_id: employeeId, source };
+
   const actor = await getWaiterEligibility(context, employeeId, client);
-  if (!actor.exists) {return;}
-  if (actor.attendanceInUse && !actor.clockedIn) {return;}
-  await runQuery(
+  if (!actor.exists) {
+    logger.warn({ ...ids, reason: "unknown_employee" }, "table_auto_assign_skipped");
+    return {
+      assigned: false,
+      reason: "unknown_employee",
+      employee_id: null,
+      employee_name: null,
+      message: "No waiter was assigned - the acting account is not a staff member at this outlet.",
+    };
+  }
+  const who = actor.name || "This employee";
+
+  // THE ATTENDANCE GATE — and the one caller it must NOT fire for.
+  //
+  // "picked" means the system chose this employee out of a pool with nothing to
+  // show they are here, so a clock-in row is the only evidence available and the
+  // rule applies in full. "seated_by" means they just seated a party: they are
+  // standing at the table. Refusing to credit them for a missing clock-in row
+  // does not keep an absent employee off a table — it leaves the table with NO
+  // waiter at all, so APC, feedback attribution and the floor view all lose the
+  // one person who demonstrably was there.
+  if (source === "picked" && actor.attendanceInUse && !actor.clockedIn) {
+    logger.warn({ ...ids, reason: "not_clocked_in" }, "table_auto_assign_skipped");
+    return {
+      assigned: false,
+      reason: "not_clocked_in",
+      employee_id: null,
+      employee_name: actor.name || null,
+      message: `${who} is not clocked in, so no waiter was assigned to this table.`,
+    };
+  }
+  // Seating while the outlet uses attendance and this person never clocked in is
+  // legal (above) but worth a line: it is the cheapest signal a manager has that
+  // someone is working a shift they forgot to open.
+  if (actor.attendanceInUse && !actor.clockedIn) {
+    logger.info({ ...ids, present_without_clock_in: true }, "table_auto_assign_seater_not_clocked_in");
+  }
+
+  // `returning id` is what makes the conflict VISIBLE: with `do nothing` a
+  // conflicting insert returns zero rows, which is the difference between "this
+  // table is now yours" and "someone else already has it" — previously
+  // indistinguishable to the caller, and both silent.
+  const inserted = await runQuery<{ id: string }>(
     `insert into "Table_assignments" (id, created_at, res_id, outlet_id, table_id, employee_id)
      values ($1, now(), $2, $3, $4, $5)
      on conflict (res_id, outlet_id, table_id)
-     do nothing`,
+     do nothing
+     returning id`,
     [randomUUID(), context.res_id, context.outlet_id, tableId, employeeId],
     client,
   );
+
+  if (inserted.length === 0) {
+    const holder = await getTableAssignee(context, tableId, client);
+    logger.info({ ...ids, reason: "already_assigned", kept_employee_id: holder?.id ?? null }, "table_auto_assign_kept_existing");
+    return {
+      assigned: false,
+      reason: "already_assigned",
+      employee_id: holder?.id ?? null,
+      employee_name: holder?.name ?? null,
+      message: holder
+        ? `This table stays with ${holder.name} - the waiter already assigned to it.`
+        : "This table already has a waiter assigned.",
+    };
+  }
+
+  logger.info({ ...ids, reason: "assigned" }, "table_auto_assigned");
+  return {
+    assigned: true,
+    reason: "assigned",
+    employee_id: employeeId,
+    employee_name: actor.name || null,
+    message: `${who} is now serving this table.`,
+  };
+}
+
+/** WHO CHOSE THE EMPLOYEE — the distinction the attendance gate turns on.
+ *
+ *  "seated_by": this employee physically seated the party (the POS occupy on the
+ *    free -> occupied transition, or seating from the queue). Presence is
+ *    DEMONSTRATED by the act itself, so the clocked-in rule does not apply.
+ *
+ *  "picked": the SYSTEM chose this employee out of a pool and nothing shows they
+ *    are on the floor, so the clocked-in rule applies in full. Nothing passes
+ *    this today. It exists so that a future auto-picker (round-robin section
+ *    cover, "assign the least-loaded waiter") inherits the gate BY DEFAULT
+ *    instead of quietly skipping it the way this function used to skip the
+ *    seater. */
+type TableAssignSource = "seated_by" | "picked";
+
+export type TableAssignmentReason =
+  | "assigned"
+  | "already_assigned"
+  | "unknown_employee"
+  | "not_clocked_in"
+  | "no_actor"
+  | "error";
+
+/** What a seating did about the table's waiter, reported all the way out to the
+ *  client so the floor learns at the host stand instead of the owner finding out
+ *  weeks later that nothing was ever assigned. */
+export interface TableAssignmentOutcome {
+  assigned: boolean;
+  reason: TableAssignmentReason;
+  /** Who owns the table AFTER this call — the new assignee, or the existing one
+   *  that was kept. Null when the table ends up with nobody. */
+  employee_id: string | null;
+  employee_name: string | null;
+  /** One sentence a client can show verbatim next to "Seated at T4". */
+  message: string;
+}
+
+/** A seating that carried no employee id (a guest QR occupy, an API caller with
+ *  no staff session). Not an error — but still reported, because "nobody was
+ *  identified" and "the assignment failed" are different problems with different
+ *  fixes. */
+function noActorAssignmentOutcome(): TableAssignmentOutcome {
+  return {
+    assigned: false,
+    reason: "no_actor",
+    employee_id: null,
+    employee_name: null,
+    message: "No waiter was assigned - this seating did not identify a staff member.",
+  };
+}
+
+function failedAssignmentOutcome(err: unknown): TableAssignmentOutcome {
+  return {
+    assigned: false,
+    reason: "error",
+    employee_id: null,
+    employee_name: null,
+    message: `No waiter was assigned - ${String((err as any)?.message ?? "the assignment could not be saved")}.`,
+  };
+}
+
+/** The employee currently holding a table, so a KEPT assignment can be named
+ *  rather than reported as an anonymous refusal. */
+async function getTableAssignee(
+  context: RestaurantContext,
+  tableId: string,
+  client?: PoolClient,
+): Promise<{ id: string; name: string } | null> {
+  const rows = await runQuery<{ employee_id: string; fname: string | null; lname: string | null }>(
+    `select a.employee_id as employee_id, e."emp_Fname" as fname, e."emp_Lname" as lname
+       from "Table_assignments" a
+       join "Employees" e on e.id = a.employee_id
+      where a.res_id = $1 and a.outlet_id = $2 and a.table_id = $3
+      limit 1`,
+    [context.res_id, context.outlet_id, tableId],
+    client,
+  );
+  const r = rows[0];
+  if (!r) {return null;}
+  return { id: String(r.employee_id), name: `${r.fname ?? ""} ${r.lname ?? ""}`.trim() || "another employee" };
+}
+
+// A table's waiter assignment belongs to ONE occupancy. Every release/settle path
+// clears it (unassignTableById) — this is the belt to that pair of braces. If a
+// path ever forgets again, the next party inherits the previous party's waiter
+// AND auto-assign keeps it (`on conflict do nothing`), so the wrong name sticks
+// silently: exactly the class of bug this whole change exists to end.
+//
+// WHY NOT SIMPLY CLEAR ON EVERY SEATING: because an assignment made while the
+// table stood FREE is a deliberate pre-assignment — a manager laying out sections
+// before service — and wiping it would re-break the durability fix above.
+//
+// The discriminator is TableSessions.left_at, the instant the previous party
+// left, written by the table_sessions_trg trigger on EVERY release path there is
+// (POS release, settle, merge, cancel, reservation un-seat). An assignment
+// created BEFORE that instant belonged to a party that has already gone: stale.
+// One created AFTER it was made while the table was free: deliberate, keep it.
+// A table with no completed session yet (max is null) matches nothing, so this
+// degrades to exactly the previous behaviour.
+async function clearStaleTableAssignment(
+  context: RestaurantContext,
+  tableId: string,
+  client?: PoolClient,
+): Promise<void> {
+  try {
+    await ensureTableAssignmentsTable(client);
+    const removed = await runQuery<{ id: string; employee_id: string }>(
+      `delete from "Table_assignments" a
+        where a.res_id = $1 and a.outlet_id = $2 and a.table_id = $3
+          and a.created_at < (
+            select max(s.left_at) from "TableSessions" s
+             where s.table_id = $3 and s.left_at is not null
+          )
+        returning a.id, a.employee_id`,
+      [context.res_id, context.outlet_id, tableId],
+      client,
+    );
+    if (removed.length > 0) {
+      // Loud on purpose: reaching this means a release path did NOT clear the
+      // assignment, and the owner deserves to know which table it happened on.
+      logger.warn(
+        { res_id: context.res_id, outlet_id: context.outlet_id, table_id: tableId, employee_id: removed[0].employee_id },
+        "table_assignment_stale_cleared",
+      );
+    }
+  } catch (err) {
+    // Never fail a seating over housekeeping.
+    logger.warn({ err: (err as any)?.message ?? err, table_id: tableId }, "clear_stale_table_assignment_failed");
+  }
 }
 
 // Remove a table's waiter assignment by table id (when the table is freed/settled).
@@ -22025,6 +22628,10 @@ async function ensureBrandingColumns(): Promise<void> {
   // Whether the walk-in queue page shows the menu / pre-order. Some restaurants
   // want a pure "queue position only" experience — default true (show it).
   await runQuery(`alter table "Restaurant" add column if not exists queue_show_menu boolean default true`);
+  // WHICH dishes that queue menu offers and how it presents them (see
+  // queue_menu.ts). NULL — every existing tenant — resolves to the whole
+  // available menu, alphabetical categories, prices on: bit-for-bit today.
+  await runQuery(`alter table "Restaurant" add column if not exists queue_menu_config jsonb default null`);
   // Manager approval threshold for staff-applied bill discounts: when a NON-admin
   // applies a discount whose computed amount exceeds this, it becomes a pending
   // DiscountRequests row instead of applying. 0 = approvals off (apply directly).
@@ -22091,6 +22698,12 @@ async function ensureBrandingColumns(): Promise<void> {
   // Null means "never customized" — the read layer applies sane defaults and
   // falls the primary colour back to the logo palette / theme_color.
   await runQuery(`alter table "Restaurant" add column if not exists brand_config jsonb default null`);
+  // Configurable menu badges: the restaurant's badge CATALOGUE (see
+  // menu_badges.ts). Restaurant-wide like kitchen_sections, because a chain
+  // wants one badge vocabulary across its outlets. NULL means "never
+  // configured", which resolves to an EMPTY catalogue — no badge renders
+  // anywhere until the owner adds one, so every existing tenant is unchanged.
+  await runQuery(`alter table "Restaurant" add column if not exists menu_badges jsonb default null`);
   brandingColsEnsured = true;
 }
 
@@ -23033,11 +23646,11 @@ export async function ExtractLogoPalette(logoRef: string | null): Promise<{ prim
 
 export async function GetPublicBranding(
   restaurantId: string,
-): Promise<{ logo_url: string | null; theme_color: string | null; theme_primary: string | null; theme_secondary: string | null; currency: string; payment_methods: PaymentMethodConfig[]; restaurant_name: string; feedback_config: FeedbackConfig; bill_logo_svg: string; queue_show_menu: boolean; timezone: string; require_table_otp: boolean; brand_config: BrandConfig; brand_palette: BrandPalette }> {
+): Promise<{ logo_url: string | null; theme_color: string | null; theme_primary: string | null; theme_secondary: string | null; currency: string; payment_methods: PaymentMethodConfig[]; restaurant_name: string; feedback_config: FeedbackConfig; bill_logo_svg: string; queue_show_menu: boolean; timezone: string; require_table_otp: boolean; brand_config: BrandConfig; brand_palette: BrandPalette; menu_badges: MenuBadge[] }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const rows = await runQuery<{ logo: string | null; theme_color: string | null; currency: string | null; payment_config: unknown; feedback_config: unknown; res_name: string | null; bill_logo_svg: string | null; queue_show_menu: boolean | null; timezone: string | null; require_table_otp: boolean | null; brand_config: unknown }>(
-    `select logo, theme_color, currency, payment_config, feedback_config, res_name, bill_logo_svg, queue_show_menu, timezone, require_table_otp, brand_config from "Restaurant" where id = $1 limit 1`,
+  const rows = await runQuery<{ logo: string | null; theme_color: string | null; currency: string | null; payment_config: unknown; feedback_config: unknown; res_name: string | null; bill_logo_svg: string | null; queue_show_menu: boolean | null; timezone: string | null; require_table_otp: boolean | null; brand_config: unknown; menu_badges: unknown }>(
+    `select logo, theme_color, currency, payment_config, feedback_config, res_name, bill_logo_svg, queue_show_menu, timezone, require_table_otp, brand_config, menu_badges from "Restaurant" where id = $1 limit 1`,
     [context.res_id],
   );
   const palette = await ExtractLogoPalette(rows[0]?.logo ?? null);
@@ -23066,6 +23679,11 @@ export async function GetPublicBranding(
     // The RESOLVED palette (role -> hex, never null) the guest surfaces theme
     // from. Same inputs as brand_config, one flat object with no null-checks.
     brand_palette: resolveBrandPalette(rows[0]?.brand_config, palette?.primary ?? null, rows[0]?.theme_color ?? null),
+    // The ENABLED badge catalogue, in tenant order — the guest surfaces map an
+    // item's resolved badge ids through this to get labels, kinds and ordering.
+    // Empty for every tenant that never configured any, which is why an absent
+    // catalogue renders nothing rather than a default set.
+    menu_badges: enabledMenuBadges(sanitizeMenuBadgeCatalogue(parseJsonArray(rows[0]?.menu_badges))),
   };
 }
 
@@ -23158,6 +23776,411 @@ export async function SetBranding(
     // explain why the served text colour differs from the stored one.
     brand_contrast: detailed.contrast,
   };
+}
+
+// --- Queue pre-order menu (which dishes a QUEUING walk-in may pick) ---------
+//
+// The rules themselves are pure and live in queue_menu.ts; this is only the
+// storage + the tenant-scoped reads. One jsonb column on "Restaurant", NULL for
+// every existing tenant, and NULL resolves to the whole menu — see
+// resolveQueueMenuConfig for the absent-equals-today contract.
+//
+// RESTAURANT-LEVEL, like queue_show_menu, brand_config and feedback_config: the
+// public queue page resolves one outlet from the slug and reads the tenant's
+// customer-facing configuration as a whole. For a MULTI-OUTLET tenant that has a
+// practical consequence worth knowing: a category rule ("no desserts while you
+// wait") applies across every branch, while an item-id rule only ever matches
+// the branch whose menu owns that id — "Menu" rows are outlet-scoped. Both
+// behave sanely; the category rule is the portable one.
+
+/** The raw stored rule plus the master on/off switch, in one read. A null
+ *  config means the tenant never customized it — the whole menu, as before. */
+async function readQueueMenuRow(context: { res_id: string }): Promise<{ config: unknown; show: boolean }> {
+  await ensureBrandingColumns();
+  const rows = await runQuery<{ queue_menu_config: unknown; queue_show_menu: boolean | null }>(
+    `select queue_menu_config, queue_show_menu from "Restaurant" where id = $1 limit 1`,
+    [context.res_id],
+  );
+  return { config: rows[0]?.queue_menu_config ?? null, show: rows[0]?.queue_show_menu ?? true };
+}
+
+/**
+ * The editors' read: the resolved config, whether the tenant has actually
+ * customized anything, and the CURRENT menu to pick from — so the picker and the
+ * "what a queuing guest sees" preview are built from one payload that cannot
+ * drift from what the guest endpoint serves.
+ */
+export async function GetQueueMenuConfig(restaurantId: string): Promise<{
+  config: ResolvedQueueMenuConfig;
+  configured: boolean;
+  /** True when the tenant turned the queue menu off wholesale (queue_show_menu). */
+  queue_show_menu: boolean;
+  /** Every menu item, each stamped with whether the current rule lets it through. */
+  items: (MenuItemRecord & { queue_included: boolean })[];
+  /** Categories in the order the queue page will render them. */
+  categories: string[];
+}> {
+  const context = await requireRestaurantContext(restaurantId);
+  const [row, items] = await Promise.all([
+    readQueueMenuRow(context),
+    GetMenuItems(restaurantId),
+  ]);
+  const config = resolveQueueMenuConfig(row.config);
+  const built = buildQueueMenu(config, items);
+  return {
+    config,
+    configured: isQueueMenuConfigured(row.config),
+    queue_show_menu: row.show,
+    // Sold-out items are reported as excluded (isQueueMenuItemAllowed refuses
+    // them) but still listed, so the editor can show WHY a dish the owner ticked
+    // is not on the queue menu today.
+    items: items.map((it) => ({ ...it, queue_included: isQueueMenuItemAllowed(config, it) })),
+    categories: built.categories,
+  };
+}
+
+/**
+ * Merge a sanitized write onto the stored config. Same discipline as
+ * SetBranding: keys the caller OMITS keep their value, keys sent as null (or a
+ * headline/intro typed back to blank) are REMOVED — which is how a tenant gets
+ * back to the shipped default rather than to some "empty" value that means
+ * something else. `reset` drops the whole column back to NULL.
+ */
+export async function SetQueueMenuConfig(
+  restaurantId: string,
+  input: unknown,
+  opts: { reset?: boolean } = {},
+): Promise<{ config: ResolvedQueueMenuConfig; configured: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureBrandingColumns();
+  if (opts.reset) {
+    await runQuery(`update "Restaurant" set queue_menu_config = null where id = $1`, [context.res_id]);
+    return { config: resolveQueueMenuConfig(null), configured: false };
+  }
+  const sanitized: QueueMenuConfig = sanitizeQueueMenuConfigInput(input);
+  const clearKeys = queueMenuClearKeys(input);
+  const rows = await runQuery<{ queue_menu_config: unknown }>(
+    `update "Restaurant"
+        set queue_menu_config = ((coalesce(queue_menu_config, '{}'::jsonb) || $2::jsonb) - $3::text[])
+      where id = $1
+      returning queue_menu_config`,
+    [context.res_id, JSON.stringify(sanitized), clearKeys],
+  );
+  const stored = rows[0]?.queue_menu_config ?? null;
+  return { config: resolveQueueMenuConfig(stored), configured: isQueueMenuConfigured(stored) };
+}
+
+/**
+ * THE endpoint payload a queuing guest's page is built from. Excluded dishes are
+ * absent from `items` — the filtering happens HERE, not in the browser, so a
+ * guest reading the network tab still cannot see (or stage) a dish the kitchen
+ * kept off the queue menu. The dine-in QR menu (GET /qr/:slug/menu) is
+ * deliberately untouched: the same dish stays orderable at the table.
+ */
+export async function GetQueueMenu(restaurantId: string): Promise<{
+  config: ResolvedQueueMenuConfig;
+  configured: boolean;
+  queue_show_menu: boolean;
+  items: MenuItemRecord[];
+  categories: string[];
+}> {
+  const context = await requireRestaurantContext(restaurantId);
+  const [row, items] = await Promise.all([
+    readQueueMenuRow(context),
+    GetMenuItems(restaurantId),
+  ]);
+  const config = resolveQueueMenuConfig(row.config);
+  const built = buildQueueMenu(config, items);
+  return {
+    config,
+    configured: isQueueMenuConfigured(row.config),
+    queue_show_menu: row.show,
+    items: built.items,
+    categories: built.categories,
+  };
+}
+
+/**
+ * Drop the lines a queuing guest is not allowed to pre-order.
+ *
+ * Runs on the WRITE path (SetWaitlistPreorder), one layer below the endpoint, so
+ * an API caller that skips the queue page is refused the same way a browser is.
+ * Dropping — rather than erroring — is deliberate: it is exactly what
+ * repriceFromMenu already does with an item that is not on the menu at all, so a
+ * guest whose held picks partly went off the queue menu keeps the rest instead
+ * of losing the whole save.
+ *
+ * THROWS when the config cannot be read, for the same reason repriceFromMenu
+ * throws on a menu read failure: silently treating an outage as "nothing is
+ * allowed" would wipe a guest's picks while reporting success.
+ *
+ * DELIBERATELY NOT ON THE CONFIRM PATH. ConfirmWaitlistPreorder turns already-
+ * held picks into a real order; those picks were staged when the rule allowed
+ * them. A kitchen that narrows the queue menu at 8pm is saying "stop taking
+ * these from now on", not "void what the party sitting down already chose" —
+ * and silently dropping a confirmed line would hand them a short order with no
+ * explanation. The gate belongs where the choice is made.
+ */
+async function filterToQueueMenu(restaurantId: string, items: WaitlistItem[]): Promise<WaitlistItem[]> {
+  if (items.length === 0) {return items;}
+  const context = await requireRestaurantContext(restaurantId);
+  const config = resolveQueueMenuConfig((await readQueueMenuRow(context)).config);
+  if (config.mode === "all") {return items;} // no rule to apply — skip the menu re-read
+  const menu = await GetMenuItems(restaurantId);
+  const byId = new Map(menu.map((m) => [String(m.id), m]));
+  // Lines reaching here have already been re-priced from the menu, so every id
+  // resolves; a line that somehow does not is dropped rather than trusted.
+  return items.filter((it) => {
+    const m = byId.get(String(it.id));
+    return m ? isQueueMenuItemAllowed(config, m) : false;
+  });
+}
+
+// --- Promotional posters (guest menu) --------------------------------------
+//
+// Rows in "Posters" (migration 031). Every rule about WHAT is visible lives in
+// posters.ts as pure functions; this layer only reads, writes and hands the day
+// key over. See posters.ts for why the schedule is a calendar key in the
+// restaurant's zone and not a timestamp.
+
+// Columns, in one place, so the three readers below cannot drift apart on what a
+// PosterRecord is made of. to_char rather than a bare `date` select: node-postgres
+// hands a `date` column back as a JS Date at LOCAL midnight, and one
+// toISOString() later a Kolkata server has turned 2026-06-15 into 2026-06-14.
+// The whole point of storing calendar keys is not to re-acquire a timezone bug on
+// the way out.
+const POSTER_COLUMNS = `
+  id::text as id,
+  image_url,
+  coalesce(title, '') as title,
+  placement,
+  sort_order,
+  to_char(start_on, 'YYYY-MM-DD') as start_on,
+  to_char(end_on, 'YYYY-MM-DD') as end_on,
+  active,
+  coalesce(width, 0) as width,
+  coalesce(height, 0) as height,
+  created_at
+`;
+
+interface PosterRow {
+  id: string;
+  image_url: string;
+  title: string;
+  placement: string;
+  sort_order: number | string;
+  start_on: string | null;
+  end_on: string | null;
+  active: boolean;
+  width: number | string;
+  height: number | string;
+  created_at: Date | string;
+}
+
+function mapPosterRow(row: PosterRow): PosterRecord {
+  return {
+    id: String(row.id),
+    image_url: String(row.image_url ?? ""),
+    title: String(row.title ?? ""),
+    // The CHECK constraint already limits this, but the record type is a union
+    // and a row written before a future placement is added should degrade to the
+    // in-menu slot rather than render nowhere.
+    placement: row.placement === "top" ? "top" : "menu",
+    sort_order: Number(row.sort_order ?? 0),
+    start_on: row.start_on ?? null,
+    end_on: row.end_on ?? null,
+    active: row.active !== false,
+    width: Number(row.width ?? 0),
+    height: Number(row.height ?? 0),
+    created_at: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at ?? ""),
+  };
+}
+
+// The tenant-scoped WHERE every poster read shares. A NULL outlet_id means "all
+// outlets of this restaurant" (see migration 031) — today's editors write NULL,
+// so this predicate is what keeps a future per-branch poster from leaking to the
+// wrong branch without any read having to change.
+const POSTER_SCOPE = `res_id = $1 and (outlet_id is null or outlet_id = $2)`;
+
+/**
+ * Every poster the tenant has, expired and paused ones included, plus the
+ * restaurant's day key so the EDITORS can label each row "showing now" using the
+ * same predicate the guest read uses. Returning the key rather than a computed
+ * flag per row keeps ONE definition of "visible" (posterIsVisible) instead of a
+ * server flag and a client rule that can disagree.
+ */
+export async function ListPosters(
+  restaurantId: string,
+): Promise<{ posters: PosterRecord[]; today: string; timezone: string }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<PosterRow>(
+    `select ${POSTER_COLUMNS} from "Posters"
+      where ${POSTER_SCOPE}
+      order by sort_order asc, created_at asc, id asc
+      limit ${String(POSTER_MAX_STORED)}`,
+    [context.res_id, context.outlet_id],
+  );
+  return {
+    posters: rows.map(mapPosterRow),
+    today: dayKeyOf(new Date(), context.timezone),
+    timezone: context.timezone,
+  };
+}
+
+/**
+ * What a GUEST should see right now: active, in-window today (in the
+ * restaurant's zone), ordered and capped, narrowed to the public fields.
+ *
+ * The date filter is applied in NODE rather than in SQL. That is deliberate:
+ * the day key is derived from the tenant's timezone, so pushing the comparison
+ * into SQL would mean two implementations of "is this poster showing" — one in
+ * posters.ts for the editor and one in a WHERE clause for guests — and the day
+ * they disagree is the day an expired poster is served to diners. There are at
+ * most POSTER_MAX_STORED rows per tenant, so filtering them in memory costs
+ * nothing measurable and buys a single source of truth that jest can assert
+ * against.
+ */
+export async function GetVisiblePosters(restaurantId: string): Promise<GuestPoster[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<PosterRow>(
+    `select ${POSTER_COLUMNS} from "Posters"
+      where ${POSTER_SCOPE} and active
+      order by sort_order asc, created_at asc, id asc
+      limit ${String(POSTER_MAX_STORED)}`,
+    [context.res_id, context.outlet_id],
+  );
+  return visiblePosters(rows.map(mapPosterRow), dayKeyOf(new Date(), context.timezone));
+}
+
+/**
+ * Create one poster. `image_url` is required and always comes from the upload
+ * route (the storage helper's public URL) — there is no path that lets a caller
+ * name an arbitrary remote image, because that would put a third-party host in
+ * the middle of a page real diners load.
+ */
+export async function CreatePoster(
+  restaurantId: string,
+  input: { image_url: string; width?: number; height?: number; patch: PosterPatch; createdBy?: string },
+): Promise<PosterRecord> {
+  const context = await requireRestaurantContext(restaurantId);
+  const patch = input.patch;
+  const windowError = posterWindowError(patch.start_on, patch.end_on);
+  if (windowError) {throw new Error(windowError);}
+
+  // The library cap is enforced HERE and not only in the editor: an owner with a
+  // stale tab or a scripted client would otherwise walk past it, and every one of
+  // these rows is an image on a customer's phone.
+  const existing = await runQuery<{ n: number }>(
+    `select count(*)::int as n from "Posters" where ${POSTER_SCOPE}`,
+    [context.res_id, context.outlet_id],
+  );
+  if (Number(existing[0]?.n ?? 0) >= POSTER_MAX_STORED) {
+    throw new Error(`You can keep up to ${String(POSTER_MAX_STORED)} posters. Delete one to add another.`);
+  }
+
+  // outlet_id is written NULL = "every outlet of this restaurant". Neither editor
+  // offers a per-branch choice yet, and defaulting a poster to the outlet the
+  // owner happened to be looking at would make it silently invisible on their
+  // other branches' QR pages — the opposite of what "add a poster" means.
+  const rows = await runQuery<PosterRow>(
+    `insert into "Posters" (res_id, outlet_id, image_url, title, placement, sort_order, start_on, end_on, active, width, height, created_by)
+     values ($1, null, $2, $3, $4, $5, $6::date, $7::date, $8, $9, $10, $11)
+     returning ${POSTER_COLUMNS}`,
+    [
+      context.res_id,
+      input.image_url,
+      patch.title ?? "",
+      patch.placement ?? "menu",
+      patch.sort_order ?? 0,
+      patch.start_on ?? null,
+      patch.end_on ?? null,
+      patch.active ?? true,
+      Math.max(0, Math.round(Number(input.width ?? 0))),
+      Math.max(0, Math.round(Number(input.height ?? 0))),
+      input.createdBy && isUuid(input.createdBy) ? input.createdBy : null,
+    ],
+  );
+  const created = rows[0];
+  if (!created) {throw new Error("Unable to save poster");}
+  return mapPosterRow(created);
+}
+
+/**
+ * Merge-on-omit update, the same contract SetBranding uses: a key the caller did
+ * not send keeps its stored value. The date bounds are the exception that makes
+ * the contract usable — sanitizePosterPatch turns "sent as null" into an
+ * explicit null, and the coalesce below is written so that reaches the column,
+ * because "take the end date off again" has to be expressible.
+ */
+export async function UpdatePoster(
+  restaurantId: string,
+  posterId: string,
+  raw: unknown,
+): Promise<PosterRecord | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(posterId)) {return null;}
+  const patch = sanitizePosterPatch(raw);
+
+  const current = await runQuery<PosterRow>(
+    `select ${POSTER_COLUMNS} from "Posters"
+      where id = $1 and res_id = $2 and (outlet_id is null or outlet_id = $3)`,
+    [posterId, context.res_id, context.outlet_id],
+  );
+  const before = current[0] ? mapPosterRow(current[0]) : null;
+  if (!before) {return null;}
+
+  const next: PosterRecord = {
+    ...before,
+    ...(patch.title !== undefined ? { title: patch.title } : {}),
+    ...(patch.placement !== undefined ? { placement: patch.placement } : {}),
+    ...(patch.sort_order !== undefined ? { sort_order: patch.sort_order } : {}),
+    ...(patch.start_on !== undefined ? { start_on: patch.start_on } : {}),
+    ...(patch.end_on !== undefined ? { end_on: patch.end_on } : {}),
+    ...(patch.active !== undefined ? { active: patch.active } : {}),
+    ...(patch.image_url !== undefined ? { image_url: patch.image_url } : {}),
+  };
+  // Validate the MERGED window, not the patch: clearing only the start date on a
+  // poster that already has an end date must still leave a sane window.
+  const windowError = posterWindowError(next.start_on, next.end_on);
+  if (windowError) {throw new Error(windowError);}
+
+  const rows = await runQuery<PosterRow>(
+    `update "Posters" set
+       image_url = $4,
+       title = $5,
+       placement = $6,
+       sort_order = $7,
+       start_on = $8::date,
+       end_on = $9::date,
+       active = $10
+     where id = $1 and res_id = $2 and (outlet_id is null or outlet_id = $3)
+     returning ${POSTER_COLUMNS}`,
+    [
+      posterId, context.res_id, context.outlet_id,
+      next.image_url, next.title, next.placement, next.sort_order,
+      next.start_on, next.end_on, next.active,
+    ],
+  );
+  return rows[0] ? mapPosterRow(rows[0]) : null;
+}
+
+/**
+ * Delete a poster, returning the row that was removed so the caller can put the
+ * whole thing in the audit detail. The stored IMAGE is deliberately left in the
+ * bucket: object deletion is not transactional with the row delete, and an
+ * orphaned object costs a few KB while a deleted object that a surviving row
+ * still points at is a broken image on a live guest page.
+ */
+export async function DeletePoster(restaurantId: string, posterId: string): Promise<PosterRecord | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(posterId)) {return null;}
+  const rows = await runQuery<PosterRow>(
+    `delete from "Posters"
+      where id = $1 and res_id = $2 and (outlet_id is null or outlet_id = $3)
+      returning ${POSTER_COLUMNS}`,
+    [posterId, context.res_id, context.outlet_id],
+  );
+  return rows[0] ? mapPosterRow(rows[0]) : null;
 }
 
 // --- Staff notifications (bell) --------------------------------------------

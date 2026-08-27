@@ -32,7 +32,9 @@ import {
   addTable,
   assignedEmployeeFor,
   assignments,
+  endOccupancy,
   resetStore,
+  seedAssignment,
 } from "./table_assignment_fixtures";
 
 jest.mock("pg", () => {
@@ -179,10 +181,35 @@ describe("issue 7 — attendance-aware assignability", () => {
     expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER1_ID);
   });
 
-  test("auto-assign never picks a not-clocked-in actor", async () => {
+  // WHAT THIS TEST USED TO ASSERT WAS THE BUG. It read
+  // `expect(assignments()).toHaveLength(0)` — seating a party while not clocked
+  // in credited nobody — and that is exactly what "waiters are not getting
+  // auto-assigned" turned out to be in production: an outlet with Attendance
+  // rows on file and nobody clocked in at that moment dropped every seating.
+  //
+  // The clocked-in rule governs candidates the SYSTEM picks. The seater is not
+  // picked; they walked the party to the table. The second half of this test is
+  // what keeps the original fix ("employees who aren't clocked in should not
+  // show up as an option to be assigned or be automatically assigned") intact:
+  // Binu is credited for HIS OWN seating and is still absent from the picker and
+  // still refused on an explicit write.
+  test("the SEATER is credited even when they never clocked in — the act of seating is the proof of presence", async () => {
     addAttendance({ emp_id: WAITER1_ID, status: "approved" });
-    // Binu is not clocked in: seating must not make him the waiter.
-    await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER2_ID);
+    // Binu is not clocked in, but he is the one who seated this party.
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER2_ID);
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER2_ID);
+    expect(r.assignment?.assigned).toBe(true);
+    expect(r.assignment?.reason).toBe("assigned");
+    expect(r.assignment?.employee_id).toBe(WAITER2_ID);
+    expect(r.assignment?.message).toContain("Binu M");
+  });
+
+  test("a not-clocked-in employee who did NOT seat anyone is still out of the picker and still refused on write", async () => {
+    addAttendance({ emp_id: WAITER1_ID, status: "approved" });
+    const roster = await db.GetAssignableEmployees(RESTAURANT_SLUG);
+    expect(roster.attendance_in_use).toBe(true);
+    expect(roster.employees.map((e) => e.employee_Username)).toEqual(["asha"]);
+    await expect(db.AssignTableToEmployee(RESTAURANT_SLUG, "T1", "binu")).rejects.toThrow(/not clocked in/);
     expect(assignments()).toHaveLength(0);
   });
 
@@ -201,7 +228,100 @@ describe("issue 7 — attendance-aware assignability", () => {
     expect(roster.attendance_in_use).toBe(true);
     expect(roster.employees).toHaveLength(0);
     await expect(db.AssignTableToEmployee(RESTAURANT_SLUG, "T1", "asha")).rejects.toThrow(/not clocked in/);
+    // Nobody is pickable and no explicit assignment is allowed — and seating
+    // STILL credits the seater. Asha's shift is closed on paper; she is
+    // nonetheless the person who just put this party at T1, and leaving the
+    // table waiterless does not make the attendance record any truer.
     await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER1_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE SILENCE. Every early return in assignTableById used to be a bare
+// `return;` — no log line, no field in the response. An outlet where auto-assign
+// fired on every seating and one where it fired on none were indistinguishable
+// from outside, which is how this ran for weeks with zero warnings in the logs
+// and was finally reported by the owner rather than by the system. Each case now
+// has to name itself.
+describe("the outcome of a seating is always reported", () => {
+  test("assigned: says who, by name", async () => {
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
+    expect(r.assignment?.reason).toBe("assigned");
+    expect(r.assignment?.employee_id).toBe(WAITER1_ID);
+    expect(r.assignment?.message).toContain("Asha K");
+  });
+
+  test("already_assigned: names the waiter that was KEPT, not just a refusal", async () => {
+    await db.AssignTableToEmployee(RESTAURANT_SLUG, "T1", "asha");
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER2_ID);
+    expect(r.assignment?.assigned).toBe(false);
+    expect(r.assignment?.reason).toBe("already_assigned");
+    expect(r.assignment?.employee_id).toBe(WAITER1_ID);
+    expect(r.assignment?.message).toContain("Asha K");
+    // The kept row is the point of `on conflict do nothing` — unchanged.
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER1_ID);
+  });
+
+  test("unknown_employee: a well-formed id that is nobody here is reported, not swallowed", async () => {
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, "99999999-9999-4999-8999-999999999999");
+    expect(r.assignment?.assigned).toBe(false);
+    expect(r.assignment?.reason).toBe("unknown_employee");
     expect(assignments()).toHaveLength(0);
+  });
+
+  test("no_actor: a guest QR occupy has nobody to credit, and says so", async () => {
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, null);
+    expect(r.assignment?.assigned).toBe(false);
+    expect(r.assignment?.reason).toBe("no_actor");
+    expect(assignments()).toHaveLength(0);
+  });
+
+  test("a re-occupy of an already-seated table reports NOTHING — it was never a seating", async () => {
+    await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", null, "order-9", ADMIN_EMP_ID);
+    // null, not a "reason" — the order flow's incidental occupy has no opinion
+    // about the waiter and must not look like a failed assignment.
+    expect(r.assignment).toBeNull();
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER1_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `on conflict do nothing` is right for a deliberate choice and wrong for a
+// leftover. Both look identical in the table — one row on a table — so the only
+// honest discriminator is WHEN it was written relative to the previous party
+// leaving (TableSessions.left_at, stamped by the DB trigger on every release).
+describe("a stale assignment cannot outlive its occupancy", () => {
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000);
+
+  test("an assignment left behind by the PREVIOUS occupancy does not survive the next seating", async () => {
+    // Binu served the last party at T1...
+    seedAssignment(TABLE1_ID, WAITER2_ID, hoursAgo(3));
+    // ...and the release path freed the table WITHOUT unassigning him (the bug
+    // class: CloseBillByOrder and the reservation un-seat both did exactly this).
+    endOccupancy(TABLE1_ID, hoursAgo(1));
+
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
+
+    // The new party's seater owns the table. Without the sweep, `do nothing`
+    // would have kept Binu on a table he is not serving — and reported
+    // "already_assigned", which is how it stayed invisible.
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER1_ID);
+    expect(r.assignment?.reason).toBe("assigned");
+  });
+
+  test("a deliberate pre-assignment made while the table stood FREE does survive", async () => {
+    // Last party left an hour ago, table cleared properly.
+    endOccupancy(TABLE1_ID, hoursAgo(1));
+    // A manager lays out sections for the next service — this is a choice, not a
+    // leftover, and it is made AFTER the table went free.
+    await db.AssignTableToEmployee(RESTAURANT_SLUG, "T1", "binu");
+
+    const r = await db.OccupyTable(RESTAURANT_SLUG, "T1", 2, null, WAITER1_ID);
+
+    expect(assignedEmployeeFor(TABLE1_ID)).toBe(WAITER2_ID);
+    expect(r.assignment?.reason).toBe("already_assigned");
+    expect(r.assignment?.employee_name).toBe("Binu M");
   });
 });

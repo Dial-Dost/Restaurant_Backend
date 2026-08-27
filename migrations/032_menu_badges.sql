@@ -1,0 +1,53 @@
+-- 033: configurable menu badges.
+--
+-- WHAT THIS IS FOR
+-- ----------------
+-- Restaurants want to put small labels on dishes — "Must Try", "Chef's
+-- Special", but also "Jain", "Vegan" and "Contains nuts". Which labels exist,
+-- what they are called and which dishes carry them all vary per restaurant, so
+-- none of it can be a hardcoded list.
+--
+-- WHERE THE TWO HALVES LIVE
+-- -------------------------
+--   catalogue -> this column. Restaurant-WIDE (not per outlet), like
+--                kitchen_sections and inventory_categories: a chain wants one
+--                badge vocabulary across every branch, and a badge removed at
+--                head office must not leave another outlet's menu claiming it.
+--   tags      -> the `badges` key inside each item's "Menu".description JSON
+--                blob, alongside image_url / station / allergens / recipe.
+--                No new item column, and no schema change here — the blob is
+--                where item metadata already lives (see encodeMenuDescription).
+--
+-- NULL IS THE DEFAULT AND IT MEANS "NO BADGES AT ALL".
+-- Not "the shipped starter set". A tenant who never opens the badges editor
+-- resolves to an EMPTY catalogue, every item's tags resolve to nothing, and the
+-- guest menu, the queue pre-order menu and the staff menu module render exactly
+-- what they rendered before this feature existed. The starter set
+-- (MENU_BADGE_PRESETS in menu_badges.ts) is something the editors OFFER with
+-- one click; the server never applies it on a restaurant's behalf, because a
+-- badge is a claim and nobody but the restaurant may make it.
+--
+-- The shape of one entry, sanitized on every write by
+-- sanitizeMenuBadgeCatalogue():
+--
+--   { "id": "jain", "label": "Jain", "kind": "diet", "enabled": true }
+--   { "id": "contains_nuts", "label": "Contains nuts", "kind": "alert",
+--     "enabled": true, "allergen": "nuts" }
+--
+-- `kind` decides behaviour, not decoration: `alert` and `diet` render first and
+-- are never truncated away to make room for marketing, and they cannot be
+-- silently removed from the catalogue while dishes still carry them (the write
+-- is refused with the counts — see SetMenuBadgeCatalogue). An `alert` entry with
+-- an `allergen` is DERIVED from the item's existing allergen list rather than
+-- tagged separately, so there is exactly one store of "this dish contains nuts"
+-- and it cannot be untagged without editing the allergen record itself.
+--
+-- IDEMPOTENT, and mirrored by ensureBrandingColumns() in database_supabase.ts,
+-- which issues the same statement at runtime. That mirroring is the existing
+-- idiom for "Restaurant" settings columns and is what keeps the backend
+-- deployable ahead of the migration, in either order.
+
+alter table "Restaurant" add column if not exists menu_badges jsonb default null;
+
+comment on column "Restaurant".menu_badges is
+  'Configurable menu badge catalogue: [{id,label,kind:alert|diet|promo,enabled,allergen?}]. NULL = never configured = no badges render anywhere. Item tags live in Menu.description.badges.';

@@ -4,7 +4,7 @@
  */
 import type { Express, Request, Response } from "express";
 import type { MenuModifierGroup, RecipeItem } from "../database_supabase.js";
-import { Audit_log_category, DeleteMenuCategory, EnsureMenuCategory, GetMenuCategories, GetMenuCosting, GetMenuItemUndoState, GetMenuItems, GetRestaurantSettings, MenuBulkDeleteError, RenameMenuStation, SaveMenuItems, SetRestaurantSettings, UpdateMenuItemPrice, UpsertMenuItem } from "../database_supabase.js";
+import { Audit_log_category, DeleteMenuCategory, EnsureMenuCategory, GetMenuBadgeCatalogue, GetMenuBadgePresets, GetMenuCategories, GetMenuCosting, GetMenuItemUndoState, GetMenuItems, GetQueueMenuConfig, GetRestaurantSettings, MENU_BADGE_KINDS, MENU_BADGE_LABEL_MAX, MENU_BADGE_PER_ITEM_MAX, MENU_BADGE_PROTECTED_KINDS, MenuBadgeSafetyError, MenuBulkDeleteError, RenameMenuStation, SaveMenuItems, SetMenuBadgeCatalogue, SetMenuItemBadges, SetQueueMenuConfig, SetRestaurantSettings, UpdateMenuItemPrice, UpsertMenuItem } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { uploadMenuImage } from "../storage_bucket_supabase.js";
 import { PERM_MENU_BULK_REPLACE, PERM_MENU_CAT_DELETE, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
@@ -53,6 +53,29 @@ app.get("/menu/categories", validateAction("f4177b38-77fa-4d8c-9fbd-c4f06bf28610
 	}
 });
 
+// The restaurant's configurable badge catalogue + the starter set the editors
+// offer. Read behind View Menu because the badges ARE menu content; the write
+// side lives in registerMenuAdminRoutes under Edit Menu.
+app.get("/menu/badges", validateAction("f4177b38-77fa-4d8c-9fbd-c4f06bf28610"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try {
+		res.json({
+			badges: await GetMenuBadgeCatalogue(restaurantId),
+			// Server-owned so neither editor hardcodes the list, and so the
+			// justification for the starter set lives in one place (menu_badges.ts).
+			presets: GetMenuBadgePresets(),
+			kinds: MENU_BADGE_KINDS,
+			protected_kinds: MENU_BADGE_PROTECTED_KINDS,
+			per_item_max: MENU_BADGE_PER_ITEM_MAX,
+			label_max: MENU_BADGE_LABEL_MAX,
+		});
+	} catch (error) {
+		logger.error({ err: error }, "get_menu_badges_failed");
+		res.status(500).json({ error: "Unable to fetch menu badges" });
+	}
+});
+
 app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
@@ -98,6 +121,10 @@ app.post("/menu", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async 
 			// Guest-facing dish description (sanitized in encodeMenuDescription).
 			// Absent = keep the stored text; "" / null = clear it.
 			blurb: typeof body.blurb === "string" ? body.blurb : body.blurb === null ? null : undefined,
+			// Badge tags. Absent = keep the stored tags (so a price or
+			// availability save from a client that predates badges cannot strip
+			// them); [] is the explicit way to clear.
+			badges: Array.isArray(body.badges) ? (body.badges as string[]) : undefined,
 		});
 		try {
 			// Only an availability-ONLY change is undoable: this route is a general
@@ -143,6 +170,55 @@ app.post("/menu/upload-image", validateAction("88a87943-8f0b-43e2-b85e-192fdc901
 		res.status(500).json({ error: "Unable to upload image" });
 	}
 });
+
+// --- The queue pre-order menu (what a QUEUING walk-in may order) ------------
+// A menu-scoping decision, not a branding one, so it sits behind the menu
+// permissions and next to the menu it narrows: read with "view menu", write with
+// "edit menu". The read hands back the resolved rule AND every menu item stamped
+// with whether the rule currently lets it through, so the editors' picker and
+// the "what a queuing guest sees" preview are built from one payload that cannot
+// drift from what /qr/:slug/queue-menu serves.
+app.get("/queue-menu-config", validateAction("f4177b38-77fa-4d8c-9fbd-c4f06bf28610"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try { res.json(await GetQueueMenuConfig(restaurantId)); }
+	catch (error) {
+		logger.error({ err: error }, "get_queue_menu_config_failed");
+		res.status(500).json({ error: "Unable to fetch the queue menu settings" });
+	}
+});
+
+app.post("/queue-menu-config", validateAction("88a87943-8f0b-43e2-b85e-192fdc901ed2"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	// `reset: true` drops the whole config, which is the ONLY way back to the
+	// shipped "the queue shows the whole menu" behaviour bit-for-bit — clearing
+	// each key by hand would leave an empty object behind that reads as
+	// "configured" to the guest page.
+	const reset = body.reset === true;
+	try {
+		// Snapshot first so the audit line can say what the rule was BEFORE. No
+		// `undo` envelope: UNDO_REGISTRY is deny-by-default and this kind is not
+		// in it, so an envelope here would be inert — and the editor's own "Back
+		// to the whole menu" is the honest way back.
+		const prior = await GetQueueMenuConfig(restaurantId).catch(() => null);
+		const result = await SetQueueMenuConfig(restaurantId, body, { reset });
+		try {
+			await log_audit(req, "88a87943-8f0b-43e2-b85e-192fdc901ed2", reset ? "Reset the queue pre-order menu to the full menu" : "Updated the queue pre-order menu", Audit_log_category.Menu, {
+				mode: result.config.mode,
+				items: result.config.items.length,
+				categories: result.config.categories.length,
+				show_prices: result.config.show_prices,
+				...(prior ? { prior_mode: prior.config.mode, prior_items: prior.config.items.length, prior_categories: prior.config.categories.length } : {}),
+			});
+		} catch (err) { logger.warn({ err }, "log_audit queue-menu-config failed"); }
+		res.json(result);
+	} catch (error) {
+		logger.error({ err: error }, "set_queue_menu_config_failed");
+		res.status(500).json({ error: "Unable to save the queue menu settings" });
+	}
+});
 }
 
 
@@ -185,6 +261,9 @@ app.put("/menu", validateAction(PERM_MENU_BULK_REPLACE), async (req: Request, re
 				// Guest-facing dish description — absent keeps the stored text, so a
 				// bulk save from a client that doesn't know the field can't wipe it.
 				blurb: typeof item.blurb === "string" ? item.blurb : item.blurb === null ? null : undefined,
+				// Badge tags — absent keeps the stored tags, so a drag-reorder or a
+				// bulk save from a client that doesn't know the field can't wipe them.
+				badges: Array.isArray(item.badges) ? item.badges : undefined,
 			})),
 			{ allowBulkDelete },
 		);
@@ -243,6 +322,71 @@ app.patch("/menu/:id/price", validateAction("ed800655-b937-44ba-a7ca-7458295886c
 		logger.error({ err: error }, "update_menu_price_failed");
 		const msg = String(error?.message ?? "Unable to update price");
 		res.status(/not found/i.test(msg) ? 404 : 400).json({ error: msg });
+	}
+});
+
+// Replace the badge catalogue. Same Edit Menu gate as PUT /menu — a badge is a
+// claim printed on the guest menu, so editing the vocabulary is a menu edit.
+// The body carries the WHOLE catalogue (order included); `release_tagged`
+// confirms dropping a dietary/safety badge that dishes still carry, which is
+// otherwise refused with 409 and the counts (see SetMenuBadgeCatalogue).
+app.put("/menu/badges", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	if (!Array.isArray(body.badges)) {
+		res.status(400).json({ error: "badges array is required" });
+		return;
+	}
+	try {
+		const result = await SetMenuBadgeCatalogue(restaurantId, body.badges, { releaseTagged: body.release_tagged === true });
+		try {
+			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Saved menu badges (${result.badges.length} badge${result.badges.length === 1 ? "" : "s"})`, Audit_log_category.Menu, {
+				count: result.badges.length,
+				ids: result.badges.map((b) => b.id),
+				released_items: result.released,
+			});
+		} catch (err) { logger.warn({ err }, "log_audit menu-badges failed"); }
+		res.json({ success: true, ...result });
+	} catch (error) {
+		// The safety guard is a deliberate refusal, not a server fault — same
+		// shape as MenuBulkDeleteError above so the editors can offer a confirm.
+		if (error instanceof MenuBadgeSafetyError) {
+			res.status(409).json({ error: error.message, badges: error.badges });
+			return;
+		}
+		logger.error({ err: error }, "save_menu_badges_failed");
+		res.status(500).json({ error: "Unable to save menu badges" });
+	}
+});
+
+// Bulk-tag dishes. Item-scoped writes that touch ONLY each item's badge list —
+// never PUT /menu, whose full-replace once wiped 56 items' images and recipes.
+// That is also what makes bulk tagging cheap: the client sends ids and tags, not
+// whole items, so a stale menu snapshot cannot overwrite anything.
+app.post("/menu/badges/tag", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const items = Array.isArray(req.body?.items) ? req.body.items : null;
+	if (!items) {
+		res.status(400).json({ error: "items array is required" });
+		return;
+	}
+	try {
+		const result = await SetMenuItemBadges(
+			restaurantId,
+			items.map((it: any) => ({
+				id: String(it?.id ?? ""),
+				badges: Array.isArray(it?.badges) ? it.badges.map((b: unknown) => String(b)) : [],
+			})),
+		);
+		try {
+			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9", `Tagged badges on ${result.updated} menu item${result.updated === 1 ? "" : "s"}`, Audit_log_category.Menu, { updated: result.updated });
+		} catch (err) { logger.warn({ err }, "log_audit menu-badge-tag failed"); }
+		res.json({ success: true, ...result });
+	} catch (error) {
+		logger.error({ err: error }, "tag_menu_badges_failed");
+		res.status(500).json({ error: "Unable to tag menu items" });
 	}
 });
 

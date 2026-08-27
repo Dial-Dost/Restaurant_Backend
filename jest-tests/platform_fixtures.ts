@@ -66,6 +66,14 @@ export interface RestaurantRow {
   account_status: string;
   /** The Swiggy/Zomato intake key. Null unless a test issues one. */
   aggregator_key: string | null;
+  /** Master on/off for the queue page's pre-order menu. */
+  queue_show_menu: boolean | null;
+  /** The queue PRE-ORDER menu rule (queue_menu.ts). Null = every existing
+   *  tenant = the whole menu, which is the contract the tests pin. */
+  queue_menu_config: unknown;
+  /** The configurable badge CATALOGUE (menu_badges.ts). Null = never
+   *  configured = no badge renders anywhere, which is what the badge tests pin. */
+  menu_badges: unknown;
 }
 
 export interface OutletRow {
@@ -152,6 +160,38 @@ export interface MenuRow {
   main_category: string | null;
 }
 
+/** One "Posters" row (migration 031) as the poster readers select it. The date
+ *  bounds are CALENDAR KEYS (YYYY-MM-DD strings), never Date objects, because
+ *  that is what to_char() hands back and the whole scheduling contract rests on
+ *  the values never round-tripping through a timezone. */
+export interface PosterRow {
+  id: string;
+  created_at: Date;
+  res_id: string;
+  outlet_id: string | null;
+  image_url: string;
+  title: string;
+  placement: string;
+  sort_order: number;
+  start_on: string | null;
+  end_on: string | null;
+  active: boolean;
+  width: number;
+  height: number;
+}
+
+/** One "Menue_main_cat" / "Menue_sub_cat" row. UpsertMenuItem resolves a
+ *  category NAME to this pair of ids before it can write a "Menu" row, so the
+ *  fixture has to model them for the real upsert to be drivable. */
+export interface MenuCategoryRow {
+  id: string;
+  res_id: string;
+  outlet_id: string | null;
+  name: string;
+  /** Set on a sub-category, null on a main category. */
+  main_cat_id: string | null;
+}
+
 export interface PlatformAdminRow { id: string; email: string; active: boolean }
 export interface PlanRow { id: string; code: string; name: string; price_cents: number; active: boolean; created_at: Date }
 export interface SubscriptionRow {
@@ -198,6 +238,8 @@ interface Store {
   platformAudit: PlatformAuditRow[];
   waitlists: WaitlistRow[];
   menuRows: MenuRow[];
+  menuCats: MenuCategoryRow[];
+  posters: PosterRow[];
   /** Every "Restaurant" INSERT throws 23505 — two callers racing the pre-check. */
   failRestaurantInsert: boolean;
   /** Every "Login" INSERT throws — the seed dying halfway through. */
@@ -245,6 +287,8 @@ function freshStore(): Store {
     platformAudit: [],
     waitlists: [],
     menuRows: [],
+    menuCats: [],
+    posters: [],
     failRestaurantInsert: false,
     failLoginInsert: false,
     failBillsCount: false,
@@ -302,6 +346,9 @@ export function addRestaurant(over: Partial<RestaurantRow> = {}): RestaurantRow 
     timezone: "Asia/Kolkata",
     account_status: "active",
     aggregator_key: null,
+    queue_show_menu: null,
+    queue_menu_config: null,
+    menu_badges: null,
     ...over,
   };
   store.restaurants.push(row);
@@ -370,20 +417,79 @@ export function addOutlet(over: Partial<OutletRow> & { res_id: string }): Outlet
 
 /** Seed a menu item the way the schema stores it: price/availability inside the
  *  JSON description column. */
-export function addMenuItem(over: { res_id: string; outlet_id: string | null; name: string; price: number; available?: boolean; id?: string }): MenuRow {
+export function addMenuItem(over: { res_id: string; outlet_id: string | null; name: string; price: number; available?: boolean; id?: string; category?: string; created_at?: Date; extra?: Record<string, unknown> }): MenuRow {
   const n = store.nextId++;
   const row: MenuRow = {
     id: over.id ?? `menu-${String(n)}`,
-    created_at: new Date("2024-01-02T00:00:00Z"),
+    // Distinct per item so GetMenuItems' newest-first ordering is deterministic
+    // — the queue menu preserves that order inside a category.
+    created_at: over.created_at ?? new Date(Date.UTC(2024, 0, 2, 0, 0, n)),
     res_id: over.res_id,
     outlet_id: over.outlet_id,
     name: over.name,
-    description: JSON.stringify({ price: over.price, available: over.available !== false }),
-    sub_category: null,
-    main_category: null,
+    // `extra` seeds the OTHER description-JSON keys (image_url, station, recipe,
+    // allergens, blurb, badges, price history). The badge tests need them so
+    // "tagging did not disturb anything else" can be asserted against a real
+    // stored blob rather than an empty one.
+    description: JSON.stringify({ price: over.price, available: over.available !== false, ...(over.extra ?? {}) }),
+    // GetMenuItems reads the sub-category first and falls back to "General".
+    sub_category: over.category ?? null,
+    // ensureMenuCategoryIds writes the SAME name to both levels, so a seeded
+    // item has to carry it too — otherwise a later upsert of that dish resolves
+    // a different main category and the id-less name lookup misses it.
+    main_category: over.category ?? null,
   };
   store.menuRows.push(row);
+  if (over.category) { ensureFixtureMenuCategory(over.res_id, over.outlet_id, over.category); }
   return row;
+}
+
+/** Seed the main+sub category pair for a name, the way ensureMenuCategoryIds
+ *  would have. Idempotent, so seeding ten dishes in one category makes one pair. */
+function ensureFixtureMenuCategory(resId: string, outletId: string | null, name: string): void {
+  const same = (c: MenuCategoryRow, mainCatId: string | null) =>
+    c.res_id === resId && c.outlet_id === outletId && c.name.toLowerCase() === name.toLowerCase() && c.main_cat_id === mainCatId;
+  let main = store.menuCats.find((c) => same(c, null));
+  if (!main) {
+    main = { id: `maincat-${String(store.nextId++)}`, res_id: resId, outlet_id: outletId, name, main_cat_id: null };
+    store.menuCats.push(main);
+  }
+  if (!store.menuCats.some((c) => same(c, main.id))) {
+    store.menuCats.push({ id: `subcat-${String(store.nextId++)}`, res_id: resId, outlet_id: outletId, name, main_cat_id: main.id });
+  }
+}
+
+/** A promotional poster. `outlet_id` defaults to NULL, which is what the poster
+ *  editor writes and what "shows on every branch" means (migration 031). */
+export function addPoster(over: Partial<PosterRow> & { res_id: string }): PosterRow {
+  const n = store.nextId++;
+  const row: PosterRow = {
+    id: `poster-${String(n)}`,
+    // Distinct per poster so the (sort_order, created_at, id) ordering the guest
+    // read promises is deterministic here too.
+    created_at: new Date(Date.UTC(2024, 0, 3, 0, 0, n)),
+    outlet_id: null,
+    image_url: `https://cdn.example.test/poster-${String(n)}.webp`,
+    title: "",
+    placement: "menu",
+    sort_order: 0,
+    start_on: null,
+    end_on: null,
+    active: true,
+    width: 1200,
+    height: 675,
+    ...over,
+  };
+  store.posters.push(row);
+  return row;
+}
+export function posters(): PosterRow[] { return store.posters; }
+
+/** Set (or clear) a tenant's queue pre-order menu rule the way the editor would.
+ *  Null is the state EVERY production tenant is in — see queue_menu.ts. */
+export function setQueueMenuConfig(resId: string, config: unknown): void {
+  const r = store.restaurants.find((x) => x.id === resId);
+  if (r) {r.queue_menu_config = config;}
 }
 
 /** Seed a queue entry directly (the join route works too, but most pre-order
@@ -650,6 +756,7 @@ function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): unk
     const row: RestaurantRow = {
       id, created_at: now(), res_username: slug, res_name: name,
       main_office_add: address, logo: null, timezone: null, account_status: "active", aggregator_key: null,
+      queue_show_menu: null, queue_menu_config: null, menu_badges: null,
     };
     store.restaurants.push(row);
     journal(() => { store.restaurants = store.restaurants.filter((x) => x !== row); });
@@ -698,6 +805,23 @@ function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): unk
       restaurant_name: r.res_name,
       restaurant_main_office_add: r.main_office_add,
       restaurant_logo_url: r.logo,
+      // READ OFF THE QUERY'S OWN SELECT LIST, not handed over unconditionally.
+      //
+      // The default (no bound outlet) branch used to omit r.timezone, so every
+      // public /qr/ request resolved a context whose zone had silently fallen
+      // back to Asia/Kolkata — a real production bug for any non-IST tenant.
+      // The fix is one word in the select list, and a fixture that returns the
+      // column whether or not the query asked for it CANNOT SEE IT: the whole
+      // suite stayed green with the fix reverted, which is exactly what this
+      // comment used to claim was impossible.
+      //
+      // Now the fixture answers like Postgres: a column the query did not
+      // select is not in the row.
+      // Matches the COLUMN (`r.timezone`), not the word: a select list can
+      // mention "timezone" while not reading the column at all (`null as
+      // timezone` was the exact pre-fix shape), and a looser regex would call
+      // that a hit and hand the value over anyway.
+      ...(/\br\s*\.\s*timezone\b/i.test(q) ? { timezone: r.timezone } : {}),
     };
     const mine = store.outlets.filter((o) => o.res_id === r.id)
       .sort((x, y) => x.created_at.getTime() - y.created_at.getTime());
@@ -705,7 +829,7 @@ function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): unk
       const bound = String(params[3] ?? "");
       const hit = mine.find((o) => o.id === bound || o.outlet_name.toLowerCase() === bound.toLowerCase());
       // No match falls through to the default branch, exactly as in production.
-      return hit ? [{ ...identity, outlet_id: hit.id, timezone: r.timezone }] : [];
+      return hit ? [{ ...identity, outlet_id: hit.id }] : [];
     }
     return [{ ...identity, outlet_id: mine[0]?.id ?? null }];
   }
@@ -976,6 +1100,166 @@ function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): unk
     return [{ id: row.id }];
   }
 
+  // --- Queue pre-order menu (readQueueMenuRow) -----------------------------
+  // The rule a queuing walk-in's menu is filtered by, plus the master on/off.
+  // Null config = every existing tenant = the whole menu.
+  if (/^select queue_menu_config, queue_show_menu from "Restaurant"/i.test(q)) {
+    const r = store.restaurants.find((x) => x.id === params[0]);
+    return r ? [{ queue_menu_config: r.queue_menu_config, queue_show_menu: r.queue_show_menu }] : [];
+  }
+
+  // GetPublicBranding — the queue page's colours, currency and display name.
+  // Matched on the leading columns so a new branding column added elsewhere does
+  // not silently turn every queue-menu test into "unhandled query".
+  if (/^select logo, theme_color, currency, payment_config/i.test(q) && /from "Restaurant"/i.test(q)) {
+    const r = store.restaurants.find((x) => x.id === params[0]);
+    if (!r) { return []; }
+    return [{
+      logo: r.logo, theme_color: null, currency: null, payment_config: null, feedback_config: null,
+      res_name: r.res_name, bill_logo_svg: null, queue_show_menu: r.queue_show_menu,
+      timezone: r.timezone, require_table_otp: null, brand_config: null, menu_badges: r.menu_badges,
+    }];
+  }
+
+  // --- Menu categories (ensureMenuCategoryIds) -----------------------------
+  // UpsertMenuItem cannot write a "Menu" row until the category name resolves to
+  // a main/sub id pair, so the real upsert is only drivable with these modelled.
+  const catLookup = (resId: string, outletId: string | null, name: string, mainCatId: string | null): MenuCategoryRow | undefined =>
+    store.menuCats.find((c) => c.res_id === resId && c.outlet_id === outletId
+      && c.name.toLowerCase() === String(name).toLowerCase() && c.main_cat_id === mainCatId);
+
+  if (/^select id\s+from "Menue_main_cat"/i.test(q.trim())) {
+    const [resId, outletId, name] = params as [string, string | null, string];
+    const hit = catLookup(resId, outletId, name, null);
+    return hit ? [{ id: hit.id }] : [];
+  }
+  if (/^select id\s+from "Menue_sub_cat"/i.test(q.trim())) {
+    const [resId, outletId, mainId, name] = params as [string, string | null, string, string];
+    const hit = catLookup(resId, outletId, name, mainId);
+    return hit ? [{ id: hit.id }] : [];
+  }
+  if (/^insert into "Menue_main_cat"/i.test(q.trim())) {
+    const [id, resId, outletId, name] = params as [string, string, string | null, string];
+    const row: MenuCategoryRow = { id, res_id: resId, outlet_id: outletId, name, main_cat_id: null };
+    store.menuCats.push(row);
+    journal(() => { store.menuCats = store.menuCats.filter((x) => x !== row); });
+    return [];
+  }
+  if (/^insert into "Menue_sub_cat"/i.test(q.trim())) {
+    const [id, resId, outletId, name, , mainId] = params as [string, string, string | null, string, string, string];
+    const row: MenuCategoryRow = { id, res_id: resId, outlet_id: outletId, name, main_cat_id: mainId };
+    store.menuCats.push(row);
+    journal(() => { store.menuCats = store.menuCats.filter((x) => x !== row); });
+    return [];
+  }
+
+  // --- The real menu upsert (UpsertMenuItem / SaveMenuItems) ---------------
+  // Modelled because "an unrelated item save must not strip X" is a claim about
+  // THIS statement's merge, and the 56-item wipe is what happens when it is
+  // wrong. GetMenuItemUndoState's read and the id-less name lookup share the
+  // shape, so all three arms live together.
+  if (/^select id, name, description from "Menu" where id = \$1 and res_id = \$2 and outlet_id = \$3/i.test(q)) {
+    const [id, resId, outletId] = params as [string, string, string | null];
+    const m = store.menuRows.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    return m ? [{ id: m.id, name: m.name, description: m.description }] : [];
+  }
+  if (/^select description from "Menu" where id = \$1 and res_id = \$2 and outlet_id = \$3/i.test(q)) {
+    const [id, resId, outletId] = params as [string, string, string | null];
+    const m = store.menuRows.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    return m ? [{ description: m.description }] : [];
+  }
+  if (/^select id from "Menu"\s+where res_id = \$1 and outlet_id = \$2 and lower\(name\) = lower\(\$3\)/i.test(q.trim())) {
+    const [resId, outletId, name, mainId] = params as [string, string | null, string, string];
+    const m = store.menuRows.find((x) => x.res_id === resId && x.outlet_id === outletId
+      && x.name.toLowerCase() === String(name).toLowerCase()
+      && x.main_category === (store.menuCats.find((c) => c.id === mainId)?.name ?? null));
+    return m ? [{ id: m.id }] : [];
+  }
+  if (/^insert into "Menu"/i.test(q.trim()) && /on conflict \(id, res_id, outlet_id\)/i.test(q)) {
+    const [id, resId, outletId, name, description, mainId, subId] =
+      params as [string, string, string | null, string, string, string, string];
+    const mainName = store.menuCats.find((c) => c.id === mainId)?.name ?? null;
+    const subName = store.menuCats.find((c) => c.id === subId)?.name ?? null;
+    const existing = store.menuRows.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    if (existing) {
+      const before = { ...existing };
+      journal(() => { Object.assign(existing, before); });
+      existing.name = name;
+      existing.description = description;
+      existing.main_category = mainName;
+      existing.sub_category = subName;
+      return [];
+    }
+    const row: MenuRow = {
+      id, created_at: now(), res_id: resId, outlet_id: outletId, name, description,
+      sub_category: subName, main_category: mainName,
+    };
+    store.menuRows.push(row);
+    journal(() => { store.menuRows = store.menuRows.filter((x) => x !== row); });
+    return [];
+  }
+
+  // --- Configurable menu badges (menu_badges.ts) ---------------------------
+  // The CATALOGUE is one jsonb column on "Restaurant"; the tags live inside each
+  // item's description blob, so the tag reads/writes below are just "Menu" rows.
+  if (/^select menu_badges from "Restaurant"/i.test(q)) {
+    const r = store.restaurants.find((x) => x.id === params[0]);
+    return r ? [{ menu_badges: r.menu_badges }] : [];
+  }
+  if (/^update "Restaurant" set menu_badges/i.test(q)) {
+    const r = store.restaurants.find((x) => x.id === params[0]);
+    if (!r) { return []; }
+    const before = { ...r };
+    journal(() => { Object.assign(r, before); });
+    // jsonb: the caller stringifies, Postgres hands back a parsed value.
+    r.menu_badges = JSON.parse(String(params[1]));
+    return [];
+  }
+  // countMenuBadgeTags + releaseMenuBadgeTags read restaurant-WIDE (no outlet
+  // predicate) because the catalogue is restaurant-wide. Matching on the absence
+  // of `outlet_id` here is what keeps that property under test: adding an outlet
+  // filter to the production query would fall through to "unhandled".
+  if (/^select description from "Menu" where res_id = \$1$/i.test(q.trim())) {
+    return store.menuRows.filter((m) => m.res_id === params[0]).map((m) => ({ description: m.description }));
+  }
+  if (/^select id, res_id, outlet_id, description from "Menu" where res_id = \$1$/i.test(q.trim())) {
+    return store.menuRows
+      .filter((m) => m.res_id === params[0])
+      .map((m) => ({ id: m.id, res_id: m.res_id, outlet_id: m.outlet_id, description: m.description }));
+  }
+  // SetMenuItemBadges' targeted read. `= any($3::uuid[])` in production, so a
+  // non-uuid id would abort the whole statement — SetMenuItemBadges filters
+  // those out before this is ever reached.
+  if (/^select id, description from "Menu" where res_id = \$1 and outlet_id = \$2 and id = any/i.test(q)) {
+    const [resId, outletId, ids] = params as [string, string | null, string[]];
+    return store.menuRows
+      .filter((m) => m.res_id === resId && m.outlet_id === outletId && ids.includes(m.id))
+      .map((m) => ({ id: m.id, description: m.description }));
+  }
+  // The description-only update shared by RenameMenuStation, SetMenuItemBadges
+  // and releaseMenuBadgeTags. Writing ONLY this column is the whole point: it is
+  // what makes a tag edit incapable of touching an image, a recipe or a price.
+  if (/^update "Menu" set description = \$4 where id = \$1 and res_id = \$2 and outlet_id/i.test(q)) {
+    const [id, resId, outletId, description] = params as [string, string, string | null, string];
+    // `= $3` and `is not distinct from $3` agree for every value the fixture
+    // stores (outlet_id is never SQL NULL on a seeded row), so one comparison
+    // serves both statement shapes.
+    const m = store.menuRows.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    if (!m) { return []; }
+    const before = m.description;
+    journal(() => { m.description = before; });
+    m.description = description;
+    return [];
+  }
+  // GetMenuCategories — the guest menu payload's category list.
+  if (/^select distinct name as category_name/i.test(q.trim()) && /from "Menue_sub_cat"/i.test(q)) {
+    const [resId, outletId] = params as [string, string | null];
+    const names = Array.from(new Set(store.menuRows
+      .filter((m) => m.res_id === resId && m.outlet_id === outletId && m.sub_category)
+      .map((m) => m.sub_category as string)));
+    return names.sort().map((category_name) => ({ category_name }));
+  }
+
   // --- "Menu" (GetMenuItems — repriceFromMenu's pricing authority) ---------
   if (/^select m\.id, m\.name, m\.description/i.test(q) && /from "Menu" m/i.test(q)) {
     if (store.failMenuRead) {
@@ -988,6 +1272,98 @@ function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): unk
       .filter((m) => m.res_id === resId && m.outlet_id === outletId)
       .sort((a, b) => b.created_at.getTime() - a.created_at.getTime())
       .map((m) => ({ id: m.id, name: m.name, description: m.description, sub_category: m.sub_category, main_category: m.main_category }));
+  }
+
+  // --- GetPublicBranding ---------------------------------------------------
+  // The single-row branding read behind the guest menu payload. Everything the
+  // fixture does not model comes back null, which is exactly the state of a
+  // tenant that never customised anything — and therefore the state under which
+  // "a restaurant with no posters gets today's payload" has to hold.
+  if (/^\s*select logo, theme_color, currency/i.test(q) && /from "Restaurant" where id = \$1/i.test(q)) {
+    const r = store.restaurants.find((x) => x.id === params[0]);
+    if (!r) { return []; }
+    return [{
+      logo: r.logo,
+      theme_color: null,
+      currency: null,
+      payment_config: null,
+      feedback_config: null,
+      res_name: r.res_name,
+      bill_logo_svg: null,
+      queue_show_menu: r.queue_show_menu,
+      timezone: r.timezone,
+      require_table_otp: null,
+      brand_config: null,
+      menu_badges: null,
+      queue_menu_config: r.queue_menu_config ?? null,
+    }];
+  }
+
+  // --- GetRestaurantProfile ------------------------------------------------
+  if (/^\s*select\s+outlet_name,\s+outlet_add/i.test(q) && /from "Outlets"/i.test(q)) {
+    const o = store.outlets.find((x) => x.id === params[0] && x.res_id === params[1]);
+    return o
+      ? [{ outlet_name: o.outlet_name, outlet_add: o.outlet_add, outlet_phone: o.outlet_main_ph, outlet_hours: o.outlet_working_hours }]
+      : [];
+  }
+  // selectProfileEmployee's no-employeeId branch (admin first, then oldest).
+  if (/^\s*select\s+e\.id,\s+e\.emp_email as email/i.test(q) && /from "Employees" e/i.test(q)) {
+    const [resId, outletId] = params as [string, string];
+    const mine = store.employees
+      .filter((e) => e.res_id === resId && e.outlet_id === outletId)
+      .sort((a, b) =>
+        (a.emp_roles.primary.toLowerCase() === "admin" ? 0 : 1) - (b.emp_roles.primary.toLowerCase() === "admin" ? 0 : 1)
+        || a.created_at.getTime() - b.created_at.getTime());
+    const e = mine[0];
+    return e ? [{ id: e.id, email: e.emp_email, phone: e.emp_ph, address: e.emp_add }] : [];
+  }
+
+  // --- "Menue_sub_cat" (GetMenuCategories) ---------------------------------
+  // The category list the guest menu payload carries. Derived from the menu rows
+  // rather than stored separately, so a fixture menu and its categories cannot
+  // disagree.
+  if (/^\s*select distinct name as category_name/i.test(q) && /from "Menue_sub_cat"/i.test(q)) {
+    const [resId, outletId] = params as [string, string | null];
+    const names = new Set(
+      store.menuRows
+        .filter((m) => m.res_id === resId && m.outlet_id === outletId && m.sub_category)
+        .map((m) => String(m.sub_category)),
+    );
+    return [...names].sort().map((category_name) => ({ category_name }));
+  }
+
+  // --- "Posters" (migration 031) -------------------------------------------
+  // Guest read (GetVisiblePosters, `and active`) and editor read (ListPosters)
+  // share one shape. The date bounds come back as the YYYY-MM-DD strings
+  // to_char() produces — modelling them as Date objects here would hide the very
+  // timezone round-trip the poster schedule exists to avoid.
+  if (/from "Posters"/i.test(q) && /^\s*select/i.test(q) && !/count\(\*\)/i.test(q)) {
+    const [resId, outletId] = params as [string, string | null];
+    const activeOnly = /and active\b/i.test(q);
+    return store.posters
+      .filter((p) => p.res_id === resId && (p.outlet_id === null || p.outlet_id === outletId))
+      .filter((p) => !activeOnly || p.active)
+      .sort((a, b) =>
+        a.sort_order - b.sort_order
+        || a.created_at.getTime() - b.created_at.getTime()
+        || a.id.localeCompare(b.id))
+      .map((p) => ({
+        id: p.id,
+        image_url: p.image_url,
+        title: p.title,
+        placement: p.placement,
+        sort_order: p.sort_order,
+        start_on: p.start_on,
+        end_on: p.end_on,
+        active: p.active,
+        width: p.width,
+        height: p.height,
+        created_at: p.created_at,
+      }));
+  }
+  if (/^\s*select count\(\*\)::int as n from "Posters"/i.test(q)) {
+    const [resId, outletId] = params as [string, string | null];
+    return [{ n: store.posters.filter((p) => p.res_id === resId && (p.outlet_id === null || p.outlet_id === outletId)).length }];
   }
 
   // --- "Waitlist" ----------------------------------------------------------
@@ -1080,6 +1456,15 @@ export interface FakeApp {
     body?: unknown;
     query?: Record<string, string>;
     ip?: string;
+    /**
+     * A resolved tenant session, as requireAuth would have left it on the
+     * request. Needed because requireAuth is mounted with app.use(), which this
+     * collector deliberately ignores (it records ROUTES, and a global gate is
+     * not one) — so without this, every validateAction-gated route answers 403
+     * and its handler is untestable. Supplying it drives the REAL guard: pass
+     * actions that do not contain the route's permission and the 403 is genuine.
+     */
+    auth?: { res_id: string; outlet_id: string; employeeId: string; role: string; actions: string[] };
   }) => Promise<RouteCall>;
 }
 
@@ -1100,6 +1485,7 @@ export function makeFakeApp(): FakeApp {
     body?: unknown;
     query?: Record<string, string>;
     ip?: string;
+    auth?: { res_id: string; outlet_id: string; employeeId: string; role: string; actions: string[] };
   } = {}): Promise<RouteCall> {
     const route = registered.find((r) => r.method === method && r.path === path);
     if (!route) { throw new Error(`platform fixture: no route registered for ${method} ${path}`); }
@@ -1120,6 +1506,9 @@ export function makeFakeApp(): FakeApp {
       query: opts.query ?? {},
       ip: opts.ip ?? "203.0.113.7",
       socket: { remoteAddress: opts.ip ?? "203.0.113.7" },
+      // Left undefined unless a test supplies one, so an unauthenticated call to
+      // a gated route still fails the way it does in production.
+      ...(opts.auth ? { auth: opts.auth } : {}),
     };
 
     // Express middleware calls next() WITHOUT awaiting it, so the promise a guard

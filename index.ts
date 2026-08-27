@@ -50,6 +50,7 @@ import { registerTableAssignmentRoutes } from "./routes/table_assignments.js";
 import { registerGuestFeedbackRoutes, registerFeedbackAdminRoutes } from "./routes/feedback.js";
 import { registerUserRoutes } from "./routes/users.js";
 import { registerSimulationRoutes } from "./routes/simulation.js";
+import { registerPosterRoutes } from "./routes/posters.js";
 
 initObservability();
 const app = express();
@@ -427,6 +428,7 @@ registerGuestFeedbackRoutes(app);
 registerUserRoutes(app);
 registerFeedbackAdminRoutes(app);
 registerSimulationRoutes(app);
+registerPosterRoutes(app);
 
 
 
