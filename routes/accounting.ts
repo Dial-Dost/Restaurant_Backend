@@ -8,7 +8,7 @@ import { AddExpense, ArchiveReportSchedule, Audit_log_category, BuildTallyXml, C
 import { logger } from "../observability.js";
 import { renderGstCsv, renderSalesCsv, toCsv } from "../report_render.js";
 import { queueReportScheduleRun } from "../report_schedules.js";
-import { ACCOUNTING_PERM, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
+import { ACCOUNTING_PERM, extractEmployeeId, extractRestaurantId, log_audit, validateAction, windowQuery } from "./_shared.js";
 
 
 // Audit LABEL for scheduled-report changes, minted by migration 026. NEVER a
@@ -17,6 +17,13 @@ import { ACCOUNTING_PERM, extractEmployeeId, extractRestaurantId, log_audit, val
 // read these reports. (Migration 025's rule.)
 const REPORT_SCHEDULE_ACTION_ID = "9e2f47a1-05b3-4c8d-8f6a-71d40b9c2e58";
 
+// The date window every /reports/* route already spoke, unchanged on the wire:
+// `from`/`to` as INCLUSIVE YYYY-MM-DD days in the restaurant's timezone. What
+// changed is underneath — both ends now resolve through report_window.ts, which
+// is where the inclusivity of `to`, the reversed-range swap, the no-future rule
+// and the two-year span cap are decided, for accounting and analytics alike.
+//
+// Missing values still mean "the last 30 days ending today", exactly as before.
 function reportRange(req: Request): { from?: string; to?: string } {
 	return {
 		from: typeof req.query.from === "string" ? req.query.from : undefined,
@@ -157,8 +164,12 @@ app.get("/reports/discounts", validateAction(ACCOUNTING_PERM), async (req: Reque
 app.get("/reports/balance-sheet", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	// `as_of` is the shipped parameter and still wins. Failing that the shared
+	// from/to window applies and the snapshot is taken at the END of it — so one
+	// calendar picker drives this screen as well as the sales report, and a
+	// one-day range means precisely what `as_of` always meant.
 	const asOf = typeof req.query.as_of === "string" ? req.query.as_of : undefined;
-	try { res.json(await GetBalanceSheet(restaurantId, asOf)); }
+	try { res.json(await GetBalanceSheet(restaurantId, asOf ?? windowQuery(req))); }
 	catch (e) { logger.error({ err: e }, "balance_sheet_failed"); res.status(500).json({ error: "Unable to build balance sheet" }); }
 });
 
@@ -168,8 +179,13 @@ app.get("/reports/balance-sheet", validateAction(ACCOUNTING_PERM), async (req: R
 app.get("/reconciliation", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	// `date` is the shipped parameter and still wins; otherwise the shared from/to
+	// window applies. A one-day range is identical to `date`; a wider one sums the
+	// expected takings and the saved entries across it (see GetReconciliation).
+	// SAVING stays per-day — the POST/DELETE below still require a single `date`,
+	// because a settlement entry is a fact about one day's till.
 	const date = typeof req.query.date === "string" ? req.query.date : undefined;
-	try { res.json(await GetReconciliation(restaurantId, date)); }
+	try { res.json(await GetReconciliation(restaurantId, date ?? windowQuery(req))); }
 	catch (e) { logger.error({ err: e }, "reconciliation_get_failed"); res.status(500).json({ error: "Unable to build reconciliation" }); }
 });
 

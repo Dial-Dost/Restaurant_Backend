@@ -1,13 +1,33 @@
 /**
  * Read-only analytics: APC, revenue, staff, kitchen, concerns, menu insights and
  * operations.
+ *
+ * THE DATE WINDOW
+ * ---------------
+ * Every endpoint here that took a rolling `?days=N` now ALSO takes an explicit
+ * `?from=YYYY-MM-DD&to=YYYY-MM-DD`, so the owner's calendar picker can ask for
+ * "1-15 August" instead of only "the last N days". Both ends are INCLUSIVE,
+ * both are calendar days in the RESTAURANT's timezone, and from/to win when
+ * sent alongside `days`.
+ *
+ * `days` keeps working exactly as it did — the shipped web and Flutter clients
+ * send it and this deploy must not move their numbers. Neither parsing nor
+ * clamping happens in this file: the raw query travels down through
+ * windowQuery() and report_window.ts resolves it once, against the tenant zone
+ * the data layer has already resolved. That is also why the per-endpoint caps
+ * (90 days of daily-revenue bars, 180 of operations, 365 elsewhere) now live
+ * beside each reader instead of being restated here where they could drift.
+ *
+ * The resolved window comes BACK in each payload as `window`, carrying any
+ * clamp that was applied, so a screen labels itself with the days the server
+ * actually read rather than the ones it hoped for.
  */
 import type { Express, Request, Response } from "express";
 import { METRIC_EXPLAINERS } from "../analytics_explainers.js";
 import { GetAdvancedAnalytics, GetApcTrends, GetConcerns, GetDailyRevenueSeries, GetKitchenAnalytics, GetMenuPerformanceInsights, GetMonthlyApcInsights, GetMonthlyHistory, GetOperationsAnalytics, GetOutletsComparison, GetOverviewInsights, GetStaffPerformance, GetTimingStats, RunExceptionChecks } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { billingConfigured, getTenantBilling } from "../platform/tenant_billing.js";
-import { extractRestaurantId, validateAction } from "./_shared.js";
+import { extractRestaurantId, validateAction, windowQuery } from "./_shared.js";
 
 
 export function registerApcAnalyticsRoutes(app: Express): void {
@@ -73,14 +93,13 @@ app.get("/orders/apc-trends", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f
 app.get("/analytics/advanced", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const days = Math.max(7, Math.min(Number(req.query.days) || 90, 365));
 	// Piggy-back the exception-alert scan on the KPI dashboard load (cheap, and
 	// the 24h alert_key dedupe makes repeat calls no-ops). Best-effort: an alert
 	// failure must never fail the analytics payload. Awaited (not detached) so it
 	// runs while the request's tenant connection is still alive.
 	try { await RunExceptionChecks(restaurantId); } catch (err) { logger.warn({ err }, "exception_checks_failed"); }
 	try {
-		const data = await GetAdvancedAnalytics(restaurantId, { days });
+		const data = await GetAdvancedAnalytics(restaurantId, windowQuery(req));
 		res.json(data);
 	} catch (error) {
 		logger.error({ err: error }, "get_advanced_analytics_failed");
@@ -94,9 +113,8 @@ app.get("/analytics/advanced", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182
 app.get("/analytics/outlets", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
 	try {
-		res.json(await GetOutletsComparison(restaurantId, days));
+		res.json(await GetOutletsComparison(restaurantId, windowQuery(req)));
 	} catch (error) {
 		logger.error({ err: error }, "get_outlets_comparison_failed");
 		res.status(500).json({ error: "Unable to fetch outlet comparison" });
@@ -136,9 +154,7 @@ app.get("/orders/timing-stats", validateAction("df75119b-e5f1-4f38-aba5-78a1cf18
 app.get("/analytics/overview", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
-	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
-	try { res.json(await GetOverviewInsights(restaurantId, days)); }
+	try { res.json(await GetOverviewInsights(restaurantId, windowQuery(req))); }
 	catch (err) { logger.error({ err }, "overview_insights_failed"); res.status(500).json({ error: "Unable to fetch overview insights" }); }
 });
 
@@ -152,9 +168,7 @@ app.get("/analytics/overview", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182
 app.get("/analytics/staff-performance", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
-	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
-	try { res.json(await GetStaffPerformance(restaurantId, days)); }
+	try { res.json(await GetStaffPerformance(restaurantId, windowQuery(req))); }
 	catch (err) { logger.error({ err }, "staff_performance_failed"); res.status(500).json({ error: "Unable to fetch staff performance" }); }
 });
 
@@ -164,8 +178,6 @@ app.get("/analytics/staff-performance", validateAction("df75119b-e5f1-4f38-aba5-
 app.get("/analytics/concerns", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
-	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
 	try {
 		// The subscription lives in the CONTROL PLANE (a separate database), which
 		// the tenant data layer deliberately does not reach into — so it is read
@@ -191,7 +203,7 @@ app.get("/analytics/concerns", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182
 				logger.warn({ err }, "concerns_subscription_lookup_failed");
 			}
 		}
-		res.json(await GetConcerns(restaurantId, days, { subscription }));
+		res.json(await GetConcerns(restaurantId, windowQuery(req), { subscription }));
 	}
 	catch (err) { logger.error({ err }, "concerns_failed"); res.status(500).json({ error: "Unable to fetch concerns" }); }
 });
@@ -199,9 +211,7 @@ app.get("/analytics/concerns", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182
 app.get("/analytics/kitchen", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
-	const days = Math.min(365, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 30));
-	try { res.json(await GetKitchenAnalytics(restaurantId, days)); }
+	try { res.json(await GetKitchenAnalytics(restaurantId, windowQuery(req))); }
 	catch (err) { logger.error({ err }, "kitchen_analytics_failed"); res.status(500).json({ error: "Unable to fetch kitchen analytics" }); }
 });
 
@@ -216,9 +226,8 @@ app.get("/analytics/metric-explainers", validateAction("df75119b-e5f1-4f38-aba5-
 app.get("/orders/daily-revenue", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 14;
 	try {
-		const series = await GetDailyRevenueSeries(restaurantId, Number.isFinite(daysRaw) ? daysRaw : 14);
+		const series = await GetDailyRevenueSeries(restaurantId, windowQuery(req));
 		res.json({ series });
 	} catch (error) {
 		logger.error({ err: error }, "get_daily_revenue_failed");
@@ -231,9 +240,8 @@ app.get("/orders/daily-revenue", validateAction("df75119b-e5f1-4f38-aba5-78a1cf1
 app.get("/analytics/menu-insights", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
 	try {
-		res.json(await GetMenuPerformanceInsights(restaurantId, Number.isFinite(daysRaw) ? daysRaw : 30));
+		res.json(await GetMenuPerformanceInsights(restaurantId, windowQuery(req)));
 	} catch (error) {
 		logger.error({ err: error }, "get_menu_insights_failed");
 		res.status(500).json({ error: "Unable to fetch menu insights" });
@@ -248,8 +256,7 @@ export function registerOperationsAnalyticsRoute(app: Express): void {
 app.get("/analytics/operations", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const daysRaw = typeof req.query.days === "string" ? Number.parseInt(req.query.days, 10) : 30;
-	try { res.json(await GetOperationsAnalytics(restaurantId, Number.isFinite(daysRaw) ? daysRaw : 30)); }
+	try { res.json(await GetOperationsAnalytics(restaurantId, windowQuery(req))); }
 	catch (e) { logger.error({ err: e }, "operations_analytics_failed"); res.status(500).json({ error: "Unable to fetch operations analytics" }); }
 });
 }

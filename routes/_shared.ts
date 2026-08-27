@@ -19,6 +19,7 @@ import type { CustomerDemographics } from "../database_supabase.js";
 import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
+import type { ReportWindowQuery } from "../report_window.js";
 import { emitRestaurant } from "../realtime.js";
 
 
@@ -149,6 +150,23 @@ export function extractBearerToken(req: Request): string | null {
 // client-supplied headers/query/body.
 export function extractRestaurantId(req: Request): string | null {
 	return req.auth?.res_id ?? null;
+}
+
+/**
+ * The ONE way a reporting route reads a date window off the query string.
+ *
+ * It deliberately does NOT parse, validate or clamp: the tenant's timezone
+ * decides what "2026-08-01" means and only the data layer has it, so the raw
+ * values travel down and report_window.ts resolves them ONCE against that zone.
+ * A route that pre-parsed here would be answering a calendar question in the
+ * SERVER's zone, which is the bug this whole contract exists to remove.
+ *
+ * `from`/`to` are inclusive YYYY-MM-DD days and win over `days`; `days` is the
+ * rolling span the shipped clients send and still means the last N days ending
+ * today. See report_window.ts for the precedence and every clamp.
+ */
+export function windowQuery(req: Request): ReportWindowQuery {
+	return { from: req.query.from, to: req.query.to, days: req.query.days };
 }
 
 export function extractRestaurantUsername(req: Request): string | null {

@@ -107,6 +107,28 @@ export * from "./posters.js";
 export type { BillTaxLine, BillDiscount } from "./billing_math.js";
 import { SIM_WINDOW_DAYS, type SimulationRawStats } from "./simulation_math.js";
 import {
+  DEFAULT_REPORT_DAYS,
+  MAX_REPORT_DAYS,
+  addDaysToKey,
+  dateKeyInZone,
+  resolveReportWindow,
+  type ReportWindowQuery,
+  type ResolvedReportWindow,
+} from "./report_window.js";
+// Re-exported so existing importers (report_schedules.ts) keep reaching the day
+// arithmetic through the data layer. The implementations MOVED to the pure
+// module so a jest suite can prove inclusivity and the timezone boundary without
+// standing up the pg/sharp/argon2 graph — the billing_math.ts arrangement.
+export {
+  DEFAULT_REPORT_DAYS,
+  MAX_REPORT_DAYS,
+  addDaysToKey,
+  countDays,
+  dateKeyInZone,
+  resolveReportWindow,
+} from "./report_window.js";
+export type { ReportWindowQuery, ResolvedReportWindow, WindowClamp } from "./report_window.js";
+import {
   computeStockStatus,
   inventoryStatusOf,
   parseUnit,
@@ -9920,6 +9942,8 @@ export interface KitchenAnalytics {
   by_section: KitchenSectionStat[];
   by_section_items: KitchenSectionItems[];
   period_days: number;
+  /** The calendar window these prep times were measured over. */
+  window: ResolvedReportWindow;
   generated_at: string;
 }
 
@@ -9993,6 +10017,8 @@ export interface AttentionRow {
 
 export interface OverviewInsights {
   window_days: number;
+  /** The calendar window these figures cover. See report_window.ts. */
+  window: ResolvedReportWindow;
   timezone: string;
   generated_at: string;
   headline: {
@@ -10489,26 +10515,39 @@ export function buildNeedsAttention(sources: AttentionSources): AttentionRow[] {
   );
 }
 
-export async function GetOverviewInsights(restaurantId: string, days = 30): Promise<OverviewInsights> {
+export async function GetOverviewInsights(restaurantId: string, days: AnalyticsWindowArg = 30): Promise<OverviewInsights> {
   const context = await requireRestaurantContext(restaurantId);
   const tz = context.timezone;
-  const window = Math.min(365, Math.max(1, Math.round(days) || 30));
+  const win = analyticsWindow(days, tz, { defaultDays: 30, maxDays: 365 });
+  const window = win.days;
+  // The composed panels get the RANGE, not the span. Handing them a day count
+  // would re-anchor each one on today, so an owner looking at 1-15 August would
+  // read August headline figures beside last-30-days dish and kitchen numbers —
+  // the Overview disagreeing with the screen it drills into, which is exactly
+  // what composing it from these helpers was meant to make impossible.
+  const sub: ReportWindowQuery = { from: win.from, to: win.to };
 
   // Composed reads — each is already outlet-scoped and already excludes
   // cancelled orders wherever it counts sales.
   const [menu, kitchen, ops, advanced] = await Promise.all([
-    GetMenuPerformanceInsights(restaurantId, window).catch(() => null),
-    GetKitchenAnalytics(restaurantId, window).catch(() => null),
-    GetOperationsAnalytics(restaurantId, window).catch(() => null),
-    GetAdvancedAnalytics(restaurantId, { days: window }).catch(() => null),
+    GetMenuPerformanceInsights(restaurantId, sub).catch(() => null),
+    GetKitchenAnalytics(restaurantId, sub).catch(() => null),
+    GetOperationsAnalytics(restaurantId, sub).catch(() => null),
+    GetAdvancedAnalytics(restaurantId, sub).catch(() => null),
   ]);
 
   // Headline: this window vs the one immediately before it, measured in the
   // restaurant's OWN days (bucketing by UTC put late covers in the wrong day).
+  // `todayKey` stays the REAL today: today_revenue, yesterday_revenue and the
+  // expiring-stock cut-off are questions about now, not about the window.
   const todayKey = dayKeyOf(new Date(), tz);
-  const curRange = dayRangeOf(todayKey, tz);
-  const curFromIso = dayRangeOf(addDaysToKey(todayKey, -(window - 1)), tz).fromIso;
-  const prevFromIso = dayRangeOf(addDaysToKey(todayKey, -(window * 2 - 1)), tz).fromIso;
+  const curRange = dayRangeOf(win.to, tz);
+  const curFromIso = dayRangeOf(win.from, tz).fromIso;
+  // The comparison window is the same length immediately BEFORE this one, so
+  // 1-15 Aug is measured against 17-31 July rather than against a fortnight
+  // counted back from today. For the `days` shorthand this is the identical
+  // instant it has always been.
+  const prevFromIso = dayRangeOf(addDaysToKey(win.from, -window), tz).fromIso;
 
   // Covers are NOT on "Bills" — they live on "TableSessions" (one row per seating,
   // covers counted once per table). Joining on the table + the session that was
@@ -10718,6 +10757,7 @@ export async function GetOverviewInsights(restaurantId: string, days = 30): Prom
 
   return {
     window_days: window,
+    window: windowMeta(win),
     timezone: tz,
     generated_at: new Date().toISOString(),
     headline: {
@@ -10825,6 +10865,8 @@ export interface SubscriptionConcernInput {
 
 export interface ConcernsReport {
   window_days: number;
+  /** The calendar window these concerns were detected over. */
+  window: ResolvedReportWindow;
   timezone: string;
   generated_at: string;
   concerns: ConcernRow[];
@@ -10862,22 +10904,25 @@ export function floorConcernScope(
 
 export async function GetConcerns(
   restaurantId: string,
-  days = 30,
+  days: AnalyticsWindowArg = 30,
   extra: { subscription?: SubscriptionConcernInput | null } = {},
 ): Promise<ConcernsReport> {
   const context = await requireRestaurantContext(restaurantId);
   const tz = context.timezone;
-  const window = Math.min(365, Math.max(1, Math.round(days) || 30));
+  const win = analyticsWindow(days, tz, { defaultDays: 30, maxDays: 365 });
+  const window = win.days;
   const rid = context.res_id, oid = context.outlet_id;
   const allOutlets = isAllOutlets();
   const og = allOutlets ? "true" : "false";
 
+  // `todayKey` is the REAL today: the expiring-stock cut-off below asks what is
+  // about to go off, which does not move with the window being reported on.
   const todayKey = dayKeyOf(new Date(), tz);
-  const fromIso = dayRangeOf(addDaysToKey(todayKey, -(window - 1)), tz).fromIso;
-  const toIso = dayRangeOf(todayKey, tz).toIso;
+  const fromIso = win.fromIso;
+  const toIso = win.toIso;
 
   const [overview, feedbackRows, attendance, tables, poRows, outletNameRows] = await Promise.all([
-    GetOverviewInsights(restaurantId, window),
+    GetOverviewInsights(restaurantId, { from: win.from, to: win.to }),
     // Unresolved service-recovery cases. `recovery_status = 'open'` is what
     // AddFeedbackEntry writes for a bad visit; the NULL branch catches rows from
     // before that column existed, where a 1-star with no ticket is plainly still
@@ -10898,7 +10943,7 @@ export async function GetConcerns(
        ) x where x.rn::int <= ${String(ATTENTION_ITEM_CAP)} order by x.rn::int`,
       [rid, oid, fromIso, toIso],
     ),
-    getStaffAttendanceStats(rid, oid, og, window, tz),
+    getStaffAttendanceStats(rid, oid, og, win, tz),
     GetTables(restaurantId),
     // Overdue purchase orders. `expected_date` is a bare date, compared against
     // the RESTAURANT's today ($3), never `current_date` — this server's session
@@ -11099,6 +11144,7 @@ export async function GetConcerns(
 
   return {
     window_days: window,
+    window: windowMeta(win),
     timezone: tz,
     generated_at: new Date().toISOString(),
     concerns,
@@ -11110,21 +11156,27 @@ export async function GetConcerns(
   };
 }
 
-export async function GetKitchenAnalytics(restaurantId: string, days = 30): Promise<KitchenAnalytics> {
+export async function GetKitchenAnalytics(restaurantId: string, days: AnalyticsWindowArg = 30): Promise<KitchenAnalytics> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureOrderTimingColumn();
   await ensureOrderBarkColumns();
   const og = isAllOutlets() ? "true" : "false";
-  const span = Math.min(365, Math.max(1, Math.round(days)));
   const now = await currentDbTime();
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (span - 1)));
+  // The window is now bounded at BOTH ends and cut on the restaurant's own
+  // midnights. It used to start at a UTC midnight, which for a non-IST tenant
+  // named a different day than every sibling reader did — the same class of
+  // drift the accounting ranges were already fixed for. Prep times carry no
+  // money, so aligning them costs nothing and stops the Overview quoting a
+  // kitchen figure measured over different hours than the revenue beside it.
+  const win = analyticsWindow(days, context.timezone, { defaultDays: 30, maxDays: 365, now });
+  const span = win.days;
   const generatedAt = now.toISOString();
 
   const rows = await runQuery<{ timing: unknown; food: unknown; barked_at: Date | string | null }>(
     `select timing, food, barked_at from "Orders"
        where res_id = $1 and (${og} or outlet_id = $2)
-         and created_at >= $3 and timing is not null`,
-    [context.res_id, context.outlet_id, start.toISOString()],
+         and created_at >= $3 and created_at < $4 and timing is not null`,
+    [context.res_id, context.outlet_id, win.fromIso, win.toIso],
   );
 
   // Station lookup from the menu (KOT routing) — see GetOrders: the order-item
@@ -11297,6 +11349,7 @@ export async function GetKitchenAnalytics(restaurantId: string, days = 30): Prom
     by_section,
     by_section_items,
     period_days: span,
+    window: windowMeta(win),
     generated_at: generatedAt,
   };
 }
@@ -13937,18 +13990,9 @@ export interface ExpenseRecord {
   created_at: string;
 }
 
-// Normalize a report range to whole-day UTC boundaries: [from 00:00, to+1day
-// 00:00) so the requested 'to' day is inclusive. Defaults to the last 30 days.
-// Calendar date (YYYY-MM-DD) of an instant AS SEEN IN `tz`.
-function dateKeyInZone(value: Date | string, tz: string): string {
-  const d = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(d.getTime())) {return "";}
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
-  }).formatToParts(d);
-  const get = (t: string) => parts.find((x) => x.type === t)?.value ?? "";
-  return `${get("year")}-${get("month")}-${get("day")}`;
-}
+// dateKeyInZone moved to report_window.ts (imported above) so the window
+// contract and every reader agree on which day an instant belongs to by
+// CONSTRUCTION rather than by two copies happening to match.
 
 // Midnight (00:00 wall clock) of a YYYY-MM-DD in `tz`, as a UTC instant.
 function zoneMidnightUtc(dateKey: string, tz: string): Date {
@@ -13959,13 +14003,7 @@ function zoneMidnightUtc(dateKey: string, tz: string): Date {
   return zonedWallToUtc(Number(m[1]), Number(m[2]), Number(m[3]), 0, 0, tz);
 }
 
-// Add whole days to a YYYY-MM-DD calendar key (no DST arithmetic — pure calendar).
-export function addDaysToKey(dateKey: string, days: number): string {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
-  if (!m) {return dateKey;}
-  const anchor = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + days));
-  return anchor.toISOString().slice(0, 10);
-}
+// addDaysToKey moved to report_window.ts (imported and re-exported above).
 
 // Day-of-week (0 = Sunday) of a YYYY-MM-DD calendar key. Pure calendar: the key
 // already names a day, so no zone is involved.
@@ -14004,26 +14042,79 @@ export function zonedClockParts(
 // served before the UTC rollover into the previous day, which is precisely the
 // kind of drift that makes a Tally export refuse to reconcile.
 function normalizeReportRange(fromInput?: string, toInput?: string, tz = "Asia/Kolkata"): { fromIso: string; toIso: string; fromDate: string; toDate: string } {
-  const now = new Date();
-  const toKey = (() => {
-    const raw = String(toInput ?? "").trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {return raw;}
-    const d = raw ? new Date(raw) : now;
-    return dateKeyInZone(Number.isNaN(d.getTime()) ? now : d, tz);
-  })();
-  const fromKey = (() => {
-    const raw = String(fromInput ?? "").trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {return raw;}
-    const d = raw ? new Date(raw) : null;
-    if (d && !Number.isNaN(d.getTime())) {return dateKeyInZone(d, tz);}
-    return addDaysToKey(toKey, -29);
-  })();
+  const w = resolveReportWindow({ from: fromInput, to: toInput }, tz, {
+    defaultDays: DEFAULT_REPORT_DAYS,
+    maxDays: MAX_REPORT_DAYS,
+  });
+  return { ...windowInstants(w, tz), fromDate: w.from, toDate: w.to };
+}
+
+/**
+ * Turn two INCLUSIVE day keys into the half-open [fromIso, toIso) instants every
+ * reader's SQL wants.
+ *
+ * `toIso` is local midnight of the day AFTER `to`. That +1 is the whole reason an
+ * owner who picks 1-15 August sees the 15th's trade: SQL compares `< toIso`, so
+ * without it the last day of every range silently vanishes — the failure an owner
+ * reports as "the numbers are short" and which no aggregate would flag.
+ */
+function windowInstants(w: { from: string; to: string }, tz: string): { fromIso: string; toIso: string } {
   return {
-    fromIso: zoneMidnightUtc(fromKey, tz).toISOString(),
-    toIso: zoneMidnightUtc(addDaysToKey(toKey, 1), tz).toISOString(),
-    fromDate: fromKey,
-    toDate: toKey,
+    fromIso: zoneMidnightUtc(w.from, tz).toISOString(),
+    toIso: zoneMidnightUtc(addDaysToKey(w.to, 1), tz).toISOString(),
   };
+}
+
+/** A resolved window plus the instants its SQL will actually bind. */
+export interface AnalyticsWindow extends ResolvedReportWindow {
+  fromIso: string;
+  /** EXCLUSIVE. Local midnight of the day after `to`. */
+  toIso: string;
+}
+
+/**
+ * What every analytics reader now accepts.
+ *
+ * A bare number is the LEGACY rolling-day span the shipped web and Flutter
+ * clients send, and it keeps meaning exactly what it meant: the last N calendar
+ * days ending today, in the restaurant's zone. An object may carry from/to
+ * instead, which wins — see report_window.ts for the precedence rule.
+ */
+export type AnalyticsWindowArg = number | ReportWindowQuery | undefined;
+
+/**
+ * The ONE place an analytics reader turns its argument into days on a calendar.
+ *
+ * `limits` stays per-reader because the caps are per-reader facts: the daily
+ * revenue chart cannot draw 365 bars usefully and the KPI dashboard's trend
+ * needs at least a week. Passing them in keeps the `days` shorthand producing
+ * byte-for-byte the window it produced before this contract existed.
+ */
+function analyticsWindow(
+  arg: AnalyticsWindowArg,
+  tz: string,
+  // `now` is threaded from currentDbTime() by the readers that already used the
+  // DATABASE clock to decide what "today" is. Those two clocks can differ, and a
+  // reader that changed which one it trusts would move its own figures on deploy.
+  limits: { defaultDays: number; minDays?: number; maxDays?: number; now?: Date },
+): AnalyticsWindow {
+  const query: ReportWindowQuery = typeof arg === "number" ? { days: arg } : (arg ?? {});
+  const w = resolveReportWindow(query, tz, limits);
+  return { ...w, ...windowInstants(w, tz) };
+}
+
+/**
+ * The window as the CLIENTS see it: day keys, span, and any clamp that was
+ * applied — never the internal instants.
+ *
+ * Every analytics payload carries this so a screen can label itself "1-15 Aug"
+ * with the window the SERVER actually used, not the one the user asked for. When
+ * they differ (a future date, a 5-year drag) `clamped` says so, which is the
+ * difference between a report that is honest about its bounds and one that
+ * quietly answers a different question.
+ */
+function windowMeta(w: AnalyticsWindow): ResolvedReportWindow {
+  return { from: w.from, to: w.to, days: w.days, source: w.source, clamped: w.clamped };
 }
 
 // Which accounting DAY an instant belongs to — the restaurant's calendar day.
@@ -14713,9 +14804,16 @@ export interface BalanceSheet {
   notes: string[];
 }
 
-export async function GetBalanceSheet(restaurantId: string, asOf?: string): Promise<BalanceSheet> {
+export async function GetBalanceSheet(restaurantId: string, asOf?: string | ReportWindowQuery): Promise<BalanceSheet> {
   const context = await requireRestaurantContext(restaurantId);
-  const range = dayRangeOf(asOf, context.timezone);
+  // A balance sheet is a SNAPSHOT, not a total over a span, so a range collapses
+  // to its LAST day: "as of 1-15 August" is the position at the close of the
+  // 15th. A one-day range is therefore exactly the `as_of` this always took, and
+  // the same calendar picker can drive this screen as drives the sales report.
+  const asOfKey = typeof asOf === "string" || asOf == null
+    ? asOf
+    : resolveReportWindow(asOf, context.timezone, { defaultDays: DEFAULT_REPORT_DAYS, maxDays: MAX_REPORT_DAYS }).to;
+  const range = dayRangeOf(asOfKey, context.timezone);
   const cutoffIso = range.toIso; // end of the as-of day (exclusive)
   const rid = context.res_id, oid = context.outlet_id;
 
@@ -14866,30 +14964,62 @@ export interface ReconciliationRow {
   note: string | null;
 }
 
-export async function GetReconciliation(restaurantId: string, date?: string): Promise<{ date: string; rows: ReconciliationRow[] }> {
+export async function GetReconciliation(
+  restaurantId: string,
+  date?: string | ReportWindowQuery,
+): Promise<{ date: string; from: string; to: string; days: number; rows: ReconciliationRow[] }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureSettlementBatchesTable();
-  const range = dayRangeOf(date, context.timezone);
-  const bills = await getSettledBills(context, range.fromIso, range.toIso);
+  const tz = context.timezone;
+  // A ONE-DAY range is byte-for-byte the single `date` this has always taken.
+  // A wider one is still one question — "did this week settle?" — so the
+  // expected takings and the saved entries are summed across it rather than
+  // returning seven reports the caller would have to add up itself.
+  //
+  // defaultDays is 1, not 30: an owner who names only an end date is asking
+  // about THAT day's till, and quietly widening it to a month would report a
+  // month's takings under a single day's heading.
+  const w = typeof date === "string" || date == null
+    ? { from: dayRangeOf(date, tz).day, to: dayRangeOf(date, tz).day, days: 1 }
+    : (() => {
+      const r = resolveReportWindow(date, tz, { defaultDays: 1, maxDays: MAX_REPORT_DAYS });
+      return { from: r.from, to: r.to, days: r.days };
+    })();
+  const iso = windowInstants(w, tz);
+  const bills = await getSettledBills(context, iso.fromIso, iso.toIso);
   const expected = methodTotalsOf(bills);
   const saved = await runQuery<{ method: string; actual: number | string; status: string; note: string | null }>(
     `select method, actual::float as actual, status, note from "SettlementBatches"
-      where res_id = $1 and outlet_id = $2 and date = $3::date`,
-    [context.res_id, context.outlet_id, range.day],
+      where res_id = $1 and outlet_id = $2 and date >= $3::date and date <= $4::date`,
+    [context.res_id, context.outlet_id, w.from, w.to],
   );
-  const savedByMethod = new Map(saved.map((r) => [r.method, r]));
+  // Over a multi-day range one method carries one saved entry PER DAY. They add
+  // up, and the range counts as matched only when every entry in it did: a week
+  // with six clean days and one variance is a week with a variance, and calling
+  // it "matched" would bury the only row anyone needed to look at.
+  const savedByMethod = new Map<string, { actual: number; matched: boolean; notes: string[] }>();
+  for (const r of saved) {
+    const cur = savedByMethod.get(r.method) ?? { actual: 0, matched: true, notes: [] };
+    cur.actual = round2(cur.actual + parseNumeric(r.actual));
+    cur.matched = cur.matched && r.status === "matched";
+    if (r.note) {cur.notes.push(r.note);}
+    savedByMethod.set(r.method, cur);
+  }
   const methods = new Set<string>([...expected.keys(), ...savedByMethod.keys()]);
   const rows: ReconciliationRow[] = [...methods].map((method): ReconciliationRow => {
     const s = savedByMethod.get(method);
     return {
       method,
       expected: round2(expected.get(method) ?? 0),
-      actual: s ? round2(parseNumeric(s.actual)) : null,
-      status: s ? (s.status === "matched" ? "matched" : "variance") : null,
-      note: s?.note ?? null,
+      actual: s ? s.actual : null,
+      status: s ? (s.matched ? "matched" : "variance") : null,
+      note: s && s.notes.length > 0 ? s.notes.join(" | ") : null,
     };
   }).sort((a, b) => b.expected - a.expected || a.method.localeCompare(b.method));
-  return { date: range.day, rows };
+  // `date` stays the LAST day of the range. Saving a reconciliation is still a
+  // per-day write (SaveReconciliation keys "SettlementBatches" on date+method),
+  // so this is the day a Save issued from what the screen is showing lands on.
+  return { date: w.to, from: w.from, to: w.to, days: w.days, rows };
 }
 
 export async function SaveReconciliation(
@@ -19475,22 +19605,22 @@ async function currentDbTime(): Promise<Date> {
 // Daily revenue + order-count series for the last `days` days (for trend charts).
 export async function GetDailyRevenueSeries(
   restaurantId: string,
-  days = 14,
+  days: AnalyticsWindowArg = 14,
 ): Promise<{ date: string; revenue: number; orders: number }[]> {
   const context = await requireRestaurantContext(restaurantId);
-  const span = Math.min(90, Math.max(1, Math.round(days)));
   const now = await currentDbTime();
   // The chart's days are the RESTAURANT's calendar days. Bucketing by UTC booked
   // this tenant's 01:00 IST covers on the previous day and left the current day
   // with no bar at all; the window lower bound has to move with the keys or the
   // first day comes out short by one UTC offset.
-  const startKey = addDaysToKey(dayKeyOf(now, context.timezone), -(span - 1));
-  const start = zoneMidnightUtc(startKey, context.timezone);
+  const win = analyticsWindow(days, context.timezone, { defaultDays: 14, maxDays: 90, now });
+  const span = win.days;
+  const startKey = win.from;
 
   const rows = await runQuery<{ created_at: Date | string; food: unknown; status: unknown }>(
     `select created_at, food, status from "Orders"
-       where res_id = $1 and outlet_id = $2 and created_at >= $3`,
-    [context.res_id, context.outlet_id, start.toISOString()],
+       where res_id = $1 and outlet_id = $2 and created_at >= $3 and created_at < $4`,
+    [context.res_id, context.outlet_id, win.fromIso, win.toIso],
   );
 
   const byDay = new Map<string, { revenue: number; orders: number }>();
@@ -19523,24 +19653,25 @@ export async function GetDailyRevenueSeries(
 // this tenant's peak when the rush is actually 21:00 local.
 export async function GetOperationsAnalytics(
   restaurantId: string,
-  days = 30,
+  days: AnalyticsWindowArg = 30,
 ): Promise<{
   days: number;
+  window: ResolvedReportWindow;
   by_hour: { hour: number; orders: number; revenue: number }[];
   by_weekday: { weekday: number; label: string; orders: number; revenue: number }[];
 }> {
   const context = await requireRestaurantContext(restaurantId);
-  const span = Math.min(180, Math.max(1, Math.round(days)));
   const now = await currentDbTime();
   // Window starts at local midnight of the first day so the earliest day is not
-  // clipped by the zone offset.
-  const start = zoneMidnightUtc(addDaysToKey(dayKeyOf(now, context.timezone), -(span - 1)), context.timezone);
+  // clipped by the zone offset, and ends at local midnight after the last.
+  const win = analyticsWindow(days, context.timezone, { defaultDays: 30, maxDays: 180, now });
+  const span = win.days;
   // ALL-OUTLETS aggregate: span every outlet of the restaurant, exactly as the
   // sibling analytics endpoints do (GetKitchenAnalytics / GetAdvancedAnalytics).
   const og = isAllOutlets() ? "true" : "false";
   const rows = await runQuery<{ created_at: Date | string; food: unknown; status: unknown }>(
-    `select created_at, food, status from "Orders" where res_id = $1 and (${og} or outlet_id = $2) and created_at >= $3`,
-    [context.res_id, context.outlet_id, start.toISOString()],
+    `select created_at, food, status from "Orders" where res_id = $1 and (${og} or outlet_id = $2) and created_at >= $3 and created_at < $4`,
+    [context.res_id, context.outlet_id, win.fromIso, win.toIso],
   );
   const byHour = Array.from({ length: 24 }, (_, h) => ({ hour: h, orders: 0, revenue: 0 }));
   const wkLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -19563,7 +19694,7 @@ export async function GetOperationsAnalytics(
       wb.revenue = round2(wb.revenue + total);
     }
   }
-  return { days: span, by_hour: byHour, by_weekday: byWeekday };
+  return { days: span, window: windowMeta(win), by_hour: byHour, by_weekday: byWeekday };
 }
 
 // --- Multi-outlet management -------------------------------------------------
@@ -19995,14 +20126,22 @@ export async function GetOutletsRollup(
 // regardless of which outlet the request is bound to).
 export async function GetOutletsComparison(
   restaurantId: string,
-  days = 30,
+  days: AnalyticsWindowArg = 30,
 ): Promise<{
   days: number;
+  window: ResolvedReportWindow;
   outlets: { outlet_id: string; name: string; revenue: number; bills: number; orders: number; avg_rating: number | null }[];
 }> {
   const context = await requireRestaurantContext(restaurantId);
-  const span = Math.max(1, Math.min(365, Math.round(days)));
-  const since = `now() - ($2 || ' days')::interval`;
+  const win = analyticsWindow(days, context.timezone, { defaultDays: 30, maxDays: 365 });
+  const span = win.days;
+  // Was `now() - N days`: a rolling 720 HOURS, which cannot name "1-15 August"
+  // and never agreed with the calendar-day windows every sibling reader uses —
+  // so the same restaurant's revenue differed between this card and the Overview
+  // beside it. Both ends are now bound to the tenant's own midnights.
+  // Named for the COLUMN it carries: the feedback query below is on
+  // submitted_at and spells its own bounds out rather than reusing this.
+  const createdInWindow = "created_at >= $2 and created_at < $3";
 
   const outletRows = await runQuery<{ id: string; outlet_name: string | null }>(
     `select id, outlet_name from "Outlets" where res_id = $1 order by created_at asc`,
@@ -20010,21 +20149,21 @@ export async function GetOutletsComparison(
   );
   const billRows = await runQuery<{ outlet_id: string | null; revenue: number; bills: number }>(
     `select outlet_id, coalesce(sum(total_amt),0)::float as revenue, count(*)::int as bills
-       from "Bills" where res_id = $1 and status <> 0 and created_at >= ${since}
+       from "Bills" where res_id = $1 and status <> 0 and ${createdInWindow}
        group by outlet_id`,
-    [context.res_id, String(span)],
+    [context.res_id, win.fromIso, win.toIso],
   );
   const orderRows = await runQuery<{ outlet_id: string | null; orders: number }>(
     `select outlet_id, count(*)::int as orders
-       from "Orders" where res_id = $1 and created_at >= ${since}
+       from "Orders" where res_id = $1 and ${createdInWindow}
        group by outlet_id`,
-    [context.res_id, String(span)],
+    [context.res_id, win.fromIso, win.toIso],
   );
   const fbRows = await runQuery<{ outlet_id: string | null; avg_rating: number | null }>(
     `select outlet_id, avg(overall_rating)::float as avg_rating
-       from "Feedback_entries" where res_id = $1 and submitted_at >= ${since}
+       from "Feedback_entries" where res_id = $1 and submitted_at >= $2 and submitted_at < $3
        group by outlet_id`,
-    [context.res_id, String(span)],
+    [context.res_id, win.fromIso, win.toIso],
   );
 
   const bills = new Map(billRows.map((r) => [r.outlet_id ?? "", r]));
@@ -20032,6 +20171,7 @@ export async function GetOutletsComparison(
   const ratings = new Map(fbRows.map((r) => [r.outlet_id ?? "", r.avg_rating]));
   return {
     days: span,
+    window: windowMeta(win),
     outlets: outletRows.map((o) => {
       const b = bills.get(o.id);
       const rating = ratings.get(o.id);
@@ -20145,7 +20285,7 @@ async function getStaffAttendanceStats(
   resId: string,
   outletId: string,
   outletGuard: string,
-  days: number,
+  win: AnalyticsWindow,
   tz: string,
 ): Promise<{ rows: StaffAttendanceStat[]; summary: StaffAttendanceSummary }> {
   await ensureAttendanceTable();
@@ -20170,9 +20310,9 @@ async function getStaffAttendanceStats(
        from "Attendance" a
        left join "Employees" e on e.id = a.emp_id and e.res_id = a.res_id
       where a.res_id = $1 and (${outletGuard} or a.outlet_id = $2)
-        and a.clock_in >= now() - ($3 || ' days')::interval
+        and a.clock_in >= $3 and a.clock_in < $5
       order by a.clock_in asc`,
-    [resId, outletId, String(days), tz],
+    [resId, outletId, win.fromIso, tz, win.toIso],
   ).catch(() => [] as never[]);
 
   // Approved leave over the same span, keyed by the SAME restaurant day keys the
@@ -20180,9 +20320,8 @@ async function getStaffAttendanceStats(
   // directly comparable. The span is taken one day wider at the start than the
   // attendance window so a leave that began just before it still covers the days
   // inside it that it overlaps.
-  const nowKey = dayKeyOf(new Date(), tz);
   const leaveByEmp = await approvedLeaveDaysByEmployee(
-    resId, outletId, outletGuard, addDaysToKey(nowKey, -Math.max(1, Math.round(days))), nowKey,
+    resId, outletId, outletGuard, addDaysToKey(win.from, -1), win.to,
   );
 
   const nowMs = Date.now();
@@ -20270,7 +20409,7 @@ async function getStaffAttendanceStats(
   return {
     rows: out,
     summary: {
-      window_days: days,
+      window_days: win.days,
       staff_tracked: out.length,
       operating_days: openDays.length,
       total_shifts: out.reduce((s, r) => s + r.shifts, 0),
@@ -20407,6 +20546,8 @@ export interface StaffPerformance {
   window_days: number;
   from: string;
   to: string;
+  /** The same window as `from`/`to`, plus its span and any clamp applied. */
+  window: ResolvedReportWindow;
   timezone: string;
   generated_at: string;
   /** The nominal weights, identical for every employee. */
@@ -20444,17 +20585,18 @@ function medianOf(values: number[]): number | null {
  * Windowed to the last `days` RESTAURANT days (default 30) — dayKeyOf/dayRangeOf
  * throughout, never `current_date`.
  */
-export async function GetStaffPerformance(restaurantId: string, days = 30): Promise<StaffPerformance> {
+export async function GetStaffPerformance(restaurantId: string, days: AnalyticsWindowArg = 30): Promise<StaffPerformance> {
   const context = await requireRestaurantContext(restaurantId);
   const tz = context.timezone;
-  const window = Math.min(365, Math.max(1, Math.round(days) || 30));
+  const win = analyticsWindow(days, tz, { defaultDays: 30, maxDays: 365 });
+  const window = win.days;
   const rid = context.res_id, oid = context.outlet_id;
   const og = isAllOutlets() ? "true" : "false";
 
-  const todayKey = dayKeyOf(new Date(), tz);
-  const fromKey = addDaysToKey(todayKey, -(window - 1));
-  const fromIso = dayRangeOf(fromKey, tz).fromIso;
-  const toIso = dayRangeOf(todayKey, tz).toIso;
+  const todayKey = win.to;
+  const fromKey = win.from;
+  const fromIso = win.fromIso;
+  const toIso = win.toIso;
 
   await ensureBillWorkflowColumns();
   const scPct = await getServiceChargePercent(rid);
@@ -20495,7 +20637,7 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
         group by emp_id`,
       [rid, oid, fromIso, toIso],
     ),
-    getStaffAttendanceStats(rid, oid, og, window, tz),
+    getStaffAttendanceStats(rid, oid, og, win, tz),
     // Turnaround = seated_at -> left_at on "TableSessions" (the real columns; the
     // session has no "released" column). Attributed to whoever billed the table
     // during that seating, which is the only employee link a session has.
@@ -20705,6 +20847,7 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
     window_days: window,
     from: fromKey,
     to: todayKey,
+    window: windowMeta(win),
     timezone: tz,
     generated_at: new Date().toISOString(),
     weights: { ...PERFORMANCE_WEIGHTS },
@@ -20721,13 +20864,21 @@ export async function GetStaffPerformance(restaurantId: string, days = 30): Prom
 // from existing data. Everything is tenant + outlet scoped and windowed to `days`.
 export async function GetAdvancedAnalytics(
   restaurantId: string,
-  opts?: { days?: number },
+  opts?: AnalyticsWindowArg,
 ): Promise<Record<string, unknown>> {
   const context = await requireRestaurantContext(restaurantId);
-  const days = Math.max(7, Math.min(Math.round(opts?.days ?? 90), 365));
+  // minDays 7 floors the `days` SHORTHAND only — the KPI colour bands read as
+  // noise over a shorter rolling window. An explicit from/to range is honoured
+  // as asked, down to a single day, because the owner picked that day.
+  const win = analyticsWindow(opts, context.timezone, { defaultDays: 90, minDays: 7, maxDays: 365 });
+  const days = win.days;
   const rid = context.res_id, oid = context.outlet_id;
   const og = isAllOutlets() ? "true" : "false";
-  const since = `now() - ($3 || ' days')::interval`;
+  // Every window query below binds the SAME half-open pair as $3/$4. It replaces
+  // `now() - N days`, a rolling interval that could not express "1-15 August"
+  // and cut its days on the UTC clock rather than on the restaurant's midnights,
+  // so this dashboard disagreed with the accounting reports about which day a
+  // late cover belonged to.
 
   // Discount & offer usage
   const disc = (await runQuery<{ total_bills: number; discount_bills: number; total_discount: number; redemptions: number }>(
@@ -20735,8 +20886,8 @@ export async function GetAdvancedAnalytics(
             count(*) filter (where discount_value > 0)::int discount_bills,
             coalesce(sum(discount_value),0)::float total_discount,
             count(*) filter (where coupon_code is not null and coupon_code <> '')::int redemptions
-       from "Bills" where res_id=$1 and (${og} or outlet_id=$2) and status <> 0 and created_at >= ${since}`,
-    [rid, oid, String(days)],
+       from "Bills" where res_id=$1 and (${og} or outlet_id=$2) and status <> 0 and created_at >= $3 and created_at < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { total_bills: 0, discount_bills: 0, total_discount: 0, redemptions: 0 };
   const utilization_pct = disc.total_bills > 0 ? round2((disc.discount_bills / disc.total_bills) * 100) : 0;
 
@@ -20746,9 +20897,9 @@ export async function GetAdvancedAnalytics(
             count(*) filter (where f.overall_rating <= 2)::int negatives
        from "Feedback_entries" f
        left join "Employees" e on e.id=f.emp_id and e.res_id=f.res_id
-       where f.res_id=$1 and (${og} or f.outlet_id=$2) and f.submitted_at >= ${since}
+       where f.res_id=$1 and (${og} or f.outlet_id=$2) and f.submitted_at >= $3 and f.submitted_at < $4
        group by e."emp_Fname" order by feedbacks desc`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   );
   const totalFb = staffRows.reduce((s, r) => s + r.feedbacks, 0);
   const totalNeg = staffRows.reduce((s, r) => s + r.negatives, 0);
@@ -20762,17 +20913,17 @@ export async function GetAdvancedAnalytics(
   }));
 
   // Per-staff ATTENDANCE over the same window as the rest of staff analytics.
-  const staff_attendance = await getStaffAttendanceStats(rid, oid, og, days, context.timezone);
+  const staff_attendance = await getStaffAttendanceStats(rid, oid, og, win, context.timezone);
 
   // Order processing time = bill time − order time, guarded to a sane 0–24h window
   // so a table left open for days doesn't blow up the average.
   const proc = (await runQuery<{ avg_min: number | null; n: number }>(
     `select avg(extract(epoch from (coalesce(b.closed_at,b.admin_approved_at,b.created_at) - o.created_at))/60)::float avg_min, count(*)::int n
        from "Bills" b join "Orders" o on o.id=b.order_id and o.res_id=b.res_id and o.outlet_id=b.outlet_id
-       where b.res_id=$1 and (${og} or b.outlet_id=$2) and b.order_id is not null and b.created_at >= ${since}
+       where b.res_id=$1 and (${og} or b.outlet_id=$2) and b.order_id is not null and b.created_at >= $3 and b.created_at < $4
          and coalesce(b.closed_at,b.admin_approved_at,b.created_at) > o.created_at
          and coalesce(b.closed_at,b.admin_approved_at,b.created_at) - o.created_at <= interval '24 hours'`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { avg_min: null, n: 0 };
   const processing_time_min = proc.avg_min != null ? round2(proc.avg_min) : null;
 
@@ -20874,8 +21025,8 @@ export async function GetAdvancedAnalytics(
   // 12h/day — a house assumption until an opening-hours setting exists.
   const OPERATING_HOURS_PER_DAY = 12;
   const windowRev = (await runQuery<{ rev: number }>(
-    `select coalesce(sum(total_amt),0)::float rev from "Bills" where res_id=$1 and (${og} or outlet_id=$2) and status <> 0 and created_at >= ${since}`,
-    [rid, oid, String(days)],
+    `select coalesce(sum(total_amt),0)::float rev from "Bills" where res_id=$1 and (${og} or outlet_id=$2) and status <> 0 and created_at >= $3 and created_at < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0]?.rev ?? 0;
   const seats = (await runQuery<{ seats: number }>(
     `select coalesce(sum(greatest(capacity, 1)), 0)::int seats from "Tables"
@@ -20888,15 +21039,15 @@ export async function GetAdvancedAnalytics(
   // sales-per-approved-labour-hour as the productivity read.
   await ensurePayrollTables();
   const labourPaid = (await runQuery<{ paid: number }>(
-    `select coalesce(sum(amount),0)::float paid from "PayrollPayments" where res_id=$1 and (${og} or outlet_id=$2) and paid_at >= ${since}`,
-    [rid, oid, String(days)],
+    `select coalesce(sum(amount),0)::float paid from "PayrollPayments" where res_id=$1 and (${og} or outlet_id=$2) and paid_at >= $3 and paid_at < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0]?.paid ?? 0;
   const labour_cost_pct = labourPaid > 0 && windowRev > 0 ? round2((labourPaid / windowRev) * 100) : null;
   const labourHours = (await runQuery<{ hours: number }>(
     `select coalesce(sum(least(extract(epoch from (clock_out - clock_in))/3600, 16)), 0)::float hours
        from "Attendance" where res_id=$1 and (${og} or outlet_id=$2) and clock_out is not null and clock_out > clock_in
-         and ${ATTENDANCE_COUNTED} and clock_in >= ${since}`,
-    [rid, oid, String(days)],
+         and ${ATTENDANCE_COUNTED} and clock_in >= $3 and clock_in < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0]?.hours ?? 0;
   // Require ≥1h of approved labour — a single seconds-long shift would otherwise
   // divide into an absurd productivity number.
@@ -20905,8 +21056,8 @@ export async function GetAdvancedAnalytics(
   // Reservation conversion: bookings whose slot status reached completed/seated
   // vs no-shows; cancellations drop out of the denominator.
   const bookingRows = await runQuery<{ slot: string }>(
-    `select slot from "Bookings" where res_id=$1 and (${og} or outlet_id=$2) and created_at >= ${since}`,
-    [rid, oid, String(days)],
+    `select slot from "Bookings" where res_id=$1 and (${og} or outlet_id=$2) and created_at >= $3 and created_at < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   );
   let bkTotal = 0, bkDone = 0, bkNoShow = 0;
   for (const b of bookingRows) {
@@ -20935,8 +21086,8 @@ export async function GetAdvancedAnalytics(
   await ensureExpensesTable();
   const windowExpenses = (await runQuery<{ total: number }>(
     `select coalesce(sum(amount),0)::float total from "Expenses"
-       where res_id=$1 and (${og} or outlet_id=$2) and spent_on >= (now() - ($3 || ' days')::interval)::date`,
-    [rid, oid, String(days)],
+       where res_id=$1 and (${og} or outlet_id=$2) and spent_on >= $3::date and spent_on <= $4::date`,
+    [rid, oid, win.from, win.to],
   ))[0]?.total ?? 0;
   const profit_margin_pct = windowRev > 0 && windowExpenses > 0
     ? Math.round(((windowRev - windowExpenses) / windowRev) * 1000) / 10
@@ -20990,8 +21141,8 @@ export async function GetAdvancedAnalytics(
             count(*)::int events,
             count(*) filter (where unit_cost is null)::int uncosted
        from "StockMovements"
-       where res_id=$1 and (${og} or outlet_id=$2) and kind='issue' and created_at >= ${since}`,
-    [rid, oid, String(days)],
+       where res_id=$1 and (${og} or outlet_id=$2) and kind='issue' and created_at >= $3 and created_at < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { cost: 0, events: 0, uncosted: 0 };
   const food_cost_pct = windowRev > 0 && issueAgg.cost > 0 ? round2((issueAgg.cost / windowRev) * 100) : null;
 
@@ -21002,13 +21153,13 @@ export async function GetAdvancedAnalytics(
     `with it as (
        select item->>'name' as name, coalesce((item->>'quantity')::numeric, 1) as qty
          from "Orders" o, jsonb_array_elements((o.food)::jsonb->'items') item
-        where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= ${since}
+        where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= $3 and o.created_at < $4
           -- Cancelled orders are not sales: they were inflating theoretical food cost,
           -- menu-engineering classes and the demand forecast (~50% of counted units).
           and coalesce(o.status::text, '1') <> '5'
      )
      select name, sum(qty)::float qty from it where coalesce(name,'') <> '' group by name limit 500`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   );
   let theoreticalCost = 0;
   let recipesMissing = 0; // distinct sold menu items with no usable recipe cost
@@ -21065,12 +21216,12 @@ export async function GetAdvancedAnalytics(
               coalesce((item->>'quantity')::numeric, 1) as qty,
               coalesce((item->>'price')::numeric, 0) * coalesce((item->>'quantity')::numeric, 1) as rev
          from "Orders" o, jsonb_array_elements((o.food)::jsonb->'items') item
-        where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= ${since}
+        where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= $3 and o.created_at < $4
           and coalesce(o.status::text, '1') <> '5'   -- exclude cancelled: not sales
      )
      select name, sum(qty)::float qty, sum(rev)::float revenue
        from it where coalesce(name,'') <> '' group by name order by 2 desc limit 60`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   );
   const median = (xs: number[]) => { if (!xs.length) {return 0;} const s = [...xs].sort((a, b) => a - b); const m = Math.floor(s.length / 2); return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2; };
   const qtyMed = median(itemRows.map((r) => r.qty));
@@ -21095,12 +21246,12 @@ export async function GetAdvancedAnalytics(
        select coalesce(nullif((o.food)::jsonb->>'customer_phone',''), nullif((o.food)::jsonb->>'customer','')) as ident,
               o.created_at, coalesce(((o.food)::jsonb->>'total')::numeric, 0) as total
          from "Orders" o
-        where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= ${since}
+        where o.res_id=$1 and (${og} or o.outlet_id=$2) and o.created_at >= $3 and o.created_at < $4
      )
      select ident, max(created_at) last_order, count(*)::int orders, coalesce(sum(total),0)::float spend
        from idents where ident is not null and lower(ident) <> 'guest'
        group by ident order by spend desc limit 200`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   );
   const halfMs = (days / 2) * 86_400_000;
   const nowMs = Date.now();
@@ -21115,8 +21266,8 @@ export async function GetAdvancedAnalytics(
   // --- Customer wait time (queue-seated parties) ------------------------------
   const wait = (await runQuery<{ avg_min: number | null; n: number }>(
     `select avg(extract(epoch from (seated_at - created_at))/60)::float avg_min, count(*)::int n
-       from "Waitlist" where res_id=$1 and (${og} or outlet_id=$2) and seated_at is not null and created_at >= ${since}`,
-    [rid, oid, String(days)],
+       from "Waitlist" where res_id=$1 and (${og} or outlet_id=$2) and seated_at is not null and created_at >= $3 and created_at < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { avg_min: null, n: 0 };
   const wait_time_min = wait.n > 0 && wait.avg_min != null ? round2(wait.avg_min) : null;
 
@@ -21130,21 +21281,21 @@ export async function GetAdvancedAnalytics(
             count(*)::int n
        from "TableSessions" s
        left join "Tables" t on t.id = s.table_id and t.res_id = s.res_id
-       where s.res_id=$1 and (${og} or s.outlet_id=$2) and s.left_at is not null and s.seated_at >= ${since}
+       where s.res_id=$1 and (${og} or s.outlet_id=$2) and s.left_at is not null and s.seated_at >= $3 and s.seated_at < $4
          and s.left_at > s.seated_at and s.left_at - s.seated_at <= interval '6 hours'
          and coalesce(t.is_virtual, false) = false`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { avg_min: null, median_min: null, n: 0 };
   const tatByTable = await runQuery<{ table_name: string; visits: number; avg_min: number }>(
     `select coalesce(s.table_name, '?') table_name, count(*)::int visits,
             avg(extract(epoch from (s.left_at - s.seated_at))/60)::float avg_min
        from "TableSessions" s
        left join "Tables" t on t.id = s.table_id and t.res_id = s.res_id
-       where s.res_id=$1 and (${og} or s.outlet_id=$2) and s.left_at is not null and s.seated_at >= ${since}
+       where s.res_id=$1 and (${og} or s.outlet_id=$2) and s.left_at is not null and s.seated_at >= $3 and s.seated_at < $4
          and s.left_at > s.seated_at and s.left_at - s.seated_at <= interval '6 hours'
          and coalesce(t.is_virtual, false) = false
        group by 1 order by visits desc limit 10`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   );
   const tat = {
     avg_min: tatAgg.n > 0 && tatAgg.avg_min != null ? round2(tatAgg.avg_min) : null,
@@ -21159,15 +21310,15 @@ export async function GetAdvancedAnalytics(
     `select date_trunc('day', b.created_at)::date::text d,
             avg(extract(epoch from (coalesce(b.closed_at,b.admin_approved_at,b.created_at) - o.created_at))/60)::float svc
        from "Bills" b join "Orders" o on o.id=b.order_id and o.res_id=b.res_id and o.outlet_id=b.outlet_id
-       where b.res_id=$1 and (${og} or b.outlet_id=$2) and b.order_id is not null and b.created_at >= ${since}
+       where b.res_id=$1 and (${og} or b.outlet_id=$2) and b.order_id is not null and b.created_at >= $3 and b.created_at < $4
          and coalesce(b.closed_at,b.admin_approved_at,b.created_at) - o.created_at between interval '0' and interval '24 hours'
        group by 1`,
-    [rid, oid, String(days)],
+    [rid, oid, win.fromIso, win.toIso],
   );
   const fbDays = await runQuery<{ d: string; r: number }>(
     `select date_trunc('day', submitted_at)::date::text d, avg(overall_rating)::float r
-       from "Feedback_entries" where res_id=$1 and (${og} or outlet_id=$2) and submitted_at >= ${since} group by 1`,
-    [rid, oid, String(days)],
+       from "Feedback_entries" where res_id=$1 and (${og} or outlet_id=$2) and submitted_at >= $3 and submitted_at < $4 group by 1`,
+    [rid, oid, win.fromIso, win.toIso],
   );
   const fbByDay = new Map(fbDays.map((f) => [f.d, f.r]));
   const pairs = svcDays.filter((s) => fbByDay.has(s.d)).map((s) => ({ x: s.svc, y: fbByDay.get(s.d)! }));
@@ -21265,8 +21416,8 @@ export async function GetAdvancedAnalytics(
     `select count(*) filter (where nps >= 9)::int promoters,
             count(*) filter (where nps <= 6)::int detractors,
             count(*) filter (where nps is not null)::int responses
-       from "Feedback_entries" where res_id=$1 and (${og} or outlet_id=$2) and submitted_at >= ${since}`,
-    [rid, oid, String(days)],
+       from "Feedback_entries" where res_id=$1 and (${og} or outlet_id=$2) and submitted_at >= $3 and submitted_at < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { promoters: 0, detractors: 0, responses: 0 };
   const nps = npsAgg.responses > 0 ? round2(((npsAgg.promoters - npsAgg.detractors) / npsAgg.responses) * 100) : null;
 
@@ -21282,8 +21433,8 @@ export async function GetAdvancedAnalytics(
             count(*) filter (where requested_at is not null and delivered_at > requested_at
                                and delivered_at - requested_at <= interval '2 hours')::int retrievals,
             count(*)::int cars
-       from "Valet_vehicle_state" where res_id=$1 and (${og} or outlet_id=$2) and entry_time >= ${since}`,
-    [rid, oid, String(days)],
+       from "Valet_vehicle_state" where res_id=$1 and (${og} or outlet_id=$2) and entry_time >= $3 and entry_time < $4`,
+    [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { avg_min: null, retrievals: 0, cars: 0 };
   const valet = {
     avg_retrieval_min: valetAgg.retrievals > 0 && valetAgg.avg_min != null ? round2(valetAgg.avg_min) : null,
@@ -21331,6 +21482,7 @@ export async function GetAdvancedAnalytics(
 
   return {
     window_days: days,
+    window: windowMeta(win),
     discounts: { total_bills: disc.total_bills, discount_bills: disc.discount_bills, utilization_pct, total_discount: round2(disc.total_discount), redemptions: disc.redemptions },
     staff, overall_avg_rating: weightedRating, overall_complaint_pct, total_feedbacks: totalFb,
     // Attendance per staff member over the same `window_days` (see
@@ -22142,9 +22294,11 @@ function suppressionExplanation(
 // from the per-order line items in Orders.food.
 export async function GetMenuPerformanceInsights(
   restaurantId: string,
-  days = 30,
+  days: AnalyticsWindowArg = 30,
 ): Promise<{
   period_days: number;
+  /** The calendar window these dishes and suggestions were measured over. */
+  window: ResolvedReportWindow;
   total_revenue: number;
   total_items_sold: number;
   top_dishes: DishStat[];
@@ -22159,8 +22313,15 @@ export async function GetMenuPerformanceInsights(
 }> {
   const context = await requireRestaurantContext(restaurantId);
   const now = await currentDbTime();
-  const periodDays = Math.max(1, Math.min(365, Math.floor(Number(days) || 30)));
-  const start = new Date(now.getTime() - periodDays * 24 * 60 * 60 * 1000);
+  // Was an exact N x 24h slice measured back from `now`, which is not a calendar
+  // window: it cut the earliest day in half and could not name "1-15 August" at
+  // all. The price suggestions built here get read beside the sales report, so
+  // the two have to be measuring the same days.
+  const win = analyticsWindow(days, context.timezone, { defaultDays: 30, maxDays: 365, now });
+  const periodDays = win.days;
+  // The instant the window OPENS. The price-suggestion cooldown below asks
+  // whether an item's price moved inside the window it is reasoning over.
+  const start = new Date(win.fromIso);
 
   // ALL-OUTLETS aggregate: span every outlet of the restaurant, exactly as the
   // sibling analytics endpoints do (GetKitchenAnalytics / GetAdvancedAnalytics).
@@ -22170,10 +22331,10 @@ export async function GetMenuPerformanceInsights(
       select o.food
       from "Orders" o
       where o.res_id = $1 and (${og} or o.outlet_id = $2)
-        and o.created_at >= $3
+        and o.created_at >= $3 and o.created_at < $4
         and coalesce(o.status::text, '1') <> '5'
     `,
-    [context.res_id, context.outlet_id, start.toISOString()],
+    [context.res_id, context.outlet_id, win.fromIso, win.toIso],
   );
 
   const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
@@ -22476,6 +22637,7 @@ export async function GetMenuPerformanceInsights(
 
   return {
     period_days: periodDays,
+    window: windowMeta(win),
     total_revenue: totalRevenue,
     total_items_sold: totalItems,
     top_dishes,
