@@ -5,7 +5,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { createHmac, randomUUID } from "crypto";
-import { AddBooking, AddNotification, AddOrder, AddWaitlistMember, AllocateBestTable, ApplyCouponToBill, CancelWaitlistByToken, CheckCoupon, ClaimWaitlistPreorder, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, DeletePushSubscription, FinalizeOnlinePayment, GetBillForTable, GetBookingSummaryById, GetMenuCategories, GetMenuItems, GetPublicBranding, GetQueueMenu, GetRestaurantProfile, GetVisiblePosters, GetRestaurantSettings, GetWaitlistEntryByToken, JoinWaitlist, SavePushSubscription, SetWaitlistPreorder, SubmitCustomerPayment, UpdateBookingDeposit, VerifyTableOtp, getRestaurantIdFromUsername, parseWallClockInZone, repriceFromMenu, badgeCoveredAllergens, resolveBrandConfig, resolveBrandPalette, resolveMenuBadges, withTenant } from "../database_supabase.js";
+import { AddBooking, AddNotification, AddOrder, AddWaitlistMember, AllocateBestTable, ApplyCouponToBill, CancelWaitlistByToken, CheckCoupon, ClaimWaitlistPreorder, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, DeletePushSubscription, FinalizeOnlinePayment, GetBillForTable, GetBookingSummaryById, GetMenuCategories, GetMenuItems, GetPublicBranding, GetQueueMenu, GetRestaurantProfile, GetVisiblePosters, GetRestaurantSettings, GetWaitlistEntryByToken, JoinWaitlist, ListMenuVariations, SavePushSubscription, SetWaitlistPreorder, SubmitCustomerPayment, UpdateBookingDeposit, VerifyTableOtp, getRestaurantIdFromUsername, parseWallClockInZone, publicVariationsByItem, repriceFromMenu, badgeCoveredAllergens, resolveBrandConfig, resolveBrandPalette, resolveMenuBadges, variationPayloadFor, withTenant, type MenuVariationRecord } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { decodeTableToken, verifyTable } from "../qr_signing.js";
 import { emitRestaurant } from "../realtime.js";
@@ -48,7 +48,7 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 	}
 	try {
 		const data = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
-			const [items, categories, profile, branding, posters] = await Promise.all([
+			const [items, categories, profile, branding, posters, variations] = await Promise.all([
 				GetMenuItems(slug),
 				GetMenuCategories(slug),
 				GetRestaurantProfile(slug),
@@ -65,10 +65,26 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 					logger.warn({ err, slug }, "qr_menu_posters_failed");
 					return [] as GuestPoster[];
 				}),
+				// Item variations (migration 039) — the price points a dish is sold
+				// at. DEGRADES TO NONE on any read failure, by the same argument the
+				// posters read above makes: an empty menu is a destroyed order, but
+				// "no variations" is precisely the menu every restaurant that has not
+				// configured any already gets, so it cannot be worth failing the whole
+				// page for. A tenant on an unapplied 039 lands here too — ListMenuVariations
+				// returns [] for a missing table rather than throwing.
+				ListMenuVariations(slug).catch((err: unknown) => {
+					logger.warn({ err, slug }, "qr_menu_variations_failed");
+					return [] as MenuVariationRecord[];
+				}),
 			]);
 			// Resolved once for the whole payload, so a dish can never disagree with
 			// the legend rendered above it.
 			const badgeCatalogue = branding.menu_badges ?? [];
+			// Grouped by dish ONCE, not looked up per item: a find() inside the map
+			// below would be a full scan of the outlet's variations for every dish on
+			// every guest page load. Also drops retired rows and lets at most one
+			// variation per dish claim is_default — see publicVariationsByItem.
+			const variationsByItem = publicVariationsByItem(variations);
 			return {
 				restaurant_name: profile?.restaurant_name ?? slug,
 				logo_url: branding.logo_url,
@@ -108,6 +124,14 @@ app.get("/qr/:slug/menu", async (req: Request, res: Response) => {
 				items: items.map((it) => ({
 					...it,
 					badges: resolveMenuBadges(badgeCatalogue, it.badges, it.allergens).map((b) => b.id),
+					// `variations` is SPREAD IN ONLY WHEN THE DISH HAS ANY —
+					// variationPayloadFor returns {} otherwise, never {variations: []}.
+					// That is what makes the absent-config guarantee literal rather than
+					// approximate: a restaurant that has configured no variations serves
+					// an items array byte-identical to the one it served before 039
+					// existed, the same rule `posters` follows below and `brand_config`
+					// follows above. jest-tests/menu_taxonomy.test.ts diffs it key by key.
+					...variationPayloadFor(it.id, variationsByItem),
 				})),
 				// OMITTED, not sent as [], when the restaurant has no poster showing
 				// today. That is the contract the tests pin: a tenant without posters
@@ -156,12 +180,22 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 			// Per-item note (e.g. "no onions") — optional, kept on the line item so
 			// the kitchen sees it. Customers can add a note to any item they order.
 			const itemNote = typeof it?.note === "string" ? it.note.trim().slice(0, 280) : "";
+			// The guest's chosen price point (migration 039). ONLY THE ID TRAVELS —
+			// never a client-sent variation price or label — and repriceFromMenu
+			// below re-resolves it against the live menu, refusing an id that names
+			// another dish's variation or a retired one and falling back to the
+			// dish's base price. So the worst a hostile payload achieves is being
+			// charged full price. Omitted when absent, which keeps the line this
+			// route builds identical to the one it built before 039 for every guest
+			// of every tenant with no variations configured.
+			const variationId = typeof it?.variation_id === "string" ? it.variation_id.trim().slice(0, 64) : "";
 			return {
 				id: String(it?.id ?? randomUUID()),
 				name: String(it?.name ?? "Item"),
 				price: Number(it?.price ?? 0) || 0,
 				quantity: Math.max(1, Math.round(Number(it?.quantity ?? 1) || 1)),
 				...(itemNote ? { note: itemNote } : {}),
+				...(variationId ? { variation_id: variationId } : {}),
 			};
 		})
 		.filter((it) => it.name.length > 0);

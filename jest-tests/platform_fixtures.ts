@@ -158,6 +158,8 @@ export interface MenuRow {
   description: string;
   sub_category: string | null;
   main_category: string | null;
+  /** Migration 039: the per-item group OVERRIDE. Null/absent = inherit the category's. */
+  group_id?: string | null;
 }
 
 /** One "Posters" row (migration 031) as the poster readers select it. The date
@@ -190,6 +192,32 @@ export interface MenuCategoryRow {
   name: string;
   /** Set on a sub-category, null on a main category. */
   main_cat_id: string | null;
+  /** Migration 039: the group every item under this MAIN category defaults to. */
+  group_id?: string | null;
+}
+
+/** One "MenuGroups" row (migration 039) — the revenue/production classification. */
+export interface MenuGroupRow {
+  id: string;
+  res_id: string;
+  outlet_id: string | null;
+  name: string;
+  kind: string;
+  active: boolean;
+  sort_order: number;
+}
+
+/** One "MenuVariations" row (migration 039) — a PRICE POINT of one dish. */
+export interface MenuVariationRow {
+  id: string;
+  res_id: string;
+  outlet_id: string | null;
+  menu_id: string;
+  name: string;
+  price: number;
+  is_default: boolean;
+  active: boolean;
+  sort_order: number;
 }
 
 export interface PlatformAdminRow { id: string; email: string; active: boolean }
@@ -239,6 +267,8 @@ interface Store {
   waitlists: WaitlistRow[];
   menuRows: MenuRow[];
   menuCats: MenuCategoryRow[];
+  menuGroups: MenuGroupRow[];
+  menuVariations: MenuVariationRow[];
   posters: PosterRow[];
   /** Every "Restaurant" INSERT throws 23505 — two callers racing the pre-check. */
   failRestaurantInsert: boolean;
@@ -288,6 +318,8 @@ function freshStore(): Store {
     waitlists: [],
     menuRows: [],
     menuCats: [],
+    menuGroups: [],
+    menuVariations: [],
     posters: [],
     failRestaurantInsert: false,
     failLoginInsert: false,
@@ -449,13 +481,16 @@ export function addMenuItem(over: { res_id: string; outlet_id: string | null; na
 function ensureFixtureMenuCategory(resId: string, outletId: string | null, name: string): void {
   const same = (c: MenuCategoryRow, mainCatId: string | null) =>
     c.res_id === resId && c.outlet_id === outletId && c.name.toLowerCase() === name.toLowerCase() && c.main_cat_id === mainCatId;
+  // UUID-SHAPED, because the real ids are: several 039 reads and writes refuse a
+  // malformed id with isUuid() before it reaches SQL, so a `maincat-1` fixture id
+  // would make the category-default assignment untestable for the wrong reason.
   let main = store.menuCats.find((c) => same(c, null));
   if (!main) {
-    main = { id: `maincat-${String(store.nextId++)}`, res_id: resId, outlet_id: outletId, name, main_cat_id: null };
+    main = { id: fixtureUuid(), res_id: resId, outlet_id: outletId, name, main_cat_id: null };
     store.menuCats.push(main);
   }
   if (!store.menuCats.some((c) => same(c, main.id))) {
-    store.menuCats.push({ id: `subcat-${String(store.nextId++)}`, res_id: resId, outlet_id: outletId, name, main_cat_id: main.id });
+    store.menuCats.push({ id: fixtureUuid(), res_id: resId, outlet_id: outletId, name, main_cat_id: main.id });
   }
 }
 
@@ -484,6 +519,64 @@ export function addPoster(over: Partial<PosterRow> & { res_id: string }): Poster
   return row;
 }
 export function posters(): PosterRow[] { return store.posters; }
+export function menuGroups(): MenuGroupRow[] { return store.menuGroups; }
+export function menuVariations(): MenuVariationRow[] { return store.menuVariations; }
+
+/**
+ * A uuid-SHAPED fixture id. Not a real uuid — deterministic, so a failing
+ * assertion names the same id every run — but it must satisfy the data layer's
+ * isUuid() guard, which several 039 reads use to refuse a malformed id before
+ * it reaches SQL. `menu-1`-style ids would be refused and the route would 404
+ * for the wrong reason.
+ */
+export function fixtureUuid(seed?: number): string {
+  const n = seed ?? store.nextId++;
+  const hex = n.toString(16).padStart(12, "0");
+  return `00000000-0000-4000-8000-${hex}`;
+}
+
+/** A menu group (migration 039). Defaults match the table's own. */
+export function addMenuGroup(over: Partial<MenuGroupRow> & { res_id: string }): MenuGroupRow {
+  const row: MenuGroupRow = {
+    id: over.id ?? fixtureUuid(),
+    res_id: over.res_id,
+    outlet_id: over.outlet_id ?? null,
+    name: over.name ?? "Beverage",
+    kind: over.kind ?? "revenue",
+    active: over.active !== false,
+    sort_order: over.sort_order ?? 0,
+  };
+  store.menuGroups.push(row);
+  return row;
+}
+
+/** A price point on one dish (migration 039). */
+export function addMenuVariation(over: Partial<MenuVariationRow> & { res_id: string; menu_id: string }): MenuVariationRow {
+  const row: MenuVariationRow = {
+    id: over.id ?? fixtureUuid(),
+    res_id: over.res_id,
+    outlet_id: over.outlet_id ?? null,
+    menu_id: over.menu_id,
+    name: over.name ?? "Half",
+    price: over.price ?? 0,
+    is_default: over.is_default === true,
+    active: over.active !== false,
+    sort_order: over.sort_order ?? 0,
+  };
+  store.menuVariations.push(row);
+  return row;
+}
+
+/**
+ * Put a group on a menu ITEM (the override) or a CATEGORY (the default),
+ * without going through the route — for seeding a tenant that is already
+ * classified.
+ */
+export function setFixtureGroupOnCategory(resId: string, outletId: string | null, categoryName: string, groupId: string | null): void {
+  const cat = store.menuCats.find((c) => c.res_id === resId && c.outlet_id === outletId
+    && c.name.toLowerCase() === categoryName.toLowerCase() && c.main_cat_id === null);
+  if (cat) { cat.group_id = groupId; }
+}
 
 /** Set (or clear) a tenant's queue pre-order menu rule the way the editor would.
  *  Null is the state EVERY production tenant is in — see queue_menu.ts. */
@@ -1151,6 +1244,186 @@ function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): unk
     store.menuCats.push(row);
     journal(() => { store.menuCats = store.menuCats.filter((x) => x !== row); });
     return [];
+  }
+
+  // --- Migration 039: menu groups + item variations ------------------------
+  //
+  // Modelled rather than stubbed because every claim this feature makes is a
+  // claim about THESE statements: that a guest with no variations gets the
+  // payload they got before, that a Half plate floors at the Half price on both
+  // order paths, and that an edit MERGES over the stored row instead of
+  // replacing it. A hand-rolled stand-in would prove none of them.
+
+  // ListMenuGroups (kind + active are folded into the text by the caller).
+  if (/^select id, outlet_id, name, kind, active, sort_order from "MenuGroups"\s+where res_id = \$1 and outlet_id = \$2/i.test(q.trim())) {
+    const [resId, outletId, kind] = params as [string, string | null, string | null];
+    const activeOnly = /active = true/.test(q);
+    return store.menuGroups
+      .filter((g) => g.res_id === resId && g.outlet_id === outletId
+        && (kind === null || g.kind === kind)
+        && (!activeOnly || g.active))
+      .slice()
+      .sort((x, y) => (x.kind === y.kind
+        ? (x.sort_order === y.sort_order ? x.name.toLowerCase().localeCompare(y.name.toLowerCase()) : x.sort_order - y.sort_order)
+        : x.kind.localeCompare(y.kind)))
+      .map((g) => ({ id: g.id, outlet_id: g.outlet_id, name: g.name, kind: g.kind, active: g.active, sort_order: g.sort_order }));
+  }
+  // GetMenuGroupById.
+  if (/^select id, outlet_id, name, kind, active, sort_order from "MenuGroups"\s+where id = \$1/i.test(q.trim())) {
+    const [id, resId, outletId] = params as [string, string, string | null];
+    const g = store.menuGroups.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    return g ? [{ id: g.id, outlet_id: g.outlet_id, name: g.name, kind: g.kind, active: g.active, sort_order: g.sort_order }] : [];
+  }
+  // UpsertMenuGroup. The real statement's arbiter is the case-insensitive
+  // (res_id, outlet_id, kind, name) unique index, so the fixture enforces it —
+  // a duplicate name has to behave like the index, not like an append.
+  if (/^insert into "MenuGroups"/i.test(q.trim())) {
+    const [id, resId, outletId, name, kind, active, sortOrder] =
+      params as [string, string, string | null, string, string, boolean, number];
+    const clash = store.menuGroups.find((g) => g.res_id === resId && g.outlet_id === outletId
+      && g.kind === kind && g.name.toLowerCase() === String(name).toLowerCase());
+    if (clash) {
+      const before = { ...clash };
+      journal(() => { Object.assign(clash, before); });
+      clash.name = name; clash.active = active; clash.sort_order = sortOrder;
+      return [{ id: clash.id, outlet_id: clash.outlet_id, name: clash.name, kind: clash.kind, active: clash.active, sort_order: clash.sort_order }];
+    }
+    const row: MenuGroupRow = { id, res_id: resId, outlet_id: outletId, name, kind, active, sort_order: sortOrder };
+    store.menuGroups.push(row);
+    journal(() => { store.menuGroups = store.menuGroups.filter((x) => x !== row); });
+    return [{ id: row.id, outlet_id: row.outlet_id, name: row.name, kind: row.kind, active: row.active, sort_order: row.sort_order }];
+  }
+  // UpdateMenuGroupById — a plain UPDATE, which is why a rename works here and
+  // would not through the upsert above.
+  if (/^update "MenuGroups"/i.test(q.trim())) {
+    const [id, resId, outletId, name, kind, active, sortOrder] =
+      params as [string, string, string | null, string, string, boolean, number];
+    const g = store.menuGroups.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    if (!g) { return []; }
+    const collides = store.menuGroups.some((x) => x !== g && x.res_id === resId && x.outlet_id === outletId
+      && x.kind === kind && x.name.toLowerCase() === String(name).toLowerCase());
+    if (collides) { throw Object.assign(new Error("duplicate key value violates unique constraint"), { code: "23505" }); }
+    const before = { ...g };
+    journal(() => { Object.assign(g, before); });
+    g.name = name; g.kind = kind; g.active = active; g.sort_order = sortOrder;
+    return [{ id: g.id, outlet_id: g.outlet_id, name: g.name, kind: g.kind, active: g.active, sort_order: g.sort_order }];
+  }
+  // SetMenuGroupAssignment — the item override and the category default.
+  if (/^update "Menu" set group_id = \$4/i.test(q.trim())) {
+    const [id, resId, outletId, groupId] = params as [string, string, string | null, string | null];
+    const m = store.menuRows.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    if (!m) { return []; }
+    const before = m.group_id ?? null;
+    journal(() => { m.group_id = before; });
+    m.group_id = groupId;
+    return [{ id: m.id }];
+  }
+  if (/^update "Menue_main_cat" set group_id = \$4/i.test(q.trim())) {
+    const [id, resId, outletId, groupId] = params as [string, string, string | null, string | null];
+    const c = store.menuCats.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId && x.main_cat_id === null);
+    if (!c) { return []; }
+    const before = c.group_id ?? null;
+    journal(() => { c.group_id = before; });
+    c.group_id = groupId;
+    return [{ id: c.id }];
+  }
+  // GetMenuGroupAssignments — the category half.
+  if (/^select mc\.id, mc\.name, g\.id as group_id, g\.name as group_name/i.test(q.trim())) {
+    const [resId, outletId, kind] = params as [string, string | null, string];
+    return store.menuCats
+      .filter((c) => c.res_id === resId && c.outlet_id === outletId && c.main_cat_id === null)
+      .slice()
+      .sort((x, y) => x.name.toLowerCase().localeCompare(y.name.toLowerCase()))
+      .map((c) => {
+        const g = store.menuGroups.find((x) => x.id === (c.group_id ?? "") && x.res_id === resId && x.outlet_id === outletId && x.kind === kind);
+        return { id: c.id, name: c.name, group_id: g ? g.id : null, group_name: g ? g.name : null };
+      });
+  }
+  // GetMenuAttributionIndex / GetMenuGroupAssignments — the item half. Both
+  // resolve item override -> category default with one coalesce; the assignment
+  // read additionally carries the raw override so an editor can tell them apart.
+  if (/coalesce\(gi\.id, gc\.id\)/i.test(q)) {
+    const [resId, outletId, kind] = params as [string, string | null, string];
+    const wantsOwn = /m\.group_id as own_group_id/i.test(q);
+    const rows = store.menuRows
+      .filter((m) => m.res_id === resId && m.outlet_id === outletId)
+      .slice();
+    if (wantsOwn) { rows.sort((x, y) => x.name.toLowerCase().localeCompare(y.name.toLowerCase())); }
+    return rows.map((m) => {
+      const own = store.menuGroups.find((x) => x.id === (m.group_id ?? "") && x.res_id === resId && x.outlet_id === outletId && x.kind === kind);
+      const cat = store.menuCats.find((c) => c.res_id === resId && c.outlet_id === outletId && c.main_cat_id === null
+        && c.name.toLowerCase() === String(m.main_category ?? "").toLowerCase());
+      const viaCat = store.menuGroups.find((x) => x.id === (cat?.group_id ?? "") && x.res_id === resId && x.outlet_id === outletId && x.kind === kind);
+      const resolved = own ?? viaCat ?? null;
+      return {
+        id: m.id, name: m.name,
+        ...(wantsOwn ? { own_group_id: m.group_id ?? null } : {}),
+        group_id: resolved ? resolved.id : null,
+        group_name: resolved ? resolved.name : null,
+      };
+    });
+  }
+  // ListMenuVariations (the optional menu_id filter and `active = true` are
+  // folded into the text by the caller, exactly as the real reader does).
+  if (/^select id, outlet_id, menu_id, name, price, is_default, active, sort_order\s+from "MenuVariations"\s+where res_id = \$1 and outlet_id = \$2/i.test(q.trim())) {
+    const [resId, outletId, menuId] = params as [string, string | null, string | null];
+    const activeOnly = /active = true/.test(q);
+    return store.menuVariations
+      .filter((v) => v.res_id === resId && v.outlet_id === outletId
+        && (menuId === null || v.menu_id === menuId)
+        && (!activeOnly || v.active))
+      .slice()
+      .sort((x, y) => (x.menu_id === y.menu_id
+        ? (x.sort_order === y.sort_order ? x.name.toLowerCase().localeCompare(y.name.toLowerCase()) : x.sort_order - y.sort_order)
+        : x.menu_id.localeCompare(y.menu_id)))
+      .map((v) => ({ ...v }));
+  }
+  // GetMenuVariationById.
+  if (/^select id, outlet_id, menu_id, name, price, is_default, active, sort_order\s+from "MenuVariations"\s+where id = \$1/i.test(q.trim())) {
+    const [id, resId, outletId] = params as [string, string, string | null];
+    const v = store.menuVariations.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    return v ? [{ ...v }] : [];
+  }
+  // UpsertMenuVariation. Enforces BOTH of 039's guards: the composite foreign
+  // key to (id, res_id, outlet_id) on "Menu" — which is what stops a variation
+  // pointing across a tenant — and the per-dish case-insensitive name index.
+  if (/^insert into "MenuVariations"/i.test(q.trim())) {
+    const [id, resId, outletId, menuId, name, price, isDefault, active, sortOrder] =
+      params as [string, string, string | null, string, string, number, boolean, boolean, number];
+    const dish = store.menuRows.find((m) => m.id === menuId && m.res_id === resId && m.outlet_id === outletId);
+    if (!dish) { throw Object.assign(new Error("insert or update violates foreign key constraint"), { code: "23503" }); }
+    const clash = store.menuVariations.find((v) => v.res_id === resId && v.outlet_id === outletId
+      && v.menu_id === menuId && v.name.toLowerCase() === String(name).toLowerCase());
+    if (clash) {
+      const before = { ...clash };
+      journal(() => { Object.assign(clash, before); });
+      clash.name = name; clash.price = price; clash.is_default = isDefault;
+      clash.active = active; clash.sort_order = sortOrder;
+      return [{ ...clash }];
+    }
+    const row: MenuVariationRow = {
+      id, res_id: resId, outlet_id: outletId, menu_id: menuId, name,
+      price, is_default: isDefault, active, sort_order: sortOrder,
+    };
+    store.menuVariations.push(row);
+    journal(() => { store.menuVariations = store.menuVariations.filter((x) => x !== row); });
+    return [{ ...row }];
+  }
+  // UpdateMenuVariationById. menu_id is deliberately NOT in the statement — a
+  // variation cannot be moved to another dish — so the fixture cannot move one
+  // either, which is the point.
+  if (/^update "MenuVariations"/i.test(q.trim())) {
+    const [id, resId, outletId, name, price, isDefault, active, sortOrder] =
+      params as [string, string, string | null, string, number, boolean, boolean, number];
+    const v = store.menuVariations.find((x) => x.id === id && x.res_id === resId && x.outlet_id === outletId);
+    if (!v) { return []; }
+    const collides = store.menuVariations.some((x) => x !== v && x.res_id === resId && x.outlet_id === outletId
+      && x.menu_id === v.menu_id && x.name.toLowerCase() === String(name).toLowerCase());
+    if (collides) { throw Object.assign(new Error("duplicate key value violates unique constraint"), { code: "23505" }); }
+    const before = { ...v };
+    journal(() => { Object.assign(v, before); });
+    v.name = name; v.price = price; v.is_default = isDefault; v.active = active; v.sort_order = sortOrder;
+    return [{ ...v }];
   }
 
   // --- The real menu upsert (UpsertMenuItem / SaveMenuItems) ---------------

@@ -3,6 +3,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { Audit_log_category, ClockIn, ClockOut, GetAttendanceSummary, GetMyAttendance, SetAttendanceApproval } from "../database_supabase.js";
+import { idempotent } from "../idempotency.js";
 import { logger } from "../observability.js";
 import { PERM_ATTENDANCE, enforcePermission, extractEmployeeId, extractRestaurantId, log_audit, validate } from "./_shared.js";
 
@@ -30,7 +31,7 @@ export function registerAttendanceRoutes(app: Express): void {
 app.post("/attendance/:id/approve", validate, (req: Request, res: Response) => void handleAttendanceReview(req, res, true));
 app.post("/attendance/:id/reject", validate, (req: Request, res: Response) => void handleAttendanceReview(req, res, false));
 
-app.post("/attendance/clock-in", validate, async (req: Request, res: Response) => {
+app.post("/attendance/clock-in", validate, idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	const employeeId = extractEmployeeId(req);
 	if (!restaurantId || !employeeId) { res.status(400).json({ error: "Missing identity" }); return; }
@@ -42,7 +43,7 @@ app.post("/attendance/clock-in", validate, async (req: Request, res: Response) =
 	catch (e: any) { logger.error({ err: e }, "clock_in_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to clock in") }); }
 });
 
-app.post("/attendance/clock-out", validate, async (req: Request, res: Response) => {
+app.post("/attendance/clock-out", validate, idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	const employeeId = extractEmployeeId(req);
 	if (!restaurantId || !employeeId) { res.status(400).json({ error: "Missing identity" }); return; }

@@ -72,6 +72,51 @@ silent-trading failure above returns.
 
 ---
 
+## `033_idempotency_keys.sql` — retry-safe writes
+
+**Apply before the build containing the `Idempotency-Key` header serves
+traffic** — and before any client is shipped that sends it.
+
+### What breaks without it
+
+`idempotency.ts` turns a client-generated `Idempotency-Key` into a promise: send
+the same key twice inside 48 hours and the second call replays the first
+response instead of applying the write again. Every part of that promise is
+enforced in SQL — a unique index on `("IdempotencyKeys".res_id, idem_key)`, the
+claim's `on conflict … where` takeover predicate, and two compare-and-swaps on
+`claim_token`.
+
+Without the table, all of it is inert. The guard catches `42P01`/`42501` and
+**fails open**: the request proceeds unguarded, exactly as it does today. That is
+the right trade at 8pm on a Friday — refusing `POST /orders` because a dedup
+table is missing stops a restaurant trading, which is worse than the duplicate
+being guarded against — but it means the failure is silent from the client's
+side. An offline outbox replaying its queue would apply every queued write
+twice: two dockets, two wastage deductions, two clock-ins.
+
+The one thing that is *not* silent is the log. The first occurrence in any
+10-minute window logs at error level:
+
+> `idempotency is OFF — "IdempotencyKeys" is unreadable (apply migration 033).`
+> `Writes proceed unguarded: a retried request applies twice.`
+
+Grep for `idempotency is OFF` after a deploy. It is the only symptom.
+
+### Why the normal pipeline already protects you
+
+Gates A and B below refuse a deploy while any migration is pending, so the
+ordinary path cannot reach this state. The degradation exists for the paths that
+bypass them — a hand-rolled container, a rollback to a database restored from
+before 033, a fresh tenant database seeded by hand.
+
+### Rollback
+
+Additive: one new table, its own indexes, its own RLS policy. Nothing else
+references it and no existing table is altered. Rolling the code back leaves the
+table unread; `drop table "IdempotencyKeys"` returns the backend to fail-open
+behaviour with no other effect. Live keys are lost, so writes in flight during
+the drop lose their dedup — do it between services, not during one.
+
 ## How CI enforces this
 
 Since the CI/CD pipeline landed, "apply migrations manually" is no longer a

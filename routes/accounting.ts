@@ -8,7 +8,7 @@ import { AddExpense, ArchiveReportSchedule, Audit_log_category, BuildTallyXml, C
 import { logger } from "../observability.js";
 import { renderGstCsv, renderSalesCsv, toCsv } from "../report_render.js";
 import { queueReportScheduleRun } from "../report_schedules.js";
-import { ACCOUNTING_PERM, extractEmployeeId, extractRestaurantId, log_audit, validateAction, windowQuery } from "./_shared.js";
+import { ACCOUNTING_PERM, counterIdFrom, extractEmployeeId, extractRestaurantId, log_audit, requireCounter, validateAction, windowQuery } from "./_shared.js";
 
 
 // Audit LABEL for scheduled-report changes, minted by migration 026. NEVER a
@@ -29,6 +29,40 @@ function reportRange(req: Request): { from?: string; to?: string } {
 		from: typeof req.query.from === "string" ? req.query.from : undefined,
 		to: typeof req.query.to === "string" ? req.query.to : undefined,
 	};
+}
+
+/**
+ * A CASH SESSION IS AN EVENT; A BILLING COUNTER IS AN IDENTITY (migration 038).
+ *
+ * "CashSessions" is one drawer counted once at the end of one shift — opening
+ * float, cash sales, variance, who opened and who closed. "BillingCounters" is
+ * the till itself: configured once, durable, there whether or not anyone is
+ * trading. The relationship is one-to-many, counter to sessions, which is why
+ * 038 put counter_id on BOTH "Bills" (which till RANG the sale) and
+ * "CashSessions" (which till was COUNTED) instead of cloning this table per
+ * counter — two tables that both meant "cash was counted" would diverge the
+ * first time a column was added to one of them.
+ *
+ * WHAT AN OMITTED COUNTER MEANS, AND WHY IT IS NOT `counter_id IS NULL`.
+ * Omitting it asks for THE OUTLET'S open drawer, which is what every existing
+ * screen has always asked for and what a single-till tenant means. The data
+ * layer's one-open-session guard therefore stays per-outlet when no counter is
+ * named and becomes per (outlet, counter) when one is, so a tenant that never
+ * touches counters sees byte-identical behaviour and a food court can run four
+ * open drawers at once.
+ *
+ * The till is read from the request the same way everywhere — body, then query,
+ * then the X-Counter-Id header a terminal sets once — so a device does not have
+ * to name itself twice.
+ */
+async function cashCounter(req: Request): Promise<string | null> {
+	const restaurantId = extractRestaurantId(req);
+	const counterId = counterIdFrom(req);
+	// Validated against the outlet's configured tills before a drawer is opened
+	// against it: a session on a counter that does not exist is a cash-up nobody
+	// can reconcile, and it would be discovered at the end of the shift.
+	if (counterId && restaurantId) { await requireCounter(restaurantId, counterId); }
+	return counterId;
 }
 
 export function registerExpenseRoutes(app: Express): void {
@@ -81,8 +115,8 @@ export function registerAccountingRoutes(app: Express): void {
 app.get("/cash/current", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	try { res.json({ session: await GetCurrentCashSession(restaurantId) }); }
-	catch (e) { logger.error({ err: e }, "cash_current_failed"); res.status(500).json({ error: "Unable to fetch cash session" }); }
+	try { res.json({ session: await GetCurrentCashSession(restaurantId, await cashCounter(req)) }); }
+	catch (e: any) { logger.error({ err: e }, "cash_current_failed"); res.status(500).json({ error: String(e?.message ?? "Unable to fetch cash session") }); }
 });
 
 app.post("/cash/open", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
@@ -93,8 +127,9 @@ app.post("/cash/open", validateAction(ACCOUNTING_PERM), async (req: Request, res
 		const session = await OpenCashSession(restaurantId, {
 			opening_float: Number(body.opening_float ?? 0) || 0,
 			openedBy: extractEmployeeId(req) ?? undefined,
+			counter_id: await cashCounter(req),
 		});
-		try { await log_audit(req, ACCOUNTING_PERM, `Opened cash session (float ${session.opening_float})`, Audit_log_category.Bill, { id: session.id }); } catch {/* ignore */}
+		try { await log_audit(req, ACCOUNTING_PERM, `Opened cash session (float ${session.opening_float})`, Audit_log_category.Bill, { id: session.id, counter_id: session.counter_id }); } catch {/* ignore */}
 		res.json(session);
 	} catch (e: any) { logger.error({ err: e }, "cash_open_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to open cash session") }); }
 });
@@ -111,8 +146,9 @@ app.post("/cash/close", validateAction(ACCOUNTING_PERM), async (req: Request, re
 			cash_payouts: Number(body.cash_payouts ?? 0) || 0,
 			notes: typeof body.notes === "string" ? body.notes : undefined,
 			closedBy: extractEmployeeId(req) ?? undefined,
+			counter_id: await cashCounter(req),
 		});
-		try { await log_audit(req, ACCOUNTING_PERM, `Closed cash session (variance ${session.variance})`, Audit_log_category.Bill, { id: session.id }); } catch {/* ignore */}
+		try { await log_audit(req, ACCOUNTING_PERM, `Closed cash session (variance ${session.variance})`, Audit_log_category.Bill, { id: session.id, counter_id: session.counter_id }); } catch {/* ignore */}
 		res.json(session);
 	} catch (e: any) { logger.error({ err: e }, "cash_close_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to close cash session") }); }
 });

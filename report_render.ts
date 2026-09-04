@@ -7,7 +7,7 @@
 // independent escaping implementations is how a comma in a vendor name turns into
 // a corrupted column six months later.
 
-import type { SalesReport, GstReport, ProfitAndLoss } from "./database_supabase.js";
+import type { SalesReport, GstReport, ProfitAndLoss, MisColumn } from "./database_supabase.js";
 
 export function toCsv(headers: string[], rows: (string | number)[][]): string {
   const esc = (v: string | number) => {
@@ -46,6 +46,63 @@ export function renderPnlCsv(r: ProfitAndLoss): string {
   ];
   for (const e of r.expenses_by_category) {rows.push([`Expense — ${e.category}`, e.amount]);}
   return toCsv(["Line", "Amount"], rows);
+}
+
+/**
+ * THE CSV FOR THE MIS / CONTROL REPORTS — one renderer for all nine.
+ *
+ * Driven by the SAME `columns` descriptor the API hands the screen, so the sheet
+ * an auditor opens has exactly the columns, the order and the TOTALS row they
+ * were looking at. Nine hand-written renderers would be nine chances for the
+ * export to drift from the screen, and an export that disagrees with the screen
+ * is the reason people stop trusting the export.
+ *
+ * THE TOTALS ROW IS DRIVEN BY THE PAYLOAD'S OWN `totals` OBJECT, not by summing
+ * the rows: a cell is filled when that object carries a value under the column's
+ * key, and left blank when it does not. That is the rule that gets both halves
+ * right at once —
+ *   * a column that must NEVER be summed ("% contribution", "Avg selling price",
+ *     "Spend per cover") has no key on the totals object, so it stays blank
+ *     instead of carrying a meaningless figure; and
+ *   * a column whose window-level value is real but is NOT a sum (ABV, APC,
+ *     covers — counted once per seating, so adding the rows would double a
+ *     split-billed party) is filled with the figure the report actually
+ *     computed, rather than being blanked for not looking summable.
+ * A totals row where nothing resolves is omitted entirely rather than emitted as
+ * a lone "Total,,,,,,". The first column holds the word "Total" because that is
+ * where a reader's eye goes.
+ *
+ * `null` / `undefined` render as an EMPTY field, never as the strings "null" or
+ * "0": a blank cell reads as "not recorded", which is what it means everywhere
+ * these reports use one (an unresolvable seating, a discount with no approver, a
+ * KOT number that cannot be tied to an order).
+ */
+export function renderMisCsv(
+  columns: readonly MisColumn[],
+  // `readonly object[]` rather than Record<string, unknown>[]: a TypeScript
+  // interface has no implicit index signature, so every one of the nine row
+  // types would need one (or a cast at every call site) to satisfy the stricter
+  // shape. The key lookup below is the single cast instead.
+  rows: readonly object[],
+  totals?: object | null,
+): string {
+  const cell = (v: unknown): string | number => {
+    if (v === null || v === undefined) {return "";}
+    if (typeof v === "number") {return Number.isFinite(v) ? v : "";}
+    if (typeof v === "boolean") {return v ? "Yes" : "No";}
+    // Only the primitives above are expected; anything else would stringify as
+    // "[object Object]" in a spreadsheet cell, which is worse than a blank.
+    return typeof v === "string" ? v : "";
+  };
+  const at = (o: object, key: string): unknown => (o as Record<string, unknown>)[key];
+  const body: (string | number)[][] = rows.map((r) => columns.map((c) => cell(at(r, c.key))));
+  if (totals) {
+    const t = totals;
+    const cells = columns.map((c, i) => (i === 0 ? "Total" : cell(at(t, c.key))));
+    // Nothing resolved: a lone "Total,,,,,," is noise on a sheet, not a total.
+    if (cells.some((v, i) => i > 0 && v !== "")) {body.push(cells);}
+  }
+  return toCsv(columns.map((c) => c.label), body);
 }
 
 export interface ReportArtifact {

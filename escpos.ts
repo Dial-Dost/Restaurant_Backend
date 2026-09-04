@@ -8,7 +8,37 @@
 const ESC = 0x1b;
 const GS = 0x1d;
 
-export interface ReceiptItem { name: string; quantity: number; price: number; note?: string; station?: string | null }
+export interface ReceiptItem {
+  name: string;
+  quantity: number;
+  price: number;
+  note?: string;
+  station?: string | null;
+  /**
+   * The price point sold, when the dish has any (migration 039) — "Half",
+   * "Large", "Bottle". Absent on every line of every restaurant that has
+   * configured no variations, which is what keeps their dockets and bills
+   * byte-identical to the ones printed before the feature existed.
+   *
+   * It is the label SNAPSHOTTED ON THE ORDER LINE, not the live one: paper is a
+   * record of what the guest was offered, and a variation renamed next month
+   * must not rewrite last month's bill. (A report prefers the live label — a
+   * different question, asked by a different reader. See attributeOrderLine.)
+   */
+  variation?: string | null;
+}
+
+/**
+ * What goes on the paper for one line: the dish, and the price point when there
+ * is one. ONE helper so the kitchen docket and the customer bill can never
+ * disagree about which thing was sold — a docket that says "Half" beside a bill
+ * that says only "Paneer Tikka" is how a ₹150 line gets queried at the till.
+ */
+function itemLabel(it: ReceiptItem): string {
+  const variation = String(it.variation ?? "").trim();
+  return variation ? `${it.name} (${variation})` : it.name;
+}
+
 export interface ReceiptTax { name: string; percentage: number; amount: number }
 
 /**
@@ -348,7 +378,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     for (const [idx, it] of opts.items.entries()) {
       const qty = Math.max(1, Math.round(Number(it.quantity) || 1));
       totalQty += qty;
-      const nameLines = wrapText(it.name, COL_ITEM - 1);
+      const nameLines = wrapText(itemLabel(it), COL_ITEM - 1);
       line(pad(`${idx + 1}`, COL_NO) + pad(nameLines[0] ?? "", COL_ITEM) + padL(String(qty), COL_QTY));
       // Continuations and notes hang under the ITEM column, so the No. and Qty
       // columns stay a clean vertical run down the docket.
@@ -377,7 +407,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     for (const it of opts.items) {
       const qty = Math.max(1, Math.round(Number(it.quantity) || 1));
       const price = Number(it.price) || 0;
-      const nameLines = wrapText(it.name, COL_ITEM - 1);
+      const nameLines = wrapText(itemLabel(it), COL_ITEM - 1);
       line(
         pad(nameLines[0] ?? "", COL_ITEM) +
         padL(String(qty), COL_QTY) +

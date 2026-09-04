@@ -3,6 +3,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { Audit_log_category, CallWaitlistEntry, CancelWaitlistEntry, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, GetPendingPreorders, GetPushSubscriptionsForWaitlist, GetWaitlist, RecordPushResult, SeatWaitlistEntry } from "../database_supabase.js";
+import { idempotent } from "../idempotency.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
 import { isPushConfigured, sendPush } from "../web_push.js";
@@ -42,7 +43,7 @@ app.get("/waitlist", validateAction(WAITLIST_PERM), async (req: Request, res: Re
 	catch (e) { logger.error({ err: e }, "waitlist_list_failed"); res.status(500).json({ error: "Unable to fetch waitlist" }); }
 });
 
-app.post("/waitlist/:id/call", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+app.post("/waitlist/:id/call", validateAction(WAITLIST_PERM), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
@@ -62,7 +63,7 @@ app.post("/waitlist/:id/call", validateAction(WAITLIST_PERM), async (req: Reques
 	} catch (e: any) { logger.error({ err: e }, "waitlist_call_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to call this party") }); }
 });
 
-app.post("/waitlist/:id/seat", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+app.post("/waitlist/:id/seat", validateAction(WAITLIST_PERM), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
@@ -101,7 +102,7 @@ app.get("/waitlist/pending-preorders", validateAction(WAITLIST_PERM), async (req
 
 // Staff-side twins of the guest pre-order actions. Same DB functions, same
 // idempotency — a waiter standing at the table can confirm on the guest's behalf.
-app.post("/waitlist/:id/preorder/confirm", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+app.post("/waitlist/:id/preorder/confirm", validateAction(WAITLIST_PERM), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
@@ -118,7 +119,7 @@ app.post("/waitlist/:id/preorder/confirm", validateAction(WAITLIST_PERM), async 
 	} catch (e: any) { logger.error({ err: e }, "waitlist_preorder_confirm_staff_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to confirm the pre-order") }); }
 });
 
-app.post("/waitlist/:id/preorder/decline", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+app.post("/waitlist/:id/preorder/decline", validateAction(WAITLIST_PERM), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
@@ -129,7 +130,7 @@ app.post("/waitlist/:id/preorder/decline", validateAction(WAITLIST_PERM), async 
 	} catch (e: any) { logger.error({ err: e }, "waitlist_preorder_decline_staff_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to update the pre-order") }); }
 });
 
-app.post("/waitlist/:id/cancel", validateAction(WAITLIST_PERM), async (req: Request, res: Response) => {
+app.post("/waitlist/:id/cancel", validateAction(WAITLIST_PERM), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;

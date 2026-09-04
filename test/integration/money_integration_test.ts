@@ -37,6 +37,15 @@ const {
   OccupyTable, AddOrder, DeleteOrder, ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin, RefundBill,
   UpsertCoupon, ApplyCouponToBill,
   ReleaseTable, GetSalesReport, SetBillDiscount,
+  // MIS data capture (migrations 034-039).
+  GetBillForTable, BarkOrder, SetOrderStatus,
+  MarkOrderItemNonChargeable, ReverseNonChargeable, GetNonChargeableEntries,
+  RecordOrderVoid, GetOrderVoidRecords,
+  WaiveServiceCharge, ReverseServiceChargeWaiver, GetServiceChargeWaivers,
+  RecordBillTenders, GetBillTenderState, VoidBillTender,
+  UpsertBillingCounter, ListBillingCounters, SetBillCounter,
+  UpsertMenuGroup, UpsertMenuVariation, SetMenuGroupAssignment,
+  GetMenuAttributionIndex, attributeOrderLine, UpsertMenuItem,
 } = db;
 
 const raw = new pg.Pool({ connectionString: DB, ssl: false, max: 3 });
@@ -77,7 +86,7 @@ async function main() {
     // T6 included: the release-without-payment section below occupies it, and a
     // missing table surfaces as "Table not found" from OccupyTable — which reads
     // like a product bug rather than a seed that is one row short.
-    tables: ["T1", "T2", "T3", "T4", "T5", "T6"].map((n) => ({ name: n, capacity: 4 })),
+    tables: ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12"].map((n) => ({ name: n, capacity: 4 })),
   });
   RES_ID = (await raw.query(`select id from "Restaurant" order by created_at desc limit 1`)).rows[0].id;
   console.log("seeded res_id:", RES_ID);
@@ -221,6 +230,457 @@ async function main() {
   check("DeleteOrder returns true on success", del === true);
   const stillThere = Number((await raw.query(`select count(*)::int n from "Orders" where id=$1`, [od.id])).rows[0].n);
   check("the deleted order row is gone", stillThere === 0);
+
+
+  // =========================================================================
+  // MIS DATA CAPTURE (migrations 034-039) — the money-critical halves, against
+  // the real database rather than against the pure functions alone.
+  // =========================================================================
+
+  // ---- 7) NON-CHARGEABLE: a comped line is not charged, and is recoverable --
+  console.log("\n[nc] a comped item comes out of the bill and stays counted");
+  // The control: the SAME order without the comped line at all.
+  await OccupyTable(RES_ID, "T7", 2, null, null);
+  await AddOrder(RES_ID, {
+    table: "T7", customer: "Control", status: "Preparing",
+    items: [ITEM("c1", "Tea", 50), ITEM("c2", "Cake", 80)], subtotal: 130, total: 130,
+  });
+  const control = await GetBillForTable(RES_ID, "T7");
+
+  await OccupyTable(RES_ID, "T8", 2, null, null);
+  const ncOrder = await AddOrder(RES_ID, {
+    table: "T8", customer: "Comped", status: "Preparing",
+    items: [ITEM("n1", "Tea", 50), ITEM("n2", "Cake", 80), ITEM("n3", "Barfi", 120)],
+    subtotal: 250, total: 250,
+  });
+  const beforeNc = await GetBillForTable(RES_ID, "T8");
+  check("the un-comped table is worth more than the control", beforeNc.grand_total > control.grand_total);
+
+  const nc = await MarkOrderItemNonChargeable(RES_ID, {
+    order_id: ncOrder.id, item_id: "n3", nc_kind: "guest_complaint",
+    reason: "dessert came out cold",
+    actor: { username: "waiter1", authorised_by_username: "manager1" },
+  });
+  check("the NC ledger row snapshots the loss at menu price x qty", nc.record.value === 120);
+  check("the NC row records who authorised it", nc.record.authorised_by_username === "manager1");
+
+  const afterNc = await GetBillForTable(RES_ID, "T8");
+  // THE HEADLINE ASSERTION: the bill with one NC item equals the bill without it.
+  check("BILL WITH AN NC ITEM === BILL WITHOUT THAT ITEM (pre-tax)",
+    Math.abs(afterNc.subtotal - control.subtotal) < 0.005);
+  check("...and at the grand total, through service charge and tax",
+    Math.abs(afterNc.grand_total - control.grand_total) < 0.005);
+  check("the comped value is separately recoverable off the bill", afterNc.nc_total === 120);
+  check("the comped line is still SHOWN on the bill, flagged",
+    afterNc.items.some((i: any) => i.nc === true && i.name === "Barfi"));
+  check("...and the chargeable lines are not merged into it",
+    afterNc.items.filter((i: any) => i.name === "Barfi").length === 1);
+
+  // THE OPEN BILL ROW MUST BE RE-SYNCED TOO, or the bill on screen and the bill
+  // in the database disagree until some unrelated edit happens to refresh it.
+  // A "Bills" row only exists once a bill has been generated / discounted /
+  // couponed / settled, so mint one deliberately (a discount does it) and then
+  // comp a second line against it.
+  const t8 = await tableId("T8");
+  await SetBillDiscount(RES_ID, "T8", "flat", 10);
+  const rowBeforeSecondComp = Number((await raw.query(
+    `select total_amt from "Bills" where res_id=$1 and table_id=$2 and closed_at is null order by created_at desc limit 1`,
+    [RES_ID, t8],
+  )).rows[0].total_amt);
+  const nc2 = await MarkOrderItemNonChargeable(RES_ID, {
+    order_id: ncOrder.id, item_id: "n2", nc_kind: "staff_meal",
+    reason: "shift meal for the chef",
+    actor: { username: "waiter1", authorised_by_username: "manager1" },
+  });
+  const rowAfterSecondComp = Number((await raw.query(
+    `select total_amt from "Bills" where res_id=$1 and table_id=$2 and closed_at is null order by created_at desc limit 1`,
+    [RES_ID, t8],
+  )).rows[0].total_amt);
+  check("comping a line RE-SYNCS the open bill row by exactly the comped value",
+    Math.abs((rowBeforeSecondComp - rowAfterSecondComp) - 80) < 0.005);
+  await ReverseNonChargeable(RES_ID, nc2.record.id, { reason: "wrong line", by_username: "manager1" });
+  const rowAfterReverse = Number((await raw.query(
+    `select total_amt from "Bills" where res_id=$1 and table_id=$2 and closed_at is null order by created_at desc limit 1`,
+    [RES_ID, t8],
+  )).rows[0].total_amt);
+  check("...and reversing it puts the same money back on the bill row",
+    Math.abs(rowAfterReverse - rowBeforeSecondComp) < 0.005);
+  await SetBillDiscount(RES_ID, "T8", "flat", 0);
+
+  // A CLIENT CANNOT COMP A DISH BY EDITING ITS OWN PAYLOAD. Re-post the order
+  // with nc:true on a line that has no ledger row behind it.
+  await AddOrder(RES_ID, {
+    table: "T8", id: ncOrder.id, customer: "Comped", status: "Preparing",
+    items: [
+      { id: "n1", name: "Tea", price: 50, quantity: 1, nc: true },
+      { id: "n2", name: "Cake", price: 80, quantity: 1 },
+      { id: "n3", name: "Barfi", price: 120, quantity: 1 },
+    ],
+    subtotal: 250, total: 250,
+  });
+  const afterForge = await GetBillForTable(RES_ID, "T8");
+  check("a client-supplied nc flag is STRIPPED — the tea is still charged",
+    !afterForge.items.some((i: any) => i.name === "Tea" && i.nc === true));
+  check("...while the SERVER's existing comp survives the same write",
+    afterForge.items.some((i: any) => i.name === "Barfi" && i.nc === true));
+  check("...so the bill is unchanged by the attempt",
+    Math.abs(afterForge.subtotal - afterNc.subtotal) < 0.005);
+
+  // Reversing puts the money back.
+  await ReverseNonChargeable(RES_ID, nc.record.id, { reason: "manager overruled", by_username: "manager1" });
+  const afterReverse = await GetBillForTable(RES_ID, "T8");
+  check("reversing a comp restores the charge",
+    Math.abs(afterReverse.subtotal - beforeNc.subtotal) < 0.005);
+  check("...and the bill carries no comped value any more", afterReverse.nc_total === 0);
+  const ncLedger = await GetNonChargeableEntries(RES_ID, "1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z");
+  check("the reversed row is KEPT, not deleted — the argument stays visible",
+    ncLedger.rows.some((r: any) => r.id === nc.record.id && r.reversed_at !== null));
+  check("a reversed comp contributes no money to the live NC total", ncLedger.total_value === 0);
+  check("...but its value is still reported as reversed", ncLedger.reversed_value === 200);
+
+  // ---- 8) SERVICE CHARGE WAIVER, in BOTH tax shapes ----------------------
+  console.log("\n[service charge] waiving works in both tax shapes");
+  const OUTLET_ID = (await raw.query(`select id from "Outlets" where res_id=$1 limit 1`, [RES_ID])).rows[0].id;
+  const setShapeB = async () => {
+    await raw.query(`update "Outlets" set default_tax = $2::json where id=$1`,
+      [OUTLET_ID, JSON.stringify({ SGST: 2.5, CGST: 2.5, "Service Charge": 10 })]);
+    await raw.query(`update "Restaurant" set service_charge = 0 where id=$1`, [RES_ID]);
+  };
+  const setShapeA = async () => {
+    await raw.query(`update "Outlets" set default_tax = $2::json where id=$1`,
+      [OUTLET_ID, JSON.stringify({ SGST: 2.5, CGST: 2.5 })]);
+    await raw.query(`update "Restaurant" set service_charge = 10 where id=$1`, [RES_ID]);
+  };
+
+  for (const [shape, apply, table] of [["b (tax line)", setShapeB, "T9"], ["a (Restaurant.service_charge)", setShapeA, "T10"]] as const) {
+    await apply();
+    await OccupyTable(RES_ID, table, 2, null, null);
+    await AddOrder(RES_ID, {
+      table, customer: "SC", status: "Preparing",
+      items: [ITEM(`sc-${table}`, "Thali", 2400)], subtotal: 2400, total: 2400,
+    });
+    const withSc = await GetBillForTable(RES_ID, table);
+    // WHERE THE CHARGE APPEARS DIFFERS BY SHAPE ON AN *OPEN* BILL, and this is
+    // pre-existing behaviour that these migrations deliberately do not change:
+    // computeBillCharges only knows about "Restaurant".service_charge, so in
+    // shape (b) the charge is still sitting inside `taxes` as the line it is
+    // configured as. (closedBillCharges lifts it out on the READ side of a
+    // SETTLED bill — see its header.) Either way it is money the guest owes, and
+    // either way the waiver has to remove it.
+    const scOnBill = (b: any) =>
+      Number(b.service_charge ?? 0)
+      + (b.taxes ?? []).filter((t: any) => /service\s*charge/i.test(String(t.name)))
+        .reduce((a: number, t: any) => a + Number(t.amount ?? 0), 0);
+    check(`shape ${shape}: the bill carries a service charge before the waiver`,
+      Math.abs(scOnBill(withSc) - 240) < 0.005);
+
+    const w = await WaiveServiceCharge(RES_ID, {
+      table_name: table, waiver_kind: "guest_request", reason: "guest asked for it to be removed",
+      actor: { username: "waiter1", authorised_by_username: "manager1" },
+    });
+    check(`shape ${shape}: the waiver records 10% of 2400`, w.record.amount_waived === 240);
+    check(`shape ${shape}: basis is named correctly`,
+      w.record.basis === (table === "T9" ? "tax_line" : "restaurant_percent"));
+    // Shape (a) also drops the GST that sat ON the charge; shape (b) cannot.
+    check(`shape ${shape}: tax_on_waived is ${table === "T9" ? "structurally 0" : "the tax that sat on the charge"}`,
+      table === "T9" ? w.record.tax_on_waived === 0 : w.record.tax_on_waived > 0);
+
+    const waived = await GetBillForTable(RES_ID, table);
+    check(`shape ${shape}: the bill now charges no service charge, in either place`,
+      scOnBill(waived) === 0);
+    check(`shape ${shape}: the bill says WHY it is zero`, waived.service_charge_waived === true);
+    check(`shape ${shape}: the grand total dropped by EXACTLY the recorded reduction`,
+      Math.abs((withSc.grand_total - waived.grand_total) - w.record.grand_total_reduction) < 0.005);
+    check(`shape ${shape}: the reported before/after match the bill view`,
+      Math.abs(w.grand_total_before - withSc.grand_total) < 0.005
+      && Math.abs(w.grand_total_after - waived.grand_total) < 0.005);
+
+    // THE WHOLE POINT: settling must charge the waived total, not the original.
+    const scOrderId = (await raw.query(
+      `select id from "Orders" where res_id=$1 and table_id=$2 order by created_at desc limit 1`,
+      [RES_ID, await tableId(table)],
+    )).rows[0].id;
+    await ConfirmBillPaymentByWaiter(RES_ID, scOrderId, "admin", "Cash");
+    const confirmedTotal = Number((await raw.query(
+      `select total_amt from "Bills" where res_id=$1 and table_id=$2 order by created_at desc limit 1`,
+      [RES_ID, await tableId(table)],
+    )).rows[0].total_amt);
+    check(`shape ${shape}: SETTLE CHARGES THE WAIVED TOTAL, not the original`,
+      Math.abs(confirmedTotal - waived.grand_total) < 0.005);
+    await ApproveBillPaymentByAdmin(RES_ID, scOrderId, "admin");
+  }
+  const waivers = await GetServiceChargeWaivers(RES_ID, "1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z");
+  check("both waivers are reportable", waivers.rows.length === 2 && waivers.total_waived === 480);
+
+  // ---- 9) TENDERS: a three-way split of an odd amount, end to end --------
+  console.log("\n[tenders] N payments must reconstruct the grand total exactly");
+  await setShapeB();
+  await OccupyTable(RES_ID, "T11", 3, null, null);
+  const tOrder = await AddOrder(RES_ID, {
+    table: "T11", customer: "Split", status: "Preparing",
+    items: [ITEM("t1", "Feast", 1000)], subtotal: 1000, total: 1000,
+  });
+  const tBill = await GetBillForTable(RES_ID, "T11");
+  const state0 = await GetBillTenderState(RES_ID, { table_name: "T11" });
+  check("an open bill starts fully outstanding",
+    state0.tenders.length === 0 && Math.abs(state0.outstanding - tBill.grand_total) < 0.005);
+
+  // A PARTIAL settlement is a legal state on an open bill.
+  await RecordBillTenders(RES_ID, {
+    table_name: "T11", settled_by_username: "cashier1",
+    tenders: [{ method: "Cash", amount: 100 }],
+  });
+  const statePartial = await GetBillTenderState(RES_ID, { table_name: "T11" });
+  check("a short tender on an OPEN bill is a partial settlement, not an error",
+    statePartial.partial === true && statePartial.exact === false);
+
+  // Over-tendering is refused: change is cash, not a tender.
+  let overRefused = false;
+  try {
+    await RecordBillTenders(RES_ID, {
+      table_name: "T11", settled_by_username: "cashier1",
+      tenders: [{ method: "Cash", amount: tBill.grand_total }],
+    });
+  } catch (e: any) { overRefused = /more than the bill/i.test(String(e?.message)); }
+  check("over-tendering is refused", overRefused);
+
+  // Finish it off in a three-way split whose parts must land on the paisa.
+  const remaining = statePartial.outstanding;
+  const third = Math.floor((remaining / 3) * 100) / 100;
+  const last = Math.round((remaining - third * 2) * 100) / 100;
+  const full = await RecordBillTenders(RES_ID, {
+    table_name: "T11", settled_by_username: "cashier1", require_full: true,
+    tenders: [
+      { method: "Card", amount: third, txn_ref: "auth-1", tip_amount: 50, tip_mode: "card", tip_credited_to_username: "waiter1" },
+      { method: "Upi", amount: third, txn_ref: "rrn-2" },
+      { method: "Cash", amount: last },
+    ],
+  });
+  check("the four tenders reconstruct the grand total EXACTLY", full.exact === true && full.outstanding === 0);
+  check("the tip is recorded on top of the bill, not inside it", full.tips_total === 50);
+  check("the compatibility mirror says Split", full.payment_method === "Split");
+  const mirrored = (await raw.query(
+    `select payment_method, payment_splits::text as ps from "Bills" where res_id=$1 and table_id=$2 order by created_at desc limit 1`,
+    [RES_ID, await tableId("T11")],
+  )).rows[0];
+  check("Bills.payment_method / payment_splits were mirrored for every existing reader",
+    String(mirrored.payment_method) === "Split" && String(mirrored.ps).includes("Card"));
+  const mirroredSum = JSON.parse(String(mirrored.ps)).reduce((a: number, p: any) => a + Number(p.amount), 0);
+  check("the mirrored splits sum back to the bill total",
+    Math.abs(mirroredSum - tBill.grand_total) < 0.005);
+
+  // Voiding one tender of a settled split leaves the bill short. TWO guards can
+  // catch that and either is a correct refusal: the pre-existing payment_splits
+  // check (the mirror is rewritten by the void, so the parts no longer add up)
+  // and the tender assertion added for migration 037. Assert the REFUSAL, not
+  // which guard won — pinning the message would make this test fail the day the
+  // order of two correct checks changes.
+  await VoidBillTender(RES_ID, full.tenders.filter((t: any) => t.voided_at === null)[0].id,
+    { reason: "keyed twice", by_username: "manager1" });
+  let settleRefused = false;
+  try { await ApproveBillPaymentByAdmin(RES_ID, tOrder.id, "admin"); }
+  catch (e: any) { settleRefused = /recorded tenders add up|split payment no longer matches/i.test(String(e?.message)); }
+  check("settling a bill whose tenders no longer add up is refused", settleRefused);
+  const stillOpen = Number((await raw.query(
+    `select count(*)::int n from "Bills" where res_id=$1 and table_id=$2 and closed_at is null`,
+    [RES_ID, await tableId("T11")],
+  )).rows[0].n);
+  check("...and the bill is still open", stillOpen === 1);
+
+  // DEFENCE 2 ON ITS OWN. A SINGLE short tender leaves payment_splits empty, so
+  // the pre-existing split check does not fire at all and only the tender
+  // assertion stands between a partially-paid bill and a closed_at. This is the
+  // case migration 037's header says the deferred database trigger cannot see:
+  // the tenders were written in one transaction and the close happens in a later
+  // one that never touches "BillTenders".
+  await OccupyTable(RES_ID, "T12", 2, null, null);
+  const shortOrder = await AddOrder(RES_ID, {
+    table: "T12", customer: "Short", status: "Preparing",
+    items: [ITEM("s1", "Platter", 800)], subtotal: 800, total: 800,
+  });
+  await RecordBillTenders(RES_ID, {
+    table_name: "T12", settled_by_username: "cashier1",
+    tenders: [{ method: "Cash", amount: 100 }],
+  });
+  await ConfirmBillPaymentByWaiter(RES_ID, shortOrder.id, "admin", "Cash");
+  let defence2 = false;
+  try { await ApproveBillPaymentByAdmin(RES_ID, shortOrder.id, "admin"); }
+  catch (e: any) { defence2 = /recorded tenders add up/i.test(String(e?.message)); }
+  check("SETTLING A SHORT-TENDERED BILL IS REFUSED (defence 2, in code)", defence2);
+  const t12Open = Number((await raw.query(
+    `select count(*)::int n from "Bills" where res_id=$1 and table_id=$2 and closed_at is null`,
+    [RES_ID, await tableId("T12")],
+  )).rows[0].n);
+  check("...and that bill is still open too", t12Open === 1);
+
+  // Paying the rest lets it settle — the guard blocks a short bill, not every bill.
+  const owed = (await GetBillTenderState(RES_ID, { table_name: "T12" })).outstanding;
+  await RecordBillTenders(RES_ID, {
+    table_name: "T12", settled_by_username: "cashier1", require_full: true,
+    tenders: [{ method: "Upi", amount: owed }],
+  });
+  await ApproveBillPaymentByAdmin(RES_ID, shortOrder.id, "admin");
+  check("once the balance is tendered the same bill settles", await billClosed("T12"));
+
+  // ---- 10) VOID STAGE, derived at each of the three stages ---------------
+  console.log("\n[void] the stage is derived from server-held facts, not self-reported");
+  const voidActor = { username: "waiter1", authorised_by_username: "manager1" };
+
+  // before_print: rung up, never barked, no bill on the table.
+  await OccupyTable(RES_ID, "T4", 2, null, null);
+  const vBefore = await AddOrder(RES_ID, {
+    table: "T4", customer: "V1", status: "Preparing",
+    items: [ITEM("v1", "Soup", 90)], subtotal: 90, total: 90,
+  });
+  const rBefore = await RecordOrderVoid(RES_ID, {
+    order_id: vBefore.id, void_kind: "wrong_entry", reason: "wrong table", actor: voidActor,
+  });
+  check("stage before_print when nothing was barked and no bill exists", rBefore.stage === "before_print");
+  check("...and the evidence is honestly empty", Object.keys(rBefore.stage_evidence).length === 0);
+  check("...and the voided value was snapshotted", rBefore.value_voided === 90);
+  await SetOrderStatus(RES_ID, vBefore.id, "Cancelled");
+
+  // after_print: the expo barked it to the kitchen.
+  const vPrint = await AddOrder(RES_ID, {
+    table: "T4", customer: "V2", status: "Preparing",
+    items: [ITEM("v2", "Naan", 60)], subtotal: 60, total: 60,
+  });
+  await BarkOrder(RES_ID, vPrint.id, "expo");
+  const rPrint = await RecordOrderVoid(RES_ID, {
+    order_id: vPrint.id, void_kind: "kitchen_error", reason: "burnt", actor: voidActor,
+  });
+  check("stage after_print once the order was barked to the kitchen", rPrint.stage === "after_print");
+  check("...and the bark instant is the evidence", typeof (rPrint.stage_evidence as any).barked_at === "string");
+  await SetOrderStatus(RES_ID, vPrint.id, "Cancelled");
+
+  // after_bill: a bill exists on the table. THE FRAUD SIGNAL.
+  await OccupyTable(RES_ID, "T5", 2, null, null);
+  const vBill = await AddOrder(RES_ID, {
+    table: "T5", customer: "V3", status: "Preparing",
+    items: [ITEM("v3", "Biryani", 340)], subtotal: 340, total: 340,
+  });
+  await BarkOrder(RES_ID, vBill.id, "expo");
+  // Applying a discount mints the bill row — i.e. the guest has a bill.
+  await SetBillDiscount(RES_ID, "T5", "percent", 5);
+  const rBill = await RecordOrderVoid(RES_ID, {
+    order_id: vBill.id, void_kind: "other", reason: "guest walked out", actor: voidActor,
+  });
+  check("stage after_bill once a bill exists — and it OUTRANKS the bark",
+    rBill.stage === "after_bill");
+  check("...and the bill is named in the evidence, re-checkable",
+    typeof (rBill.stage_evidence as any).bill_id === "string"
+    && typeof (rBill.stage_evidence as any).barked_at === "string");
+
+  // A double-tapped void keeps the FIRST reason.
+  const rAgain = await RecordOrderVoid(RES_ID, {
+    order_id: vBill.id, void_kind: "duplicate", reason: "double tap", actor: voidActor,
+  });
+  check("a repeated void returns the existing record rather than overwriting the reason",
+    rAgain.id === rBill.id && rAgain.reason === "guest walked out");
+
+  const voids = await GetOrderVoidRecords(RES_ID, "1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z");
+  check("all three stages are reportable, with their money",
+    voids.by_stage.before_print.count === 1
+    && voids.by_stage.after_print.count === 1
+    && voids.by_stage.after_bill.count === 1);
+
+  // An unauthorised void is refused outright — the whole point of the control.
+  let unauthorised = false;
+  try {
+    await RecordOrderVoid(RES_ID, {
+      order_id: vBefore.id, void_kind: "other", reason: "no approver",
+      actor: { username: "waiter1", authorised_by_username: "" },
+    });
+  } catch (e: any) { unauthorised = /authoriser/i.test(String(e?.message)); }
+  check("a void with no authoriser is refused", unauthorised);
+
+  // ---- 11) COUNTERS + MENU GROUPS/VARIATIONS -----------------------------
+  console.log("\n[counters/menu] tills, groups and variations");
+  const counter = await UpsertBillingCounter(RES_ID, { code: "C1", name: "Counter 1", kind: "counter" });
+  check("a counter is created", counter.code === "C1" && counter.active === true);
+  const sameCode = await UpsertBillingCounter(RES_ID, { code: "c1", name: "Renamed" });
+  check("the same code in a different case UPDATES rather than duplicating",
+    sameCode.id === counter.id && (await ListBillingCounters(RES_ID)).length === 1);
+  const t11Bill = (await raw.query(
+    `select id from "Bills" where res_id=$1 and table_id=$2 order by created_at desc limit 1`,
+    [RES_ID, await tableId("T11")],
+  )).rows[0].id;
+  check("a bill can be attributed to the till that rang it",
+    await SetBillCounter(RES_ID, t11Bill, counter.id));
+
+  const group = await UpsertMenuGroup(RES_ID, { name: "Beverage", kind: "revenue" });
+  const dish = await UpsertMenuItem(RES_ID, { id: "", name: "Masala Chai", price: 60, category: "Hot Drinks" });
+  const menuRow = (await raw.query(
+    `select id, name, main_cat_id from "Menu" where res_id=$1 and id=$2 limit 1`, [RES_ID, dish.id],
+  )).rows[0];
+  await SetMenuGroupAssignment(RES_ID, { main_cat_id: menuRow.main_cat_id }, group.id);
+  const variation = await UpsertMenuVariation(RES_ID, { menu_id: menuRow.id, name: "Half", price: 35 });
+  await UpsertMenuVariation(RES_ID, { menu_id: menuRow.id, name: "Full", price: 60, is_default: true });
+  const index = await GetMenuAttributionIndex(RES_ID, "revenue");
+
+  // A line written SINCE 039 carries menu_id and attributes to its group — which
+  // is inherited from the CATEGORY here, not set on the item.
+  const stamped = attributeOrderLine({ id: "x", name: menuRow.name, menu_id: menuRow.id }, index);
+  check("a stamped line attributes to its category's group",
+    stamped.group_name === "Beverage" && stamped.source === "stamped");
+  check("its variation resolves too",
+    attributeOrderLine({ id: "x", name: menuRow.name, menu_id: menuRow.id, variation_id: variation.id }, index)
+      .variation_name === "Half");
+
+  // A PRE-039 line — no menu_id, a re-minted uuid — still reports, by name.
+  const legacy = attributeOrderLine({ id: randomUUID(), name: menuRow.name }, index);
+  check("a pre-039 line still attributes, by name",
+    legacy.menu_id === menuRow.id && legacy.source === "legacy_name");
+  check("...and never gains a variation it never had", legacy.variation_id === null);
+  check("an off-menu line reports Unclassified, never a nearest match",
+    attributeOrderLine({ id: "x", name: "Valet Fee" }, index).group_name === "Unclassified");
+
+  // THE MONEY-CRITICAL HALF OF 039: the price floor must use the VARIATION's
+  // price, not the base item's, or a Half plate is silently billed as a Full one.
+  await OccupyTable(RES_ID, "T2", 2, null, null);
+  const varOrder = await AddOrder(RES_ID, {
+    table: "T2", customer: "Half", status: "Preparing",
+    items: [{ id: menuRow.id, name: "Masala Chai", price: 35, quantity: 1, variation_id: variation.id }],
+    subtotal: 35, total: 35,
+  });
+  const varFood = (await raw.query(`select food::jsonb as f from "Orders" where id=$1`, [varOrder.id])).rows[0].f;
+  check("a Half at 35 is NOT floored up to the 60 base price",
+    Number(varFood.items[0].price) === 35);
+  check("the line was stamped with its menu id, server-side",
+    String(varFood.items[0].menu_id) === String(menuRow.id));
+  check("...and with the variation it was sold as",
+    String(varFood.items[0].variation_id) === String(variation.id)
+    && String(varFood.items[0].variation_name) === "Half");
+  check("the bill charges the variation price", Number(varFood.subtotal) === 35);
+
+  // ...while a line naming NO variation still floors against the base price, as
+  // it always has. An under-rung line is still refused.
+  const baseOrder = await AddOrder(RES_ID, {
+    table: "T2", customer: "Half", status: "Preparing",
+    items: [{ id: randomUUID(), name: "Masala Chai", price: 1, quantity: 1 }],
+    subtotal: 1, total: 1,
+  });
+  const baseFood = (await raw.query(`select food::jsonb as f from "Orders" where id=$1`, [baseOrder.id])).rows[0].f;
+  const rung = (baseFood.items as any[]).find((i: any) => Number(i.price) !== 35);
+  check("a line with no variation is still floored to the MENU price (1 -> 60)",
+    Number(rung.price) === 60);
+  check("...and it is stamped too, so old and new lines report the same way",
+    String(rung.menu_id) === String(menuRow.id) && rung.variation_id === undefined);
+
+  // ---- 12) EVERY PRE-034 ORDER IS UNCHANGED -------------------------------
+  console.log("\n[compat] orders written before these migrations are untouched");
+  const legacyBlobs = Number((await raw.query(
+    `select count(*)::int n from "Orders"
+      where res_id=$1 and (food::jsonb ? 'nc_subtotal')`, [RES_ID],
+  )).rows[0].n);
+  check("only the orders that were actually comped carry an nc_subtotal key", legacyBlobs === 0);
+  const noNcFlags = Number((await raw.query(
+    `select count(*)::int n from "Orders" o,
+            lateral jsonb_array_elements(case when jsonb_typeof(o.food::jsonb -> 'items') = 'array'
+                                              then o.food::jsonb -> 'items' else '[]'::jsonb end) it
+      where o.res_id=$1 and (it ? 'nc')`, [RES_ID],
+  )).rows[0].n);
+  check("no order line carries a stray nc flag after the reversal", noNcFlags === 0);
 
   console.log(`\n✓ ALL ${passed} integration assertions passed`);
 }

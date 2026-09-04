@@ -4,6 +4,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableSections, GetTableStatus, GetTables, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction } from "../database_supabase.js";
+import { idempotent } from "../idempotency.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
 import { AUDIT_TABLE_UPDATED, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
@@ -640,7 +641,7 @@ app.delete("/table/:name", validateAction("5777c4aa-29df-4ea1-9c45-c1038d25f746"
 });
 
 // Occupy a table (mark as occupied and set number of covers)
-app.post("/occupy-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+app.post("/occupy-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -672,7 +673,7 @@ app.post("/occupy-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085")
 });
 
 // Update number of covers at a table
-app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });
@@ -714,7 +715,7 @@ app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"
 });
 
 // Release/unoccupy a table
-app.post("/release-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+app.post("/release-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
 		res.status(400).json({ error: "Missing restaurantId" });

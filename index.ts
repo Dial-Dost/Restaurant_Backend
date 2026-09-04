@@ -11,6 +11,7 @@ import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatfor
 import { registerPlatformRoutes } from "./platform/routes.js";
 import { closeRealtime, initRealtime } from "./realtime.js";
 import { runReportScheduleSweep } from "./report_schedules.js";
+import { runIdempotencyReaperSweep } from "./idempotency.js";
 import { runPrintJobReaperSweep } from "./print_jobs.js";
 import { extractBearerToken, isAllOutletsSentinel, normalizeRole, rawRequestedOutletId, sendDueBookingReminders } from "./routes/_shared.js";
 import { registerGuestOrderingRoutes, registerGuestWaitlistAndPaymentRoutes, registerGuestBrandingRoute } from "./routes/guest.js";
@@ -22,7 +23,7 @@ import { registerCustomerCreateRoute, registerCustomerQueryRoutes } from "./rout
 import { registerTableRoutes, registerTableListRoute } from "./routes/tables.js";
 import { registerBookingCreateRoute, registerBookingListRoute, registerBookingStatusRoute, registerBookingTableAndCancelRoutes, registerBookingRangeRoute } from "./routes/bookings.js";
 import { registerValetInfoRoute, registerValetRoutes } from "./routes/valet.js";
-import { registerBillRoutes, registerBillPaymentRoutes, registerBillPrintAndEditRoutes, registerBillOpsRoutes } from "./routes/bills.js";
+import { registerBillRoutes, registerBillPaymentRoutes, registerBillPrintAndEditRoutes, registerBillOpsRoutes, registerTenderRoutes } from "./routes/bills.js";
 import { registerRestaurantLogoRoutes, registerSettingsRoutes, registerRestaurantProfileReadRoute, registerRestaurantProfileWriteRoute } from "./routes/settings.js";
 import { registerAuditRoutes } from "./routes/audit.js";
 import { registerInventoryRoutes, registerInventoryMovementRoutes, registerInventoryDeleteRoute, registerInventoryCategoryRenameRoute } from "./routes/inventory.js";
@@ -51,6 +52,9 @@ import { registerGuestFeedbackRoutes, registerFeedbackAdminRoutes } from "./rout
 import { registerUserRoutes } from "./routes/users.js";
 import { registerSimulationRoutes } from "./routes/simulation.js";
 import { registerPosterRoutes } from "./routes/posters.js";
+import { registerMisCaptureRoutes } from "./routes/mis_capture.js";
+import { registerMisReportRoutes } from "./routes/reports_mis.js";
+import { registerMenuTaxonomyRoutes } from "./routes/menu_taxonomy.js";
 
 initObservability();
 const app = express();
@@ -169,6 +173,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
 
 	req.auth = {
 		employeeId: session.employeeId,
+		employeeUsername: session.employeeUsername,
 		res_id: session.res_id,
 		outlet_id: effectiveOutlet,
 		role: normalizedRole,
@@ -248,12 +253,18 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 		// Custom tenant headers sent cross-origin by the guest feedback form
 		// (X-Restaurant-Id / X-Employee-Id / X-Outlet-Id) must be preflight-allowed
 		// or the browser blocks the request before it reaches the handler.
-		"Content-Type,Authorization,X-Outlet-Id,X-Restaurant-Id,X-Employee-Id,X-Restaurant-Username",
+		// Idempotency-Key is the retry-safety key (idempotency.ts). It MUST be
+		// listed here or the browser fails the preflight and the dashboard's keyed
+		// writes never leave the tab — the Flutter app, which does no preflight,
+		// would keep working and the breakage would look web-only.
+		"Content-Type,Authorization,X-Outlet-Id,X-Restaurant-Id,X-Employee-Id,X-Restaurant-Username,Idempotency-Key",
 	);
 	// Paging metadata on list endpoints (audit logs, closed bills) travels in
 	// headers so the response body can stay the shape existing clients expect.
 	// Without this a browser hides them from fetch() even on a same-tenant call.
-	res.header("Access-Control-Expose-Headers", "X-Total-Count,X-Has-More");
+	// Idempotent-Replay tells a caller its write was already applied and this is
+	// the stored answer — hidden from fetch() without the expose header.
+	res.header("Access-Control-Expose-Headers", "X-Total-Count,X-Has-More,Idempotent-Replay");
 	res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 	if (req.method === "OPTIONS") {
 		res.sendStatus(204);
@@ -429,6 +440,25 @@ registerUserRoutes(app);
 registerFeedbackAdminRoutes(app);
 registerSimulationRoutes(app);
 registerPosterRoutes(app);
+// The MIS / control reports (Insights -> Reports). Registered LAST, and every
+// one of its paths is a literal under /reports/mis/, so it can neither shadow
+// nor be shadowed by the accounting /reports/* routes registered far above.
+registerMisReportRoutes(app);
+// The MIS CAPTURE writes (non-chargeable, order voids, service-charge waivers).
+// These are the control ledgers the reports above read; without them the reports
+// are permanently empty, so an unregistered file here is a silent no-op.
+registerMisCaptureRoutes(app);
+// TENDERS, TIPS AND BILLING COUNTERS (migrations 037/038). Registered after
+// everything else so no earlier pattern can swallow /bills/tenders,
+// /bills/counter, /billing-counters or /tips, and so none of them can shadow a
+// bill route that already exists — every path here is a literal.
+registerTenderRoutes(app);
+// Menu groups + item variations (migration 039). Registered last, beside the
+// other 039 surface: every path is a literal under /menu-groups,
+// /menu-group-assignments or /menu-variations, none of which any earlier pattern
+// can match, so its position cannot shadow or be shadowed by anything above —
+// including the /menu/* routes it sits conceptually next to.
+registerMenuTaxonomyRoutes(app);
 
 
 
@@ -702,6 +732,46 @@ async function bootstrap(): Promise<void> {
 		logger.info("✅ Print job reaper armed");
 	} else {
 		logger.info("Print job reaper disabled (PRINT_JOB_REAPER=false)");
+	}
+
+	// Idempotency-key reaper: delete keys past their 48h window.
+	//
+	// PURE HYGIENE, and more obviously so than the print reaper above: the claim
+	// statement refuses to honour an expired row at READ time
+	// (ClaimIdempotencyKey's takeover predicate), so a database whose sweep never
+	// runs still applies every key exactly once. All this buys is a bounded table.
+	//
+	// HOURLY, not 15-minutely like the print reaper, and that gap is deliberate:
+	// every sweep here opens one tenant connection per tenant against a 15-slot
+	// session pooler, and the 2026-08-24 standstill is what that budget looks like
+	// when it runs out. Nothing is late by an hour that matters — the window is
+	// two days.
+	//
+	// Same replica posture as the sweeps above: no leader lock exists on the
+	// tenant pool and none is needed, because the DELETE is idempotent and two
+	// replicas racing it converge. The flag only stops one slow sweep stacking on
+	// the next tick.
+	if (process.env.IDEMPOTENCY_REAPER !== "false") {
+		let idemReaperRunning = false;
+		const idemReaperSweep = async () => {
+			if (idemReaperRunning) {return;}
+			idemReaperRunning = true;
+			try {
+				await runIdempotencyReaperSweep();
+			} catch (err) {
+				logger.warn({ err }, "idempotency_reaper_failed");
+			} finally {
+				idemReaperRunning = false;
+			}
+		};
+		const idemReaperTimer = setInterval(
+			() => void idemReaperSweep(),
+			Math.max(1, Number(process.env.IDEMPOTENCY_REAPER_INTERVAL_MIN) || 60) * 60_000,
+		);
+		idemReaperTimer.unref?.();
+		logger.info("✅ Idempotency key reaper armed");
+	} else {
+		logger.info("Idempotency key reaper disabled (IDEMPOTENCY_REAPER=false)");
 	}
 
 	// Graceful shutdown: Railway (and most platforms) send SIGTERM on deploy. Drain

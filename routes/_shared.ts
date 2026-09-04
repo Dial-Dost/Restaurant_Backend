@@ -16,7 +16,7 @@ import { z } from "zod";
 import { destroyAllForEmployee } from "../auth/sessions.js";
 import { getStore } from "../auth/store.js";
 import type { CustomerDemographics } from "../database_supabase.js";
-import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
+import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import type { ReportWindowQuery } from "../report_window.js";
@@ -114,6 +114,13 @@ export function normalizeRole(rawRole: unknown): AppRole | null {
 
 interface AuthContext {
 	employeeId: string;
+	// The login username from the VERIFIED session (SessionPayload.employeeUsername),
+	// never from the body — the 034/035/036 control ledgers store it as
+	// marked_by/voided_by/waived_by, and a client that could name its own actor
+	// could sign a comp as the manager. Optional because a session minted before
+	// this field existed carries none; extractEmployeeUsername then returns null
+	// and the route refuses rather than writing an identity it cannot stand behind.
+	employeeUsername?: string;
 	res_id: string;
 	outlet_id: string;
 	role: AppRole;
@@ -193,6 +200,21 @@ export function extractRestaurantUsername(req: Request): string | null {
 
 export function extractEmployeeId(req: Request): string | null {
 	return req.auth?.employeeId ?? null;
+}
+
+/**
+ * The signed-in user's LOGIN USERNAME, from the verified session only.
+ *
+ * This is what the 034/035/036 ledgers store as `marked_by` / `voided_by` /
+ * `waived_by`, so it must never be readable from the body: a client that could
+ * name its own actor could sign a comp as the manager. Returns null (rather than
+ * a display name or the employee id) when the session carries none, so the route
+ * refuses instead of writing an identity it cannot stand behind.
+ */
+export function extractEmployeeUsername(req: Request): string | null {
+	const raw = req.auth?.employeeUsername;
+	const name = typeof raw === "string" ? raw.trim() : "";
+	return name.length > 0 ? name : null;
 }
 
 export async function enforceRoles(
@@ -289,6 +311,33 @@ export const PERM_TABLE_SECTIONS = "2f7c5a94-8e13-4b60-9d27-6a0f3c8e5b41"; // Ma
 // 023 landed. Audit titles render from "Actions".action_name, so without this row
 // every move and capacity edit was filed under "Table Added" and was unfindable.
 export const AUDIT_TABLE_UPDATED = "526c6b48-4036-4d0d-b617-b34acba3a1d2"; // Table Updated (Tables)
+
+// --- MIS CAPTURE (migrations 034/035/036) — the three MANAGER acts -----------
+//
+// Each of these three is BOTH the permission gate AND the audit action id, the
+// same double duty PERM_ORDER_DELETE does. That is not a shortcut: "Audit_logs"
+// has a foreign key to "Actions", audit titles render from
+// "Actions".action_name, and the Bill Edit report prefilters on action id
+// (BILL_EDIT_ACTION_IDS in mis_report_math.ts). Reusing 4ad474d4… ("Add
+// Orders") — the catch-all every floor write already files under — would have
+// filed a comp under "Add Orders" and left the report guessing from reason text.
+//
+// WHY THEY ARE SEPARATE FROM EVERYTHING THAT EXISTS. Marking a dish
+// non-chargeable, voiding a rung-up order and taking the service charge off a
+// bill each REDUCE what a guest pays. None of them may ride on a permission a
+// waiter already holds: 4ad474d4… ("Add Orders") is held by waiter, captain and
+// cashier alike, so gating a comp on it would mean every waiter can comp their
+// own friend's table and sign for it themselves. They are also separate from
+// EACH OTHER, because a restaurant that lets a floor manager comp a dessert does
+// not necessarily let them waive a 10% service charge on a ₹40,000 bill.
+//
+// Seeded as grantable "Actions" rows by ensureFeaturePermissionActions() and
+// granted to the core `manager` role (admin passes on "*"). See the module
+// header of routes/mis_capture.ts for how the SECOND name — the authoriser — is
+// checked against these same three ids.
+export const PERM_NON_CHARGEABLE = "b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472"; // Mark Items Non-Chargeable (Bills)
+export const PERM_VOID_ORDER = "c1f83b26-5a97-4e40-b8d3-7e02a9c4f156"; // Void Orders With Reason (Orders)
+export const PERM_SERVICE_CHARGE_WAIVER = "d5a06e73-9c41-4b28-8f6a-1b74d3e08c95"; // Waive Service Charge (Bills)
 
 // Permission gate for a specific granted Action. Admin (actions include "*")
 // always passes; any role granted this action UUID passes; everyone else 403.
@@ -525,6 +574,56 @@ export async function refuseGuestWriteIfClosed(res: Response, resId: string): Pr
 	if (await restaurantAcceptsGuestWrites(resId)) {return false;}
 	res.status(404).json({ error: "Restaurant not found" });
 	return true;
+}
+
+/**
+ * THE TILL THIS REQUEST WAS RUNG ON (migration 038), or null for "the outlet's
+ * single till" — which is what every existing bill and every existing cash
+ * session is, and what every tenant that never configures a counter keeps being.
+ *
+ * `X-Counter-Id` is the primary source, and it is the reason counters never had
+ * to be threaded through the settle SIGNATURES: a terminal sets the header once
+ * and every request it makes carries it, so which device rang a sale is a
+ * property of the REQUEST rather than of the money path. An explicit
+ * `counter_id` in the body wins, for the shared till that has to be named per
+ * call; `?counter_id=` serves the GETs, which have no body.
+ *
+ * Body over query over header, because that is increasing order of how
+ * deliberate the caller was: a header is ambient configuration, a query string
+ * is a screen's current scope, a body field is this one act.
+ */
+export function counterIdFrom(req: Request): string | null {
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const fromBody = typeof body.counter_id === "string" ? body.counter_id.trim() : "";
+	if (fromBody) {return fromBody;}
+	const q = req.query?.counter_id;
+	const fromQuery = Array.isArray(q) ? q[0] : q;
+	if (typeof fromQuery === "string" && fromQuery.trim().length > 0) {return fromQuery.trim();}
+	const header = req.headers["x-counter-id"];
+	const raw = Array.isArray(header) ? header[0] : header;
+	return typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : null;
+}
+
+/**
+ * Check a counter id against the outlet's configured tills BEFORE any money
+ * moves. Throws, so callers surface it as the same 400 every other money route
+ * returns.
+ *
+ * INACTIVE COUNTERS COUNT AS FOUND. Migration 038 deactivates rather than
+ * deletes precisely so the attribution on every bill a till ever rang survives
+ * it, and a terminal whose counter was retired mid-shift must still be able to
+ * take the payment in front of it — refusing here would stop a settle with a
+ * guest standing at the counter, over a configuration change.
+ *
+ * A counter id from ANOTHER outlet is not found, because ListBillingCounters is
+ * outlet-scoped: attributing this outlet's bill to another outlet's till would
+ * make both cash-ups wrong at once.
+ */
+export async function requireCounter(restaurantId: string, counterId: string): Promise<void> {
+	const counters = await ListBillingCounters(restaurantId, { includeInactive: true });
+	if (!counters.some((c) => c.id === counterId)) {
+		throw new Error(`No billing counter with id ${counterId} is configured for this outlet`);
+	}
 }
 
 // Clamp a client-supplied ?limit= to a sane range so a huge/negative value can't

@@ -39,6 +39,19 @@ export interface KotKeyItem {
   name: string;
   quantity: number;
   note?: string | null;
+  /**
+   * The price point sold (migration 039). Part of the fingerprint for the same
+   * reason `note` is: "Paneer Tikka, Half" is a different instruction to the
+   * kitchen than "Paneer Tikka, Full", and without it a table whose Half was
+   * swapped for a Full at the same quantity would hash identically and the
+   * second docket would print the FIRST ticket's number, marked as a reprint.
+   *
+   * Absent on every line of every restaurant with no variations configured, and
+   * the field is appended to the signature ONLY when it is non-empty — so every
+   * such ticket keys to exactly the hash it keyed to before this existed, and a
+   * reprint across the deploy that ships 039 still finds the number on paper.
+   */
+  variation?: string | null;
 }
 
 /**
@@ -89,7 +102,12 @@ export function kotTicketKey(input: {
     .map((it) => {
       // The renderer's own floor: a KOT line is never for less than one.
       const qty = Math.max(1, Math.round(it.quantity) || 1);
-      return `${norm(it.name)}${FIELD}${String(qty)}${FIELD}${norm(it.note)}`;
+      // APPENDED ONLY WHEN PRESENT, never as a trailing empty field: adding one
+      // unconditionally would change the hash of every ticket in the fleet on
+      // the deploy that shipped it, and the first reprint of every live table
+      // would burn a second KOT number for a docket already on paper.
+      const variation = norm(it.variation);
+      return `${norm(it.name)}${FIELD}${String(qty)}${FIELD}${norm(it.note)}${variation ? FIELD + variation : ""}`;
     })
     .sort()
     .join(ITEM);

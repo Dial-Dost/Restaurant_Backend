@@ -38,11 +38,88 @@ import {
   computeBillCharges,
   computeCouponDiscount,
   computeBillSplit,
+  // MIS data capture (migrations 034-039). The money rules live in
+  // billing_math.ts beside computeBillCharges, deliberately — see mis_capture.ts's
+  // header for why the classification rules live somewhere else.
+  chargeableSubtotal,
+  nonChargeableValue,
+  isNonChargeableLine,
+  orderLinePrice,
+  orderLineQuantity,
+  quoteServiceChargeWaiver,
+  reconcileTenders,
+  tenderAmountsTowardBill,
+  allocateTenderAmounts,
+  toPaisa,
+  // Migration 039. The ONE rule both order-write paths floor a line with, so a
+  // Half plate cannot be ₹150 to a guest and ₹250 to a waiter.
+  anyLineNamesVariation,
+  resolveLinePriceFloor,
   type BillTaxLine,
   type BillDiscount,
+  type ServiceChargeWaiverQuote,
+  type TenderReconciliation,
+  type VariationPriceRef,
 } from "./billing_math.js";
 // Re-exported so existing importers of these from "./database_supabase.js" keep working.
 export { round2, computeBillTaxes, computeBillCharges, computeCouponDiscount, computeBillSplit } from "./billing_math.js";
+export {
+  chargeableSubtotal, nonChargeableValue, isNonChargeableLine,
+  quoteServiceChargeWaiver, reconcileTenders, tenderAmountsTowardBill, allocateTenderAmounts,
+  anyLineNamesVariation, resolveLinePriceFloor,
+} from "./billing_math.js";
+export type { ServiceChargeWaiverQuote, TenderReconciliation, VariationPriceRef } from "./billing_math.js";
+// Migration 039's EDITING and SHAPING rules (menu groups + item variations).
+// Re-exported here for the same reason billing_math and mis_capture are: routes
+// and tests import the pure rules from the data layer rather than reaching past
+// it, so there is one import surface and no second copy of a rule.
+export {
+  MENU_TAXONOMY_NAME_MAX, MENU_TAXONOMY_SORT_MAX, MENU_TAXONOMY_SORT_MIN,
+  mergeMenuGroupPatch, mergeMenuVariationPatch,
+  publicVariationsByItem, variationPayloadFor,
+} from "./menu_taxonomy.js";
+export type {
+  MenuGroupWrite, MenuVariationWrite, MergeResult, PublicMenuVariation,
+  StoredMenuGroup, StoredMenuVariation,
+} from "./menu_taxonomy.js";
+import type { MenuGroupWrite, MenuVariationWrite } from "./menu_taxonomy.js";
+import {
+  NON_CHARGEABLE_KINDS,
+  VOID_KINDS,
+  SERVICE_CHARGE_WAIVER_KINDS,
+  TIP_MODES,
+  COUNTER_KINDS,
+  MENU_GROUP_KINDS,
+  UNCLASSIFIED_GROUP,
+  attributeOrderLine,
+  buildMenuAttributionIndex,
+  deriveVoidStage,
+  normalizeReason,
+  normalizeVocabulary,
+  type CounterKind,
+  type MenuAttributionIndex,
+  type MenuAttributionRow,
+  type MenuGroupKind,
+  type NonChargeableKind,
+  type OrderLineAttribution,
+  type ServiceChargeWaiverKind,
+  type TipMode,
+  type VoidKind,
+  type VoidStage,
+} from "./mis_capture.js";
+// Same re-export pattern as billing_math/brand_theme: routes and tests import the
+// vocabularies and the pure resolvers from here rather than reaching past the
+// data layer for them.
+export {
+  NON_CHARGEABLE_KINDS, VOID_KINDS, SERVICE_CHARGE_WAIVER_KINDS, TIP_MODES,
+  COUNTER_KINDS, MENU_GROUP_KINDS, UNCLASSIFIED_GROUP,
+  attributeOrderLine, buildMenuAttributionIndex, deriveVoidStage,
+} from "./mis_capture.js";
+export type {
+  CounterKind, MenuAttributionIndex, MenuAttributionRow, MenuGroupKind,
+  NonChargeableKind, OrderLineAttribution, ServiceChargeWaiverKind, TipMode,
+  VoidKind, VoidStage,
+} from "./mis_capture.js";
 import {
   BRAND_CLEARABLE_ENUM_KEYS,
   BRAND_COLOR_KEYS,
@@ -110,11 +187,56 @@ import {
   DEFAULT_REPORT_DAYS,
   MAX_REPORT_DAYS,
   addDaysToKey,
+  countDays,
   dateKeyInZone,
   resolveReportWindow,
   type ReportWindowQuery,
   type ResolvedReportWindow,
 } from "./report_window.js";
+// The MIS / control reports' money ladder and the pure rules they share. Kept in
+// their own module for the billing_math.ts reason: jest proves every rung, the
+// discount reconstruction, the settlement allocation, the period-on-period
+// arithmetic and the bill-edit classifier without standing up a pg pool. The
+// nine readers at the bottom of this file are the only consumers.
+import {
+  BILL_EDIT_ACTION_IDS,
+  UNALLOCATED_METHOD,
+  UNATTRIBUTED_GROUP,
+  addToLadder,
+  allocateSettlement,
+  attributionBucket,
+  averageBillValue,
+  classifyBillEdit,
+  composeBillMoney,
+  formatMethodSplit,
+  growthPct,
+  humaniseVocabulary,
+  liveMoney,
+  orderChannel,
+  perCover,
+  previousWindow,
+  serviceChargeBasisLabel,
+  sharePct,
+  zeroLadder,
+  type BillEditKind,
+  type BillMoney,
+  type LadderTotals,
+  type SettlementPart,
+} from "./mis_report_math.js";
+export {
+  BILL_EDIT_ACTION_IDS,
+  UNALLOCATED_METHOD,
+  UNATTRIBUTED_GROUP,
+  attributionBucket,
+  billDiscountMoney,
+  classifyBillEdit,
+  formatMethodSplit,
+  humaniseVocabulary,
+  liveMoney,
+  previousWindow,
+  serviceChargeBasisLabel,
+} from "./mis_report_math.js";
+export type { BillEditKind, BillMoney, LadderTotals } from "./mis_report_math.js";
 // Re-exported so existing importers (report_schedules.ts) keep reaching the day
 // arithmetic through the data layer. The implementations MOVED to the pure
 // module so a jest suite can prove inclusivity and the timezone boundary without
@@ -181,7 +303,13 @@ export const CORE_ROLES = {
   // "2e7b9c40…" = Review Attendance: managers previously reached GET /attendance
   // via an admin/manager role check; now that the attendance endpoints are gated
   // by that granted Action, keep managers' access by granting them the UUID here.
-  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd", "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63"],
+  // The three MIS-capture manager acts (migrations 034/035/036): comp a dish,
+  // void an order with a reason, waive a service charge. Deliberately NOT given
+  // to cashier/captain/waiter — each REDUCES what a guest pays, and an approval
+  // the person doing it can grant themselves is not an approval. A tenant that
+  // wants a senior cashier to comp grants the UUID to a custom role; that is what
+  // the grantable "Actions" rows in ensureFeaturePermissionActions() are for.
+  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd", "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63", "b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472", "c1f83b26-5a97-4e40-b8d3-7e02a9c4f156", "d5a06e73-9c41-4b28-8f6a-1b74d3e08c95"],
 };
 
 export enum Audit_log_category {
@@ -702,6 +830,21 @@ export interface OrderItemRecord {
   // until it is fired; firing stamps fired_at and clears the hold.
   course_hold?: boolean;
   fired_at?: string | null;
+  /**
+   * The price point this line was sold at (migration 039) — the "MenuVariations"
+   * id, and the label snapshotted when the line was priced.
+   *
+   * Surfaced on the orders read because THE KITCHEN HAS TO KNOW: a KDS card that
+   * says "Paneer Tikka" for a line the guest ordered Half is a wrong plate, and
+   * the orders grid is where a captain checks what was rung in. Read-only — the
+   * server stamps both in applyMenuPriceFloor / repriceFromMenu and never takes
+   * either from a client.
+   *
+   * BOTH KEYS ARE OMITTED, not sent as null, on a line that names no variation —
+   * so GET /orders for a tenant that has configured none is unchanged.
+   */
+  variation_id?: string;
+  variation?: string;
 }
 
 export interface OrderRecord {
@@ -3348,7 +3491,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; taxes: BillTaxLine[]; tax_total: number; grand_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -3423,8 +3566,9 @@ export async function GetBillForTable(
   // Aggregate the placed line items (merged by name + price) for the bill view.
   // Per-item notes are carried through (distinct notes joined) so the kitchen/
   // waiter sees any special instructions on the bill.
-  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string }>();
+  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string }>();
   let billCustomer = "";
+  let ncTotal = 0;
   for (const o of orderRows) {
     const f = parseJsonObject(o.food) ?? {};
     // Use the first non-empty, non-placeholder customer name for the bill header.
@@ -3439,13 +3583,41 @@ export async function GetBillForTable(
       const price = parseNumeric(it.price);
       const quantity = Math.max(1, Math.round(parseNumeric(it.quantity) || 1));
       const note = String(it.note ?? "").trim();
-      const key = `${name.toLowerCase()}@@${price}`;
+      const nc = isNonChargeableLine(it);
+      if (nc) {ncTotal = round2(ncTotal + price * quantity);}
+      // NON-CHARGEABLE IS PART OF THE MERGE KEY (migration 034). Without it, one
+      // comped dessert and two paid ones of the same dish collapse into a single
+      // "Gulab Jamun x3" line, and the printed bill then either charges for all
+      // three or none of them — while `total` (which comes from the blob's
+      // chargeable subtotal) says something different again. Keeping them apart
+      // is what lets the bill print "x2" beside the price and "x1 — NC" beside
+      // zero, adding up to the amount actually charged.
+      // THE VARIATION IS PART OF THE MERGE KEY TOO (migration 039), and for the
+      // same reason `nc` is: a Half and a Full of one dish are two things sold,
+      // and a bill that collapses them into one "Paneer Tikka x2" can only print
+      // ONE price beside it — so it would either overcharge for the Half or
+      // undercharge for the Full. They differ in price today, which already
+      // separates them here; keying on the label as well means two price points
+      // that happen to cost the same still print as the two lines they are.
+      //
+      // The LABEL is the one snapshotted on the line by applyMenuPriceFloor /
+      // repriceFromMenu, because this is the PRINTING path: what the guest is
+      // handed must say what the guest was offered, even after the variation is
+      // later renamed. (Reports prefer the live label — see attributeOrderLine.)
+      // Absent on every line of every tenant that has configured none, so the
+      // key and the item are byte-identical to what they were.
+      const variation = String(it.variation_name ?? "").trim();
+      const key = `${name.toLowerCase()}@@${price}@@${nc ? "nc" : ""}@@${variation.toLowerCase()}`;
       const existing = itemMap.get(key);
       if (existing) {
         existing.quantity += quantity;
         if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
       } else {
-        itemMap.set(key, { name, price, quantity, note: note || undefined });
+        itemMap.set(key, {
+          name, price, quantity, note: note || undefined,
+          ...(nc ? { nc: true as const, nc_kind: String(it.nc_kind ?? "") || undefined } : {}),
+          ...(variation ? { variation } : {}),
+        });
       }
     }
   }
@@ -3457,11 +3629,10 @@ export async function GetBillForTable(
   const tableApc = covers > 0 ? round2(total / covers) : 0;
 
   // Apply the optional service charge + the outlet's taxes to get the grand total.
-  const taxRows = await runQuery<{ default_tax: any }>(
-    `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
-    [context.outlet_id, context.res_id],
-  );
-  const scPct = await getServiceChargePercent(context.res_id);
+  // openBillChargeConfig is the ONE place the two service-charge shapes and any
+  // live waiver (migration 036) are resolved, so this view and the settle paths
+  // can never disagree about what the guest owes.
+  const chargeCfg = await openBillChargeConfig(context, tableId);
   const discount = await getOpenBillDiscount(context, tableId);
   const {
     discount: discountAmount,
@@ -3472,7 +3643,7 @@ export async function GetBillForTable(
     taxes,
     tax_total,
     grand_total,
-  } = computeBillCharges(total, taxRows[0]?.default_tax ?? null, scPct, true, discount);
+  } = computeBillCharges(total, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, discount);
   const bill = billRows[0];
   const paymentStatus = bill == null
     ? null
@@ -3512,9 +3683,22 @@ export async function GetBillForTable(
     discount_value: discountValue,
     service_charge,
     service_charge_percent,
+    // Migration 036. `service_charge` above is ALREADY 0 when a waiver is live —
+    // openBillChargeConfig removed the charge before computeBillCharges ran — so
+    // these two exist to let the bill say WHY it is zero rather than leaving the
+    // guest and the waiter to work it out. The printed bill must read this: a
+    // reprint that recomputes the charge itself would hand the guest a second,
+    // higher total than the one on screen.
+    service_charge_waived: chargeCfg.waiver !== null,
+    service_charge_waiver: chargeCfg.waiver,
     taxes,
     tax_total,
     grand_total,
+    // Migration 034: the menu value of everything comped on this table. NOT part
+    // of `subtotal`/`grand_total` (that is the entire point of a non-chargeable),
+    // carried so the bill can print it as a visible "given away" line instead of
+    // the food simply not appearing.
+    nc_total: ncTotal,
     covers,
     apc: tableApc,
     order_ids: orderRows.map((row) => row.id),
@@ -7866,7 +8050,19 @@ export async function ensureFeaturePermissionActions(): Promise<void> {
          -- riding on 'Table Added'. Moving a table BETWEEN existing sections is
          -- everyday floor work and deliberately stays on 'Table Added' — see
          -- PERM_TABLE_SECTIONS in index.ts.
-         ('2f7c5a94-8e13-4b60-9d27-6a0f3c8e5b41', 'Manage Table Sections', 'Create, rename and remove floor sections (zones). Moving a table into an EXISTING section stays under Table Added.', 'Tables'::"Action_groups")
+         ('2f7c5a94-8e13-4b60-9d27-6a0f3c8e5b41', 'Manage Table Sections', 'Create, rename and remove floor sections (zones). Moving a table into an EXISTING section stays under Table Added.', 'Tables'::"Action_groups"),
+         -- MIS capture (migrations 034/035/036). Each is BOTH the route's gate and
+         -- its audit action id, so these rows are load-bearing twice over:
+         -- "Audit_logs".action_id has a foreign key to this table, so without them
+         -- every comp/void/waiver audit write would fail with a 23503, and the
+         -- Bill Edit report joins "Actions" for the label it renders.
+         --
+         -- Each ALSO names the authoriser it will accept: ResolveAuthoriser
+         -- checks the second name against the SAME id, so granting one of these
+         -- to a role is granting both "may do it" and "may sign for it".
+         ('b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472', 'Mark Items Non-Chargeable', 'Comp a dish (complimentary, staff meal, spoilage, tasting, guest complaint, promo) off what the guest pays, and reverse one. Also names who may AUTHORISE a comp.', 'Bills'::"Action_groups"),
+         ('c1f83b26-5a97-4e40-b8d3-7e02a9c4f156', 'Void Orders With Reason', 'Cancel a rung-up order with a recorded reason and authoriser. Also names who may AUTHORISE a void.', 'Orders'::"Action_groups"),
+         ('d5a06e73-9c41-4b28-8f6a-1b74d3e08c95', 'Waive Service Charge', 'Take the service charge off an open bill with a recorded reason and authoriser, and put it back. Also names who may AUTHORISE a waiver.', 'Bills'::"Action_groups")
        on conflict (id) do nothing`,
     ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
   });
@@ -9417,6 +9613,8 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       station: stationById.get(String(entry.id ?? "")) ?? stationByName.get(name.trim().toLowerCase()) ?? null,
       course_hold: entry.course_hold === true,
       fired_at: typeof entry.fired_at === "string" && entry.fired_at ? entry.fired_at : null,
+      ...(typeof entry.variation_id === "string" && entry.variation_id.trim() ? { variation_id: entry.variation_id.trim() } : {}),
+      ...(typeof entry.variation_name === "string" && entry.variation_name.trim() ? { variation: entry.variation_name.trim() } : {}),
     };
   };
 
@@ -11789,10 +11987,17 @@ export async function AddOrder(
   let itemsSplitForStore: unknown = undefined;
   if (Array.isArray(order.items) && order.items.length > 0 && Array.isArray(order.items[0]) && typeof (order.items[0] as any)[0] === 'string' && Array.isArray((order.items[0] as any)[1])) {
     // tuple format
-    itemsSplitForStore = order.items;
-    itemsForStore = (order.items as any[]).flatMap((t) => Array.isArray(t[1]) ? t[1] : []);
+    // Migration 034: the nc* keys are SERVER-OWNED and are stripped off every
+    // client-supplied line here (see stripClientNonChargeable). A tuple that is
+    // not the [label, items[]] shape is passed through untouched rather than
+    // normalised into an empty one — this path already tolerates malformed
+    // legacy payloads and quietly discarding their contents would be a data loss
+    // introduced by a fraud control.
+    itemsSplitForStore = (order.items as any[]).map((t) =>
+      (Array.isArray(t) && Array.isArray(t[1])) ? [t[0], stripClientNonChargeable(t[1])] : t);
+    itemsForStore = (itemsSplitForStore as any[]).flatMap((t) => (Array.isArray(t) && Array.isArray(t[1])) ? t[1] : []);
   } else {
-    itemsForStore = Array.isArray(order.items) ? order.items : [];
+    itemsForStore = stripClientNonChargeable(Array.isArray(order.items) ? order.items : []);
   }
 
   // If this is an update to an existing order (upsert) and caller provided a legacy items array,
@@ -11925,11 +12130,22 @@ export async function AddOrder(
   // The stored subtotal/total is the PRE-TAX base every bill builds on
   // (sumOrderTotalsForTable), so derive it from the priced lines rather than
   // echoing whatever the client claimed.
-  const pricedSubtotal = round2(
-    (itemsForStore as unknown[]).reduce((acc: number, raw) => {
-      const it = parseJsonObject(raw) ?? {};
-      return acc + parseNumeric(it.price) * Math.max(1, parseNumeric(it.quantity) || 1);
-    }, 0),
+  //
+  // NON-CHARGEABLE LINES ARE OUT OF IT (migration 034). chargeableSubtotal is
+  // byte-identical to the reduction this used to inline whenever no line carries
+  // an `nc` flag — which is every order ever written before 034 — so adopting it
+  // changes nothing for existing data. When a line IS comped, this is the one
+  // place a later item-add would otherwise silently re-charge it: the merge above
+  // preserves the server's stored nc flag (`{ ...prev }`), and this reduction
+  // then keeps honouring it instead of rebuilding the subtotal at full price.
+  const pricedSubtotal = chargeableSubtotal(
+    (itemsForStore as unknown[]).map((raw) => (parseJsonObject(raw) ?? {}) as { price?: unknown; quantity?: unknown; nc?: unknown }),
+  );
+  // The revenue given away on this order, carried alongside so the bill view and
+  // the printed bill can show it without re-reading the NC ledger. Derived, never
+  // client-supplied, and always exactly (full value - pricedSubtotal).
+  const ncSubtotal = nonChargeableValue(
+    (itemsForStore as unknown[]).map((raw) => (parseJsonObject(raw) ?? {}) as { price?: unknown; quantity?: unknown; nc?: unknown }),
   );
 
   // "Barked" step: new orders always arrive UN-barked — the expo barks them to
@@ -11956,6 +12172,10 @@ export async function AddOrder(
     taken_by_employee_role: takenByEmployeeRoleRaw || null,
     items: itemsForStore,
     subtotal: pricedSubtotal,
+    // Migration 034. Omitted entirely when nothing is comped, so an order blob
+    // written on a tenant that never uses NC is unchanged byte-for-byte from
+    // before this feature existed.
+    ...(ncSubtotal > 0 ? { nc_subtotal: ncSubtotal } : {}),
     serviceChargePercentage: parseNumeric(order.serviceChargePercentage),
     taxes: Array.isArray(order.taxes) ? order.taxes : [],
     applyServiceCharge: Boolean(order.applyServiceCharge),
@@ -12140,6 +12360,18 @@ function activeOrderSubtotal(
     // service charge + tax, which computeBillCharges then charged a SECOND time
     // (~15% overcharge to the guest). Fall back to `total` only for legacy rows
     // that carry no subtotal.
+    //
+    // NON-CHARGEABLES (migration 034) NEED NO CODE HERE, AND THAT IS THE DESIGN.
+    // `food.subtotal` is written over CHARGEABLE lines only — by AddOrder's
+    // chargeableSubtotal and by MarkOrderItemNonChargeable, which are its only
+    // two writers — so a comped line is already out of the number this reduction
+    // reads. Both writers set `total` to the same value, so the legacy fallback
+    // below is equally NC-aware and an order whose ONLY line is comped
+    // contributes 0 rather than falling through to a stale pre-NC total.
+    // Everything downstream of sumOrderTotalsForTable (the open bill, the printed
+    // bill, the KOT, waiter-confirm, admin-approve, the customer pay path,
+    // discount, coupon, split, merge, move-item, remove-item) therefore agrees
+    // without any of them knowing NC exists. See billing_math.ts's NC header.
     const subtotal = parseNumeric(p.subtotal);
     const total = subtotal > 0 ? subtotal : parseNumeric(p.total);
     sum += total;
@@ -13107,7 +13339,16 @@ export async function ReopenBill(
 //   people  — waiter_confirmed_by_username / admin_approved_by_username /
 //             closed_by_username are recorded verbatim by the settle workflow.
 
-export interface ClosedBillItem { name: string; price: number; quantity: number; note: string | null; line_total: number }
+export interface ClosedBillItem {
+  name: string; price: number; quantity: number; note: string | null; line_total: number;
+  /**
+   * The price point sold (migration 039), snapshotted on the order line. Absent
+   * on every line written before variations existed and on every line of every
+   * tenant that configures none — so a settled bill reconstructed for such a
+   * tenant is byte-identical to the one this read produced before.
+   */
+  variation?: string;
+}
 
 export interface ClosedBillSummary {
   id: string;
@@ -13476,14 +13717,19 @@ function aggregateClosedBillOrders(
       const price = parseNumeric(it.price);
       const quantity = Math.max(1, Math.round(parseNumeric(it.quantity) || 1));
       const note = String(it.note ?? "").trim();
-      const key = `${name.toLowerCase()}@@${price}`;
+      // Keyed on the variation too, for the same reason the live bill is: a Half
+      // and a Full are two things sold, and one merged line can only carry one
+      // price. This screen is what an owner reopens a settled bill to read, so it
+      // must show the same line breakdown the guest was handed on paper.
+      const variation = String(it.variation_name ?? "").trim();
+      const key = `${name.toLowerCase()}@@${price}@@${variation.toLowerCase()}`;
       const existing = itemMap.get(key);
       if (existing) {
         existing.quantity += quantity;
         existing.line_total = round2(existing.price * existing.quantity);
         if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
       } else {
-        itemMap.set(key, { name, price, quantity, note: note || null, line_total: round2(price * quantity) });
+        itemMap.set(key, { name, price, quantity, note: note || null, line_total: round2(price * quantity), ...(variation ? { variation } : {}) });
       }
     }
     orders.push({
@@ -14296,6 +14542,14 @@ export interface CashSessionRecord {
   variance: number | null;
   notes: string | null;
   status: "open" | "closed";
+  /**
+   * The till this drawer belongs to (migration 038), or NULL for "the outlet's
+   * single till" — which is every session that existed before counters did.
+   * "BillingCounters" is the till's IDENTITY; a cash session is ONE COUNT of one
+   * drawer, and there are many of them per counter over time. See 038's header
+   * for why these are two tables and not one.
+   */
+  counter_id: string | null;
 }
 
 async function ensureCashSessionsTable(_client?: PoolClient): Promise<void> {
@@ -14320,6 +14574,9 @@ async function ensureCashSessionsTable(_client?: PoolClient): Promise<void> {
          status text not null default 'open'
        )`,
     );
+    // Migration 038 adds this to an already-migrated database; repeated here so a
+    // tenant whose "CashSessions" was created down this lazy path also gets it.
+    await runQuery(`alter table "CashSessions" add column if not exists counter_id uuid`);
     await runQuery(
       `create index if not exists cash_sessions_lookup_idx on "CashSessions" (res_id, outlet_id, status, opened_at desc)`,
     );
@@ -14345,6 +14602,7 @@ function mapCashSession(r: Record<string, any>): CashSessionRecord {
     variance: num(r.variance),
     notes: r.notes ?? null,
     status: r.status === "closed" ? "closed" : "open",
+    counter_id: typeof r.counter_id === "string" ? r.counter_id : null,
   };
 }
 
@@ -14356,13 +14614,22 @@ async function cashTotalsSince(
   sinceIso: string,
   client?: PoolClient,
   untilIso?: string,
+  counterId?: string | null,
 ): Promise<{ cash_sales: number; cash_refunds: number; bill_count: number }> {
   await ensureBillWorkflowColumns(client);
   const params: unknown[] = [context.res_id, context.outlet_id, sinceIso];
   let upperBound = "";
   if (untilIso) {
     params.push(untilIso);
-    upperBound = ` and coalesce(closed_at, admin_approved_at) < $4`;
+    upperBound = ` and coalesce(closed_at, admin_approved_at) < $${String(params.length)}`;
+  }
+  // Migration 038. A counter-scoped drawer is counted against the bills THAT TILL
+  // rang, not the whole outlet. Omitted (null) leaves this query byte-identical
+  // to what it has always been, which is what every existing tenant gets.
+  let counterBound = "";
+  if (counterId) {
+    params.push(counterId);
+    counterBound = ` and counter_id = $${String(params.length)}`;
   }
   const rows = await runQuery<{ total_amt: number | string | null; refund_amount: number | string | null; payment_method: string | null; payment_splits: unknown }>(
     `select total_amt, coalesce(refund_amount, 0) as refund_amount, payment_method, payment_splits
@@ -14370,7 +14637,7 @@ async function cashTotalsSince(
       where res_id = $1 and outlet_id = $2
         and lower(coalesce(payment_method, '')) in ('cash', 'split')
         and (admin_approved_at is not null or closed_at is not null)
-        and coalesce(closed_at, admin_approved_at) >= $3${upperBound}`,
+        and coalesce(closed_at, admin_approved_at) >= $3${upperBound}${counterBound}`,
     params,
     client,
   );
@@ -14400,38 +14667,62 @@ async function cashTotalsSince(
 // computation so the operator can see the drawer position before closing.
 export async function GetCurrentCashSession(
   restaurantId: string,
+  counterId?: string | null,
 ): Promise<(CashSessionRecord & { live_cash_sales: number; live_cash_refunds: number; live_expected: number }) | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureCashSessionsTable();
+  // COUNTER SCOPING, AND WHY THE OMITTED CASE IS NOT `counter_id IS NULL`.
+  // Omitting the counter asks for the OUTLET's open drawer, which is what every
+  // caller has always asked for and what a single-till tenant means. Filtering
+  // the omitted case to `counter_id is null` would hide a food court drawer from
+  // every existing screen, which is a behaviour change dressed up as a scope.
+  const scoped = isUuid(String(counterId ?? ""));
   const rows = await runQuery<Record<string, any>>(
-    `select * from "CashSessions" where res_id = $1 and outlet_id = $2 and status = 'open' order by opened_at desc limit 1`,
-    [context.res_id, context.outlet_id],
+    `select * from "CashSessions"
+      where res_id = $1 and outlet_id = $2 and status = 'open'
+        and ($3::uuid is null or counter_id = $3)
+      order by opened_at desc limit 1`,
+    [context.res_id, context.outlet_id, scoped ? counterId : null],
   );
   if (!rows[0]) {return null;}
   const session = mapCashSession(rows[0]);
-  const totals = await cashTotalsSince(context, session.opened_at);
+  const totals = await cashTotalsSince(context, session.opened_at, undefined, undefined, session.counter_id);
   const live_expected = round2(session.opening_float + totals.cash_sales - totals.cash_refunds);
   return { ...session, live_cash_sales: totals.cash_sales, live_cash_refunds: totals.cash_refunds, live_expected };
 }
 
 export async function OpenCashSession(
   restaurantId: string,
-  input: { opening_float?: number; openedBy?: string },
+  input: { opening_float?: number; openedBy?: string; counter_id?: string | null },
 ): Promise<CashSessionRecord> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureCashSessionsTable();
+  const counterId = isUuid(String(input.counter_id ?? "")) ? String(input.counter_id) : null;
   return withTransaction(async (client) => {
+    // THE ONE-OPEN-SESSION GUARD IS NOW PER (OUTLET, COUNTER) — but only when a
+    // counter is named. A tenant that never supplies one keeps the exact rule it
+    // has always had (one open drawer per outlet), because the predicate then
+    // matches every open session regardless of counter. A food court naming its
+    // counters gets one open drawer PER TILL, which is the whole point of
+    // migration 038: four stalls cannot cash up separately if opening the second
+    // drawer is refused because the first one is open.
     const open = await runQuery<{ id: string }>(
-      `select id from "CashSessions" where res_id = $1 and outlet_id = $2 and status = 'open' limit 1`,
-      [context.res_id, context.outlet_id],
+      counterId
+        ? `select id from "CashSessions" where res_id = $1 and outlet_id = $2 and status = 'open' and counter_id = $3 limit 1`
+        : `select id from "CashSessions" where res_id = $1 and outlet_id = $2 and status = 'open' limit 1`,
+      counterId ? [context.res_id, context.outlet_id, counterId] : [context.res_id, context.outlet_id],
       client,
     );
-    if (open[0]) {throw new Error("A cash session is already open for this outlet. Close it first.");}
+    if (open[0]) {
+      throw new Error(counterId
+        ? "A cash session is already open for this counter. Close it first."
+        : "A cash session is already open for this outlet. Close it first.");
+    }
     const opening = round2(Math.max(0, Number(input.opening_float) || 0));
     const rows = await runQuery<Record<string, any>>(
-      `insert into "CashSessions" (id, res_id, outlet_id, opened_by, opening_float, status)
-       values ($1, $2, $3, $4, $5, 'open') returning *`,
-      [randomUUID(), context.res_id, context.outlet_id, input.openedBy ?? null, opening],
+      `insert into "CashSessions" (id, res_id, outlet_id, opened_by, opening_float, status, counter_id)
+       values ($1, $2, $3, $4, $5, 'open', $6) returning *`,
+      [randomUUID(), context.res_id, context.outlet_id, input.openedBy ?? null, opening, counterId],
       client,
     );
     if (!rows[0]) {throw new Error("Failed to open cash session");}
@@ -14441,20 +14732,26 @@ export async function OpenCashSession(
 
 export async function CloseCashSession(
   restaurantId: string,
-  input: { counted_cash: number; cash_payouts?: number; notes?: string; closedBy?: string },
+  input: { counted_cash: number; cash_payouts?: number; notes?: string; closedBy?: string; counter_id?: string | null },
 ): Promise<CashSessionRecord> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureCashSessionsTable();
+  const counterId = isUuid(String(input.counter_id ?? "")) ? String(input.counter_id) : null;
   return withTransaction(async (client) => {
     const rows = await runQuery<Record<string, any>>(
-      `select * from "CashSessions" where res_id = $1 and outlet_id = $2 and status = 'open' order by opened_at desc limit 1`,
-      [context.res_id, context.outlet_id],
+      `select * from "CashSessions"
+        where res_id = $1 and outlet_id = $2 and status = 'open'
+          and ($3::uuid is null or counter_id = $3)
+        order by opened_at desc limit 1`,
+      [context.res_id, context.outlet_id, counterId],
       client,
     );
     const session = rows[0];
     if (!session) {throw new Error("No open cash session to close");}
     const openedAtIso = session.opened_at instanceof Date ? session.opened_at.toISOString() : String(session.opened_at);
-    const totals = await cashTotalsSince(context, openedAtIso, client);
+    // Counted against the bills THIS TILL rang, so a stall variance is its own.
+    const totals = await cashTotalsSince(context, openedAtIso, client, undefined,
+      typeof session.counter_id === "string" ? session.counter_id : null);
     const openingFloat = round2(parseNumeric(session.opening_float));
     const payouts = round2(Math.max(0, Number(input.cash_payouts) || 0));
     const counted = round2(Math.max(0, Number(input.counted_cash) || 0));
@@ -16850,14 +17147,12 @@ export async function ConfirmBillPaymentByWaiter(
     // consistent basis for accounting/reporting (mirrors the customer/online
     // payment paths, which already store the grand total in total_amt).
     const subtotalNow = await sumOrderTotalsForTable(context, tableId, client);
-    const taxRows = await runQuery<{ default_tax: any }>(
-      `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
-      [context.outlet_id, context.res_id],
-      client,
-    );
-    const scPctNow = await getServiceChargePercent(context.res_id, client);
+    // Same resolver as the bill view (migration 036): a service charge waived on
+    // the open bill must be gone HERE too, or the guest is shown one total and
+    // settled at another.
+    const chargeCfgNow = await openBillChargeConfig(context, tableId, client);
     const discountNow = await getOpenBillDiscount(context, tableId, client);
-    const charges = computeBillCharges(subtotalNow, taxRows[0]?.default_tax ?? null, scPctNow, true, discountNow);
+    const charges = computeBillCharges(subtotalNow, chargeCfgNow.taxConfig, chargeCfgNow.scPct, chargeCfgNow.includeServiceCharge, discountNow);
     const taxJsonNow = JSON.stringify(charges.taxes);
 
     // Split tender: the parts must reconstruct the charged grand total exactly
@@ -16968,14 +17263,11 @@ export async function SubmitCustomerPayment(
 
     const subtotal = await sumOrderTotalsForTable(context, tableId, client);
     // Fold the optional service charge + taxes into the recorded/charged total.
-    const taxRows = await runQuery<{ default_tax: any }>(
-      `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
-      [context.outlet_id, context.res_id],
-      client,
-    );
-    const scPct = await getServiceChargePercent(context.res_id, client);
+    // Through openBillChargeConfig (migration 036) so a live service-charge
+    // waiver is honoured on this path exactly as it is on the bill view.
+    const chargeCfg = await openBillChargeConfig(context, tableId, client);
     const billDiscount = await getOpenBillDiscount(context, tableId, client);
-    const { taxes, grand_total } = computeBillCharges(subtotal, taxRows[0]?.default_tax ?? null, scPct, true, billDiscount);
+    const { taxes, grand_total } = computeBillCharges(subtotal, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, billDiscount);
     const total = grand_total;
     const taxJson = JSON.stringify(taxes);
 
@@ -17086,18 +17378,17 @@ export async function ApproveBillPaymentByAdmin(
     // Bills.total_amt with the PRE-TAX subtotal) otherwise got frozen into the
     // closed bill, recording revenue ~13% under what the guest actually paid.
     const subtotalAtApproval = await sumOrderTotalsForTable(context, tableId, client);
-    const taxRowsAtApproval = await runQuery<{ default_tax: any }>(
-      `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
-      [context.outlet_id, context.res_id],
-      client,
-    );
-    const scPctAtApproval = await getServiceChargePercent(context.res_id, client);
+    // Re-resolved HERE rather than carried from waiter-confirm: a service charge
+    // waived (or a waiver reversed) between the two steps has to move this total
+    // for the same reason a bill edit does. openBillChargeConfig is the one
+    // resolver both steps use, so they cannot disagree.
+    const chargeCfgAtApproval = await openBillChargeConfig(context, tableId, client);
     const discountAtApproval = await getOpenBillDiscount(context, tableId, client);
     const chargesAtApproval = computeBillCharges(
       subtotalAtApproval,
-      taxRowsAtApproval[0]?.default_tax ?? null,
-      scPctAtApproval,
-      true,
+      chargeCfgAtApproval.taxConfig,
+      chargeCfgAtApproval.scPct,
+      chargeCfgAtApproval.includeServiceCharge,
       discountAtApproval,
     );
 
@@ -17117,6 +17408,18 @@ export async function ApproveBillPaymentByAdmin(
           `The split payment no longer matches this bill — the recorded parts add up to ${splitSum} but the bill is now ${chargesAtApproval.grand_total}. Re-take the payment with the corrected split, then approve.`,
         );
       }
+    }
+
+    // DEFENCE 2 for migration 037's tender sum. The deferred constraint trigger
+    // checks Σ(live tenders) = total_amt at COMMIT of any transaction that
+    // touches "BillTenders" — and this transaction does not touch it, so without
+    // this a bill whose tenders were recorded earlier could be closed while a
+    // paisa (or a whole tender) short. A NO-OP when no tenders exist, which is
+    // every settle on every tenant until a client starts recording them: the
+    // single-method path below is unchanged.
+    const openBillIdAtApproval = await existingOpenBillId(context, tableId, client);
+    if (openBillIdAtApproval) {
+      await assertTendersReconcileForSettle(context, openBillIdAtApproval, chargesAtApproval.grand_total, client);
     }
 
     const updated = await runQuery<{ id: string }>(
@@ -17557,14 +17860,11 @@ export async function FinalizeOnlinePayment(
 
     const subtotal = await sumOrderTotalsForTable(context, tableId, client);
     // Fold the optional service charge + taxes into the charged/recorded total.
-    const taxRows = await runQuery<{ default_tax: any }>(
-      `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
-      [context.outlet_id, context.res_id],
-      client,
-    );
-    const scPct = await getServiceChargePercent(context.res_id, client);
+    // Through openBillChargeConfig (migration 036) so a live service-charge
+    // waiver is honoured on this path exactly as it is on the bill view.
+    const chargeCfg = await openBillChargeConfig(context, tableId, client);
     const billDiscount = await getOpenBillDiscount(context, tableId, client);
-    const { taxes, grand_total } = computeBillCharges(subtotal, taxRows[0]?.default_tax ?? null, scPct, true, billDiscount);
+    const { taxes, grand_total } = computeBillCharges(subtotal, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, billDiscount);
     const total = grand_total;
     const taxJson = JSON.stringify(taxes);
 
@@ -18092,7 +18392,31 @@ async function resolveEmployeeByUsername(
 // Walk-in parties join a queue (public QR) when the floor is full; staff call &
 // seat them. A held pre_order (items picked while waiting) is placed as a real
 // order on seating. RLS-scoped by res_id like every tenant table.
-export interface WaitlistItem { id: string; name: string; price: number; quantity: number; note?: string }
+export interface WaitlistItem {
+  id: string;
+  name: string;
+  price: number;
+  quantity: number;
+  note?: string;
+  /**
+   * The "Menu".id this line resolved to (migration 039), stamped by
+   * repriceFromMenu. Optional so a line the caller built by hand still typechecks;
+   * every line this system EMITS carries it, which is what makes a guest order
+   * attributable to a menu group and a variation exactly like a staff one.
+   */
+  menu_id?: string;
+  /**
+   * The "MenuVariations".id this line was priced against (migration 039), and
+   * the label snapshotted for printing. ACCEPTED from a guest only as an id —
+   * repriceFromMenu re-resolves it against the menu and rewrites both keys, so a
+   * client can neither invent a price point nor name someone else's.
+   *
+   * Both are ABSENT on a line that named no variation, which is every line on
+   * every tenant that has configured none.
+   */
+  variation_id?: string;
+  variation_name?: string;
+}
 // Additive contact-capture: everyone who scans the shared "join party" QR records
 // their own name/phone here. Does NOT change party_size (that's still the head count).
 export interface WaitlistMember { name: string; phone: string; joined_at: string }
@@ -18208,7 +18532,18 @@ function normalizeWaitlistItems(raw: unknown): WaitlistItem[] {
     const quantity = Math.min(99, Math.max(1, Math.round(parseNumeric(o.quantity ?? 1) || 1)));
     const price = Math.max(0, parseNumeric(o.price ?? 0));
     const note = typeof o.note === "string" ? o.note.trim().slice(0, 280) : "";
-    out.push({ id: String(o.id ?? randomUUID()), name, price: round2(price), quantity, ...(note ? { note } : {}) });
+    // Migration 039: the guest's PICK travels, nothing else. Only the id is
+    // carried (never a client-sent price, name or label) and it is re-resolved
+    // by repriceFromMenu against the live menu before anything is billed. An
+    // unrecognised id costs the guest nothing — the line falls back to the
+    // dish's base price. Omitted entirely when absent, so a stored pre_order
+    // blob on a tenant with no variations is unchanged byte-for-byte.
+    const variationId = typeof o.variation_id === "string" ? o.variation_id.trim().slice(0, 64) : "";
+    out.push({
+      id: String(o.id ?? randomUUID()), name, price: round2(price), quantity,
+      ...(note ? { note } : {}),
+      ...(variationId ? { variation_id: variationId } : {}),
+    });
   }
   return out;
 }
@@ -18225,19 +18560,45 @@ function normalizeWaitlistItems(raw: unknown): WaitlistItem[] {
 // pre-orders while reporting success. An empty menu still drops everything —
 // items that don't exist can't be billed — but a read error must surface so
 // callers fail loudly (and retryably) instead of losing the guest's picks.
+//
+// ---------------------------------------------------------------------------
+// MIGRATION 039: THIS PATH HONOURS VARIATIONS, AND IT HAD TO.
+//
+// applyMenuPriceFloor (below) learned the variation floor when 039's data layer
+// landed; this function did not, and the two are the SAME decision made about
+// the same line by two different doors. Left as it was, a guest who tapped
+// "Half — ₹150" on the QR page would have had the line floored UP to the dish's
+// ₹250 base and been overcharged ₹100 with "Half" still on the docket. Both now
+// call resolveLinePriceFloor (billing_math.ts), so there is one rule.
+//
+// The stamped keys are the same three, for the same reason: `menu_id` was always
+// the menu id on this path by ACCIDENT (nothing had re-minted it yet), and
+// stamping it makes a guest line and a staff line report identically.
+// `variation_id` / `variation_name` appear ONLY on a line that named a variation
+// the server honoured — so a tenant with no variations gets a line object
+// byte-identical to the one this function has always emitted.
+// ---------------------------------------------------------------------------
 export async function repriceFromMenu(restaurantId: string, items: WaitlistItem[], floorOnly = false): Promise<WaitlistItem[]> {
   if (!Array.isArray(items) || items.length === 0) {return [];}
   const menu = await GetMenuItems(restaurantId);
   if (menu.length === 0) {return [];}
   const byId = new Map(menu.map((m) => [String(m.id), m]));
   const byName = new Map(menu.map((m) => [m.name.trim().toLowerCase(), m]));
+  // Loaded only when a line actually names a variation — see anyLineNamesVariation.
+  const variations = anyLineNamesVariation(items as unknown as Record<string, unknown>[])
+    ? await listMenuVariationsByIdMap(restaurantId).catch(() => new Map<string, MenuVariationRecord>())
+    : new Map<string, MenuVariationRecord>();
   const out: WaitlistItem[] = [];
   for (const it of items) {
     const m = byId.get(String(it.id)) ?? byName.get(String(it.name).trim().toLowerCase());
     if (!m) {continue;}
-    const base = round2(parseNumeric(m.price));
-    const price = floorOnly ? Math.max(base, round2(parseNumeric(it.price))) : base;
-    out.push({ id: String(m.id), name: m.name, price, quantity: it.quantity, ...(it.note ? { note: it.note } : {}) });
+    const floor = resolveLinePriceFloor(it.variation_id, { id: String(m.id), price: m.price }, variations as ReadonlyMap<string, VariationPriceRef>);
+    const price = floorOnly ? Math.max(floor.base, round2(parseNumeric(it.price))) : floor.base;
+    out.push({
+      id: String(m.id), menu_id: String(m.id), name: m.name, price, quantity: it.quantity,
+      ...(it.note ? { note: it.note } : {}),
+      ...(floor.variation ? { variation_id: floor.variation.id, variation_name: floor.variation.name } : {}),
+    });
   }
   return out;
 }
@@ -18258,20 +18619,66 @@ export async function repriceFromMenu(restaurantId: string, items: WaitlistItem[
 //
 // Must run inside the tenant context. Returns the input untouched when the menu
 // can't be read, so a menu outage can never block order entry.
+//
+// ---------------------------------------------------------------------------
+// MIGRATION 039 ADDED A SECOND JOB HERE, AND THIS IS DELIBERATELY THE ONLY PLACE
+// IT HAPPENS.
+//
+// (1) IT STAMPS `menu_id`. An order line records a NAME; its `id` is a menu id
+//     only by accident and only until AddOrder's merge path mints a fresh uuid
+//     for an added quantity. That is why no report could ever attribute a sale
+//     to a menu group or a variation. This function is the one place EVERY order
+//     write already routes EVERY line through, it already does exactly this
+//     lookup (by id, then by lower(name)) to enforce the floor, and it already
+//     degrades to "leave the line as typed" when the menu cannot be read — so
+//     stamping here adds a fact without adding a resolution path or a failure
+//     mode. It is server-side, so a client cannot lie about which menu row it
+//     billed against.
+//
+// (2) IT FLOORS AGAINST THE VARIATION, NOT THE BASE ITEM, when the line names
+//     one. This is the money-critical half: a Half plate at ₹150 against a base
+//     of ₹250 would otherwise be floored UP to ₹250 and the guest overcharged by
+//     ₹100 with the bill still printing "Half". A line that names no variation
+//     floors against the base price exactly as before — which is every line that
+//     exists today.
+//
+// Both additions are ADDITIVE KEYS on the stored line. Nothing reads them yet
+// except the attribution resolver, and every reader that does not know about
+// them is unaffected.
+// ---------------------------------------------------------------------------
 export async function applyMenuPriceFloor<T>(restaurantId: string, items: T[]): Promise<T[]> {
   if (!Array.isArray(items) || items.length === 0) {return items;}
   const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
   if (menu.length === 0) {return items;}
   const byId = new Map(menu.map((m) => [String(m.id), m]));
   const byName = new Map(menu.map((m) => [m.name.trim().toLowerCase(), m]));
-  return items.map((raw) => {
-    const it = parseJsonObject(raw);
+  // Variations are loaded only when at least one incoming line actually names
+  // one. A tenant that has never configured a variation — i.e. every tenant on
+  // the day this ships — pays nothing for this at order-entry time.
+  const parsed = items.map((raw) => parseJsonObject(raw));
+  const variations = anyLineNamesVariation(parsed)
+    ? await listMenuVariationsByIdMap(restaurantId).catch(() => new Map<string, MenuVariationRecord>())
+    : new Map<string, MenuVariationRecord>();
+
+  return items.map((raw, i) => {
+    const it = parsed[i];
     if (!it) {return raw;}
     const m = byId.get(String(it.id ?? "")) ?? byName.get(String(it.name ?? "").trim().toLowerCase());
     if (!m) {return raw;} // off-menu / custom charge — bill it as typed
-    const base = round2(parseNumeric(m.price));
-    if (round2(parseNumeric(it.price)) >= base) {return raw;}
-    return { ...it, price: base } as unknown as T;
+    // ONE rule, shared with repriceFromMenu — a variation is honoured only when
+    // it belongs to the dish this line resolved to and is still sold. See
+    // resolveLinePriceFloor in billing_math.ts for why each refusal exists.
+    const floor = resolveLinePriceFloor(it.variation_id, { id: String(m.id), price: m.price }, variations as ReadonlyMap<string, VariationPriceRef>);
+    const stamped: Record<string, unknown> = { ...it, menu_id: String(m.id) };
+    if (floor.variation) {
+      stamped.variation_id = floor.variation.id;
+      // Snapshotted for PRINTING a historical bill: the label the guest saw is
+      // the right one on paper even after the variation is renamed. Reports
+      // prefer the live label — see attributeOrderLine.
+      stamped.variation_name = floor.variation.name;
+    }
+    if (round2(parseNumeric(it.price)) < floor.base) {stamped.price = floor.base;}
+    return stamped as unknown as T;
   });
 }
 
@@ -26833,6 +27240,117 @@ export async function GetRestaurantPlan(resId: string): Promise<RestaurantPlan> 
   }
 }
 
+/**
+ * THE ONE DEFINITION of "which permission UUIDs does this employee hold".
+ *
+ * Extracted out of AuthenticateRestaurantEmployee (unchanged, line for line,
+ * including the empty-set fallback to the `employee` core role) so that the
+ * SECOND caller — ResolveAuthoriser, checking the person whose name is going on
+ * a comp / void / waiver — asks the same question the login asks. Two copies of
+ * this walk would be a permission hole waiting for the day one of them learns
+ * about a new role shape and the other does not.
+ *
+ * Custom roles resolve per res_id, not per outlet: "Roles" is restaurant-wide.
+ */
+async function resolveEmployeeActionSet(
+  resId: string,
+  empRoles: Record<string, string[]> | null | undefined,
+  client?: PoolClient,
+): Promise<Set<string>> {
+  const coreRoleName = Object.keys(CORE_ROLES);
+  const actionSet = new Set<string>();
+  const promises = (empRoles?.['all'] ?? []).map(async role => {
+    if (coreRoleName.includes(role)) {
+      CORE_ROLES[role as CoreRoleKey].forEach(action => actionSet.add(action));
+    } else {
+      const actionRows = await runQuery<{ actions_performable: string[] }>(
+        `select actions_performable from "Roles" where id = $1 and res_id = $2 limit 1`,
+        [role, resId],
+        client,
+      );
+      if (actionRows[0]) {
+        actionRows[0].actions_performable.forEach(action => actionSet.add(action));
+      }
+    }
+  });
+
+  await Promise.all(promises);
+
+  if (actionSet.size === 0) {
+    // Default to employee permissions if no roles or actions found
+    CORE_ROLES.employee.forEach(action => actionSet.add(action));
+  }
+  return actionSet;
+}
+
+/** A named authoriser, resolved and permission-checked. */
+export interface AuthoriserIdentity {
+  employee_id: string;
+  /** The LOGIN username as stored, not as typed — the ledgers record this. */
+  username: string;
+  /** "Fname Lname", for the response and the audit line. Never for the ledger. */
+  display_name: string;
+}
+
+export type ResolveAuthoriserResult =
+  | { ok: true; identity: AuthoriserIdentity }
+  | { ok: false; reason: "not_found" | "not_permitted" };
+
+/**
+ * Resolve the person named as the AUTHORISER of a comp, a void or a waiver, and
+ * refuse unless they could actually have authorised it.
+ *
+ * WHY THE ROUTE CANNOT JUST TRUST THE STRING. Migrations 034/035/036 make
+ * `authorised_by_username` NOT NULL precisely so every giveaway carries a second
+ * name, and CaptureActor's contract is that the route must never default it to
+ * the actor. But a NOT NULL text column stops nothing on its own: a till that can
+ * type any string into it writes "Manager" and the control is theatre. So the
+ * name is resolved to a REAL employee of this restaurant and outlet, and that
+ * employee must hold `requiredActionId` — the same permission that gates the
+ * route. What lands in the ledger is then the username as STORED, not as typed,
+ * so "MANAGER01" and "manager01" are one person in the report.
+ *
+ * WHAT THIS IS NOT. It is not proof the manager was standing there — no
+ * step-up credential exists in this system and inventing one behind a body field
+ * would be worse than honest. It is the guarantee that every authoriser named in
+ * a control ledger is a person who could have authorised it, and that a waiter
+ * cannot invent one. A manager acting alone passes their own username and the
+ * row says so, which is exactly what 034's header describes.
+ *
+ * SCOPED TO THE ACTING OUTLET, because employee identities are per-outlet: a
+ * manager of Branch 2 is not an authoriser for a comp rung up in Branch 1.
+ */
+export async function ResolveAuthoriser(
+  restaurantId: string,
+  usernameOrId: string,
+  requiredActionId: string,
+  client?: PoolClient,
+): Promise<ResolveAuthoriserResult> {
+  const wanted = String(usernameOrId ?? "").trim();
+  if (!wanted) {return { ok: false, reason: "not_found" };}
+  const context = await requireRestaurantContext(restaurantId, client);
+  const employee = await resolveEmployeeByUsername(context, wanted, client);
+  if (!employee) {return { ok: false, reason: "not_found" };}
+  const rows = await runQuery<{ emp_roles: Record<string, string[]> }>(
+    `select emp_roles from "Employees" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [employee.id, context.res_id, context.outlet_id],
+    client,
+  );
+  const actions = await resolveEmployeeActionSet(context.res_id, rows[0]?.emp_roles, client);
+  if (!actions.has(requiredActionId) && !actions.has("*")) {
+    return { ok: false, reason: "not_permitted" };
+  }
+  return {
+    ok: true,
+    identity: {
+      employee_id: employee.id,
+      username: employee.username,
+      display_name: [employee.fname, employee.lname].filter((p) => (p ?? "").trim()).join(" ").trim()
+        || employee.username,
+    },
+  };
+}
+
 export async function AuthenticateRestaurantEmployee(
   restaurantId: string,
   employeeUsername: string,
@@ -26912,28 +27430,7 @@ export async function AuthenticateRestaurantEmployee(
         );
       }
 
-      const coreRoleName = Object.keys(CORE_ROLES);
-      const actionSet = new Set<string>();
-      const promises = (row.emp_roles['all'] ?? []).map(async role => {
-        if (coreRoleName.includes(role)) {
-          CORE_ROLES[role as CoreRoleKey].forEach(action => actionSet.add(action));
-        } else {
-          const actionRows = await runQuery<{ actions_performable: string[] }>(
-            `select actions_performable from "Roles" where id = $1 and res_id = $2 limit 1`,
-            [role, context.res_id],
-          );
-          if (actionRows[0]) {
-            actionRows[0].actions_performable.forEach(action => actionSet.add(action));
-          }
-        }
-      });
-
-      await Promise.all(promises);
-
-      if (actionSet.size === 0) {
-        // Default to employee permissions if no roles or actions found
-        CORE_ROLES.employee.forEach(action => actionSet.add(action));
-      }
+      const actionSet = await resolveEmployeeActionSet(context.res_id, row.emp_roles);
 
       const actionIds = Array.from(actionSet).filter((id) => isUuid(id));
       const actionNameRows = actionIds.length > 0
@@ -27438,4 +27935,6448 @@ export async function OutletBelongsToRestaurant(resId: string, outletId: string)
     [outletId, resId],
   );
   return rows.length > 0;
+}
+
+// --- Idempotency keys (migration 033) ----------------------------------------
+//
+// Every statement that touches "IdempotencyKeys" lives here, behind a named
+// export, because runQuery is module-private. The POLICY — the window, the lease
+// length, the header, what a non-2xx means, what happens when migration 033 has
+// not been applied — lives in idempotency.ts. These functions are the SQL and
+// nothing else, and they THROW; deciding what a failure means is the caller's
+// job. (Same split, same reasons, as the "PrintJobs" block above.)
+//
+// THE GUARANTEE, and where each half of it actually lives:
+//
+//   at-most-once application  <- the unique index on (res_id, idem_key) plus the
+//                                claim's ON CONFLICT ... WHERE takeover
+//                                predicate. Not an in-process map, because an
+//                                in-process map does not survive a second
+//                                replica or a redeploy — and a redeploy is
+//                                precisely when a client is retrying.
+//   the same answer twice     <- response_status/response_body, captured from
+//                                the first 2xx and replayed verbatim. A retry
+//                                that got a DIFFERENT answer could not tell a
+//                                replay from a second application.
+//
+// All three run on the request's AMBIENT tenant connection (openTenantConnection
+// binds it for the whole handler chain), so RLS scoping is already right and no
+// transaction is opened here. That also means the claim and the completion are
+// separate statements on one connection rather than one transaction: they must
+// be, because the thing between them is the route handler.
+
+export interface IdempotencyClaimInput {
+  outlet_id: string | null;
+  employee_id: string | null;
+  idem_key: string;
+  route_key: string;
+  fingerprint: string;
+  /** Absolute instant this claim's lease lapses (may be re-claimed after). */
+  lease_until: Date;
+  /** Absolute instant the whole key stops being honoured. */
+  expires_at: Date;
+}
+
+export type IdempotencyClaim =
+  /** This request owns the key. Run the handler, then settle with the token. */
+  | { outcome: "claimed"; claim_token: string }
+  /** A previous request already produced a 2xx. Replay it; do not run again. */
+  | { outcome: "completed"; response_status: number; response_body: unknown; fingerprint: string }
+  /** A live holder is still running. Neither replay nor re-apply is correct. */
+  | { outcome: "in_flight"; fingerprint: string; route_key: string }
+  /** The key exists but carried a different request. */
+  | { outcome: "mismatch"; route_key: string }
+  /** The row vanished between the two statements — see the caller's note. */
+  | { outcome: "vanished" };
+
+interface IdempotencyRow {
+  claim_token: string;
+  status: string;
+  fingerprint: string;
+  route_key: string;
+  response_status: number | null;
+  response_body: unknown;
+}
+
+/**
+ * Claim a key, or report why this request may not proceed.
+ *
+ * STATEMENT ONE is the whole concurrency story:
+ *
+ *   insert ... on conflict (res_id, idem_key) do update ... where <takeover>
+ *
+ * A fresh key inserts. A key whose row has EXPIRED, or whose holder's LEASE has
+ * lapsed, is taken over — the row is reset to in_flight with a NEW claim_token,
+ * which is what makes a completion by the old holder a no-op rather than a
+ * clobber. A key whose row is live (completed inside the window, or in_flight
+ * under a live lease) matches neither arm of the WHERE and returns ZERO rows.
+ *
+ * Zero rows is not an error and not a claim; it is "somebody else's row", so
+ * STATEMENT TWO reads it to find out which. Two round trips, but only ever on
+ * the duplicate path — the common case (a key seen for the first time) is one
+ * statement, and correctness is worth more here than a saved round trip on the
+ * rare path.
+ *
+ * WHY THE TAKEOVER PREDICATE IS NOT OPTIONAL. Without the expiry arm the window
+ * would depend on the reaper having run. Without the lease arm, a process killed
+ * between claim and response — a redeploy, an OOM, a pool timeout — would pin
+ * its key in_flight forever and the client could never land that write at all.
+ * The failure mode there is a LOST order, which is strictly worse than the
+ * duplicate this table exists to prevent.
+ *
+ * `vanished` is the honest name for the one race the two statements admit: the
+ * reaper deleting the conflicting row between them. It cannot normally happen
+ * (a row that conflicted was, by the WHERE, neither expired nor lease-lapsed,
+ * and the reaper only deletes expired rows) but "cannot normally" is not
+ * "cannot", so it is reported rather than guessed at.
+ */
+export async function ClaimIdempotencyKey(
+  resId: string,
+  input: IdempotencyClaimInput,
+): Promise<IdempotencyClaim> {
+  const claimed = await runQuery<{ claim_token: string }>(
+    `insert into "IdempotencyKeys"
+       (res_id, outlet_id, employee_id, idem_key, route_key, fingerprint,
+        status, lease_until, expires_at)
+     values ($1,$2,$3,$4,$5,$6,'in_flight',$7::timestamptz,$8::timestamptz)
+     on conflict (res_id, idem_key) do update
+        set outlet_id       = excluded.outlet_id,
+            employee_id     = excluded.employee_id,
+            route_key       = excluded.route_key,
+            fingerprint     = excluded.fingerprint,
+            status          = 'in_flight',
+            attempts        = "IdempotencyKeys".attempts + 1,
+            claim_token     = gen_random_uuid(),
+            lease_until     = excluded.lease_until,
+            expires_at      = excluded.expires_at,
+            created_at      = now(),
+            completed_at    = null,
+            response_status = null,
+            response_body   = null
+      where "IdempotencyKeys".expires_at <= now()
+         or ("IdempotencyKeys".status = 'in_flight'
+             and ("IdempotencyKeys".lease_until is null
+                  or "IdempotencyKeys".lease_until <= now()))
+     returning claim_token`,
+    [
+      resId, input.outlet_id, input.employee_id, input.idem_key,
+      input.route_key, input.fingerprint,
+      input.lease_until.toISOString(), input.expires_at.toISOString(),
+    ],
+  );
+  if (claimed.length > 0) {
+    return { outcome: "claimed", claim_token: String(claimed[0]?.claim_token ?? "") };
+  }
+
+  const existing = await runQuery<IdempotencyRow>(
+    `select claim_token, status, fingerprint, route_key, response_status, response_body
+       from "IdempotencyKeys"
+      where res_id = $1 and idem_key = $2
+        and expires_at > now()
+      limit 1`,
+    [resId, input.idem_key],
+  );
+  const row = existing[0];
+  if (!row) { return { outcome: "vanished" }; }
+
+  // THE REUSE GUARD, checked before anything is handed back. A key carrying a
+  // different request is a client bug; answering it with the first request's
+  // response would be a wrong answer delivered confidently, which is the one
+  // outcome worse than an error.
+  if (row.fingerprint !== input.fingerprint) {
+    return { outcome: "mismatch", route_key: row.route_key };
+  }
+  if (row.status === "completed" && row.response_status !== null) {
+    return {
+      outcome: "completed",
+      response_status: row.response_status,
+      response_body: row.response_body ?? null,
+      fingerprint: row.fingerprint,
+    };
+  }
+  return { outcome: "in_flight", fingerprint: row.fingerprint, route_key: row.route_key };
+}
+
+/**
+ * Record the 2xx this key produced, by compare-and-swap on the claim token.
+ *
+ * Returns true when THIS holder settled the key. False means the lease lapsed
+ * and somebody else took the row over while this request was still running — in
+ * which case this response is superseded and must NOT be written, or a client
+ * would later replay an answer to a request that was overtaken.
+ *
+ * `status = 'in_flight'` is checked too, so a completion can never be applied
+ * twice to the same claim.
+ */
+export async function CompleteIdempotencyKey(
+  resId: string,
+  idemKey: string,
+  claimToken: string,
+  responseStatus: number,
+  responseBody: unknown,
+  expiresAt: Date,
+): Promise<boolean> {
+  const rows = await runQuery<{ id: string }>(
+    `update "IdempotencyKeys"
+        set status          = 'completed',
+            completed_at    = now(),
+            response_status = $4,
+            response_body   = $5::jsonb,
+            lease_until     = null,
+            expires_at      = $6::timestamptz
+      where res_id = $1 and idem_key = $2
+        and claim_token = $3 and status = 'in_flight'
+      returning id`,
+    [
+      resId, idemKey, claimToken, responseStatus,
+      responseBody === undefined || responseBody === null ? null : JSON.stringify(responseBody),
+      expiresAt.toISOString(),
+    ],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Un-claim a key, because the request it guarded did NOT apply.
+ *
+ * Deleting rather than marking failed is the deliberate choice, and it is what
+ * makes an out-of-order replay self-repairing: an outbox that sends a table
+ * release before the order that table is carrying gets today's 404, the key is
+ * released, and the SAME key succeeds once the prerequisite lands. A cached 404
+ * would wedge that queue entry forever.
+ *
+ * Guarded by claim_token for the same reason completion is: a request whose
+ * lease lapsed must not delete the row a later request now owns.
+ */
+export async function ReleaseIdempotencyKey(
+  resId: string,
+  idemKey: string,
+  claimToken: string,
+): Promise<boolean> {
+  const rows = await runQuery<{ id: string }>(
+    `delete from "IdempotencyKeys"
+      where res_id = $1 and idem_key = $2
+        and claim_token = $3 and status = 'in_flight'
+      returning id`,
+    [resId, idemKey, claimToken],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Reaper: delete keys past their window.
+ *
+ * PURE HYGIENE. The claim's takeover predicate already refuses to honour an
+ * expired row, so a database whose sweep never ran still behaves correctly — it
+ * just keeps rows nobody will read. Bounded by `limit` because DELETE has no
+ * LIMIT of its own and the first sweep after this ships could otherwise take one
+ * statement across a tenant's entire key history.
+ */
+export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number): Promise<number> {
+  const rows = await runQuery<{ id: string }>(
+    `with doomed as (
+       select id
+         from "IdempotencyKeys"
+        where res_id = $1
+          and expires_at <= now()
+        order by expires_at asc
+        limit $2
+     )
+     delete from "IdempotencyKeys" k
+      using doomed d
+      where k.id = d.id
+     returning k.id`,
+    [resId, limit],
+  );
+  return rows.length;
+}
+
+// ============================================================================
+// MIS / CONTROL REPORTS — the nine documents an owner or an auditor reads.
+// ============================================================================
+//
+// THE MONEY IS DEFINED IN mis_report_math.ts, NOT HERE. That module carries the
+// one Gross → Discount → Net → Tax → Service Charge → Round Off → Grand Total
+// ladder every report below composes, the discount reconstruction, the
+// settlement allocation, the period-on-period rules and the bill-edit
+// classifier — all pure, all jest-proven without a pg pool. Read its header
+// before changing a number in this section; two of these reports disagreeing
+// about "net sales" is how an auditor stops believing all nine.
+//
+// WHAT LIVES HERE is only what needs the database: the tenant/outlet/window
+// resolution, the SQL, and the shaping of each payload.
+//
+// SETTLEMENT TIME IS THE CLOCK. Eight of the nine bucket a bill by
+// coalesce(closed_at, admin_approved_at) — the same predicate getSettledBills
+// uses, so these reports and the accounting reports always add up the same rows.
+// Item Wise is the exception and says so in its own notes: it buckets by ORDER
+// PLACEMENT time because an item has no settlement of its own.
+//
+// READ-ONLY. Nothing in this section writes, and nothing here touches the
+// idempotency outbox. No migration was needed: every column read below already
+// exists (the lazy ensure* helpers are called only so a tenant that predates a
+// column still reads rather than 42703-ing).
+//
+// OUTLET SCOPE follows the house pattern exactly: `og` is "true" in the
+// admin/manager ALL-OUTLETS aggregate read (isAllOutlets(), set by the
+// X-Outlet-Id "all" sentinel) and "false" otherwise, inlined into
+// `(${og} or <alias>.outlet_id = $2)`. RLS still bounds every one of them to
+// res_id, so ALL-OUTLETS means "every outlet of MY restaurant" and can never
+// mean another tenant's.
+
+/** The reporting window a MIS report resolved, plus the instants its SQL binds. */
+export interface MisWindow extends ResolvedReportWindow {
+  fromIso: string;
+  /** EXCLUSIVE — local midnight of the day AFTER `to`. This is what makes the
+   *  range inclusive of its last day; see windowInstants. */
+  toIso: string;
+}
+
+/** Everything the nine share: identity, zone, scope and the resolved window. */
+interface MisContext {
+  context: RestaurantContext;
+  /** "true" / "false" — the outlet-predicate literal. Server-derived, never input. */
+  og: string;
+  allOutlets: boolean;
+  window: MisWindow;
+  tz: string;
+}
+
+/** How a client asks for any of the nine. All values arrive raw off the query string. */
+export interface MisReportQuery extends ReportWindowQuery {
+  /** Bill No. / KOT (order id) / table — free text, matched per report. */
+  search?: unknown;
+  limit?: unknown;
+  offset?: unknown;
+  /** The time-wise toggle: "day" (default) or "hour". */
+  bucket?: unknown;
+}
+
+/** One column, so the client's column picker and TOTALS row are server-driven. */
+export interface MisColumn {
+  key: string;
+  label: string;
+  type: "text" | "int" | "money" | "percent" | "datetime" | "date";
+  /** True when this column is summed into the TOTALS row. */
+  total?: boolean;
+  /** False for columns hidden until the user turns them on. */
+  default_on?: boolean;
+}
+
+/** The envelope every one of the nine returns. */
+export interface MisReportMeta {
+  report: string;
+  title: string;
+  window: ResolvedReportWindow;
+  timezone: string;
+  outlet_scope: "outlet" | "all";
+  outlet_id: string | null;
+  outlet_name: string | null;
+  generated_at: string;
+  /** Every caveat that applies to the numbers below, in plain words. */
+  notes: string[];
+}
+
+/** Paging state for the row-level reports. */
+export interface MisPage {
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+}
+
+const MIS_DEFAULT_DAYS = 30;
+const MIS_DEFAULT_PAGE = 100;
+const MIS_MAX_PAGE = 500;
+
+/** The note every report bucketed on settlement carries. */
+const NOTE_SETTLEMENT_BASIS =
+  "Bills are counted on the day they were SETTLED (closed, or admin-approved when never closed), in the restaurant's own timezone. Both ends of the date range are inclusive.";
+const NOTE_CANCELLED_EXCLUDED =
+  "Cancelled orders are not sales and are excluded from every revenue figure.";
+const NOTE_COVERS_ONCE =
+  "Covers are counted ONCE PER SEATING, so split bills on one table do not double the party. Bills with no resolvable seating contribute their money but no covers.";
+const NOTE_PER_COVER_PRETAX =
+  "Per-cover figures are PRE-TAX (net of discount, before service charge and tax) — the house APC convention. Average bill value is the tax-inclusive grand total.";
+const NOTE_ROUND_OFF =
+  "Round off is always 0: no bill field records a rounding adjustment, so the ladder closes exactly.";
+const NOTE_DISCOUNT_ESTIMATE =
+  "A discount stored as a percentage did not have its money value snapshotted; it is reconstructed from the settled total. Those bills are counted in estimated_discount_bills.";
+
+/**
+ * Resolve tenant, outlet scope and window ONCE for a MIS report.
+ *
+ * The window goes through resolveReportWindow (report_window.ts), so `from`/`to`
+ * are inclusive calendar days IN THE TENANT'S ZONE, a reversed drag is swapped
+ * rather than emptied, a future end is pulled back to today, and a span wider
+ * than MAX_REPORT_DAYS is clamped with the clamp NAMED in the payload. A report
+ * that silently answered a narrower question than the one asked would be worse
+ * than one that refused.
+ */
+async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisContext> {
+  const context = await requireRestaurantContext(restaurantId);
+  const allOutlets = isAllOutlets();
+  const tz = context.timezone;
+  const resolved = resolveReportWindow(q, tz, {
+    defaultDays: MIS_DEFAULT_DAYS,
+    maxDays: MAX_REPORT_DAYS,
+  });
+  return {
+    context,
+    og: allOutlets ? "true" : "false",
+    allOutlets,
+    window: { ...resolved, ...windowInstants(resolved, tz) },
+    tz,
+  };
+}
+
+async function misMeta(mc: MisContext, report: string, title: string, notes: string[]): Promise<MisReportMeta> {
+  let outletName: string | null = null;
+  if (!mc.allOutlets) {
+    try {
+      const rows = await runQuery<{ outlet_name: string | null }>(
+        `select outlet_name from "Outlets" where id = $1 and res_id = $2 limit 1`,
+        [mc.context.outlet_id, mc.context.res_id],
+      );
+      outletName = rows[0]?.outlet_name ?? null;
+    } catch { outletName = null; }
+  }
+  return {
+    report,
+    title,
+    window: { from: mc.window.from, to: mc.window.to, days: mc.window.days, source: mc.window.source, clamped: mc.window.clamped },
+    timezone: mc.tz,
+    outlet_scope: mc.allOutlets ? "all" : "outlet",
+    outlet_id: mc.allOutlets ? null : mc.context.outlet_id,
+    outlet_name: outletName,
+    generated_at: new Date().toISOString(),
+    notes,
+  };
+}
+
+function misPageOf(q: MisReportQuery, total: number): MisPage {
+  const limit = Math.max(1, Math.min(Math.round(parseNumeric(q.limit) || MIS_DEFAULT_PAGE), MIS_MAX_PAGE));
+  const offset = Math.max(0, Math.min(Math.round(parseNumeric(q.offset) || 0), 1_000_000));
+  return { limit, offset, total, has_more: offset + limit < total };
+}
+
+function misSearch(q: MisReportQuery): string | null {
+  const raw = Array.isArray(q.search) ? q.search[0] : q.search;
+  const s = typeof raw === "string" ? raw.trim().slice(0, 120) : "";
+  return s.length > 0 ? s : null;
+}
+
+function misBucketMode(q: MisReportQuery): "day" | "hour" {
+  const raw = Array.isArray(q.bucket) ? q.bucket[0] : q.bucket;
+  return String(raw ?? "").trim().toLowerCase() === "hour" ? "hour" : "day";
+}
+
+// --- Reading a capture table that may not exist yet --------------------------
+//
+// THE DEGRADATION RULE, stated once for both halves of migrations 034-039: the
+// rollout order is migration, then backend, so between the two every statement
+// against a capture table raises 42P01 (or 42501 when the grants half did not
+// run). A WRITE must not degrade — see the MIS DATA CAPTURE section's header for
+// why silently accepting an unrecorded comp is worse than refusing it. A READ
+// degrades to empty, loudly, because a control report that refuses to open is
+// worse than one that opens and says the feature is not configured here yet.
+//
+// Defined here rather than beside the writers because the six capture-fed
+// REPORTS below reach it first, and one definition is what keeps the two halves
+// catching the same two SQLSTATEs.
+
+/**
+ * "That migration has not run here yet", as a SQLSTATE test.
+ *
+ *   42P01 undefined_table          — 034/035/036/037/038/039 created a table.
+ *   42501 insufficient_privilege   — the table exists, the GRANT half did not run.
+ *   42703 undefined_column         — 038 added "Bills".counter_id and
+ *                                    "CashSessions".counter_id to EXISTING tables,
+ *                                    so its unapplied state is a missing column
+ *                                    rather than a missing table. Without this
+ *                                    third code the Counter Summary would 500 on
+ *                                    a tenant that is one migration behind, which
+ *                                    is precisely the window this guard exists for.
+ *
+ * READS ONLY. No write path calls captureRead — see the MIS DATA CAPTURE header.
+ */
+function isCaptureTableMissing(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  return code === "42P01" || code === "42501" || code === "42703";
+}
+
+/** Run a capture READ, degrading to `fallback` when its migration is unapplied. */
+async function captureRead<T>(what: string, run: () => Promise<T>, fallback: T): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (!isCaptureTableMissing(err)) {throw err;}
+    logger.warn({ what }, "mis_capture_table_missing");
+    return fallback;
+  }
+}
+
+// --- Non-chargeable, BESIDE the ladder (migration 034) -----------------------
+//
+// A COMP IS NOT A RUNG, and this is where that rule is enforced rather than
+// merely stated. MarkOrderItemNonChargeable reduces the order's chargeable
+// subtotal, so by the time a bill settles its total_amt is ALREADY net of every
+// comp on it: `gross`, `net` and `grand_total` are all correct without any
+// knowledge that a comp happened. Adding the comp back would invent revenue the
+// guest was never charged; leaving it out altogether would hide revenue that was
+// given away. So it rides alongside as its own figure, in its own column, and
+// the notes of every report that carries one say which clock it is on.
+//
+// THE CLOCK. These rows are bucketed by the MOMENT OF THE COMP
+// ("OrderItemNonChargeable".created_at), not by settlement, because a comp has
+// no settlement of its own — the same reason Item Wise buckets by placement. On
+// a normal day the two coincide; on a table that opens before midnight and pays
+// after it they do not, and the payload says so rather than pretending.
+//
+// A REVERSED COMP GAVE AWAY NOTHING. Its money is reported under `reversed_*`
+// and contributes zero to `value`, so "12 comps, 2 of them overturned" reads as
+// 10 comps' worth of money and 12 rows — which is the fact a control reader is
+// after. Filtering reversed rows out entirely would hide the argument.
+
+/** What was given away in a window, and what was given away and then taken back. */
+export interface MisNonChargeableTotals {
+  /** LIVE comps only: the money the guest was not charged. */
+  value: number;
+  /** Units comped, live rows only. */
+  qty: number;
+  entries: number;
+  reversed_value: number;
+  reversed_entries: number;
+}
+
+/** One "OrderItemNonChargeable" row, reduced to what a report sums. */
+interface MisNcRow {
+  created_at: Date | string;
+  outlet_id: string;
+  quantity: number | string;
+  value: number | string;
+  reversed: boolean;
+}
+
+export function zeroNonChargeable(): MisNonChargeableTotals {
+  return { value: 0, qty: 0, entries: 0, reversed_value: 0, reversed_entries: 0 };
+}
+
+function addNonChargeable(acc: MisNonChargeableTotals, r: MisNcRow): MisNonChargeableTotals {
+  const value = round2(parseNumeric(r.value));
+  if (r.reversed) {
+    acc.reversed_value = round2(acc.reversed_value + value);
+    acc.reversed_entries += 1;
+    return acc;
+  }
+  acc.value = round2(acc.value + value);
+  acc.qty = round2(acc.qty + parseNumeric(r.quantity));
+  acc.entries += 1;
+  return acc;
+}
+
+/**
+ * Every comp in the window, degrading to none before migration 034.
+ *
+ * Deliberately NOT paginated, for the same reason fetchMisBills is not: a totals
+ * figure cannot be computed from a page, and the span cap in report_window.ts is
+ * what bounds it. Comps are a low-volume control table by construction — a
+ * restaurant that gives away hundreds of dishes a day has a bigger problem than
+ * this query.
+ */
+async function fetchMisNonChargeables(mc: MisContext): Promise<MisNcRow[]> {
+  return captureRead("OrderItemNonChargeable", () => runQuery<MisNcRow>(
+    `select created_at, outlet_id, quantity, value, (reversed_at is not null) as reversed
+       from "OrderItemNonChargeable"
+      where res_id = $1 and (${mc.og} or outlet_id = $2)
+        and created_at >= $3 and created_at < $4`,
+    [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
+  ), [] as MisNcRow[]);
+}
+
+function misNcTotals(rows: readonly MisNcRow[]): MisNonChargeableTotals {
+  const acc = zeroNonChargeable();
+  for (const r of rows) {addNonChargeable(acc, r);}
+  return acc;
+}
+
+/** The comps of a window, cut by outlet — the Executive Summary's per-branch column. */
+function misNcByOutlet(rows: readonly MisNcRow[]): Map<string, MisNonChargeableTotals> {
+  const out = new Map<string, MisNonChargeableTotals>();
+  for (const r of rows) {
+    const acc = out.get(r.outlet_id) ?? zeroNonChargeable();
+    addNonChargeable(acc, r);
+    out.set(r.outlet_id, acc);
+  }
+  return out;
+}
+
+/** The comps of a window, cut into the SAME bucket keys misSeries uses. */
+function misNcByBucket(rows: readonly MisNcRow[], tz: string, mode: "day" | "hour"): Map<string, MisNonChargeableTotals> {
+  const out = new Map<string, MisNonChargeableTotals>();
+  for (const r of rows) {
+    const clock = zonedClockParts(r.created_at, tz);
+    if (!clock) {continue;}
+    const key = mode === "hour" ? `${clock.key}T${String(clock.hour).padStart(2, "0")}` : clock.key;
+    const acc = out.get(key) ?? zeroNonChargeable();
+    addNonChargeable(acc, r);
+    out.set(key, acc);
+  }
+  return out;
+}
+
+/** The note every report that carries an NC figure states out loud. */
+const NOTE_NC_BESIDE_LADDER =
+  "Non-chargeable (comped) items are NOT part of the sales ladder: a settled bill's total is already net of them, so adding them back would invent revenue that was never charged. They are reported beside it as the revenue that was given away.";
+const NOTE_NC_CLOCK =
+  "Non-chargeable figures are bucketed by the moment the item was COMPED, not by when the bill settled — a comp has no settlement of its own. On a table that opens before midnight and pays after it, the two fall on different days.";
+const NOTE_NC_REVERSED =
+  "A comp that a manager reversed gave away nothing: its money reads 0 in the live columns and is carried under Reversed instead, so every money column still adds up to its own total.";
+
+// --- The shared bill read ----------------------------------------------------
+
+/**
+ * The LADDER COLUMNS of every settled bill in the window — the one read that
+ * feeds the totals of eight of the nine reports.
+ *
+ * Deliberately NOT paginated, and that is not an oversight: a totals row and a
+ * TOTALS-must-reconcile guarantee cannot be computed from a page. getSettledBills
+ * (which GetSalesReport has always used) fetches the same window unbounded for
+ * exactly this reason; the span cap in report_window.ts is what bounds it.
+ *
+ * The seating lateral is the covers source. It matches CLOSED_BILL_JOINS's
+ * predicate but keys on the SETTLEMENT instant rather than closed_at alone, so a
+ * bill that was admin-approved and never closed still finds its party.
+ */
+interface MisBillRow {
+  id: string;
+  bill_no: string | null;
+  outlet_id: string;
+  settled_at: Date | string;
+  total_amt: number | string | null;
+  tax_breakdown: unknown;
+  payment_method: string | null;
+  payment_splits: unknown;
+  discount_type: string | null;
+  discount_value: number | string | null;
+  coupon_code: string | null;
+  refund_amount: number | string | null;
+  session_id: string | null;
+  session_covers: number | null;
+}
+
+/**
+ * The item array of an order, or an empty array when `food` does not hold one.
+ *
+ * jsonb_array_elements and jsonb_array_length both RAISE on a value that is not
+ * an array, and "Orders".food is an unvalidated JSON blob written by several
+ * clients over several years. One malformed row would therefore 500 an entire
+ * report rather than costing it one order — and a control document that refuses
+ * to open is worse than one with a gap in it. The existing analytics readers
+ * take that risk; these do not.
+ */
+const MIS_ITEMS_JSON = `case when jsonb_typeof((o.food)::jsonb->'items') = 'array'
+                             then (o.food)::jsonb->'items' else '[]'::jsonb end`;
+
+const MIS_SETTLED_PREDICATE = `
+  (b.admin_approved_at is not null or b.closed_at is not null)
+  and coalesce(b.closed_at, b.admin_approved_at) >= $3
+  and coalesce(b.closed_at, b.admin_approved_at) < $4
+`;
+
+/** The seating a bill belongs to. Same rule as CLOSED_BILL_JOINS; see above. */
+const MIS_SESSION_LATERAL = `
+  left join lateral (
+    select ts.id as session_id, ts.covers
+      from "TableSessions" ts
+     where ts.table_id = b.table_id and ts.res_id = b.res_id
+       and ts.seated_at <= coalesce(b.closed_at, b.admin_approved_at)
+       and (ts.left_at is null
+            or ts.left_at >= coalesce(b.closed_at, b.admin_approved_at) - interval '5 seconds')
+     order by ts.seated_at desc
+     limit 1
+  ) s on true
+`;
+
+async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
+  await ensureBillWorkflowColumns();
+  await ensureTableSessionsTable();
+  return runQuery<MisBillRow>(
+    `select b.id, b.bill_no::text as bill_no, b.outlet_id,
+            coalesce(b.closed_at, b.admin_approved_at) as settled_at,
+            b.total_amt, b.tax_breakdown, b.payment_method, b.payment_splits,
+            b.discount_type, b.discount_value, b.coupon_code,
+            coalesce(b.refund_amount, 0) as refund_amount,
+            s.session_id, s.covers as session_covers
+       from "Bills" b
+       ${MIS_SESSION_LATERAL}
+      where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
+        and ${MIS_SETTLED_PREDICATE}
+      order by coalesce(b.closed_at, b.admin_approved_at) asc, b.id asc`,
+    [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
+  );
+}
+
+/** One bill turned into ladder money + the seating it should count covers for. */
+interface MisBill {
+  row: MisBillRow;
+  money: BillMoney;
+  day: string;
+  hour: number;
+  session_id: string | null;
+  covers: number;
+}
+
+/**
+ * Compose the fetched bills onto the ladder.
+ *
+ * `scPct` is read once for the whole set, not per bill, so the service-charge
+ * classification here is identical to the one the bill-detail screen shows.
+ */
+function composeMisBills(rows: MisBillRow[], scPct: number, tz: string): MisBill[] {
+  return rows.map((row) => {
+    const grand = round2(parseNumeric(row.total_amt));
+    const charges = closedBillCharges(grand, parseTaxLines(row.tax_breakdown), scPct);
+    const clock = zonedClockParts(row.settled_at, tz);
+    return {
+      row,
+      money: composeBillMoney({
+        grand_total: grand,
+        charges,
+        discount_type: row.discount_type,
+        discount_value: parseNumeric(row.discount_value),
+        refund_amount: parseNumeric(row.refund_amount),
+      }),
+      day: clock?.key ?? "",
+      hour: clock?.hour ?? 0,
+      session_id: row.session_id,
+      covers: row.session_id ? Math.max(1, Math.round(parseNumeric(row.session_covers)) || 1) : 0,
+    };
+  });
+}
+
+/**
+ * Sum a bill set onto the ladder, counting each SEATING's covers exactly once.
+ *
+ * `firstSeen` is threaded so a session that settles two bills on two different
+ * days is still one party: it counts on the first day it appears, which keeps
+ * Σ by_day.covers exactly equal to the window's covers. Counting it in both days
+ * would make the day rows add up to more than the window, and a totals row that
+ * does not equal the sum of its own rows is the one thing an auditor checks first.
+ */
+function ladderOf(bills: MisBill[], seenSessions?: Set<string>): LadderTotals {
+  const acc = zeroLadder();
+  const seen = seenSessions ?? new Set<string>();
+  for (const b of bills) {
+    addToLadder(acc, b.money);
+    if (b.session_id && !seen.has(b.session_id)) {
+      seen.add(b.session_id);
+      acc.covers += b.covers;
+    }
+  }
+  return acc;
+}
+
+/** Ladder + the derived per-bill / per-cover figures every summary reports. */
+export interface MisLadder extends LadderTotals {
+  /** net ÷ covers — PRE-TAX, the house APC convention. */
+  apc: number | null;
+  /** grand_total ÷ bills — the number on the paper the guest was handed. */
+  abv: number | null;
+  /** Bills whose seating could not be resolved, so they carry no covers. */
+  bills_without_covers: number;
+}
+
+function misLadder(bills: MisBill[], seenSessions?: Set<string>): MisLadder {
+  const totals = ladderOf(bills, seenSessions);
+  return {
+    ...totals,
+    apc: perCover(totals.net, totals.covers),
+    abv: averageBillValue(totals.grand_total, totals.bills),
+    bills_without_covers: bills.filter((b) => !b.session_id).length,
+  };
+}
+
+/** Bucket key for the time-wise toggle, in the TENANT's calendar. */
+function misBucketKey(b: MisBill, mode: "day" | "hour"): string {
+  return mode === "hour" ? `${b.day}T${String(b.hour).padStart(2, "0")}` : b.day;
+}
+
+/**
+ * Widen a ladder series with the comped money of each bucket, and ADD a bucket
+ * for a period that comped something and settled nothing.
+ *
+ * The zero-ladder row is the point. misSeries builds its buckets from bills, so
+ * a Tuesday on which a manager gave away four dishes and the restaurant took no
+ * money would have no row at all — and the NC column would then sum to less than
+ * its own total, which is exactly the discrepancy these reports exist to make
+ * impossible. The added row is truthful: no bills, no covers, no money, and the
+ * comps that did happen.
+ */
+function misNcCompletedSeries(
+  series: (MisLadder & { bucket: string })[],
+  ncByBucket: Map<string, MisNonChargeableTotals>,
+): (MisLadder & { bucket: string; nc_value: number; nc_qty: number })[] {
+  const out = series.map((row) => {
+    const b = ncByBucket.get(row.bucket);
+    return { ...row, nc_value: b?.value ?? 0, nc_qty: b?.qty ?? 0 };
+  });
+  const seen = new Set(series.map((r) => r.bucket));
+  for (const [bucket, v] of ncByBucket) {
+    if (seen.has(bucket) || (v.value === 0 && v.qty === 0)) {continue;}
+    out.push({
+      bucket,
+      ...misLadder([]),
+      nc_value: v.value,
+      nc_qty: v.qty,
+    });
+  }
+  return out.sort((a, z) => a.bucket.localeCompare(z.bucket));
+}
+
+/** by_day / by_hour series, covers attributed to a session's FIRST bucket only. */
+function misSeries(bills: MisBill[], mode: "day" | "hour"): (MisLadder & { bucket: string })[] {
+  const buckets = new Map<string, MisBill[]>();
+  for (const b of bills) {
+    if (!b.day) {continue;}
+    const key = misBucketKey(b, mode);
+    const list = buckets.get(key);
+    if (list) {list.push(b);} else {buckets.set(key, [b]);}
+  }
+  const seen = new Set<string>();
+  return [...buckets.entries()]
+    .sort((a, z) => a[0].localeCompare(z[0]))
+    .map(([bucket, list]) => ({ bucket, ...misLadder(list, seen) }));
+}
+
+// --- 1. Item Wise ------------------------------------------------------------
+
+export interface ItemWiseRow {
+  name: string;
+  /** Recovered by joining the item NAME to the menu — see the report's notes. */
+  category: string | null;
+  qty: number;
+  /** Σ price × quantity at the price stored on the order line. Menu-price value. */
+  gross_amount: number;
+  /** Always 0 — discounts in this system are BILL-level. See the notes. */
+  discount_amount: number;
+  net_amount: number;
+  /**
+   * Units of this dish that were made and served but NOT charged for
+   * (migration 034). Counted INSIDE qty, never subtracted from it — the food was
+   * cooked. See the report's notes.
+   */
+  nc_qty: number;
+  /** Menu-price value of those units: the revenue given away on this dish. */
+  nc_value: number;
+  avg_selling_price: number | null;
+  /** Share of the report's total gross. */
+  contribution_pct: number | null;
+  dine_in_qty: number;
+  takeaway_qty: number;
+  delivery_qty: number;
+  other_qty: number;
+}
+
+export interface ItemWiseReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: ItemWiseRow[];
+  totals: {
+    items: number;
+    qty: number;
+    gross_amount: number;
+    discount_amount: number;
+    net_amount: number;
+    nc_qty: number;
+    nc_value: number;
+    dine_in_qty: number;
+    takeaway_qty: number;
+    delivery_qty: number;
+    other_qty: number;
+  };
+  page: MisPage;
+  /** The window's BILL-level discount, so the money given away is never hidden. */
+  bill_level_discount: number;
+  /** False — the category column is a name join and a rename silently breaks it. */
+  category_exact: boolean;
+}
+
+const ITEM_WISE_COLUMNS: MisColumn[] = [
+  { key: "name", label: "Item", type: "text" },
+  { key: "category", label: "Category", type: "text" },
+  { key: "qty", label: "Qty", type: "int", total: true },
+  { key: "gross_amount", label: "Gross", type: "money", total: true },
+  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
+  { key: "net_amount", label: "Net", type: "money", total: true },
+  { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
+  { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
+  { key: "avg_selling_price", label: "Avg selling price", type: "money" },
+  { key: "contribution_pct", label: "% contribution", type: "percent" },
+  { key: "dine_in_qty", label: "Dine-in", type: "int", total: true },
+  { key: "takeaway_qty", label: "Takeaway", type: "int", total: true },
+  { key: "delivery_qty", label: "Delivery", type: "int", total: true },
+  { key: "other_qty", label: "Other", type: "int", total: true, default_on: false },
+];
+
+/**
+ * ITEM WISE — what sold, how much of it, and what share of the money.
+ *
+ * THE ONE REPORT NOT BUCKETED ON SETTLEMENT, and it cannot be. An item has no
+ * settlement instant of its own; only the bill it ends up on does. So this
+ * aggregates by ORDER PLACEMENT time, which means it will NOT tie to the Sales
+ * Summary for the same window — an order placed at 23:50 and settled at 00:10
+ * lands in different days in the two views. The payload says so rather than
+ * inviting the reader to subtract one from the other.
+ *
+ * THREE MORE THINGS THE SCHEMA FORCES, all declared in `notes`:
+ *   * "Orders".food is a JSON blob and there is NO OrderItems table, so an item
+ *     line carries a NAME, a price and a quantity — no menu id, no category, no
+ *     variation. Aggregation is therefore by name string.
+ *   * Category is recovered by joining that name to the current menu. Rename a
+ *     dish and the join silently stops matching, which is why `category_exact`
+ *     is false and the UI is expected to label the column as indicative.
+ *   * The money is the MENU PRICE. Discounts here are applied to the BILL, never
+ *     to a line, so item net equals item gross and `discount_amount` is a
+ *     truthful zero. The window's bill-level discount is reported alongside
+ *     rather than smeared across the lines as an invented per-item number.
+ */
+export async function GetItemWiseReport(restaurantId: string, q: MisReportQuery = {}): Promise<ItemWiseReport> {
+  const mc = await misContext(restaurantId, q);
+  const search = misSearch(q);
+
+  const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
+  let searchSql = "";
+  if (search) {
+    params.push(`%${search}%`);
+    searchSql = ` and item->>'name' ilike $${String(params.length)}`;
+  }
+
+  const rows = await runQuery<{ name: string; channel: string; nc: boolean; qty: number; gross: number }>(
+    `with it as (
+       select item->>'name' as name,
+              -- The comp flag, matched EXACTLY as isNonChargeableLine matches it:
+              -- the jsonb boolean true and nothing else. A ::boolean cast would
+              -- also accept '1' and would RAISE on anything else a client ever
+              -- wrote there, so one malformed line would 500 the whole report.
+              coalesce((item->'nc') = 'true'::jsonb, false) as nc,
+              coalesce((item->>'quantity')::numeric, 1) as qty,
+              coalesce((item->>'price')::numeric, 0) as price,
+              coalesce(nullif(trim((o.food)::jsonb->>'order_type'), ''), 'dine_in') as channel
+         from "Orders" o, jsonb_array_elements(${MIS_ITEMS_JSON}) item
+        where o.res_id = $1 and (${mc.og} or o.outlet_id = $2)
+          and o.created_at >= $3 and o.created_at < $4
+          -- Cancelled is not a sale. Same exclusion as every other revenue read.
+          and coalesce(o.status::text, '1') <> '5'
+          ${searchSql}
+     )
+     select name, channel, nc, sum(qty)::float as qty, sum(price * qty)::float as gross
+       from it
+      where coalesce(name, '') <> ''
+      group by name, channel, nc`,
+    params,
+  );
+
+  // Category, best-effort, by NAME. A menu read is one query for the whole
+  // report; failing it must not fail the report, so it degrades to null.
+  const categoryByName = new Map<string, string>();
+  try {
+    for (const m of await GetMenuItems(restaurantId)) {
+      if (m.name.trim()) {categoryByName.set(m.name.trim().toLowerCase(), m.category);}
+    }
+  } catch { /* category stays null — declared in the notes */ }
+
+  interface Acc {
+    name: string; qty: number; gross: number; nc_qty: number; nc_value: number;
+    dine_in: number; takeaway: number; delivery: number; other: number;
+  }
+  const byName = new Map<string, Acc>();
+  for (const r of rows) {
+    const key = r.name.trim().toLowerCase();
+    const acc = byName.get(key)
+      ?? { name: r.name.trim(), qty: 0, gross: 0, nc_qty: 0, nc_value: 0, dine_in: 0, takeaway: 0, delivery: 0, other: 0 };
+    const qty = Number(r.qty) || 0;
+    acc.qty = round2(acc.qty + qty);
+    acc.gross = round2(acc.gross + (Number(r.gross) || 0));
+    // Comped units stay INSIDE qty and gross — the dish was made and served —
+    // and are reported again here as the part that was given away. Netting them
+    // out of gross would silently change what this report has always meant by
+    // "sold", and would put it out of step with the Group and Variation
+    // summaries, which cut the same lines.
+    if (r.nc) {
+      acc.nc_qty = round2(acc.nc_qty + qty);
+      acc.nc_value = round2(acc.nc_value + (Number(r.gross) || 0));
+    }
+    switch (orderChannel(r.channel)) {
+      case "dine_in": acc.dine_in = round2(acc.dine_in + qty); break;
+      case "takeaway": acc.takeaway = round2(acc.takeaway + qty); break;
+      case "delivery": acc.delivery = round2(acc.delivery + qty); break;
+      default: acc.other = round2(acc.other + qty); break;
+    }
+    byName.set(key, acc);
+  }
+
+  const all = [...byName.entries()].sort((a, z) => z[1].gross - a[1].gross);
+  const totalGross = round2(all.reduce((s, [, a]) => s + a.gross, 0));
+  const totals = {
+    items: all.length,
+    qty: round2(all.reduce((s, [, a]) => s + a.qty, 0)),
+    gross_amount: totalGross,
+    discount_amount: 0,
+    net_amount: totalGross,
+    nc_qty: round2(all.reduce((s, [, a]) => s + a.nc_qty, 0)),
+    nc_value: round2(all.reduce((s, [, a]) => s + a.nc_value, 0)),
+    dine_in_qty: round2(all.reduce((s, [, a]) => s + a.dine_in, 0)),
+    takeaway_qty: round2(all.reduce((s, [, a]) => s + a.takeaway, 0)),
+    delivery_qty: round2(all.reduce((s, [, a]) => s + a.delivery, 0)),
+    other_qty: round2(all.reduce((s, [, a]) => s + a.other, 0)),
+  };
+
+  const page = misPageOf(q, all.length);
+  const rowsOut: ItemWiseRow[] = all.slice(page.offset, page.offset + page.limit).map(([key, a]) => ({
+    name: a.name,
+    category: categoryByName.get(key) ?? null,
+    qty: a.qty,
+    gross_amount: a.gross,
+    discount_amount: 0,
+    net_amount: a.gross,
+    nc_qty: a.nc_qty,
+    nc_value: a.nc_value,
+    avg_selling_price: a.qty > 0 ? round2(a.gross / a.qty) : null,
+    contribution_pct: sharePct(a.gross, totalGross),
+    dine_in_qty: a.dine_in,
+    takeaway_qty: a.takeaway,
+    delivery_qty: a.delivery,
+    other_qty: a.other,
+  }));
+
+  // The bill-level discount for the SAME window, on the settled-bill basis, so
+  // the money given away is visible next to the item lines instead of missing.
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const billLadder = misLadder(composeMisBills(await fetchMisBills(mc), scPct, mc.tz));
+
+  return {
+    meta: await misMeta(mc, "item_wise", "Item Wise", [
+      "Aggregated by ORDER PLACEMENT time, not settlement time — this is the only one of the nine that is. It therefore will NOT tie exactly to the Sales Summary for the same dates.",
+      NOTE_CANCELLED_EXCLUDED,
+      "There is no OrderItems table: an order line carries only a name, a price and a quantity. Items are aggregated by NAME, so renaming a dish splits its history into two rows.",
+      "Category is recovered by matching the item name against the CURRENT menu. A renamed or deleted menu item shows no category. Treat this column as indicative, not exact.",
+      "Amounts are the MENU PRICE charged on the line (price × quantity) — before any bill-level discount, service charge or tax.",
+      "Discounts in this system are applied to the BILL, never to a line, so item discount is a truthful 0 and net equals gross. The window's bill-level discount is reported as bill_level_discount.",
+      "NC qty / NC value are the part of this dish that was served but never charged for. They are counted INSIDE Qty and Gross — the food was made — and shown again separately as the revenue given away. Every bill total elsewhere is already net of them.",
+    ]),
+    columns: ITEM_WISE_COLUMNS,
+    rows: rowsOut,
+    totals,
+    page,
+    bill_level_discount: billLadder.discount,
+    category_exact: false,
+  };
+}
+
+// --- 2. Discount -------------------------------------------------------------
+
+export interface DiscountReportRow {
+  bill_id: string;
+  bill_no: string | null;
+  settled_at: string;
+  table_name: string | null;
+  /** "percent" | "flat" — as stored. A coupon is always written flat. */
+  discount_type: string | null;
+  /** The RAW stored value: a percentage for "percent", money for "flat". */
+  discount_value: number;
+  /** The MONEY it removed. `estimated` when reconstructed from a percentage. */
+  discount_amount: number;
+  estimated: boolean;
+  coupon_code: string | null;
+  reason: string | null;
+  /** From an approval request, when the discount went through one. */
+  requested_by: string | null;
+  approved_by: string | null;
+  gross: number;
+  net: number;
+  grand_total: number;
+}
+
+export interface DiscountReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: DiscountReportRow[];
+  totals: {
+    discounted_bills: number;
+    estimated_bills: number;
+    discount_amount: number;
+    gross: number;
+    net: number;
+    grand_total: number;
+    /** Discount as a share of the window's gross — the number that gets watched. */
+    discount_pct_of_gross: number | null;
+  };
+  page: MisPage;
+}
+
+const DISCOUNT_COLUMNS: MisColumn[] = [
+  { key: "settled_at", label: "Date & time", type: "datetime" },
+  { key: "bill_no", label: "Bill No.", type: "text" },
+  { key: "table_name", label: "Table", type: "text" },
+  { key: "discount_type", label: "Type", type: "text" },
+  { key: "discount_value", label: "Value", type: "money" },
+  { key: "discount_amount", label: "Discount", type: "money", total: true },
+  { key: "coupon_code", label: "Code", type: "text" },
+  { key: "reason", label: "Reason", type: "text" },
+  { key: "requested_by", label: "Requested by", type: "text" },
+  { key: "approved_by", label: "Approved by", type: "text" },
+  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "net", label: "Net", type: "money", total: true },
+  { key: "grand_total", label: "Grand total", type: "money", total: true },
+];
+
+/**
+ * DISCOUNT — every discount given away in the window, one row per BILL.
+ *
+ * BILL-LEVEL, and only bill-level, because that is the only level this schema
+ * has: "Bills" carries discount_type / discount_value / coupon_code / reason and
+ * there is nowhere to record a discount against a line. A per-item discount
+ * column here would be a fiction.
+ *
+ * APPLIED-BY IS NOT ALWAYS KNOWABLE, and the report says which. A discount over
+ * the approval threshold is parked as a "DiscountRequests" row that records
+ * requested_by and decided_by, so those bills name both people. One applied
+ * directly (under the threshold) writes only the type and the value onto the
+ * bill — no actor column exists — so both fields are null rather than guessed at
+ * from a nearby audit entry.
+ */
+export async function GetDiscountReport(restaurantId: string, q: MisReportQuery = {}): Promise<DiscountReport> {
+  const mc = await misContext(restaurantId, q);
+  await ensureBillWorkflowColumns();
+  await ensureTableSessionsTable();
+  await ensureDiscountRequestsTable();
+  const search = misSearch(q);
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+
+  const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
+  const where: string[] = [
+    `b.res_id = $1`,
+    `(${mc.og} or b.outlet_id = $2)`,
+    MIS_SETTLED_PREDICATE.trim(),
+    // A discount OR a coupon: a 100%-off gift voucher can leave discount_value 0.
+    `(coalesce(b.discount_value, 0) > 0 or coalesce(b.coupon_code, '') <> '')`,
+  ];
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${String(params.length)}`;
+    where.push(`(b.bill_no::text ilike ${p} or t.table_name ilike ${p} or coalesce(b.coupon_code,'') ilike ${p} or b.id::text ilike ${p})`);
+  }
+  const whereSql = where.join(" and ");
+
+  const countRows = await runQuery<{ total: string }>(
+    `select count(*)::text as total
+       from "Bills" b
+       left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+      where ${whereSql}`,
+    params,
+  );
+  const page = misPageOf(q, Math.max(0, Math.round(Number(countRows[0]?.total ?? 0))));
+
+  params.push(page.limit); const limIdx = `$${String(params.length)}`;
+  params.push(page.offset); const offIdx = `$${String(params.length)}`;
+  const rows = await runQuery<{
+    id: string; bill_no: string | null; settled_at: Date | string; table_name: string | null;
+    total_amt: number | string | null; tax_breakdown: unknown;
+    discount_type: string | null; discount_value: number | string | null;
+    coupon_code: string | null; reason: string | null;
+    refund_amount: number | string | null;
+    requested_by: string | null; decided_by: string | null;
+  }>(
+    `select b.id, b.bill_no::text as bill_no,
+            coalesce(b.closed_at, b.admin_approved_at) as settled_at,
+            t.table_name, b.total_amt, b.tax_breakdown,
+            b.discount_type, b.discount_value, b.coupon_code, b.reason,
+            coalesce(b.refund_amount, 0) as refund_amount,
+            d.requested_by, d.decided_by
+       from "Bills" b
+       left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+       -- outlet_id is NULLABLE on "DiscountRequests", so it is not part of the
+       -- join key (see the Attention feed's note on the same table).
+       left join lateral (
+         select dr.requested_by, dr.decided_by
+           from "DiscountRequests" dr
+          where dr.bill_id = b.id and dr.res_id = b.res_id
+          order by dr.created_at desc
+          limit 1
+       ) d on true
+      where ${whereSql}
+      order by coalesce(b.closed_at, b.admin_approved_at) desc, b.id desc
+      limit ${limIdx} offset ${offIdx}`,
+    params,
+  );
+
+  const out: DiscountReportRow[] = rows.map((r) => {
+    const grand = round2(parseNumeric(r.total_amt));
+    const charges = closedBillCharges(grand, parseTaxLines(r.tax_breakdown), scPct);
+    const money = composeBillMoney({
+      grand_total: grand,
+      charges,
+      discount_type: r.discount_type,
+      discount_value: parseNumeric(r.discount_value),
+      refund_amount: parseNumeric(r.refund_amount),
+    });
+    return {
+      bill_id: r.id,
+      bill_no: r.bill_no,
+      settled_at: iso(r.settled_at) ?? "",
+      table_name: r.table_name,
+      discount_type: r.discount_type,
+      discount_value: round2(parseNumeric(r.discount_value)),
+      discount_amount: money.discount,
+      estimated: money.discount_estimated,
+      coupon_code: r.coupon_code?.trim() || null,
+      reason: r.reason?.trim() || null,
+      requested_by: r.requested_by?.trim() || null,
+      approved_by: r.decided_by?.trim() || null,
+      gross: money.gross,
+      net: money.net,
+      grand_total: money.grand_total,
+    };
+  });
+
+  // Totals span the WHOLE window, never the page — a totals row computed from a
+  // page is the classic way a control report understates what was given away.
+  const windowBills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
+  const ladder = misLadder(windowBills);
+  const discounted = windowBills.filter((b) => b.money.discount > 0 || b.money.discount_estimated);
+  const discountedLadder = misLadder(discounted);
+
+  return {
+    meta: await misMeta(mc, "discount", "Discount", [
+      NOTE_SETTLEMENT_BASIS,
+      "Discounts in this system are BILL-level: there is no per-item discount to report.",
+      NOTE_DISCOUNT_ESTIMATE,
+      "Requested by / Approved by are populated only for discounts that went through the approval threshold. A discount applied directly records no actor, and both columns stay blank rather than being inferred.",
+      "Bill totals are already NET of these discounts — this report is context, never a figure to subtract from revenue a second time.",
+    ]),
+    columns: DISCOUNT_COLUMNS,
+    rows: out,
+    totals: {
+      discounted_bills: ladder.discounted_bills,
+      estimated_bills: ladder.estimated_discount_bills,
+      discount_amount: ladder.discount,
+      gross: discountedLadder.gross,
+      net: discountedLadder.net,
+      grand_total: discountedLadder.grand_total,
+      discount_pct_of_gross: sharePct(ladder.discount, ladder.gross),
+    },
+    page,
+  };
+}
+
+// --- 3. Void KOT -------------------------------------------------------------
+
+export interface VoidKotRow {
+  order_id: string;
+  /** Always null — see the report's notes on why a KOT number is not recoverable. */
+  kot_no: number | null;
+  table_name: string | null;
+  placed_at: string;
+  /** When the order was moved to Cancelled, from the audit trail. */
+  voided_at: string | null;
+  /** Who moved it, from the audit trail. Null when no entry was written. */
+  voided_by: string | null;
+  order_type: string;
+  item_count: number;
+  qty: number;
+  /** Σ price × quantity — the menu-price value that did NOT become revenue. */
+  value: number;
+  items: { name: string; quantity: number; price: number }[];
+}
+
+export interface VoidKotReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: VoidKotRow[];
+  totals: { voids: number; qty: number; value: number; item_count: number };
+  page: MisPage;
+}
+
+const VOID_KOT_COLUMNS: MisColumn[] = [
+  { key: "placed_at", label: "Placed", type: "datetime" },
+  { key: "voided_at", label: "Voided", type: "datetime" },
+  { key: "order_id", label: "KOT / Order", type: "text" },
+  { key: "table_name", label: "Table", type: "text" },
+  { key: "order_type", label: "Type", type: "text" },
+  { key: "item_count", label: "Lines", type: "int", total: true },
+  { key: "qty", label: "Qty", type: "int", total: true },
+  { key: "value", label: "Value", type: "money", total: true },
+  { key: "voided_by", label: "Voided by", type: "text" },
+];
+
+/**
+ * VOID KOT — the orders that were cancelled, what was on them and who did it.
+ *
+ * A VOID IS "Orders".status = 5. That is the whole of what the schema records: a
+ * cancelled order has no void REASON column, no void STAGE (was it before or
+ * after the food was fired?) and no AUTHORISER field. Rather than invent those
+ * three columns, this report takes the actor and the moment from the audit
+ * entry the cancel path writes (`Order <id> -> Cancelled`), which is real, and
+ * leaves the rest out of this phase.
+ *
+ * KOT NUMBER IS NOT RECOVERABLE, and it is reported as null rather than guessed.
+ * "KotTickets" keys a number by a CONTENT FINGERPRINT of what was sent to the
+ * kitchen (kot_numbers.ts:kotTicketKey — outlet, business day, table, normalised
+ * item set), deliberately not by order id, so a reprint reuses its number. There
+ * is no column joining a KOT number back to an order, and matching one by table
+ * and day would be a guess. In a fraud-control document a guessed identifier is
+ * worse than a blank one, so the order id is the ticket identity here and the
+ * search box matches it.
+ */
+export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery = {}): Promise<VoidKotReport> {
+  const mc = await misContext(restaurantId, q);
+  await ensureAuditLogIndexes();
+  const search = misSearch(q);
+
+  const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
+  const where: string[] = [
+    `o.res_id = $1`,
+    `(${mc.og} or o.outlet_id = $2)`,
+    `coalesce(o.status::text, '1') = '5'`,
+    `o.created_at >= $3`,
+    `o.created_at < $4`,
+  ];
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${String(params.length)}`;
+    where.push(`(o.id::text ilike ${p} or t.table_name ilike ${p} or (o.food)::text ilike ${p})`);
+  }
+  const whereSql = where.join(" and ");
+
+  const countRows = await runQuery<{ total: string }>(
+    `select count(*)::text as total
+       from "Orders" o
+       left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+      where ${whereSql}`,
+    params,
+  );
+  const total = Math.max(0, Math.round(Number(countRows[0]?.total ?? 0)));
+  const page = misPageOf(q, total);
+
+  // Window totals come from their own aggregate rather than the page, for the
+  // same reason every other report's do.
+  const totalRows = await runQuery<{ voids: string; qty: number; value: number; lines: string }>(
+    `with it as (
+       select o.id,
+              coalesce((item->>'quantity')::numeric, 1) as qty,
+              coalesce((item->>'price')::numeric, 0) as price
+         from "Orders" o
+         left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+         left join lateral jsonb_array_elements(${MIS_ITEMS_JSON}) item on true
+        where ${whereSql}
+     )
+     select count(distinct id)::text as voids,
+            coalesce(sum(qty), 0)::float as qty,
+            coalesce(sum(price * qty), 0)::float as value,
+            count(*) filter (where qty is not null)::text as lines
+       from it`,
+    params,
+  );
+
+  params.push(page.limit); const limIdx = `$${String(params.length)}`;
+  params.push(page.offset); const offIdx = `$${String(params.length)}`;
+  const rows = await runQuery<{
+    id: string; created_at: Date | string; table_name: string | null; food: unknown;
+    voided_at: Date | string | null; voided_fname: string | null; voided_lname: string | null; voided_username: string | null;
+  }>(
+    `select o.id, o.created_at, t.table_name, o.food,
+            v.created_at as voided_at, v.fname as voided_fname, v.lname as voided_lname, v.emp_username as voided_username
+       from "Orders" o
+       left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+       -- WHO CANCELLED IT. The status route writes one audit entry per real
+       -- transition into Cancelled (an idempotent re-cancel writes none), keyed
+       -- by order id inside additional_details. Deliberately NOT matched on
+       -- outlet: an admin acting on another branch files the entry against that
+       -- branch, and res_id + order id already identify it uniquely.
+       left join lateral (
+         select l.created_at, e."emp_Fname" as fname, e."emp_Lname" as lname, lg.emp_username
+           from "Audit_logs" l
+           left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id
+           left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
+          where l.res_id = o.res_id
+            and l.additional_details ->> 'order_id' = o.id::text
+            and l.reason ilike '%Cancelled'
+          order by l.created_at desc
+          limit 1
+       ) v on true
+      where ${whereSql}
+      order by o.created_at desc, o.id desc
+      limit ${limIdx} offset ${offIdx}`,
+    params,
+  );
+
+  const out: VoidKotRow[] = rows.map((r) => {
+    const food = parseJsonObject(r.food) ?? {};
+    const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+    let qty = 0, value = 0;
+    const items = list.map((raw) => {
+      const it = (raw ?? {}) as Record<string, unknown>;
+      const quantity = Math.max(1, Math.round(parseNumeric(it.quantity) || 1));
+      const price = round2(parseNumeric(it.price));
+      qty += quantity;
+      value = round2(value + price * quantity);
+      return { name: String(it.name ?? "Item"), quantity, price };
+    });
+    const name = [r.voided_fname, r.voided_lname].filter((x) => (x ?? "").trim()).join(" ").trim();
+    return {
+      order_id: r.id,
+      kot_no: null,
+      table_name: r.table_name,
+      placed_at: iso(r.created_at) ?? "",
+      voided_at: iso(r.voided_at),
+      voided_by: name || r.voided_username?.trim() || null,
+      order_type: orderChannel(food.order_type),
+      item_count: items.length,
+      qty,
+      value,
+      items,
+    };
+  });
+
+  const t = totalRows[0];
+  return {
+    meta: await misMeta(mc, "void_kot", "Void KOT", [
+      "Bucketed by when the order was PLACED, since that is the ticket's own moment. The cancellation time is shown separately.",
+      "A void is an order with status Cancelled. The schema records no void reason, no void stage and no authoriser field, so none are shown.",
+      "Voided by / voided at come from the audit trail entry the cancel path writes. An order cancelled before that entry existed, or by a path that wrote none, shows blank.",
+      "KOT numbers are keyed by a fingerprint of the ticket's CONTENT, not by order id, so a printed KOT number cannot be tied back to an order with certainty. The order id is the ticket identity here.",
+      "Value is the menu-price value of the cancelled lines (price × quantity). It never appeared in revenue.",
+    ]),
+    columns: VOID_KOT_COLUMNS,
+    rows: out,
+    totals: {
+      voids: Math.max(0, Math.round(Number(t?.voids ?? 0))),
+      qty: round2(Number(t?.qty ?? 0)),
+      value: round2(Number(t?.value ?? 0)),
+      item_count: Math.max(0, Math.round(Number(t?.lines ?? 0))),
+    },
+    page,
+  };
+}
+
+// --- 4. Bill Edit ------------------------------------------------------------
+
+export interface BillEditRow {
+  audit_id: string;
+  at: string;
+  kind: BillEditKind;
+  action: string;
+  /** What the writer actually wrote, verbatim. */
+  description: string | null;
+  by: string | null;
+  bill_id: string | null;
+  order_id: string | null;
+  table_name: string | null;
+  item: string | null;
+}
+
+export interface BillEditReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: BillEditRow[];
+  totals: { edits: number; by_kind: { kind: BillEditKind; label: string; count: number }[] };
+  page: MisPage;
+}
+
+const BILL_EDIT_COLUMNS: MisColumn[] = [
+  { key: "at", label: "Date & time", type: "datetime" },
+  { key: "action", label: "Change", type: "text" },
+  { key: "table_name", label: "Table", type: "text" },
+  { key: "bill_id", label: "Bill", type: "text", default_on: false },
+  { key: "order_id", label: "Order / KOT", type: "text", default_on: false },
+  { key: "item", label: "Item", type: "text" },
+  { key: "by", label: "By", type: "text" },
+  { key: "description", label: "Detail", type: "text" },
+];
+
+/**
+ * BILL EDIT — what was changed on a bill after it was generated, and by whom.
+ *
+ * THE AUDIT TRAIL IS THE ONLY SOURCE, and it was not designed as a report. One
+ * action id (4ad474d4…, "Add Orders") covers removing an item from a running
+ * bill, moving an item between tables, applying a discount or a coupon, merging
+ * two tables, editing an item note — AND simply printing a KOT. So entries are
+ * CLASSIFIED, by classifyBillEdit in mis_report_math.ts, from the action id, the
+ * reason text and the shape of additional_details together; anything that does
+ * not classify as an edit is dropped rather than shown as "other".
+ *
+ * NO BEFORE/AFTER AMOUNTS, AND NO COMPUTED DIFFERENCE. `additional_details` is
+ * free-form per call site and not one of the bill-edit writers records the value
+ * before or after the change. Those columns are therefore absent rather than
+ * filled with a number this report would have had to invent.
+ *
+ * PAGING IS OVER THE CLASSIFIED SET, so the total is the number of real edits,
+ * not the number of candidate audit rows. That costs a full-window fetch of the
+ * candidates, which is why the action-id prefilter is done in SQL.
+ */
+export async function GetBillEditReport(restaurantId: string, q: MisReportQuery = {}): Promise<BillEditReport> {
+  const mc = await misContext(restaurantId, q);
+  await ensureAuditLogIndexes();
+  const search = misSearch(q);
+
+  const params: unknown[] = [
+    mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso,
+    [...BILL_EDIT_ACTION_IDS],
+  ];
+  const where: string[] = [
+    `l.res_id = $1`,
+    `(${mc.og} or l.outlet_id = $2)`,
+    `l.created_at >= $3`,
+    `l.created_at < $4`,
+    `l.action_id::text = any($5::text[])`,
+  ];
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${String(params.length)}`;
+    where.push(`(l.reason ilike ${p} or a.action_name ilike ${p} or l.additional_details::text ilike ${p})`);
+  }
+
+  const rows = await runQuery<{
+    id: string; created_at: Date | string; reason: string | null; action_id: string;
+    action_name: string; additional_details: unknown;
+    fname: string | null; lname: string | null; emp_username: string | null;
+  }>(
+    `select l.id, l.created_at, l.reason, l.action_id::text as action_id, a.action_name, l.additional_details,
+            e."emp_Fname" as fname, e."emp_Lname" as lname, lg.emp_username
+       from "Audit_logs" l
+       join "Actions" a on a.id = l.action_id
+       left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id
+       left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
+      where ${where.join(" and ")}
+      order by l.created_at desc, l.id desc`,
+    params,
+  );
+
+  const classified: BillEditRow[] = [];
+  for (const r of rows) {
+    const details = parseJsonObject(r.additional_details);
+    const c = classifyBillEdit(r.action_id, r.reason, details);
+    if (!c) {continue;}
+    const name = [r.fname, r.lname].filter((x) => (x ?? "").trim()).join(" ").trim();
+    classified.push({
+      audit_id: r.id,
+      at: iso(r.created_at) ?? "",
+      kind: c.kind,
+      action: c.label,
+      description: r.reason?.trim() || null,
+      by: name || r.emp_username?.trim() || null,
+      bill_id: c.bill_id,
+      order_id: c.order_id,
+      table_name: c.table,
+      item: c.item,
+    });
+  }
+
+  const byKind = new Map<BillEditKind, { label: string; count: number }>();
+  for (const c of classified) {
+    const e = byKind.get(c.kind) ?? { label: c.action, count: 0 };
+    e.count += 1;
+    byKind.set(c.kind, e);
+  }
+
+  const page = misPageOf(q, classified.length);
+  return {
+    meta: await misMeta(mc, "bill_edit", "Bill Edit", [
+      "Every row is an entry from the immutable audit trail, classified into a kind of change. Entries that are not edits to a bill (printing, order creation, course firing) are not shown.",
+      "No before/after amounts are recorded anywhere by the write paths, so this report shows WHAT changed and WHO changed it, never a value difference. A computed difference here would be fabricated.",
+      "The trail records the outlet the change LANDED on, not the actor's home outlet, so a cross-outlet admin's edits appear under the branch they touched.",
+    ]),
+    columns: BILL_EDIT_COLUMNS,
+    rows: classified.slice(page.offset, page.offset + page.limit),
+    totals: {
+      edits: classified.length,
+      by_kind: [...byKind.entries()].map(([kind, v]) => ({ kind, label: v.label, count: v.count })).sort((a, z) => z.count - a.count),
+    },
+    page,
+  };
+}
+
+// --- 5. Sales Summary --------------------------------------------------------
+
+/** The ladder, plus the comped money that sits beside it. See MIS_NC helpers. */
+export type SalesLadder = MisLadder & { nc_value: number; nc_qty: number };
+
+export interface SalesSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  totals: SalesLadder;
+  /** The time-wise cut: one row per tenant-calendar day, or per hour. */
+  bucket: "day" | "hour";
+  series: (SalesLadder & { bucket: string })[];
+  by_order_type: { order_type: string; bills: number; grand_total: number; share_pct: number | null }[];
+  /**
+   * What was given away in this window (migration 034), in full — including the
+   * comps a manager reversed, which the `nc_value` column deliberately excludes.
+   * NOT a rung of the ladder: see NOTE_NC_BESIDE_LADDER.
+   */
+  non_chargeable: MisNonChargeableTotals;
+}
+
+const SALES_SUMMARY_COLUMNS: MisColumn[] = [
+  { key: "bucket", label: "Period", type: "text" },
+  { key: "bills", label: "Bills", type: "int", total: true },
+  { key: "covers", label: "Covers", type: "int", total: true },
+  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "discount", label: "Discount", type: "money", total: true },
+  { key: "net", label: "Net", type: "money", total: true },
+  { key: "service_charge", label: "Service charge", type: "money", total: true },
+  { key: "tax", label: "Tax", type: "money", total: true },
+  { key: "round_off", label: "Round off", type: "money", total: true, default_on: false },
+  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "refund", label: "Refunds", type: "money", total: true },
+  // Beside the ladder, never inside it — and on the COMP clock, not the
+  // settlement clock the rest of the row is on. Both facts are in the notes and
+  // in the column label, which is what makes carrying it here honest rather than
+  // a second definition of sales.
+  { key: "nc_value", label: "NC given away", type: "money", total: true, default_on: false },
+  { key: "abv", label: "ABV", type: "money" },
+  { key: "apc", label: "APC (pre-tax)", type: "money" },
+];
+
+/**
+ * SALES SUMMARY — the whole ladder for the window, with a time-wise cut.
+ *
+ * THIS IS THE REPORT THE OTHER EIGHT ARE CHECKED AGAINST. `totals.grand_total`
+ * must equal the sum of the Order Summary's rows and the sum of the Settlement
+ * Summary's rows over the same window; jest proves all three, because a control
+ * pack whose three headline numbers disagree is a control pack nobody signs.
+ *
+ * Every rung is composed by mis_report_math.ts. Nothing is recomputed here.
+ */
+export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<SalesSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
+  const bucket = misBucketMode(q);
+  const ncRows = await fetchMisNonChargeables(mc);
+  const nc = misNcTotals(ncRows);
+  const ncByBucket = misNcByBucket(ncRows, mc.tz, bucket);
+
+  // Order type lives in the ORDER's food JSON, so it is one extra grouped read
+  // rather than a column on the bill.
+  const typeRows = await runQuery<{ channel: string; bills: string; total: number }>(
+    `select coalesce(nullif(trim((o.food)::jsonb->>'order_type'), ''), 'dine_in') as channel,
+            count(*)::text as bills,
+            coalesce(sum(b.total_amt), 0)::float as total
+       from "Bills" b
+       join "Orders" o on o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
+      where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
+        and ${MIS_SETTLED_PREDICATE}
+      group by 1`,
+    [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
+  );
+  const typeAcc = new Map<string, { bills: number; total: number }>();
+  for (const r of typeRows) {
+    const key = orderChannel(r.channel);
+    const e = typeAcc.get(key) ?? { bills: 0, total: 0 };
+    e.bills += Math.max(0, Math.round(Number(r.bills) || 0));
+    e.total = round2(e.total + (Number(r.total) || 0));
+    typeAcc.set(key, e);
+  }
+  const typeTotal = round2([...typeAcc.values()].reduce((s, v) => s + v.total, 0));
+
+  return {
+    meta: await misMeta(mc, "sales_summary", "Sales Summary", [
+      NOTE_SETTLEMENT_BASIS,
+      NOTE_CANCELLED_EXCLUDED,
+      NOTE_COVERS_ONCE,
+      NOTE_PER_COVER_PRETAX,
+      NOTE_ROUND_OFF,
+      NOTE_DISCOUNT_ESTIMATE,
+      "Grand total here equals the sum of the Order Summary rows, the sum of the Settlement Summary rows and the sum of the Counter Summary rows for the same window and outlet scope.",
+      "The order-type split counts the bill against the order it was raised from; a bill whose order row is gone is not in that split, though its money is in the totals.",
+      NOTE_NC_BESIDE_LADDER,
+      NOTE_NC_CLOCK,
+      NOTE_NC_REVERSED,
+    ]),
+    columns: SALES_SUMMARY_COLUMNS,
+    totals: { ...misLadder(bills), nc_value: nc.value, nc_qty: nc.qty },
+    bucket,
+    // The comped money is attached to the SAME bucket key the ladder used, so
+    // the NC column adds up to its own total exactly like every other column —
+    // INCLUDING on a day that gave food away and settled nothing, which gets a
+    // zero-ladder row rather than being dropped. Dropping it is the one way this
+    // column could stop summing to its own total, and a column that does not is
+    // the first thing an auditor checks.
+    series: misNcCompletedSeries(misSeries(bills, bucket), ncByBucket),
+    by_order_type: [...typeAcc.entries()]
+      .map(([order_type, v]) => ({ order_type, bills: v.bills, grand_total: v.total, share_pct: sharePct(v.total, typeTotal) }))
+      .sort((a, z) => z.grand_total - a.grand_total),
+    non_chargeable: nc,
+  };
+}
+
+// --- 6. Order Summary --------------------------------------------------------
+
+export interface OrderSummaryRow {
+  bill_id: string;
+  bill_no: string | null;
+  settled_at: string;
+  order_type: string;
+  table_name: string | null;
+  covers: number | null;
+  waiter: string | null;
+  item_count: number;
+  gross: number;
+  discount: number;
+  net: number;
+  service_charge: number;
+  tax: number;
+  grand_total: number;
+  refund: number;
+  payment_method: string | null;
+  status: string;
+}
+
+export interface OrderSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: OrderSummaryRow[];
+  /** The WINDOW's totals, not the page's. Reconciles to the Sales Summary. */
+  totals: MisLadder;
+  page: MisPage;
+}
+
+const ORDER_SUMMARY_COLUMNS: MisColumn[] = [
+  { key: "settled_at", label: "Date & time", type: "datetime" },
+  { key: "bill_no", label: "Bill No.", type: "text" },
+  { key: "order_type", label: "Type", type: "text" },
+  { key: "table_name", label: "Table", type: "text" },
+  { key: "covers", label: "Covers", type: "int" },
+  { key: "waiter", label: "Waiter", type: "text" },
+  { key: "item_count", label: "Items", type: "int", total: true },
+  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "discount", label: "Discount", type: "money", total: true },
+  { key: "net", label: "Net", type: "money", total: true },
+  { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
+  { key: "tax", label: "Tax", type: "money", total: true },
+  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "refund", label: "Refund", type: "money", total: true, default_on: false },
+  { key: "payment_method", label: "Payment", type: "text" },
+  { key: "status", label: "Status", type: "text" },
+];
+
+/**
+ * ORDER SUMMARY — one line per bill: how it was served, by whom, and for how much.
+ *
+ * `totals` is computed over the WHOLE window, never the page. A totals row that
+ * only adds up the fifty rows on screen is the classic way a control report
+ * quietly understates a day, and it would also break the reconciliation with the
+ * Sales Summary that jest asserts.
+ *
+ * `covers` is the SEATING's covers, so two split bills on one table each show the
+ * party's size — and the window total still counts that party once. That is the
+ * honest presentation of a figure that is per-seating, not per-bill.
+ */
+export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<OrderSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  await ensureBillWorkflowColumns();
+  await ensureTableSessionsTable();
+  await ensureClosedBillIndexes();
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const search = misSearch(q);
+
+  const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
+  const where: string[] = [`b.res_id = $1`, `(${mc.og} or b.outlet_id = $2)`, MIS_SETTLED_PREDICATE.trim()];
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${String(params.length)}`;
+    where.push(`(b.bill_no::text ilike ${p} or t.table_name ilike ${p} or b.id::text ilike ${p} or b.order_id::text ilike ${p} or coalesce(b.payment_method,'') ilike ${p})`);
+  }
+  const whereSql = where.join(" and ");
+
+  const countRows = await runQuery<{ total: string }>(
+    `select count(*)::text as total
+       from "Bills" b
+       left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+      where ${whereSql}`,
+    params,
+  );
+  const page = misPageOf(q, Math.max(0, Math.round(Number(countRows[0]?.total ?? 0))));
+
+  params.push(page.limit); const limIdx = `$${String(params.length)}`;
+  params.push(page.offset); const offIdx = `$${String(params.length)}`;
+  const rows = await runQuery<{
+    id: string; bill_no: string | null; settled_at: Date | string; status: number | string | null;
+    table_name: string | null; total_amt: number | string | null; tax_breakdown: unknown;
+    payment_method: string | null; discount_type: string | null; discount_value: number | string | null;
+    refund_amount: number | string | null; session_covers: number | null;
+    emp_fname: string | null; emp_lname: string | null;
+    order_type: string | null; item_count: string | null;
+  }>(
+    `select b.id, b.bill_no::text as bill_no,
+            coalesce(b.closed_at, b.admin_approved_at) as settled_at,
+            b.status, t.table_name, b.total_amt, b.tax_breakdown, b.payment_method,
+            b.discount_type, b.discount_value, coalesce(b.refund_amount, 0) as refund_amount,
+            s.covers as session_covers,
+            e."emp_Fname" as emp_fname, e."emp_Lname" as emp_lname,
+            (o.food)::jsonb->>'order_type' as order_type,
+            jsonb_array_length(${MIS_ITEMS_JSON})::text as item_count
+       from "Bills" b
+       left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+       left join "Employees" e on e.id = b.emp_id and e.res_id = b.res_id and e.outlet_id = b.outlet_id
+       left join "Orders" o on o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
+       ${MIS_SESSION_LATERAL}
+      where ${whereSql}
+      order by coalesce(b.closed_at, b.admin_approved_at) desc, b.id desc
+      limit ${limIdx} offset ${offIdx}`,
+    params,
+  );
+
+  const out: OrderSummaryRow[] = rows.map((r) => {
+    const grand = round2(parseNumeric(r.total_amt));
+    const charges = closedBillCharges(grand, parseTaxLines(r.tax_breakdown), scPct);
+    const money = composeBillMoney({
+      grand_total: grand,
+      charges,
+      discount_type: r.discount_type,
+      discount_value: parseNumeric(r.discount_value),
+      refund_amount: parseNumeric(r.refund_amount),
+    });
+    const waiter = [r.emp_fname, r.emp_lname].filter((x) => (x ?? "").trim()).join(" ").trim();
+    return {
+      bill_id: r.id,
+      bill_no: r.bill_no,
+      settled_at: iso(r.settled_at) ?? "",
+      order_type: orderChannel(r.order_type),
+      table_name: r.table_name,
+      covers: r.session_covers == null ? null : Math.max(1, Math.round(parseNumeric(r.session_covers))),
+      waiter: waiter || null,
+      item_count: Math.max(0, Math.round(Number(r.item_count ?? 0))),
+      gross: money.gross,
+      discount: money.discount,
+      net: money.net,
+      service_charge: money.service_charge,
+      tax: money.tax,
+      grand_total: money.grand_total,
+      refund: money.refund,
+      payment_method: r.payment_method?.trim() || null,
+      status: misBillStatus(r.status, r.refund_amount),
+    };
+  });
+
+  return {
+    meta: await misMeta(mc, "order_summary", "Order Summary", [
+      NOTE_SETTLEMENT_BASIS,
+      NOTE_COVERS_ONCE,
+      "Covers on a row are the SEATING's party size, so two split bills on one table each show the same party. The totals row still counts that party once.",
+      "Items is the line count of the order the bill was raised from, not the merged item count of every order on the table.",
+      NOTE_DISCOUNT_ESTIMATE,
+      "The totals row covers the WHOLE window, not the page on screen, and equals the Sales Summary's grand total for the same window.",
+    ]),
+    columns: ORDER_SUMMARY_COLUMNS,
+    rows: out,
+    totals: misLadder(composeMisBills(await fetchMisBills(mc), scPct, mc.tz)),
+    page,
+  };
+}
+
+/** A settled bill's status in words. Refunded outranks the stored code. */
+function misBillStatus(status: unknown, refund: unknown): string {
+  if (parseNumeric(refund) > 0) {return "Refunded";}
+  const code = Math.round(parseNumeric(status));
+  if (code === 2) {return "Paid";}
+  if (code === 3) {return "Cancelled";}
+  return "Closed";
+}
+
+// --- 7. Executive Summary ----------------------------------------------------
+
+export interface ExecutiveOutletRow {
+  outlet_id: string;
+  outlet_name: string | null;
+  bills: number;
+  covers: number;
+  net: number;
+  grand_total: number;
+  abv: number | null;
+  apc: number | null;
+  /** Revenue given away at this branch (migration 034). Beside the ladder. */
+  nc_value: number;
+  previous_grand_total: number;
+  growth_pct: number | null;
+  share_pct: number | null;
+}
+
+export interface ExecutiveSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  /** The GROUP row — what the per-outlet rows add up to, plus last period and
+   *  the growth between them. It is `current` widened with the two comparison
+   *  columns so the export's TOTALS row is the group, not a blank line. */
+  totals: MisLadder & {
+    nc_value: number;
+    previous_grand_total: number;
+    growth_pct: number | null;
+    share_pct: number | null;
+  };
+  current: MisLadder;
+  previous: MisLadder;
+  /** What the group gave away this window, in full. NOT part of the ladder. */
+  non_chargeable: MisNonChargeableTotals;
+  /** The window `previous` was measured over, and how it was chosen. */
+  previous_window: { from: string; to: string; days: number; basis: "months" | "days" };
+  growth: {
+    grand_total: number | null;
+    net: number | null;
+    bills: number | null;
+    covers: number | null;
+    abv: number | null;
+    apc: number | null;
+    discount: number | null;
+  };
+  /** One row per outlet in ALL-OUTLETS mode; one row otherwise. */
+  by_outlet: ExecutiveOutletRow[];
+}
+
+const EXECUTIVE_COLUMNS: MisColumn[] = [
+  { key: "outlet_name", label: "Outlet", type: "text" },
+  { key: "bills", label: "Bills", type: "int", total: true },
+  { key: "covers", label: "Covers", type: "int", total: true },
+  { key: "net", label: "Net", type: "money", total: true },
+  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "abv", label: "ABV", type: "money" },
+  { key: "apc", label: "APC (pre-tax)", type: "money" },
+  { key: "nc_value", label: "NC given away", type: "money", total: true, default_on: false },
+  { key: "previous_grand_total", label: "Previous period", type: "money", total: true },
+  { key: "growth_pct", label: "Growth %", type: "percent" },
+  { key: "share_pct", label: "% of group", type: "percent" },
+];
+
+/**
+ * EXECUTIVE SUMMARY — the leadership rollup, across outlets, against last period.
+ *
+ * ACROSS OUTLETS is the existing ALL-OUTLETS aggregate read, not a new mechanism:
+ * an admin or manager sends the X-Outlet-Id "all" sentinel, requireAuth validates
+ * it, and every query below spans every outlet OF THEIR OWN RESTAURANT because
+ * `og` becomes "true". RLS keys on res_id, so this can never reach another
+ * tenant. A non-privileged role stays pinned to its own outlet and simply gets a
+ * one-row breakdown.
+ *
+ * THE COMPARISON PERIOD IS A CALENDAR, NOT A SUBTRACTION. previousWindow (see
+ * mis_report_math.ts) compares August against July — both whole months, 31 days
+ * against 31 — and a financial year against the previous financial year, because
+ * a month is not 30 days and an owner asking "how did we do against last month"
+ * is not asking about "the 30 days before this window". Only an arbitrary drag
+ * falls back to an equally-long preceding span.
+ *
+ * GROWTH FROM ZERO IS `null`, never "infinite" and never 100%: both absolute
+ * figures are on the row next to it, which is the information actually wanted.
+ */
+export async function GetExecutiveSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<ExecutiveSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+
+  const prev = previousWindow(mc.window.from, mc.window.to);
+  const prevInstants = windowInstants(prev, mc.tz);
+  const prevMc: MisContext = {
+    ...mc,
+    window: {
+      from: prev.from, to: prev.to, days: countDays(prev.from, prev.to),
+      source: mc.window.source, clamped: [],
+      ...prevInstants,
+    },
+  };
+
+  const ncRows = await fetchMisNonChargeables(mc);
+  const nc = misNcTotals(ncRows);
+  const ncByOutlet = misNcByOutlet(ncRows);
+
+  const [currentRows, previousRows] = await Promise.all([fetchMisBills(mc), fetchMisBills(prevMc)]);
+  const current = composeMisBills(currentRows, scPct, mc.tz);
+  const previous = composeMisBills(previousRows, scPct, mc.tz);
+  const cur = misLadder(current);
+  const pre = misLadder(previous);
+
+  // Per-outlet. In single-outlet scope this is one row; the grouping is the same
+  // code either way so the two can never drift.
+  const outletNames = new Map<string, string | null>();
+  try {
+    for (const o of await runQuery<{ id: string; outlet_name: string | null }>(
+      `select id, outlet_name from "Outlets" where res_id = $1`,
+      [mc.context.res_id],
+    )) { outletNames.set(o.id, o.outlet_name); }
+  } catch { /* names are cosmetic — ids still identify the row */ }
+
+  const groupBy = (bills: MisBill[]): Map<string, MisBill[]> => {
+    const m = new Map<string, MisBill[]>();
+    for (const b of bills) {
+      const list = m.get(b.row.outlet_id);
+      if (list) {list.push(b);} else {m.set(b.row.outlet_id, [b]);}
+    }
+    return m;
+  };
+  const curByOutlet = groupBy(current);
+  const preByOutlet = groupBy(previous);
+
+  // An outlet that gave food away and settled nothing still belongs in the
+  // breakdown: without this its comps would be in the group total and in no row,
+  // and the NC column would stop summing to its own total.
+  for (const [outletId, v] of ncByOutlet) {
+    if (!curByOutlet.has(outletId) && v.value > 0) {curByOutlet.set(outletId, []);}
+  }
+
+  const by_outlet: ExecutiveOutletRow[] = [...curByOutlet.entries()].map(([outlet_id, list]) => {
+    const l = misLadder(list);
+    const p = misLadder(preByOutlet.get(outlet_id) ?? []);
+    return {
+      outlet_id,
+      outlet_name: outletNames.get(outlet_id) ?? null,
+      bills: l.bills,
+      covers: l.covers,
+      net: l.net,
+      grand_total: l.grand_total,
+      abv: l.abv,
+      apc: l.apc,
+      nc_value: ncByOutlet.get(outlet_id)?.value ?? 0,
+      previous_grand_total: p.grand_total,
+      growth_pct: growthPct(l.grand_total, p.grand_total),
+      share_pct: sharePct(l.grand_total, cur.grand_total),
+    };
+  }).sort((a, z) => z.grand_total - a.grand_total);
+
+  return {
+    meta: await misMeta(mc, "executive_summary", "Executive Summary", [
+      NOTE_SETTLEMENT_BASIS,
+      NOTE_CANCELLED_EXCLUDED,
+      NOTE_COVERS_ONCE,
+      NOTE_PER_COVER_PRETAX,
+      mc.allOutlets
+        ? "Showing every outlet of this restaurant. Group totals are the sum of the outlet rows."
+        : "Showing one outlet. Switch the outlet selector to All to compare branches.",
+      prev.basis === "months"
+        ? `The comparison period is the ${String(countDays(prev.from, prev.to))} calendar days of the immediately preceding whole month(s) (${prev.from} to ${prev.to}), not a fixed day count.`
+        : `The comparison period is the equally-long window immediately before this one (${prev.from} to ${prev.to}).`,
+      "Growth is blank when the previous period was zero: there is no honest percentage growth from a base of nothing.",
+      NOTE_NC_BESIDE_LADDER,
+      NOTE_NC_CLOCK,
+      NOTE_NC_REVERSED,
+    ]),
+    columns: EXECUTIVE_COLUMNS,
+    totals: {
+      ...cur,
+      nc_value: nc.value,
+      previous_grand_total: pre.grand_total,
+      growth_pct: growthPct(cur.grand_total, pre.grand_total),
+      // The group is 100% of itself. Stated rather than left blank so the column
+      // adds up on the page.
+      share_pct: cur.grand_total === 0 ? null : 100,
+    },
+    current: cur,
+    previous: pre,
+    non_chargeable: nc,
+    previous_window: { from: prev.from, to: prev.to, days: countDays(prev.from, prev.to), basis: prev.basis },
+    growth: {
+      grand_total: growthPct(cur.grand_total, pre.grand_total),
+      net: growthPct(cur.net, pre.net),
+      bills: growthPct(cur.bills, pre.bills),
+      covers: growthPct(cur.covers, pre.covers),
+      abv: growthPct(cur.abv ?? 0, pre.abv ?? 0),
+      apc: growthPct(cur.apc ?? 0, pre.apc ?? 0),
+      discount: growthPct(cur.discount, pre.discount),
+    },
+    by_outlet,
+  };
+}
+
+// --- 8. Cover Size Summary ---------------------------------------------------
+
+export interface CoverSizeRow {
+  /** The party size. `null` collects bills whose seating could not be resolved. */
+  party_size: number | null;
+  parties: number;
+  bills: number;
+  covers: number;
+  net: number;
+  grand_total: number;
+  /** PRE-TAX spend per cover in this bucket. */
+  spend_per_cover: number | null;
+  avg_bill_value: number | null;
+  share_pct: number | null;
+}
+
+export interface CoverSizeSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: CoverSizeRow[];
+  totals: MisLadder & { parties: number };
+}
+
+const COVER_SIZE_COLUMNS: MisColumn[] = [
+  { key: "party_size", label: "Party size", type: "int" },
+  { key: "parties", label: "Parties", type: "int", total: true },
+  { key: "bills", label: "Bills", type: "int", total: true },
+  { key: "covers", label: "Covers", type: "int", total: true },
+  { key: "net", label: "Net", type: "money", total: true },
+  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "spend_per_cover", label: "Spend per cover (pre-tax)", type: "money" },
+  { key: "avg_bill_value", label: "Avg bill value", type: "money" },
+  { key: "share_pct", label: "% of sales", type: "percent" },
+];
+
+/**
+ * COVER SIZE SUMMARY — how the money splits by party size.
+ *
+ * A PARTY IS A SEATING, not a bill. Every bill of one seating lands in that
+ * seating's bucket, `parties` counts the seating once, and `covers` is the
+ * party's size counted once — so a table of four that split three ways is one
+ * party of four, not three parties of four. Getting that wrong is what turns a
+ * quiet Tuesday into a fictional banquet.
+ *
+ * Bills whose seating cannot be resolved (legacy rows, merged bills, takeaway
+ * against a virtual table) are collected in an explicit `party_size: null`
+ * bucket. Their MONEY is there — so the buckets still sum to the Sales Summary —
+ * but they contribute no covers and no per-cover figure, because nobody knows
+ * how many people they fed.
+ */
+export async function GetCoverSizeSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<CoverSizeSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
+
+  interface Bucket { bills: MisBill[]; sessions: Map<string, number> }
+  const buckets = new Map<number | null, Bucket>();
+  for (const b of bills) {
+    const size = b.session_id ? b.covers : null;
+    const bucket = buckets.get(size) ?? { bills: [], sessions: new Map<string, number>() };
+    bucket.bills.push(b);
+    if (b.session_id) {bucket.sessions.set(b.session_id, b.covers);}
+    buckets.set(size, bucket);
+  }
+
+  const totalGrand = round2(bills.reduce((s, b) => s + b.money.grand_total, 0));
+  const rows: CoverSizeRow[] = [...buckets.entries()]
+    .map(([party_size, bucket]) => {
+      const l = ladderOf(bucket.bills, new Set<string>());
+      const covers = [...bucket.sessions.values()].reduce((s, c) => s + c, 0);
+      return {
+        party_size,
+        parties: bucket.sessions.size,
+        bills: l.bills,
+        covers,
+        net: l.net,
+        grand_total: l.grand_total,
+        spend_per_cover: perCover(l.net, covers),
+        avg_bill_value: averageBillValue(l.grand_total, l.bills),
+        share_pct: sharePct(l.grand_total, totalGrand),
+      };
+    })
+    .sort((a, z) => {
+      if (a.party_size === null) {return 1;}
+      if (z.party_size === null) {return -1;}
+      return a.party_size - z.party_size;
+    });
+
+  const totals = misLadder(bills);
+  return {
+    meta: await misMeta(mc, "cover_size_summary", "Cover Size Summary", [
+      NOTE_SETTLEMENT_BASIS,
+      NOTE_COVERS_ONCE,
+      "A party is one SEATING. Every bill raised on that seating sits in the same bucket, and the party is counted once however many ways the bill was split.",
+      NOTE_PER_COVER_PRETAX,
+      "Bills whose seating cannot be resolved sit in the blank party-size row: their money is included so the buckets still add up to the Sales Summary, but they contribute no covers.",
+    ]),
+    columns: COVER_SIZE_COLUMNS,
+    rows,
+    totals: { ...totals, parties: rows.reduce((s, r) => s + r.parties, 0) },
+  };
+}
+
+// --- 9. Settlement Summary ---------------------------------------------------
+
+export interface SettlementRow {
+  method: string;
+  /** Bills that touched this mode. A split bill counts under each mode it used. */
+  bills: number;
+  amount: number;
+  share_pct: number | null;
+  refund: number;
+  net_amount: number;
+}
+
+export interface SettlementSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: SettlementRow[];
+  totals: {
+    bills: number;
+    amount: number;
+    refund: number;
+    net_amount: number;
+    /** Bills settled with more than one mode. */
+    split_bills: number;
+    /** Money that split parts failed to account for. Should always be 0. */
+    unallocated: number;
+  };
+}
+
+const SETTLEMENT_COLUMNS: MisColumn[] = [
+  { key: "method", label: "Payment mode", type: "text" },
+  { key: "bills", label: "Bills", type: "int", total: true },
+  { key: "amount", label: "Collected", type: "money", total: true },
+  { key: "share_pct", label: "% of takings", type: "percent" },
+  { key: "refund", label: "Refunds", type: "money", total: true },
+  { key: "net_amount", label: "Net", type: "money", total: true },
+];
+
+/**
+ * SETTLEMENT SUMMARY — the end-of-day cash-up sheet.
+ *
+ * `Σ rows.amount` IS REQUIRED TO EQUAL the Sales Summary's grand total, exactly,
+ * and jest asserts it. That makes split tenders the whole design problem:
+ * "Bills".payment_splits is free-form JSON, live data contains rows whose parts
+ * do not add back to the bill total, and quietly trusting them shrinks the day's
+ * takings by the difference — which the cashier then hunts as a phantom
+ * shortfall. allocateSettlement (mis_report_math.ts) therefore books any residual
+ * to an explicit Unallocated row. Seeing it is the point; `totals.unallocated`
+ * should be 0 and is worth an alert when it is not.
+ *
+ * REFUNDS ARE SHOWN, NOT NETTED OFF THE COLLECTED FIGURE. "Bills" records a
+ * refund without a mode of its own, so it is attributed to the mode(s) the bill
+ * was paid with, pro rata. `amount` stays what was taken at the till (which is
+ * what the drawer and the gateway statement show) and `net_amount` is what
+ * survived the refund.
+ *
+ * A bill with no recorded payment method lands under "Other" rather than being
+ * dropped — dropping it would break the reconciliation and hide money.
+ */
+export async function GetSettlementSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<SettlementSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
+
+  const acc = new Map<string, { bills: number; amount: number; refund: number }>();
+  let splitBills = 0;
+  let unallocated = 0;
+  for (const b of bills) {
+    const parts = allocateSettlement(
+      b.money.grand_total,
+      b.row.payment_method,
+      parsePaymentSplits(b.row.payment_splits),
+    );
+    if (parts.length > 1) {splitBills += 1;}
+    for (const p of parts) {
+      if (p.method === UNALLOCATED_METHOD) {unallocated = round2(unallocated + p.amount);}
+      const e = acc.get(p.method) ?? { bills: 0, amount: 0, refund: 0 };
+      e.bills += 1;
+      e.amount = round2(e.amount + p.amount);
+      // A refund has no mode of its own, so it follows the money: each part
+      // carries its share of the bill's refund.
+      if (b.money.refund > 0 && b.money.grand_total > 0) {
+        e.refund = round2(e.refund + (b.money.refund * p.amount) / b.money.grand_total);
+      }
+      acc.set(p.method, e);
+    }
+  }
+
+  const totalAmount = round2([...acc.values()].reduce((s, v) => s + v.amount, 0));
+  const rows: SettlementRow[] = [...acc.entries()]
+    .map(([method, v]) => ({
+      method,
+      bills: v.bills,
+      amount: v.amount,
+      share_pct: sharePct(v.amount, totalAmount),
+      refund: round2(v.refund),
+      net_amount: round2(v.amount - v.refund),
+    }))
+    .sort((a, z) => z.amount - a.amount);
+
+  const ladder = misLadder(bills);
+  return {
+    meta: await misMeta(mc, "settlement_summary", "Settlement Summary", [
+      NOTE_SETTLEMENT_BASIS,
+      "Collected totals equal the Sales Summary's grand total for the same window — that equality is what makes this a cash-up sheet.",
+      "A bill settled with more than one mode counts once under each mode it touched, so the bill counts here can add up to more than the bill count.",
+      "Refunds have no payment mode of their own; each is attributed to the mode(s) its bill was paid with, in proportion. Collected is what was taken at the till; Net is what survived the refunds.",
+      "Anything in the Unallocated row is money whose split-tender parts did not add back to the bill total. It should always be zero; if it is not, those bills need looking at.",
+    ]),
+    columns: SETTLEMENT_COLUMNS,
+    rows,
+    totals: {
+      bills: ladder.bills,
+      amount: totalAmount,
+      refund: round2(rows.reduce((s, r) => s + r.refund, 0)),
+      net_amount: round2(rows.reduce((s, r) => s + r.net_amount, 0)),
+      split_bills: splitBills,
+      unallocated,
+    },
+  };
+}
+
+// --- Drill-down --------------------------------------------------------------
+
+/**
+ * THE ORDER (KOT) BEHIND A ROW, in full.
+ *
+ * The bill drill-down is GetClosedBill, which already returns every line item,
+ * the discount, the charge split and every timestamp — reusing it means the
+ * drill-down and the History screen can never show two different bills. This is
+ * its counterpart for the ticket-level reports (Void KOT, and a Bill Edit row
+ * that names an order), where the subject is an ORDER and there may be no bill
+ * at all.
+ */
+export interface MisOrderDetail {
+  id: string;
+  created_at: string;
+  updated_at: string | null;
+  status: OrderRecord["status"];
+  order_type: string;
+  table_name: string | null;
+  customer: string | null;
+  taken_by: string | null;
+  items: { name: string; quantity: number; price: number; line_total: number; note: string | null; station: string | null }[];
+  item_count: number;
+  qty: number;
+  value: number;
+  bill_id: string | null;
+  bill_no: string | null;
+  /** Every audit entry that named this order, newest first. */
+  trail: { at: string; action: string; description: string | null; by: string | null }[];
+}
+
+export async function GetMisOrderDetail(restaurantId: string, orderId: string): Promise<MisOrderDetail | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  await ensureRecordTimestampColumns();
+  await ensureAuditLogIndexes();
+  const id = String(orderId ?? "").trim();
+  if (!isUuid(id)) {return null;}
+
+  const rows = await runQuery<{
+    id: string; created_at: Date; updated_at: Date | null; status: unknown; food: unknown;
+    table_name: string | null; bill_id: string | null; bill_no: string | null;
+  }>(
+    `select o.id, o.created_at, o.updated_at, o.status, o.food, t.table_name,
+            b.id as bill_id, b.bill_no::text as bill_no
+       from "Orders" o
+       left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+       left join "Bills" b on b.order_id = o.id and b.res_id = o.res_id and b.outlet_id = o.outlet_id
+      where o.id = $1 and o.res_id = $2 and (${og} or o.outlet_id = $3)
+      limit 1`,
+    [id, context.res_id, context.outlet_id],
+  );
+  const row = rows[0];
+  if (!row) {return null;}
+
+  const food = parseJsonObject(row.food) ?? {};
+  const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+  let qty = 0, value = 0;
+  const items = list.map((raw) => {
+    const it = (raw ?? {}) as Record<string, unknown>;
+    const quantity = Math.max(1, Math.round(parseNumeric(it.quantity) || 1));
+    const price = round2(parseNumeric(it.price));
+    qty += quantity;
+    value = round2(value + price * quantity);
+    return {
+      name: String(it.name ?? "Item"),
+      quantity,
+      price,
+      line_total: round2(price * quantity),
+      note: String(it.note ?? "").trim() || null,
+      station: String(it.station ?? "").trim() || null,
+    };
+  });
+
+  const trailRows = await runQuery<{
+    created_at: Date; action_name: string; reason: string | null;
+    fname: string | null; lname: string | null; emp_username: string | null;
+  }>(
+    `select l.created_at, a.action_name, l.reason,
+            e."emp_Fname" as fname, e."emp_Lname" as lname, lg.emp_username
+       from "Audit_logs" l
+       join "Actions" a on a.id = l.action_id
+       left join "Employees" e on e.id = l.employee_id and e.res_id = l.res_id
+       left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
+      where l.res_id = $1 and l.additional_details ->> 'order_id' = $2
+      order by l.created_at desc
+      limit 50`,
+    [context.res_id, id],
+  );
+
+  const customer = String(food.customer ?? "").trim();
+  return {
+    id: row.id,
+    created_at: iso(row.created_at) ?? "",
+    updated_at: iso(row.updated_at),
+    status: fromOrderStatusCode(row.status),
+    order_type: orderChannel(food.order_type),
+    table_name: row.table_name,
+    customer: customer && customer.toLowerCase() !== "guest" ? customer : null,
+    taken_by: String(food.taken_by_employee_name ?? "").trim() || null,
+    items,
+    item_count: items.length,
+    qty,
+    value,
+    bill_id: row.bill_id,
+    bill_no: row.bill_no,
+    trail: trailRows.map((t) => ({
+      at: iso(t.created_at) ?? "",
+      action: t.action_name,
+      description: t.reason?.trim() || null,
+      by: [t.fname, t.lname].filter((x) => (x ?? "").trim()).join(" ").trim() || t.emp_username?.trim() || null,
+    })),
+  };
+}
+
+// ============================================================================
+// MIS DATA CAPTURE — migrations 034-039
+// ============================================================================
+//
+// THE PROBLEM THESE SIX SOLVE. Six of the fifteen mandatory MIS reports describe
+// things this system has never recorded: which dishes were given away and on
+// whose authority, why a ticket was voided and how far it had got, when a
+// service charge was taken off, how a bill was actually tendered and what was
+// tipped, which till rang a sale, and what group or size a line belonged to.
+// This section is the RECORDING. The reports are somebody else's file.
+//
+// WHERE THE RULES LIVE, restated because it is the thing to get right:
+//   * MONEY   -> billing_math.ts (chargeableSubtotal, quoteServiceChargeWaiver,
+//                reconcileTenders). It composes with computeBillCharges rather
+//                than sitting beside it, so there is one definition of what a
+//                service charge is and one definition of a pre-tax base.
+//   * CLASSIFICATION -> mis_capture.ts (the vocabularies, the void-stage
+//                derivation, the menu attribution). Pure, jest-provable.
+//   * HERE    -> only what needs the database: tenant resolution, the SQL, and
+//                the transactional stitching that keeps the ledger row and the
+//                order blob from ever disagreeing.
+//
+// THE DEGRADATION RULE, the same one print_jobs.ts states for 027 and
+// kot_numbers.ts for 029: the rollout order is migration, then backend. In the
+// window between them every statement against these six tables raises 42P01 (or
+// 42501 if the grants half did not run). A READ degrades to empty, loudly. A
+// WRITE does NOT degrade — it throws — because silently accepting a
+// non-chargeable that was never recorded is worse than refusing it: the guest
+// would not be charged and nothing would say why.
+
+// isCaptureTableMissing / captureRead — THE DEGRADATION RULE above, in code —
+// live in the MIS report scaffolding further up this file. They were moved there
+// (and not copied) when the six capture-fed reports shipped: those reports read
+// these same tables and must degrade identically, and a second copy of "is this
+// migration applied?" is how one of the two ends up catching a code the other
+// does not.
+
+/**
+ * Who did it, and who backed it.
+ *
+ * `authorised_by_username` is REQUIRED and is not defaulted to the actor. The
+ * whole fraud control in migrations 034/035/036 is that a giveaway, a void and a
+ * waiver each carry a second name; defaulting it here would turn the one field
+ * that matters into the one field that is always the same as the field beside
+ * it. A manager authorising their own act passes their own name explicitly, and
+ * the row then says so.
+ */
+export interface CaptureActor {
+  employee_id?: string | null;
+  username: string;
+  authorised_by_employee_id?: string | null;
+  authorised_by_username: string;
+}
+
+/** Validate an actor, or throw with the message a route should surface verbatim. */
+function requireActor(actor: CaptureActor | null | undefined, act: string): {
+  by_id: string | null; by: string; auth_id: string | null; auth: string;
+} {
+  const by = String(actor?.username ?? "").trim();
+  const auth = String(actor?.authorised_by_username ?? "").trim();
+  if (!by) {throw new Error(`Who is ${act}? A signed-in user is required.`);}
+  if (!auth) {throw new Error(`${act} requires an authoriser — record who approved it.`);}
+  const uuidOrNull = (v: unknown): string | null => {
+    const s = String(v ?? "").trim();
+    return isUuid(s) ? s : null;
+  };
+  return {
+    by_id: uuidOrNull(actor?.employee_id),
+    by,
+    auth_id: uuidOrNull(actor?.authorised_by_employee_id),
+    auth,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Order-blob surgery, shared by the NC paths.
+// ---------------------------------------------------------------------------
+
+/** The two places an order's lines live: `items`, and each `items_split` tuple. */
+interface OrderFoodLines {
+  food: Record<string, unknown>;
+  items: Record<string, unknown>[];
+  split: [string, Record<string, unknown>[]][] | null;
+}
+
+function readOrderFoodLines(raw: unknown): OrderFoodLines {
+  const food = (parseJsonObject(raw) ?? {}) as Record<string, unknown>;
+  const items = (Array.isArray(food.items) ? food.items : [])
+    .map((it) => (parseJsonObject(it) ?? {}) as Record<string, unknown>);
+  const rawSplit = Array.isArray(food.items_split) ? (food.items_split as unknown[]) : null;
+  const split = rawSplit === null
+    ? null
+    : rawSplit.map((t) => {
+      const tuple = Array.isArray(t) ? t : [t, []];
+      const label = String(tuple[0] ?? "");
+      const arr = (Array.isArray(tuple[1]) ? tuple[1] : [])
+        .map((it) => (parseJsonObject(it) ?? {}) as Record<string, unknown>);
+      return [label, arr] as [string, Record<string, unknown>[]];
+    });
+  return { food, items, split };
+}
+
+/**
+ * Re-derive the order blob's money from its lines and hand back the JSON to store.
+ *
+ * `subtotal` AND `total` are both written, over CHARGEABLE lines only, because
+ * activeOrderSubtotal reads `subtotal` and falls back to `total` — an order whose
+ * every line is comped has a subtotal of 0, which is falsy, so leaving `total`
+ * stale would make the fallback re-charge the whole thing. `nc_subtotal` is
+ * carried alongside and OMITTED when nothing is comped, so a blob on a tenant
+ * that never uses NC is unchanged byte-for-byte.
+ */
+function repriceOrderFood(lines: OrderFoodLines): string {
+  const chargeable = chargeableSubtotal(lines.items);
+  const given = nonChargeableValue(lines.items);
+  const next: Record<string, unknown> = { ...lines.food, items: lines.items, subtotal: chargeable, total: chargeable };
+  if (given > 0) {next.nc_subtotal = given;} else {delete next.nc_subtotal;}
+  if (lines.split !== null) {next.items_split = lines.split;}
+  return JSON.stringify(next);
+}
+
+/**
+ * Strip every server-owned non-chargeable key from client-supplied order lines.
+ *
+ * THE FRAUD CONTROL. `nc` is the flag that decides whether a guest is charged
+ * for a dish, and it is written by exactly one path (MarkOrderItemNonChargeable),
+ * which also writes the ledger row naming the authoriser. If AddOrder accepted
+ * `nc: true` from a payload, any client holding "Add Orders" could comp anything
+ * by editing its own request — no reason, no authoriser, no ledger row, and the
+ * dish still on the printed bill at zero. So the keys are removed on the way in,
+ * unconditionally; AddOrder's merge then re-applies the SERVER's stored flags
+ * from the existing row (`{ ...prev }`), which is why an existing comp survives a
+ * later item-add.
+ *
+ * Non-mutating: the caller's array is left alone and copies are returned, because
+ * these objects are also read by the audit-undo envelope builder.
+ */
+function stripClientNonChargeable(items: readonly unknown[]): unknown[] {
+  return items.map((raw) => {
+    const it = parseJsonObject(raw);
+    if (!it) {return raw;}
+    if (it.nc === undefined && it.nc_id === undefined && it.nc_kind === undefined) {return raw;}
+    const copy = { ...it };
+    delete copy.nc;
+    delete copy.nc_id;
+    delete copy.nc_kind;
+    return copy;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 034 — NON-CHARGEABLE
+// ---------------------------------------------------------------------------
+
+/** One non-chargeable, as stored. `value` is the database's own derivation. */
+export interface NonChargeableRecord {
+  id: string;
+  created_at: string;
+  outlet_id: string;
+  order_id: string;
+  item_id: string;
+  item_name: string;
+  table_id: string | null;
+  nc_kind: NonChargeableKind;
+  reason: string;
+  quantity: number;
+  unit_price: number;
+  menu_price_at_nc: number | null;
+  /** quantity x unit_price, computed by Postgres (034: GENERATED ALWAYS). */
+  value: number;
+  marked_by_username: string;
+  authorised_by_username: string;
+  reversed_at: string | null;
+  reversed_by_username: string | null;
+  reversal_reason: string | null;
+}
+
+interface NonChargeableRow {
+  id: string; created_at: Date; outlet_id: string; order_id: string; item_id: string;
+  item_name: string; table_id: string | null; nc_kind: string; reason: string;
+  quantity: number | string; unit_price: number | string; menu_price_at_nc: number | string | null;
+  value: number | string; marked_by_username: string; authorised_by_username: string;
+  reversed_at: Date | null; reversed_by_username: string | null; reversal_reason: string | null;
+}
+
+const NC_SELECT = `id, created_at, outlet_id, order_id, item_id, item_name, table_id,
+  nc_kind, reason, quantity, unit_price, menu_price_at_nc, value,
+  marked_by_username, authorised_by_username, reversed_at, reversed_by_username, reversal_reason`;
+
+function mapNonChargeable(r: NonChargeableRow): NonChargeableRecord {
+  return {
+    id: r.id,
+    created_at: (r.created_at instanceof Date ? r.created_at : new Date(r.created_at)).toISOString(),
+    outlet_id: r.outlet_id,
+    order_id: r.order_id,
+    item_id: r.item_id,
+    item_name: r.item_name,
+    table_id: r.table_id,
+    nc_kind: r.nc_kind as NonChargeableKind,
+    reason: r.reason,
+    quantity: parseNumeric(r.quantity),
+    unit_price: round2(parseNumeric(r.unit_price)),
+    menu_price_at_nc: r.menu_price_at_nc == null ? null : round2(parseNumeric(r.menu_price_at_nc)),
+    value: round2(parseNumeric(r.value)),
+    marked_by_username: r.marked_by_username,
+    authorised_by_username: r.authorised_by_username,
+    reversed_at: r.reversed_at ? new Date(r.reversed_at).toISOString() : null,
+    reversed_by_username: r.reversed_by_username,
+    reversal_reason: r.reversal_reason,
+  };
+}
+
+export interface MarkNonChargeableInput {
+  order_id: string;
+  /** The order-line id inside "Orders".food.items[]. */
+  item_id: string;
+  nc_kind: string;
+  reason: string;
+  /**
+   * How many of the line to comp. Defaults to the WHOLE line. A partial comp
+   * SPLITS the line (see below), which is the only way "one of the three
+   * desserts was on the house" can be both billed and reported correctly.
+   */
+  quantity?: number;
+  actor: CaptureActor;
+}
+
+/** What the comp did to the money, so a caller can show it without re-reading. */
+export interface MarkNonChargeableResult {
+  record: NonChargeableRecord;
+  /** The order's pre-tax base AFTER the comp. */
+  order_subtotal: number;
+  /** Everything comped on this order, after the comp. */
+  order_nc_total: number;
+  /** The table's consolidated pre-tax base after the comp, when it has a table. */
+  table_subtotal: number | null;
+}
+
+/**
+ * Mark one order line non-chargeable.
+ *
+ * ONE TRANSACTION WRITES BOTH FACTS: the ledger row (why, who, how much) and the
+ * `nc` flag on the line (what billing reads). Migration 034's header argues why
+ * there are two; the guarantee that keeps them honest is that they are written
+ * together or not at all, and that the flag carries the ledger row's id.
+ *
+ * A PARTIAL COMP SPLITS THE LINE, and the split is deliberate in its direction:
+ * the ORIGINAL line id keeps the chargeable remainder and the comped portion
+ * gets a fresh id. Prep timers, served state and course-hold all key on the line
+ * id (FireOrderItems, IsOrderItemServed, the KDS timing map), and those belong to
+ * the food the guest is paying for. Doing it the other way round would move a
+ * running timer onto a line that is no longer being charged for.
+ *
+ * REFUSED ON A SETTLED OR CANCELLED ORDER. assertOrderStatusEditable is the same
+ * guard every other money edit uses: a comp after the money has moved is not a
+ * comp, it is a refund, and it has its own path and its own columns.
+ */
+export async function MarkOrderItemNonChargeable(
+  restaurantId: string,
+  input: MarkNonChargeableInput,
+): Promise<MarkNonChargeableResult> {
+  const kind = normalizeVocabulary(input.nc_kind, NON_CHARGEABLE_KINDS);
+  if (!kind) {
+    throw new Error(`nc_kind must be one of: ${NON_CHARGEABLE_KINDS.join(", ")}`);
+  }
+  const reason = normalizeReason(input.reason);
+  if (!reason) {throw new Error("A reason is required to make an item non-chargeable.");}
+  const who = requireActor(input.actor, "marking an item non-chargeable");
+  const orderId = String(input.order_id ?? "").trim();
+  const itemId = String(input.item_id ?? "").trim();
+  if (!orderId || !itemId) {throw new Error("order id and item id are required");}
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    await assertOrderStatusEditable(context, orderId, client);
+
+    const orderRows = await runQuery<{ food: unknown; table_id: string | null }>(
+      `select food, table_id from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+    if (!orderRows[0]) {throw new Error("Order not found");}
+    const tableId = orderRows[0].table_id;
+    const lines = readOrderFoodLines(orderRows[0].food);
+
+    const target = lines.items.find((it) => String(it.id ?? "") === itemId);
+    if (!target) {throw new Error("That item is not on this order");}
+    if (isNonChargeableLine(target)) {
+      throw new Error("That item is already non-chargeable. Reverse it first if the reason was wrong.");
+    }
+
+    const lineQty = orderLineQuantity(target);
+    const unitPrice = round2(orderLinePrice(target));
+    const wanted = input.quantity === undefined ? lineQty : Number(input.quantity);
+    if (!Number.isFinite(wanted) || wanted <= 0) {throw new Error("quantity must be greater than zero");}
+    if (wanted > lineQty) {
+      throw new Error(`Only ${String(lineQty)} of that item are on the order.`);
+    }
+    const ncQty = wanted;
+    const remainder = round2(lineQty - ncQty);
+    const itemName = String(target.name ?? "Item");
+
+    // The menu's price NOW, recorded beside the line price. Nullable and
+    // deliberately not substituted for unit_price: a line billed above menu (an
+    // uplift, an off-menu charge) gave away the LINE price, and a line that
+    // resolves to no menu row gives an honest null rather than a fabricated
+    // number. See 034's header.
+    const menuPrice = await (async (): Promise<number | null> => {
+      try {
+        const menu = await GetMenuItems(restaurantId);
+        const byId = new Map(menu.map((m) => [String(m.id), m]));
+        const byName = new Map(menu.map((m) => [m.name.trim().toLowerCase(), m]));
+        const stamped = String(target.menu_id ?? "").trim();
+        const m = (stamped ? byId.get(stamped) : undefined)
+          ?? byId.get(String(target.id ?? ""))
+          ?? byName.get(itemName.trim().toLowerCase());
+        return m ? round2(parseNumeric(m.price)) : null;
+      } catch { return null; }
+    })();
+
+    // The line the flag lands on. A whole-line comp keeps the id it has; a
+    // partial comp mints one for the comped portion (see the header).
+    const ncLineId = remainder > 0 ? randomUUID() : itemId;
+    const ncId = randomUUID();
+
+    const inserted = await runQuery<NonChargeableRow>(
+      `insert into "OrderItemNonChargeable"
+         (id, res_id, outlet_id, order_id, item_id, item_name, table_id,
+          nc_kind, reason, quantity, unit_price, menu_price_at_nc,
+          marked_by_employee_id, marked_by_username,
+          authorised_by_employee_id, authorised_by_username)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       returning ${NC_SELECT}`,
+      [ncId, context.res_id, context.outlet_id, orderId, ncLineId, itemName, tableId,
+        kind, reason, ncQty, unitPrice, menuPrice,
+        who.by_id, who.by, who.auth_id, who.auth],
+      client,
+    );
+
+    // Apply the flag (and the split) to BOTH representations. items_split is what
+    // the KDS and the course-fire path read; leaving it un-flagged would print a
+    // comped dish as chargeable on a re-rendered ticket.
+    const applyTo = (arr: Record<string, unknown>[]): Record<string, unknown>[] => {
+      const out: Record<string, unknown>[] = [];
+      for (const it of arr) {
+        if (String(it.id ?? "") !== itemId) { out.push(it); continue; }
+        if (remainder > 0) {
+          out.push({ ...it, quantity: remainder });
+          out.push({ ...it, id: ncLineId, quantity: ncQty, nc: true, nc_id: ncId, nc_kind: kind });
+        } else {
+          out.push({ ...it, nc: true, nc_id: ncId, nc_kind: kind });
+        }
+      }
+      return out;
+    };
+    lines.items = applyTo(lines.items);
+    if (lines.split !== null) {
+      lines.split = lines.split.map(([label, arr]) => [label, applyTo(arr)]);
+    }
+
+    await runQuery(
+      `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+      [orderId, context.res_id, context.outlet_id, repriceOrderFood(lines)],
+      client,
+    );
+
+    // Re-sync the table's OPEN bill to the new pre-tax base, exactly as
+    // removeItemFromTableOrders does. An open bill's total_amt IS the pre-tax
+    // subtotal (settle overwrites it with the grand total), so a comp that did
+    // not do this would leave the bill showing the pre-comp amount until the next
+    // edit happened to refresh it.
+    let tableSubtotal: number | null = null;
+    if (tableId) {
+      tableSubtotal = await sumOrderTotalsForTable(context, tableId, client);
+      const openBill = await existingOpenBillId(context, tableId, client);
+      if (openBill) {
+        await runQuery(
+          `update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4 and closed_at is null`,
+          [tableSubtotal, openBill, context.res_id, context.outlet_id],
+          client,
+        );
+      }
+    }
+
+    return {
+      record: mapNonChargeable(inserted[0]),
+      order_subtotal: chargeableSubtotal(lines.items),
+      order_nc_total: nonChargeableValue(lines.items),
+      table_subtotal: tableSubtotal,
+    };
+  });
+}
+
+/**
+ * Reverse a non-chargeable: the dish becomes billable again.
+ *
+ * SUPERSESSION, NOT DELETION (034's header). The ledger row stays and is stamped
+ * `reversed_at`, which is what lets a control report show "12 comps, 2 of them
+ * reversed by the manager" rather than showing 10 and hiding the argument.
+ *
+ * A PARTIALLY-COMPED LINE IS NOT RE-MERGED. Reversing leaves two chargeable
+ * lines of the same dish where there was one. The bill total is identical either
+ * way, and merging them back would have to guess which line's timers, served
+ * state and course-hold survive — a guess that can lose the record of food that
+ * was actually cooked, to tidy up a display. The bill view already aggregates
+ * identical name+price lines for presentation.
+ */
+export async function ReverseNonChargeable(
+  restaurantId: string,
+  ncId: string,
+  input: { reason: string; by_username: string },
+): Promise<NonChargeableRecord> {
+  const reason = normalizeReason(input.reason);
+  if (!reason) {throw new Error("A reason is required to reverse a non-chargeable.");}
+  const by = String(input.by_username ?? "").trim();
+  if (!by) {throw new Error("Who is reversing this? A signed-in user is required.");}
+  const id = String(ncId ?? "").trim();
+  if (!isUuid(id)) {throw new Error("A non-chargeable id is required");}
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const rows = await runQuery<NonChargeableRow>(
+      `update "OrderItemNonChargeable"
+          set reversed_at = now(), reversed_by_username = $4, reversal_reason = $5
+        where id = $1 and res_id = $2 and outlet_id = $3 and reversed_at is null
+        returning ${NC_SELECT}`,
+      [id, context.res_id, context.outlet_id, by, reason],
+      client,
+    );
+    if (!rows[0]) {throw new Error("No live non-chargeable with that id");}
+    const rec = mapNonChargeable(rows[0]);
+
+    await assertOrderStatusEditable(context, rec.order_id, client);
+    const orderRows = await runQuery<{ food: unknown; table_id: string | null }>(
+      `select food, table_id from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [rec.order_id, context.res_id, context.outlet_id],
+      client,
+    );
+    if (orderRows[0]) {
+      const lines = readOrderFoodLines(orderRows[0].food);
+      const clear = (arr: Record<string, unknown>[]): Record<string, unknown>[] =>
+        arr.map((it) => {
+          if (String(it.nc_id ?? "") !== id) {return it;}
+          const copy = { ...it };
+          delete copy.nc; delete copy.nc_id; delete copy.nc_kind;
+          return copy;
+        });
+      lines.items = clear(lines.items);
+      if (lines.split !== null) {lines.split = lines.split.map(([l, arr]) => [l, clear(arr)]);}
+      await runQuery(
+        `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+        [rec.order_id, context.res_id, context.outlet_id, repriceOrderFood(lines)],
+        client,
+      );
+      const tableId = orderRows[0].table_id;
+      if (tableId) {
+        const subtotal = await sumOrderTotalsForTable(context, tableId, client);
+        const openBill = await existingOpenBillId(context, tableId, client);
+        if (openBill) {
+          await runQuery(
+            `update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4 and closed_at is null`,
+            [subtotal, openBill, context.res_id, context.outlet_id],
+            client,
+          );
+        }
+      }
+    }
+    return rec;
+  });
+}
+
+/**
+ * One table's NAME from its id — the only thing a route needs that the capture
+ * results do not already carry.
+ *
+ * Exists because every `bill:updated` payload in this codebase is `{ table: <name> }`
+ * (routes/bills.ts, routes/discounts.ts, routes/guest.ts) and the 034 ledger
+ * records a table_id. Emitting an id under that key would be a payload no client
+ * parses, so the floor would not refresh after a comp — the bill screen would
+ * keep showing the pre-comp total until something else happened to refetch it.
+ *
+ * Returns null rather than throwing (a takeaway order has no table), so the
+ * caller's emit degrades to no emit.
+ */
+export async function GetTableNameById(restaurantId: string, tableId: string | null): Promise<string | null> {
+  const id = String(tableId ?? "").trim();
+  if (!isUuid(id)) {return null;}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ table_name: string | null }>(
+    `select table_name from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [id, context.res_id, context.outlet_id],
+  );
+  const name = String(rows[0]?.table_name ?? "").trim();
+  return name.length > 0 ? name : null;
+}
+
+/** The live non-chargeables on a set of orders, keyed by order id. */
+export async function GetNonChargeablesForOrders(
+  restaurantId: string,
+  orderIds: readonly string[],
+): Promise<Map<string, NonChargeableRecord[]>> {
+  const ids = [...new Set(orderIds.map((o) => String(o ?? "").trim()).filter((o) => isUuid(o)))];
+  const out = new Map<string, NonChargeableRecord[]>();
+  if (ids.length === 0) {return out;}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await captureRead("OrderItemNonChargeable", () => runQuery<NonChargeableRow>(
+    `select ${NC_SELECT} from "OrderItemNonChargeable"
+      where res_id = $1 and order_id = any($2::uuid[]) and reversed_at is null
+      order by created_at asc`,
+    [context.res_id, ids],
+  ), [] as NonChargeableRow[]);
+  for (const r of rows) {
+    const rec = mapNonChargeable(r);
+    const list = out.get(rec.order_id);
+    if (list) {list.push(rec);} else {out.set(rec.order_id, [rec]);}
+  }
+  return out;
+}
+
+/**
+ * Every non-chargeable in a window — the read the NC report is built on.
+ *
+ * REVERSED ROWS ARE RETURNED, not filtered out, and carry their reversal. A
+ * fraud-control document that silently drops the comps a manager overturned is
+ * hiding the most interesting rows in it. Callers that want the money only sum
+ * where `reversed_at === null`.
+ */
+export async function GetNonChargeableEntries(
+  restaurantId: string,
+  fromIso: string,
+  toIso: string,
+  opts: { includeReversed?: boolean; limit?: number; offset?: number } = {},
+): Promise<{ rows: NonChargeableRecord[]; total_value: number; reversed_value: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const limit = Math.max(1, Math.min(Math.round(Number(opts.limit) || 500), 5000));
+  const offset = Math.max(0, Math.round(Number(opts.offset) || 0));
+  const rows = await captureRead("OrderItemNonChargeable", () => runQuery<NonChargeableRow>(
+    `select ${NC_SELECT} from "OrderItemNonChargeable"
+      where res_id = $1 and (${og} or outlet_id = $2)
+        and created_at >= $3 and created_at < $4
+        and (${opts.includeReversed === false ? "reversed_at is null" : "true"})
+      order by created_at desc
+      limit $5 offset $6`,
+    [context.res_id, context.outlet_id, fromIso, toIso, limit, offset],
+  ), [] as NonChargeableRow[]);
+  const mapped = rows.map(mapNonChargeable);
+  let total = 0;
+  let reversed = 0;
+  for (const r of mapped) {
+    if (r.reversed_at) {reversed = round2(reversed + r.value);} else {total = round2(total + r.value);}
+  }
+  return { rows: mapped, total_value: total, reversed_value: reversed };
+}
+
+// ---------------------------------------------------------------------------
+// 035 — VOID REASON + STAGE
+// ---------------------------------------------------------------------------
+
+/** One void, as stored. `stage` is server-derived; see mis_capture.ts. */
+export interface OrderVoidRecord {
+  id: string;
+  created_at: string;
+  outlet_id: string;
+  order_id: string;
+  scope: "order" | "item";
+  item_id: string | null;
+  item_name: string | null;
+  table_id: string | null;
+  voided_at: string;
+  void_kind: VoidKind;
+  reason: string;
+  stage: VoidStage;
+  stage_evidence: Record<string, unknown>;
+  value_voided: number;
+  voided_by_username: string;
+  authorised_by_username: string;
+}
+
+interface OrderVoidRow {
+  id: string; created_at: Date; outlet_id: string; order_id: string; scope: string;
+  item_id: string | null; item_name: string | null; table_id: string | null;
+  voided_at: Date; void_kind: string; reason: string; stage: string;
+  stage_evidence: unknown; value_voided: number | string;
+  voided_by_username: string; authorised_by_username: string;
+}
+
+const VOID_SELECT = `id, created_at, outlet_id, order_id, scope, item_id, item_name, table_id,
+  voided_at, void_kind, reason, stage, stage_evidence, value_voided,
+  voided_by_username, authorised_by_username`;
+
+function mapOrderVoid(r: OrderVoidRow): OrderVoidRecord {
+  return {
+    id: r.id,
+    created_at: new Date(r.created_at).toISOString(),
+    outlet_id: r.outlet_id,
+    order_id: r.order_id,
+    scope: r.scope === "item" ? "item" : "order",
+    item_id: r.item_id,
+    item_name: r.item_name,
+    table_id: r.table_id,
+    voided_at: new Date(r.voided_at).toISOString(),
+    void_kind: r.void_kind as VoidKind,
+    reason: r.reason,
+    stage: r.stage as VoidStage,
+    stage_evidence: parseJsonObject(r.stage_evidence) ?? {},
+    value_voided: round2(parseNumeric(r.value_voided)),
+    voided_by_username: r.voided_by_username,
+    authorised_by_username: r.authorised_by_username,
+  };
+}
+
+/**
+ * Gather the facts the void stage is derived from. EVERY ONE IS READ FROM THE
+ * DATABASE — nothing here is client-supplied, which is what makes the stage a
+ * fraud signal instead of a self-assessment (035's header).
+ *
+ * The KOT-print lookup is best-effort and degrades to null: "PrintJobs" belongs
+ * to migration 027 and a tenant that has not applied it must still be able to
+ * void an order. Losing that corroboration downgrades a void from after_print to
+ * before_print only when `barked_at` is ALSO absent, which is a tenant whose
+ * floor uses neither the bark step nor durable printing — i.e. one where the
+ * server genuinely holds no evidence either way, which is exactly what
+ * before_print then means.
+ */
+async function collectVoidStageFacts(
+  context: RestaurantContext,
+  order: { id: string; created_at: Date | string; barked_at: Date | string | null; table_id: string | null },
+  client?: PoolClient,
+): Promise<Parameters<typeof deriveVoidStage>[0]> {
+  const createdAtIso = new Date(order.created_at).toISOString();
+  const barked = order.barked_at ? new Date(order.barked_at).toISOString() : null;
+  if (!order.table_id) {return { bill: null, barked_at: barked, kot_print: null };}
+
+  // "Does a bill exist?" — an OPEN bill on the table, or one closed at or after
+  // this order was rung up. Either means this order was, at some point, on a
+  // bill the guest could have been handed. A bill closed BEFORE the order
+  // existed belongs to a previous seating and is correctly ignored.
+  const billRows = await runQuery<{ id: string; bill_no: string | number | null; created_at: Date }>(
+    `select id, bill_no, created_at from "Bills"
+      where table_id = $1 and res_id = $2 and outlet_id = $3
+        and (closed_at is null or closed_at >= $4)
+      order by created_at desc
+      limit 1`,
+    [order.table_id, context.res_id, context.outlet_id, createdAtIso],
+    client,
+  );
+  const bill = billRows[0]
+    ? {
+      id: billRows[0].id,
+      bill_no: billRows[0].bill_no == null ? null : String(billRows[0].bill_no),
+      created_at: new Date(billRows[0].created_at).toISOString(),
+    }
+    : null;
+
+  const kot = await captureRead("PrintJobs(kot)", async () => {
+    const rows = await runQuery<{ id: string; created_at: Date }>(
+      `select p.id, p.created_at
+         from "PrintJobs" p
+         join "Tables" t on t.id = $4 and t.res_id = p.res_id and t.outlet_id = p.outlet_id
+        where p.res_id = $1 and p.outlet_id = $2 and p.kind = 'kot'
+          and p.created_at >= $3
+          -- routes/bills.ts enqueues a KOT under the table's open bill id when it
+          -- has one and "<table name>-<epoch>" when it does not, so both shapes
+          -- have to be matched. Neither is a key; this is corroboration, not
+          -- identity, and a false negative only ever downgrades the stage.
+          and (p.bill_id = coalesce((select b.id::text from "Bills" b
+                                      where b.table_id = t.id and b.res_id = p.res_id
+                                        and b.outlet_id = p.outlet_id and b.closed_at is null
+                                      order by b.created_at desc limit 1), '')
+               or p.bill_id like t.table_name || '-%')
+        order by p.created_at desc
+        limit 1`,
+      [context.res_id, context.outlet_id, createdAtIso, order.table_id],
+      client,
+    );
+    return rows[0] ? { id: rows[0].id, created_at: new Date(rows[0].created_at).toISOString() } : null;
+  }, null as { id: string; created_at: string } | null);
+
+  return { bill, barked_at: barked, kot_print: kot };
+}
+
+export interface RecordOrderVoidInput {
+  order_id: string;
+  scope?: "order" | "item";
+  /** Required for scope='item' — the order-line id being removed. */
+  item_id?: string | null;
+  item_name?: string | null;
+  void_kind: string;
+  reason: string;
+  /**
+   * The pre-tax money being voided. Supplied by the caller because the order blob
+   * is edited by the very act being recorded, so reading it here would report 0
+   * for every void. Falls back to the order's CURRENT chargeable subtotal when
+   * omitted, which is right for the order-level case called BEFORE the status
+   * change.
+   */
+  value_voided?: number;
+  actor: CaptureActor;
+}
+
+/**
+ * Record why an order (or one of its lines) was voided, and derive at which
+ * stage.
+ *
+ * Takes an optional `client` so it can join the SAME transaction as the void
+ * itself: a void that lands with no reason because the record failed afterwards
+ * is exactly the gap this migration exists to close.
+ *
+ * IDEMPOTENT BY CONSTRUCTION. 035's partial unique indexes allow one order-level
+ * void per order and one item-level void per line, and this uses ON CONFLICT DO
+ * NOTHING and returns the EXISTING row. A double-tapped cancel therefore keeps
+ * the first (real) reason instead of overwriting it with whatever the second tap
+ * carried — the same posture SetOrderStatus takes when it treats a re-cancel as
+ * a clean no-op.
+ */
+export async function RecordOrderVoid(
+  restaurantId: string,
+  input: RecordOrderVoidInput,
+  client?: PoolClient,
+): Promise<OrderVoidRecord> {
+  const kind = normalizeVocabulary(input.void_kind, VOID_KINDS);
+  if (!kind) {throw new Error(`void_kind must be one of: ${VOID_KINDS.join(", ")}`);}
+  const reason = normalizeReason(input.reason);
+  if (!reason) {throw new Error("A reason is required to void an order.");}
+  const who = requireActor(input.actor, "voiding");
+  const orderId = String(input.order_id ?? "").trim();
+  if (!orderId) {throw new Error("order id is required");}
+  const scope = input.scope === "item" ? "item" : "order";
+  const itemId = scope === "item" ? String(input.item_id ?? "").trim() : "";
+  if (scope === "item" && !itemId) {throw new Error("item id is required for an item-level void");}
+
+  const run = async (c: PoolClient): Promise<OrderVoidRecord> => {
+    const context = await requireRestaurantContext(restaurantId, c);
+    const orderRows = await runQuery<{
+      id: string; created_at: Date; barked_at: Date | null; table_id: string | null; food: unknown;
+    }>(
+      `select id, created_at, barked_at, table_id, food
+         from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [orderId, context.res_id, context.outlet_id],
+      c,
+    );
+    if (!orderRows[0]) {throw new Error("Order not found");}
+    const order = orderRows[0];
+    const lines = readOrderFoodLines(order.food);
+
+    const value = input.value_voided !== undefined && Number.isFinite(Number(input.value_voided))
+      ? round2(Math.max(0, Number(input.value_voided)))
+      : (scope === "item"
+        ? (() => {
+          const line = lines.items.find((it) => String(it.id ?? "") === itemId);
+          return line ? round2(orderLinePrice(line) * orderLineQuantity(line)) : 0;
+        })()
+        : chargeableSubtotal(lines.items));
+
+    const itemName = String(
+      input.item_name
+      ?? (scope === "item" ? lines.items.find((it) => String(it.id ?? "") === itemId)?.name ?? "" : ""),
+    ).trim() || null;
+
+    const facts = await collectVoidStageFacts(context, order, c);
+    const derived = deriveVoidStage(facts);
+
+    const inserted = await runQuery<OrderVoidRow>(
+      `insert into "OrderVoids"
+         (id, res_id, outlet_id, order_id, scope, item_id, item_name, table_id,
+          void_kind, reason, stage, stage_evidence, value_voided,
+          voided_by_employee_id, voided_by_username,
+          authorised_by_employee_id, authorised_by_username)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,$17)
+       on conflict do nothing
+       returning ${VOID_SELECT}`,
+      [randomUUID(), context.res_id, context.outlet_id, orderId, scope,
+        scope === "item" ? itemId : null, itemName, order.table_id,
+        kind, reason, derived.stage, JSON.stringify(derived.evidence), value,
+        who.by_id, who.by, who.auth_id, who.auth],
+      c,
+    );
+    if (inserted[0]) {return mapOrderVoid(inserted[0]);}
+
+    // ON CONFLICT DO NOTHING fired: this order (or line) is already voided. Hand
+    // back the record that exists rather than a second, competing one.
+    const existing = await runQuery<OrderVoidRow>(
+      `select ${VOID_SELECT} from "OrderVoids"
+        where res_id = $1 and order_id = $2 and scope = $3
+          and (($3 = 'order' and item_id is null) or item_id = $4)
+        limit 1`,
+      [context.res_id, orderId, scope, scope === "item" ? itemId : null],
+      c,
+    );
+    if (existing[0]) {return mapOrderVoid(existing[0]);}
+    throw new Error("Could not record the void");
+  };
+
+  return client ? run(client) : withTransaction(run);
+}
+
+export type VoidOrderWithReasonResult =
+  | { ok: false }
+  | { ok: true; record: OrderVoidRecord; previous_status: OrderRecord["status"] };
+
+/**
+ * VOID AN ORDER AND RECORD WHY, IN ONE TRANSACTION.
+ *
+ * THIS FUNCTION EXISTS FOR THE ATOMICITY AND FOR NOTHING ELSE. RecordOrderVoid
+ * takes an optional client exactly so the reason can be written in the same
+ * transaction as the void — its header says so — and a route cannot open one.
+ * Doing it as two calls from a handler reintroduces the gap 035 was written to
+ * close, in one direction or the other:
+ *   * record first, then cancel: the cancel fails and a fraud-control document
+ *     now names an employee for voiding an order that is still live;
+ *   * cancel first, then record: the record fails and the void has no reason,
+ *     which is the entire thing being fixed.
+ * Together or not at all.
+ *
+ * IT REFUSES AN ALREADY-CANCELLED ORDER instead of taking SetOrderStatus's
+ * idempotent-no-op path, and that is deliberate. Attaching a reason to a cancel
+ * that happened earlier would derive `stage` from the table's state NOW, about a
+ * void that happened THEN — a bill raised for the next party since would report
+ * `after_bill` against a void that was actually `before_print`. 035's header
+ * refuses back-derivation for that reason and this refuses it for the same one.
+ * The caller sees the ordinary "already cancelled" message.
+ *
+ * `{ ok: false }` means the order does not exist, so the route answers 404
+ * rather than turning a missing id into a 400 about reasons.
+ *
+ * Everything else is SetOrderStatus's cancel path, unchanged: the same status
+ * code (5), the same `food.status` mirror, the same assertOrderStatusEditable
+ * guard that makes a settled bill final. applyTimingForStatus is not called
+ * because it is a no-op for anything but Preparing/Served.
+ */
+export async function VoidOrderWithReason(
+  restaurantId: string,
+  input: Omit<RecordOrderVoidInput, "scope" | "item_id" | "item_name">,
+): Promise<VoidOrderWithReasonResult> {
+  const orderId = String(input.order_id ?? "").trim();
+  if (!orderId) {throw new Error("order id is required");}
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const previousCode = await readOrderStatusCode(context, orderId, client);
+    if (previousCode === null) {return { ok: false };}
+    // Cancelled is terminal and Paid/Closed are locked — the same guard, and the
+    // same messages, every other status edit refuses on.
+    await assertOrderStatusEditable(context, orderId, client);
+
+    // Recorded BEFORE the status flips, so `value_voided` is the money that was
+    // on the ticket and the stage evidence is the state at the moment of the
+    // void, not one statement after it.
+    const record = await RecordOrderVoid(restaurantId, { ...input, scope: "order" }, client);
+
+    await runQuery(
+      `update "Orders"
+          set status = 5,
+              food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb('Cancelled'::text), true)
+        where id = $1 and res_id = $2 and outlet_id = $3`,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+
+    return { ok: true, record, previous_status: fromOrderStatusCode(previousCode) };
+  });
+}
+
+/** The void records for a set of orders, keyed by order id. */
+export async function GetOrderVoidsForOrders(
+  restaurantId: string,
+  orderIds: readonly string[],
+): Promise<Map<string, OrderVoidRecord[]>> {
+  const ids = [...new Set(orderIds.map((o) => String(o ?? "").trim()).filter((o) => isUuid(o)))];
+  const out = new Map<string, OrderVoidRecord[]>();
+  if (ids.length === 0) {return out;}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await captureRead("OrderVoids", () => runQuery<OrderVoidRow>(
+    `select ${VOID_SELECT} from "OrderVoids"
+      where res_id = $1 and order_id = any($2::uuid[])
+      order by voided_at asc`,
+    [context.res_id, ids],
+  ), [] as OrderVoidRow[]);
+  for (const r of rows) {
+    const rec = mapOrderVoid(r);
+    const list = out.get(rec.order_id);
+    if (list) {list.push(rec);} else {out.set(rec.order_id, [rec]);}
+  }
+  return out;
+}
+
+/**
+ * Every recorded void in a window, plus the stage split.
+ *
+ * WHAT IS NOT HERE: the status=5 orders that predate migration 035. They have no
+ * row and are NOT back-derived — 035's header explains why at length (a stage
+ * computed from a table's state today, about a void that happened months ago, is
+ * a fabricated fraud signal pointing at a named employee). The void report joins
+ * these records onto the cancelled orders it already lists and shows the ones
+ * with no record as "unknown", counting them so the gap is visible rather than
+ * silent.
+ */
+export async function GetOrderVoidRecords(
+  restaurantId: string,
+  fromIso: string,
+  toIso: string,
+  opts: { stage?: VoidStage | null; limit?: number; offset?: number } = {},
+): Promise<{ rows: OrderVoidRecord[]; by_stage: Record<VoidStage, { count: number; value: number }> }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const limit = Math.max(1, Math.min(Math.round(Number(opts.limit) || 500), 5000));
+  const offset = Math.max(0, Math.round(Number(opts.offset) || 0));
+  const stage = opts.stage ?? null;
+  const rows = await captureRead("OrderVoids", () => runQuery<OrderVoidRow>(
+    `select ${VOID_SELECT} from "OrderVoids"
+      where res_id = $1 and (${og} or outlet_id = $2)
+        and voided_at >= $3 and voided_at < $4
+        and ($5::text is null or stage = $5)
+      order by voided_at desc
+      limit $6 offset $7`,
+    [context.res_id, context.outlet_id, fromIso, toIso, stage, limit, offset],
+  ), [] as OrderVoidRow[]);
+  const mapped = rows.map(mapOrderVoid);
+  const by_stage: Record<VoidStage, { count: number; value: number }> = {
+    before_print: { count: 0, value: 0 },
+    after_print: { count: 0, value: 0 },
+    after_bill: { count: 0, value: 0 },
+  };
+  for (const r of mapped) {
+    const b = by_stage[r.stage];
+    if (b) { b.count += 1; b.value = round2(b.value + r.value_voided); }
+  }
+  return { rows: mapped, by_stage };
+}
+
+// ---------------------------------------------------------------------------
+// 036 — SERVICE CHARGE WAIVER
+// ---------------------------------------------------------------------------
+
+/** One waiver, as stored. The three money columns are 036's, unchanged. */
+export interface ServiceChargeWaiverRecord {
+  id: string;
+  created_at: string;
+  outlet_id: string;
+  bill_id: string;
+  table_id: string | null;
+  waived_at: string;
+  basis: "restaurant_percent" | "tax_line";
+  basis_percent: number;
+  basis_amount: number;
+  amount_waived: number;
+  tax_on_waived: number;
+  /** amount_waived + tax_on_waived, computed by Postgres (036: GENERATED). */
+  grand_total_reduction: number;
+  waiver_kind: ServiceChargeWaiverKind;
+  reason: string;
+  waived_by_username: string;
+  authorised_by_username: string;
+  reversed_at: string | null;
+  reversed_by_username: string | null;
+  reversal_reason: string | null;
+}
+
+interface ServiceChargeWaiverRow {
+  id: string; created_at: Date; outlet_id: string; bill_id: string; table_id: string | null;
+  waived_at: Date; basis: string; basis_percent: number | string; basis_amount: number | string;
+  amount_waived: number | string; tax_on_waived: number | string; grand_total_reduction: number | string;
+  waiver_kind: string; reason: string; waived_by_username: string; authorised_by_username: string;
+  reversed_at: Date | null; reversed_by_username: string | null; reversal_reason: string | null;
+}
+
+const SC_WAIVER_SELECT = `id, created_at, outlet_id, bill_id, table_id, waived_at,
+  basis, basis_percent, basis_amount, amount_waived, tax_on_waived, grand_total_reduction,
+  waiver_kind, reason, waived_by_username, authorised_by_username,
+  reversed_at, reversed_by_username, reversal_reason`;
+
+function mapServiceChargeWaiver(r: ServiceChargeWaiverRow): ServiceChargeWaiverRecord {
+  return {
+    id: r.id,
+    created_at: new Date(r.created_at).toISOString(),
+    outlet_id: r.outlet_id,
+    bill_id: r.bill_id,
+    table_id: r.table_id,
+    waived_at: new Date(r.waived_at).toISOString(),
+    basis: r.basis === "tax_line" ? "tax_line" : "restaurant_percent",
+    basis_percent: round2(parseNumeric(r.basis_percent)),
+    basis_amount: round2(parseNumeric(r.basis_amount)),
+    amount_waived: round2(parseNumeric(r.amount_waived)),
+    tax_on_waived: round2(parseNumeric(r.tax_on_waived)),
+    grand_total_reduction: round2(parseNumeric(r.grand_total_reduction)),
+    waiver_kind: r.waiver_kind as ServiceChargeWaiverKind,
+    reason: r.reason,
+    waived_by_username: r.waived_by_username,
+    authorised_by_username: r.authorised_by_username,
+    reversed_at: r.reversed_at ? new Date(r.reversed_at).toISOString() : null,
+    reversed_by_username: r.reversed_by_username,
+    reversal_reason: r.reversal_reason,
+  };
+}
+
+/** The live waiver on one bill, or null. Degrades to null before migration 036. */
+async function liveServiceChargeWaiver(
+  context: RestaurantContext,
+  billId: string | null,
+  client?: PoolClient,
+): Promise<ServiceChargeWaiverRecord | null> {
+  if (!billId) {return null;}
+  const rows = await captureRead("ServiceChargeWaivers", () => runQuery<ServiceChargeWaiverRow>(
+    `select ${SC_WAIVER_SELECT} from "ServiceChargeWaivers"
+      where res_id = $1 and bill_id = $2 and reversed_at is null limit 1`,
+    [context.res_id, billId],
+    client,
+  ), [] as ServiceChargeWaiverRow[]);
+  return rows[0] ? mapServiceChargeWaiver(rows[0]) : null;
+}
+
+/**
+ * THE CHARGE CONFIGURATION FOR ONE TABLE'S OPEN BILL — the single place the two
+ * tax shapes and any live waiver are resolved.
+ *
+ * WHY THIS EXISTS AS ONE FUNCTION. Five call sites used to read Outlets.default_tax
+ * and "Restaurant".service_charge themselves and hand them straight to
+ * computeBillCharges: the bill view, the KOT/bill print's source, waiter-confirm,
+ * admin-approve and the two customer-payment paths. A waiver honoured in four of
+ * the five would mean the guest is shown a bill without the charge and then
+ * settled WITH it — the worst possible failure, because it is invisible until an
+ * angry guest is holding two different totals. So all of them now resolve through
+ * here and there is exactly one answer per table.
+ *
+ * The waiver's effect is taken from quoteServiceChargeWaiver, which computes it
+ * by running computeBillCharges twice and differencing — so the waived config
+ * this hands back is the same config the recorded saving was measured against.
+ */
+interface OpenBillChargeConfig {
+  taxConfig: Record<string, number> | { name: string; percentage: number }[] | null;
+  scPct: number;
+  includeServiceCharge: boolean;
+  waiver: ServiceChargeWaiverRecord | null;
+}
+
+async function openBillChargeConfig(
+  context: RestaurantContext,
+  tableId: string | null,
+  client?: PoolClient,
+): Promise<OpenBillChargeConfig> {
+  const taxRows = await runQuery<{ default_tax: unknown }>(
+    `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
+    [context.outlet_id, context.res_id],
+    client,
+  );
+  const taxConfig = (taxRows[0]?.default_tax ?? null) as OpenBillChargeConfig["taxConfig"];
+  const scPct = await getServiceChargePercent(context.res_id, client);
+  const billId = tableId ? await existingOpenBillId(context, tableId, client) : null;
+  const waiver = await liveServiceChargeWaiver(context, billId, client);
+  if (!waiver) {return { taxConfig, scPct, includeServiceCharge: true, waiver: null };}
+  // Waived: drop the "Service Charge" tax line (shape b) AND zero the percent
+  // (shape a). quoteServiceChargeWaiver already produced the filtered config it
+  // priced the saving against; reusing it is what guarantees the bill the guest
+  // pays and the number on the waiver record are the same subtraction.
+  const quote = quoteServiceChargeWaiver(0, taxConfig, scPct, null);
+  return { taxConfig: quote.tax_config_waived, scPct: 0, includeServiceCharge: false, waiver };
+}
+
+export interface WaiveServiceChargeInput {
+  /** The table whose OPEN bill the charge comes off. */
+  table_name?: string;
+  /** Or the open bill directly. One of the two is required. */
+  bill_id?: string;
+  waiver_kind: string;
+  reason: string;
+  actor: CaptureActor;
+}
+
+/**
+ * Waive the service charge on a table's OPEN bill.
+ *
+ * ONLY AN OPEN BILL. A settled bill is final — assertBillEditable and the
+ * post-settle lock exist because editing money after it has moved is how phantom
+ * bills and mis-stated revenue happen. A guest who disputes the charge after
+ * paying is a REFUND, which has its own path, its own columns and its own audit
+ * entry. Allowing a waiver to rewrite total_amt post-settlement would put a hole
+ * in the money ladder that no report could reconcile.
+ *
+ * THE OPEN BILL'S total_amt IS NOT TOUCHED, and that is correct rather than an
+ * omission: on an open bill that column holds the PRE-TAX subtotal (settle
+ * overwrites it with the grand total), and a service charge is not part of a
+ * pre-tax subtotal. The waiver takes effect through openBillChargeConfig, which
+ * every path that computes this table's grand total now goes through.
+ */
+export async function WaiveServiceCharge(
+  restaurantId: string,
+  input: WaiveServiceChargeInput,
+): Promise<{ record: ServiceChargeWaiverRecord; grand_total_before: number; grand_total_after: number }> {
+  const kind = normalizeVocabulary(input.waiver_kind, SERVICE_CHARGE_WAIVER_KINDS);
+  if (!kind) {
+    throw new Error(`waiver_kind must be one of: ${SERVICE_CHARGE_WAIVER_KINDS.join(", ")}`);
+  }
+  const reason = normalizeReason(input.reason);
+  if (!reason) {throw new Error("A reason is required to waive the service charge.");}
+  const who = requireActor(input.actor, "waiving the service charge");
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+
+    let tableId: string | null = null;
+    let billId = String(input.bill_id ?? "").trim();
+    if (billId) {
+      const rows = await runQuery<{ table_id: string | null; closed_at: Date | null }>(
+        `select table_id, closed_at from "Bills" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+        [billId, context.res_id, context.outlet_id],
+        client,
+      );
+      if (!rows[0]) {throw new Error("Bill not found");}
+      if (rows[0].closed_at) {
+        throw new Error("This bill is already settled — a service charge cannot be waived on it. Refund it instead.");
+      }
+      tableId = rows[0].table_id;
+    } else {
+      const name = String(input.table_name ?? "").trim();
+      if (!name) {throw new Error("A table name or a bill id is required");}
+      tableId = await tableIdByName(context, name, client);
+      if (!tableId) {throw new Error("Table not found");}
+      await assertBillEditable(context, tableId, client);
+      await assertTableSessionOpen(context, tableId, "waiving the service charge", client);
+      billId = await ensureOpenBillIdForTable(context, tableId, client);
+    }
+
+    const subtotal = tableId ? await sumOrderTotalsForTable(context, tableId, client) : 0;
+    const discount = tableId ? await getOpenBillDiscount(context, tableId, client) : null;
+    const taxRows = await runQuery<{ default_tax: unknown }>(
+      `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
+      [context.outlet_id, context.res_id],
+      client,
+    );
+    const scPct = await getServiceChargePercent(context.res_id, client);
+    const quote = quoteServiceChargeWaiver(
+      subtotal,
+      (taxRows[0]?.default_tax ?? null) as Record<string, number> | { name: string; percentage: number }[] | null,
+      scPct,
+      discount,
+    );
+    if (quote.basis === "none" || quote.amount_waived <= 0) {
+      throw new Error("This bill carries no service charge, so there is nothing to waive.");
+    }
+
+    const inserted = await runQuery<ServiceChargeWaiverRow>(
+      `insert into "ServiceChargeWaivers"
+         (id, res_id, outlet_id, bill_id, table_id, basis, basis_percent, basis_amount,
+          amount_waived, tax_on_waived, waiver_kind, reason,
+          waived_by_employee_id, waived_by_username,
+          authorised_by_employee_id, authorised_by_username)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       returning ${SC_WAIVER_SELECT}`,
+      [randomUUID(), context.res_id, context.outlet_id, billId, tableId,
+        quote.basis, quote.basis_percent, quote.basis_amount,
+        quote.amount_waived, quote.tax_on_waived, kind, reason,
+        who.by_id, who.by, who.auth_id, who.auth],
+      client,
+    );
+    if (!inserted[0]) {throw new Error("Could not record the waiver");}
+
+    return {
+      record: mapServiceChargeWaiver(inserted[0]),
+      grand_total_before: quote.grand_total_with,
+      grand_total_after: quote.grand_total_without,
+    };
+  });
+}
+
+/** Put the service charge back. Supersession, not deletion — see 036's header. */
+export async function ReverseServiceChargeWaiver(
+  restaurantId: string,
+  waiverId: string,
+  input: { reason: string; by_username: string },
+): Promise<ServiceChargeWaiverRecord> {
+  const reason = normalizeReason(input.reason);
+  if (!reason) {throw new Error("A reason is required to reverse a service-charge waiver.");}
+  const by = String(input.by_username ?? "").trim();
+  if (!by) {throw new Error("Who is reversing this? A signed-in user is required.");}
+  const id = String(waiverId ?? "").trim();
+  if (!isUuid(id)) {throw new Error("A waiver id is required");}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<ServiceChargeWaiverRow>(
+    `update "ServiceChargeWaivers"
+        set reversed_at = now(), reversed_by_username = $4, reversal_reason = $5
+      where id = $1 and res_id = $2 and outlet_id = $3 and reversed_at is null
+      returning ${SC_WAIVER_SELECT}`,
+    [id, context.res_id, context.outlet_id, by, reason],
+  );
+  if (!rows[0]) {throw new Error("No live service-charge waiver with that id");}
+  return mapServiceChargeWaiver(rows[0]);
+}
+
+/** Every service-charge waiver in a window — the read behind the waiver report. */
+export async function GetServiceChargeWaivers(
+  restaurantId: string,
+  fromIso: string,
+  toIso: string,
+  opts: { limit?: number; offset?: number } = {},
+): Promise<{ rows: ServiceChargeWaiverRecord[]; total_waived: number; total_reduction: number; reversed_count: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const limit = Math.max(1, Math.min(Math.round(Number(opts.limit) || 500), 5000));
+  const offset = Math.max(0, Math.round(Number(opts.offset) || 0));
+  const rows = await captureRead("ServiceChargeWaivers", () => runQuery<ServiceChargeWaiverRow>(
+    `select ${SC_WAIVER_SELECT} from "ServiceChargeWaivers"
+      where res_id = $1 and (${og} or outlet_id = $2)
+        and waived_at >= $3 and waived_at < $4
+      order by waived_at desc
+      limit $5 offset $6`,
+    [context.res_id, context.outlet_id, fromIso, toIso, limit, offset],
+  ), [] as ServiceChargeWaiverRow[]);
+  const mapped = rows.map(mapServiceChargeWaiver);
+  let waived = 0;
+  let reduction = 0;
+  let reversed = 0;
+  for (const r of mapped) {
+    if (r.reversed_at) { reversed += 1; continue; }
+    waived = round2(waived + r.amount_waived);
+    reduction = round2(reduction + r.grand_total_reduction);
+  }
+  return { rows: mapped, total_waived: waived, total_reduction: reduction, reversed_count: reversed };
+}
+
+// ---------------------------------------------------------------------------
+// 037 — TENDERS + TIPS
+// ---------------------------------------------------------------------------
+
+/** One tender on one bill. `amount` settles the bill; `tip_amount` is on top. */
+export interface BillTenderRecord {
+  id: string;
+  created_at: string;
+  outlet_id: string;
+  bill_id: string;
+  table_id: string | null;
+  seq: number;
+  method: string;
+  amount: number;
+  txn_ref: string | null;
+  settled_at: string;
+  settled_by_username: string;
+  tip_amount: number;
+  tip_mode: TipMode | null;
+  tip_credited_to_username: string | null;
+  voided_at: string | null;
+  voided_by_username: string | null;
+  void_reason: string | null;
+}
+
+interface BillTenderRow {
+  id: string; created_at: Date; outlet_id: string; bill_id: string; table_id: string | null;
+  seq: number; method: string; amount: number | string; txn_ref: string | null;
+  settled_at: Date; settled_by_username: string;
+  tip_amount: number | string; tip_mode: string | null; tip_credited_to_username: string | null;
+  voided_at: Date | null; voided_by_username: string | null; void_reason: string | null;
+}
+
+const TENDER_SELECT = `id, created_at, outlet_id, bill_id, table_id, seq, method, amount, txn_ref,
+  settled_at, settled_by_username, tip_amount, tip_mode, tip_credited_to_username,
+  voided_at, voided_by_username, void_reason`;
+
+function mapBillTender(r: BillTenderRow): BillTenderRecord {
+  return {
+    id: r.id,
+    created_at: new Date(r.created_at).toISOString(),
+    outlet_id: r.outlet_id,
+    bill_id: r.bill_id,
+    table_id: r.table_id,
+    seq: Math.round(parseNumeric(r.seq)),
+    method: r.method,
+    amount: round2(parseNumeric(r.amount)),
+    txn_ref: r.txn_ref,
+    settled_at: new Date(r.settled_at).toISOString(),
+    settled_by_username: r.settled_by_username,
+    tip_amount: round2(parseNumeric(r.tip_amount)),
+    tip_mode: (r.tip_mode as TipMode | null) ?? null,
+    tip_credited_to_username: r.tip_credited_to_username,
+    voided_at: r.voided_at ? new Date(r.voided_at).toISOString() : null,
+    voided_by_username: r.voided_by_username,
+    void_reason: r.void_reason,
+  };
+}
+
+/**
+ * The bill's GRAND TOTAL, whichever state it is in.
+ *
+ * A SETTLED bill stores it in total_amt (ConfirmPayment and ApproveCustomerPayment
+ * both overwrite that column with charges.grand_total). An OPEN bill stores the
+ * PRE-TAX SUBTOTAL there instead, so it has to be recomputed — through
+ * openBillChargeConfig, so a live service-charge waiver is honoured and a partial
+ * settlement is measured against the amount the guest will actually be asked for.
+ * Reading total_amt in both cases is the bug this function exists to prevent: it
+ * would let a bill be "fully tendered" at roughly 85% of its real total.
+ */
+async function billGrandTotal(
+  context: RestaurantContext,
+  bill: { id: string; table_id: string | null; total_amt: number | string | null; waiter_confirmed_at: Date | null; admin_approved_at: Date | null; closed_at: Date | null },
+  client?: PoolClient,
+): Promise<number> {
+  if (bill.waiter_confirmed_at || bill.admin_approved_at || bill.closed_at) {
+    return round2(parseNumeric(bill.total_amt));
+  }
+  if (!bill.table_id) {return round2(parseNumeric(bill.total_amt));}
+  const subtotal = await sumOrderTotalsForTable(context, bill.table_id, client);
+  const discount = await getOpenBillDiscount(context, bill.table_id, client);
+  const cfg = await openBillChargeConfig(context, bill.table_id, client);
+  return computeBillCharges(subtotal, cfg.taxConfig, cfg.scPct, cfg.includeServiceCharge, discount).grand_total;
+}
+
+interface BillIdentityRow {
+  id: string; table_id: string | null; total_amt: number | string | null;
+  waiter_confirmed_at: Date | null; admin_approved_at: Date | null; closed_at: Date | null;
+  payment_method: string | null;
+}
+
+/**
+ * Resolve the bill a tender belongs to.
+ *
+ * `create` IS THE WHOLE DIFFERENCE BETWEEN THE READ AND THE WRITE, and it is not
+ * a convenience flag. A "Bills" row is only minted when a bill is generated,
+ * discounted, couponed or settled, so a table that has ordered but not yet asked
+ * for the bill has orders and no bill row at all.
+ *   * RECORDING a tender means the guest is paying, which IS the act that raises
+ *     the bill — so the write path mints one, behind the same two guards every
+ *     other money edit uses (assertBillEditable, assertTableSessionOpen).
+ *   * READING the tender state must never mint anything. A GET that allocates a
+ *     bill number is how a phantom bill gets created by a polling client — the
+ *     exact failure the post-settle lock was added to stop. It returns null and
+ *     the caller synthesizes an untendered state.
+ */
+/**
+ * The table a tender is being taken on: named directly, or reached through the
+ * order that is being settled. Shared by resolveTenderBill and by the
+ * no-bill-row-yet branch of GetBillTenderState so those two can never disagree
+ * about which table an `order_id` meant.
+ */
+async function tenderTableId(
+  context: RestaurantContext,
+  input: { table_name?: string; order_id?: string },
+  client?: PoolClient,
+): Promise<string | null> {
+  const name = String(input.table_name ?? "").trim();
+  if (name) {return tableIdByName(context, name, client);}
+  const orderId = String(input.order_id ?? "").trim();
+  if (!orderId) {return null;}
+  const rows = await runQuery<{ table_id: string | null }>(
+    `select table_id from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [orderId, context.res_id, context.outlet_id], client,
+  );
+  return rows[0]?.table_id ?? null;
+}
+
+async function resolveTenderBill(
+  context: RestaurantContext,
+  input: { bill_id?: string; table_name?: string; order_id?: string },
+  client?: PoolClient,
+  opts: { create?: boolean } = {},
+): Promise<BillIdentityRow | null> {
+  const cols = `id, table_id, total_amt, waiter_confirmed_at, admin_approved_at, closed_at, payment_method`;
+  const billId = String(input.bill_id ?? "").trim();
+  if (billId) {
+    const rows = await runQuery<BillIdentityRow>(
+      `select ${cols} from "Bills" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [billId, context.res_id, context.outlet_id], client,
+    );
+    // An id the caller NAMED and that does not exist is an error either way —
+    // there is nothing to synthesize a state for.
+    if (!rows[0]) {throw new Error("Bill not found");}
+    return rows[0];
+  }
+  const name = String(input.table_name ?? "").trim();
+  // AN ORDER ID IS THE THIRD WAY IN, and it exists for exactly one caller:
+  // POST /bills/order/:orderId/waiter-confirm-payment, which holds an order id
+  // and nothing else. Resolving it here — through the order's table, with the
+  // SAME `closed_at is null, order by created_at desc limit 1` read the settle
+  // path itself uses — is what makes it impossible for a settle and the tenders
+  // it records to land on two different bills. The alternative (looking the bill
+  // up in the route via GetBillByOrder) matches on `order_id = $1 OR table_id`,
+  // which can select a bill on a DIFFERENT table when an order has been moved.
+  const orderId = String(input.order_id ?? "").trim();
+  if (!name && !orderId) {throw new Error("A table name, an order id or a bill id is required");}
+  const tableId = await tenderTableId(context, input, client);
+  if (!tableId) {throw new Error(name ? "Table not found" : "Order table not found");}
+  const read = async (): Promise<BillIdentityRow | undefined> => (await runQuery<BillIdentityRow>(
+    `select ${cols} from "Bills"
+      where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null
+      order by created_at desc limit 1`,
+    [tableId, context.res_id, context.outlet_id], client,
+  ))[0];
+  const existing = await read();
+  if (existing) {return existing;}
+  if (!opts.create || !client) {return null;}
+  await assertBillEditable(context, tableId, client);
+  await assertTableSessionOpen(context, tableId, "recording a payment", client);
+  await ensureOpenBillIdForTable(context, tableId, client);
+  const created = await read();
+  if (!created) {throw new Error("Could not open a bill for that table");}
+  return created;
+}
+
+/** One tender as a caller supplies it. `amount` excludes the tip, always. */
+export interface TenderInput {
+  method: string;
+  amount: number;
+  txn_ref?: string | null;
+  tip_amount?: number;
+  tip_mode?: string | null;
+  tip_credited_to_employee_id?: string | null;
+  /** An employee's username, or the literal "pool". Required when tipped. */
+  tip_credited_to_username?: string | null;
+}
+
+export interface BillTenderState {
+  bill_id: string;
+  grand_total: number;
+  tenders: BillTenderRecord[];
+  tendered: number;
+  outstanding: number;
+  exact: boolean;
+  partial: boolean;
+  over: boolean;
+  tips_total: number;
+  /**
+   * How the bill's own payment_method / payment_splits columns read for this set
+   * of tenders — the compatibility mirror every existing reader still uses.
+   */
+  payment_method: string | null;
+  payment_splits: { method: string; amount: number }[];
+}
+
+/** The live tenders of one bill, plus the reconciliation. */
+async function readTenderState(
+  context: RestaurantContext,
+  bill: BillIdentityRow,
+  client?: PoolClient,
+): Promise<BillTenderState> {
+  const rows = await captureRead("BillTenders", () => runQuery<BillTenderRow>(
+    `select ${TENDER_SELECT} from "BillTenders"
+      where res_id = $1 and bill_id = $2 order by seq asc`,
+    [context.res_id, bill.id], client,
+  ), [] as BillTenderRow[]);
+  const all = rows.map(mapBillTender);
+  const live = all.filter((t) => t.voided_at === null);
+  const grand = await billGrandTotal(context, bill, client);
+  // Tips excluded by name, not by an inline map — see tenderAmountsTowardBill.
+  const rec = reconcileTenders(grand, tenderAmountsTowardBill(live));
+  const mirror = mirrorTendersToBillColumns(live);
+  return {
+    bill_id: bill.id,
+    grand_total: grand,
+    tenders: all,
+    tendered: rec.tendered,
+    outstanding: rec.outstanding,
+    exact: rec.exact,
+    partial: rec.partial,
+    over: rec.over,
+    tips_total: round2(live.reduce((s, t) => s + t.tip_amount, 0)),
+    payment_method: mirror.payment_method,
+    payment_splits: mirror.payment_splits,
+  };
+}
+
+/**
+ * THE COMPATIBILITY MIRROR. Reduce a set of live tenders to the two columns every
+ * existing reader still uses.
+ *
+ * One tender  -> payment_method = that method, payment_splits = null.
+ * N tenders   -> payment_method = 'Split', payment_splits = the parts.
+ *
+ * 'Split' with a capital S because normalizePaymentMethod maps the lowercase form
+ * to exactly that, and both GetSalesReport and allocateSettlement compare
+ * `payment_method.toLowerCase() === 'split'` before they will read the parts —
+ * so this is the one spelling that satisfies the type, the normaliser and both
+ * settlement cuts at once.
+ *
+ * TIPS ARE NOT MIRRORED, deliberately: payment_splits feeds the settlement
+ * summary, which must reconstruct the BILL total exactly (mis_report_math's
+ * allocateSettlement books any residual to an explicit Unallocated bucket). Adding
+ * a tip to a part would push every tipped bill into that bucket and make the
+ * day's takings read high by the tips.
+ */
+function mirrorTendersToBillColumns(live: readonly BillTenderRecord[]): {
+  payment_method: string | null;
+  payment_splits: { method: string; amount: number }[];
+} {
+  if (live.length === 0) {return { payment_method: null, payment_splits: [] };}
+  if (live.length === 1) {return { payment_method: live[0].method, payment_splits: [] };}
+  return {
+    payment_method: "Split",
+    payment_splits: live.map((t) => ({ method: t.method, amount: t.amount })),
+  };
+}
+
+export interface RecordBillTendersInput {
+  bill_id?: string;
+  table_name?: string;
+  /** The order being settled — the settle route's only handle on the bill. */
+  order_id?: string;
+  tenders: TenderInput[];
+  settled_by_employee_id?: string | null;
+  settled_by_username: string;
+  /**
+   * True when this call is meant to FULLY settle the bill: the tenders must then
+   * reconstruct the grand total exactly or nothing is written. False (default)
+   * records a partial settlement — see 037's header for what that means.
+   */
+  require_full?: boolean;
+}
+
+/**
+ * Record N tenders against one bill, and mirror them into the bill's own
+ * payment_method / payment_splits columns.
+ *
+ * WHAT IS REFUSED, AND WHY EACH REFUSAL IS BETTER THAN THE ALTERNATIVE:
+ *   * A settled bill. Tenders describe how a bill WAS paid; adding one after
+ *     closure would change a settled bill's payment mix with no audit of the
+ *     change. Void the tender and re-record instead.
+ *   * An over-tender. Change handed back in cash is not a negative tender, and
+ *     recording one would make the sum of tenders stop meaning "money that
+ *     entered the till".
+ *   * A tip with no destination. 037's CHECK enforces it; this refuses it first
+ *     so the caller gets a sentence instead of a 23514.
+ *   * require_full with a short sum. This is DEFENCE 2 from 037's header: the
+ *     deferred trigger cannot see a bill closed in a LATER transaction than the
+ *     one that wrote its tenders, so the assertion has to exist here too.
+ */
+export async function RecordBillTenders(
+  restaurantId: string,
+  input: RecordBillTendersInput,
+): Promise<BillTenderState> {
+  const by = String(input.settled_by_username ?? "").trim();
+  if (!by) {throw new Error("Who took the payment? A signed-in user is required.");}
+  const raw = Array.isArray(input.tenders) ? input.tenders : [];
+  if (raw.length === 0) {throw new Error("At least one tender is required");}
+  if (raw.length > 50) {throw new Error("A bill cannot carry more than 50 tenders");}
+
+  const parsed = raw.map((t, i) => {
+    // THE APPLICATION-SIDE BOUND migration 037's header names. The column is free
+    // text so a tenant can gain an aggregator mode without a migration, and the
+    // application is what keeps it honest. This is load-bearing, not cosmetic:
+    // mirrorTendersToBillColumns writes this exact string into
+    // "Bills".payment_method, and GetBillByOrder, the settle path's proof rule
+    // (paymentRequiresProof) and the cash-drawer cut (`lower(payment_method) in
+    // ('cash','split')`) all read it back through normalizePaymentMethod. A
+    // tender recorded as "Zomatoo" would mirror down as a method every one of
+    // those reads as NULL — the bill would display no payment method at all, and
+    // an aggregator bill would silently skip the screenshot the settle path is
+    // supposed to demand. Storing the normalised form (not the caller's spelling)
+    // is what keeps the ledger and the mirror byte-identical.
+    const method = normalizePaymentMethod(t?.method);
+    if (!method) {
+      throw new Error(
+        `Tender ${String(i + 1)}: "${String(t?.method ?? "")}" is not a payment method this system can settle a bill with`,
+      );
+    }
+    // "Split" is the MIRROR's word for "this bill has N tenders", not a way
+    // anybody pays. Accepting it would write a bill whose payment_method reads
+    // Split with one part, which every settlement cut treats as a split bill
+    // whose parts are missing.
+    if (method === "Split") {
+      throw new Error(`Tender ${String(i + 1)}: "Split" is not a payment method — record the individual tenders instead`);
+    }
+    const amount = round2(Number(t?.amount));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error(`Tender ${String(i + 1)} must have an amount greater than zero`);
+    }
+    const tip = round2(Math.max(0, Number(t?.tip_amount) || 0));
+    const tipMode = tip > 0 ? normalizeVocabulary(t?.tip_mode, TIP_MODES) : null;
+    const tipTo = tip > 0 ? String(t?.tip_credited_to_username ?? "").trim() : "";
+    if (tip > 0 && !tipMode) {
+      throw new Error(`Tender ${String(i + 1)}: a tip must say how it was paid (${TIP_MODES.join(", ")})`);
+    }
+    if (tip > 0 && !tipTo) {
+      throw new Error(`Tender ${String(i + 1)}: a tip must say who it goes to (an employee, or "pool")`);
+    }
+    const tipToId = String(t?.tip_credited_to_employee_id ?? "").trim();
+    return {
+      method,
+      amount,
+      txn_ref: String(t?.txn_ref ?? "").trim() || null,
+      tip_amount: tip,
+      tip_mode: tipMode,
+      tip_credited_to_username: tipTo || null,
+      tip_credited_to_employee_id: isUuid(tipToId) ? tipToId : null,
+    };
+  });
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const bill = await resolveTenderBill(context, input, client, { create: true });
+    if (!bill) {throw new Error("Could not open a bill for that table");}
+    if (bill.closed_at) {
+      throw new Error("This bill is already settled — void the tender that is wrong and record a new one.");
+    }
+
+    const before = await readTenderState(context, bill, client);
+    const liveAmounts = before.tenders.filter((t) => t.voided_at === null).map((t) => t.amount);
+    const proposed = [...liveAmounts, ...parsed.map((p) => p.amount)];
+    const rec = reconcileTenders(before.grand_total, proposed);
+    if (rec.over) {
+      throw new Error(
+        `Those tenders come to ${String(rec.tendered)}, which is more than the bill's ${String(before.grand_total)}. Change is handed back in cash, not recorded as a tender.`,
+      );
+    }
+    if (input.require_full === true && !rec.exact) {
+      throw new Error(
+        `The tenders add up to ${String(rec.tendered)} but the bill is ${String(before.grand_total)} — ${String(rec.outstanding)} is still outstanding.`,
+      );
+    }
+
+    const maxSeq = before.tenders.reduce((m, t) => Math.max(m, t.seq), 0);
+    for (let i = 0; i < parsed.length; i++) {
+      const p = parsed[i];
+      await runQuery(
+        `insert into "BillTenders"
+           (id, res_id, outlet_id, bill_id, table_id, seq, method, amount, txn_ref,
+            settled_by_employee_id, settled_by_username,
+            tip_amount, tip_mode, tip_credited_to_employee_id, tip_credited_to_username)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [randomUUID(), context.res_id, context.outlet_id, bill.id, bill.table_id,
+          maxSeq + i + 1, p.method, p.amount, p.txn_ref,
+          isUuid(String(input.settled_by_employee_id ?? "")) ? input.settled_by_employee_id : null, by,
+          p.tip_amount, p.tip_mode, p.tip_credited_to_employee_id, p.tip_credited_to_username],
+        client,
+      );
+    }
+
+    const after = await readTenderState(context, bill, client);
+    await runQuery(
+      `update "Bills" set payment_method = $4, payment_splits = $5::jsonb
+        where id = $1 and res_id = $2 and outlet_id = $3`,
+      [bill.id, context.res_id, context.outlet_id,
+        after.payment_method,
+        after.payment_splits.length > 0 ? JSON.stringify(after.payment_splits) : null],
+      client,
+    );
+    return after;
+  });
+}
+
+/**
+ * Void one tender. Superseded, never deleted — 037's header.
+ *
+ * THE DOUBLE-COUNT THIS CLOSES: a card payment keyed twice leaves two rows and,
+ * without a void, two live amounts summing to twice the bill. Voiding drops one
+ * out of every sum (`voided_at IS NULL`) while leaving the evidence that it was
+ * keyed, which is what a cashier needs when the acquirer's statement shows two
+ * authorisations.
+ *
+ * OPEN BILLS ONLY — see the guard below for why a settled bill's tender cannot
+ * be voided even though the constraint trigger would let the last one go.
+ */
+export async function VoidBillTender(
+  restaurantId: string,
+  tenderId: string,
+  input: { reason: string; by_username: string },
+): Promise<BillTenderState> {
+  const reason = normalizeReason(input.reason);
+  if (!reason) {throw new Error("A reason is required to void a tender.");}
+  const by = String(input.by_username ?? "").trim();
+  if (!by) {throw new Error("Who is voiding this? A signed-in user is required.");}
+  const id = String(tenderId ?? "").trim();
+  if (!isUuid(id)) {throw new Error("A tender id is required");}
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    // A SETTLED BILL IS NOT VOIDABLE, and this is the one guard the deferred
+    // trigger cannot supply. On a settled bill the trigger refuses a PARTIAL
+    // void (the survivors no longer sum to total_amt) but stays silent when the
+    // LAST live tender goes, because zero tenders is the state of every bill
+    // that never had one. Voiding them all would therefore succeed and leave a
+    // closed bill reading payment_method 'Split' with payment_splits NULL —
+    // a split bill whose parts are missing, which is precisely the shape
+    // allocateSettlement books to Unallocated. The money already moved; the
+    // correction for that is a refund, which has its own columns and its own
+    // audit entry. In-transaction, so it cannot be raced past.
+    const target = await runQuery<{ closed_at: Date | null; admin_approved_at: Date | null }>(
+      `select b.closed_at, b.admin_approved_at
+         from "BillTenders" t
+         join "Bills" b on b.id = t.bill_id and b.res_id = t.res_id
+        where t.id = $1 and t.res_id = $2 and t.outlet_id = $3 and t.voided_at is null
+        limit 1`,
+      [id, context.res_id, context.outlet_id],
+      client,
+    );
+    if (!target[0]) {throw new Error("No live tender with that id");}
+    if (target[0].closed_at || target[0].admin_approved_at) {
+      throw new Error("This bill is settled — a payment recorded on it is corrected with a refund, not by voiding the tender that recorded it.");
+    }
+    const rows = await runQuery<BillTenderRow>(
+      `update "BillTenders"
+          set voided_at = now(), voided_by_username = $4, void_reason = $5
+        where id = $1 and res_id = $2 and outlet_id = $3 and voided_at is null
+        returning ${TENDER_SELECT}`,
+      [id, context.res_id, context.outlet_id, by, reason],
+      client,
+    );
+    if (!rows[0]) {throw new Error("No live tender with that id");}
+    const billId = rows[0].bill_id;
+    const billRows = await runQuery<BillIdentityRow>(
+      `select id, table_id, total_amt, waiter_confirmed_at, admin_approved_at, closed_at, payment_method
+         from "Bills" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [billId, context.res_id, context.outlet_id], client,
+    );
+    if (!billRows[0]) {throw new Error("Bill not found");}
+    const after = await readTenderState(context, billRows[0], client);
+    await runQuery(
+      `update "Bills" set payment_method = $4, payment_splits = $5::jsonb
+        where id = $1 and res_id = $2 and outlet_id = $3`,
+      [billId, context.res_id, context.outlet_id,
+        // A bill with every tender voided falls back to the method it already
+        // carried rather than to NULL: blanking it would make a settled bill read
+        // as "no payment method recorded" in every historical report.
+        after.payment_method ?? billRows[0].payment_method,
+        after.payment_splits.length > 0 ? JSON.stringify(after.payment_splits) : null],
+      client,
+    );
+    return after;
+  });
+}
+
+/**
+ * The tender state of one bill (by id, or a table's open bill).
+ *
+ * READ-ONLY, INCLUDING WHEN THERE IS NO BILL ROW YET. A table that has ordered
+ * but not yet asked for the bill has no "Bills" row, and this must not create
+ * one (see resolveTenderBill). It reports the grand total the guest currently
+ * owes, with nothing tendered against it — which is the true answer, and the one
+ * a payment screen needs before the first tender is taken.
+ */
+export async function GetBillTenderState(
+  restaurantId: string,
+  input: { bill_id?: string; table_name?: string; order_id?: string },
+): Promise<BillTenderState> {
+  const context = await requireRestaurantContext(restaurantId);
+  const bill = await resolveTenderBill(context, input);
+  if (bill) {return readTenderState(context, bill);}
+
+  const tableId = await tenderTableId(context, input);
+  const subtotal = tableId ? await sumOrderTotalsForTable(context, tableId) : 0;
+  const discount = tableId ? await getOpenBillDiscount(context, tableId) : null;
+  const cfg = await openBillChargeConfig(context, tableId);
+  const grand = computeBillCharges(subtotal, cfg.taxConfig, cfg.scPct, cfg.includeServiceCharge, discount).grand_total;
+  return {
+    bill_id: "",
+    grand_total: grand,
+    tenders: [],
+    tendered: 0,
+    outstanding: grand,
+    exact: grand === 0,
+    partial: false,
+    over: false,
+    tips_total: 0,
+    payment_method: null,
+    payment_splits: [],
+  };
+}
+
+/**
+ * WHAT A BILL'S LIVE TENDERS REDUCE THE TWO COMPATIBILITY COLUMNS TO — and
+ * nothing else. No charge recomputation, no bill creation, one indexed read.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM GetBillTenderState. The settle route has to
+ * ask one question on EVERY settle, including the millions that will never carry
+ * a tender: "does this bill already have a payment ledger I must not overwrite?"
+ * GetBillTenderState answers it, but to report `outstanding` it must first
+ * re-derive the bill's grand total (sumOrderTotalsForTable + the discount + the
+ * charge config), which is four more reads on the money path to compute a number
+ * the settle path is about to compute authoritatively inside its own
+ * transaction. Two answers to "what is this bill worth", one of them stale by
+ * the time it is used, is exactly the divergence migration 036 consolidated
+ * openBillChargeConfig to remove — so this read deliberately cannot produce one.
+ *
+ * THE FAILURE IT PREVENTS. ConfirmBillPaymentByWaiter overwrites
+ * payment_method AND payment_splits from its arguments. A bill whose tenders
+ * were recorded through POST /bills/tenders and then settled by a client that
+ * sent only `payment_method` would have its mirror blanked: the ledger would
+ * still say "Cash 500 + Card 255.55" while "Bills" said "Cash", and the
+ * settlement summary — which reads the columns, not the ledger — would book the
+ * whole bill to one mode. The route consults this and settles with the LEDGER's
+ * mirror whenever a ledger exists, so the two can never disagree.
+ *
+ * `bill_id` is null when the table has no "Bills" row yet, which is the normal
+ * state of a table that has ordered and not yet asked for the bill. Like
+ * GetBillTenderState, this NEVER mints one: a read that allocated a bill number
+ * is how a polling client creates phantom invoices.
+ */
+export interface BillPaymentLedger {
+  /** The open bill this request means, or null when there is no bill row yet. */
+  bill_id: string | null;
+  /** Live (un-voided) tenders. 0 on every bill on every tenant until one is written. */
+  live_count: number;
+  /** Σ of the live tender amounts. Excludes tips, always. */
+  tendered: number;
+  /** Σ of the live tips. Never part of `tendered`, never part of any sales figure. */
+  tips_total: number;
+  /** payment_method as the ledger would mirror it: the one method, or 'Split'. */
+  payment_method: string | null;
+  /** payment_splits as the ledger would mirror them. Empty for 0 or 1 tender. */
+  payment_splits: { method: string; amount: number }[];
+}
+
+export async function GetBillPaymentLedger(
+  restaurantId: string,
+  input: { bill_id?: string; table_name?: string; order_id?: string },
+): Promise<BillPaymentLedger> {
+  const context = await requireRestaurantContext(restaurantId);
+  const bill = await resolveTenderBill(context, input);
+  const empty: BillPaymentLedger = {
+    bill_id: null, live_count: 0, tendered: 0, tips_total: 0,
+    payment_method: null, payment_splits: [],
+  };
+  if (!bill) {return empty;}
+  // captureRead, not a bare query: a tenant that has not yet run migration 037
+  // has no "BillTenders" table, and a settle must not fail because a capture
+  // table is missing. It reads as "no ledger", which is the truth there.
+  const rows = await captureRead("BillTenders", () => runQuery<BillTenderRow>(
+    `select ${TENDER_SELECT} from "BillTenders"
+      where res_id = $1 and bill_id = $2 and voided_at is null
+      order by seq asc`,
+    [context.res_id, bill.id],
+  ), [] as BillTenderRow[]);
+  const live = rows.map(mapBillTender);
+  const mirror = mirrorTendersToBillColumns(live);
+  let tendered = 0;
+  let tips = 0;
+  for (const t of live) {
+    tendered = round2(tendered + t.amount);
+    tips = round2(tips + t.tip_amount);
+  }
+  return {
+    bill_id: bill.id,
+    live_count: live.length,
+    tendered,
+    tips_total: tips,
+    payment_method: mirror.payment_method,
+    payment_splits: mirror.payment_splits,
+  };
+}
+
+/**
+ * DEFENCE 2 from migration 037's header: refuse to settle a bill whose live
+ * tenders do not reconstruct its grand total.
+ *
+ * The deferred constraint trigger cannot see this case — tenders written in one
+ * transaction, closed_at stamped in a later one that never touches "BillTenders"
+ * — so the assertion has to exist in the settle path too. A NO-OP when the bill
+ * has no tenders at all, which is every settle on every tenant until a client
+ * starts writing them: this is additive and must never break the existing
+ * single-method settle.
+ */
+export async function assertTendersReconcileForSettle(
+  context: RestaurantContext,
+  billId: string,
+  grandTotal: number,
+  client?: PoolClient,
+): Promise<void> {
+  const rows = await captureRead("BillTenders", () => runQuery<{ amount: number | string }>(
+    `select amount from "BillTenders"
+      where res_id = $1 and bill_id = $2 and voided_at is null`,
+    [context.res_id, billId], client,
+  ), [] as { amount: number | string }[]);
+  if (rows.length === 0) {return;}
+  const rec = reconcileTenders(grandTotal, rows.map((r) => parseNumeric(r.amount)));
+  if (!rec.exact) {
+    throw new Error(
+      `The recorded tenders add up to ${String(rec.tendered)} but this bill is ${String(grandTotal)}. Correct the payment before settling.`,
+    );
+  }
+}
+
+/** Every tender in a window — the read behind the tip and settlement reports. */
+export async function GetBillTenders(
+  restaurantId: string,
+  fromIso: string,
+  toIso: string,
+  opts: { tippedOnly?: boolean; limit?: number; offset?: number } = {},
+): Promise<{ rows: BillTenderRecord[]; total_tendered: number; total_tips: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const limit = Math.max(1, Math.min(Math.round(Number(opts.limit) || 500), 5000));
+  const offset = Math.max(0, Math.round(Number(opts.offset) || 0));
+  const rows = await captureRead("BillTenders", () => runQuery<BillTenderRow>(
+    `select ${TENDER_SELECT} from "BillTenders"
+      where res_id = $1 and (${og} or outlet_id = $2)
+        and settled_at >= $3 and settled_at < $4
+        and voided_at is null
+        and (${opts.tippedOnly === true ? "tip_amount > 0" : "true"})
+      order by settled_at desc, seq asc
+      limit $5 offset $6`,
+    [context.res_id, context.outlet_id, fromIso, toIso, limit, offset],
+  ), [] as BillTenderRow[]);
+  const mapped = rows.map(mapBillTender);
+  let tendered = 0;
+  let tips = 0;
+  for (const r of mapped) {
+    tendered = round2(tendered + r.amount);
+    tips = round2(tips + r.tip_amount);
+  }
+  return { rows: mapped, total_tendered: tendered, total_tips: tips };
+}
+
+/** What one person (or the pool) is owed for a window, and how it arrived. */
+export interface TipLedgerEntry {
+  /** An employee's username, or the literal 'pool'. Never null — 037's CHECK. */
+  credited_to: string;
+  /** Sum of that destination's tips, accumulated in whole paisa. */
+  tips: number;
+  /** How many tenders carried one. Not a bill count: one bill can tip twice. */
+  tender_count: number;
+  /** cash / card / upi / wallet / other -> amount. The side of the drawer it landed on. */
+  by_mode: Record<string, number>;
+}
+
+/**
+ * THE TIP LEDGER FOR A WINDOW — the payroll question migration 037 exists to
+ * make answerable: how much was tipped, in what form, and who is owed it.
+ *
+ * WHY THIS WRAPPER EXISTS instead of a route calling GetBillTenders directly.
+ * GetBillTenders binds `settled_at >= $3 and settled_at < $4` with the instants
+ * it is handed, and only the data layer knows the tenant's timezone. A route
+ * passing "2026-09-01" straight through would bind UTC midnight — 05:30 in
+ * Asia/Kolkata — and an EXCLUSIVE upper bound at the start of the last chosen
+ * day, silently dropping that whole day's tips and mis-slicing the first. So the
+ * same INCLUSIVE day keys every other report speaks are resolved here, through
+ * the same normalizeReportRange the accounting reads use, and never in a route.
+ *
+ * A TIP IS NOT REVENUE, and this reader is that rule in the shape of an API: it
+ * reports tips and says nothing about sales. `tip_amount` rides on the tender
+ * and is excluded from every sum of `amount`, so it reaches no sales figure, no
+ * APC, no ABV and no rung of the money ladder — GetBillTenders returns
+ * total_tendered and total_tips as two separate numbers for exactly that reason.
+ *
+ * Accumulated in WHOLE PAISA. A day of 200 tips summed as doubles drifts; the
+ * person being handed the money counts in rupees and paise and is entitled to
+ * the same answer twice.
+ */
+export async function GetTipLedger(
+  restaurantId: string,
+  fromDay?: string,
+  toDay?: string,
+): Promise<{
+  from: string;
+  to: string;
+  rows: BillTenderRecord[];
+  total_tips: number;
+  by_credited_to: TipLedgerEntry[];
+}> {
+  const context = await requireRestaurantContext(restaurantId);
+  const range = normalizeReportRange(fromDay, toDay, context.timezone);
+  const { rows } = await GetBillTenders(restaurantId, range.fromIso, range.toIso, {
+    tippedOnly: true,
+    limit: 5000,
+  });
+  const paisaByName = new Map<string, { paisa: number; count: number; modes: Map<string, number> }>();
+  let totalPaisa = 0;
+  for (const r of rows) {
+    const paisa = toPaisa(r.tip_amount);
+    if (paisa <= 0) {continue;}
+    totalPaisa += paisa;
+    // Unreachable while billtenders_tip_attributed stands (a tip must name a
+    // destination), and kept anyway: a payroll report that silently dropped an
+    // orphan tip would hide the very money it exists to hand over.
+    const key = r.tip_credited_to_username ?? "unattributed";
+    const entry = paisaByName.get(key) ?? { paisa: 0, count: 0, modes: new Map<string, number>() };
+    entry.paisa += paisa;
+    entry.count += 1;
+    const mode = r.tip_mode ?? "other";
+    entry.modes.set(mode, (entry.modes.get(mode) ?? 0) + paisa);
+    paisaByName.set(key, entry);
+  }
+  const by_credited_to: TipLedgerEntry[] = [...paisaByName.entries()].map(([credited_to, e]) => ({
+    credited_to,
+    tips: round2(e.paisa / 100),
+    tender_count: e.count,
+    by_mode: Object.fromEntries([...e.modes.entries()].map(([m, v]) => [m, round2(v / 100)])),
+  })).sort((a, b) => b.tips - a.tips || a.credited_to.localeCompare(b.credited_to));
+  return {
+    from: range.fromDate,
+    to: range.toDate,
+    rows,
+    total_tips: round2(totalPaisa / 100),
+    by_credited_to,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 038 — BILLING COUNTERS
+// ---------------------------------------------------------------------------
+
+export interface BillingCounterRecord {
+  id: string;
+  outlet_id: string;
+  code: string;
+  name: string;
+  kind: CounterKind;
+  device_hint: string | null;
+  active: boolean;
+  sort_order: number;
+}
+
+interface BillingCounterRow {
+  id: string; outlet_id: string; code: string; name: string; kind: string;
+  device_hint: string | null; active: boolean; sort_order: number;
+}
+
+const COUNTER_SELECT = `id, outlet_id, code, name, kind, device_hint, active, sort_order`;
+
+function mapBillingCounter(r: BillingCounterRow): BillingCounterRecord {
+  return {
+    id: r.id,
+    outlet_id: r.outlet_id,
+    code: r.code,
+    name: r.name,
+    kind: (r.kind === "terminal" ? "terminal" : "counter"),
+    device_hint: r.device_hint,
+    active: r.active !== false,
+    sort_order: Math.round(parseNumeric(r.sort_order)),
+  };
+}
+
+/** The outlet's counters. Empty on a tenant that has never configured one. */
+export async function ListBillingCounters(
+  restaurantId: string,
+  opts: { includeInactive?: boolean } = {},
+): Promise<BillingCounterRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const rows = await captureRead("BillingCounters", () => runQuery<BillingCounterRow>(
+    `select ${COUNTER_SELECT} from "BillingCounters"
+      where res_id = $1 and (${og} or outlet_id = $2)
+        and (${opts.includeInactive === true ? "true" : "active = true"})
+      order by sort_order asc, lower(code) asc`,
+    [context.res_id, context.outlet_id],
+  ), [] as BillingCounterRow[]);
+  return rows.map(mapBillingCounter);
+}
+
+/**
+ * Create or update a counter.
+ *
+ * Upserts on (res_id, outlet_id, lower(code)) — the identity migration 038 makes
+ * unique — so re-saving the configuration screen updates rather than duplicating,
+ * and a code that differs only by case cannot become a second till nobody can
+ * tell apart on a cash-up sheet.
+ */
+export async function UpsertBillingCounter(
+  restaurantId: string,
+  input: { id?: string; code: string; name?: string; kind?: string; device_hint?: string | null; active?: boolean; sort_order?: number },
+): Promise<BillingCounterRecord> {
+  const code = String(input.code ?? "").trim().slice(0, 16);
+  if (!code) {throw new Error("A counter code is required");}
+  const name = String(input.name ?? "").trim() || code;
+  const kind = normalizeVocabulary(input.kind, COUNTER_KINDS) ?? "counter";
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<BillingCounterRow>(
+    `insert into "BillingCounters" (id, res_id, outlet_id, code, name, kind, device_hint, active, sort_order)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     on conflict (res_id, outlet_id, lower(code)) do update
+       set name = excluded.name,
+           kind = excluded.kind,
+           device_hint = excluded.device_hint,
+           active = excluded.active,
+           sort_order = excluded.sort_order
+     returning ${COUNTER_SELECT}`,
+    [isUuid(String(input.id ?? "")) ? input.id : randomUUID(),
+      context.res_id, context.outlet_id, code, name, kind,
+      String(input.device_hint ?? "").trim() || null,
+      input.active === false ? false : true,
+      Math.round(Number(input.sort_order) || 0)],
+  );
+  return mapBillingCounter(rows[0]);
+}
+
+/**
+ * Attribute a bill to the till that rang it.
+ *
+ * Separate from the settle path on purpose: the counter is a property of the
+ * DEVICE, resolved from the request (a header or the signed-in terminal), and
+ * threading it through six settle signatures would put a device concern inside
+ * the money path. Callable at any point in a bill's life; a bill with no counter
+ * reads as "this outlet's till", which is what every existing bill is.
+ */
+export async function SetBillCounter(
+  restaurantId: string,
+  billId: string,
+  counterId: string | null,
+  client?: PoolClient,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId, client);
+  const id = String(billId ?? "").trim();
+  if (!isUuid(id)) {return false;}
+  const counter = String(counterId ?? "").trim();
+  const rows = await runQuery<{ id: string }>(
+    `update "Bills" set counter_id = $4
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id`,
+    [id, context.res_id, context.outlet_id, isUuid(counter) ? counter : null],
+    client,
+  );
+  return rows.length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// 039 — MENU GROUPS + VARIATIONS
+// ---------------------------------------------------------------------------
+
+export interface MenuGroupRecord {
+  id: string;
+  outlet_id: string;
+  name: string;
+  kind: MenuGroupKind;
+  active: boolean;
+  sort_order: number;
+}
+
+export interface MenuVariationRecord {
+  id: string;
+  outlet_id: string;
+  menu_id: string;
+  name: string;
+  price: number;
+  is_default: boolean;
+  active: boolean;
+  sort_order: number;
+}
+
+interface MenuGroupRow {
+  id: string; outlet_id: string; name: string; kind: string; active: boolean; sort_order: number;
+}
+interface MenuVariationRow {
+  id: string; outlet_id: string; menu_id: string; name: string; price: number | string;
+  is_default: boolean; active: boolean; sort_order: number;
+}
+
+function mapMenuGroup(r: MenuGroupRow): MenuGroupRecord {
+  return {
+    id: r.id,
+    outlet_id: r.outlet_id,
+    name: r.name,
+    kind: r.kind === "production" ? "production" : "revenue",
+    active: r.active !== false,
+    sort_order: Math.round(parseNumeric(r.sort_order)),
+  };
+}
+
+function mapMenuVariation(r: MenuVariationRow): MenuVariationRecord {
+  return {
+    id: r.id,
+    outlet_id: r.outlet_id,
+    menu_id: r.menu_id,
+    name: r.name,
+    price: round2(parseNumeric(r.price)),
+    is_default: r.is_default === true,
+    active: r.active !== false,
+    sort_order: Math.round(parseNumeric(r.sort_order)),
+  };
+}
+
+/** The outlet's menu groups, on one axis or both. */
+export async function ListMenuGroups(
+  restaurantId: string,
+  opts: { kind?: string; includeInactive?: boolean } = {},
+): Promise<MenuGroupRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const kind = normalizeVocabulary(opts.kind, MENU_GROUP_KINDS);
+  const rows = await captureRead("MenuGroups", () => runQuery<MenuGroupRow>(
+    `select id, outlet_id, name, kind, active, sort_order from "MenuGroups"
+      where res_id = $1 and outlet_id = $2
+        and ($3::text is null or kind = $3)
+        and (${opts.includeInactive === true ? "true" : "active = true"})
+      order by kind asc, sort_order asc, lower(name) asc`,
+    [context.res_id, context.outlet_id, kind],
+  ), [] as MenuGroupRow[]);
+  return rows.map(mapMenuGroup);
+}
+
+/** Create or update a group. Upserts on (res_id, outlet_id, kind, lower(name)). */
+export async function UpsertMenuGroup(
+  restaurantId: string,
+  input: { id?: string; name: string; kind?: string; active?: boolean; sort_order?: number },
+): Promise<MenuGroupRecord> {
+  const name = String(input.name ?? "").trim().slice(0, 60);
+  if (!name) {throw new Error("A group name is required");}
+  const kind = normalizeVocabulary(input.kind, MENU_GROUP_KINDS) ?? "revenue";
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<MenuGroupRow>(
+    `insert into "MenuGroups" (id, res_id, outlet_id, name, kind, active, sort_order)
+     values ($1,$2,$3,$4,$5,$6,$7)
+     on conflict (res_id, outlet_id, kind, lower(name)) do update
+       set active = excluded.active, sort_order = excluded.sort_order, name = excluded.name
+     returning id, outlet_id, name, kind, active, sort_order`,
+    [isUuid(String(input.id ?? "")) ? input.id : randomUUID(),
+      context.res_id, context.outlet_id, name, kind,
+      input.active === false ? false : true,
+      Math.round(Number(input.sort_order) || 0)],
+  );
+  return mapMenuGroup(rows[0]);
+}
+
+/**
+ * One group by id — the SNAPSHOT an edit merges over.
+ *
+ * menu_taxonomy.ts's contract is read-merge-write: a field absent from a PATCH
+ * means "keep what is stored", and there is nothing to keep without this read.
+ * Returns null (never a fabricated default row) when the id belongs to another
+ * outlet or to nothing, so the route answers 404 rather than creating a group
+ * the caller thought it was editing.
+ */
+export async function GetMenuGroupById(restaurantId: string, groupId: string): Promise<MenuGroupRecord | null> {
+  const id = String(groupId ?? "").trim();
+  if (!isUuid(id)) {return null;}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await captureRead("MenuGroups", () => runQuery<MenuGroupRow>(
+    `select id, outlet_id, name, kind, active, sort_order from "MenuGroups"
+      where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [id, context.res_id, context.outlet_id],
+  ), [] as MenuGroupRow[]);
+  return rows[0] ? mapMenuGroup(rows[0]) : null;
+}
+
+/**
+ * Write a COMPLETE group row over an existing id.
+ *
+ * WHY THIS EXISTS INSTEAD OF REUSING UpsertMenuGroup. That function's conflict
+ * arbiter is (res_id, outlet_id, kind, lower(name)), which makes it exactly
+ * right for "create Beverage, or adopt the Beverage that is already there" and
+ * exactly wrong for editing a row BY ID:
+ *
+ *   * RENAMING would fail. With a new name there is no arbiter conflict, so the
+ *     statement proceeds to a real INSERT and trips the PRIMARY KEY on the id it
+ *     was handed — a 23505 on a rename that has nothing wrong with it.
+ *   * Renaming ONTO an existing group's name would be worse than failing: the
+ *     arbiter would match that OTHER row and silently rewrite it, quietly
+ *     merging two groups and returning an id the caller never asked about.
+ *
+ * A plain UPDATE by id does what the merge contract describes and nothing else.
+ * A collision with another group's name surfaces as the unique violation it is,
+ * which the route turns into a 409 the owner can act on.
+ */
+export async function UpdateMenuGroupById(
+  restaurantId: string,
+  groupId: string,
+  write: MenuGroupWrite,
+): Promise<MenuGroupRecord | null> {
+  const id = String(groupId ?? "").trim();
+  if (!isUuid(id)) {return null;}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<MenuGroupRow>(
+    `update "MenuGroups"
+        set name = $4, kind = $5, active = $6, sort_order = $7
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id, outlet_id, name, kind, active, sort_order`,
+    [id, context.res_id, context.outlet_id,
+      String(write.name ?? "").trim().slice(0, 60), write.kind,
+      write.active !== false, Math.round(Number(write.sort_order) || 0)],
+  );
+  return rows[0] ? mapMenuGroup(rows[0]) : null;
+}
+
+/**
+ * Put a group on a menu ITEM (the exception) or on a CATEGORY (the default).
+ *
+ * Passing a null group clears the assignment, which for an item means "fall back
+ * to my category" and for a category means "everything under me is Unclassified
+ * until somebody says otherwise". Neither is an error state: an unclassified menu
+ * is what every tenant has on the day this ships, and the reports say so out loud
+ * rather than inventing a group.
+ */
+export async function SetMenuGroupAssignment(
+  restaurantId: string,
+  target: { menu_id?: string; main_cat_id?: string },
+  groupId: string | null,
+): Promise<boolean> {
+  const context = await requireRestaurantContext(restaurantId);
+  const gid = isUuid(String(groupId ?? "")) ? groupId : null;
+  const menuId = String(target.menu_id ?? "").trim();
+  const catId = String(target.main_cat_id ?? "").trim();
+  if (isUuid(menuId)) {
+    const rows = await runQuery<{ id: string }>(
+      `update "Menu" set group_id = $4 where id = $1 and res_id = $2 and outlet_id = $3 returning id`,
+      [menuId, context.res_id, context.outlet_id, gid],
+    );
+    return rows.length > 0;
+  }
+  if (isUuid(catId)) {
+    const rows = await runQuery<{ id: string }>(
+      `update "Menue_main_cat" set group_id = $4 where id = $1 and res_id = $2 and outlet_id = $3 returning id`,
+      [catId, context.res_id, context.outlet_id, gid],
+    );
+    return rows.length > 0;
+  }
+  throw new Error("A menu item id or a category id is required");
+}
+
+/** One row of the classification map: what a category or an item is filed as. */
+export interface MenuGroupAssignmentRow {
+  id: string;
+  name: string;
+  /** The group set DIRECTLY on this row, or null. For an item this is the override. */
+  group_id: string | null;
+  /** What this row RESOLVES to today (item override -> category default -> null). */
+  resolved_group_id: string | null;
+  resolved_group_name: string | null;
+}
+
+/**
+ * THE CLASSIFICATION MAP an editor needs to do anything at all.
+ *
+ * A group attaches to "Menue_main_cat".group_id (the default) or "Menu".group_id
+ * (the per-item exception) — and NOTHING a client can already call exposes a
+ * category id. GetMenuCategories returns bare sub-category NAMES; GetMenuItems
+ * flattens the whole taxonomy to one `category` string. So without this read the
+ * only assignment a client could make is the per-item one, and setting a group
+ * on 300 items one at a time is precisely the workflow 039's header says nobody
+ * will use.
+ *
+ * It returns both halves and the RESOLUTION, so a picker can show "Beverages —
+ * Liquor (from category)" beside "Fresh Lime Soda — Beverage (override)" without
+ * re-deriving the precedence client-side and getting it different from the
+ * report. `unclassified_items` is the honest headline: a group report's totals
+ * only equal the sales summary's if what it cannot classify is counted, and an
+ * owner should see that number BEFORE the report does.
+ *
+ * Degrades to "no groups anywhere" when migration 039 is unapplied, so the
+ * editor opens and shows an unconfigured menu rather than an error.
+ */
+export async function GetMenuGroupAssignments(
+  restaurantId: string,
+  kind: MenuGroupKind = "revenue",
+): Promise<{
+  kind: MenuGroupKind;
+  groups: MenuGroupRecord[];
+  categories: MenuGroupAssignmentRow[];
+  items: MenuGroupAssignmentRow[];
+  unclassified_items: number;
+}> {
+  const context = await requireRestaurantContext(restaurantId);
+  const wantedKind = normalizeVocabulary(kind, MENU_GROUP_KINDS) ?? "revenue";
+  const groups = await ListMenuGroups(restaurantId, { kind: wantedKind, includeInactive: true });
+
+  const categoryRows = await captureRead("Menue_main_cat.group_id", () => runQuery<{
+    id: string; name: string; group_id: string | null; group_name: string | null;
+  }>(
+    `select mc.id, mc.name, g.id as group_id, g.name as group_name
+       from "Menue_main_cat" mc
+       left join "MenuGroups" g
+         on g.id = mc.group_id and g.res_id = mc.res_id and g.outlet_id = mc.outlet_id and g.kind = $3
+      where mc.res_id = $1 and mc.outlet_id = $2
+      order by lower(mc.name) asc`,
+    [context.res_id, context.outlet_id, wantedKind],
+  ), [] as { id: string; name: string; group_id: string | null; group_name: string | null }[]);
+
+  // The item half re-uses the SAME coalesce GetMenuAttributionIndex reports
+  // with, so what this screen says a dish is filed as is what the report will
+  // say — carried as two columns here only so the editor can tell an override
+  // apart from an inherited default.
+  const itemRows = await captureRead("Menu.group_id", () => runQuery<{
+    id: string; name: string; own_group_id: string | null;
+    group_id: string | null; group_name: string | null;
+  }>(
+    `select m.id, m.name, m.group_id as own_group_id,
+            coalesce(gi.id, gc.id)     as group_id,
+            coalesce(gi.name, gc.name) as group_name
+       from "Menu" m
+       left join "MenuGroups" gi
+         on gi.id = m.group_id and gi.res_id = m.res_id and gi.outlet_id = m.outlet_id and gi.kind = $3
+       left join "Menue_main_cat" mc
+         on mc.id = m.main_cat_id and mc.res_id = m.res_id and mc.outlet_id = m.outlet_id
+       left join "MenuGroups" gc
+         on gc.id = mc.group_id and gc.res_id = m.res_id and gc.outlet_id = m.outlet_id and gc.kind = $3
+      where m.res_id = $1 and m.outlet_id = $2
+      order by lower(m.name) asc`,
+    [context.res_id, context.outlet_id, wantedKind],
+  ), [] as { id: string; name: string; own_group_id: string | null; group_id: string | null; group_name: string | null }[]);
+
+  const items = itemRows.map((r): MenuGroupAssignmentRow => ({
+    id: r.id,
+    name: r.name,
+    group_id: r.own_group_id,
+    resolved_group_id: r.group_id,
+    resolved_group_name: r.group_name,
+  }));
+  return {
+    kind: wantedKind,
+    groups,
+    categories: categoryRows.map((r): MenuGroupAssignmentRow => ({
+      id: r.id,
+      name: r.name,
+      group_id: r.group_id,
+      resolved_group_id: r.group_id,
+      resolved_group_name: r.group_name,
+    })),
+    items,
+    unclassified_items: items.reduce((n, it) => n + (it.resolved_group_id ? 0 : 1), 0),
+  };
+}
+
+/** The variations of one dish, or of the whole menu. */
+export async function ListMenuVariations(
+  restaurantId: string,
+  opts: { menu_id?: string; includeInactive?: boolean } = {},
+): Promise<MenuVariationRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const menuId = isUuid(String(opts.menu_id ?? "")) ? String(opts.menu_id) : null;
+  const rows = await captureRead("MenuVariations", () => runQuery<MenuVariationRow>(
+    `select id, outlet_id, menu_id, name, price, is_default, active, sort_order
+       from "MenuVariations"
+      where res_id = $1 and outlet_id = $2
+        and ($3::uuid is null or menu_id = $3)
+        and (${opts.includeInactive === true ? "true" : "active = true"})
+      order by menu_id asc, sort_order asc, lower(name) asc`,
+    [context.res_id, context.outlet_id, menuId],
+  ), [] as MenuVariationRow[]);
+  return rows.map(mapMenuVariation);
+}
+
+/**
+ * Every variation of the outlet, keyed by id.
+ *
+ * Loaded by applyMenuPriceFloor ONLY when an incoming line actually names a
+ * variation, so a tenant that has never configured one pays nothing for this at
+ * order-entry time. Inactive variations are included: an order placed while a
+ * variation was live must still resolve (and must still floor) after it is
+ * retired — the `active` flag is checked at the point of use, where "this
+ * variation is no longer sold" can be distinguished from "this variation never
+ * existed".
+ */
+async function listMenuVariationsByIdMap(restaurantId: string): Promise<Map<string, MenuVariationRecord>> {
+  const all = await ListMenuVariations(restaurantId, { includeInactive: true });
+  return new Map(all.map((v) => [v.id, v]));
+}
+
+/** Create or update a variation. Upserts on (res_id, outlet_id, menu_id, lower(name)). */
+export async function UpsertMenuVariation(
+  restaurantId: string,
+  input: { id?: string; menu_id: string; name: string; price: number; is_default?: boolean; active?: boolean; sort_order?: number },
+): Promise<MenuVariationRecord> {
+  const menuId = String(input.menu_id ?? "").trim();
+  if (!isUuid(menuId)) {throw new Error("A menu item id is required");}
+  const name = String(input.name ?? "").trim().slice(0, 60);
+  if (!name) {throw new Error("A variation name is required");}
+  const price = round2(Number(input.price));
+  if (!Number.isFinite(price) || price < 0) {throw new Error("A variation price is required");}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<MenuVariationRow>(
+    `insert into "MenuVariations" (id, res_id, outlet_id, menu_id, name, price, is_default, active, sort_order)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     on conflict (res_id, outlet_id, menu_id, lower(name)) do update
+       set price = excluded.price, is_default = excluded.is_default,
+           active = excluded.active, sort_order = excluded.sort_order, name = excluded.name
+     returning id, outlet_id, menu_id, name, price, is_default, active, sort_order`,
+    [isUuid(String(input.id ?? "")) ? input.id : randomUUID(),
+      context.res_id, context.outlet_id, menuId, name, price,
+      input.is_default === true, input.active === false ? false : true,
+      Math.round(Number(input.sort_order) || 0)],
+  );
+  return mapMenuVariation(rows[0]);
+}
+
+/**
+ * One variation by id — the SNAPSHOT an edit merges over.
+ *
+ * Inactive rows come back: retiring a variation is `active:false`, and the next
+ * edit (reinstating it, correcting its price) has to be able to read the row it
+ * is editing. Returns null for another outlet's id, so a PATCH answers 404
+ * instead of touching a tenant it cannot see.
+ */
+export async function GetMenuVariationById(restaurantId: string, variationId: string): Promise<MenuVariationRecord | null> {
+  const id = String(variationId ?? "").trim();
+  if (!isUuid(id)) {return null;}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await captureRead("MenuVariations", () => runQuery<MenuVariationRow>(
+    `select id, outlet_id, menu_id, name, price, is_default, active, sort_order
+       from "MenuVariations"
+      where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+    [id, context.res_id, context.outlet_id],
+  ), [] as MenuVariationRow[]);
+  return rows[0] ? mapMenuVariation(rows[0]) : null;
+}
+
+/**
+ * Write a COMPLETE variation row over an existing id.
+ *
+ * Same argument as UpdateMenuGroupById — UpsertMenuVariation's arbiter is
+ * (res_id, outlet_id, menu_id, lower(name)), so editing by id through it would
+ * fail on a rename and silently rewrite the OTHER "Half" on a colliding one.
+ *
+ * `menu_id` IS NOT IN THE UPDATE. A variation cannot be moved to another dish
+ * (mergeMenuVariationPatch refuses it in words the owner can act on); the column
+ * is left out here as well so no future caller can do by accident what that
+ * refusal exists to prevent — the id is stamped on order lines, and re-pointing
+ * it would relabel every past sale that named it.
+ */
+export async function UpdateMenuVariationById(
+  restaurantId: string,
+  variationId: string,
+  write: MenuVariationWrite,
+): Promise<MenuVariationRecord | null> {
+  const id = String(variationId ?? "").trim();
+  if (!isUuid(id)) {return null;}
+  const price = round2(Number(write.price));
+  // Belt to the merge's braces: a zero or negative floor is a standing invitation
+  // to ring the dish in at nothing (menu_taxonomy.ts's header). Refused here too
+  // so no caller can reach the column with one.
+  if (!Number.isFinite(price) || price <= 0) {throw new Error("price must be a positive number");}
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<MenuVariationRow>(
+    `update "MenuVariations"
+        set name = $4, price = $5, is_default = $6, active = $7, sort_order = $8
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id, outlet_id, menu_id, name, price, is_default, active, sort_order`,
+    [id, context.res_id, context.outlet_id,
+      String(write.name ?? "").trim().slice(0, 60), price,
+      write.is_default === true, write.active !== false,
+      Math.round(Number(write.sort_order) || 0)],
+  );
+  return rows[0] ? mapMenuVariation(rows[0]) : null;
+}
+
+/**
+ * THE ATTRIBUTION INDEX: every menu row with its RESOLVED group and its
+ * variations, ready for attributeOrderLine.
+ *
+ * The group precedence — item override, then category default — is a single
+ * COALESCE here rather than two ids carried through every reader. 039's header
+ * explains why the group is resolved at READ time and never snapshotted onto the
+ * order line: a classification correction has to make the last six months of
+ * reports right, not freeze the error into history.
+ *
+ * Degrades to an index built from the plain menu (every group Unclassified, no
+ * variations) when migration 039 is unapplied, so a report still opens.
+ */
+export async function GetMenuAttributionIndex(
+  restaurantId: string,
+  kind: MenuGroupKind = "revenue",
+): Promise<MenuAttributionIndex> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await captureRead("MenuGroups/MenuVariations", () => runQuery<{
+    id: string; name: string; group_id: string | null; group_name: string | null;
+  }>(
+    `select m.id, m.name,
+            coalesce(gi.id, gc.id)     as group_id,
+            coalesce(gi.name, gc.name) as group_name
+       from "Menu" m
+       left join "MenuGroups" gi
+         on gi.id = m.group_id and gi.res_id = m.res_id and gi.outlet_id = m.outlet_id and gi.kind = $3
+       left join "Menue_main_cat" mc
+         on mc.id = m.main_cat_id and mc.res_id = m.res_id and mc.outlet_id = m.outlet_id
+       left join "MenuGroups" gc
+         on gc.id = mc.group_id and gc.res_id = m.res_id and gc.outlet_id = m.outlet_id and gc.kind = $3
+      where m.res_id = $1 and m.outlet_id = $2`,
+    [context.res_id, context.outlet_id, kind],
+  ), null as { id: string; name: string; group_id: string | null; group_name: string | null }[] | null);
+
+  if (rows === null) {
+    const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
+    return buildMenuAttributionIndex(
+      menu.map((m) => ({ id: String(m.id), name: m.name, group_id: null, group_name: null })),
+    );
+  }
+
+  const variations = await ListMenuVariations(restaurantId, { includeInactive: true }).catch(() => [] as MenuVariationRecord[]);
+  const byItem = new Map<string, { id: string; name: string; price: number }[]>();
+  for (const v of variations) {
+    const list = byItem.get(v.menu_id);
+    const ref = { id: v.id, name: v.name, price: v.price };
+    if (list) {list.push(ref);} else {byItem.set(v.menu_id, [ref]);}
+  }
+  return buildMenuAttributionIndex(rows.map((r): MenuAttributionRow => ({
+    id: r.id,
+    name: r.name,
+    group_id: r.group_id,
+    group_name: r.group_name,
+    variations: byItem.get(r.id) ?? [],
+  })));
+}
+
+
+// ============================================================================
+// THE SIX CAPTURE REPORTS — 10 to 15 of the mandatory MIS pack
+// ============================================================================
+//
+// The nine above ship against data this system has always held. These six read
+// the six capture tables of migrations 034-039, which is why they sit HERE,
+// after the writers, rather than beside the nine: everything they read is
+// defined above them and nothing is reached before it exists.
+//
+// THEY ARE THE SAME REPORTS AS THE NINE, and that is a design constraint rather
+// than a remark. Every one of them:
+//   * resolves its tenant, outlet scope and window through misContext, so a
+//     clamp is named and a reversed drag is swapped exactly as it is elsewhere;
+//   * returns meta / columns / totals, so the client's column picker, its TOTALS
+//     row and renderMisCsv all work with no per-report code;
+//   * puts its money through mis_report_math.ts and nowhere else.
+//
+// WHICH CLOCK EACH ONE IS ON, stated once here and again in every payload's own
+// notes, because "two reports that both claim net sales and disagree" is the
+// failure this whole pack is built to avoid:
+//
+//   SETTLEMENT CLOCK (ties exactly to the Sales Summary)
+//     Counter Summary        — it IS the Sales Summary's bill set, re-cut by till.
+//   ORDER-PLACEMENT CLOCK (ties exactly to Item Wise, and to nothing else)
+//     Group Summary, Variation Summary — the same order lines, re-cut.
+//   THE ACT'S OWN CLOCK (ties to nothing, and says so)
+//     NC Summary             — when the dish was comped.
+//     Service Charge Deny    — when the charge was taken off.
+//     Tip Summary            — when the tender was taken.
+//
+// DEGRADATION. Every read below goes through captureRead, so a tenant that is
+// one migration behind gets an EMPTY report with its own date range on it rather
+// than a 500. An owner reads a failed request as lost data; an empty report with
+// a note reads as "nothing here yet", which is the truth.
+
+/** The bucket a bill with no recorded till lands in. See migration 038. */
+const COUNTER_UNASSIGNED_CODE = "(none)";
+const COUNTER_UNASSIGNED_NAME = "This outlet's till — no counter recorded";
+/** A counter_id on a bill whose counter row is gone. 038 deactivates, never deletes. */
+const COUNTER_UNKNOWN_NAME = "Counter no longer configured";
+/** The row that collects a dish's sales that named no variation. */
+const VARIATION_BASE_LABEL = "Base (no variation)";
+
+const NOTE_ITEM_CLOCK =
+  "Aggregated by ORDER PLACEMENT time, not settlement time, exactly as Item Wise is. It ties to Item Wise for the same window and will NOT tie to the Sales Summary.";
+const NOTE_ITEM_BASIS =
+  "Amounts are the MENU PRICE charged on the line (price x quantity) — before any bill-level discount, service charge or tax. Discounts in this system are BILL-level, so line discount is a truthful 0 and net equals gross.";
+const NOTE_ACT_CLOCK =
+  "Rows are bucketed by when the ACT happened, not by when the bill settled. An act on a table that pays after midnight falls on the day of the act.";
+
+// --- The shared item-line read (Group Summary, Variation Summary) ------------
+
+/**
+ * Every order line in the window, pre-aggregated, with the two ids migration 039
+ * stamps on it.
+ *
+ * THE SAME PREDICATES AS ITEM WISE, deliberately: same window, same
+ * cancelled-is-not-a-sale exclusion, same array guard, same price x quantity
+ * basis. That is what makes Sigma Group Summary gross equal Item Wise gross, which
+ * jest asserts — three item-level reports disagreeing is the same failure as
+ * three bill-level reports disagreeing, one level down.
+ *
+ * WHAT IS DELIBERATELY NOT SELECTED: the order line's own `id`. attributeOrderLine
+ * can resolve a pre-039 line whose id happens to BE a menu id, but grouping by a
+ * per-line uuid would return one row per line instead of one row per
+ * (dish, variation) and turn a summary into a full table scan of the window's
+ * items. The line's NAME is the fallback instead — the same fallback Item Wise's
+ * category column already trusts, so the two reports always agree about which
+ * dish a line is. The cost is that a dish RENAMED since it was sold reports as
+ * unattributed here and as category-less there: one gap, consistently.
+ */
+interface MisOrderLineRow {
+  name: string;
+  menu_id: string | null;
+  variation_id: string | null;
+  variation_name: string | null;
+  nc: boolean;
+  qty: number;
+  gross: number;
+}
+
+async function fetchMisOrderLines(mc: MisContext): Promise<MisOrderLineRow[]> {
+  return runQuery<MisOrderLineRow>(
+    `with it as (
+       select item->>'name' as name,
+              nullif(btrim(item->>'menu_id'), '')        as menu_id,
+              nullif(btrim(item->>'variation_id'), '')   as variation_id,
+              nullif(btrim(item->>'variation_name'), '') as variation_name,
+              coalesce((item->'nc') = 'true'::jsonb, false) as nc,
+              coalesce((item->>'quantity')::numeric, 1) as qty,
+              coalesce((item->>'price')::numeric, 0) as price
+         from "Orders" o, jsonb_array_elements(${MIS_ITEMS_JSON}) item
+        where o.res_id = $1 and (${mc.og} or o.outlet_id = $2)
+          and o.created_at >= $3 and o.created_at < $4
+          and coalesce(o.status::text, '1') <> '5'
+     )
+     select name, menu_id, variation_id, variation_name, nc,
+            sum(qty)::float as qty, sum(price * qty)::float as gross
+       from it
+      where coalesce(name, '') <> ''
+      group by name, menu_id, variation_id, variation_name, nc`,
+    [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
+  );
+}
+
+/**
+ * The menu attribution index FOR A REPORT'S OUTLET SCOPE.
+ *
+ * GetMenuAttributionIndex exists and is not reusable here for one reason: it is
+ * pinned to `context.outlet_id`, which is right for order entry (a line is rung
+ * up at one till in one outlet) and wrong for the ALL-OUTLETS aggregate read,
+ * where a group report over three branches would resolve only the first
+ * branch's dishes and file the other two as unattributed. Everything else — the
+ * item-override-then-category-default COALESCE, the fallback when migration 039
+ * is unapplied, the shape handed to buildMenuAttributionIndex — is identical, so
+ * a dish is filed under the same group by both.
+ *
+ * Groups are read on the REVENUE axis. The production axis exists for kitchen
+ * reporting and classifying money by it would answer a different question.
+ */
+async function fetchMisAttributionIndex(mc: MisContext): Promise<MenuAttributionIndex> {
+  const params = [mc.context.res_id, mc.context.outlet_id];
+  const rows = await captureRead("MenuGroups (report)", () => runQuery<{
+    id: string; name: string; group_id: string | null; group_name: string | null;
+  }>(
+    `select m.id, m.name,
+            coalesce(gi.id, gc.id)     as group_id,
+            coalesce(gi.name, gc.name) as group_name
+       from "Menu" m
+       left join "MenuGroups" gi
+         on gi.id = m.group_id and gi.res_id = m.res_id and gi.outlet_id = m.outlet_id and gi.kind = 'revenue'
+       left join "Menue_main_cat" cat
+         on cat.id = m.main_cat_id and cat.res_id = m.res_id and cat.outlet_id = m.outlet_id
+       left join "MenuGroups" gc
+         on gc.id = cat.group_id and gc.res_id = m.res_id and gc.outlet_id = m.outlet_id and gc.kind = 'revenue'
+      where m.res_id = $1 and (${mc.og} or m.outlet_id = $2)`,
+    params,
+  ), null as { id: string; name: string; group_id: string | null; group_name: string | null }[] | null);
+
+  if (rows === null) {
+    // Migration 039 is not applied here. Every dish is still reportable — it
+    // simply has no group and no variation, which is exactly what the report
+    // then says out loud.
+    const plain = await runQuery<{ id: string; name: string }>(
+      `select m.id, m.name from "Menu" m where m.res_id = $1 and (${mc.og} or m.outlet_id = $2)`,
+      params,
+    ).catch(() => [] as { id: string; name: string }[]);
+    return buildMenuAttributionIndex(
+      plain.map((m): MenuAttributionRow => ({ id: String(m.id), name: m.name, group_id: null, group_name: null })),
+    );
+  }
+
+  const variations = await captureRead("MenuVariations (report)", () => runQuery<{
+    id: string; menu_id: string; name: string; price: number | string;
+  }>(
+    `select id, menu_id, name, price from "MenuVariations"
+      where res_id = $1 and (${mc.og} or outlet_id = $2)`,
+    params,
+  ), [] as { id: string; menu_id: string; name: string; price: number | string }[]);
+
+  const byItem = new Map<string, { id: string; name: string; price: number }[]>();
+  for (const v of variations) {
+    const list = byItem.get(v.menu_id);
+    const ref = { id: String(v.id), name: v.name, price: round2(parseNumeric(v.price)) };
+    if (list) {list.push(ref);} else {byItem.set(v.menu_id, [ref]);}
+  }
+  return buildMenuAttributionIndex(rows.map((r): MenuAttributionRow => ({
+    id: String(r.id),
+    name: r.name,
+    group_id: r.group_id,
+    group_name: r.group_name,
+    variations: byItem.get(String(r.id)) ?? [],
+  })));
+}
+
+// --- 10. NC Summary ----------------------------------------------------------
+
+export interface NcSummaryRow {
+  nc_id: string;
+  marked_at: string;
+  bill_id: string | null;
+  bill_no: string | null;
+  order_id: string;
+  item_name: string;
+  /** Recovered by joining the item NAME to the menu, exactly as Item Wise does. */
+  category: string | null;
+  quantity: number;
+  /** The menu's list price when the comp was made. Null when the dish no longer resolves. */
+  menu_price: number | null;
+  /** The price the LINE was carrying — what the guest would otherwise have paid. */
+  nc_price: number;
+  /** quantity x menu_price. 0 on a reversed row, null when menu_price is unknown. */
+  menu_value: number | null;
+  /** THE CONTROL FIGURE: quantity x nc_price. 0 on a reversed row. */
+  loss: number;
+  /** The same money on a reversed row, and 0 on a live one. */
+  reversed_loss: number;
+  nc_kind: string;
+  reason: string;
+  marked_by: string;
+  authorised_by: string;
+  /** Who took the order the dish was on, when the order recorded it. */
+  waiter: string | null;
+  table_name: string | null;
+  /** dine_in / takeaway / delivery / other, from the order the comp was on. */
+  order_type: string;
+  reversed: boolean;
+  reversed_at: string | null;
+  reversed_by: string | null;
+  reversal_reason: string | null;
+}
+
+export interface NcSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: NcSummaryRow[];
+  totals: {
+    entries: number;
+    reversed_entries: number;
+    quantity: number;
+    menu_value: number;
+    loss: number;
+    reversed_loss: number;
+    /** The window's net sales, for scale. On the SETTLEMENT clock — see notes. */
+    net_sales: number;
+    loss_pct_of_net: number | null;
+  };
+  by_kind: { kind: string; label: string; entries: number; quantity: number; loss: number }[];
+  page: MisPage;
+  /** False — the category column is a name join and a rename silently breaks it. */
+  category_exact: boolean;
+}
+
+const NC_SUMMARY_COLUMNS: MisColumn[] = [
+  { key: "marked_at", label: "Date & time", type: "datetime" },
+  { key: "bill_no", label: "Bill", type: "text" },
+  { key: "order_id", label: "KOT / Order", type: "text", default_on: false },
+  { key: "item_name", label: "Item", type: "text" },
+  { key: "category", label: "Category", type: "text" },
+  { key: "quantity", label: "Qty", type: "int", total: true },
+  { key: "menu_price", label: "Menu price", type: "money" },
+  { key: "nc_price", label: "NC price", type: "money" },
+  { key: "menu_value", label: "Menu value", type: "money", total: true, default_on: false },
+  { key: "loss", label: "Loss (given away)", type: "money", total: true },
+  { key: "nc_kind", label: "Kind", type: "text" },
+  { key: "reason", label: "Reason", type: "text" },
+  { key: "authorised_by", label: "Authorised by", type: "text" },
+  { key: "marked_by", label: "Marked by", type: "text" },
+  { key: "waiter", label: "Waiter", type: "text" },
+  { key: "table_name", label: "Table", type: "text" },
+  { key: "order_type", label: "Type", type: "text" },
+  { key: "reversed_loss", label: "Reversed", type: "money", total: true, default_on: false },
+  { key: "reversed_by", label: "Reversed by", type: "text", default_on: false },
+];
+
+interface NcSummarySqlRow {
+  id: string; created_at: Date | string; order_id: string; item_name: string;
+  nc_kind: string; reason: string;
+  quantity: number | string; unit_price: number | string; menu_price_at_nc: number | string | null;
+  value: number | string;
+  marked_by_username: string; authorised_by_username: string;
+  reversed_at: Date | null; reversed_by_username: string | null; reversal_reason: string | null;
+  table_name: string | null; order_type: string | null; waiter: string | null;
+  bill_id: string | null; bill_no: string | null;
+}
+
+/**
+ * NC SUMMARY — every dish that was served and not billed, and on whose say-so.
+ *
+ * THREE PRICES, BECAUSE THE SCHEMA HOLDS THREE AND CONFLATING THEM IS HOW THIS
+ * REPORT WOULD LIE:
+ *   Menu price — "Menu".price at the moment of the comp, as snapshotted by
+ *                migration 034. NULL when the dish resolves to no menu row, and
+ *                deliberately not substituted with anything.
+ *   NC price   — the price the LINE was carrying. This is the money the guest
+ *                would have paid, and it is what a comp actually gives away.
+ *                On an off-menu or uplifted line it is NOT the menu price, which
+ *                is the whole reason both are recorded.
+ *   Charged    — zero. This system's non-chargeable is all-or-nothing: the line
+ *                leaves chargeableSubtotal entirely. There is no partial NC rate,
+ *                so there is no column for one.
+ * LOSS is therefore quantity x NC price — the revenue given away — and Menu
+ * value sits beside it so the gap between list and line is visible by
+ * subtraction rather than asserted as a number nobody can check.
+ *
+ * A REVERSED COMP GAVE AWAY NOTHING. Its row is still listed (dropping it would
+ * hide the most interesting rows in a fraud-control document) with Loss 0 and
+ * its money under Reversed, so every money column adds up to its own total.
+ *
+ * THE BILL COLUMN IS A RESOLUTION, NOT A FOREIGN KEY. 034 records the order and
+ * the table, and a dine-in bill covers a table's orders rather than pointing at
+ * one; so the bill shown is the FIRST bill on that table that settled at or
+ * after the comp — the bill the comp actually reduced. A comp on a table whose
+ * bill is still open resolves to that open bill. A takeaway order with no table
+ * resolves through "Bills".order_id instead. Where neither finds one, the column
+ * is blank rather than guessed.
+ */
+export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<NcSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const search = misSearch(q);
+
+  const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
+  let searchSql = "";
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${String(params.length)}`;
+    searchSql = ` and (n.item_name ilike ${p} or n.reason ilike ${p} or n.nc_kind ilike ${p}
+                       or n.marked_by_username ilike ${p} or n.authorised_by_username ilike ${p}
+                       or t.table_name ilike ${p} or n.order_id::text ilike ${p} or bl.bill_no ilike ${p})`;
+  }
+
+  const rows = await captureRead("OrderItemNonChargeable", () => runQuery<NcSummarySqlRow>(
+    `select n.id, n.created_at, n.order_id, n.item_name, n.nc_kind, n.reason,
+            n.quantity, n.unit_price, n.menu_price_at_nc, n.value,
+            n.marked_by_username, n.authorised_by_username,
+            n.reversed_at, n.reversed_by_username, n.reversal_reason,
+            t.table_name,
+            (o.food)::jsonb->>'order_type'             as order_type,
+            (o.food)::jsonb->>'taken_by_employee_name' as waiter,
+            bl.bill_id, bl.bill_no
+       from "OrderItemNonChargeable" n
+       left join "Tables" t on t.id = n.table_id and t.res_id = n.res_id and t.outlet_id = n.outlet_id
+       left join "Orders" o on o.id = n.order_id and o.res_id = n.res_id and o.outlet_id = n.outlet_id
+       -- THE BILL THE COMP REDUCED. See the header: the first bill on this table
+       -- that settled at or after the comp, or an open one when none has; and
+       -- "Bills".order_id for a table-less (takeaway) order. 'infinity' sorts an
+       -- OPEN bill last so a bill that actually closed after the comp wins.
+       left join lateral (
+         select b.id as bill_id, b.bill_no::text as bill_no
+           from "Bills" b
+          where b.res_id = n.res_id and b.outlet_id = n.outlet_id
+            and ((n.table_id is not null and b.table_id = n.table_id
+                  and (coalesce(b.closed_at, b.admin_approved_at) is null
+                       or coalesce(b.closed_at, b.admin_approved_at) >= n.created_at))
+              or (n.table_id is null and b.order_id = n.order_id))
+          order by coalesce(b.closed_at, b.admin_approved_at, 'infinity'::timestamptz) asc, b.created_at asc
+          limit 1
+       ) bl on true
+      where n.res_id = $1 and (${mc.og} or n.outlet_id = $2)
+        and n.created_at >= $3 and n.created_at < $4
+        ${searchSql}
+      order by n.created_at desc, n.id desc`,
+    params,
+  ), [] as NcSummarySqlRow[]);
+
+  const categoryByName = new Map<string, string>();
+  try {
+    for (const m of await GetMenuItems(restaurantId)) {
+      if (m.name.trim()) {categoryByName.set(m.name.trim().toLowerCase(), m.category);}
+    }
+  } catch { /* category stays null — declared in the notes */ }
+
+  const out: NcSummaryRow[] = rows.map((r) => {
+    const reversed = r.reversed_at !== null;
+    const quantity = round2(parseNumeric(r.quantity));
+    const menuPrice = r.menu_price_at_nc == null ? null : round2(parseNumeric(r.menu_price_at_nc));
+    const money = liveMoney(parseNumeric(r.value), reversed);
+    const menuMoney = menuPrice === null ? null : liveMoney(round2(menuPrice * quantity), reversed).live;
+    return {
+      nc_id: r.id,
+      marked_at: iso(r.created_at) ?? "",
+      bill_id: r.bill_id,
+      bill_no: r.bill_no,
+      order_id: r.order_id,
+      item_name: r.item_name,
+      category: categoryByName.get(r.item_name.trim().toLowerCase()) ?? null,
+      quantity,
+      menu_price: menuPrice,
+      nc_price: round2(parseNumeric(r.unit_price)),
+      menu_value: menuMoney,
+      loss: money.live,
+      reversed_loss: money.reversed,
+      nc_kind: humaniseVocabulary(r.nc_kind),
+      reason: r.reason,
+      marked_by: r.marked_by_username,
+      authorised_by: r.authorised_by_username,
+      waiter: r.waiter?.trim() || null,
+      table_name: r.table_name,
+      order_type: orderChannel(r.order_type),
+      reversed,
+      reversed_at: iso(r.reversed_at),
+      reversed_by: r.reversed_by_username,
+      reversal_reason: r.reversal_reason,
+    };
+  });
+
+  const byKind = new Map<string, { label: string; entries: number; quantity: number; loss: number }>();
+  for (let i = 0; i < rows.length; i++) {
+    const raw = rows[i];
+    const row = out[i];
+    if (row.reversed) {continue;}
+    const e = byKind.get(raw.nc_kind) ?? { label: row.nc_kind, entries: 0, quantity: 0, loss: 0 };
+    e.entries += 1;
+    e.quantity = round2(e.quantity + row.quantity);
+    e.loss = round2(e.loss + row.loss);
+    byKind.set(raw.nc_kind, e);
+  }
+
+  // Net sales for the same window, for scale. On the SETTLEMENT clock while the
+  // rows are on the comp clock — declared in the notes rather than quietly
+  // presented as one number. Same read the Discount report uses for the same
+  // reason: a giveaway figure with nothing to measure it against is unreadable.
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const ladder = misLadder(composeMisBills(await fetchMisBills(mc), scPct, mc.tz));
+
+  const totalLoss = round2(out.reduce((s, r) => s + r.loss, 0));
+  const page = misPageOf(q, out.length);
+  return {
+    meta: await misMeta(mc, "nc_summary", "NC Summary", [
+      NOTE_ACT_CLOCK,
+      NOTE_NC_BESIDE_LADDER,
+      NOTE_NC_REVERSED,
+      "Loss is quantity x the price the LINE was carrying: the money the guest would otherwise have paid. Menu value is the same quantity at the menu's list price when the comp was made, and is blank when the dish no longer resolves to a menu row. Where the two differ, the line was billed off-menu.",
+      "A non-chargeable in this system is all-or-nothing — the line leaves the chargeable subtotal entirely — so the amount charged for it is always zero and there is no partial NC rate to report.",
+      "The Bill column is the first bill on the comp's table that settled at or after the comp (or the bill raised from the order, for a takeaway with no table). It is a resolution, not a stored link, and is blank where neither finds one.",
+      "Category is recovered by matching the item name against the CURRENT menu, exactly as Item Wise does. A renamed or deleted dish shows no category.",
+      "Net sales is shown for scale only and is on the SETTLEMENT clock, unlike the rows above it.",
+    ]),
+    columns: NC_SUMMARY_COLUMNS,
+    rows: out.slice(page.offset, page.offset + page.limit),
+    totals: {
+      entries: out.filter((r) => !r.reversed).length,
+      reversed_entries: out.filter((r) => r.reversed).length,
+      quantity: round2(out.reduce((s, r) => s + (r.reversed ? 0 : r.quantity), 0)),
+      menu_value: round2(out.reduce((s, r) => s + (r.menu_value ?? 0), 0)),
+      loss: totalLoss,
+      reversed_loss: round2(out.reduce((s, r) => s + r.reversed_loss, 0)),
+      net_sales: ladder.net,
+      loss_pct_of_net: sharePct(totalLoss, ladder.net),
+    },
+    by_kind: [...byKind.entries()]
+      .map(([kind, v]) => ({ kind, ...v }))
+      .sort((a, z) => z.loss - a.loss || a.kind.localeCompare(z.kind)),
+    page,
+    category_exact: false,
+  };
+}
+
+// --- 11. Service Charge Deny -------------------------------------------------
+
+export interface ServiceChargeDenyRow {
+  waiver_id: string;
+  waived_at: string;
+  bill_id: string;
+  bill_no: string | null;
+  table_name: string | null;
+  /** "Restaurant %" or "Tax line" — which of the two shapes carried the charge. */
+  basis: string;
+  /** The percentage that WOULD have applied. */
+  basis_percent: number;
+  /** The pre-tax base it would have applied to. */
+  basis_amount: number;
+  /** The charge itself. 0 on a reversed row. */
+  amount_waived: number;
+  /** The tax that would have ridden on that charge. 0 on a reversed row. */
+  tax_on_waived: number;
+  /** amount_waived + tax_on_waived — what the guest did not pay. 0 if reversed. */
+  grand_total_reduction: number;
+  /** The same reduction on a reversed row, and 0 on a live one. */
+  reversed_amount: number;
+  waiver_kind: string;
+  reason: string;
+  denied_by: string;
+  authorised_by: string;
+  /** The bill's own tax-inclusive total, when it has settled. */
+  bill_grand_total: number | null;
+  settled_at: string | null;
+  reversed: boolean;
+  reversed_at: string | null;
+  reversed_by: string | null;
+  reversal_reason: string | null;
+}
+
+export interface ServiceChargeDenyReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: ServiceChargeDenyRow[];
+  totals: {
+    waivers: number;
+    reversed_waivers: number;
+    amount_waived: number;
+    tax_on_waived: number;
+    grand_total_reduction: number;
+    reversed_amount: number;
+    bill_grand_total: number;
+    /** Service charge the window actually COLLECTED. Settlement clock — see notes. */
+    service_charge_collected: number;
+    /** denied / (denied + collected): the share of the charge that was given up. */
+    denied_pct_of_chargeable: number | null;
+  };
+  by_kind: { kind: string; label: string; waivers: number; amount: number }[];
+  page: MisPage;
+}
+
+const SC_DENY_COLUMNS: MisColumn[] = [
+  { key: "waived_at", label: "Date & time", type: "datetime" },
+  { key: "bill_no", label: "Bill", type: "text" },
+  { key: "table_name", label: "Table", type: "text" },
+  { key: "basis", label: "Charge basis", type: "text" },
+  { key: "basis_percent", label: "Applicable %", type: "percent" },
+  { key: "basis_amount", label: "Charged on", type: "money" },
+  { key: "amount_waived", label: "Amount denied", type: "money", total: true },
+  { key: "tax_on_waived", label: "Tax denied", type: "money", total: true },
+  { key: "grand_total_reduction", label: "Total reduction", type: "money", total: true },
+  { key: "waiver_kind", label: "Kind", type: "text" },
+  { key: "reason", label: "Reason", type: "text" },
+  { key: "denied_by", label: "Denied by", type: "text" },
+  { key: "authorised_by", label: "Authorised by", type: "text" },
+  { key: "bill_grand_total", label: "Bill total", type: "money", total: true, default_on: false },
+  { key: "settled_at", label: "Bill settled", type: "datetime", default_on: false },
+  { key: "reversed_amount", label: "Reversed", type: "money", total: true, default_on: false },
+  { key: "reversed_by", label: "Reversed by", type: "text", default_on: false },
+];
+
+interface ScDenySqlRow {
+  id: string; waived_at: Date | string; bill_id: string;
+  basis: string; basis_percent: number | string; basis_amount: number | string;
+  amount_waived: number | string; tax_on_waived: number | string; grand_total_reduction: number | string;
+  waiver_kind: string; reason: string; waived_by_username: string; authorised_by_username: string;
+  reversed_at: Date | null; reversed_by_username: string | null; reversal_reason: string | null;
+  table_name: string | null; bill_no: string | null;
+  total_amt: number | string | null; settled_at: Date | string | null;
+}
+
+/**
+ * SERVICE CHARGE DENY — the bills whose service charge was taken off, and why.
+ *
+ * CORRECT IN BOTH TAX SHAPES, WITHOUT KNOWING WHICH ONE IT IS. That is not this
+ * report's cleverness; it is migration 036's. quoteServiceChargeWaiver measured
+ * the saving at the moment of the waiver by running computeBillCharges twice and
+ * differencing, and stored the answer — the basis it found (the restaurant's
+ * percentage, or a "Service Charge" line inside Outlets.default_tax), the
+ * percentage, the base, the charge and the tax that would have ridden on it. So
+ * this report READS four settled numbers rather than re-deriving a charge from a
+ * configuration that may have changed since. A report that re-derived it would
+ * restate last month's waivers every time an owner edits their tax setup.
+ *
+ * WHY THE BILL'S OWN TOTAL IS NOT REDUCED BY THIS. On an OPEN bill total_amt is
+ * the pre-tax subtotal and a service charge was never part of it; on a settled
+ * one the charge is simply absent from the grand total that was computed. So
+ * "Amount denied" is money that never entered any sales figure, and adding it to
+ * one would invent revenue. It is reported for what it is: what the house chose
+ * not to charge.
+ *
+ * SETTLED BILLS CANNOT BE WAIVED (WaiveServiceCharge refuses one), so a row here
+ * whose bill has since settled shows that bill's real total for context, and a
+ * row whose bill is still open shows none.
+ */
+export async function GetServiceChargeDenyReport(restaurantId: string, q: MisReportQuery = {}): Promise<ServiceChargeDenyReport> {
+  const mc = await misContext(restaurantId, q);
+  const search = misSearch(q);
+
+  const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
+  let searchSql = "";
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${String(params.length)}`;
+    searchSql = ` and (w.reason ilike ${p} or w.waiver_kind ilike ${p}
+                       or w.waived_by_username ilike ${p} or w.authorised_by_username ilike ${p}
+                       or t.table_name ilike ${p} or b.bill_no::text ilike ${p} or w.bill_id::text ilike ${p})`;
+  }
+
+  const rows = await captureRead("ServiceChargeWaivers", () => runQuery<ScDenySqlRow>(
+    `select w.id, w.waived_at, w.bill_id, w.basis, w.basis_percent, w.basis_amount,
+            w.amount_waived, w.tax_on_waived, w.grand_total_reduction,
+            w.waiver_kind, w.reason, w.waived_by_username, w.authorised_by_username,
+            w.reversed_at, w.reversed_by_username, w.reversal_reason,
+            t.table_name, b.bill_no::text as bill_no, b.total_amt,
+            coalesce(b.closed_at, b.admin_approved_at) as settled_at
+       from "ServiceChargeWaivers" w
+       left join "Tables" t on t.id = w.table_id and t.res_id = w.res_id and t.outlet_id = w.outlet_id
+       left join "Bills" b on b.id = w.bill_id and b.res_id = w.res_id and b.outlet_id = w.outlet_id
+      where w.res_id = $1 and (${mc.og} or w.outlet_id = $2)
+        and w.waived_at >= $3 and w.waived_at < $4
+        ${searchSql}
+      order by w.waived_at desc, w.id desc`,
+    params,
+  ), [] as ScDenySqlRow[]);
+
+  const out: ServiceChargeDenyRow[] = rows.map((r) => {
+    const reversed = r.reversed_at !== null;
+    const charge = liveMoney(parseNumeric(r.amount_waived), reversed);
+    const tax = liveMoney(parseNumeric(r.tax_on_waived), reversed);
+    const reduction = liveMoney(parseNumeric(r.grand_total_reduction), reversed);
+    return {
+      waiver_id: r.id,
+      waived_at: iso(r.waived_at) ?? "",
+      bill_id: r.bill_id,
+      bill_no: r.bill_no,
+      table_name: r.table_name,
+      basis: serviceChargeBasisLabel(r.basis),
+      basis_percent: round2(parseNumeric(r.basis_percent)),
+      basis_amount: round2(parseNumeric(r.basis_amount)),
+      amount_waived: charge.live,
+      tax_on_waived: tax.live,
+      grand_total_reduction: reduction.live,
+      reversed_amount: reduction.reversed,
+      waiver_kind: humaniseVocabulary(r.waiver_kind),
+      reason: r.reason,
+      denied_by: r.waived_by_username,
+      authorised_by: r.authorised_by_username,
+      bill_grand_total: r.settled_at ? round2(parseNumeric(r.total_amt)) : null,
+      settled_at: iso(r.settled_at),
+      reversed,
+      reversed_at: iso(r.reversed_at),
+      reversed_by: r.reversed_by_username,
+      reversal_reason: r.reversal_reason,
+    };
+  });
+
+  const byKind = new Map<string, { label: string; waivers: number; amount: number }>();
+  for (let i = 0; i < rows.length; i++) {
+    const row = out[i];
+    if (row.reversed) {continue;}
+    const e = byKind.get(rows[i].waiver_kind) ?? { label: row.waiver_kind, waivers: 0, amount: 0 };
+    e.waivers += 1;
+    e.amount = round2(e.amount + row.amount_waived);
+    byKind.set(rows[i].waiver_kind, e);
+  }
+
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const ladder = misLadder(composeMisBills(await fetchMisBills(mc), scPct, mc.tz));
+  const denied = round2(out.reduce((s, r) => s + r.amount_waived, 0));
+
+  const page = misPageOf(q, out.length);
+  return {
+    meta: await misMeta(mc, "service_charge_deny", "Service Charge Deny", [
+      NOTE_ACT_CLOCK,
+      "The percentage, the base, the charge and the tax on it are the numbers migration 036 measured AT THE MOMENT of the waiver, not re-derived from today's configuration. That is what makes them right whether the charge came from the restaurant's own percentage or from a Service Charge line inside the outlet's default tax — and what stops an edit to the tax setup restating last month's waivers.",
+      "A denied service charge never entered any sales figure: on an open bill the charge is not part of the stored subtotal, and on a settled one it is simply absent from the grand total. This report is what the house chose not to charge, never a figure to subtract from revenue.",
+      "A service charge can only be waived on an OPEN bill — a settled bill is corrected with a refund. Bill total and Bill settled are blank until the bill settles.",
+      "A reversed waiver put the charge back: its money reads 0 in the live columns and is carried under Reversed, so every money column still adds up to its own total.",
+      "Service charge collected is the window's SETTLED service charge and is on the settlement clock, unlike the rows above it. The denied share compares the two.",
+    ]),
+    columns: SC_DENY_COLUMNS,
+    rows: out.slice(page.offset, page.offset + page.limit),
+    totals: {
+      waivers: out.filter((r) => !r.reversed).length,
+      reversed_waivers: out.filter((r) => r.reversed).length,
+      amount_waived: denied,
+      tax_on_waived: round2(out.reduce((s, r) => s + r.tax_on_waived, 0)),
+      grand_total_reduction: round2(out.reduce((s, r) => s + r.grand_total_reduction, 0)),
+      reversed_amount: round2(out.reduce((s, r) => s + r.reversed_amount, 0)),
+      bill_grand_total: round2(out.reduce((s, r) => s + (r.bill_grand_total ?? 0), 0)),
+      service_charge_collected: ladder.service_charge,
+      denied_pct_of_chargeable: sharePct(denied, round2(denied + ladder.service_charge)),
+    },
+    by_kind: [...byKind.entries()]
+      .map(([kind, v]) => ({ kind, ...v }))
+      .sort((a, z) => z.amount - a.amount || a.kind.localeCompare(z.kind)),
+    page,
+  };
+}
+
+// --- 12. Group Summary -------------------------------------------------------
+
+export interface GroupSummaryRow {
+  /** Null for the two gap buckets, which have no group to point at. */
+  group_id: string | null;
+  group_name: string;
+  /** True for Unclassified and Unattributed — see UNATTRIBUTED_GROUP. */
+  gap: boolean;
+  /** Distinct dishes that sold under this group. */
+  items: number;
+  qty: number;
+  gross_amount: number;
+  /** Always 0 — discounts in this system are BILL-level. */
+  discount_amount: number;
+  net_amount: number;
+  nc_qty: number;
+  nc_value: number;
+  contribution_pct: number | null;
+}
+
+export interface GroupSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: GroupSummaryRow[];
+  totals: {
+    groups: number;
+    items: number;
+    qty: number;
+    gross_amount: number;
+    discount_amount: number;
+    net_amount: number;
+    nc_qty: number;
+    nc_value: number;
+    /** Sales under a dish that is on the menu and in no group. A CONFIGURATION gap. */
+    unclassified_gross: number;
+    /** Sales under a line that resolves to no menu row at all. A HISTORY gap. */
+    unattributed_gross: number;
+  };
+  /** The window's BILL-level discount, so the money given away is never hidden. */
+  bill_level_discount: number;
+}
+
+const GROUP_SUMMARY_COLUMNS: MisColumn[] = [
+  { key: "group_name", label: "Group", type: "text" },
+  { key: "items", label: "Items", type: "int", total: true },
+  { key: "qty", label: "Qty", type: "int", total: true },
+  { key: "gross_amount", label: "Gross", type: "money", total: true },
+  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
+  { key: "net_amount", label: "Net", type: "money", total: true },
+  { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
+  { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
+  { key: "contribution_pct", label: "% contribution", type: "percent" },
+];
+
+/**
+ * GROUP SUMMARY — what sold, rolled up by the revenue group a dish is filed
+ * under.
+ *
+ * THE SAME LINES AS ITEM WISE, RE-CUT. Same window, same order-placement clock,
+ * same menu-price basis, same cancelled-is-not-a-sale exclusion — so its gross
+ * equals Item Wise's gross exactly and jest asserts it. Two item-level reports
+ * that disagree about what sold are the same failure as two bill-level reports
+ * that disagree about net sales.
+ *
+ * TWO GAP BUCKETS, AND NEVER A DEFAULT GROUP. A line that resolves to a dish
+ * which is in no group lands in Unclassified; a line that resolves to no dish at
+ * all lands in Unattributed. The first is a configuration gap an owner can close
+ * in the group editor and watch shrink to zero; the second is a history gap that
+ * never shrinks, because a dish deleted or renamed since cannot be reclassified
+ * backwards. Folding either into a real group would move money into a group
+ * nobody put it in, which is the one thing this report must not do — and folding
+ * them into EACH OTHER would tell an owner who has just classified their whole
+ * menu that a bucket they cannot empty is still their fault.
+ *
+ * THE GROUP IS RESOLVED AT READ TIME, never snapshotted onto the order line
+ * (migration 039's header). Reclassifying a dish therefore corrects the last six
+ * months of this report rather than freezing the old answer into history.
+ */
+export async function GetGroupSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<GroupSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const [lines, index] = await Promise.all([fetchMisOrderLines(mc), fetchMisAttributionIndex(mc)]);
+
+  interface Acc {
+    group_id: string | null; group_name: string; gap: boolean;
+    items: Set<string>; qty: number; gross: number; nc_qty: number; nc_value: number;
+  }
+  const byGroup = new Map<string, Acc>();
+  for (const line of lines) {
+    const a = attributeOrderLine(line, index);
+    const bucket = attributionBucket(a);
+    const acc = byGroup.get(bucket.key) ?? {
+      group_id: bucket.gap ? null : a.group_id,
+      group_name: bucket.name,
+      gap: bucket.gap,
+      items: new Set<string>(), qty: 0, gross: 0, nc_qty: 0, nc_value: 0,
+    };
+    // Identity of a "dish" is its resolved menu row where there is one, and its
+    // name where there is not — so two names of one dish do not count twice and
+    // two unresolved names do not collapse into one.
+    acc.items.add(a.menu_id ?? `~${line.name.trim().toLowerCase()}`);
+    const qty = Number(line.qty) || 0;
+    const gross = Number(line.gross) || 0;
+    acc.qty = round2(acc.qty + qty);
+    acc.gross = round2(acc.gross + gross);
+    if (line.nc) {
+      acc.nc_qty = round2(acc.nc_qty + qty);
+      acc.nc_value = round2(acc.nc_value + gross);
+    }
+    byGroup.set(bucket.key, acc);
+  }
+
+  const totalGross = round2([...byGroup.values()].reduce((s, a) => s + a.gross, 0));
+  const rows: GroupSummaryRow[] = [...byGroup.values()]
+    .map((a) => ({
+      group_id: a.group_id,
+      group_name: a.group_name,
+      gap: a.gap,
+      items: a.items.size,
+      qty: a.qty,
+      gross_amount: a.gross,
+      discount_amount: 0,
+      net_amount: a.gross,
+      nc_qty: a.nc_qty,
+      nc_value: a.nc_value,
+      contribution_pct: sharePct(a.gross, totalGross),
+    }))
+    // Real groups first, by money; the two gap buckets last, so an owner reads
+    // their menu before they read what the report could not file.
+    .sort((x, z) => {
+      if (x.gap !== z.gap) {return x.gap ? 1 : -1;}
+      return z.gross_amount - x.gross_amount || x.group_name.localeCompare(z.group_name);
+    });
+
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const billLadder = misLadder(composeMisBills(await fetchMisBills(mc), scPct, mc.tz));
+
+  const grossOf = (name: string): number =>
+    round2(rows.filter((r) => r.gap && r.group_name === name).reduce((s, r) => s + r.gross_amount, 0));
+
+  return {
+    meta: await misMeta(mc, "group_summary", "Group Summary", [
+      NOTE_ITEM_CLOCK,
+      NOTE_CANCELLED_EXCLUDED,
+      NOTE_ITEM_BASIS,
+      `A dish that is on the menu but in no group is reported under "${UNCLASSIFIED_GROUP}": a configuration gap, and it disappears as the menu is classified. A line that matches no menu row at all — a dish deleted or renamed since, an off-menu charge — is reported under "${UNATTRIBUTED_GROUP}": a history gap that cannot be closed backwards. Neither is ever folded into a real group.`,
+      "A line is matched to its dish by the menu id the server stamps on it (migration 039), and by NAME for lines written before that. A dish renamed since it was sold is therefore unattributed here and category-less in Item Wise — one gap, reported consistently in both.",
+      "Groups are resolved when the report is read, never stored on the order line, so reclassifying a dish corrects its whole history rather than only its future.",
+      "Gross here equals Item Wise's gross for the same window: it is the same set of lines, cut a different way.",
+    ]),
+    columns: GROUP_SUMMARY_COLUMNS,
+    rows,
+    totals: {
+      groups: rows.length,
+      items: rows.reduce((s, r) => s + r.items, 0),
+      qty: round2(rows.reduce((s, r) => s + r.qty, 0)),
+      gross_amount: totalGross,
+      discount_amount: 0,
+      net_amount: totalGross,
+      nc_qty: round2(rows.reduce((s, r) => s + r.nc_qty, 0)),
+      nc_value: round2(rows.reduce((s, r) => s + r.nc_value, 0)),
+      unclassified_gross: grossOf(UNCLASSIFIED_GROUP),
+      unattributed_gross: grossOf(UNATTRIBUTED_GROUP),
+    },
+    bill_level_discount: billLadder.discount,
+  };
+}
+
+// --- 13. Variation Summary ---------------------------------------------------
+
+export interface VariationSummaryRow {
+  menu_id: string | null;
+  item_name: string;
+  variation_id: string | null;
+  variation_name: string;
+  /** True for the row that collects this dish's sales at its base price. */
+  base: boolean;
+  /** False when the line named a variation this menu no longer has. */
+  resolved: boolean;
+  qty: number;
+  /** gross / qty — what it actually sold at, which can differ from the list price. */
+  avg_price: number | null;
+  /** "MenuVariations".price TODAY. Null on a base row and on an unresolved one. */
+  list_price: number | null;
+  gross_amount: number;
+  discount_amount: number;
+  net_amount: number;
+  nc_qty: number;
+  nc_value: number;
+  /** Share of the PARENT DISH's gross — the number this report exists for. */
+  item_share_pct: number | null;
+  /** Share of everything this report covers. */
+  contribution_pct: number | null;
+}
+
+export interface VariationSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: VariationSummaryRow[];
+  totals: {
+    items: number;
+    variations: number;
+    qty: number;
+    gross_amount: number;
+    discount_amount: number;
+    net_amount: number;
+    nc_qty: number;
+    nc_value: number;
+  };
+  /** Item Wise's gross for the same window, so the subset is measurable. */
+  window_gross: number;
+  /** True when this tenant has configured no variations at all. */
+  no_variations_configured: boolean;
+}
+
+const VARIATION_SUMMARY_COLUMNS: MisColumn[] = [
+  { key: "item_name", label: "Item", type: "text" },
+  { key: "variation_name", label: "Variation", type: "text" },
+  { key: "qty", label: "Qty", type: "int", total: true },
+  { key: "avg_price", label: "Sold at", type: "money" },
+  { key: "list_price", label: "Configured price", type: "money" },
+  { key: "gross_amount", label: "Gross", type: "money", total: true },
+  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
+  { key: "net_amount", label: "Net", type: "money", total: true },
+  { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
+  { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
+  { key: "item_share_pct", label: "% of item", type: "percent" },
+  { key: "contribution_pct", label: "% of report", type: "percent" },
+];
+
+/**
+ * VARIATION SUMMARY — how a dish's sales split across its sizes.
+ *
+ * A DELIBERATE SUBSET, AND IT SAYS SO. Only dishes that HAVE variations appear:
+ * one row per variation, plus a base row where lines of that dish named none.
+ * Listing every dish in the menu with a single "Base" row would bury the six
+ * that are actually sold in sizes under three hundred that are not, and the
+ * report exists to answer "is anybody buying the large one". `window_gross`
+ * carries Item Wise's total for the same window so the size of the subset is
+ * visible rather than implied.
+ *
+ * THE SAME LINES AS ITEM WISE, on the same clock and the same menu-price basis,
+ * so its numbers sit inside Item Wise's rather than beside them.
+ *
+ * A VARIATION IS NEVER INFERRED FROM A NAME. A line reports a variation only
+ * because the server stamped `variation_id` on it (migration 039).
+ * "Paneer Tikka (Half)" typed by a waiter as an off-menu line is not evidence
+ * that a Half was sold, and treating it as such would move money between price
+ * points. A line that names a variation this menu no longer has keeps its own
+ * label, is marked unresolved and carries no configured price — it was a real
+ * sale of something that has since been retired.
+ *
+ * `Sold at` IS THE AVERAGE THE LINES ACTUALLY CARRIED, not the configured price
+ * beside it. applyMenuPriceFloor enforces the variation's price as a FLOOR, not
+ * as a fixed rate, so the two differ legitimately — and where they differ a lot,
+ * that is the finding.
+ */
+export async function GetVariationSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<VariationSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const [lines, index] = await Promise.all([fetchMisOrderLines(mc), fetchMisAttributionIndex(mc)]);
+
+  // Dishes that have at least one configured variation. A dish with none never
+  // appears, however its lines are labelled.
+  const itemsWithVariations = new Set<string>();
+  for (const [, hit] of index.variationById) {itemsWithVariations.add(hit.item.id);}
+
+  interface Acc {
+    menu_id: string | null; item_name: string;
+    variation_id: string | null; variation_name: string;
+    base: boolean; resolved: boolean; list_price: number | null;
+    qty: number; gross: number; nc_qty: number; nc_value: number;
+  }
+  const acc = new Map<string, Acc>();
+  for (const line of lines) {
+    const a = attributeOrderLine(line, index);
+    // A line names a variation only when attributeOrderLine resolved one, or
+    // when it carried a snapshot label of one this menu no longer has. Either
+    // way the parent dish resolved — attributeOrderLine's unresolved branch
+    // returns a null variation name — so a covered line always has a menu row.
+    const named = a.variation_id !== null || (a.variation_name ?? "").trim().length > 0;
+    const covered = named || (a.menu_id !== null && itemsWithVariations.has(a.menu_id));
+    if (!covered || a.menu_id === null) {continue;}
+
+    const resolved = a.variation_id !== null;
+    const label = resolved
+      ? (a.variation_name ?? "")
+      : ((a.variation_name ?? "").trim() || VARIATION_BASE_LABEL);
+    const itemKey = a.menu_id ?? `~${line.name.trim().toLowerCase()}`;
+    const key = `${itemKey}::${a.variation_id ?? label.toLowerCase()}`;
+    const e = acc.get(key) ?? {
+      menu_id: a.menu_id,
+      item_name: a.menu_name ?? line.name.trim(),
+      variation_id: a.variation_id,
+      variation_name: label,
+      base: label === VARIATION_BASE_LABEL,
+      resolved: resolved || label === VARIATION_BASE_LABEL,
+      list_price: resolved && a.menu_id !== null
+        ? (index.variationById.get(a.variation_id ?? "")?.variation.price ?? null)
+        : null,
+      qty: 0, gross: 0, nc_qty: 0, nc_value: 0,
+    };
+    const qty = Number(line.qty) || 0;
+    const gross = Number(line.gross) || 0;
+    e.qty = round2(e.qty + qty);
+    e.gross = round2(e.gross + gross);
+    if (line.nc) {
+      e.nc_qty = round2(e.nc_qty + qty);
+      e.nc_value = round2(e.nc_value + gross);
+    }
+    acc.set(key, e);
+  }
+
+  const all = [...acc.values()];
+  const coveredGross = round2(all.reduce((s, a) => s + a.gross, 0));
+  const itemGross = new Map<string, number>();
+  for (const a of all) {
+    const k = a.menu_id ?? `~${a.item_name.toLowerCase()}`;
+    itemGross.set(k, round2((itemGross.get(k) ?? 0) + a.gross));
+  }
+
+  const rows: VariationSummaryRow[] = all
+    .map((a) => ({
+      menu_id: a.menu_id,
+      item_name: a.item_name,
+      variation_id: a.variation_id,
+      variation_name: a.variation_name,
+      base: a.base,
+      resolved: a.resolved,
+      qty: a.qty,
+      avg_price: a.qty > 0 ? round2(a.gross / a.qty) : null,
+      list_price: a.list_price,
+      gross_amount: a.gross,
+      discount_amount: 0,
+      net_amount: a.gross,
+      nc_qty: a.nc_qty,
+      nc_value: a.nc_value,
+      item_share_pct: sharePct(a.gross, itemGross.get(a.menu_id ?? `~${a.item_name.toLowerCase()}`) ?? 0),
+      contribution_pct: sharePct(a.gross, coveredGross),
+    }))
+    // Grouped by dish (biggest dish first), then by variation within it, so the
+    // "% of item" column reads down a block instead of jumping between dishes.
+    .sort((x, z) => {
+      const xi = itemGross.get(x.menu_id ?? `~${x.item_name.toLowerCase()}`) ?? 0;
+      const zi = itemGross.get(z.menu_id ?? `~${z.item_name.toLowerCase()}`) ?? 0;
+      if (xi !== zi) {return zi - xi;}
+      const byItem = x.item_name.localeCompare(z.item_name);
+      if (byItem !== 0) {return byItem;}
+      if (x.base !== z.base) {return x.base ? 1 : -1;}
+      return z.gross_amount - x.gross_amount || x.variation_name.localeCompare(z.variation_name);
+    });
+
+  const windowGross = round2(lines.reduce((s, l) => s + (Number(l.gross) || 0), 0));
+  return {
+    meta: await misMeta(mc, "variation_summary", "Variation Summary", [
+      NOTE_ITEM_CLOCK,
+      NOTE_CANCELLED_EXCLUDED,
+      NOTE_ITEM_BASIS,
+      "Only dishes that are sold in variations appear here, so these totals are a SUBSET of Item Wise's for the same window. window_gross carries Item Wise's total so the size of that subset is visible.",
+      "A line counts as a variation only because the server stamped one on it. A variation is never inferred from an item name, so a hand-typed off-menu line is not read as a size that was sold.",
+      "A line naming a variation this menu no longer has keeps that label, is marked unresolved and shows no configured price — it was a real sale of something since retired.",
+      "Sold at is what the lines actually carried; Configured price is the variation's price today. The variation price is a FLOOR, not a fixed rate, so the two can legitimately differ.",
+      "% of item is the share of that dish's own sales. % of report is the share of everything this report covers, not of the window.",
+    ]),
+    columns: VARIATION_SUMMARY_COLUMNS,
+    rows,
+    totals: {
+      items: itemGross.size,
+      variations: rows.length,
+      qty: round2(rows.reduce((s, r) => s + r.qty, 0)),
+      gross_amount: coveredGross,
+      discount_amount: 0,
+      net_amount: coveredGross,
+      nc_qty: round2(rows.reduce((s, r) => s + r.nc_qty, 0)),
+      nc_value: round2(rows.reduce((s, r) => s + r.nc_value, 0)),
+    },
+    window_gross: windowGross,
+    no_variations_configured: index.variationById.size === 0,
+  };
+}
+
+// --- 14. Tip Summary ---------------------------------------------------------
+
+export interface TipSummaryRow {
+  tender_id: string;
+  settled_at: string;
+  bill_id: string | null;
+  bill_no: string | null;
+  table_name: string | null;
+  /** Only when the bill names the order it was raised from. Null otherwise. */
+  order_type: string | null;
+  /** The tender the tip rode in on. Its AMOUNT is deliberately not reported. */
+  method: string;
+  tip_amount: number;
+  tip_mode: string | null;
+  /** An employee's username, or the literal "pool". Never null — 037's CHECK. */
+  credited_to: string | null;
+  settled_by: string | null;
+}
+
+export interface TipSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: TipSummaryRow[];
+  totals: {
+    /** THE PERIOD TOTAL. Not revenue, not in any ladder, not in APC or ABV. */
+    tip_amount: number;
+    tenders: number;
+    bills: number;
+  };
+  by_mode: { mode: string; label: string; tips: number; tenders: number }[];
+  by_credited_to: { credited_to: string; tips: number; tenders: number }[];
+  page: MisPage;
+}
+
+const TIP_SUMMARY_COLUMNS: MisColumn[] = [
+  { key: "settled_at", label: "Date & time", type: "datetime" },
+  { key: "bill_no", label: "Bill", type: "text" },
+  { key: "table_name", label: "Table", type: "text" },
+  { key: "order_type", label: "Type", type: "text" },
+  { key: "method", label: "Tender", type: "text" },
+  { key: "tip_mode", label: "Tip mode", type: "text" },
+  { key: "credited_to", label: "Credited to", type: "text" },
+  { key: "tip_amount", label: "Tip", type: "money", total: true },
+  { key: "settled_by", label: "Taken by", type: "text", default_on: false },
+];
+
+interface TipSqlRow {
+  id: string; settled_at: Date | string; bill_id: string; seq: number;
+  method: string; tip_amount: number | string; tip_mode: string | null;
+  tip_credited_to_username: string | null; settled_by_username: string;
+  table_name: string | null; bill_no: string | null; order_type: string | null;
+}
+
+/**
+ * TIP SUMMARY — what was tipped, in what form, and who is owed it.
+ *
+ * A TIP IS NOT REVENUE, and this report is that rule in the shape of a document.
+ * "BillTenders".tip_amount rides ON a tender and is excluded from every sum of
+ * `amount`, so it reaches no rung of the money ladder, no APC, no ABV and no
+ * settlement bucket — mirrorTendersToBillColumns deliberately does not mirror it
+ * into payment_splits for exactly that reason, because a tip inside a split part
+ * would push every tipped bill into the Settlement Summary's Unallocated bucket
+ * and read the day's takings high by the tips.
+ *
+ * SO THE TENDER'S OWN AMOUNT IS NOT A COLUMN HERE. It would be the only number
+ * on this page that IS revenue, sitting next to a column that is not, in a
+ * report an owner reads quickly. The bill drill-down is one click away and shows
+ * it in the context where it means something.
+ *
+ * VOIDED TENDERS ARE EXCLUDED. A tender keyed twice and then voided did not
+ * carry a tip anybody is owed; leaving it in would double what a waiter is
+ * handed at the end of a shift.
+ *
+ * ACCUMULATED IN WHOLE PAISA, like GetTipLedger, because the person being handed
+ * the money counts in rupees and paise and is entitled to the same answer twice.
+ */
+export async function GetTipSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<TipSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const search = misSearch(q);
+
+  const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
+  let searchSql = "";
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${String(params.length)}`;
+    searchSql = ` and (tn.method ilike ${p} or tn.tip_mode ilike ${p}
+                       or coalesce(tn.tip_credited_to_username, '') ilike ${p}
+                       or tn.settled_by_username ilike ${p}
+                       or t.table_name ilike ${p} or b.bill_no::text ilike ${p})`;
+  }
+
+  const rows = await captureRead("BillTenders", () => runQuery<TipSqlRow>(
+    `select tn.id, tn.settled_at, tn.bill_id, tn.seq, tn.method,
+            tn.tip_amount, tn.tip_mode, tn.tip_credited_to_username, tn.settled_by_username,
+            t.table_name, b.bill_no::text as bill_no,
+            case when b.order_id is not null then (o.food)::jsonb->>'order_type' end as order_type
+       from "BillTenders" tn
+       left join "Tables" t on t.id = tn.table_id and t.res_id = tn.res_id and t.outlet_id = tn.outlet_id
+       left join "Bills" b on b.id = tn.bill_id and b.res_id = tn.res_id and b.outlet_id = tn.outlet_id
+       left join "Orders" o on o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
+      where tn.res_id = $1 and (${mc.og} or tn.outlet_id = $2)
+        and tn.settled_at >= $3 and tn.settled_at < $4
+        and tn.voided_at is null
+        and tn.tip_amount > 0
+        ${searchSql}
+      order by tn.settled_at desc, tn.seq asc`,
+    params,
+  ), [] as TipSqlRow[]);
+
+  const out: TipSummaryRow[] = rows.map((r) => ({
+    tender_id: r.id,
+    settled_at: iso(r.settled_at) ?? "",
+    bill_id: r.bill_id,
+    bill_no: r.bill_no,
+    table_name: r.table_name,
+    order_type: r.order_type === null ? null : orderChannel(r.order_type),
+    method: r.method,
+    tip_amount: round2(parseNumeric(r.tip_amount)),
+    tip_mode: r.tip_mode === null ? null : humaniseVocabulary(r.tip_mode),
+    credited_to: r.tip_credited_to_username,
+    settled_by: r.settled_by_username?.trim() || null,
+  }));
+
+  // Whole paisa, so a day of two hundred tips does not drift by a rupee.
+  let totalPaisa = 0;
+  const modes = new Map<string, { label: string; paisa: number; tenders: number }>();
+  const people = new Map<string, { paisa: number; tenders: number }>();
+  const bills = new Set<string>();
+  for (let i = 0; i < rows.length; i++) {
+    const paisa = toPaisa(out[i].tip_amount);
+    if (paisa <= 0) {continue;}
+    totalPaisa += paisa;
+    if (out[i].bill_id) {bills.add(out[i].bill_id ?? "");}
+    const modeKey = rows[i].tip_mode ?? "other";
+    const m = modes.get(modeKey) ?? { label: out[i].tip_mode ?? humaniseVocabulary("other"), paisa: 0, tenders: 0 };
+    m.paisa += paisa; m.tenders += 1;
+    modes.set(modeKey, m);
+    // Unreachable while billtenders_tip_attributed stands, and kept anyway: a
+    // payroll figure that silently dropped an orphan tip would hide the very
+    // money it exists to hand over.
+    const who = out[i].credited_to ?? "unattributed";
+    const pe = people.get(who) ?? { paisa: 0, tenders: 0 };
+    pe.paisa += paisa; pe.tenders += 1;
+    people.set(who, pe);
+  }
+
+  const page = misPageOf(q, out.length);
+  return {
+    meta: await misMeta(mc, "tip_summary", "Tip Summary", [
+      "Bucketed by when the TENDER was taken, in the restaurant's own timezone. Both ends of the date range are inclusive.",
+      "A TIP IS NOT REVENUE. It appears in no sales figure, no per-cover figure and no average bill value anywhere in this system, and no total on this page is a sales figure.",
+      "The tender's own amount is deliberately not a column here: it is the only number on this page that would be revenue, and the bill drill-down shows it in the context where it means something.",
+      "Voided tenders are excluded — a payment keyed twice and voided carries no tip anybody is owed.",
+      "Credited to is an employee, or the literal \"pool\" when the house splits tips. Migration 037 requires every tip to name one, so this column is never blank.",
+      "Type is shown only when the bill names the order it was raised from; a consolidated table bill does not, and the column is blank rather than assumed to be dine-in.",
+    ]),
+    columns: TIP_SUMMARY_COLUMNS,
+    rows: out.slice(page.offset, page.offset + page.limit),
+    totals: {
+      tip_amount: round2(totalPaisa / 100),
+      tenders: out.length,
+      bills: bills.size,
+    },
+    by_mode: [...modes.entries()]
+      .map(([mode, v]) => ({ mode, label: v.label, tips: round2(v.paisa / 100), tenders: v.tenders }))
+      .sort((a, z) => z.tips - a.tips || a.mode.localeCompare(z.mode)),
+    by_credited_to: [...people.entries()]
+      .map(([credited_to, v]) => ({ credited_to, tips: round2(v.paisa / 100), tenders: v.tenders }))
+      .sort((a, z) => z.tips - a.tips || a.credited_to.localeCompare(z.credited_to)),
+    page,
+  };
+}
+
+// --- 15. Counter Summary -----------------------------------------------------
+
+export interface CounterSummaryRow {
+  /** Null for the bills that recorded no till — every bill written before 038. */
+  counter_id: string | null;
+  counter_code: string;
+  counter_name: string;
+  counter_kind: string | null;
+  active: boolean | null;
+  /** The staff who rang on this till in the window, as one cell. */
+  cashiers: string | null;
+  cashier_count: number;
+  bills: number;
+  covers: number;
+  gross: number;
+  discount: number;
+  net: number;
+  service_charge: number;
+  tax: number;
+  grand_total: number;
+  refund: number;
+  /** The mode cut, machine-readable. Sums to grand_total exactly. */
+  by_method: { method: string; amount: number }[];
+  /** The same cut as one spreadsheet cell. */
+  payment_modes: string;
+  /** Cash sessions on this till that overlap the window (migration 038). */
+  sessions: number;
+  opened_at: string | null;
+  /** Null while any overlapping session is still open. */
+  closed_at: string | null;
+  /** Counted minus expected, summed over those sessions. Null when none. */
+  variance: number | null;
+}
+
+export interface CounterSummaryReport {
+  meta: MisReportMeta;
+  columns: MisColumn[];
+  rows: CounterSummaryRow[];
+  totals: MisLadder & { counters: number; sessions: number; variance: number; payment_modes: string };
+  /** True when this outlet has configured no tills, so everything is unassigned. */
+  no_counters_configured: boolean;
+}
+
+const COUNTER_SUMMARY_COLUMNS: MisColumn[] = [
+  { key: "counter_code", label: "Counter", type: "text" },
+  { key: "counter_name", label: "Name", type: "text" },
+  { key: "cashiers", label: "Cashiers", type: "text" },
+  { key: "bills", label: "Bills", type: "int", total: true },
+  { key: "covers", label: "Covers", type: "int", total: true, default_on: false },
+  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "discount", label: "Discount", type: "money", total: true },
+  { key: "net", label: "Net", type: "money", total: true },
+  { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
+  { key: "tax", label: "Tax", type: "money", total: true, default_on: false },
+  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "refund", label: "Refunds", type: "money", total: true, default_on: false },
+  { key: "payment_modes", label: "Payment modes", type: "text" },
+  { key: "opened_at", label: "Opened", type: "datetime" },
+  { key: "closed_at", label: "Closed", type: "datetime" },
+  { key: "sessions", label: "Cash sessions", type: "int", total: true, default_on: false },
+  { key: "variance", label: "Cash variance", type: "money", total: true, default_on: false },
+];
+
+/** Which till rang each bill, and who was on it. Empty before migration 038. */
+async function fetchMisBillCounters(mc: MisContext): Promise<Map<string, { counter_id: string | null; cashier: string | null }>> {
+  const rows = await captureRead("Bills.counter_id", () => runQuery<{
+    id: string; counter_id: string | null; fname: string | null; lname: string | null;
+  }>(
+    `select b.id, b.counter_id, e."emp_Fname" as fname, e."emp_Lname" as lname
+       from "Bills" b
+       left join "Employees" e on e.id = b.emp_id and e.res_id = b.res_id and e.outlet_id = b.outlet_id
+      where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
+        and ${MIS_SETTLED_PREDICATE}`,
+    [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
+  ), [] as { id: string; counter_id: string | null; fname: string | null; lname: string | null }[]);
+  const out = new Map<string, { counter_id: string | null; cashier: string | null }>();
+  for (const r of rows) {
+    const name = [r.fname, r.lname].filter((x) => (x ?? "").trim()).join(" ").trim();
+    out.set(r.id, { counter_id: r.counter_id, cashier: name || null });
+  }
+  return out;
+}
+
+/** The shift half of migration 038: cash sessions on a till, over a window. */
+async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>> {
+  const rows = await captureRead("CashSessions.counter_id", () => runQuery<{
+    counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null;
+  }>(
+    // Scoped by res_id and counter_id ONLY, deliberately. "CashSessions".outlet_id
+    // is nullable in the base schema and legacy rows carry no outlet, while a
+    // counter is per-outlet by construction (038) — so keying on the counter is
+    // both exact and immune to that null. Sessions that OVERLAP the window are
+    // included: a shift that opened yesterday and is still counting money today
+    // is this window's shift.
+    `select counter_id,
+            count(*)::text as sessions,
+            min(opened_at) as opened_at,
+            case when bool_or(closed_at is null) then null else max(closed_at) end as closed_at,
+            coalesce(sum(variance), 0)::float as variance
+       from "CashSessions"
+      where res_id = $1 and counter_id is not null
+        and opened_at < $3 and (closed_at is null or closed_at >= $2)
+      group by counter_id`,
+    [mc.context.res_id, mc.window.fromIso, mc.window.toIso],
+  ), [] as { counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null }[]);
+  const out = new Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>();
+  for (const r of rows) {
+    out.set(r.counter_id, {
+      sessions: Math.max(0, Math.round(Number(r.sessions) || 0)),
+      opened_at: iso(r.opened_at),
+      closed_at: iso(r.closed_at),
+      variance: round2(parseNumeric(r.variance)),
+    });
+  }
+  return out;
+}
+
+/**
+ * COUNTER SUMMARY — the day's takings, cut by the till that rang them.
+ *
+ * IT IS THE SALES SUMMARY'S OWN BILL SET, re-cut. It composes fetchMisBills
+ * through the same ladder, so Sigma rows.grand_total equals the Sales Summary's grand
+ * total exactly, and jest asserts it alongside the Order Summary and the
+ * Settlement Summary. Nothing here re-derives a rung.
+ *
+ * EVERY BILL LANDS SOMEWHERE. A bill with no counter_id — which is every bill
+ * written before migration 038, and every bill on the overwhelming majority of
+ * tenants that have one till — goes into an explicit unassigned row rather than
+ * being dropped. Dropping it would break the reconciliation and hide money,
+ * which is the failure mode this report exists to catch.
+ *
+ * THE MODE SPLIT IS allocateSettlement's, not a second one. A split tender is
+ * cut exactly as the Settlement Summary cuts it, including the Unallocated
+ * bucket, so "counter 2 is 4,000 short" can be traced into the same numbers the
+ * cash-up sheet shows.
+ *
+ * COVERS ARE STILL COUNTED ONCE PER SEATING, across counters as well as within
+ * one: a party that pays half at the bar and half at the till is one party. The
+ * rows are built in a stable order with one shared set of seatings — the same
+ * rule misSeries uses across day buckets — and that order is also the display
+ * order, so what a reader sees and what the covers were attributed to are the
+ * same thing.
+ *
+ * THE COUNTER IS THE TILL; THE CASH SESSION IS THE SHIFT (038's header). Opened
+ * and Closed are the earliest opening and the latest closing of the cash
+ * sessions on that till that overlap the window, and Closed is deliberately
+ * BLANK while any of them is still open — a shift that has not been counted has
+ * no closing time, and inventing one would make an uncounted drawer look
+ * reconciled.
+ */
+export async function GetCounterSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<CounterSummaryReport> {
+  const mc = await misContext(restaurantId, q);
+  const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
+  const [counters, billCounters, sessions] = await Promise.all([
+    ListBillingCounters(restaurantId, { includeInactive: true }).catch(() => [] as BillingCounterRecord[]),
+    fetchMisBillCounters(mc),
+    fetchMisCounterSessions(mc),
+  ]);
+  const counterById = new Map(counters.map((c) => [c.id, c]));
+
+  const UNASSIGNED = "";
+  interface Bucket {
+    bills: MisBill[];
+    cashiers: Set<string>;
+    methods: Map<string, number>;
+  }
+  const buckets = new Map<string, Bucket>();
+  const bucketOf = (key: string): Bucket => {
+    const b = buckets.get(key) ?? { bills: [], cashiers: new Set<string>(), methods: new Map<string, number>() };
+    buckets.set(key, b);
+    return b;
+  };
+  for (const b of bills) {
+    const meta = billCounters.get(b.row.id);
+    const key = meta?.counter_id ?? UNASSIGNED;
+    const bucket = bucketOf(key);
+    bucket.bills.push(b);
+    if (meta?.cashier) {bucket.cashiers.add(meta.cashier);}
+    for (const part of allocateSettlement(b.money.grand_total, b.row.payment_method, parsePaymentSplits(b.row.payment_splits))) {
+      bucket.methods.set(part.method, round2((bucket.methods.get(part.method) ?? 0) + part.amount));
+    }
+  }
+  // A till that was opened and counted but rang nothing still belongs on a
+  // cash-up sheet: an empty drawer with a variance is exactly the row somebody
+  // needs to see.
+  for (const counterId of sessions.keys()) {
+    if (counterById.has(counterId)) {bucketOf(counterId);}
+  }
+
+  const codeOf = (key: string): string => {
+    if (key === UNASSIGNED) {return COUNTER_UNASSIGNED_CODE;}
+    return counterById.get(key)?.code ?? key.slice(0, 8);
+  };
+  // ONE stable order for both the covers walk and the display, so the two can
+  // never disagree about which row a shared seating was counted in. Configured
+  // sort order first (that is what it is for), then code; the unassigned row
+  // last, because it is not a till.
+  const orderedKeys = [...buckets.keys()].sort((x, z) => {
+    if (x === UNASSIGNED) {return 1;}
+    if (z === UNASSIGNED) {return -1;}
+    const cx = counterById.get(x), cz = counterById.get(z);
+    const sx = cx?.sort_order ?? Number.MAX_SAFE_INTEGER, sz = cz?.sort_order ?? Number.MAX_SAFE_INTEGER;
+    if (sx !== sz) {return sx - sz;}
+    return codeOf(x).localeCompare(codeOf(z));
+  });
+
+  const seenSessions = new Set<string>();
+  const rows: CounterSummaryRow[] = orderedKeys.map((key) => {
+    const bucket = buckets.get(key) ?? { bills: [], cashiers: new Set<string>(), methods: new Map<string, number>() };
+    const l = ladderOf(bucket.bills, seenSessions);
+    const counter = key === UNASSIGNED ? undefined : counterById.get(key);
+    const shift = key === UNASSIGNED ? undefined : sessions.get(key);
+    const names = [...bucket.cashiers].sort((a, z) => a.localeCompare(z));
+    const parts: SettlementPart[] = [...bucket.methods.entries()].map(([method, amount]) => ({ method, amount }));
+    return {
+      counter_id: key === UNASSIGNED ? null : key,
+      counter_code: codeOf(key),
+      counter_name: key === UNASSIGNED
+        ? COUNTER_UNASSIGNED_NAME
+        : (counter?.name ?? COUNTER_UNKNOWN_NAME),
+      counter_kind: counter ? counter.kind : null,
+      active: counter ? counter.active : null,
+      // Bounded: a shift with thirty names in one cell is unreadable, and the
+      // count beside it is the number that was actually wanted.
+      cashiers: names.length === 0
+        ? null
+        : (names.length <= 5 ? names.join(", ") : `${names.slice(0, 5).join(", ")} +${String(names.length - 5)} more`),
+      cashier_count: names.length,
+      bills: l.bills,
+      covers: l.covers,
+      gross: l.gross,
+      discount: l.discount,
+      net: l.net,
+      service_charge: l.service_charge,
+      tax: l.tax,
+      grand_total: l.grand_total,
+      refund: l.refund,
+      by_method: [...parts].sort((a, z) => z.amount - a.amount || a.method.localeCompare(z.method)),
+      payment_modes: formatMethodSplit(parts),
+      sessions: shift?.sessions ?? 0,
+      opened_at: shift?.opened_at ?? null,
+      closed_at: shift?.closed_at ?? null,
+      variance: shift ? shift.variance : null,
+    };
+  });
+
+  const windowMethods = new Map<string, number>();
+  for (const r of rows) {
+    for (const p of r.by_method) {
+      windowMethods.set(p.method, round2((windowMethods.get(p.method) ?? 0) + p.amount));
+    }
+  }
+
+  return {
+    meta: await misMeta(mc, "counter_summary", "Counter Summary", [
+      NOTE_SETTLEMENT_BASIS,
+      NOTE_COVERS_ONCE,
+      "Grand total here equals the Sales Summary's grand total for the same window: this is the same set of bills, cut by the till that rang them.",
+      `Bills that recorded no till are collected in the "${COUNTER_UNASSIGNED_CODE}" row. That is every bill written before billing counters existed, and every bill on an outlet with a single till — the row is normal, not an error.`,
+      "The payment-mode split is the same allocation the Settlement Summary uses, including its Unallocated bucket, so a shortfall on one till traces into the same numbers as the cash-up sheet.",
+      "The counter is the TILL and the cash session is the SHIFT. Opened and Closed are the earliest opening and the latest closing of the sessions on that till that overlap this window; Closed is blank while any of them is still open, because a drawer that has not been counted has no closing time.",
+      "Cash variance is counted minus expected, summed over those sessions. It covers CASH only and is blank for a till with no session in the window.",
+    ]),
+    columns: COUNTER_SUMMARY_COLUMNS,
+    rows,
+    totals: {
+      ...misLadder(bills),
+      counters: rows.filter((r) => r.counter_id !== null).length,
+      sessions: rows.reduce((s, r) => s + r.sessions, 0),
+      variance: round2(rows.reduce((s, r) => s + (r.variance ?? 0), 0)),
+      payment_modes: formatMethodSplit([...windowMethods.entries()].map(([method, amount]) => ({ method, amount }))),
+    },
+    no_counters_configured: counters.length === 0,
+  };
 }

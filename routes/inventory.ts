@@ -4,6 +4,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { Audit_log_category, DeleteInventoryItem, GetInventoryItems, GetRestaurantSettings, GetStockMovements, GetVendorPriceHistory, ISSUE_STOCK_ACTION_ID, IssueStock, ReceiveStock, RecordWastage, RenameInventoryCategory, SetInventoryExpiry, SetInventoryReorderLevel, SetRestaurantSettings, UpsertInventoryItem } from "../database_supabase.js";
+import { idempotent } from "../idempotency.js";
 import { logger } from "../observability.js";
 import { INV_MANAGE, INV_VIEW, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
 
@@ -123,7 +124,7 @@ app.post("/inventory", validateAction("dfe2cde8-c159-4685-b015-ec7b0d4386eb"), a
 
 export function registerInventoryMovementRoutes(app: Express): void {
 
-app.post("/inventory/receive", validateAction(INV_MANAGE), async (req: Request, res: Response) => {
+app.post("/inventory/receive", validateAction(INV_MANAGE), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const b = (req.body ?? {}) as Record<string, unknown>;
@@ -141,7 +142,7 @@ app.post("/inventory/receive", validateAction(INV_MANAGE), async (req: Request, 
 		res.json(r);
 	} catch (e: any) { logger.error({ err: e }, "receive_stock_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to receive stock") }); }
 });
-app.post("/inventory/wastage", validateAction(INV_MANAGE), async (req: Request, res: Response) => {
+app.post("/inventory/wastage", validateAction(INV_MANAGE), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const b = (req.body ?? {}) as Record<string, unknown>;
@@ -160,7 +161,7 @@ app.post("/inventory/wastage", validateAction(INV_MANAGE), async (req: Request, 
 	} catch (e: any) { logger.error({ err: e }, "record_wastage_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to record wastage") }); }
 });
 // Issue stock from the store to the kitchen (feeds the food-cost % KPI).
-app.post("/inventory/issue", validateAction(INV_MANAGE), async (req: Request, res: Response) => {
+app.post("/inventory/issue", validateAction(INV_MANAGE), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const b = (req.body ?? {}) as Record<string, unknown>;

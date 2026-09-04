@@ -4,15 +4,16 @@
  * split, merge, refund, reopen).
  */
 import type { Express, Request, Response } from "express";
+import type { BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetClosedBill, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMenuItems, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, computeBillCharges, dayKeyOf } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMenuItems, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, dayKeyOf } from "../database_supabase.js";
 import { buildKotBase64, buildReceiptBase64 } from "../escpos.js";
 import { allocateKotNumber, kotOrderContext, kotStamp, kotTicketKey, serviceModeLabel } from "../kot_numbers.js";
 import { logger } from "../observability.js";
 import { ackPrintJob, enqueuePrintJob, printJobPayload } from "../print_jobs.js";
 import { emitOutlet, emitRestaurant } from "../realtime.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
-import { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, endOfDayBound, enforceAdmin, enforceRoles, extractEmployeeId, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, endOfDayBound, enforceAdmin, enforcePermission, enforceRoles, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -30,6 +31,159 @@ const sBillMerge = z.object({ from_table: z.string(), to_table: z.string() }).pa
 const sBillRefund = z.object({ bill_id: z.string().optional(), table_name: z.string().optional() }).passthrough()
 	.refine((b) => (typeof b.bill_id === "string" && b.bill_id.trim().length > 0) || (typeof b.table_name === "string" && b.table_name.trim().length > 0),
 		{ message: "bill_id or table_name is required" });
+// TENDERS (migration 037) and BILLING COUNTERS (migration 038).
+//
+// `tenders` is the array of rows a settle or a part-payment is made of; the
+// identity of the bill is the usual bill_id / table_name / order_id triple and at
+// least one has to be present, which the refine below is what enforces.
+const sBillTenders = z.object({
+	bill_id: z.string().optional(),
+	table_name: z.string().optional(),
+	order_id: z.string().optional(),
+	tenders: z.array(z.unknown()),
+}).passthrough().refine(
+	(b) => [b.bill_id, b.table_name, b.order_id].some((v) => typeof v === "string" && v.trim().length > 0),
+	{ message: "bill_id, table_name or order_id is required" },
+);
+const sTenderVoid = z.object({ reason: z.string() }).passthrough();
+const sBillCounter = z.object({
+	bill_id: z.string().optional(),
+	table_name: z.string().optional(),
+	order_id: z.string().optional(),
+}).passthrough().refine(
+	(b) => [b.bill_id, b.table_name, b.order_id].some((v) => typeof v === "string" && v.trim().length > 0),
+	{ message: "bill_id, table_name or order_id is required" },
+);
+const sCounterUpsert = z.object({ code: z.string() }).passthrough();
+
+/**
+ * HOW MANY WAYS ONE BILL MAY BE SPLIT, and why the number is six.
+ *
+ * "BillTenders" itself allows 50 (migration 037), but the bill's own
+ * `payment_splits` column is the COMPATIBILITY SURFACE every existing settlement
+ * reader still uses, and normalizePaymentSplits — the data layer's validator for
+ * that column — accepts 2..6 parts. A seventh tender would therefore be
+ * perfectly recordable and then impossible to mirror, which means impossible to
+ * settle: a fully-paid bill stranded open with the guest already gone. Six is
+ * the number the whole chain agrees on, so it is enforced at the door, before
+ * anything is written.
+ */
+const MAX_BILL_TENDERS = 6;
+
+/**
+ * METHODS THAT CANNOT BE ONE OF SEVERAL PAYMENTS ON A BILL.
+ *
+ * normalizePaymentSplits — the data layer's validator for `payment_splits` —
+ * refuses a part whose method is 'Split' (that is the mirror's own word for "this
+ * bill has N tenders", not a way anybody pays) or 'Razorpay' (the online gateway
+ * settles a whole bill; there is no such thing as part of a Razorpay
+ * authorisation here, and the refund path keys off the gateway reference on the
+ * bill). "BillTenders" itself accepts both, because its `method` column is bound
+ * only by normalizePaymentMethod.
+ *
+ * That gap is a trap with real money in it: a Razorpay tender alongside a cash
+ * one would RECORD perfectly, mirror down as a split part, and then be REFUSED by
+ * normalizePaymentSplits the moment the bill is settled — leaving a fully paid
+ * bill open, the guest gone, and the only way out a manual void. So the same rule
+ * is enforced here, before anything is written.
+ *
+ * A LONE Razorpay tender is still fine, and deliberately so: with one tender the
+ * mirror is `payment_method = 'Razorpay'` with no parts, normalizePaymentSplits
+ * is never called, and the bill settles exactly as an online payment always has.
+ */
+const UNSPLITTABLE_TENDER_METHODS: ReadonlySet<string> = new Set(["razorpay", "split"]);
+
+/**
+ * Everything that must be true of a proposed set of tenders BEFORE a row is
+ * written, checked against what the bill already carries. Returns the sentence to
+ * show the person at the till, or null when the set is recordable.
+ *
+ * Both rules exist for the same reason and neither belongs in readTenderList:
+ * they are not about the shape of a request, they are about whether the result
+ * could still be SETTLED afterwards. A tender that can be recorded and then not
+ * settled is worse than one that is refused.
+ */
+function tenderSetRefusal(
+	ledger: { live_count: number; payment_method: string | null; payment_splits: { method: string; amount: number }[] },
+	proposed: readonly RouteTender[],
+): string | null {
+	const total = ledger.live_count + proposed.length;
+	if (total > MAX_BILL_TENDERS) {
+		return `A bill can be settled across at most ${String(MAX_BILL_TENDERS)} tenders; this one already carries ${String(ledger.live_count)}. Void one before recording another.`;
+	}
+	if (total <= 1) { return null; }
+	// The methods already on the bill, read off the mirror: one live tender is
+	// reported as payment_method, several as the parts.
+	const existing = ledger.live_count === 1
+		? (ledger.payment_method ? [ledger.payment_method] : [])
+		: ledger.payment_splits.map((p) => p.method);
+	const bad = [...existing, ...proposed.map((t) => t.method)]
+		.find((m) => UNSPLITTABLE_TENDER_METHODS.has(m.trim().toLowerCase()));
+	if (bad) {
+		return `${bad} cannot be one of several payments on the same bill — it settles a bill on its own. Take the rest another way, or settle this bill as ${bad} alone.`;
+	}
+	return null;
+}
+
+/** One tender as it arrives on the wire. `amount` never includes the tip. */
+interface RouteTender {
+	method: string;
+	amount: number;
+	txn_ref: string | null;
+	tip_amount: number;
+	tip_mode: string | null;
+	tip_credited_to_employee_id: string | null;
+	tip_credited_to_username: string | null;
+}
+
+/**
+ * Read the `tenders` array off a request body.
+ *
+ * RETURNS null WHEN THE KEY IS ABSENT, and that distinction is the whole parity
+ * contract of the settle route: a client written before migration 037 never sends
+ * the key, gets null here, and every value the settle handler computes downstream
+ * is then the one it has always computed. An absent key and an empty array are
+ * deliberately DIFFERENT answers — `[]` is a caller who meant to send tenders and
+ * sent none, which is a 400, not a silent fall back to the legacy single-method
+ * path with whatever `payment_method` happened to be in the body.
+ *
+ * SHAPE ONLY. It coerces types and refuses a body that could not be money. It does
+ * NOT decide whether a method is one this system can settle with, whether a tip
+ * names where it goes, or whether the amounts add up to the bill — those live in
+ * RecordBillTenders and billing_math's reconcileTenders, and restating them here
+ * would create a second copy of the money rules that could drift from the first.
+ */
+function readTenderList(raw: unknown): RouteTender[] | null {
+	if (raw === undefined || raw === null) { return null; }
+	if (!Array.isArray(raw)) { throw new Error("`tenders` must be an array of {method, amount} rows"); }
+	if (raw.length === 0) { throw new Error("At least one tender is required"); }
+	return raw.map((t, i) => {
+		const o = (t ?? {}) as Record<string, unknown>;
+		const label = `Tender ${String(i + 1)}`;
+		const method = typeof o.method === "string" ? o.method.trim() : "";
+		if (!method) { throw new Error(`${label} has no payment method`); }
+		const amount = Number(o.amount);
+		if (!Number.isFinite(amount) || amount <= 0) {
+			throw new Error(`${label} must have an amount greater than zero`);
+		}
+		// A tip is money ON TOP of the bill (037's header). It is carried on the
+		// tender and never folded into `amount`, which is the only reason the parts
+		// of a tipped bill still reconstruct the grand total.
+		const tip = o.tip_amount === undefined || o.tip_amount === null ? 0 : Number(o.tip_amount);
+		if (!Number.isFinite(tip) || tip < 0) { throw new Error(`${label} has an invalid tip amount`); }
+		const str = (v: unknown): string | null => (typeof v === "string" && v.trim().length > 0 ? v.trim() : null);
+		return {
+			method,
+			amount,
+			txn_ref: str(o.txn_ref),
+			tip_amount: tip,
+			tip_mode: str(o.tip_mode),
+			tip_credited_to_employee_id: str(o.tip_credited_to_employee_id),
+			tip_credited_to_username: str(o.tip_credited_to_username),
+		};
+	});
+}
+
 // The printer agent's receipt for one print job. `jobId` is the SERVER-generated
 // "PrintJobs".id it was handed, never a bill id — see migration 027's header for
 // why bill_id cannot be the identity here. .uuid() so a malformed id is a clean
@@ -359,20 +513,144 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
 	const splits = Array.isArray(req.body?.splits) ? req.body.splits : undefined;
 	const waiterEmployeeId = extractEmployeeId(req);
 
-	if (!orderId || (!paymentMethod && !splits) || !waiterEmployeeId) {
+	// TENDERS (037) and the TILL (038). `tenders` ABSENT reads as null, and that is
+	// the parity contract of this route: a client written before either migration
+	// never sends the key, so every value computed below is the one this handler
+	// has always computed. A malformed `tenders` is answered here so the 400 names
+	// tenders instead of a missing payment_method.
+	let tenders: RouteTender[] | null;
+	try {
+		tenders = readTenderList((req.body ?? {}).tenders);
+	} catch (err) {
+		res.status(400).json({ error: String((err as { message?: unknown })?.message ?? 'Invalid tenders') });
+		return;
+	}
+	const counterId = counterIdFrom(req);
+
+	// `&& !tenders` WIDENS what is accepted and can never narrow it: a body that
+	// carries tenders and no payment_method is now a settle (the methods are on the
+	// tenders). Every request that was valid before is still valid, unchanged.
+	if (!orderId || (!paymentMethod && !splits && !tenders) || !waiterEmployeeId) {
 		res.status(400).json({ error: 'Missing orderId, payment_method, or employee identity' });
 		return;
 	}
 
 	try {
-		const result = await ConfirmBillPaymentByWaiter(
-			auth.restaurantId,
-			orderId,
-			waiterEmployeeId,
-			paymentMethod,
-			paymentProofScreenshotUrl || null,
-			splits,
-		);
+		// THE TILL, CHECKED BEFORE ANY MONEY MOVES. An unknown counter id is a
+		// misconfigured terminal, and settling the bill anyway would attribute a
+		// real sale to nothing — the exact hole migration 038 exists to close.
+		if (counterId) { await requireCounter(auth.restaurantId, counterId); }
+
+		// THE LEDGER CONSULT. One narrow read (see GetBillPaymentLedger for why it
+		// is not GetBillTenderState) answering the only question the settle path
+		// must ask about tenders on EVERY settle: does this bill already have a
+		// payment ledger? On every bill of every tenant that has never written a
+		// tender the answer is `live_count: 0`, and every value below is then the
+		// one this handler has always computed.
+		const ledger = await GetBillPaymentLedger(auth.restaurantId, { order_id: orderId });
+
+		// WHAT COULD BE RECORDED AND THEN NOT SETTLED, refused before it is written:
+		// the six-part ceiling of `payment_splits` and the methods that column will
+		// not accept as a part. See tenderSetRefusal — both rules exist so a paid
+		// bill can never be stranded open with the guest already gone.
+		const refusal = tenderSetRefusal(ledger, tenders ?? []);
+		if (refusal) { res.status(400).json({ error: refusal }); return; }
+
+		let settleMethod = paymentMethod;
+		let settleSplits: unknown = splits;
+		let tenderState: BillTenderState | null = null;
+
+		if (tenders) {
+			// The actor comes from the VERIFIED SESSION and there is no body field
+			// that can set it. A till that could name its own cashier could sign
+			// someone else's settlement.
+			const username = extractEmployeeUsername(req);
+			if (!username) {
+				res.status(400).json({ error: "Your session does not carry a username. Sign out and sign in again." });
+				return;
+			}
+			// require_full: this call IS the settle, so the tenders must reconstruct
+			// the grand total to the paisa or nothing is written — defence 2 of
+			// migration 037, in the one place the deferred trigger cannot see.
+			tenderState = await RecordBillTenders(auth.restaurantId, {
+				order_id: orderId,
+				tenders,
+				settled_by_employee_id: waiterEmployeeId,
+				settled_by_username: username,
+				require_full: true,
+			});
+			settleMethod = tenderState.payment_method ?? '';
+			settleSplits = tenderState.payment_splits.length > 0 ? tenderState.payment_splits : undefined;
+		} else if (ledger.live_count > 0) {
+			// A LEDGER THAT EXISTS IS THE AUTHORITY ON HOW THE BILL WAS PAID. This is
+			// the case of tenders recorded through POST /bills/tenders and then
+			// settled by a caller that sent only `payment_method`: taking the body's
+			// word would blank payment_splits and book a split bill to a single mode.
+			// The ledger's own mirror goes down instead, so the two columns and the
+			// rows behind them cannot disagree. A SHORT ledger is refused a moment
+			// later by assertTendersReconcileForSettle, with the outstanding named.
+			settleMethod = ledger.payment_method ?? paymentMethod;
+			settleSplits = ledger.payment_splits.length > 0 ? ledger.payment_splits : undefined;
+		}
+
+		// RecordBillTenders commits in its OWN transaction, so a settle that fails
+		// after it (a proof-bearing method with no screenshot, a session closed
+		// underneath, a re-priced bill) leaves the payments recorded on an open
+		// bill. That is recoverable and the recovery is not obvious, so it is said
+		// here rather than left to a cashier to work out with a guest waiting: a
+		// second attempt WITHOUT the tenders field settles from the ledger that is
+		// now on the bill. Re-sending the same tenders would over-tender and be
+		// refused, which is correct and reads like a dead end without this sentence.
+		let result;
+		try {
+			result = await ConfirmBillPaymentByWaiter(
+				auth.restaurantId,
+				orderId,
+				waiterEmployeeId,
+				settleMethod,
+				paymentProofScreenshotUrl || null,
+				settleSplits,
+			);
+		} catch (err) {
+			if (!tenderState) { throw err; }
+			throw new Error(
+				`The payments were recorded, but this bill could not be settled: ${String((err as { message?: unknown })?.message ?? err)} — settle again WITHOUT the tenders field and the payments already recorded will be used.`,
+			);
+		}
+
+		// Everything below is ADDITIVE: `extra` and `extraAudit` stay EMPTY for a
+		// request that carried neither tenders nor a till, so such a caller receives
+		// `result` itself and an audit entry with the same four fields it has always
+		// had.
+		const extra: Record<string, unknown> = {};
+		const extraAudit: Record<string, unknown> = {};
+		if (tenderState) {
+			extra.tenders = tenderState.tenders;
+			extra.tendered = tenderState.tendered;
+			extra.outstanding = tenderState.outstanding;
+			// Reported SEPARATELY and never added to `tendered`: a tip is not revenue,
+			// it is money held for a named person or for the pool.
+			extra.tips_total = tenderState.tips_total;
+			extraAudit.tenders = tenderState.tenders.length;
+			extraAudit.tendered = tenderState.tendered;
+			extraAudit.tips_total = tenderState.tips_total;
+		}
+		if (counterId) {
+			// AFTER the settle, because ConfirmBillPaymentByWaiter is what mints the
+			// bill row for a table that never had one. Best-effort and logged rather
+			// than fatal: the money has already moved, and failing the response over a
+			// reporting attribution would tell the till that a settled bill did not
+			// settle. POST /bills/counter repairs it.
+			try {
+				const billId = ledger.bill_id
+					?? (await GetBillPaymentLedger(auth.restaurantId, { order_id: orderId })).bill_id;
+				if (billId && await SetBillCounter(auth.restaurantId, billId, counterId)) {
+					extra.counter_id = counterId;
+					extraAudit.counter_id = counterId;
+				}
+			} catch (err) { logger.warn({ err }, 'settle_counter_attribution_failed'); }
+		}
+
 		try {
 			emitRestaurant(auth.restaurantId, 'bill:waiter_confirmed_payment', {
 				order_id: orderId,
@@ -383,11 +661,11 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
 			// ignore realtime failures
 		}
 		try {
-			await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", `Waiter confirmed payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, waiter: waiterEmployeeId, payment_method: result.payment_method });
+			await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", `Waiter confirmed payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, waiter: waiterEmployeeId, payment_method: result.payment_method, ...extraAudit });
 		} catch (err) {
 			logger.warn({ err }, 'log_audit waiter-confirm-payment failed');
 		}
-		res.json(result);
+		res.json(Object.keys(extra).length > 0 ? { ...result, ...extra } : result);
 	} catch (error: any) {
 		logger.error({ err: error }, 'waiter_confirm_bill_payment_failed');
 		res.status(400).json({ error: String(error?.message ?? 'Unable to confirm payment') });
@@ -1011,6 +1289,391 @@ app.post('/bills/:id/reopen', validate, async (req: Request, res: Response) => {
 	} catch (e: any) {
 		logger.error({ err: e }, 'reopen_bill_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to re-open bill') });
+	}
+});
+}
+
+
+/**
+ * TENDERS, TIPS AND TILLS — the HTTP surface over migrations 037 and 038.
+ *
+ * Registered LAST (index.ts), after every other bill route, so nothing here can
+ * shadow a path that already exists and nothing that already exists can swallow
+ * one of these. Every path is a literal or a literal followed by an id, and the
+ * route manifest is the check that stays true.
+ *
+ * ============================================================================
+ * WHAT A TENDER IS, AND WHAT IT IS NOT
+ * ============================================================================
+ * A tender is ONE payment against ONE bill: a method, an amount, and the
+ * acquirer's reference. `amount` is the portion of the BILL it settles and never
+ * includes the tip. The tip rides on the same row because that is how it is
+ * physically taken — "put fifty on the card" — but it is excluded from every sum
+ * that reconciles against the grand total, so a tipped bill still balances to
+ * the paisa. A tip reaches no sales figure, no APC and no ABV; the only reader
+ * that reports it is GetTipLedger, and it reports nothing else.
+ *
+ * ============================================================================
+ * OVER-TENDER AND UNDER-TENDER, DECIDED RATHER THAN LEFT OPEN
+ * ============================================================================
+ *   * OVER-TENDER IS REFUSED, never recorded, and never netted off. Change
+ *     handed back in cash is not a negative tender; if it were, the sum of
+ *     tenders would stop meaning "money that entered the till" and every
+ *     drawer-level reconciliation built on that sum would quietly become wrong.
+ *     The tender is the amount APPLIED TO THE BILL. What the guest actually held
+ *     out is not a fact this system has, and inventing it is worse than
+ *     admitting it.
+ *   * UNDER-TENDER ON AN OPEN BILL IS A PARTIAL SETTLEMENT and is a legal,
+ *     named state: the guest has paid some of it, `outstanding` says how much is
+ *     left, and the bill stays open. That is the whole reason POST /bills/tenders
+ *     exists separately from the settle.
+ *   * UNDER-TENDER AT SETTLE IS REFUSED. The settle passes require_full, so the
+ *     tenders must reconstruct the grand total exactly or nothing is written —
+ *     and if a short ledger somehow reaches approval anyway,
+ *     assertTendersReconcileForSettle refuses there too.
+ *
+ * ============================================================================
+ * COUNTERS AND "CashSessions" ARE TWO DIFFERENT NOUNS
+ * ============================================================================
+ * "BillingCounters" is an IDENTITY — a till, configured once, durable, existing
+ * whether or not anyone is trading. "CashSessions" is an EVENT — one drawer
+ * counted once at the end of one shift. The relationship is one-to-many, counter
+ * to sessions, and migration 038 puts counter_id on BOTH "Bills" (which till
+ * RANG the sale) and "CashSessions" (which till was COUNTED), because only with
+ * both can a cash-up be reconciled against the sales it is supposed to explain.
+ * So this file configures and attributes counters and does NOT reimplement the
+ * cash-up: /cash/open, /cash/close and /cash/current in routes/accounting.ts now
+ * take the same counter and stay the one place a drawer is counted.
+ *
+ * A NULL counter still means "this outlet's single till", which is what every
+ * existing bill and every existing session is. A tenant that never configures a
+ * counter never sends the header and sees no change anywhere.
+ *
+ * ============================================================================
+ * NO idempotent() ON ANY ROUTE HERE — SO THE FLUTTER OUTBOX ALLOWLIST IS UNTOUCHED
+ * ============================================================================
+ * Deliberate, and said loudly because outbox.dart mirrors the server opt-in
+ * exactly. Recording a tender mints a "Bills" row (and with it an invoice
+ * number) for a table that has none, which idempotency.ts's header puts
+ * explicitly out of scope; and a queued payment is a bill that says one thing on
+ * the printed copy and another on the server. The right offline behaviour for
+ * taking money is "refuse now", not "apply later" — the same rule settle already
+ * lives by.
+ */
+export function registerTenderRoutes(app: Express): void {
+
+/*
+	What this bill is worth and what has been paid against it.
+
+	GET /bills/tenders?bill_id= | ?table_name= | ?order_id=
+	  -> 200 { bill_id, grand_total, tenders, tendered, outstanding,
+	           exact, partial, over, tips_total, payment_method, payment_splits }
+
+	READ-ONLY, INCLUDING WHEN THERE IS NO BILL ROW YET. A table that has ordered
+	and not yet asked for the bill has no "Bills" row, and this must not create
+	one: a GET that allocated an invoice number is how a polling payment screen
+	mints phantom bills. It answers with the grand total the guest currently owes
+	and nothing tendered, which is the true state and the one a payment screen
+	needs before the first tender is taken.
+
+	`grand_total` here is a LIVE quote on an open bill, not a promise: the settle
+	recomputes it inside its own transaction, so an order landing in between moves
+	the number rather than settling at a stale one.
+*/
+app.get('/bills/tenders', validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const q = (req.query ?? {}) as Record<string, unknown>;
+	const str = (v: unknown): string => (typeof v === "string" ? v.trim() : Array.isArray(v) && typeof v[0] === "string" ? v[0].trim() : "");
+	const billId = str(q.bill_id);
+	const tableName = str(q.table_name);
+	const orderId = str(q.order_id);
+	if (!billId && !tableName && !orderId) {
+		res.status(400).json({ error: "bill_id, table_name or order_id is required" });
+		return;
+	}
+	try {
+		res.json(await GetBillTenderState(restaurantId, {
+			...(billId ? { bill_id: billId } : {}),
+			...(tableName ? { table_name: tableName } : {}),
+			...(orderId ? { order_id: orderId } : {}),
+		}));
+	} catch (e: any) {
+		logger.error({ err: e }, 'get_bill_tenders_failed');
+		res.status(400).json({ error: String(e?.message ?? 'Unable to read the payments on this bill') });
+	}
+});
+
+/*
+	Record one or more payments against an OPEN bill.
+
+	POST /bills/tenders
+	  body { bill_id | table_name | order_id, tenders: [ {method, amount, txn_ref?,
+	         tip_amount?, tip_mode?, tip_credited_to_username?, tip_credited_to_employee_id?} ] }
+	  -> 201 { ...state }
+
+	This is the PART-PAYMENT route: the amounts may come to less than the bill and
+	the bill stays open, with `outstanding` saying what is left. The tender that
+	FINISHES the bill is normally sent on the settle call itself
+	(POST /bills/order/:orderId/waiter-confirm-payment), which appends it to
+	whatever is already here and checks the total in one transaction — but a set
+	recorded here that happens to complete the bill is still correct, because the
+	settle consults this ledger and mirrors it rather than overwriting it.
+
+	WHO TOOK THE PAYMENT COMES FROM THE VERIFIED SESSION. There is no body field
+	that can set it, for the same reason no control ledger accepts an actor from
+	the client: a till that could name its own cashier could sign someone else's
+	settlement. `tip_credited_to_username` DOES come from the body, because it is
+	a destination rather than an actor, and it is deliberately not resolved
+	against the staff list — tips are routinely owed to the kitchen or to a pool,
+	i.e. to people who hold no POS permission at all and may not be POS users.
+	What the schema guarantees is that a tip always says how it arrived and where
+	it is going; who that is remains an operator's word.
+*/
+app.post('/bills/tenders', validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), validateBody(sBillTenders), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const username = extractEmployeeUsername(req);
+	if (!username) { res.status(400).json({ error: "Your session does not carry a username. Sign out and sign in again." }); return; }
+	const body = req.body as { bill_id?: string; table_name?: string; order_id?: string };
+	const target = {
+		...(body.bill_id ? { bill_id: String(body.bill_id).trim() } : {}),
+		...(body.table_name ? { table_name: String(body.table_name).trim() } : {}),
+		...(body.order_id ? { order_id: String(body.order_id).trim() } : {}),
+	};
+
+	let tenders: RouteTender[] | null;
+	try { tenders = readTenderList((req.body as Record<string, unknown>).tenders); }
+	catch (err) { res.status(400).json({ error: String((err as { message?: unknown })?.message ?? 'Invalid tenders') }); return; }
+	if (!tenders) { res.status(400).json({ error: "At least one tender is required" }); return; }
+
+	try {
+		// The same refusals the settle applies, for the same reason and from the
+		// same function: a tender recorded here that the settle could not mirror
+		// would leave a paid bill permanently open.
+		const ledger = await GetBillPaymentLedger(restaurantId, target);
+		const refusal = tenderSetRefusal(ledger, tenders);
+		if (refusal) { res.status(400).json({ error: refusal }); return; }
+		const state = await RecordBillTenders(restaurantId, {
+			...target,
+			tenders,
+			settled_by_employee_id: extractEmployeeId(req),
+			settled_by_username: username,
+		});
+		try {
+			await log_audit(
+				req, "2393edd7-cdd9-439c-9ff3-d563d5216967",
+				`Recorded ${String(tenders.length)} payment(s) totalling ${state.tendered} on bill ${state.bill_id}${state.tips_total > 0 ? ` (tips ${state.tips_total})` : ""}${state.outstanding > 0 ? ` — ${state.outstanding} still outstanding` : ""}`,
+				Audit_log_category.Bill,
+				{
+					bill_id: state.bill_id, tenders: tenders.length, tendered: state.tendered,
+					tips_total: state.tips_total, outstanding: state.outstanding,
+					grand_total: state.grand_total, payment_method: state.payment_method,
+				},
+			);
+		} catch (err) { logger.warn({ err }, 'log_audit record-tenders failed'); }
+		try { if (body.table_name) {emitRestaurant(restaurantId, "bill:updated", { table: String(body.table_name).trim() });} } catch {/* ignore */}
+		res.status(201).json(state);
+	} catch (e: any) {
+		logger.error({ err: e }, 'record_bill_tenders_failed');
+		res.status(400).json({ error: String(e?.message ?? 'Unable to record that payment') });
+	}
+});
+
+/*
+	Void one recorded payment.
+
+	POST /bills/tenders/:id/void
+	  body { reason }
+	  -> 200 { ...state }
+
+	SUPERSEDED, NEVER DELETED. The row stays, stamped with who voided it and why,
+	and drops out of every sum. This is what closes the double-count: a card
+	payment keyed twice leaves two rows and one live amount, and the evidence that
+	it was keyed twice survives for the day the acquirer's statement shows two
+	authorisations.
+
+	OPEN BILLS ONLY, enforced in the data layer inside the same transaction. On a
+	settled bill the constraint trigger already refuses a partial void, but it
+	stays silent when the LAST tender goes — which would leave a closed bill
+	reading 'Split' with no parts, i.e. a settlement the reports cannot allocate.
+	Money that has already moved is corrected with a refund, which has its own
+	path, its own columns and its own audit entry.
+*/
+app.post('/bills/tenders/:id/void', validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), validateBody(sTenderVoid), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const username = extractEmployeeUsername(req);
+	if (!username) { res.status(400).json({ error: "Your session does not carry a username. Sign out and sign in again." }); return; }
+	const tenderId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+	if (!tenderId) { res.status(400).json({ error: "A tender id is required" }); return; }
+	const body = req.body as { reason: string };
+	try {
+		const state = await VoidBillTender(restaurantId, tenderId, { reason: body.reason, by_username: username });
+		try {
+			await log_audit(
+				req, "2393edd7-cdd9-439c-9ff3-d563d5216967",
+				`Voided a payment on bill ${state.bill_id} — ${state.tendered} now tendered, ${state.outstanding} outstanding`,
+				Audit_log_category.Bill,
+				{
+					reversal: true, bill_id: state.bill_id, tender_id: tenderId, reason: body.reason,
+					tendered: state.tendered, outstanding: state.outstanding,
+					grand_total: state.grand_total, payment_method: state.payment_method,
+				},
+			);
+		} catch (err) { logger.warn({ err }, 'log_audit void-tender failed'); }
+		res.json(state);
+	} catch (e: any) {
+		logger.error({ err: e }, 'void_bill_tender_failed');
+		res.status(400).json({ error: String(e?.message ?? 'Unable to void that payment') });
+	}
+});
+
+/*
+	Attribute a bill to the till that rang it.
+
+	POST /bills/counter
+	  body { bill_id | table_name | order_id, counter_id? }   (or the X-Counter-Id header)
+	  -> 200 { bill_id, counter_id }
+
+	The settle route already does this automatically from `X-Counter-Id`, so this
+	exists for the two cases that route cannot serve: attributing a bill BEFORE it
+	is settled (a food-court stall that rings and prints from one till), and
+	CORRECTING an attribution after a terminal was found to be misconfigured. A
+	closed bill is not refused, because the reason to reach for this is usually
+	that a settled bill went to the wrong till and a cash-up will not balance
+	until it is moved.
+
+	An omitted counter_id (and no header) CLEARS the attribution back to "this
+	outlet's single till", which is the state of every bill that predates
+	migration 038.
+*/
+app.post('/bills/counter', validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), validateBody(sBillCounter), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = req.body as { bill_id?: string; table_name?: string; order_id?: string };
+	const target = {
+		...(body.bill_id ? { bill_id: String(body.bill_id).trim() } : {}),
+		...(body.table_name ? { table_name: String(body.table_name).trim() } : {}),
+		...(body.order_id ? { order_id: String(body.order_id).trim() } : {}),
+	};
+	const counterId = counterIdFrom(req);
+	try {
+		if (counterId) { await requireCounter(restaurantId, counterId); }
+		const ledger = await GetBillPaymentLedger(restaurantId, target);
+		if (!ledger.bill_id) { res.status(404).json({ error: "No bill to attribute — this table has not been billed yet" }); return; }
+		const ok = await SetBillCounter(restaurantId, ledger.bill_id, counterId);
+		if (!ok) { res.status(404).json({ error: "Bill not found" }); return; }
+		try {
+			await log_audit(
+				req, "2393edd7-cdd9-439c-9ff3-d563d5216967",
+				counterId
+					? `Attributed bill ${ledger.bill_id} to counter ${counterId}`
+					: `Cleared the counter attribution on bill ${ledger.bill_id}`,
+				Audit_log_category.Bill,
+				{ bill_id: ledger.bill_id, counter_id: counterId },
+			);
+		} catch (err) { logger.warn({ err }, 'log_audit bill-counter failed'); }
+		res.json({ bill_id: ledger.bill_id, counter_id: counterId });
+	} catch (e: any) {
+		logger.error({ err: e }, 'set_bill_counter_failed');
+		res.status(400).json({ error: String(e?.message ?? 'Unable to attribute that bill') });
+	}
+});
+
+/*
+	The outlet's tills.
+
+	GET /billing-counters?include_inactive=1 -> 200 { counters: [...] }
+
+	Gated on the RECORD-PAYMENT permission rather than on settings, deliberately
+	and asymmetrically with the write below: whoever can take money has to be able
+	to see which till they are on, and a cashier picking their counter at the
+	start of a shift is not a configuration act. Creating and renaming tills is,
+	and that stays with settings.
+
+	EMPTY IS THE NORMAL ANSWER. Most tenants have one till per outlet and never
+	configure a counter; they get `[]` here and NULL attribution everywhere, which
+	reads as "this outlet's till" in every report.
+*/
+app.get('/billing-counters', validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const raw = req.query.include_inactive;
+	const v = Array.isArray(raw) ? raw[0] : raw;
+	const includeInactive = v === "1" || v === "true";
+	try {
+		res.json({ counters: await ListBillingCounters(restaurantId, { includeInactive }) });
+	} catch (e: any) {
+		logger.error({ err: e }, 'list_billing_counters_failed');
+		res.status(500).json({ error: "Unable to list the billing counters" });
+	}
+});
+
+/*
+	Create or rename a till.
+
+	POST /billing-counters
+	  body { code, name?, kind?, device_hint?, active?, sort_order?, id? }
+	  -> 200 { counter }
+
+	UPSERTS ON THE CODE, case-insensitively per outlet, so re-saving the
+	configuration screen updates rather than duplicating and "C1" and "c1" can
+	never become two tills nobody can tell apart on a cash-up sheet at 1am.
+
+	DEACTIVATION, NOT DELETION — there is no DELETE here on purpose. Removing a
+	counter would orphan the counter_id on every bill it ever rang, which is
+	precisely the history the column exists to keep. `active: false` retires it:
+	it stops being offered, and every bill and cash session it is named on still
+	resolves.
+*/
+app.post('/billing-counters', validateAction(PERM_SETTINGS), validateBody(sCounterUpsert), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = req.body as { id?: string; code: string; name?: string; kind?: string; device_hint?: string | null; active?: boolean; sort_order?: number };
+	try {
+		const counter = await UpsertBillingCounter(restaurantId, body);
+		try {
+			await log_audit(
+				req, PERM_SETTINGS,
+				`Saved billing counter ${counter.code} (${counter.name}, ${counter.kind}${counter.active ? "" : ", inactive"})`,
+				Audit_log_category.General,
+				{ counter_id: counter.id, code: counter.code, kind: counter.kind, active: counter.active },
+			);
+		} catch (err) { logger.warn({ err }, 'log_audit billing-counter failed'); }
+		res.json({ counter });
+	} catch (e: any) {
+		logger.error({ err: e }, 'upsert_billing_counter_failed');
+		res.status(400).json({ error: String(e?.message ?? 'Unable to save that counter') });
+	}
+});
+
+/*
+	THE TIP LEDGER — who is owed what, over a window.
+
+	GET /tips?from=YYYY-MM-DD&to=YYYY-MM-DD
+	  -> 200 { from, to, total_tips, by_credited_to: [{credited_to, tips, tender_count, by_mode}], rows }
+
+	This is a PAYROLL read, not a sales read, and it is gated with payroll and the
+	other accounting reports for that reason. It reports tips and nothing else:
+	`total_tips` never appears in any sales figure, in APC or ABV, or on any rung
+	of the money ladder, because a tip lives on the tender beside `amount` and is
+	excluded from every sum that reconciles against the bill.
+
+	The window is INCLUSIVE day keys in the RESTAURANT'S timezone, resolved in the
+	data layer like every other report — a route that parsed them here would be
+	answering a calendar question in the server's zone and would silently drop the
+	last day of every range.
+*/
+app.get('/tips', validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined);
+	try {
+		res.json(await GetTipLedger(restaurantId, str(req.query.from), str(req.query.to)));
+	} catch (e: any) {
+		logger.error({ err: e }, 'tip_ledger_failed');
+		res.status(500).json({ error: "Unable to build the tip ledger" });
 	}
 });
 }
