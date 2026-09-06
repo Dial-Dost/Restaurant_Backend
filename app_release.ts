@@ -13,11 +13,18 @@
  * it. Releasing the app becomes: commit the artifacts, bump the version here,
  * push. No box access, no separate runbook step.
  *
- * THE ENV STILL WINS. Every field below is overridable by its original
- * environment variable, so the operator keeps the ability to change what
- * clients see WITHOUT a deploy — pulling a bad release, or forcing an upgrade
- * during an incident, at a moment when waiting for CI is the wrong answer. This
- * is a default, not a replacement.
+ * THE OVERRIDE USES NEW NAMES, AND THAT IS THE WHOLE POINT. The obvious design
+ * — keep reading APP_LATEST_VERSION and let env win — is wrong here, and I
+ * shipped it once before catching it: those variables are ALREADY SET on the
+ * box, so env would shadow this file and the first "automated" release would
+ * still have needed someone to SSH in and delete six variables. That is the
+ * exact manual step this exists to remove.
+ *
+ * So the code is the default and the escape hatch is APP_RELEASE_PIN_* — names
+ * nothing currently sets. An operator can still pull a bad release or force an
+ * upgrade without waiting for CI; they just say so explicitly. The legacy
+ * variables are now INERT, which is a footgun if discovered at 2am, so
+ * `warnAboutLegacyReleaseEnv` logs them at boot by name.
  *
  * ORDER OF OPERATIONS WHEN RELEASING, and it matters:
  *   1. Build the clients with the production dart-defines and check the API host
@@ -75,23 +82,56 @@ function envOverride(name: string): string | undefined {
 }
 
 /**
- * The manifest as served. Env beats code, field by field, so an operator can
- * override exactly one thing (pull a release, force an upgrade) without having
- * to restate the rest.
+ * The variables this file replaced. They may still be set on a box provisioned
+ * before it, where they now do NOTHING — so say so once, loudly, at boot. A
+ * silently ignored setting is how someone spends an incident editing a file
+ * that cannot help them.
+ */
+export const LEGACY_RELEASE_ENV = [
+	"APP_LATEST_VERSION", "APP_MIN_VERSION", "APP_UPDATE_NOTES",
+	"APP_DOWNLOAD_WINDOWS", "APP_DOWNLOAD_ANDROID", "APP_DOWNLOAD_IOS",
+] as const;
+
+/** Names of legacy release variables that are set and now inert. */
+export function inertReleaseEnv(): string[] {
+	return LEGACY_RELEASE_ENV.filter((n) => typeof process.env[n] === "string" && process.env[n]!.trim().length > 0);
+}
+
+/**
+ * The manifest as served. The CODE above is the default; an APP_RELEASE_PIN_*
+ * variable overrides exactly one field, so an operator pulling a bad release
+ * does not have to restate the other five. The legacy APP_* names are NOT read
+ * here — see the header for why that inversion is the entire point.
  */
 export function resolveAppRelease(): AppReleaseManifest {
 	return {
-		latest: envOverride("APP_LATEST_VERSION") ?? APP_RELEASE.latest,
-		min_supported: envOverride("APP_MIN_VERSION") ?? APP_RELEASE.min_supported,
-		// Deliberately ?? and not ||: an operator setting APP_UPDATE_NOTES to an
-		// empty string is asking for no notes, and blanking them is a legitimate
-		// way to strip a wrong changelog in a hurry. envOverride already treats
-		// whitespace-only as unset, so "" here is an explicit choice.
-		notes: process.env.APP_UPDATE_NOTES ?? APP_RELEASE.notes,
+		latest: envOverride("APP_RELEASE_PIN_VERSION") ?? APP_RELEASE.latest,
+		min_supported: envOverride("APP_RELEASE_PIN_MIN") ?? APP_RELEASE.min_supported,
+		// Deliberately ?? and not ||: setting the pin to an empty string is asking
+		// for NO notes, and blanking a wrong changelog in a hurry is legitimate.
+		// envOverride treats whitespace-only as unset, so "" here is a choice.
+		notes: process.env.APP_RELEASE_PIN_NOTES ?? APP_RELEASE.notes,
 		downloads: {
-			windows: envOverride("APP_DOWNLOAD_WINDOWS") ?? APP_RELEASE.downloads.windows,
-			android: envOverride("APP_DOWNLOAD_ANDROID") ?? APP_RELEASE.downloads.android,
-			ios: envOverride("APP_DOWNLOAD_IOS") ?? APP_RELEASE.downloads.ios,
+			windows: envOverride("APP_RELEASE_PIN_WINDOWS") ?? APP_RELEASE.downloads.windows,
+			android: envOverride("APP_RELEASE_PIN_ANDROID") ?? APP_RELEASE.downloads.android,
+			ios: envOverride("APP_RELEASE_PIN_IOS") ?? APP_RELEASE.downloads.ios,
 		},
 	};
+}
+
+/**
+ * Log once, at boot, if a legacy release variable is still set. It no longer
+ * does anything, and finding that out during an incident — after editing it and
+ * restarting and seeing no change — is the worst possible moment.
+ */
+export function warnAboutLegacyReleaseEnv(log: { warn: (o: unknown, m: string) => void }): void {
+	const inert = inertReleaseEnv();
+	if (inert.length === 0) { return; }
+	log.warn(
+		{ inert, replacement: "APP_RELEASE_PIN_*" },
+		`These release variables are set but NO LONGER READ: ${inert.join(", ")}. ` +
+		"The shipped manifest now lives in app_release.ts and ships with the deploy. " +
+		"To override a field without deploying, use APP_RELEASE_PIN_VERSION / _MIN / _NOTES / " +
+		"_WINDOWS / _ANDROID / _IOS. The old variables can be deleted from .env at your leisure.",
+	);
 }

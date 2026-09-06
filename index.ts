@@ -11,6 +11,7 @@ import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatfor
 import { registerPlatformRoutes } from "./platform/routes.js";
 import { closeRealtime, initRealtime } from "./realtime.js";
 import { runReportScheduleSweep } from "./report_schedules.js";
+import { warnAboutLegacyReleaseEnv } from "./app_release.js";
 import { runIdempotencyReaperSweep } from "./idempotency.js";
 import { runPrintJobReaperSweep } from "./print_jobs.js";
 import { extractBearerToken, isAllOutletsSentinel, normalizeRole, rawRequestedOutletId, sendDueBookingReminders } from "./routes/_shared.js";
@@ -525,6 +526,11 @@ export function ensureRealtime(): Promise<HttpServer> {
 }
 
 async function bootstrap(): Promise<void> {
+	// Say once, at boot, if the old release variables are still set on this box.
+	// They are inert now (app_release.ts owns the manifest), and discovering that
+	// mid-incident — after editing .env and restarting and seeing no change — is
+	// the worst possible moment to learn it.
+	warnAboutLegacyReleaseEnv(logger);
 	// The CSR Organics demo tenant (admin/admin123) must NOT be auto-created on a
 	// production/turnkey deploy. Seed only when explicitly opted in, or outside
 	// production. EnsureRestaurantSeed is idempotent, so existing tenants are safe.
