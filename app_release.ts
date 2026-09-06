@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.8.4";
+const LATEST = "1.8.5";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,9 +118,9 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"The What-If Simulator is now yours to configure: pick exactly the levers you want to test " +
-		"from 34 parameters across pricing, staffing, operations, marketing and overhead. Remove one " +
-		"and it quietly goes back to your own numbers rather than zero.",
+		"The app now keeps working when the internet drops. Sign in once and it stays signed in: " +
+		"your screens still open from the last data they saw, and orders you take are saved and sent " +
+		"the moment the line comes back. Billing still needs a connection, and says so.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
