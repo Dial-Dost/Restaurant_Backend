@@ -26,14 +26,69 @@
  * variables are now INERT, which is a footgun if discovered at 2am, so
  * `warnAboutLegacyReleaseEnv` logs them at boot by name.
  *
+ * WHERE THE ARTIFACTS LIVE, AND WHY THAT MOVED. They used to be committed into
+ * Restaurant_Dashboard_UI/public/downloads/ — ~115MB of binaries into git per
+ * release, and a second repository CI would have needed a write token for. They
+ * are now GitHub RELEASE ASSETS of the owner-app repo, published by that repo's
+ * `Release clients` workflow, which also proves the production URLs are baked in
+ * and that the APK carries the same signing certificate as the build already in
+ * the field. See restaurant_owner_app/docs/RELEASE.md.
+ *
+ * The URLs below are DERIVED from `latest` rather than written out, so bumping
+ * the version cannot leave them pointing at the previous build's assets. That
+ * desync is silent in the worst direction: the dialog offers "1.8.5" and hands
+ * the client 1.8.4, which then reports itself as out of date and offers the same
+ * update again on every launch.
+ *
  * ORDER OF OPERATIONS WHEN RELEASING, and it matters:
- *   1. Build the clients with the production dart-defines and check the API host
- *      is actually baked in (config.dart defaults to localhost).
- *   2. Commit the artifacts to Restaurant_Dashboard_UI/public/downloads/ and let
- *      that deploy — the files must be DOWNLOADABLE first.
- *   3. Only then bump `latest` here. The reverse order points every client at a
- *      download that 404s.
+ *   1. Bump `version:` in the owner app's pubspec.yaml and tag it `v<version>`.
+ *      The workflow refuses a tag that disagrees with pubspec.
+ *   2. Let the workflow finish. It builds both clients with the production
+ *      dart-defines, asserts the API host is really in the binary (config.dart
+ *      defaults to localhost), asserts the Windows zip is flat, asserts the APK
+ *      signature, and publishes the two assets under that tag. The files must be
+ *      DOWNLOADABLE first.
+ *   3. Only then bump `latest` here and push. The reverse order points every
+ *      client at a download that 404s.
  */
+
+/**
+ * Where the built clients are published. Kept next to the version it is joined
+ * to: these two lines are the whole release, and splitting them is how they
+ * drift apart.
+ *
+ * The tag is `v${latest}` and the asset filenames are fixed by the workflow's
+ * WINDOWS_ASSET / ANDROID_ASSET — renaming one there 404s every client that
+ * reads this manifest.
+ */
+const OWNER_APP_REPO = "https://github.com/Dial-Dost/restaurant_owner_app";
+
+/** Where a published GitHub release asset lives, once the workflow has made one. */
+const releaseAsset = (version: string, file: string): string =>
+	`${OWNER_APP_REPO}/releases/download/v${version}/${file}`;
+
+/**
+ * The dashboard-hosted artifacts, which is where the CLIENTS IN THE FIELD
+ * actually download from today.
+ *
+ * NOT YET SWITCHED TO releaseAsset(), deliberately. The `Release clients`
+ * workflow that publishes GitHub release assets has never run — there are no
+ * tags and no releases in the owner-app repo — so every releaseAsset() URL is
+ * currently a 404. Pointing the manifest at them would break in-app update for
+ * the whole fleet, and it would break it in the file that documents
+ * "artifacts first, manifest second" three paragraphs above.
+ *
+ * THE SWITCH IS ONE LINE, and the order is: add the signing secrets, let the
+ * workflow publish v<version> once, confirm both asset URLs return 200, THEN
+ * change these two to releaseAsset(LATEST, …) and push. Until that has
+ * happened, these files are the live download and are served from the
+ * dashboard's public/downloads/.
+ */
+const dashboardAsset = (file: string): string =>
+	`https://experiosolutions.dialdost.com/downloads/${file}`;
+
+/** The version the manifest advertises. Bump this and the URLs follow. */
+const LATEST = "1.8.4";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -58,7 +113,7 @@ export interface AppReleaseManifest {
  * them, in their words, and skip the internals.
  */
 export const APP_RELEASE: AppReleaseManifest = {
-	latest: "1.8.4",
+	latest: LATEST,
 	// Not a hard gate. Raise this only to force an upgrade off a build that is
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
@@ -67,8 +122,10 @@ export const APP_RELEASE: AppReleaseManifest = {
 		"from 34 parameters across pricing, staffing, operations, marketing and overhead. Remove one " +
 		"and it quietly goes back to your own numbers rather than zero.",
 	downloads: {
-		windows: "https://experiosolutions.dialdost.com/downloads/RestaurantDash-Windows.zip",
-		android: "https://experiosolutions.dialdost.com/downloads/RestaurantDash-Android.apk",
+		windows: dashboardAsset("RestaurantDash-Windows.zip"),
+		android: dashboardAsset("RestaurantDash-Android.apk"),
+		// No iOS build exists. "" is the honest answer and update_checker.dart
+		// treats it as "no in-app download for this platform".
 		ios: "",
 	},
 };

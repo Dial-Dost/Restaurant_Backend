@@ -110,6 +110,77 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+step "the 'migrate' verb (OPTIONAL — absent is a supported state, not a failure)"
+# NOTHING HERE RUNS `rd-deploy migrate`. That verb applies schema changes to the
+# live database; an installer must never invoke it as a side effect of being run.
+# The only probe below is `migrate backend`, which the grammar refuses before it
+# reaches anything, and the only other evidence is a file existing.
+#
+# rd-entry — which this script DOES install, from the repo — accepts `migrate`
+# whether or not the wrapper implements it. That is deliberate and safe: on a box
+# without the verb, `migrate` reaches rd-deploy and comes back 64, which
+# deploy.yml reports as "the box is behind this repo" together with the one-click
+# way to restore the manual route. It cannot cause an unintended migration.
+RD_MIGRATE=/usr/local/sbin/rd-migrate
+if [ ! -e "$RD_MIGRATE" ]; then
+  printf '  [--] %s is not installed.\n' "$RD_MIGRATE"
+  printf '       This is FINE and is the current state of the box. The deploy pipeline\n'
+  printf '       must then run in MANUAL migration mode: set the repository variable\n'
+  printf '       MIGRATION_APPLY_MODE=manual in BOTH repos, or every migration-carrying\n'
+  printf '       deploy will stop with exit 64 having changed nothing.\n'
+  printf '       To install it, review deploy/vps/rd-deploy-migrate.proposed.sh and follow\n'
+  printf '       README.md, "Installing the migrate verb". It is a deliberate human step:\n'
+  printf '       this installer will NOT create it, for the same reason it will not create\n'
+  printf '       rd-deploy — it is a security boundary that writes to production data.\n'
+else
+  perm="$(stat -c '%U:%G %a' "$RD_MIGRATE")"
+  [ "$perm" = "root:root 755" ] && ok "$RD_MIGRATE is root:root 755" \
+                                || bad "$RD_MIGRATE is $perm — expected root:root 755"
+
+  # It must refuse a service argument: there is ONE database behind all three
+  # services, so `migrate backend` is a sentence that could only mislead.
+  set +e
+  "$WRAPPER" migrate backend >/dev/null 2>&1; rc_msvc=$?
+  set -e
+  [ "$rc_msvc" -eq 64 ] && ok "'migrate backend' -> 64 (takes no service)" \
+                        || bad "'migrate backend' -> $rc_msvc, expected 64. One database serves all three services; a service argument must not be accepted."
+
+  # Its two preconditions. rd-migrate refuses (66) without either, having changed
+  # nothing — but finding that out during a release is worse than finding it now.
+  PGTOOLS="$(sed -n 's/^PGTOOLS_IMAGE=//p' "$SRC_DIR/rd-deploy-migrate.proposed.sh" | head -n1)"
+  if [ -n "$PGTOOLS" ]; then
+    if docker image inspect "$PGTOOLS" >/dev/null 2>&1; then
+      ok "$PGTOOLS is present locally (rd-migrate never pulls — a release step must not need a registry)"
+    else
+      bad "$PGTOOLS is NOT present. rd-migrate takes its pg_dump with it and deliberately does not pull, so it will refuse with 66 and no migration will ever be applied. Fix: docker pull $PGTOOLS"
+    fi
+  fi
+  DUMPS=/var/backups/restaurant-dash/premigration
+  if [ -d "$DUMPS" ]; then
+    dperm="$(stat -c '%U:%G %a' "$DUMPS")"
+    [ "$dperm" = "root:root 700" ] && ok "$DUMPS is root:root 700" \
+      || bad "$DUMPS is $dperm — expected root:root 700. Those files are full copies of the production database, customer data included."
+    free_kb="$(df -Pk "$DUMPS" | awk 'NR==2 {print $4}')"
+    printf '  [--] %s has %s KB free (rd-migrate refuses below 2097152)\n' "$DUMPS" "$free_kb"
+  else
+    printf '  [--] %s does not exist yet; rd-migrate creates it 0700 on first use.\n' "$DUMPS"
+  fi
+
+  # The opt-in automatic restore. Its DEFAULT is off, and off is the recommended
+  # setting — see the header of rd-deploy-migrate.proposed.sh. Say so loudly if
+  # someone has turned it on, because nothing else on the box will.
+  if [ -f /opt/restaurant-dash/.rd-migrate-autorestore ]; then
+    printf '  [!!] /opt/restaurant-dash/.rd-migrate-autorestore EXISTS.\n'
+    printf '       A failed migration will now attempt a FULL pg_restore of the production\n'
+    printf '       database, discarding every order, payment and clock-in committed since the\n'
+    printf '       dump was taken minutes earlier. This is NOT the default and NOT the\n'
+    printf '       recommended setting. Remove the file unless you can say why it is there.\n'
+  else
+    ok "automatic restore is OFF (the default; a failed migration halts for a human)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 step "verify the sudoers grant (NOT installed from this repo)"
 SUDOERS=/etc/sudoers.d/restaurant-deploy
 if [ ! -f "$SUDOERS" ]; then

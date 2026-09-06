@@ -136,6 +136,22 @@ jobs:
       - name: Deploy routing guard (does a crash-loop roll back?)
         run: bash deploy/vps/tests/test_deploy_routing.sh
 
+      # The third undeclared dependency, and the first one that WRITES TO THE
+      # PRODUCTION DATABASE. `rd-deploy migrate` cannot read an exit code to tell
+      # "pending" from "clean" — scripts/migrate.ts returns 0 either way — so it
+      # keys on two SENTENCES that file prints. This pins those sentences, the
+      # pending-file parser, dump retention (deleting the newest dump instead of
+      # the oldest is the one retention bug that costs anything), rd-entry's
+      # acceptance of `migrate` with no service argument, and deploy.yml's
+      # routing of rd-migrate's exit codes.
+      #
+      # The routing assertion that matters most is 64. It means "the box does not
+      # have the verb installed yet", and the generic handler would report it as
+      # a bug in the workflow file — the same misdiagnosis that once rendered a
+      # missing forced command (127) as PENDING MIGRATION. Needs nothing but bash.
+      - name: Migrate verb guard (rd-migrate contract and exit-code routing)
+        run: bash deploy/vps/tests/test_migrate_contract.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

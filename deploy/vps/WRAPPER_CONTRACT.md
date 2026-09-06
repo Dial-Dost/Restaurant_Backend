@@ -38,6 +38,7 @@ That single fact drives everything below. In particular it is why CI must send
 | `rd-deploy revision` | `<repo-dir><TAB><40-char sha>`, **one line per repo** |
 | `rd-deploy logs [service]` | `compose logs --tail 100` |
 | `rd-deploy check-migrations` | prints the migrate dry-run verdict; **applies nothing** |
+| `rd-deploy migrate` | **PROPOSED, NOT INSTALLED.** dumps, verifies the dump, applies the pending migrations, re-checks. See *The `migrate` verb* below |
 | `rd-deploy update <service>` | `git fetch` + `reset --hard FETCH_HEAD`, prints `revision <12ch> -> <12ch>`, **then** the migration gate, **then** tags the outgoing image `:previous`, **then** `compose build` + `up -d` |
 | `rd-deploy deploy [service]` | migration gate, then `up -d`. **No rebuild.** |
 | `rd-deploy rollback [service]` | retags `<img>:previous` back to `:latest`, then force-recreates |
@@ -89,8 +90,18 @@ everything it lets through.
 | `deploy valkey`, `rollback valkey`, `logs valkey` | **rejected, 64** | valkey is the shared cache; a restart is felt by every till at once, and no workflow has ever named it |
 | bare `deploy`, bare `rollback`, bare `update` | **rejected, 64** | those are the whole stack. The backend workflow sends `update python` then `update backend`; the dashboard sends `update dashboard` |
 
-`status`, `revision` and `check-migrations` take no service and are unchanged.
-Bare `logs` is still accepted (it changes nothing).
+`status`, `revision`, `check-migrations` and `migrate` take no service and are
+unchanged. Bare `logs` is still accepted (it changes nothing).
+
+`migrate` is the one verb `rd-entry` was *widened* to accept, and it is the only
+one in this grammar that writes to the production database. What that costs a
+leaked `DEPLOY_SSH_KEY`, and why it is still bounded, is argued at the top of
+`rd-entry` itself. The short version: the SQL it applies is whatever is already
+in the box's working tree, that tree is moved only by `update` resetting to a
+clone fetched with a **read-only** deploy key, and the verb takes no argument —
+so a leaked key cannot author SQL, cannot choose which SQL runs, and cannot
+retarget the database. It can only ask for migrations a maintainer already merged
+to `main` to be applied sooner than someone intended.
 
 Both narrowings only turn an accept into a `64`, so a `64` in a workflow log can
 mean *either* side refused. The workflows' 64 message says so.
@@ -101,6 +112,135 @@ mean *either* side refused. The workflows' 64 message says so.
 therefore should no longer occur — but every call site in both workflows still
 handles it, because a 127 today would mean the forced command has been *removed*,
 which is a security event rather than an unfinished install.
+
+---
+
+## The `migrate` verb
+
+**STATUS: PROPOSED. It is not on the box.** Until a human installs it,
+`rd-deploy migrate` comes back **64** and both `deploy.yml` files must run with
+`MIGRATION_APPLY_MODE=manual`. Everything in this section describes what
+[`rd-deploy-migrate.proposed.sh`](./rd-deploy-migrate.proposed.sh) does; that
+file is the authority on its own behaviour, this is the contract the pipeline is
+written against.
+
+### Why it exists
+
+`README.md` gated migrations out of the pipeline with one sentence: *"The
+production database has no PITR, so an auto-applied migration is an
+unrecoverable event a health check cannot see."*
+
+That is a statement about the **restore path**, not about migrations. This verb
+creates the missing restore path — a verified `pg_dump` taken before anything is
+applied, with a refusal to apply if the dump did not work — and nothing else.
+**If the dump half is ever weakened, put the gate back.** The gate was the honest
+admission that there was no way back; it was never the safety itself.
+
+### Shape
+
+It takes **no arguments**. Not a service, not a path, not a flag. Every image,
+directory and limit is a constant compiled into the script, so there is no
+injection surface at all. `migrate <anything>` is 64, from both `rd-entry` and
+the wrapper.
+
+It is **not per-service**, and that is why it sits with `status` / `revision` /
+`check-migrations` rather than with `update` / `deploy` / `rollback`: there is
+one database behind all three services, so a service argument would be a lie the
+grammar accepted.
+
+The proposed wrapper edit is **one arm**, and deliberately no more than that:
+
+```sh
+migrate)
+  [ $# -eq 1 ] || exit 64          # takes no service, no arguments
+  exec /usr/local/sbin/rd-migrate
+  ;;
+```
+
+The logic lives in `/usr/local/sbin/rd-migrate` — a separate root-owned program
+whose source **is in this repository** and can therefore be diffed, blamed and
+re-reviewed. `rd-deploy` itself still is not, and still must not be.
+
+### What a run does, in order
+
+1. Refuse any argument; refuse a non-root caller; take a **non-blocking** flock.
+   Two concurrent migration runs against one database is the worst thing in this
+   verb's blast radius.
+2. Pre-flight: the clone's `migrations/` exists; `.env.migrate` exists and is
+   `root:root 600`; `MIGRATION_DATABASE_URL` parses as a postgres URL; both
+   images are present **locally** (it never pulls — a release step must not
+   depend on a registry, and an image fetched mid-incident is an unvetted
+   image); the backend image's `WorkingDir` really is `/app`; there is disk.
+3. `migrate:dry` **in the deployed image with the clone's `migrations/`
+   bind-mounted read-only**. That bind mount is load-bearing: `migrations/` is
+   baked into the image, so without it the deployed image compares the *old*
+   file set and reports clean. Nothing pending → exit 0, **no dump taken**.
+4. **`pg_dump`, then verify it**: non-empty, above a floor, `pg_restore --list`
+   parses it, and the TOC contains a known table (a dump of the *wrong*
+   database passes every other check). Any failure → **66, nothing applied**.
+5. Apply. Then re-run the dry run and require it to say clean.
+6. Retention: keep the newest 10 dumps, sorted **by name** — the names are
+   ISO-8601 UTC stamps, so lexical order is chronological order and cannot be
+   disturbed by a `touch`, a copy or a backup agent the way an mtime can.
+
+### On failure it does NOT restore, by default
+
+This is the one place the proposal deviates from "restore on failure", and it is
+deliberate:
+
+* `scripts/migrate.ts` runs **each file in its own transaction** and rolls that
+  transaction back on error. A failed run is already in a *known* state: the
+  files before the failure are applied, the failing one is not, the rest never
+  ran. Nothing is half-written.
+* The dump was taken **while the restaurant was trading**. Restoring it discards
+  every order, payment, KOT and clock-in committed since. Undoing a DDL statement
+  that already rolled itself back by deleting an evening of real revenue turns a
+  recoverable event into an unrecoverable one — which is the exact sentence the
+  original gate existed to prevent.
+
+So the default is **halt (67)** and hand a human the dump plus the exact
+`pg_restore` command. A complete restore routine is nonetheless in the script,
+because the worst time to write one is during the incident; it runs only if the
+root-owned flag file `/opt/restaurant-dash/.rd-migrate-autorestore` exists.
+`install.sh` reports loudly when it does.
+
+**If the restore is attempted and also fails → 68.** Decided in advance, because
+this is the case that becomes an incident: do not retry, do not fall back, do not
+delete the dump. The restore uses `--single-transaction` (which implies
+`--exit-on-error`), so it is all-or-nothing and the *likely* truth is that
+nothing was restored — but likely is not certain, so the schema is reported as
+**indeterminate** until a human has read it, and no deploy follows.
+
+### Exit codes
+
+| Code | Meaning | Database state |
+|---|---|---|
+| `0` | applied and verified clean, **or** nothing was pending | changed as intended, or untouched |
+| `64` | an argument was passed, the caller is not root — **or the verb is not installed on this box** | untouched |
+| `66` | refused during pre-flight. Includes **the `pg_dump` failed** and **the dump did not verify**, which is the whole point of the verb | **untouched** |
+| `67` | the migration failed. **Not restored** (the default) | files before the failure applied; the failing file rolled itself back |
+| `68` | the migration failed **and the restore also failed** | **indeterminate.** Stop. Page a human |
+| `75` | another `rd-migrate` holds the lock; this call did not queue | untouched by this call |
+| `77` | apply reported success, the re-check still says pending | unknown — the runner and the database disagree |
+
+`64` is the one that will actually happen, because it is what an
+**uninstalled** verb returns. `deploy.yml` gives it its own branch that says *the
+box is behind this repo* and names the one-click way back to the manual route —
+never "bug in this workflow file". That is the same misdiagnosis class as
+rendering a missing forced command (127) as PENDING MIGRATION, and it is pinned
+by `tests/test_migrate_contract.sh`.
+
+### What it does not protect against
+
+Stated in full at the top of `rd-deploy-migrate.proposed.sh`; the short list:
+in-flight writes are outside the dump; a migration that succeeds and is
+semantically wrong passes every check here; roles and grants are `pg_dumpall`
+territory and are not covered; the free-space floor is a constant that does not
+learn as the database grows; and **no dump from this box has ever been
+restore-tested**. Do that once, deliberately, into a scratch database, before
+trusting any of it.
+
+---
 
 ## Exit codes
 
@@ -180,6 +320,13 @@ These absences drive the design of `deploy.yml`; do not paper over them.
 sudo /usr/local/sbin/rd-deploy nonsense ; echo "expect 64, got $?"
 sudo /usr/local/sbin/rd-deploy update   ; echo "expect 64 (bare update), got $?"
 sudo /usr/local/sbin/rd-deploy update valkey ; echo "expect 64, got $?"
+
+# The migrate verb. `migrate backend` is REFUSED by the grammar before it reaches
+# anything, so this probe is safe. DO NOT probe with a bare `migrate` — that one
+# applies schema changes to the live database.
+sudo /usr/local/sbin/rd-deploy migrate backend ; echo "expect 64, got $?"
+ls -l /usr/local/sbin/rd-migrate   # absent = the verb is not installed; use MIGRATION_APPLY_MODE=manual
+
 sudo /usr/local/sbin/rd-deploy status | head
 sudo /usr/local/sbin/rd-deploy revision
 stat -c '%U:%G %a' /usr/local/sbin/rd-deploy   # expect: root:root 755
@@ -201,6 +348,14 @@ unproven. Run it after any change to either side:
 ```sh
 bash deploy/vps/tests/test_status_parser.sh
 ```
+
+`deploy/vps/tests/test_migrate_contract.sh` does the same job for the `migrate`
+verb: it pins the two sentences `scripts/migrate.ts` prints (which is how
+`rd-migrate` tells "pending" from "clean", since that script exits 0 either way),
+the pending-file parser, dump retention, `rd-entry`'s acceptance of `migrate`
+with no service argument, and `deploy.yml`'s routing of every `rd-migrate` exit
+code — including that a 64 is diagnosed as *the box is behind this repo* rather
+than as a workflow bug. `ci.yml` runs both on every push and pull request.
 
 If any of that has changed, **stop and fix `deploy.yml` to match the box** —
 never the other way round. The box is authoritative.

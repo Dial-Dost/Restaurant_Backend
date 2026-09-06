@@ -45,11 +45,16 @@ Two guards, so this cannot be discovered by a customer:
    feature works fine without 028, and refusing to boot would take a fleet down
    to protect one button.
 
-### Why this is a manual step
+### Why this is a separate step at all
 
 `Dockerfile.node`'s `CMD` is `node build/index.js`, **not** `npm run start:prod`
-(the only script that chains `npm run migrate`). The container deploy path
-therefore never applies migrations. Use one of:
+(the only script that chains `npm run migrate`). **The container deploy path
+therefore never applies migrations**, and it should not: a migration run per
+replica, racing itself on start-up, is a worse failure than a missing column.
+
+So it is a release step. Whether a *human* performs it or `rd-deploy migrate`
+does is the `MIGRATION_APPLY_MODE` question below — either way it happens once,
+against the owner role, before the new image serves traffic. Use one of:
 
 ```bash
 # release / pre-deploy step, once per deploy, as the OWNER role
@@ -122,27 +127,46 @@ the drop lose their dedup — do it between services, not during one.
 Since the CI/CD pipeline landed, "apply migrations manually" is no longer a
 convention you have to remember — it is a gate that stops the deploy.
 
-`.github/workflows/deploy.yml` and the VPS wrapper `/usr/local/sbin/rd-deploy`
-between them will **never** apply a migration. They detect pending ones and
-refuse. (The wrapper is **not** in this repository and deliberately is not
+**Nothing in CI ever applies a migration.** `.github/workflows/deploy.yml` holds
+no database credential and never will: putting one on a GitHub runner would move
+the most dangerous credential in this system to the least defensible place. The
+gates *detect*; the box *applies*, or a human does. (The VPS wrapper
+`/usr/local/sbin/rd-deploy` is **not** in this repository and deliberately is not
 shipped from it — it is root-owned on the box and installing it from a git
-checkout would overwrite a vetted security boundary. The grammar this pipeline
-is written against is recorded in `deploy/vps/WRAPPER_CONTRACT.md`.)
+checkout would overwrite a vetted security boundary. The grammar this pipeline is
+written against is recorded in `deploy/vps/WRAPPER_CONTRACT.md`.)
 
-* **Gate A**, in CI, after the images are built: does this push add or change
-  anything under `migrations/`? If so the deploy is refused and the job summary
-  names the files and prints the exact `docker run ... npm run migrate` command,
-  using the digest of the image just built. Gate A needs two commits to diff, so
-  it evaluates on **push runs only** and skips on `workflow_dispatch` — which is
-  also how you re-run a deploy after applying a migration by hand. Until the
-  push trigger is enabled (`deploy.yml` ships dispatch-only in its first commit,
-  see the `on:` block there), Gate A always skips and Gate B is the only gate.
+* **Gate A**, in CI, before an SSH connection is opened: does this push add or
+  change anything under `migrations/`? It is a `git diff` and nothing more. Gate
+  A needs two commits to diff, so it evaluates on **push runs only** and skips on
+  `workflow_dispatch` — which is also how you re-run a deploy after applying a
+  migration by hand.
 * **Gate B**, on the VPS inside `rd-deploy`, before any container is swapped:
   `npm run migrate:dry` executed **inside the new image**, against
   `/opt/restaurant-dash/.env.migrate` (root-only, never in GitHub). Pending
   migrations abort the deploy with exit 65, having changed nothing. This one is
   authoritative — it catches a migration added in an earlier push that nobody
   applied, which Gate A cannot see.
+
+### What happens after a gate fires: `MIGRATION_APPLY_MODE`
+
+* **`manual`** — the deploy stops and the job summary prints the exact
+  `docker run ... npm run migrate` command to run as root on the VPS. **This is
+  the mode to use today**, because the `migrate` verb below is not installed yet.
+* **`auto`** (the default when the repository variable is unset) — the deploy
+  calls `rd-deploy migrate` on the box, which takes and **verifies a `pg_dump`
+  before applying anything** and refuses to apply if that dump failed, then
+  retries the update once.
+
+The full behaviour, the exit codes and the honest list of what the dump does not
+protect against are in `deploy/vps/WRAPPER_CONTRACT.md`, *The `migrate` verb*,
+and in the header of `deploy/vps/rd-deploy-migrate.proposed.sh`. The one-time
+install is `deploy/vps/README.md`, *Installing the `migrate` verb*.
+
+Note what does **not** change in `auto` mode: the ordering constraints this
+document exists for. `rd-deploy migrate` runs during the deploy, *before* the new
+image serves traffic, which is exactly the window the two migrations above
+require. It does not let a migration land after its code.
 
 Two details that matter and are easy to get wrong:
 

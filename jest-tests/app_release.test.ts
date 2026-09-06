@@ -42,16 +42,69 @@ describe("app release manifest", () => {
 		expect(APP_RELEASE.latest).not.toBe("1.0.0");
 	});
 
-	test("every non-empty download URL is absolute https", () => {
+	test("every non-empty download URL is absolute https and names a real file", () => {
 		// update_checker.dart refuses anything not starting with http, and a
 		// relative path here would silently disable in-app install.
+		//
+		// The old form of this test also required the URL to contain
+		// "/downloads/", which was a proxy for "points at a file, not a bare
+		// origin" back when the artifacts were committed to the dashboard's
+		// public/downloads/. They are GitHub release assets now, so that literal
+		// no longer appears — the check below tests the actual property that
+		// mattered (a real filename with the platform's extension) rather than
+		// the path that used to imply it.
+		//
 		// Collected rather than asserted per-iteration so a failure names WHICH
 		// platform is wrong; jest's expect takes no message argument.
+		const EXPECTED_EXT: Record<string, string> = {
+			windows: ".zip",
+			android: ".apk",
+			ios: ".ipa",
+		};
 		const bad = Object.entries(APP_RELEASE.downloads)
 			.filter(([, url]) => url !== "") // a platform with no build is legitimate
-			.filter(([, url]) => !/^https:\/\//.test(url) || !url.includes("/downloads/"))
+			.filter(([platform, url]) => {
+				if (!/^https:\/\//.test(url)) { return true; }
+				const path = new URL(url).pathname;
+				// A filename, not a directory or a bare origin.
+				const file = path.slice(path.lastIndexOf("/") + 1);
+				return file === "" || !file.endsWith(EXPECTED_EXT[platform] ?? "");
+			})
 			.map(([platform, url]) => `${platform}: ${url}`);
 		expect(bad).toEqual([]);
+	});
+
+	test("a release-asset URL is pinned to the version being advertised", () => {
+		// THE DESYNC THIS PREVENTS. `latest` and the download URLs are two
+		// statements of the same fact. Once the URLs carry the tag in the path,
+		// bumping one without the other makes the dialog offer "1.8.5" while
+		// handing the client the 1.8.4 artifact — which installs happily, reports
+		// itself as out of date, and offers the same update again on every launch,
+		// forever. Nothing errors; the fleet just stops moving.
+		//
+		// SCOPED TO RELEASE-ASSET URLS ON PURPOSE. The manifest still points at the
+		// dashboard-hosted files, which carry no version in the path because they
+		// are overwritten in place each release. Asserting the pin unconditionally
+		// would fail on the URLs that are actually live and correct — so this
+		// checks the rule for the form it applies to, and the test below keeps the
+		// two forms from being mixed.
+		const pinned = Object.entries(APP_RELEASE.downloads)
+			.filter(([, url]) => url !== "" && url.includes("/releases/download/"))
+			.filter(([, url]) => !url.includes(`/v${APP_RELEASE.latest}/`))
+			.map(([platform, url]) => `${platform}: ${url}`);
+		expect(pinned).toEqual([]);
+	});
+
+	test("every platform is served from ONE host, not a mix", () => {
+		// Half-migrating (windows on release assets, android still on the
+		// dashboard) is the state that looks fine in review and leaves one
+		// platform 404ing. Whichever host is chosen, both must use it.
+		const hosts = new Set(
+			Object.values(APP_RELEASE.downloads)
+				.filter((u) => u !== "")
+				.map((u) => new URL(u).host),
+		);
+		expect([...hosts]).toHaveLength(1);
 	});
 
 	test("windows and android both have a build", () => {

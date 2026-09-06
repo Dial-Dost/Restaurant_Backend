@@ -301,15 +301,20 @@ with `revision ... UNCHANGED` spelled out in the summary.
    integration tests, container smoke test. Node 22. A red CI makes the deploy
    job **unreachable**.
 2. **migration_gate (Gate A)** — a `git diff` over `migrations/`. Zero
-   credentials, no network call. If this push adds SQL the run stops here and the
-   box is never contacted.
+   credentials, no network call. It also validates `MIGRATION_MODE` here, where
+   nothing is at stake. If this push adds SQL: in `manual` mode the run stops
+   here and the box is never contacted; in `auto` mode it names the files in the
+   summary and passes, and the apply happens on the box.
 3. **deploy** (`environment: production`, and `if: github.ref ==
    'refs/heads/main'` so the branch restriction is visible in the file and not
    only in Settings) — `revision` (baseline) → `status` (**the baseline snapshot
    the recreation proof compares against; a failure to read it refuses the deploy
-   outright, while the box is still untouched**) → `check-migrations` →
-   `update python` → `update backend` → `revision` (proof) → `status` (compared
-   against the baseline) → health poll → public probe of
+   outright, while the box is still untouched**) → `check-migrations`
+   (→ `migrate` → `check-migrations`, in `auto` mode, if anything is pending from
+   an earlier release) → `update python` → `update backend` (either of which, on
+   a 65 in `auto` mode, triggers `migrate` and **one** retry) → `revision`
+   (proof) → `status` (compared against the baseline) → health poll → public
+   probe of
    `https://api.dialdost.com/health`. On failure: the logs of **whichever service
    is actually unhealthy**, then `rollback backend`, `rollback python`.
 
@@ -353,7 +358,9 @@ this commit, which a force-push or squash breaks.
 | When it fires | before the box is contacted at all | **after the working tree has already been reset** |
 
 Gate A exists to fail before an SSH connection is opened. The server gate is the
-true one. **Neither ever applies a migration.**
+true one. **Neither ever applies a migration**, and neither ever will — Gate A
+holds no database credential by design, and giving it one would move the most
+dangerous credential in this system onto a GitHub runner.
 
 A `workflow_dispatch` run skips Gate A deliberately — that is how you re-run a
 deploy after applying a migration by hand.
@@ -361,6 +368,46 @@ deploy after applying a migration by hand.
 The workflows also run `check-migrations` *before* `update`. That catches a
 migration left unapplied by an **earlier** release, while the tree is still
 untouched, which is a strictly better place to stop.
+
+### What the gates DO with the answer: `MIGRATION_MODE`
+
+Detecting is not the same as refusing, and since the `migrate` verb exists the
+two are separate. Resolution order, most specific first:
+
+1. the `workflow_dispatch` input `migrations`, unless it is the literal `default`
+2. the repository variable `MIGRATION_APPLY_MODE`
+3. `auto`
+
+| | `manual` | `auto` (the default) |
+|---|---|---|
+| Gate A, migration in the push | refuses, prints the by-hand recipe | `::notice::`, names the files in the summary, passes |
+| pre-flight `check-migrations` non-zero | refuses | `rd-deploy migrate`, then re-asks `check-migrations` |
+| `update` returns 65 | refuses (this is today's behaviour) | `rd-deploy migrate`, then retries the update **once** |
+
+A push cannot carry an input, so a push resolves to (2) then (3). **The
+repository variable is the kill switch**: visible in Settings, effective on the
+next run, no commit needed. The dispatch input overrides it for one run.
+
+An unrecognised value is a **hard failure in both jobs**, never a silent
+fallback. A typo in a repository variable must not quietly decide whether
+production migrates itself. Both jobs check, because Gate A is skipped on a
+dispatch and on a force-push, and the deploy job is the one holding the key.
+
+**Why the default is `auto`.** A default of `manual` would leave the automated
+path installed and never taken: every migration-carrying push would still stop,
+this runbook would still say "ssh in as root", and the only thing that changed
+would be that there is now a second way to do it that nobody uses. The safety of
+this step never came from the gate — it came from there being no way back, and
+the gate was the honest admission of that. `rd-deploy migrate` takes and verifies
+a dump before it applies anything and refuses to apply if that fails, so a way
+back now exists. Its limits are real and are listed in
+`rd-deploy-migrate.proposed.sh`; read them before deciding this default is wrong,
+and if you decide it is, set the variable rather than editing a workflow.
+
+**Until the verb is installed, `auto` fails safe.** The box answers `migrate`
+with 64, and the workflow reports *the box is behind this repo* — naming both the
+one-time install and the `MIGRATION_APPLY_MODE=manual` escape hatch. Nothing is
+applied and nothing is deployed.
 
 ---
 
@@ -396,6 +443,7 @@ a wrong value, not its disclosure.
 | `DEPLOY_USER` | `deploy` | the restricted identity |
 | `DEPLOY_PORT` | `22` | may be omitted; defaults to 22 |
 | `SSH_KNOWN_HOSTS` | output of `ssh-keyscan` | the workflow **refuses to run** without it. Never `StrictHostKeyChecking=no` — that would let anyone on the runner's network path present their own host key and collect the deploy key |
+| `MIGRATION_APPLY_MODE` | `auto` \| `manual` \| unset | **set this to `manual` in both repos until `/usr/local/sbin/rd-migrate` is installed.** Unset means `auto`. Any other value is a hard failure in both jobs — a typo must not decide whether production migrates itself. See *What the gates DO with the answer* |
 
 ### Optional per-repo overrides
 
@@ -498,6 +546,15 @@ visible change, and so the failure output can name what should be true.
    `app_runtime` (which intentionally lacks DDL privileges). `check-migrations`
    reads it; nothing in CI ever sees it.
 
+The one thing in this section that is **not** done:
+
+6. **`/usr/local/sbin/rd-migrate` is NOT installed**, so `rd-deploy migrate` is
+   not a verb the box knows and comes back 64. Both repos must therefore be set
+   to `MIGRATION_APPLY_MODE=manual`. See *Installing the `migrate` verb*. The
+   repo side of that change — `rd-entry`'s acceptance of the verb, the
+   workflow's `auto` path, the guard test — is already in place and is inert
+   until the box catches up.
+
 To re-verify, on the VPS:
 
 ```sh
@@ -556,8 +613,24 @@ idempotent.
 
 ## Applying a migration
 
-The pipeline will **never** do this. The production database has no PITR, so an
-auto-applied migration is an unrecoverable event a health check cannot see.
+**Which of the two sections below applies to you depends on one thing: whether
+`/usr/local/sbin/rd-migrate` exists on the box.**
+
+```sh
+ls -l /usr/local/sbin/rd-migrate    # absent -> by hand, below. present -> the pipeline does it.
+```
+
+It does **not** exist today. Until it does, the by-hand procedure below is the
+only route and **both repos must be set to `MIGRATION_APPLY_MODE=manual`** —
+otherwise every migration-carrying deploy stops with exit 64 ("the box does not
+have the migrate verb"), having changed nothing.
+
+### While the verb is NOT installed — by hand
+
+The production database has no PITR, so an auto-applied migration would be an
+unrecoverable event a health check cannot see. **That is a statement about the
+restore path, not about migrations**, and it is what
+[*Installing the `migrate` verb*](#installing-the-migrate-verb) below is for.
 
 The awkward part of the git transport is that the SQL has to reach the box before
 it can be applied, and the only thing allowed to fetch is `update` — which
@@ -604,6 +677,136 @@ become the very build you are trying to be able to escape from.
 
 Then re-run the deploy workflow from the **Actions tab**. A `workflow_dispatch`
 run skips Gate A; the server gate still runs, and now passes.
+
+### Once the verb IS installed — the pipeline does it
+
+Nothing. Push. The deploy job reaches `update`, is refused with 65, calls
+`rd-deploy migrate`, and retries the update once. The job summary names the
+migrations that were applied and the dump that was taken first.
+
+To take the by-hand route for one release anyway — a migration nobody trusts,
+or one you want to watch — dispatch from the Actions tab with
+**migrations = manual**. To turn it off for everyone, set the repository
+variable `MIGRATION_APPLY_MODE=manual`. Neither needs a commit.
+
+---
+
+## Installing the `migrate` verb
+
+**One-time, as root on the VPS. This is the step that closes the last manual gap
+in the release pipeline, and it is deliberately a human decision** — it grants a
+root-owned program the ability to write schema changes to a live database
+holding real restaurant money.
+
+### Before you start: read the thing you are installing
+
+[`rd-deploy-migrate.proposed.sh`](./rd-deploy-migrate.proposed.sh) is written to
+be read in one sitting. Read the header. In particular read *WHAT THIS DOES NOT
+PROTECT AGAINST* and the paragraph about why it does **not** restore on failure
+by default — if you disagree with that call, this is the moment to say so, not
+after it is installed. [`WRAPPER_CONTRACT.md`](./WRAPPER_CONTRACT.md), *The
+`migrate` verb*, is the summary.
+
+**Do the restore test first.** No dump from this box has ever been restored. A
+seatbelt nobody has pulled is not a seatbelt:
+
+```sh
+# On the VPS, as root, into a SCRATCH database — never the live one.
+# Take a dump exactly the way rd-migrate will, restore it somewhere else, and
+# confirm the row counts you expect. If this does not work, nothing below matters.
+```
+
+### The install
+
+```sh
+# 1. Get the reviewed script onto the box. It is in the repo clone already —
+#    that clone is what the pipeline deploys from, so it is the same bytes CI saw.
+cd /opt/restaurant-dash/Restaurant_Backend
+git log -1 --format='%H %s' -- deploy/vps/rd-deploy-migrate.proposed.sh   # know what you are installing
+
+install -o root -g root -m 0755 \
+    deploy/vps/rd-deploy-migrate.proposed.sh \
+    /usr/local/sbin/rd-migrate
+
+# 2. Pre-pull the client image. rd-migrate NEVER pulls: a release step must not
+#    depend on a registry being up, and an image fetched mid-incident is an
+#    unvetted image. It refuses with 66 if this is missing.
+#    The tag must be >= the server's major version or pg_dump aborts.
+docker pull "$(sed -n 's/^PGTOOLS_IMAGE=//p' deploy/vps/rd-deploy-migrate.proposed.sh | head -n1)"
+
+# 3. Add the ONE arm to the wrapper. This is the only edit to a vetted security
+#    boundary in this whole change — keep it to these three lines. Back it up
+#    first; there is no copy of rd-deploy anywhere else.
+cp -a /usr/local/sbin/rd-deploy /root/rd-deploy.bak.$(date -u +%Y%m%dT%H%M%SZ)
+vi /usr/local/sbin/rd-deploy
+```
+
+The arm, next to the other no-service verbs (`status`, `revision`,
+`check-migrations`):
+
+```sh
+migrate)
+  [ $# -eq 1 ] || exit 64          # takes no service, no arguments
+  exec /usr/local/sbin/rd-migrate
+  ;;
+```
+
+Then re-install the forced command so `rd-entry` accepts the new verb, and let
+the installer check the whole thing:
+
+```sh
+scp -r deploy/vps root@<host>:/tmp/rd-vps
+ssh root@<host> 'bash /tmp/rd-vps/install.sh /tmp/rd-vps/ci-deploy.pub'
+```
+
+`install.sh` treats an absent `rd-migrate` as a **supported state, not a
+failure**, and reports what it finds either way: the file's mode, that
+`migrate backend` is refused with 64, that the pg client image is present, that
+the dump directory is `root:root 700`, how much disk is free, and — loudly —
+whether the opt-in automatic restore has been switched on.
+
+### Verifying it is live
+
+```sh
+# SAFE probes. Neither of these applies anything.
+sudo /usr/local/sbin/rd-deploy migrate backend ; echo "expect 64, got $?"
+stat -c '%U:%G %a' /usr/local/sbin/rd-migrate  ; # expect root:root 755
+
+# From a workstation, with the CI key — proves the pipeline can reach it.
+ssh -i ci-deploy deploy@<host> 'migrate backend'   # expect 64 from rd-entry
+```
+
+**Do not "test" it with a bare `sudo rd-deploy migrate`.** With nothing pending
+it is a harmless no-op that exits 0 without taking a dump — but with something
+pending it applies it, which is not a test. The real first exercise is a release
+that carries one migration you have read, deployed outside service hours, with
+the job summary open.
+
+Then turn the pipeline on: set `MIGRATION_APPLY_MODE=auto` in both repos, or
+delete the variable (`auto` is the default when it is unset).
+
+### Rolling it back
+
+Removing the verb is two commands and takes effect immediately. Nothing that has
+already been applied is undone by this — it stops future automatic applies.
+
+```sh
+# 1. Stop the pipeline sending it. Do this FIRST: a deploy in flight will
+#    otherwise reach a verb that is about to disappear.
+#    In BOTH repos: Settings > Secrets and variables > Actions > Variables
+#      MIGRATION_APPLY_MODE = manual
+
+# 2. Remove the arm from the wrapper (restore the backup taken above), and:
+rm -f /usr/local/sbin/rd-migrate
+```
+
+The pipeline degrades exactly to today's behaviour: Gate A refuses a
+migration-carrying push in manual mode, the server gate refuses with 65, and the
+by-hand recipe above is printed in the job summary.
+
+**Keep `/var/backups/restaurant-dash/premigration`.** Those dumps are the only
+rollback points for the migrations that were applied while the verb was live, and
+deleting them is the one part of this rollback that is not reversible.
 
 ---
 
@@ -669,8 +872,13 @@ If the site is still down after a rollback, stop automating. Check the ingress
 |---|---|---|---|
 | `0` | — | deployed, proven, healthy, publicly reachable | nothing |
 | `1` | workflow | ssh transport failure (ssh's own 255, remapped) | if it happened during `update`, **the build kept running on the box**: check `revision` and `status` before re-running |
-| `64` | wrapper / `rd-entry` | bad arguments | a **pipeline bug** — the workflow sent a sentence the grammar does not accept. Nothing on the box changed; re-running will not help |
-| `65` | wrapper | pending migration, nothing built | apply it (above). **The working tree has already moved** if the 65 came from `update` |
+| `64` | wrapper / `rd-entry` | bad arguments | a **pipeline bug** — the workflow sent a sentence the grammar does not accept. Nothing on the box changed; re-running will not help. **One exception:** if the sentence was `migrate`, it is not a bug — the verb is not installed on the box yet. Install it, or set `MIGRATION_APPLY_MODE=manual`. The job summary says which case it is |
+| `65` | wrapper | pending migration, nothing built | apply it (above). **The working tree has already moved** if the 65 came from `update`. In `auto` mode you only see this if `migrate` was already used once this run, or the retry was refused again |
+| `66` | `rd-migrate` | the migration was refused **before the database was touched** — most often the `pg_dump` failed or did not verify, which is the feature working | **the database is unchanged.** Fix what the summary names (a Postgres server upgraded past the pinned client image, or a full `/var`) and re-run |
+| `67` | `rd-migrate` | the migration failed and was **not** restored — the default | the failing file rolled itself back; files earlier in the run **are** applied. Production is still on the OLD code against that schema — check that first. Dump and restore command are on the box. Do not re-run |
+| `68` | `rd-migrate` | the migration failed **and the restore also failed** | schema **indeterminate**. Stop. Do not re-run, do not deploy, do not delete the dump. Page a human |
+| `75` | `rd-migrate` | another migration run holds the lock | wait for it, confirm with `check-migrations`, re-run |
+| `77` | `rd-migrate` | apply reported success, the re-check still says pending | the runner and the database disagree. Read the rd-migrate log on the box before shipping code against this schema |
 | `69` | dashboard workflow | the backend was already unhealthy | fix or roll back the backend first; nothing was deployed |
 | `70` | workflow | unhealthy, **image rolled back**. Reached by a service that went unhealthy *and* by one whose post-update `status` line was `Restarting`/`Exited`/`Created` — a recognised not-running state is a health failure, not a failure to measure | production is on the previous build. **Revert the commit on `main`** — do not re-run |
 | `71` | workflow | either the `rollback` **call** failed, or it succeeded and the service **still** did not come back. The summary and the error message say which | page a human; do not re-run. If the call succeeded and production is still down, the fault is probably not in these images |
@@ -721,7 +929,18 @@ rather than race, and you would want `75` in the table above.
 
 ## What is deliberately not automated
 
-* **Applying migrations.** No PITR; see above.
+* **Installing the `migrate` verb.** The verb itself automates applying
+  migrations (see *Installing the `migrate` verb*), but putting it on the box is
+  a human decision made once, with the script read: it is root-owned, it writes
+  schema changes to a live database, and `install.sh` verifies it and refuses to
+  create it — the same rule that already covers `rd-deploy` and the sudoers file.
+  **Until it is installed, applying migrations is manual and both repos must be
+  set to `MIGRATION_APPLY_MODE=manual`.**
+* **Restoring after a failed migration.** `rd-migrate` takes the dump and refuses
+  to migrate without one; it does **not** restore from it by default. A failed
+  migration rolled its own transaction back, while restoring discards every order
+  taken since the dump — see *On failure it does NOT restore, by default* in
+  `WRAPPER_CONTRACT.md`. A human decides.
 * **Refreshing `public/downloads`.** Shipping a 94 MB APK to every restaurant is a
   release decision, not a side effect of a code push. It stays a deliberate `scp`
   and a read-only bind mount.
@@ -743,11 +962,13 @@ rather than race, and you would want `75` in the table above.
 
 ```sh
 bash deploy/vps/tests/test_status_parser.sh
+bash deploy/vps/tests/test_deploy_routing.sh
+bash deploy/vps/tests/test_migrate_contract.sh
 ```
 
-**`ci.yml` runs it on every push and every pull request**, as the first step of
-the `backend` job — before the toolchain is installed, because it needs nothing
-but bash. A guard nobody runs is not a guard.
+**`ci.yml` runs all three on every push and every pull request**, as the first
+steps of the `backend` job — before the toolchain is installed, because they need
+nothing but bash. A guard nobody runs is not a guard.
 
 The wrapper is not in this repository, so the exact text of `rd-deploy status`,
 `rd-deploy revision` and `rd-deploy rollback` is an **undeclared dependency** of
@@ -773,6 +994,19 @@ What it pins, beyond "the format has not changed":
 Every one of those was found by reading, not by a failing test. **Do not loosen
 this script**; re-capture the fixtures instead.
 
+`test_migrate_contract.sh` covers the third undeclared dependency — the one that
+writes to the production database. `rd-migrate` cannot read an exit code to tell
+"pending" from "clean", because `scripts/migrate.ts` returns 0 either way, so it
+keys on two **sentences** that file prints. The test extracts those constants
+from the proposed wrapper and asserts they still appear in `migrate.ts`; it also
+pins the pending-file parser, dump retention (against the one retention bug that
+costs anything — deleting the newest dump instead of the oldest), `rd-entry`'s
+acceptance of `migrate` with no service argument, and `deploy.yml`'s routing of
+every `rd-migrate` exit code. The routing assertion that matters most is **64**:
+it must be diagnosed as *the box is behind this repo*, never as a workflow bug —
+the same misdiagnosis class that once rendered a missing forced command (127) as
+PENDING MIGRATION.
+
 ---
 
 ## Known gaps, honestly
@@ -797,6 +1031,17 @@ this script**; re-capture the fixtures instead.
 4. **The apply-a-migration command above has not been run on this box.** Its two
    assumptions (WORKDIR `/app`, `migrations/` read relative to it) are checkable
    in one command; do that the first time rather than in an incident.
+
+   `rd-migrate` turns the first of those into a **checked precondition** — it
+   refuses with 66 if the image's `WorkingDir` is not `/app` — but it inherits
+   the second assumption unchanged, and it inherits the whole recipe unexercised.
+
+   **And a bigger one it adds: no dump this design produces has ever been
+   restored.** `pg_restore --list` proves the archive header and table of
+   contents parse and that a known table is present; it does not read a single
+   data block. Until someone has restored one into a scratch database and checked
+   the row counts, the restore path this whole change is built on is an
+   assumption. Do that before installing the verb, not after.
 5. **The no-`:previous` detection still reads the wrapper's warning text**, and
    that is now the *only* remaining direction of error. It matches the sentence
    the wrapper actually prints (`no previous image for` / `code is NOT

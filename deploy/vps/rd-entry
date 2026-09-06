@@ -10,9 +10,30 @@
 # This is what collapses the blast radius of a leaked DEPLOY_SSH_KEY. Without it,
 # that key is shell access to a box holding live restaurant data. With it, the
 # key's ENTIRE vocabulary is: read status, read the deployed git revision, read
-# logs, ask whether migrations are pending, ask for an update (pull + rebuild),
-# ask for a deploy, ask for a rollback. It cannot get a shell, cannot forward a
-# port to Valkey or the database, and cannot cat an env file.
+# logs, ask whether migrations are pending, ask for the pending migrations to be
+# applied, ask for an update (pull + rebuild), ask for a deploy, ask for a
+# rollback. It cannot get a shell, cannot forward a port to Valkey or the
+# database, and cannot cat an env file.
+#
+# `migrate` IS THE ONE THING THIS KEY CAN DO THAT IT COULD NOT BEFORE, and it is
+# the only verb here that writes to the production database. What that costs, and
+# why it is still bounded, is worth being precise about:
+#
+#   * It applies ONLY the .sql files already sitting in the box's working tree.
+#     That tree is moved by exactly one thing — `update`, which resets to
+#     FETCH_HEAD of a real clone fetched with a read-only deploy key. So a leaked
+#     CI key cannot author SQL, cannot choose which SQL runs, and cannot point
+#     the run at another database. It can only ask for migrations a maintainer
+#     already merged to `main` to be applied sooner than someone intended.
+#   * It takes no argument, so there is nothing to smuggle.
+#   * It is idempotent: a second call finds nothing pending and exits 0 having
+#     taken no dump and made no change.
+#   * It dumps and verifies the dump before it applies anything, and refuses to
+#     apply if that fails.
+#
+# That is a real widening and it should be weighed rather than waved through. The
+# alternative it replaces is worse in practice: a human holding a root shell on
+# the box for every release that carries SQL. See rd-deploy-migrate.proposed.sh.
 #
 # The client's command arrives in $SSH_ORIGINAL_COMMAND and is UNTRUSTED input.
 # It is never eval'd, never passed to `sh -c`, and never word-split by the shell
@@ -106,7 +127,11 @@ svc="${args[1]:-}"
 # the wrapper anyway; rejecting it here keeps the wrapper from ever seeing it and
 # makes the refusal auditable in syslog.
 case "$verb" in
-  status|check-migrations|revision)
+  # `migrate` belongs here and NOT with update/deploy/rollback: it is not
+  # per-service. There is one database behind all three services, so a service
+  # argument would be a lie the grammar accepted. Rejecting it keeps the caller
+  # from ever believing it scoped anything.
+  status|check-migrations|revision|migrate)
     [ -z "$svc" ] || reject "refused ('$verb' takes no service argument)"
     ;;
   # Read-only. A bare `logs` (the whole stack) changes nothing and is left
