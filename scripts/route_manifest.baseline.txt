@@ -69,7 +69,7 @@ mw08 USE     *                                                      | <inline(re
 0047 POST    /qr/:slug/razorpay/verify                              | -                                              | c58759aa
 0048 GET     /core-roles                                            | validateAction("17ba6407-b703-4403-ab59-13235966053f") | cb89f800
 0049 GET     /                                                      | -                                              | 686b8742
-0050 GET     /app/version                                           | -                                              | d6fa6385
+0050 GET     /app/version                                           | -                                              | 9b32c64f
 0051 GET     /health                                                | -                                              | e5c9ab83
 0052 GET     /metrics                                               | -                                              | d1569962
 0053 POST    /auth/register-restaurant                              | rateLimit("register", 5, 60000) -> validateBody(registerRestaurantSchema) -> validate | 19b740d4

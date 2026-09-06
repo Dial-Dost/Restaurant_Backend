@@ -3,6 +3,7 @@
  * public reception/realtime concierge surface.
  */
 import type { Express, Request, Response } from "express";
+import { resolveAppRelease } from "../app_release.js";
 import { AddBooking, AddNotification, AllocateBestTable, CheckDatabaseHealth, GetAvailableTablesForInterval, GetRestaurantSettings, getRestaurantIdFromUsername, parseWallClockInZone, withTenant } from "../database_supabase.js";
 import { logger, metricsHandler } from "../observability.js";
 import { OPENAI_REALTIME_MODEL, checkAvailabilityForRequest, getRestaurantKnowledgeSnapshot } from "../realtime_reception_agent.js";
@@ -28,19 +29,14 @@ app.get("/", (_req: Request, res: Response) => {
 
 // Public app self-update manifest. Apps (Windows/Android/iOS) call this on
 // launch, compare to their built-in version, and prompt/download when newer.
-// Driven by env so you can roll a release without a code change.
+//
+// The shipped release lives in app_release.ts and travels with the deploy, so
+// releasing the app is a push rather than an SSH session — see that file for
+// why, and for the artifacts-before-manifest ordering. Every field is still
+// env-overridable, so an operator can pull a bad release or force an upgrade
+// without waiting for CI.
 app.get("/app/version", (_req: Request, res: Response) => {
-	res.json({
-		latest: process.env.APP_LATEST_VERSION ?? "1.0.0",
-		// Apps older than this should be forced to update (hard gate).
-		min_supported: process.env.APP_MIN_VERSION ?? "0.0.0",
-		notes: process.env.APP_UPDATE_NOTES ?? "",
-		downloads: {
-			windows: process.env.APP_DOWNLOAD_WINDOWS ?? "",
-			android: process.env.APP_DOWNLOAD_ANDROID ?? "",
-			ios: process.env.APP_DOWNLOAD_IOS ?? "",
-		},
-	});
+	res.json(resolveAppRelease());
 });
 
 app.get("/health", async (_req: Request, res: Response) => {
