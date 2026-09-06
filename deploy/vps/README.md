@@ -443,7 +443,7 @@ a wrong value, not its disclosure.
 | `DEPLOY_USER` | `deploy` | the restricted identity |
 | `DEPLOY_PORT` | `22` | may be omitted; defaults to 22 |
 | `SSH_KNOWN_HOSTS` | output of `ssh-keyscan` | the workflow **refuses to run** without it. Never `StrictHostKeyChecking=no` — that would let anyone on the runner's network path present their own host key and collect the deploy key |
-| `MIGRATION_APPLY_MODE` | `auto` \| `manual` \| unset | **set this to `manual` in both repos until `/usr/local/sbin/rd-migrate` is installed.** Unset means `auto`. Any other value is a hard failure in both jobs — a typo must not decide whether production migrates itself. See *What the gates DO with the answer* |
+| `MIGRATION_APPLY_MODE` | `auto` \| `manual` \| unset | **set this to `manual` in the BACKEND repo until `/usr/local/sbin/rd-migrate` is installed** (done — set 2026-09-06). Unset means `auto`. Only the backend workflow reads it: the dashboard runs `check-migrations` and refuses on a pending migration, but never calls `migrate`, so setting it there does nothing. Any other value is a hard failure in both jobs — a typo must not decide whether production migrates itself. See *What the gates DO with the answer* |
 
 ### Optional per-repo overrides
 
@@ -782,8 +782,9 @@ pending it applies it, which is not a test. The real first exercise is a release
 that carries one migration you have read, deployed outside service hours, with
 the job summary open.
 
-Then turn the pipeline on: set `MIGRATION_APPLY_MODE=auto` in both repos, or
-delete the variable (`auto` is the default when it is unset).
+Then turn the pipeline on: set `MIGRATION_APPLY_MODE=auto` in the backend repo,
+or delete the variable (`auto` is the default when it is unset). The dashboard
+repo has no such variable to change.
 
 ### Rolling it back
 
