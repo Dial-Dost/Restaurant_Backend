@@ -131,10 +131,17 @@ AUTORESTORE_FLAG="$APP_DIR/.rd-migrate-autorestore"
 # a dump rather than filling the disk, and a full /var takes the box down.
 KEEP=10
 
-# A dump smaller than this is not a dump of THIS database. Sized well under the
-# real figure so growth never trips it; it is a floor against a truncated or
-# empty file, not a size assertion.
-MIN_DUMP_BYTES=$((1024 * 1024))
+# A dump smaller than this is not a dump of THIS database. It is a floor against
+# a truncated or empty file, NOT a size assertion.
+#
+# 1 MiB was the first guess and it was WRONG: the production database compresses
+# to ~928 KB, so the very first real run refused a perfectly good dump with
+# exit 66 and applied nothing. That failure was safe but it was noise, and the
+# fix is not to trust the number more — it is to keep this crude check well
+# clear of reality and let the REAL verification below do the work.
+# `pg_restore --list` is what actually proves the archive is readable; this only
+# catches the zero-byte and obviously-truncated cases before we get there.
+MIN_DUMP_BYTES=$((256 * 1024))
 
 # Refuse to start a dump without this much free space. See the "disk next year"
 # caveat in the header — this number does not learn.

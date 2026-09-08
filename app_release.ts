@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.8.5";
+const LATEST = "1.8.6";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,9 +118,12 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"The app now keeps working when the internet drops. Sign in once and it stays signed in: " +
-		"your screens still open from the last data they saw, and orders you take are saved and sent " +
-		"the moment the line comes back. Billing still needs a connection, and says so.",
+		"Kitchen tickets now print by themselves the moment an order is barked — no more remembering " +
+		"the button — and you can point each printer at what it should print: one for the kitchen, one " +
+		"for the bar, one for bills. A phone can drive a network printer too. Waiters now see only " +
+		"their own tables and covers instead of the restaurant's takings, and open straight onto " +
+		"Tables. You can drag table sections into the order your floor actually runs in. There is " +
+		"also a new look you can switch on in Settings, and switch straight back off.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
