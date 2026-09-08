@@ -61,6 +61,10 @@ import {
   type TenderReconciliation,
   type VariationPriceRef,
 } from "./billing_math.js";
+// The floor-section ordering rules (migration 041). Kept out of SQL on purpose:
+// see that module's header for why the decision lives in a pure function and
+// the database is left holding a dumb renumber.
+import { compareTableSections, planSectionOrder, sectionOrderKey } from "./table_sections_order.js";
 // Re-exported so existing importers of these from "./database_supabase.js" keep working.
 export { round2, computeBillTaxes, computeBillCharges, computeCouponDiscount, computeBillSplit } from "./billing_math.js";
 export {
@@ -2534,15 +2538,131 @@ export async function UpdateTable(
 // outlet — there is no Sections table, so listing is a group-by, renaming is one
 // UPDATE ... where section = $old, and deleting a section just clears the label
 // off its tables (the tables themselves are never touched otherwise).
+//
+// Migration 023 added the "Table_sections" ROSTER on top of that, so a zone with
+// no tables in it can exist; migration 041 added `sort_order` to the roster, so
+// the list has an order an owner chose instead of the alphabetical one the
+// schema forced. Neither replaces "Tables".section as the source of truth for
+// WHICH zone a table is in.
 
-export interface TableSectionSummary { section: string; tables: number; seats: number }
+export interface TableSectionSummary {
+  section: string;
+  tables: number;
+  seats: number;
+  /** Chosen position within this outlet, 1-based; null = never positioned, which
+   *  sorts into the alphabetical tail. See table_sections_order.ts. */
+  sort_order: number | null;
+}
 
-/** Every named section for the outlet + how many tables/seats sit in it. */
+// Per-outlet section ORDER (migration 041). Its own ensure key so it still runs
+// in a process that already ensured the 020 section column. `Table_sections`
+// itself is created by migration 023, never lazily, so the guard is a plain
+// existence check rather than a create.
+async function ensureTableSectionOrderColumn(client?: PoolClient): Promise<void> {
+  await ensureLazyTable("Table_sections.sort_order", async () => {
+    await runQuery(
+      `
+        do $$
+        begin
+          if to_regclass('public."Table_sections"') is not null then
+            alter table "Table_sections" add column if not exists sort_order integer;
+          end if;
+        end $$
+      `,
+      [],
+      client,
+    );
+    await runQuery(
+      `create index if not exists table_sections_order_idx on "Table_sections" (res_id, outlet_id, sort_order)`,
+      [],
+      client,
+    ).catch(() => {/* index is an optimisation; a locked table must not break boot */});
+  });
+}
+
+/**
+ * Process-wide answer to "does this database have migration 041 yet?".
+ * null = not asked, true = the column answered, false = it is not there.
+ *
+ * This exists because of the deploy gate: code reaches the VPS on a push and the
+ * migration is a MANUAL root-only step afterwards, so there is a real window in
+ * which this build is live against a 040 schema. The floor plan must survive
+ * that window. `readSectionOrderByKey` is therefore allowed to come back empty —
+ * which is precisely "no section has a position", i.e. 1.8.5's alphabetical
+ * list — instead of turning GET /get-tables into a 500 for every device on the
+ * floor. It is asked once and then never again; a schema cannot un-happen while
+ * the process lives.
+ */
+let sectionOrderColumnPresent: boolean | null = null;
+
+/** Test seam: jest drives ReorderTableSections against fixtures in one process
+ *  and must not inherit an earlier suite's probe result. */
+export function __resetSectionOrderProbe(): void {
+  sectionOrderColumnPresent = null;
+}
+
+/**
+ * `lower(btrim(name))` -> chosen position, for one outlet. Empty when nothing
+ * has been positioned, when migration 041 has not run, or when the read is
+ * unsafe to attempt (see below) — all three of which mean the same thing to
+ * every caller: order alphabetically.
+ *
+ * THE `inTxn` GUARD. A failed statement inside a PostgreSQL transaction aborts
+ * the whole transaction, so a speculative read that might hit `undefined_column`
+ * would take its caller's transaction down with it — and GetTables is called
+ * from an analytics aggregate that fans out over one connection. So the FIRST,
+ * possibly-failing attempt is only ever made on an autocommit connection, where
+ * a 42703 costs nothing but the error. Once the column has answered once, the
+ * read is known-safe and runs anywhere.
+ */
+async function readSectionOrderByKey(context: { res_id: string; outlet_id: string }): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (sectionOrderColumnPresent === false) {return out;}
+  const inTxn = (tenantStorage.getStore()?.txnDepth ?? 0) > 0;
+  if (sectionOrderColumnPresent === null && inTxn) {return out;}
+  try {
+    // `sort_order` is typed `unknown` on purpose: node-pg hands integer columns
+    // back as numbers, but this one is read on a schema this build may be ahead
+    // of, so the value is coerced and range-checked rather than trusted.
+    const rows = await runQuery<{ name: string; sort_order: unknown }>(
+      `
+        select btrim(name) as name, sort_order
+        from "Table_sections"
+        where res_id = $1 and outlet_id = $2 and sort_order is not null and btrim(name) <> ''
+      `,
+      [context.res_id, context.outlet_id],
+    );
+    sectionOrderColumnPresent = true;
+    for (const r of rows) {
+      const pos = Number(r.sort_order);
+      if (!Number.isFinite(pos)) {continue;}
+      const key = sectionOrderKey(r.name);
+      // Two rows keyed the same cannot happen through the API (023's unique
+      // index) but a hand-edited row could; the lower position wins so the read
+      // is deterministic either way.
+      const seen = out.get(key);
+      if (seen === undefined || pos < seen) {out.set(key, pos);}
+    }
+  } catch (err) {
+    // 42703 undefined_column / 42P01 undefined_table — this build is running
+    // ahead of its migration. Stop asking and fall back to alphabetical.
+    const code = (err as { code?: string } | null)?.code;
+    if (code === "42703" || code === "42P01") {sectionOrderColumnPresent = false;}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "table_section_order_read_failed");
+  }
+  return out;
+}
+
+/** Every named section for the outlet + how many tables/seats sit in it, plus
+ *  the outlet's chosen order. `order` is handed back raw as well as stamped onto
+ *  the summaries, because the caller unions in the EMPTY zones — which have no
+ *  table to be summarised from — and has to position those too. */
 export async function GetTableSections(
   restaurantId: string,
-): Promise<{ sections: TableSectionSummary[]; unassigned: number }> {
+): Promise<{ sections: TableSectionSummary[]; unassigned: number; order: Record<string, number> }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
+  await ensureTableSectionOrderColumn();
   const rows = await runQuery<{ section: string | null; tables: number; seats: number }>(
     `
       -- Group case-INSENSITIVELY so this matches how rename/delete resolve a
@@ -2562,13 +2682,142 @@ export async function GetTableSections(
     `,
     [context.res_id, context.outlet_id],
   );
+  const orderByKey = await readSectionOrderByKey(context);
   let unassigned = 0;
   const sections: TableSectionSummary[] = [];
   for (const r of rows) {
     if (!r.section) { unassigned += Number(r.tables ?? 0); continue; }
-    sections.push({ section: r.section, tables: Number(r.tables ?? 0), seats: Number(r.seats ?? 0) });
+    sections.push({
+      section: r.section,
+      tables: Number(r.tables ?? 0),
+      seats: Number(r.seats ?? 0),
+      sort_order: orderByKey.get(sectionOrderKey(r.section)) ?? null,
+    });
   }
-  return { sections, unassigned };
+  // The SQL orders alphabetically (it has to pick something); the chosen order
+  // is applied here, on the one comparator the whole feature shares. The caller
+  // sorts AGAIN after it unions in the empty roster zones — that re-sort is what
+  // places those, and it cannot disagree with this one because it is the same
+  // function.
+  sections.sort(compareTableSections);
+  return { sections, unassigned, order: Object.fromEntries(orderByKey) };
+}
+
+/**
+ * Give this outlet's sections the order `requested` puts them in.
+ *
+ * The whole write is one transaction and four statements, in this order and for
+ * these reasons:
+ *
+ *  1. `for update` on the outlet's roster rows. This is what makes two devices
+ *     reordering at the same moment safe: the second transaction blocks here,
+ *     and because READ COMMITTED takes a fresh snapshot per statement, it then
+ *     runs its remaining statements against everything the first one committed.
+ *     The two orders never interleave — the LAST commit defines the whole list,
+ *     which is the only outcome an owner can make sense of ("the other tablet
+ *     won"), and the realtime `table:sections_updated` this route emits is what
+ *     tells the loser to re-read. It also cannot produce duplicate positions,
+ *     because step 4 renumbers the entire outlet rather than editing slots.
+ *     (When the roster is EMPTY there is nothing to lock — but then step 2's
+ *     INSERT is itself the serialisation point, blocking on 023's unique index.)
+ *
+ *  2. MATERIALISE. Every zone that exists only as a "Tables".section string gets
+ *     the roster row it never had — migration 023's seed statement, re-run for
+ *     this outlet. Without this the whole feature is a data-loss bug: positions
+ *     live on roster rows, so an implicit zone would be handed no position, and
+ *     any implementation that then read its ordered list back from the roster
+ *     would drop it. See table_sections_order.ts's header.
+ *
+ *  3. Read the roster back — now provably complete — inside the same lock.
+ *
+ *  4. ONE renumbering UPDATE, driven by ids from `unnest(...) with ordinality`.
+ *     One statement because a per-row loop would leave the outlet half-ordered
+ *     if the connection dropped, and because a single statement has no
+ *     intermediate state for a future unique index to trip over.
+ *
+ * The ORDER ITSELF is decided in TypeScript by planSectionOrder, not here and
+ * not in SQL. Everything worth asserting about this feature — the alphabetical
+ * fallback, where a new section lands, that a stale client cannot drop a zone —
+ * is a property of that function and is tested as one.
+ */
+export async function ReorderTableSections(
+  restaurantId: string,
+  requested: readonly string[],
+): Promise<{ ordered: string[]; positioned: number }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  await ensureTableSectionOrderColumn();
+
+  return withTransaction(async (client) => {
+    await runQuery(
+      `select id from "Table_sections" where res_id = $1 and outlet_id = $2 for update`,
+      [context.res_id, context.outlet_id],
+      client,
+    );
+
+    // Migration 023's seed, scoped to this outlet. Same predicates as
+    // GetTableSections so it can never mint a zone the list would not show:
+    // deleted and virtual tables are excluded, blank labels are excluded, and
+    // names are grouped case-insensitively with min() picking a stable spelling.
+    await runQuery(
+      `
+        insert into "Table_sections" (res_id, outlet_id, name)
+        select t.res_id, t.outlet_id, min(btrim(t.section))
+        from "Tables" t
+        where t.res_id = $1 and t.outlet_id = $2
+          and coalesce(t.is_deleted, false) = false
+          and coalesce(t.is_virtual, false) = false
+          and nullif(btrim(coalesce(t.section, '')), '') is not null
+        group by t.res_id, t.outlet_id, lower(btrim(t.section))
+        on conflict do nothing
+      `,
+      [context.res_id, context.outlet_id],
+      client,
+    );
+
+    const roster = await runQuery<{ id: string; name: string }>(
+      `
+        select id, btrim(name) as name
+        from "Table_sections"
+        where res_id = $1 and outlet_id = $2 and btrim(name) <> ''
+      `,
+      [context.res_id, context.outlet_id],
+      client,
+    );
+
+    const ordered = planSectionOrder(requested, roster.map((r) => r.name));
+    // First id wins per key, matching planSectionOrder's own first-spelling-wins
+    // de-duplication: a database that somehow holds two rows for one zone gets
+    // one of them positioned and the other left null (alphabetical tail), rather
+    // than two rows fighting over the same slot.
+    const idByKey = new Map<string, string>();
+    for (const r of roster) {
+      const key = sectionOrderKey(r.name);
+      if (!idByKey.has(key)) {idByKey.set(key, r.id);}
+    }
+    const ids = ordered
+      .map((name) => idByKey.get(sectionOrderKey(name)))
+      .filter((id): id is string => typeof id === "string");
+
+    if (ids.length > 0) {
+      await runQuery(
+        `
+          update "Table_sections" t
+             set sort_order = o.pos
+            from (select id, ord::int as pos
+                    from unnest($3::uuid[]) with ordinality as u(id, ord)) o
+           where t.id = o.id and t.res_id = $1 and t.outlet_id = $2
+        `,
+        [context.res_id, context.outlet_id, ids],
+        client,
+      );
+      // The column has now answered on this connection, so later reads may run
+      // inside a transaction without risking an abort.
+      sectionOrderColumnPresent = true;
+    }
+
+    return { ordered, positioned: ids.length };
+  });
 }
 
 /**
@@ -3942,7 +4191,7 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null }[] | null> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
@@ -4075,6 +4324,22 @@ export async function GetTables(
     totalByTable.set(o.table_id, (totalByTable.get(o.table_id) ?? 0) + t);
   }
 
+  // The outlet's chosen section order (migration 041), so the floor plan groups
+  // in the order the owner arranged rather than alphabetically.
+  //
+  // It rides on THIS route rather than only on GET /table-sections because that
+  // roster is gated behind "Manage Table Sections": a manager or waiter can see
+  // the floor but not the roster, and an owner who reorders their sections would
+  // otherwise have rearranged only their own screen. Nothing new is disclosed —
+  // a position is stamped only onto a section the caller can already see the
+  // tables of, so an empty zone (the roster's private content) stays invisible.
+  //
+  // Deliberately not a join on the "Tables" read: this is the floor plan, the
+  // single most-hit screen in the app, and readSectionOrderByKey is allowed to
+  // answer "nothing is positioned" if migration 041 has not run yet. A join
+  // would turn that window into a 500 for every device on the floor.
+  const sectionOrder = await readSectionOrderByKey(context);
+
   return tableRows.map((row) => {
     const occupied = row.is_occupied;
     const tCovers = Math.max(1, parseNumeric(row.num_covers) ?? 1);
@@ -4088,6 +4353,10 @@ export async function GetTables(
       // Floor section/zone this table sits in; null = unassigned. Clients group
       // the grid by this and PATCH /table/:name to drag a table to another one.
       section: normalizeTableSection(row.section),
+      // Where that section sits in the outlet's chosen order; null = never
+      // positioned, which clients render in the alphabetical tail. Null for
+      // every table until somebody reorders, so this is inert on 1.8.5 data.
+      section_position: sectionOrder.get(sectionOrderKey(row.section ?? "")) ?? null,
       booked: bookedTables.has(row.id),
       reserved: reservedTables.has(row.id),
       occupied,
@@ -6756,6 +7025,7 @@ const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; null
   inventory_categories: { column: "inventory_categories", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(sanitizeInventoryCategories(v))) },
   timezone: { column: "timezone", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? sanitizeTimezone(v) : null) },
   require_table_otp: { column: "require_table_otp", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
+  kot_auto_print: { column: "kot_auto_print", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   queue_show_menu: { column: "queue_show_menu", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
 };
 
@@ -20317,6 +20587,117 @@ export async function GetKotTableContext(
   };
 }
 
+/**
+ * Everything a KOT needs about ONE ORDER — the auto-print-on-bark counterpart to
+ * GetKotTableContext.
+ *
+ * WHY AN ORDER-SCOPED READ EXISTS AT ALL
+ * --------------------------------------
+ * The manual thermal KOT is TABLE-scoped: /print/bill{kind:"kot"} goes through
+ * GetBillForTable, which aggregates EVERY ACTIVE order on the table. That is the
+ * right document for "print this table's ticket again".
+ *
+ * Barking is not table-scoped. It is one order being announced to the kitchen,
+ * and a table can accumulate several: a party orders starters at 19:00 (barked,
+ * cooked, eaten) and mains at 19:40. Auto-printing the TABLE aggregate on the
+ * second bark would hand the kitchen the starters a second time and the
+ * restaurant would cook and eat the cost of them. So the bark docket is built
+ * from the barked order's own lines and nothing else.
+ *
+ * The items are aggregated by the SAME key GetBillForTable uses — name, price,
+ * non-chargeable flag, variation label — so a docket and a bill can never
+ * disagree about what was sold. Only the price column differs, and a KOT does
+ * not print prices at all.
+ */
+export async function GetOrderKotContext(
+  restaurantId: string,
+  orderId: string,
+): Promise<
+  | {
+      order_id: string;
+      table_id: string;
+      table_name: string;
+      section: string | null;
+      covers: number;
+      is_virtual: boolean;
+      order_type: string;
+      items: { name: string; price: number; quantity: number; note?: string; variation?: string }[];
+    }
+  | null
+> {
+  const context = await requireRestaurantContext(restaurantId);
+  await ensureTableOccupancyColumns();
+  const id = String(orderId ?? "").trim();
+  if (!id) {return null;}
+
+  const rows = await runQuery<{
+    order_id: string;
+    food: unknown;
+    table_id: string | null;
+    table_name: string | null;
+    section: string | null;
+    num_covers: unknown;
+    is_virtual: boolean | null;
+  }>(
+    `
+      select o.id as order_id, o.food, o.table_id,
+             t.table_name, t.section,
+             coalesce(t.num_covers, 1) as num_covers,
+             coalesce(t.is_virtual, false) as is_virtual
+      from "Orders" o
+      left join "Tables" t
+        on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+      where o.id = $1 and o.res_id = $2 and o.outlet_id = $3
+      limit 1
+    `,
+    [id, context.res_id, context.outlet_id],
+  );
+
+  const row = rows[0];
+  if (!row) {return null;}
+
+  const food = parseJsonObject(row.food) ?? {};
+  const orderType = String((food as Record<string, unknown>).order_type ?? "").trim().toLowerCase() || "dine_in";
+
+  // Same merge key as GetBillForTable (name + price + nc + variation), so one
+  // order's lines collapse on the docket exactly as they do on the bill.
+  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; variation?: string }>();
+  const list = Array.isArray((food as { items?: unknown }).items) ? ((food as { items: unknown[] }).items) : [];
+  for (const raw of list) {
+    const it = (raw ?? {}) as Record<string, unknown>;
+    const name = String(it.name ?? "Item");
+    const price = parseNumeric(it.price);
+    const quantity = Math.max(1, Math.round(parseNumeric(it.quantity) || 1));
+    const note = String(it.note ?? "").trim();
+    const nc = isNonChargeableLine(it);
+    const variation = String(it.variation_name ?? "").trim();
+    const key = `${name.toLowerCase()}@@${price}@@${nc ? "nc" : ""}@@${variation.toLowerCase()}`;
+    const existing = itemMap.get(key);
+    if (existing) {
+      existing.quantity += quantity;
+      if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
+    } else {
+      itemMap.set(key, { name, price, quantity, note: note || undefined, ...(variation ? { variation } : {}) });
+    }
+  }
+
+  return {
+    order_id: String(row.order_id),
+    // A takeaway/delivery order is backed by a hidden virtual "Tables" row, so
+    // table_id is populated for those too. An order with NO table row at all
+    // cannot be keyed for KOT numbering (the ticket key needs a table
+    // component), so it reports "" and the caller declines to auto-print rather
+    // than minting a number against an empty key.
+    table_id: String(row.table_id ?? ""),
+    table_name: String(row.table_name ?? "").trim(),
+    section: String(row.section ?? "").trim() || null,
+    covers: Math.max(1, Number(row.num_covers ?? 1) || 1),
+    is_virtual: row.is_virtual === true,
+    order_type: orderType,
+    items: [...itemMap.values()],
+  };
+}
+
 export interface OutletRecord {
   id: string;
   outlet_name: string;
@@ -23262,6 +23643,12 @@ async function ensureBrandingColumns(): Promise<void> {
   // will place an order — stops a passer-by ordering to an occupied table they
   // aren't sitting at. Default OFF (existing behaviour: no code needed).
   await runQuery(`alter table "Restaurant" add column if not exists require_table_otp boolean default false`);
+  // Whether barking an order to the kitchen also prints its docket (migration
+  // 040). DEFAULT TRUE, and NULL reads as true, because the whole point of the
+  // feature is that nobody has to remember to press Print — an owner who never
+  // opens the setting gets the auto-print. Turning it off restores the
+  // press-the-button-yourself behaviour this column replaced.
+  await runQuery(`alter table "Restaurant" add column if not exists kot_auto_print boolean default true`);
   // Rich customer-page branding: a sanitized JSON customization object (font +
   // colors + header/button style — see sanitizeBrandConfigInput / BrandConfig).
   // Null means "never customized" — the read layer applies sane defaults and
@@ -23707,6 +24094,8 @@ export interface RestaurantSettings {
   timezone: string;
   // Whether guests must enter a per-table OTP before ordering from the QR page.
   require_table_otp: boolean;
+  /** Barking an order also prints its kitchen docket. Default (and NULL) = true. */
+  kot_auto_print: boolean;
   // Rich customer-page branding (resolved with defaults — see resolveBrandConfig)
   // so the admin UI can prefill the editor.
   brand_config: BrandConfig;
@@ -23812,8 +24201,8 @@ export async function GetRestaurantSettings(
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
-    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, bill_legal_name, bill_gstin, bill_qr_note, queue_show_menu, kitchen_sections, inventory_categories, timezone, require_table_otp, theme_color, brand_config from "Restaurant" where id = $1 limit 1`,
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; theme_color: string | null; brand_config: unknown }>(
+    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, bill_legal_name, bill_gstin, bill_qr_note, queue_show_menu, kitchen_sections, inventory_categories, timezone, require_table_otp, kot_auto_print, theme_color, brand_config from "Restaurant" where id = $1 limit 1`,
     [context.res_id],
   );
   const taxRows = await runQuery<{ default_tax: unknown }>(
@@ -23859,6 +24248,9 @@ export async function GetRestaurantSettings(
     inventory_categories: sanitizeInventoryCategories(rows[0]?.inventory_categories),
     timezone: sanitizeTimezone(rows[0]?.timezone),
     require_table_otp: rows[0]?.require_table_otp === true,
+    // NULL reads as ON. A tenant whose row predates migration 040 has never
+    // made a choice, and the shipped default for that choice is "print it".
+    kot_auto_print: rows[0]?.kot_auto_print !== false,
     // Admin editor prefill: the stored customization resolved with defaults
     // (color_primary falls back to theme_color here — the logo-extracted palette
     // is only resolved on the public branding path to keep this admin read cheap)
@@ -23875,7 +24267,7 @@ export async function GetRestaurantSettings(
 
 export async function SetRestaurantSettings(
   restaurantId: string,
-  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; bill_legal_name?: unknown; bill_gstin?: unknown; bill_qr_note?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean },
+  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; bill_legal_name?: unknown; bill_gstin?: unknown; bill_qr_note?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean; kot_auto_print?: boolean },
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
@@ -23958,6 +24350,9 @@ export async function SetRestaurantSettings(
   const timezone = typeof opts.timezone === "string" && opts.timezone.trim() ? sanitizeTimezone(opts.timezone) : null;
   // Per-table OTP gate: only written when a boolean is sent (null leaves it as-is).
   const requireTableOtp = typeof opts.require_table_otp === "boolean" ? opts.require_table_otp : null;
+  // null = "not in this request", which the coalesce below leaves untouched —
+  // the same shape every other optional boolean here uses.
+  const kotAutoPrint = typeof opts.kot_auto_print === "boolean" ? opts.kot_auto_print : null;
   // Printed-bill header identity + the custom QR sentence. All three follow the
   // bill_logo_svg idiom exactly: only written when the key is PRESENT, and an
   // empty string CLEARS the column (nullif below) rather than storing a blank
@@ -23965,7 +24360,7 @@ export async function SetRestaurantSettings(
   const billLegalName = opts.bill_legal_name !== undefined ? sanitizeBillHeaderField(opts.bill_legal_name) : null;
   const billGstin = opts.bill_gstin !== undefined ? sanitizeBillHeaderField(opts.bill_gstin) : null;
   const billQrNote = opts.bill_qr_note !== undefined ? sanitizeBillQrNote(opts.bill_qr_note) : null;
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; theme_color: string | null; brand_config: unknown }>(
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; theme_color: string | null; brand_config: unknown }>(
     `update "Restaurant" set
        auto_push_orders = coalesce($2, auto_push_orders),
        currency = coalesce($3, currency),
@@ -23997,9 +24392,10 @@ export async function SetRestaurantSettings(
        require_table_otp = coalesce($29, require_table_otp),
        bill_legal_name = case when $30::text is null then bill_legal_name else nullif($30, '') end,
        bill_gstin = case when $31::text is null then bill_gstin else nullif($31, '') end,
-       bill_qr_note = case when $32::text is null then bill_qr_note else nullif($32, '') end
+       bill_qr_note = case when $32::text is null then bill_qr_note else nullif($32, '') end,
+       kot_auto_print = coalesce($33, kot_auto_print)
      where id = $1
-     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone, require_table_otp, bill_legal_name, bill_gstin, bill_qr_note, theme_color, brand_config`,
+     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone, require_table_otp, kot_auto_print, bill_legal_name, bill_gstin, bill_qr_note, theme_color, brand_config`,
     [
       context.res_id,
       typeof opts.auto_push_orders === "boolean" ? opts.auto_push_orders : null,
@@ -24033,6 +24429,7 @@ export async function SetRestaurantSettings(
       billLegalName,
       billGstin,
       billQrNote,
+      kotAutoPrint,
     ],
   );
   // First messaging save: mint the webhook secret (Meta hub.verify_token +
@@ -24091,6 +24488,9 @@ export async function SetRestaurantSettings(
     inventory_categories: sanitizeInventoryCategories(rows[0]?.inventory_categories),
     timezone: sanitizeTimezone(rows[0]?.timezone),
     require_table_otp: rows[0]?.require_table_otp === true,
+    // NULL reads as ON. A tenant whose row predates migration 040 has never
+    // made a choice, and the shipped default for that choice is "print it".
+    kot_auto_print: rows[0]?.kot_auto_print !== false,
     // brand_config isn't written here (branding is set via SetBranding), but the
     // type requires it — echo the current stored value resolved with defaults.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),

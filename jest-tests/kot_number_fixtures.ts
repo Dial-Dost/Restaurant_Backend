@@ -61,9 +61,28 @@ export interface TicketRow {
   ticket_key: string;
 }
 
+/**
+ * One "Menu" row, reduced to the two columns a kitchen docket actually reads.
+ *
+ * The station is what buildKotBase64 splits a ticket by, and it lives inside the
+ * JSON `description` blob rather than in a column of its own (see
+ * parseMenuDescription) — so the dispatcher below re-encodes it exactly the way
+ * the real column stores it instead of inventing a shape GetMenuItems would not
+ * understand.
+ */
+export interface MenuFixtureRow {
+  id: string;
+  name: string;
+  station: string | null;
+}
+
 interface Store {
   counters: Map<string, CounterRow>;
   tickets: TicketRow[];
+  /** The outlet's menu, as GetMenuItems would read it. Empty by default, which
+   *  is the "no stations configured" restaurant: every dish falls into the one
+   *  shared docket. */
+  menu: MenuFixtureRow[];
   /** Every "KotCounters"/"KotTickets" statement throws 42P01 — migration 029
    *  not applied. */
   tableMissing: boolean;
@@ -72,7 +91,7 @@ interface Store {
 let store: Store = freshStore();
 
 function freshStore(): Store {
-  return { counters: new Map(), tickets: [], tableMissing: false };
+  return { counters: new Map(), tickets: [], menu: [], tableMissing: false };
 }
 
 export function resetStore(): void {
@@ -98,6 +117,15 @@ export function breakKotTables(): void { store.tableMissing = true; }
  * insert really are one unit of work.
  */
 export function seedTicket(row: TicketRow): void { store.tickets.push(row); }
+
+/**
+ * Give the outlet a menu, so a docket can be split across kitchen stations.
+ *
+ * Needed only by the tests that assert the SPLIT shares one number: without it
+ * GetMenuItems returns nothing, every line resolves to a null station, and
+ * buildKotBase64 produces the single "General" docket a one-station kitchen gets.
+ */
+export function seedMenu(rows: MenuFixtureRow[]): void { store.menu = [...rows]; }
 
 const counterKey = (res: string, outlet: string, day: string) => `${res}|${outlet}|${day}`;
 
@@ -203,6 +231,26 @@ async function query(connId: number, sqlRaw: string, params: unknown[] = []): Pr
 
   // --- Context resolution ---------------------------------------------------
   if (s.includes('from "restaurant" r')) {return { rows: [contextRow()] };}
+
+  // --- Menu -----------------------------------------------------------------
+  // GetMenuItems, which dispatchKot consults to tag each line with the station
+  // that cooks it. Modelled because the per-station SPLIT is the thing that
+  // makes "one number for the whole ticket" a claim worth testing at all — with
+  // no menu there is only ever one docket and the claim is vacuous.
+  if (s.includes('from "menu" m')) {
+    return {
+      rows: store.menu.map((m) => ({
+        id: m.id,
+        name: m.name,
+        // The real column is a JSON blob; parseMenuDescription reads `station`
+        // out of it. Encoding it here rather than returning a `station` column
+        // keeps the fixture honest about where the value actually lives.
+        description: JSON.stringify({ price: 0, station: m.station }),
+        sub_category: null,
+        main_category: null,
+      })),
+    };
+  }
 
   const kotStatement = s.includes('"kotcounters"') || s.includes('"kottickets"');
   if (kotStatement && store.tableMissing) {

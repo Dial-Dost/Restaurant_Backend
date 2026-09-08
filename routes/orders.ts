@@ -4,13 +4,14 @@
  */
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "crypto";
-import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrders, GetOrdersScope, IsOrderItemServed, OrderTimingAction, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
+import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrderKotContext, GetOrders, GetOrdersScope, GetRestaurantProfile, GetRestaurantSettings, GetTableFeedbackContext, IsOrderItemServed, OrderTimingAction, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
+import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { idempotent } from "../idempotency.js";
 import { resolveServeIntent } from "../order_intent.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforcePermission, extractEmployeeId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, validateAction } from "./_shared.js";
+import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforcePermission, extractEmployeeId, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, validateAction } from "./_shared.js";
 
 
 // --- Order/item preparation timers (pause/resume, mark item served) ---------
@@ -18,6 +19,102 @@ const ORDER_ACTION = "4ad474d4-5230-449c-874f-6a238b833bca";
 // Barking pushes a ticket to the kitchen — a different job from taking the order.
 // It used to share "Add Orders", which every waiter needs, so waiters could bark.
 const PERM_BARK = "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63"; // Bark Order
+
+/**
+ * Print the barked order's kitchen docket.
+ *
+ * WHY THE DOCKET IS ORDER-SCOPED AND NOT TABLE-SCOPED
+ * ---------------------------------------------------
+ * The manual thermal KOT (POST /print/bill {kind:"kot"}) prints the TABLE: it
+ * goes through GetBillForTable, which aggregates every active order on the
+ * table. Barking is not that. A party orders starters at 19:00 (barked, cooked,
+ * eaten) and mains at 19:40; auto-printing the table aggregate on the second
+ * bark would put the starters in front of the kitchen again and the restaurant
+ * would cook and eat the cost of them. So this reads the barked ORDER's own
+ * lines (GetOrderKotContext) and prints those.
+ *
+ * WHY THIS CANNOT MINT A SECOND KOT NUMBER
+ * ----------------------------------------
+ * Two interlocks, and they are independent:
+ *
+ *   1. BarkOrder is a compare-and-set on a null barked_at. A second bark of the
+ *      same order returns already_barked and this function is never reached, so
+ *      the ordinary "someone pressed it twice" case never gets as far as
+ *      numbering.
+ *   2. Even if it were reached — two replicas racing the first bark, or an
+ *      offline outbox replay that carries a fresh idempotency key — the ticket
+ *      key is (outlet, business day, table, normalised item set). An unchanged
+ *      order hashes to the same key, AllocateKotNumber returns the memoised
+ *      number with reused:true, and the second docket carries the number that is
+ *      already on paper rather than burning the next one.
+ *
+ * Interlock 2 is what makes the manual reprint (POST /print/kot/order/:id) a
+ * genuine REPRINT of this docket rather than a new ticket listing the same food.
+ *
+ * WHY A FAILURE HERE MUST NOT FAIL THE BARK
+ * -----------------------------------------
+ * Barking stamps barked_at and rebases every prep timer — it is the kitchen's
+ * clock starting, and it has already been committed by the time this runs. A
+ * printer problem, an unreadable menu or an unapplied migration must not roll
+ * that back or 400 the request, because the alternative is a kitchen that has
+ * been told about an order the system now claims was never announced. So this
+ * returns a result the response reports and never throws.
+ */
+async function autoPrintBarkedKot(
+	req: Request,
+	restaurantId: string,
+	orderId: string,
+): Promise<{ printed: boolean; kot_no: number | null; tickets: number; reason?: string }> {
+	const outletId = extractOutletId(req);
+	if (!outletId) {return { printed: false, kot_no: null, tickets: 0, reason: "no_outlet" };}
+	try {
+		const settings = await GetRestaurantSettings(restaurantId);
+		// DEFAULT ON. kot_auto_print is NULL for every tenant that predates
+		// migration 040 and GetRestaurantSettings reads NULL as true, so the
+		// feature is live without anyone opting in — which is the point.
+		if (settings.kot_auto_print === false) {return { printed: false, kot_no: null, tickets: 0, reason: "disabled" };}
+
+		const order = await GetOrderKotContext(restaurantId, orderId);
+		if (!order) {return { printed: false, kot_no: null, tickets: 0, reason: "order_not_found" };}
+		// An order with no lines has nothing for the kitchen to cook. Printing an
+		// empty docket would burn a KOT number on a blank piece of paper.
+		if (order.items.length === 0) {return { printed: false, kot_no: null, tickets: 0, reason: "no_items" };}
+
+		const [profile, waiterCtx] = await Promise.all([
+			GetRestaurantProfile(restaurantId).catch(() => null),
+			order.table_name ? GetTableFeedbackContext(restaurantId, order.table_name).catch(() => null) : Promise.resolve(null),
+		]);
+		const waiterName = (waiterCtx?.employee_name ?? "").trim();
+		const waiterRole = (waiterCtx?.employee_role ?? "").trim().toLowerCase();
+
+		const dispatched = await dispatchKot({
+			restaurantId, outletId,
+			tableName: order.table_name,
+			tableId: order.table_id,
+			section: order.section,
+			covers: order.covers,
+			isVirtual: order.is_virtual,
+			orderType: order.order_type,
+			items: order.items,
+			assignedTo: waiterName || null,
+			captain: waiterName && (waiterRole === "captain" || waiterRole === "manager") ? waiterName : null,
+			// The same shape POST /print/kot/order/:id uses, so a docket and its
+			// later reprint group together in "PrintJobs".
+			billId: `order-${order.order_id}`,
+			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+			currency: settings.currency ?? "\u20b9",
+			cols: settings.bill_paper_width === "58mm" ? 32 : 48,
+			tz: settings.timezone || "Asia/Kolkata",
+		});
+		logKotDispatched("bark_auto_print", dispatched, { resId: restaurantId, outletId, orderId });
+		return { printed: true, kot_no: dispatched.kotNo, tickets: dispatched.tickets };
+	} catch (err) {
+		// Loud, because a kitchen that stops getting dockets has to be findable
+		// in the logs — but never fatal to the bark that already happened.
+		logger.error({ err, orderId, restaurantId }, "bark_auto_print_failed");
+		return { printed: false, kot_no: null, tickets: 0, reason: "print_failed" };
+	}
+}
 async function handleTiming(req: Request, res: Response, action: "pause" | "resume" | "serve" | "start" | "unserve", withItem: boolean) {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -431,11 +528,26 @@ app.post("/orders/:id/bark", validateAction(PERM_BARK), idempotent(), async (req
 	if (!orderId) { res.status(400).json({ error: "order id is required" }); return; }
 	try {
 		const result = await BarkOrder(restaurantId, orderId, extractEmployeeId(req));
+		// THE DOCKET PRINTS ON THE FIRST BARK AND ONLY THE FIRST. already_barked
+		// is BarkOrder's compare-and-set telling us this order was announced
+		// before; re-announcing it must not put a second ticket on the pass. A
+		// deliberate second copy is what POST /print/kot/order/:id is for, and
+		// that route is a true reprint (same key, same number).
+		const printed = result.already_barked
+			? { printed: false, kot_no: null, tickets: 0, reason: "already_barked" }
+			: await autoPrintBarkedKot(req, restaurantId, orderId);
 		if (!result.already_barked) {
-			try { await log_audit(req, BARK_ORDER_ACTION_ID, `Barked order ${orderId} to the kitchen`, Audit_log_category.Orders, { order_id: orderId, barked_at: result.barked_at }); } catch {/* ignore */}
+			try { await log_audit(req, BARK_ORDER_ACTION_ID, `Barked order ${orderId} to the kitchen${printed.kot_no ? ` (KOT-${printed.kot_no})` : ""}`, Audit_log_category.Orders, { order_id: orderId, barked_at: result.barked_at, kot_no: printed.kot_no, auto_printed: printed.printed }); } catch {/* ignore */}
 			try { emitRestaurant(restaurantId, "order:updated", { order_id: orderId, barked: true }); } catch {/* ignore */}
 		}
-		res.json({ success: true, barked_at: result.barked_at, already_barked: result.already_barked });
+		// The print outcome rides the bark response so the app can say "sent to
+		// the kitchen, KOT-26" or "barked, but the docket did not print" instead
+		// of a bare tick that means one of two very different things.
+		res.json({
+			success: true, barked_at: result.barked_at, already_barked: result.already_barked,
+			kot_printed: printed.printed, kot_no: printed.kot_no, kot_tickets: printed.tickets,
+			...(printed.reason ? { kot_skipped: printed.reason } : {}),
+		});
 	} catch (err: any) {
 		logger.error({ err }, "bark_order_failed");
 		res.status(400).json({ error: String(err?.message ?? "Unable to bark order") });

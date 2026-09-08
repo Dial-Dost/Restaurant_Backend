@@ -6,9 +6,9 @@
 import type { Express, Request, Response } from "express";
 import type { BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMenuItems, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, dayKeyOf } from "../database_supabase.js";
-import { buildKotBase64, buildReceiptBase64 } from "../escpos.js";
-import { allocateKotNumber, kotOrderContext, kotStamp, kotTicketKey, serviceModeLabel } from "../kot_numbers.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges } from "../database_supabase.js";
+import { buildReceiptBase64 } from "../escpos.js";
+import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
 import { ackPrintJob, enqueuePrintJob, printJobPayload } from "../print_jobs.js";
 import { emitOutlet, emitRestaurant } from "../realtime.js";
@@ -838,13 +838,6 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		// agent that maps station -> printer can route it; a single-printer agent
 		// prints all N tickets on one roll (same paper, just split + labelled).
 		if (kind === "kot") {
-			const stationByName = new Map<string, string>();
-			try {
-				const menu = await GetMenuItems(restaurantId);
-				for (const m of menu) {if (m.station) {stationByName.set(m.name.trim().toLowerCase(), m.station);}}
-			} catch {/* menu unavailable — items fall under a single General ticket */}
-			const kotItems = bill.items.map((it) => ({ ...it, station: stationByName.get(String(it.name).trim().toLowerCase()) ?? null }));
-
 			// THE KOT HEADER, resolved here and printed verbatim by the renderer.
 			//
 			// The zone is the tenant's own ("Restaurant".timezone). Everything
@@ -853,76 +846,52 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			// fired at 01:00 IST reads 01:00 and counts as the night it was
 			// actually cooked, on a backend hosted in UTC.
 			const tz = settings.timezone || 'Asia/Kolkata';
-			const firedAt = new Date();
 			// Neither lookup is allowed to take the kitchen down: an unresolvable
 			// table or waiter costs a header line, not the docket.
 			const [tableCtx, waiterCtx] = await Promise.all([
 				GetKotTableContext(restaurantId, tableName).catch(() => null),
 				GetTableFeedbackContext(restaurantId, tableName).catch(() => null),
 			]);
-			const serviceMode = serviceModeLabel(tableCtx?.order_type);
-			// Covers come from the TABLE (num_covers, counted once per table), the
-			// same number the bill divides by for APC.
-			const covers = tableCtx?.covers ?? bill.covers ?? 1;
 			// "Assign to:" is whoever the table is assigned to; "Captain:" prints
 			// only when that person's role really is captain/manager, so a plain
 			// waiter's table does not grow a second identical line.
 			const waiterName = (waiterCtx?.employee_name ?? '').trim();
 			const waiterRole = (waiterCtx?.employee_role ?? '').trim().toLowerCase();
-
-			// ONE NUMBER FOR THE WHOLE KOT, allocated BEFORE the per-station split
-			// so all N dockets of one order carry the same "KOT - n" and the expo
-			// can pair them. A reprint of the same table with the same items
-			// resolves to the number already on paper instead of burning a new
-			// one; a null means migration 029 is unapplied and the ticket prints
-			// unnumbered rather than failing.
-			const businessDay = dayKeyOf(firedAt, tz);
-			const kot = tableCtx
-				? await allocateKotNumber(
-					restaurantId,
-					kotTicketKey({ outletId, businessDay, tableId: tableCtx.table_id, items: kotItems }),
-					firedAt,
-				)
-				: null;
-
-			const tickets = buildKotBase64({
-				restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
-				table: tableName,
-				covers,
-				items: kotItems,
-				total: charges.subtotal,
-				currency: settings.currency ?? "₹",
-				kind: "kot",
-				kotNo: kot?.kot_no ?? null,
-				printedAt: kotStamp(firedAt, tz),
-				orderContext: kotOrderContext(tableCtx?.is_virtual === true, serviceMode),
-				serviceMode,
+			const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
+			// STATION ENRICHMENT, TICKET NUMBERING, THE PER-STATION SPLIT AND THE
+			// PERSIST-THEN-EMIT OF EACH DOCKET NOW LIVE IN kot_print.ts, because
+			// the bark path (routes/orders.ts) has to produce a docket that is
+			// identical in every one of those respects. A second copy here is
+			// exactly where the two would drift apart on the KOT number.
+			const dispatched = await dispatchKot({
+				restaurantId, outletId,
+				tableName,
+				tableId: tableCtx?.table_id ?? "",
 				section: tableCtx?.section ?? null,
+				// Covers come from the TABLE (num_covers, counted once per table),
+				// the same number the bill divides by for APC.
+				covers: tableCtx?.covers ?? bill.covers ?? 1,
+				isVirtual: tableCtx?.is_virtual === true,
+				orderType: tableCtx?.order_type ?? null,
+				items: bill.items,
 				assignedTo: waiterName || null,
 				captain: waiterName && (waiterRole === 'captain' || waiterRole === 'manager') ? waiterName : null,
-			}, cols);
-			const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
-			// ONE DURABLE JOB PER STATION TICKET, all sharing this one billId. That
-			// sharing is precisely why the job uuid — not billId — is the identity
-			// every downstream guard keys on: deduplicating on billId would print the
-			// first station's docket and silently drop every other kitchen's.
-			for (const t of tickets) {
-				const jobId = await enqueuePrintJob(restaurantId, {
-					outlet_id: outletId, bill_id: billId, kind: "kot", station: t.station, esc_base64: t.escBase64,
-				});
-				emitOutlet(restaurantId, outletId, 'bill:print', printJobPayload({
-					billId, escBase64: t.escBase64, kind: "kot", station: t.station, jobId,
-					publishedAt: new Date().toISOString(),
-				}));
-			}
+				billId,
+				restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+				currency: settings.currency ?? "₹",
+				cols,
+				tz,
+				total: charges.subtotal,
+			});
+			logKotDispatched("print_bill_table", dispatched, { resId: restaurantId, outletId, table: tableName });
 			// The KOT number goes in the audit line and the response: it is the
-			// handle a manager uses to find this ticket afterwards, and `reused`
+			// handle a manager uses to find this ticket afterwards, and `reprint`
 			// distinguishes a genuine second order from a reprint of the first.
-			const kotLabel = kot ? `KOT-${kot.kot_no}${kot.reused ? ' (reprint)' : ''}` : 'KOT';
-			try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kotLabel} for table ${tableName} (${tickets.length} station ticket(s))`, Audit_log_category.Bill, { table: tableName, kind, stations: tickets.map((t) => t.station), kot_no: kot?.kot_no ?? null, business_day: kot?.business_day ?? null, reprint: kot?.reused ?? null }); } catch {/* ignore */}
+			const kotLabel = dispatched.kotNo ? `KOT-${dispatched.kotNo}${dispatched.reprint ? ' (reprint)' : ''}` : 'KOT';
+			try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kotLabel} for table ${tableName} (${dispatched.tickets} station ticket(s))`, Audit_log_category.Bill, { table: tableName, kind, stations: dispatched.stations, kot_no: dispatched.kotNo, business_day: dispatched.businessDay, reprint: dispatched.reprint }); } catch {/* ignore */}
 			res.json({
-				success: true, billId, tickets: tickets.length, stations: tickets.map((t) => t.station),
-				kot_no: kot?.kot_no ?? null, business_day: kot?.business_day ?? null, reprint: kot?.reused ?? false,
+				success: true, billId, tickets: dispatched.tickets, stations: dispatched.stations,
+				kot_no: dispatched.kotNo, business_day: dispatched.businessDay, reprint: dispatched.reprint,
 			});
 			return;
 		}
@@ -1035,6 +1004,81 @@ app.post('/print/ack', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), v
 	} catch (err: any) {
 		logger.error({ err }, 'print_ack_failed');
 		res.status(500).json({ error: String(err?.message ?? 'Unable to record print ack') });
+	}
+});
+
+/*
+	Reprint ONE ORDER's kitchen docket — the manual half of auto-print-on-bark.
+
+	POST /print/kot/order/:id
+	  -> 200 { success, billId, tickets, stations, kot_no, business_day, reprint }
+
+	WHY THIS IS NOT /print/bill{kind:"kot"}. That route is TABLE-scoped: it goes
+	through GetBillForTable, which aggregates every active order on the table. It
+	is the right document for "print this table's ticket again", and the wrong one
+	for "the printer jammed, send order 47's docket again" — on a table that has
+	since taken a second order it would hand the kitchen the first order's food a
+	second time.
+
+	IT IS A REPRINT IN THE STRICT SENSE, and that is the whole point. The ticket
+	key is (outlet, business day, table, item set), so an unchanged order resolves
+	to the number already on paper via migration 029's memo and comes back with
+	reprint:true. The kitchen gets the SAME docket, not a new ticket that happens
+	to list the same food.
+
+	Gated on the existing print permission (4ad474d4...), like every other print
+	route: whoever may print may reprint. Minting a new Action id would strip the
+	capability from every role that has it today (migration 025's rule).
+*/
+app.post('/print/kot/order/:id', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	const outletId = extractOutletId(req);
+	if (!restaurantId || !outletId) { res.status(400).json({ error: 'Missing restaurant/outlet' }); return; }
+	const orderId = String(req.params.id ?? "").trim();
+	if (!orderId) { res.status(400).json({ error: 'order id is required' }); return; }
+	try {
+		const [order, settings, profile] = await Promise.all([
+			GetOrderKotContext(restaurantId, orderId),
+			GetRestaurantSettings(restaurantId).catch(() => ({ currency: "\u20b9" } as any)),
+			GetRestaurantProfile(restaurantId).catch(() => null),
+		]);
+		if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
+		if (order.items.length === 0) { res.status(400).json({ error: 'This order has no items to print' }); return; }
+		const waiterCtx = order.table_name
+			? await GetTableFeedbackContext(restaurantId, order.table_name).catch(() => null)
+			: null;
+		const waiterName = (waiterCtx?.employee_name ?? '').trim();
+		const waiterRole = (waiterCtx?.employee_role ?? '').trim().toLowerCase();
+		const dispatched = await dispatchKot({
+			restaurantId, outletId,
+			tableName: order.table_name,
+			tableId: order.table_id,
+			section: order.section,
+			covers: order.covers,
+			isVirtual: order.is_virtual,
+			orderType: order.order_type,
+			items: order.items,
+			assignedTo: waiterName || null,
+			captain: waiterName && (waiterRole === 'captain' || waiterRole === 'manager') ? waiterName : null,
+			// The SAME bill_id shape the bark path uses, so a docket and its
+			// reprint group together in "PrintJobs" instead of looking like two
+			// unrelated tickets.
+			billId: `order-${order.order_id}`,
+			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+			currency: settings.currency ?? "\u20b9",
+			cols: settings.bill_paper_width === "58mm" ? 32 : 48,
+			tz: settings.timezone || 'Asia/Kolkata',
+		});
+		logKotDispatched("print_kot_order", dispatched, { resId: restaurantId, outletId, orderId });
+		const kotLabel = dispatched.kotNo ? `KOT-${dispatched.kotNo}${dispatched.reprint ? ' (reprint)' : ''}` : 'KOT';
+		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Reprinted ${kotLabel} for order ${orderId} (${dispatched.tickets} station ticket(s))`, Audit_log_category.Bill, { order_id: orderId, table: order.table_name, kind: 'kot', stations: dispatched.stations, kot_no: dispatched.kotNo, business_day: dispatched.businessDay, reprint: dispatched.reprint }); } catch {/* ignore */}
+		res.json({
+			success: true, billId: dispatched.billId, tickets: dispatched.tickets, stations: dispatched.stations,
+			kot_no: dispatched.kotNo, business_day: dispatched.businessDay, reprint: dispatched.reprint,
+		});
+	} catch (err: any) {
+		logger.error({ err, orderId }, 'print_kot_order_failed');
+		res.status(500).json({ error: String(err?.message ?? 'Unable to print the docket') });
 	}
 });
 

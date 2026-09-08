@@ -3,10 +3,11 @@
  * covers.
  */
 import type { Express, Request, Response } from "express";
-import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableSections, GetTableStatus, GetTables, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction } from "../database_supabase.js";
+import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableSections, GetTableStatus, GetTables, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
 import { idempotent } from "../idempotency.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
+import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
 import { AUDIT_TABLE_UPDATED, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
 
 
@@ -111,6 +112,47 @@ async function deleteStoredZone(scope: ZoneScope, name: string): Promise<number>
 }
 
 /**
+ * The floor's zone list as every caller must see it: the zones the TABLES carry
+ * (with their counts) unioned with the ROSTER (where an empty zone is the only
+ * kind that can live), de-duplicated case-insensitively, and put in the outlet's
+ * chosen order.
+ *
+ * Shared by GET /table-sections and PUT /table-sections/order so the reorder
+ * answers with the exact list the next GET would produce — a client that adopts
+ * the response cannot end up showing an order the server does not hold.
+ *
+ * The SORT is the last thing that happens and it happens unconditionally.
+ * Sorting inside the `if (scope)` (as this did when the union was inline) was
+ * harmless only because every section route is authenticated and therefore
+ * always has a scope; leaving the one line that decides the order dependent on
+ * that is a trap for whoever adds the next caller.
+ */
+async function buildSectionRoster(
+	req: Request,
+	restaurantId: string,
+): Promise<{ sections: TableSectionSummary[]; unassigned: number }> {
+	const roster = await GetTableSections(restaurantId);
+	const scope = zoneScope(req);
+	if (scope) {
+		// Union the two sources: zones derived from "Tables".section already carry
+		// their counts, and any roster row they don't cover is an EMPTY zone (0/0).
+		// Keyed case-insensitively, the same way rename/delete resolve a zone, so a
+		// stored "patio" never renders a second time next to a table's "Patio".
+		const seen = new Set(roster.sections.map((s) => s.section.trim().toLowerCase()));
+		for (const name of await listStoredZones(scope)) {
+			const key = name.trim().toLowerCase();
+			if (seen.has(key)) { continue; }
+			seen.add(key);
+			// An empty zone has no table to be summarised from, so its position has
+			// to come off the raw order map rather than a summary row.
+			roster.sections.push({ section: name, tables: 0, seats: 0, sort_order: roster.order[key] ?? null });
+		}
+	}
+	roster.sections.sort(compareTableSections);
+	return { sections: roster.sections, unassigned: roster.unassigned };
+}
+
+/**
  * The table as it stands BEFORE a PATCH, so the audit reason can name what
  * actually changed ("moved from Patio to Garden") instead of reprinting every
  * field on every edit. Best-effort: a null snapshot degrades the wording, never
@@ -142,7 +184,14 @@ async function readTableBeforeUpdate(
 	wrote the new zone to localStorage, which meant no audit entry and a zone that
 	never left that one browser.
 
-	GET    /table-sections            -> { sections: [{ section, tables, seats }], unassigned }
+	Migration 041 added a third thing a zone can carry: "Table_sections".sort_order,
+	the outlet's chosen position for it. Null everywhere until somebody rearranges,
+	and null sorts into the alphabetical tail, so the list reads exactly as it
+	always did until it is deliberately changed.
+
+	GET    /table-sections            -> { sections: [{ section, tables, seats, sort_order }], unassigned }
+	                                     in the outlet's chosen order
+	PUT    /table-sections/order      body { "sections": ["Entrance", "Bar"] } -> the GET body
 	POST   /table-sections            body { "name": "Garden" } -> { section, tables, seats }
 	PATCH  /table-sections/:name      body { "name": "New name" } -> { section, updated }
 	                                     409 if the new name is already a zone (both
@@ -416,26 +465,64 @@ app.get("/table-sections", validateAction(TABLE_SECTION_PERM), async (req: Reque
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
-		const roster = await GetTableSections(restaurantId);
-		const scope = zoneScope(req);
-		if (scope) {
-			// Union the two sources: zones derived from "Tables".section already carry
-			// their counts, and any roster row they don't cover is an EMPTY zone (0/0).
-			// Keyed case-insensitively, the same way rename/delete resolve a zone, so a
-			// stored "patio" never renders a second time next to a table's "Patio".
-			const seen = new Set(roster.sections.map((s) => s.section.trim().toLowerCase()));
-			for (const name of await listStoredZones(scope)) {
-				const key = name.toLowerCase();
-				if (seen.has(key)) { continue; }
-				seen.add(key);
-				roster.sections.push({ section: name, tables: 0, seats: 0 });
-			}
-			roster.sections.sort((a, b) => a.section.localeCompare(b.section, undefined, { sensitivity: "base" }));
-		}
-		res.json(roster);
+		res.json(await buildSectionRoster(req, restaurantId));
 	} catch (error: any) {
 		logger.error({ err: error }, "table_sections_list_failed");
 		res.status(500).json({ error: "Unable to fetch table sections" });
+	}
+});
+
+/*
+	Arrange the outlet's sections (migration 041).
+
+	PUT /table-sections/order  body { "sections": ["Entrance", "Main Hall", ...] }
+	  -> the same body GET /table-sections returns, in the new order.
+
+	WHY A WHOLE-LIST PUT and not "move Patio to index 2": a positional edit needs
+	the client and the server to agree on what the list currently is, and two
+	tablets dragging at the same time do not. Sending the finished list makes the
+	write idempotent, makes "last commit wins" a complete and explainable outcome
+	rather than a half-applied one, and means a client that is a few seconds stale
+	loses only its own drag. See ReorderTableSections for the locking that backs
+	that up, and table_sections_order.ts for why a stale list can never DROP a
+	section.
+
+	PERMISSION: rearranging the floor plan is section ADMINISTRATION — the same
+	gate as creating, renaming and dissolving a zone — not the "Table Added"
+	permission the floor holds for re-seating. Moving a table is service work;
+	deciding what order the whole restaurant reads its floor in is not.
+*/
+app.put("/table-sections/order", validateAction(TABLE_SECTION_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	let requested: string[];
+	try {
+		requested = readSectionOrderRequest(req.body);
+	} catch (error) {
+		// Only a malformed BODY is answered here. Anything else is a real fault and
+		// must not be reported to the client as "your request was wrong".
+		if (error instanceof SectionOrderRequestError) { res.status(400).json({ error: error.message }); return; }
+		throw error;
+	}
+	try {
+		const { ordered, positioned } = await ReorderTableSections(restaurantId, requested);
+		try { emitRestaurant(restaurantId, "table:sections_updated", { action: "reorder", sections: ordered }); } catch { /* ignore realtime errors */ }
+		try {
+			await log_audit(
+				req,
+				TABLE_SECTION_PERM,
+				`Rearranged table sections (${String(positioned)}): ${ordered.join(" -> ")}`,
+				Audit_log_category.Tables,
+				{ sections: ordered },
+			);
+		} catch (err) { logger.warn({ err }, "log_audit reorder-sections failed"); }
+		// Answer with the list as it now reads, not with what was sent: the two
+		// differ whenever the request was stale, and the client must adopt the
+		// server's version rather than keep believing its own.
+		res.json(await buildSectionRoster(req, restaurantId));
+	} catch (error: any) {
+		logger.error({ err: error }, "table_sections_reorder_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to rearrange sections") });
 	}
 });
 

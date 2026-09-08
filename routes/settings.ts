@@ -308,6 +308,11 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 			inventory_categories: Array.isArray(body.inventory_categories) ? body.inventory_categories : undefined,
 			timezone: typeof body.timezone === "string" ? body.timezone : undefined,
 			require_table_otp: typeof body.require_table_otp === "boolean" ? body.require_table_otp : undefined,
+			// Whether barking an order also prints its kitchen docket (migration
+			// 040). undefined leaves the stored value alone; only an explicit
+			// boolean writes, so a client that has never heard of this setting
+			// cannot silently turn it off by omitting it.
+			kot_auto_print: typeof body.kot_auto_print === "boolean" ? body.kot_auto_print : undefined,
 		});
 		const settingsUndo = buildSettingsUndo(priorSettings, result);
 		try {
