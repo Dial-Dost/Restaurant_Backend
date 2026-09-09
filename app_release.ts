@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.8.6";
+const LATEST = "1.9.0";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,12 +118,17 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"Kitchen tickets now print by themselves the moment an order is barked — no more remembering " +
-		"the button — and you can point each printer at what it should print: one for the kitchen, one " +
-		"for the bar, one for bills. A phone can drive a network printer too. Waiters now see only " +
-		"their own tables and covers instead of the restaurant's takings, and open straight onto " +
-		"Tables. You can drag table sections into the order your floor actually runs in. There is " +
-		"also a new look you can switch on in Settings, and switch straight back off.",
+		"Waiters now see only their own floor. Their app opens on Tables, shows their orders instead of " +
+		"seating, and carries their own average per cover, attendance and guest ratings — not the " +
+		"restaurant's takings. Settling, discounts, coupons, merging and reprinting are off the waiter's " +
+		"app entirely, so a busy shift cannot cost you a wrong bill. Kitchen tickets now print the moment " +
+		"the order is placed, held items included, and each printer can be pointed at the kind of order it " +
+		"should handle. Bills carry your legal name, address, phone and GSTIN, and can be split by menu " +
+		"section when a table wants drinks separate from food; item notes stay on the kitchen ticket and " +
+		"off the guest's copy. You can move a party to another table and the order and its kitchen ticket " +
+		"go with them. A table now turns occupied once an order is placed rather than the moment someone " +
+		"sits down. Table sections keep the order you made them in, and you can drag them into the order " +
+		"your floor actually runs in.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
