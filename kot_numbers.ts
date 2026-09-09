@@ -89,6 +89,25 @@ export function kotTicketKey(input: {
   businessDay: string;
   tableId: string;
   items: KotKeyItem[];
+  /**
+   * An extra identity component for a docket that is NOT the order's whole item
+   * set — today, exactly one caller: the line added to an order that is already
+   * on the pass (POST /orders/:id/items), which passes the added line's id.
+   *
+   * WHY IT HAS TO EXIST. Two separate "add a Gulab Jamun" presses on the same
+   * table produce byte-identical item sets, so without a discriminator the
+   * second one hashes to the first one's key, comes back reused, and the kitchen
+   * is never told about the second sweet. The line id is the only thing that
+   * distinguishes them, and it is already unique per line (randomUUID at the
+   * add, or the till's own id).
+   *
+   * APPENDED ONLY WHEN NON-EMPTY, never as a trailing empty group — the same
+   * rule `variation` follows above, and for the same reason: every ticket that
+   * does not use it must hash to exactly the value it hashed to before this
+   * existed, or the first reprint of every live table burns a second number for
+   * a docket already on paper.
+   */
+  scope?: string | null;
 }): string {
   const norm = (s: string | null | undefined): string => (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
   // Non-printing separators between every field, spelled as escapes rather than
@@ -111,7 +130,8 @@ export function kotTicketKey(input: {
     })
     .sort()
     .join(ITEM);
-  const material = [norm(input.outletId), norm(input.businessDay), norm(input.tableId), signature].join(GROUP);
+  const scope = norm(input.scope);
+  const material = [norm(input.outletId), norm(input.businessDay), norm(input.tableId), signature, ...(scope ? [scope] : [])].join(GROUP);
   // Hashed rather than stored raw: the item set of a large table is unbounded in
   // length, and the column is only ever compared for equality.
   return createHash("sha256").update(material, "utf8").digest("hex").slice(0, 40);

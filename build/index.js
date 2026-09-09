@@ -11,6 +11,7 @@ import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatfor
 import { registerPlatformRoutes } from "./platform/routes.js";
 import { closeRealtime, initRealtime } from "./realtime.js";
 import { runReportScheduleSweep } from "./report_schedules.js";
+import { warnAboutLegacyReleaseEnv } from "./app_release.js";
 import { runIdempotencyReaperSweep } from "./idempotency.js";
 import { runPrintJobReaperSweep } from "./print_jobs.js";
 import { extractBearerToken, isAllOutletsSentinel, normalizeRole, rawRequestedOutletId, sendDueBookingReminders } from "./routes/_shared.js";
@@ -23,7 +24,7 @@ import { registerCustomerCreateRoute, registerCustomerQueryRoutes } from "./rout
 import { registerTableRoutes, registerTableListRoute } from "./routes/tables.js";
 import { registerBookingCreateRoute, registerBookingListRoute, registerBookingStatusRoute, registerBookingTableAndCancelRoutes, registerBookingRangeRoute } from "./routes/bookings.js";
 import { registerValetInfoRoute, registerValetRoutes } from "./routes/valet.js";
-import { registerBillRoutes, registerBillPaymentRoutes, registerBillPrintAndEditRoutes, registerBillOpsRoutes } from "./routes/bills.js";
+import { registerBillRoutes, registerBillPaymentRoutes, registerBillPrintAndEditRoutes, registerBillOpsRoutes, registerTenderRoutes } from "./routes/bills.js";
 import { registerRestaurantLogoRoutes, registerSettingsRoutes, registerRestaurantProfileReadRoute, registerRestaurantProfileWriteRoute } from "./routes/settings.js";
 import { registerAuditRoutes } from "./routes/audit.js";
 import { registerInventoryRoutes, registerInventoryMovementRoutes, registerInventoryDeleteRoute, registerInventoryCategoryRenameRoute } from "./routes/inventory.js";
@@ -52,7 +53,10 @@ import { registerGuestFeedbackRoutes, registerFeedbackAdminRoutes } from "./rout
 import { registerUserRoutes } from "./routes/users.js";
 import { registerSimulationRoutes } from "./routes/simulation.js";
 import { registerPosterRoutes } from "./routes/posters.js";
+import { registerMisCaptureRoutes } from "./routes/mis_capture.js";
 import { registerMisReportRoutes } from "./routes/reports_mis.js";
+import { registerMenuTaxonomyRoutes } from "./routes/menu_taxonomy.js";
+import { registerSelfScorecardRoute } from "./routes/me.js";
 initObservability();
 const app = express();
 // Behind Railway's proxy — trust the first hop so req.ip is the real client IP
@@ -173,6 +177,7 @@ async function requireAuth(req, res, next) {
     }
     req.auth = {
         employeeId: session.employeeId,
+        employeeUsername: session.employeeUsername,
         res_id: session.res_id,
         outlet_id: effectiveOutlet,
         role: normalizedRole,
@@ -434,6 +439,27 @@ registerPosterRoutes(app);
 // one of its paths is a literal under /reports/mis/, so it can neither shadow
 // nor be shadowed by the accounting /reports/* routes registered far above.
 registerMisReportRoutes(app);
+// The MIS CAPTURE writes (non-chargeable, order voids, service-charge waivers).
+// These are the control ledgers the reports above read; without them the reports
+// are permanently empty, so an unregistered file here is a silent no-op.
+registerMisCaptureRoutes(app);
+// TENDERS, TIPS AND BILLING COUNTERS (migrations 037/038). Registered after
+// everything else so no earlier pattern can swallow /bills/tenders,
+// /bills/counter, /billing-counters or /tips, and so none of them can shadow a
+// bill route that already exists — every path here is a literal.
+registerTenderRoutes(app);
+// Menu groups + item variations (migration 039). Registered last, beside the
+// other 039 surface: every path is a literal under /menu-groups,
+// /menu-group-assignments or /menu-variations, none of which any earlier pattern
+// can match, so its position cannot shadow or be shadowed by anything above —
+// including the /menu/* routes it sits conceptually next to.
+registerMenuTaxonomyRoutes(app);
+// The signed-in employee's OWN scorecard (`GET /me/scorecard`) — the read behind
+// a waiter's Overview. Registered last on purpose: /me is a namespace nothing
+// above uses, so a single literal path here can neither shadow an existing route
+// nor be shadowed by one, and appending rather than inserting keeps the route
+// manifest's diff to the one line this actually adds.
+registerSelfScorecardRoute(app);
 export { app };
 app.use((err, req, res, next) => {
     if (err instanceof SyntaxError && "body" in err) {
@@ -496,6 +522,11 @@ export function ensureRealtime() {
 }
 async function bootstrap() {
     var _a, _b, _c, _d;
+    // Say once, at boot, if the old release variables are still set on this box.
+    // They are inert now (app_release.ts owns the manifest), and discovering that
+    // mid-incident — after editing .env and restarting and seeing no change — is
+    // the worst possible moment to learn it.
+    warnAboutLegacyReleaseEnv(logger);
     // The CSR Organics demo tenant (admin/admin123) must NOT be auto-created on a
     // production/turnkey deploy. Seed only when explicitly opted in, or outside
     // production. EnsureRestaurantSeed is idempotent, so existing tenants are safe.

@@ -73,11 +73,39 @@ export function sectionOrderKey(name: string): string {
   return name.trim().toLowerCase();
 }
 
-/** A section as the ordering cares about it: what it is called and where it
- *  sits. `sort_order` null = never positioned. */
+/** A section as the ordering cares about it: what it is called, where it sits,
+ *  and when it came into being. `sort_order` null = never positioned;
+ *  `created_at` null = no birth instant is known (see [compareTableSections]). */
 export interface OrderableSection {
   section: string;
   sort_order: number | null;
+  /**
+   * When this zone first existed, as epoch milliseconds.
+   *
+   * WHAT IT IS, AND WHY IT IS NOT SIMPLY THE ROSTER ROW'S created_at. A zone
+   * exists in two places (see this file's header) and the roster row is the
+   * younger of them: a zone that was only ever a "Tables".section string gets
+   * its roster row MATERIALISED by the first reorder, so that row's created_at
+   * is when the owner rearranged their floor, not when they first used the
+   * zone. Ordering by it would put a zone the restaurant has had since it
+   * opened after one created last week, which is the exact opposite of what
+   * "creation order" is supposed to mean.
+   *
+   * So the caller resolves it as the EARLIEST EVIDENCE THE ZONE EXISTED: the
+   * roster row's created_at, or the first table ever put in the zone, whichever
+   * is older. See readSectionBirthByKey in database_supabase.ts. An empty zone
+   * has no tables and falls back to its roster row, which is correct - an empty
+   * zone exists only because somebody created that row.
+   */
+  created_at?: number | null;
+}
+
+/** The birth instant [compareTableSections] should use, or null when none is
+ *  known. Non-finite values (a bad row, an unparseable date) are treated as
+ *  unknown rather than sorted unpredictably against everything else. */
+function birthOf(s: OrderableSection): number | null {
+  const at = s.created_at;
+  return typeof at === "number" && Number.isFinite(at) ? at : null;
 }
 
 /**
@@ -85,20 +113,53 @@ export interface OrderableSection {
  *
  *   1. positioned sections before unpositioned ones,
  *   2. positioned sections by their position ascending,
- *   3. everything else — and any tie — alphabetically, case-insensitively.
+ *   3. everything else in CREATION ORDER, oldest first,
+ *   4. and any remaining tie alphabetically, case-insensitively.
  *
- * Step 3 is not a rounding-off; it is the ENTIRE behaviour of an outlet that
- * has never reordered (every row null, so 1 and 2 never fire) and it is why
- * shipping this feature changes nothing on screen until somebody drags
- * something. It uses localeCompare with `sensitivity: "base"`, which is
- * character-for-character what GET /table-sections already sorted with on
- * 1.8.5, so the untouched case is not merely "still alphabetical" but the same
- * alphabetical.
+ * WHY STEP 3 IS NO LONGER ALPHABETICAL, AND WHAT THAT REVERSES
+ * -----------------------------------------------------------
+ * Migration 041 shipped `(sort_order IS NULL, sort_order, lower(name))`, and
+ * the alphabetical tail was chosen for one honest reason: on 1.8.5 the schema
+ * had no ordering column, so `order by name` was the only total order the data
+ * could express, and keeping it made 041 invisible until somebody dragged
+ * something.
+ *
+ * That was the right default for a release whose whole promise was "nothing
+ * moves". It is the wrong default for the question the owner was actually
+ * asking. A floor is not laid out alphabetically, and it is not in dictionary
+ * order by accident either: an owner who adds Entrance, then Main Hall, then
+ * Terrace has already expressed an order, by building the restaurant in that
+ * sequence. Alphabetical THROWS THAT AWAY and hands back an arrangement nobody
+ * chose - it is the only ordering in the app that can put a zone created this
+ * morning above one the restaurant has had for three years.
+ *
+ * Every row already carries a creation instant (both sources are `created_at
+ * timestamptz NOT NULL DEFAULT now()`), so this costs no migration and no
+ * backfill. It is a different reading of data that has been there all along.
+ *
+ * WHAT IT CHANGES ON SCREEN, said plainly: an outlet that has never reordered
+ * DOES move. That is the point of the change, and it is the one thing 041
+ * promised would not happen, so it is stated here rather than discovered on a
+ * till. Nothing about a REARRANGED outlet moves - steps 1 and 2 are untouched,
+ * so every position an owner has chosen still wins outright.
+ *
+ * WHY UNDATED SECTIONS SORT LAST. `created_at` is null only when the birth
+ * instant could not be READ at all (an unmigrated schema, a failed roster
+ * query), never for one zone out of several, because both sources have a NOT
+ * NULL creation column. So the realistic states are "every section dated"
+ * (creation order) and "no section dated" (step 4 fires for the whole list,
+ * which is 1.8.5 alphabetical exactly). Placing the unknown last is the same
+ * rule step 1 applies to an unknown position: no information sorts after
+ * information.
  *
  * The final tiebreak on the raw key makes the order TOTAL: two sections whose
  * names compare equal under a base-sensitivity collation ("Patio" and "patio",
  * which the union should have folded into one but which a hand-edited row could
  * still produce) must not swap places between two renders of the same data.
+ * Two sections born in the same millisecond fall through to it as well - the
+ * materialising INSERT in ReorderTableSections writes a whole outlet's roster
+ * rows inside ONE statement, so equal timestamps are the normal case for a
+ * first reorder, not an exotic one, and that is why this line has to stay.
  */
 export function compareTableSections(a: OrderableSection, b: OrderableSection): number {
   // A non-finite position is treated as no position at all: NaN sorts
@@ -108,6 +169,10 @@ export function compareTableSections(a: OrderableSection, b: OrderableSection): 
   const bp = b.sort_order !== null && Number.isFinite(b.sort_order) ? b.sort_order : null;
   if ((ap === null) !== (bp === null)) {return ap === null ? 1 : -1;}
   if (ap !== null && bp !== null && ap !== bp) {return ap - bp;}
+  const ab = birthOf(a);
+  const bb = birthOf(b);
+  if ((ab === null) !== (bb === null)) {return ab === null ? 1 : -1;}
+  if (ab !== null && bb !== null && ab !== bb) {return ab - bb;}
   const byName = a.section.localeCompare(b.section, undefined, { sensitivity: "base" });
   if (byName !== 0) {return byName;}
   const ak = sectionOrderKey(a.section);
@@ -186,15 +251,36 @@ export function readSectionOrderRequest(body: unknown): string[] {
  *     after everything the client did name.
  *   * A section named in the request that no longer exists is ignored, not
  *     invented. There is no row to carry its position.
- *   * The remainder is appended in the SAME alphabetical order the whole list
- *     had before this feature existed, so the part of the floor nobody has
- *     touched keeps the arrangement people already know.
+ *   * The remainder is appended in the same order the SCREEN shows it in -
+ *     creation order, oldest first, falling through to alphabetical for
+ *     anything whose birth instant is unknown (see [compareTableSections]). It
+ *     has to be the screen's order and not merely "some order", because this
+ *     tail is about to be stamped into `sort_order` permanently: whatever this
+ *     line decides is what the floor plan reads as for ever afterwards.
  *
  * Every section ends up positioned once an outlet reorders at all — the null
  * bucket is emptied for that outlet — which is exactly why a section created
  * LATER (null again) sorts to the end rather than into the middle.
  */
-export function planSectionOrder(requested: readonly string[], existing: readonly string[]): string[] {
+export function planSectionOrder(
+  requested: readonly string[],
+  existing: readonly string[],
+  /**
+   * Birth instants by [sectionOrderKey], as epoch milliseconds - the same map
+   * the read path sorts by. Optional, and an absent key simply has no known
+   * birth: with no map at all the appended remainder falls through to the
+   * alphabetical tiebreak, which is exactly what this function did before
+   * creation order existed.
+   *
+   * It matters here and not only on the read path because the remainder is
+   * APPENDED IN THE ORDER THIS FUNCTION CHOOSES and then renumbered 1..N by the
+   * caller - i.e. this call is what STAMPS a permanent position on every
+   * section the request did not name. Sorting that tail alphabetically while
+   * the screen sorts it by creation would freeze the wrong arrangement into
+   * `sort_order` the first time an owner rearranged anything.
+   */
+  birthByKey?: ReadonlyMap<string, number>,
+): string[] {
   // Keyed by identity, first spelling wins — the same de-duplication the union
   // in GET /table-sections performs, so a roster "patio" and a table's "Patio"
   // are one entry here too and cannot be handed two different positions.
@@ -222,7 +308,11 @@ export function planSectionOrder(requested: readonly string[], existing: readonl
   const rest = [...byKey.entries()]
     .filter(([key]) => !taken.has(key))
     .map(([, label]) => label)
-    .sort((a, b) => compareTableSections({ section: a, sort_order: null }, { section: b, sort_order: null }));
+    .sort((a, b) =>
+      compareTableSections(
+        { section: a, sort_order: null, created_at: birthByKey?.get(sectionOrderKey(a)) ?? null },
+        { section: b, sort_order: null, created_at: birthByKey?.get(sectionOrderKey(b)) ?? null },
+      ));
 
   return [...placed, ...rest];
 }

@@ -38,6 +38,10 @@ import {
   computeBillCharges,
   computeCouponDiscount,
   computeBillSplit,
+  // Migration 039 wired into the till: splitting a bill between the parts of
+  // the menu it came from. Its own header explains why it is not a fourth
+  // branch inside computeBillSplit.
+  computeSectionSplit,
   // MIS data capture (migrations 034-039). The money rules live in
   // billing_math.ts beside computeBillCharges, deliberately — see mis_capture.ts's
   // header for why the classification rules live somewhere else.
@@ -59,6 +63,8 @@ import {
   type BillDiscount,
   type ServiceChargeWaiverQuote,
   type TenderReconciliation,
+  type SectionSplitLine,
+  type SectionSplitResult,
   type VariationPriceRef,
 } from "./billing_math.js";
 // The floor-section ordering rules (migration 041). Kept out of SQL on purpose:
@@ -2550,8 +2556,22 @@ export interface TableSectionSummary {
   tables: number;
   seats: number;
   /** Chosen position within this outlet, 1-based; null = never positioned, which
-   *  sorts into the alphabetical tail. See table_sections_order.ts. */
+   *  sorts into the CREATION-ORDER tail. See table_sections_order.ts. */
   sort_order: number | null;
+  /**
+   * When this zone first existed, ISO-8601, or null when that could not be read.
+   *
+   * The tail of the read order (everything the owner has never positioned) is
+   * sorted by this, so it has to reach the client: the floor plan does its own
+   * grouping and sorting, and a client that could only see `sort_order` would
+   * have to fall back to alphabetical for every unpositioned zone - i.e. for
+   * every zone in every outlet that has never rearranged anything, which is
+   * exactly the case this ordering exists to fix.
+   *
+   * Resolved as the EARLIEST EVIDENCE the zone existed (roster row vs first
+   * table in it) - see readSectionBirthByKey.
+   */
+  created_at: string | null;
 }
 
 // Per-outlet section ORDER (migration 041). Its own ensure key so it still runs
@@ -2594,11 +2614,15 @@ async function ensureTableSectionOrderColumn(client?: PoolClient): Promise<void>
  * the process lives.
  */
 let sectionOrderColumnPresent: boolean | null = null;
+/** The same probe for the birth read: null = never asked, false = the schema
+ *  cannot answer and the tail falls back to alphabetical. */
+let sectionBirthReadable: boolean | null = null;
 
 /** Test seam: jest drives ReorderTableSections against fixtures in one process
  *  and must not inherit an earlier suite's probe result. */
 export function __resetSectionOrderProbe(): void {
   sectionOrderColumnPresent = null;
+  sectionBirthReadable = null;
 }
 
 /**
@@ -2653,13 +2677,93 @@ async function readSectionOrderByKey(context: { res_id: string; outlet_id: strin
   return out;
 }
 
+/**
+ * When each of this outlet's zones first existed, keyed by [sectionOrderKey] and
+ * valued in epoch milliseconds. This is the tail of the read order: every zone
+ * the owner has never dragged sorts by it, oldest first.
+ *
+ * THE EARLIEST EVIDENCE, NOT THE ROSTER ROW - and the difference is the whole
+ * reason this is a function rather than one more column in the roster read.
+ *
+ * A zone exists in two places (see table_sections_order.ts) and the roster row
+ * is routinely the YOUNGER of them. A zone that was only ever a "Tables".section
+ * string has no roster row at all until ReorderTableSections materialises one,
+ * and that INSERT stamps created_at = now(). Sort by the roster alone and the
+ * first rearrangement an owner ever makes would date every long-standing zone to
+ * the minute they rearranged - a restaurant's original Main Hall would come out
+ * NEWER than a Terrace added last month, and "creation order" would be a lie
+ * told confidently. So both sources are unioned and the OLDEST instant wins:
+ *
+ *   * a zone with tables in it is dated by the first table ever put in it,
+ *     which is when the owner actually started using it;
+ *   * an EMPTY zone has no table to be dated by and falls back to its roster
+ *     row, which is correct - an empty zone exists only because somebody
+ *     created that row;
+ *   * a zone with both takes the older, so materialisation can never re-date a
+ *     zone that was already in use.
+ *
+ * The "Tables" half carries the SAME predicates GetTableSections groups by
+ * (is_deleted, is_virtual, blank labels), so a deleted table cannot date a zone
+ * it is no longer part of and a hidden takeaway row cannot date one at all.
+ *
+ * DEGRADATION, same rule as readSectionOrderByKey: an empty map is a legal
+ * answer. Every consumer treats "no birth instant" as the alphabetical tail,
+ * which is 1.8.5's order exactly, so a schema this build is running ahead of
+ * costs the new ordering and nothing else.
+ */
+async function readSectionBirthByKey(context: { res_id: string; outlet_id: string }): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  // Same in-transaction guard readSectionOrderByKey carries: a missing
+  // "Table_sections" raises 42P01, and inside a transaction that aborts
+  // everything the caller has done so far. Until one plain read has proved the
+  // table is there, do not ask from inside a transaction.
+  const inTxn = (tenantStorage.getStore()?.txnDepth ?? 0) > 0;
+  if (sectionBirthReadable === false) {return out;}
+  if (sectionBirthReadable === null && inTxn) {return out;}
+  try {
+    const rows = await runQuery<{ name: string; at: Date | string | null }>(
+      `
+        select key as name, min(at) as at
+          from (
+            select lower(btrim(name)) as key, created_at as at
+              from "Table_sections"
+             where res_id = $1 and outlet_id = $2 and btrim(name) <> ''
+            union all
+            select lower(btrim(section)) as key, created_at as at
+              from "Tables"
+             where res_id = $1 and outlet_id = $2
+               and coalesce(is_deleted, false) = false
+               and coalesce(is_virtual, false) = false
+               and nullif(btrim(coalesce(section, '')), '') is not null
+          ) u
+         group by key
+      `,
+      [context.res_id, context.outlet_id],
+    );
+    sectionBirthReadable = true;
+    for (const r of rows) {
+      const key = sectionOrderKey(String(r.name ?? ""));
+      if (!key) {continue;}
+      const at = r.at instanceof Date ? r.at.getTime() : Date.parse(String(r.at ?? ""));
+      if (!Number.isFinite(at)) {continue;}
+      const seen = out.get(key);
+      if (seen === undefined || at < seen) {out.set(key, at);}
+    }
+  } catch (err) {
+    const code = (err as { code?: string } | null)?.code;
+    if (code === "42703" || code === "42P01") {sectionBirthReadable = false;}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "table_section_birth_read_failed");
+  }
+  return out;
+}
+
 /** Every named section for the outlet + how many tables/seats sit in it, plus
  *  the outlet's chosen order. `order` is handed back raw as well as stamped onto
  *  the summaries, because the caller unions in the EMPTY zones — which have no
  *  table to be summarised from — and has to position those too. */
 export async function GetTableSections(
   restaurantId: string,
-): Promise<{ sections: TableSectionSummary[]; unassigned: number; order: Record<string, number> }> {
+): Promise<{ sections: TableSectionSummary[]; unassigned: number; order: Record<string, number>; born: Record<string, string> }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureTableSectionOrderColumn();
@@ -2683,15 +2787,18 @@ export async function GetTableSections(
     [context.res_id, context.outlet_id],
   );
   const orderByKey = await readSectionOrderByKey(context);
+  const birthByKey = await readSectionBirthByKey(context);
   let unassigned = 0;
   const sections: TableSectionSummary[] = [];
   for (const r of rows) {
     if (!r.section) { unassigned += Number(r.tables ?? 0); continue; }
+    const born = birthByKey.get(sectionOrderKey(r.section));
     sections.push({
       section: r.section,
       tables: Number(r.tables ?? 0),
       seats: Number(r.seats ?? 0),
       sort_order: orderByKey.get(sectionOrderKey(r.section)) ?? null,
+      created_at: born === undefined ? null : new Date(born).toISOString(),
     });
   }
   // The SQL orders alphabetically (it has to pick something); the chosen order
@@ -2699,8 +2806,24 @@ export async function GetTableSections(
   // sorts AGAIN after it unions in the empty roster zones — that re-sort is what
   // places those, and it cannot disagree with this one because it is the same
   // function.
-  sections.sort(compareTableSections);
-  return { sections, unassigned, order: Object.fromEntries(orderByKey) };
+  // compareTableSections wants epoch millis; the summaries carry ISO, so the
+  // birth map is handed to it directly rather than round-tripped through the
+  // string. Same comparator the caller re-sorts with after it unions in the
+  // empty roster zones, so the two can never disagree.
+  sections.sort((a, b) =>
+    compareTableSections(
+      { ...a, created_at: birthByKey.get(sectionOrderKey(a.section)) ?? null },
+      { ...b, created_at: birthByKey.get(sectionOrderKey(b.section)) ?? null },
+    ));
+  return {
+    sections,
+    unassigned,
+    order: Object.fromEntries(orderByKey),
+    // Raw birth instants alongside the summaries, for exactly the reason `order`
+    // is handed back raw: the caller unions in EMPTY zones, which have no
+    // summary row to have been dated from, and has to date those too.
+    born: Object.fromEntries([...birthByKey].map(([k, v]) => [k, new Date(v).toISOString()])),
+  };
 }
 
 /**
@@ -2748,6 +2871,17 @@ export async function ReorderTableSections(
   await ensureTableOccupancyColumns();
   await ensureTableSectionOrderColumn();
 
+  // READ BEFORE THE TRANSACTION, DELIBERATELY. Step 2 below materialises a
+  // roster row for every implicit zone, stamping created_at = now() on it; read
+  // the birth map afterwards and every one of those zones would date to this
+  // request. Reading first sees the truth the materialisation is about to
+  // paper over - the first table ever put in each zone - which is the whole
+  // point of ordering by creation. (A zone created by another device between
+  // this read and the lock is simply undated here, so it joins the
+  // alphabetical tail of the remainder rather than being lost; planSectionOrder
+  // still appends it, which is the invariant that matters.)
+  const birthByKey = await readSectionBirthByKey(context);
+
   return withTransaction(async (client) => {
     await runQuery(
       `select id from "Table_sections" where res_id = $1 and outlet_id = $2 for update`,
@@ -2785,7 +2919,7 @@ export async function ReorderTableSections(
       client,
     );
 
-    const ordered = planSectionOrder(requested, roster.map((r) => r.name));
+    const ordered = planSectionOrder(requested, roster.map((r) => r.name), birthByKey);
     // First id wins per key, matching planSectionOrder's own first-spelling-wins
     // de-duplication: a database that somehow holds two rows for one zone gets
     // one of them positioned and the other left null (alphabetical tail), rather
@@ -3740,7 +3874,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -3815,7 +3949,20 @@ export async function GetBillForTable(
   // Aggregate the placed line items (merged by name + price) for the bill view.
   // Per-item notes are carried through (distinct notes joined) so the kitchen/
   // waiter sees any special instructions on the bill.
-  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string }>();
+  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }>();
+  // HOW MANY OF EACH MERGED LINE ARE ON COURSE HOLD, tracked ALONGSIDE the merge
+  // rather than inside its key.
+  //
+  // Held-ness deliberately does NOT split a bill line. If it did, a table with
+  // two Paneer Tikkas — one held, one not — would print two "x1" lines while the
+  // course waited and one "x2" line after it was fired: the same bill, printed
+  // twice minutes apart, disagreeing about its own shape for a reason the guest
+  // cannot see and the total does not reflect. The kitchen needs the split and
+  // the guest does not, so the count rides along and kot_print.ts splits the
+  // DOCKET line while the bill line stays whole. The key is absent entirely
+  // unless something really is held, so a restaurant that never holds a course
+  // gets byte-identical items out of this function.
+  const heldByKey = new Map<string, number>();
   let billCustomer = "";
   let ncTotal = 0;
   for (const o of orderRows) {
@@ -3857,6 +4004,10 @@ export async function GetBillForTable(
       // key and the item are byte-identical to what they were.
       const variation = String(it.variation_name ?? "").trim();
       const key = `${name.toLowerCase()}@@${price}@@${nc ? "nc" : ""}@@${variation.toLowerCase()}`;
+      // Same predicate extractHeldItemIds uses, so the docket, the KDS and the
+      // prep timers all agree on which lines are still waiting: held means the
+      // waiter marked it hold AND nobody has fired it since.
+      if (it.course_hold === true && !it.fired_at) {heldByKey.set(key, (heldByKey.get(key) ?? 0) + quantity);}
       const existing = itemMap.get(key);
       if (existing) {
         existing.quantity += quantity;
@@ -3870,7 +4021,10 @@ export async function GetBillForTable(
       }
     }
   }
-  const items = [...itemMap.values()];
+  const items = [...itemMap.entries()].map(([key, item]) => {
+    const heldQty = heldByKey.get(key) ?? 0;
+    return heldQty > 0 ? { ...item, held_qty: Math.min(heldQty, item.quantity) } : item;
+  });
 
   // Running bill total = sum of the table's active orders; APC = total / covers.
   // APC stays on the pre-tax subtotal (per-cover spend convention).
@@ -4191,7 +4345,7 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; booked?: boolean; reserved?: boolean; occupied?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null }[] | null> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
@@ -4317,8 +4471,15 @@ export async function GetTables(
     [context.res_id, context.outlet_id],
   ).catch(() => [] as { table_id: string | null; food: unknown }[]);
   const totalByTable = new Map<string, number>();
+  // WHICH TABLES HAVE AN ORDER ON THEM - tracked as its own set rather than
+  // inferred from a total, because a table can genuinely be running a bill of
+  // ZERO (every line comped under migration 034, or a round that has only been
+  // rung as non-chargeable). "There is an order" and "the order is worth
+  // something" are different questions and the floor plan asks the first one.
+  const orderedTables = new Set<string>();
   for (const o of activeOrders) {
     if (!o.table_id) {continue;}
+    orderedTables.add(o.table_id);
     const p = parseJsonObject(o.food) ?? {};
     const t = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     totalByTable.set(o.table_id, (totalByTable.get(o.table_id) ?? 0) + t);
@@ -4339,6 +4500,12 @@ export async function GetTables(
   // answer "nothing is positioned" if migration 041 has not run yet. A join
   // would turn that window into a 500 for every device on the floor.
   const sectionOrder = await readSectionOrderByKey(context);
+  // ...and, for everything the owner has NOT positioned, when each zone came
+  // into being. It rides on this route for the same reason section_position
+  // does: the roster is gated behind "Manage Table Sections", so a manager or a
+  // waiter would otherwise see a floor sorted alphabetically while the owner
+  // who set it up sees creation order.
+  const sectionBirth = await readSectionBirthByKey(context);
 
   return tableRows.map((row) => {
     const occupied = row.is_occupied;
@@ -4357,9 +4524,35 @@ export async function GetTables(
       // positioned, which clients render in the alphabetical tail. Null for
       // every table until somebody reorders, so this is inert on 1.8.5 data.
       section_position: sectionOrder.get(sectionOrderKey(row.section ?? "")) ?? null,
+      // When that section first existed, ISO-8601; null when unknown. The tail
+      // of the floor order (every zone nobody has positioned) sorts by this.
+      section_created_at: (() => {
+        const at = sectionBirth.get(sectionOrderKey(row.section ?? ""));
+        return at === undefined ? null : new Date(at).toISOString();
+      })(),
       booked: bookedTables.has(row.id),
       reserved: reservedTables.has(row.id),
+      // WHAT `occupied` MEANS HERE HAS NOT CHANGED, AND MUST NOT.
+      //
+      // It is "Tables".is_occupied - the SEATING - and every consumer built on
+      // that reading stays correct: the TableSessions trigger opens a seating
+      // row on this flag, covers are counted once per seating, APC is bill over
+      // covers, and turnaround is seated_at -> left_at. Redefining this field to
+      // mean "has an order" would silently redefine a COVER, and therefore APC,
+      // the MIS reports and the simulator baseline, for every client that reads
+      // it - including the web dashboard and the waiter app, which are not in
+      // this repo. So the wire keeps its meaning and the two facts the floor
+      // plan actually wants are added ALONGSIDE it.
       occupied,
+      // The seating, named for what it is. Same value as `occupied`; a client
+      // written against the new vocabulary should not have to know that the old
+      // field was the seating all along.
+      seated: occupied,
+      // Whether anything has been ORDERED at this table yet. This is the half of
+      // the status the floor plan was missing: a party that has been sat down
+      // but has not ordered is not the same thing as a table with food coming,
+      // and until now both painted the same colour.
+      has_order: orderedTables.has(row.id),
       covers: parseNumeric(row.num_covers),
       payment_pending: pendingTables.has(row.id),
       table_total: tTotal,
@@ -13217,10 +13410,188 @@ export async function DecideDiscountRequest(
   });
 }
 
+// ============================================================================
+// SPLITTING A BILL
+// ============================================================================
+//
+// Three ways, none of which mutates anything: the whole table still settles as
+// ONE bill, and a split is a proposal the till reads out and takes payment
+// against (migration 037's tenders are what record the money).
+//
+//   'even'    — divide the grand total N ways. What "split the bill" has always
+//               meant here: N is the head count.
+//   'item'    — total the caller's own guest groups and pro-rate the charges.
+//   'section' — divide it between the parts of the MENU the food came from:
+//               starters, mains, the bar. The caller picks the AXIS; the menu
+//               decides the buckets and every line lands in exactly one.
+//
+// WHY 'section' NEEDS THE ORDER LINES AND NOT THE OPEN BILL'S ITEM LIST. The
+// bill's items are merged for PRINTING — by name, price, NC flag and variation
+// label — and the merge drops `menu_id`, which is the only authoritative link
+// from a sold line back to the menu row it came from (migration 039 stamps it
+// server-side; a name is all a pre-039 line has). Splitting off the printed list
+// would therefore misfile every dish that has been renamed since it was ordered,
+// and the section a guest is asked to pay for is not a place to guess. It also
+// rounds quantities to whole units, which a weighed line is not.
+//
+// WHICH AXES EXIST, and why more than one. The user's own example — "starters,
+// mains, alcohol/drinks" — is TWO different cuts of the menu in one sentence.
+// Starters and mains are CATEGORIES (the "Menue_sub_cat" every tenant already
+// has, with no configuration at all). Alcohol is a revenue GROUP (migration 039:
+// Food / Beverage / Liquor, the axis an accountant and a licensing return care
+// about, and one an owner has to configure before it says anything). Serving
+// only groups would answer half the question and answer it as one big
+// "Unclassified" bucket for every tenant that has not set them up yet; serving
+// only categories would never produce the food-versus-bar cut that is the reason
+// anybody asks. So the axis is the caller's, `category` is the default because
+// it works for every tenant on day one, and the response says which one ran.
+
+/** Which cut of the menu a section split divides a bill along. */
+export type BillSectionAxis = "category" | "revenue_group" | "production_group";
+
+/** The axes a client may ask for. Anything else is refused at the door. */
+export const BILL_SECTION_AXES: readonly BillSectionAxis[] = ["category", "revenue_group", "production_group"];
+
+export interface BillSectionSplitResult extends SectionSplitResult {
+  axis: BillSectionAxis;
+  /** Sentences for the till. Where the money went that could not be classified. */
+  notes: string[];
+}
+
+/**
+ * WHICH SECTION ONE ATTRIBUTED LINE BELONGS TO, on the requested axis.
+ *
+ * Pure and exported so the RULE can be tested without a table, a bill or a
+ * database — it decides which guest is asked to pay for which dish, and that is
+ * not a decision to leave only reachable through three joins.
+ *
+ * THE GROUP AXES ARE attributionBucket, VERBATIM. Not a lookalike: the Group
+ * Summary report cuts the same lines into the same buckets with the same names,
+ * so an owner who checks a split against that report finds them agreeing, and a
+ * future change to what counts as a gap changes both at once.
+ *
+ * THE CATEGORY AXIS MAKES THE SAME DISTINCTION BETWEEN THE TWO GAPS. A line that
+ * resolved to no menu row at all is "Unattributed" — a HISTORY gap: the dish was
+ * deleted or renamed, or the line was typed off-menu, and nothing an owner does
+ * today closes it backwards. A line that resolved to a menu row with no category
+ * is "Unclassified" — a CONFIGURATION gap that closes the moment the dish is
+ * filed. Folding them together would tell an owner who has just tidied their
+ * whole menu that a bucket they cannot empty is still their fault; folding either
+ * into a real section would put money in a section nobody put it in, and here
+ * that is money somebody is about to be asked to hand over.
+ */
+export function resolveBillSection(
+  attribution: OrderLineAttribution,
+  axis: BillSectionAxis,
+  categoryByMenuId: ReadonlyMap<string, string>,
+): { key: string; label: string; gap: boolean } {
+  if (axis !== "category") {
+    const bucket = attributionBucket(attribution);
+    return { key: bucket.key, label: bucket.name, gap: bucket.gap };
+  }
+  if (attribution.source === "unresolved") {
+    return { key: `~${UNATTRIBUTED_GROUP}`, label: UNATTRIBUTED_GROUP, gap: true };
+  }
+  const category = (categoryByMenuId.get(attribution.menu_id ?? "") ?? "").trim();
+  if (!category) {
+    return { key: `~${UNCLASSIFIED_GROUP}`, label: UNCLASSIFIED_GROUP, gap: true };
+  }
+  // Keyed case-insensitively for the reason "MenuGroups".name is: "Starters" and
+  // "starters" as two sections would split one part of the bill in two, and the
+  // guest would be handed both.
+  return { key: `category:${category.toLowerCase()}`, label: category, gap: false };
+}
+
+/**
+ * Every ACTIVE order line on a table, tagged with the section it belongs to.
+ *
+ * THE ATTRIBUTION IS THE REPORT'S ATTRIBUTION, not a second copy of it.
+ * attributeOrderLine resolves a line to a menu row (stamped menu_id, then the
+ * line's own id, then its name, then nothing) and attributionBucket turns that
+ * into a bucket — the exact pair GetGroupSummaryReport uses. So a section on a
+ * split and a row in the Group Summary are the same bucket with the same name,
+ * and an owner who reconciles one against the other finds them agreeing. A
+ * lookalike resolver here would have been the third copy of a rule that must not
+ * drift.
+ *
+ * THE CATEGORY AXIS BORROWS THE SAME LADDER rather than matching names itself:
+ * it resolves the line to a menu row through attributeOrderLine and then reads
+ * that ROW's category. The unresolved line is Unattributed for the same reason
+ * it is there — the dish it names is gone — and a row whose category is somehow
+ * blank is Unclassified, which is the same distinction between a history gap and
+ * a configuration gap that the group axes make.
+ */
+async function sectionLinesForTable(
+  restaurantId: string,
+  context: RestaurantContext,
+  tableId: string,
+  axis: BillSectionAxis,
+  client?: PoolClient,
+): Promise<SectionSplitLine[]> {
+  // The same "belongs to the CURRENT occupancy" predicate GetBillForTable uses.
+  const orderRows = await runQuery<{ food: unknown }>(
+    `
+      select food
+      from "Orders"
+      where res_id = $1 and outlet_id = $2 and table_id = $3
+        and coalesce(status::text, '1') not in ('4', '5', '7')
+      order by created_at asc
+    `,
+    [context.res_id, context.outlet_id, tableId],
+    client,
+  );
+
+  let index: MenuAttributionIndex;
+  const categoryByMenuId = new Map<string, string>();
+  if (axis === "category") {
+    // ONE menu read. GetMenuItems returns EVERY row (no availability filter) and
+    // flattens the taxonomy the same way the POS, the QR menu and the item
+    // reports do — sub-category, falling back to main — so the section names on
+    // a split are the section names on the menu screen, not a fourth vocabulary.
+    const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
+    for (const m of menu) {categoryByMenuId.set(String(m.id), String(m.category ?? "").trim());}
+    index = buildMenuAttributionIndex(
+      menu.map((m) => ({ id: String(m.id), name: m.name, group_id: null, group_name: null })),
+    );
+  } else {
+    index = await GetMenuAttributionIndex(restaurantId, axis === "production_group" ? "production" : "revenue");
+  }
+
+  const lines: SectionSplitLine[] = [];
+  for (const row of orderRows) {
+    const food = parseJsonObject(row.food) ?? {};
+    const list = Array.isArray((food as { items?: unknown }).items) ? (food as { items: unknown[] }).items : [];
+    for (const raw of list) {
+      const it = (raw ?? {}) as Record<string, unknown>;
+      const section = resolveBillSection(attributeOrderLine(it, index), axis, categoryByMenuId);
+      const nc = isNonChargeableLine(it);
+      lines.push({
+        section_key: section.key,
+        section_label: section.label,
+        section_gap: section.gap,
+        name: String(it.name ?? "Item"),
+        // orderLinePrice / orderLineQuantity, not a local coercion: the WEIGHT a
+        // section is allocated by has to be read exactly as chargeableSubtotal
+        // reads the money it is a share of, or a weighed line would weigh one
+        // amount and bill another.
+        price: orderLinePrice(it),
+        quantity: orderLineQuantity(it),
+        ...(nc ? { nc: true, nc_kind: String(it.nc_kind ?? "") || undefined } : {}),
+        // The label SNAPSHOTTED on the line, as on the printed bill: what the
+        // guest was offered is what the guest is asked to pay for. (Reports
+        // prefer the live label — see attributeOrderLine.)
+        variation: String(it.variation_name ?? "").trim() || null,
+      });
+    }
+  }
+  return lines;
+}
+
 // Compute a split of a table's current bill WITHOUT mutating any state (the whole
 // table still settles as one bill). 'even' divides the grand total N ways; 'item'
 // totals caller-assigned item groups and pro-rates charges so the parts sum to the
-// grand total exactly (last part absorbs rounding).
+// grand total exactly (last part absorbs rounding); 'section' divides it between
+// the parts of the menu the food came from, apportioning every rung of the ladder.
 export async function SplitBillForTable(
   restaurantId: string,
   tableName: string,
@@ -13236,6 +13607,69 @@ export async function SplitBillForTable(
     groups: options.groups,
     subtotalFallback: bill.subtotal,
   });
+}
+
+/**
+ * Split a table's bill between the sections of the menu it was ordered from.
+ *
+ * READ-ONLY, like the other two modes. It changes nothing: the table still has
+ * one bill and one settlement, and what comes back is a set of amounts the till
+ * takes payment against.
+ *
+ * THE LADDER IT APPORTIONS IS THE BILL'S OWN. Every figure handed to
+ * computeSectionSplit comes off GetBillForTable, which is the same view the
+ * screen and the printed bill are built from — so the parts cannot add up to a
+ * different bill than the one the guest is looking at. The discounted subtotal
+ * is derived here exactly as computeBillCharges derives it (subtotal - discount,
+ * both already 2dp), because the open-bill view reports the two ends and not the
+ * rung between them.
+ */
+export async function SplitBillForTableBySection(
+  restaurantId: string,
+  tableName: string,
+  axis: BillSectionAxis,
+): Promise<BillSectionSplitResult> {
+  const bill = await GetBillForTable(restaurantId, tableName);
+  if (!bill) {throw new Error("No open bill for this table");}
+  const context = await requireRestaurantContext(restaurantId);
+  const lines = await sectionLinesForTable(restaurantId, context, bill.table_id, axis);
+
+  const split = computeSectionSplit(
+    {
+      subtotal: bill.subtotal,
+      discount: bill.discount,
+      discounted_subtotal: round2(Math.max(0, bill.subtotal - bill.discount)),
+      service_charge: bill.service_charge,
+      taxes: bill.taxes,
+      tax_total: bill.tax_total,
+      grand_total: bill.grand_total,
+    },
+    lines,
+    { fallbackLabel: `Table ${tableName}` },
+  );
+
+  // WHAT THE TILL IS TOLD, IN WORDS. A section split is read out to a guest, so
+  // where the money could not be classified has to be said rather than left to
+  // be inferred from a bucket named "Unclassified" appearing on the bill.
+  const notes: string[] = [
+    axis === "category"
+      ? "Sections are the menu categories already on the menu screen (sub-category, falling back to main)."
+      : `Sections are the ${axis === "production_group" ? "production" : "revenue"} groups — the same buckets, under the same names, as the Group Summary report.`,
+  ];
+  const gapTotal = round2(split.parts.filter((part) => part.gap).reduce((s, part) => s + part.grand_total, 0));
+  if (split.parts.length > 0 && split.parts.every((part) => part.gap)) {
+    notes.push(
+      axis === "category"
+        ? `Nothing on this bill resolved to a menu row, so all of it is in the gap buckets: every line is off-menu, or names a dish that has been deleted or renamed since it was ordered.`
+        : `No dish on this bill is filed under a ${axis === "production_group" ? "production" : "revenue"} group, so all of it is "${UNCLASSIFIED_GROUP}". Set the groups up in the menu editor and this splits properly — nothing about the bill needs to change.`,
+    );
+  } else if (gapTotal > 0) {
+    notes.push(
+      `${String(gapTotal)} of this bill is in a gap bucket. "${UNCLASSIFIED_GROUP}" is a dish that is on the menu but in no section — a configuration gap that closes as the menu is classified. "${UNATTRIBUTED_GROUP}" is a line that matches no menu row at all — an off-menu charge, or a dish deleted or renamed since. Neither is ever folded into a real section.`,
+    );
+  }
+
+  return { ...split, axis, notes };
 }
 
 // Merge one table's active orders into another (combine checks). Moves the source
@@ -13335,6 +13769,553 @@ export async function MergeTableBills(
 
     return { success: true, total_amt: consolidated, moved_orders: orders.length };
   });
+}
+
+/**
+ * MOVE A SEATED PARTY, AND EVERYTHING THAT BELONGS TO THEM, FROM ONE TABLE TO
+ * ANOTHER.
+ *
+ * The floor case: a party is sat at T1, they have ordered 500 rupees of food,
+ * and they are moved to T2 - because T2 is quieter, because T1 is under the
+ * air-conditioner, because a bigger party needs T1. Everything about them has to
+ * arrive at T2 together: the seating, the orders, the running bill, the waiter,
+ * the ordering code the guest was read out.
+ *
+ * WHY THIS IS ONE TRANSACTION AND NOT A SEQUENCE OF CALLS
+ * ------------------------------------------------------
+ * The dangerous outcome here is not failure, it is HALF SUCCESS. A guest whose
+ * orders are on T2 while their seating is still on T1 is worse than a guest who
+ * was never moved: the bill splits across two tables, T1 looks occupied by
+ * nobody, T2 looks free with food coming, and the covers behind APC are counted
+ * against a table the party is not sitting at. The only way to make that
+ * unreachable is for every write below to commit together or not at all, which
+ * is what withTransaction gives - a throw anywhere in this function leaves the
+ * database exactly as it was.
+ *
+ * WHY THE BILL ROW IS MOVED, NOT CLOSED AND REBUILT
+ * -------------------------------------------------
+ * MergeTableBills - the closest relative to this function - closes the source
+ * bill and recomputes a fresh one on the destination, and it is right to,
+ * because a merge genuinely ends one bill by folding it into another. A MOVE
+ * ends nothing. The same party is still running the same bill, so the ROW moves
+ * and keeps everything hanging off it: its bill number, an applied discount and
+ * who approved it, a redeemed coupon, a service-charge waiver, recorded tips,
+ * split state, item notes. Closing and rebuilding would silently drop every one
+ * of those, and drop them at the moment they are hardest to notice - mid-service,
+ * on a bill nobody is looking at yet.
+ *
+ * WHAT HAPPENS IF THE DESTINATION IS OCCUPIED: NOTHING. It is refused, and the
+ * message names the operation that does mean "put these two parties on one
+ * bill" - Merge. The two are not the same act and must not be one button. A
+ * move that silently merged would combine two unrelated parties' food onto one
+ * bill and sum their covers, and the first anyone would know is a guest being
+ * asked to pay for a table they never sat at. Refusing costs one tap; the other
+ * mistake costs an argument at the till.
+ *
+ * WHAT THIS DOES TO COVERS, APC AND TURNAROUND: NOTHING, AND THAT IS DELIBERATE
+ * ----------------------------------------------------------------------------
+ * "TableSessions" holds one row per SEATING (the table_session_track trigger
+ * opens one when is_occupied goes false -> true and closes it on the way back),
+ * covers are counted once per seating, and APC is the bill over those covers.
+ * The naive implementation of this feature - free the source, occupy the
+ * destination - fires that trigger TWICE: it closes the party's session on T1
+ * and opens a brand-new one on T2. One party would then own two seatings, so
+ * their covers would be counted twice, the APC denominator would double and the
+ * APC itself would halve; turnaround would record two short sittings instead of
+ * one real one. Every one of those numbers feeds analytics, the MIS reports and
+ * the simulator baseline.
+ *
+ * So the trigger is allowed to fire (it must - the flags really do change) and
+ * the result is then REPAIRED inside the same transaction: the row the trigger
+ * opened on the destination is deleted, and the party's ORIGINAL session is
+ * re-pointed at the destination with left_at cleared. One seating, one set of
+ * covers, one turnaround measured from when the party actually sat down. A
+ * move is invisible to every number this restaurant reports.
+ */
+export async function MoveTableParty(
+  restaurantId: string,
+  fromTable: string,
+  toTable: string,
+): Promise<{
+  success: true;
+  from_table: string;
+  to_table: string;
+  covers: number;
+  moved_orders: number;
+  total_amt: number;
+  /** True when an open bill row was carried across (false = the party had not
+   *  ordered yet, so there was no bill to move). */
+  moved_bill: boolean;
+  /** True when the party's original seating row was carried across. False means
+   *  there was no open session to move - a table occupied before the trigger
+   *  existed - and the destination keeps the fresh one the trigger opened. */
+  moved_session: boolean;
+  /** True when a waiter assignment travelled with the party. */
+  moved_waiter: boolean;
+}> {
+  return withTransaction(async (client) => {
+    await ensureBillWorkflowColumns(client);
+    await ensureTableOccupancyColumns(client);
+    await ensureTableSessionsTable(client);
+    await ensureTableAssignmentsTable(client);
+    const context = await requireRestaurantContext(restaurantId, client);
+
+    const from = fromTable.trim();
+    const to = toTable.trim();
+    if (!from || !to) {throw new Error("Both table names are required");}
+    if (from.toLowerCase() === to.toLowerCase()) {throw new Error("Pick a different table to move to");}
+
+    // BOTH ROWS, LOCKED, IN ONE STATEMENT ORDERED BY ID. Two moves that cross
+    // (T1 -> T2 while T2 -> T1) would deadlock if each locked its own source
+    // first; a single statement with a deterministic order cannot, because both
+    // transactions ask for the same rows in the same sequence and one simply
+    // waits.
+    const rows = await runQuery<{
+      id: string;
+      table_name: string;
+      capacity: unknown;
+      max_capacity: unknown;
+      is_occupied: boolean;
+      num_covers: number | null;
+      linked_order_id: string | null;
+      order_otp: string | null;
+      is_virtual: boolean;
+    }>(
+      `select id, table_name, capacity, max_capacity,
+              coalesce(is_occupied, false) as is_occupied,
+              num_covers, linked_order_id, order_otp,
+              coalesce(is_virtual, false) as is_virtual
+         from "Tables"
+        where res_id = $1 and outlet_id = $2
+          and lower(btrim(table_name)) in (lower(btrim($3)), lower(btrim($4)))
+          and coalesce(is_deleted, false) = false
+        order by id`,
+      [context.res_id, context.outlet_id, from, to],
+      client,
+    );
+    const src = rows.find((r) => r.table_name.trim().toLowerCase() === from.toLowerCase());
+    const dst = rows.find((r) => r.table_name.trim().toLowerCase() === to.toLowerCase());
+    if (!src) {throw new Error(`${from} is not a table at this outlet`);}
+    if (!dst) {throw new Error(`${to} is not a table at this outlet`);}
+    // A virtual row is the hidden table provisioned to back ONE takeaway or
+    // delivery order. It is not somewhere a party can sit, in either direction.
+    if (src.is_virtual || dst.is_virtual) {throw new Error("Takeaway and delivery orders are not seated at a table, so they cannot be moved this way");}
+    if (!src.is_occupied) {throw new Error(`${src.table_name} is not seated - there is no party to move.`);}
+    if (dst.is_occupied) {
+      throw new Error(
+        `${dst.table_name} is already seated. Moving a party onto an occupied table would put two parties on one bill - use Merge on ${dst.table_name} if that is what you meant.`,
+      );
+    }
+
+    const covers = Math.max(1, Math.round(Number(src.num_covers ?? 1)) || 1);
+    // The destination has to be able to seat them. Enforced with the same rule
+    // and the same wording seating itself uses, so "T2 seats up to 4" reads the
+    // same here as it does at the host stand.
+    assertCoversFitTable(dst.table_name, covers, dst.capacity, dst.max_capacity);
+
+    // An admin-approved bill on either end is locked (the guest has paid and the
+    // money is booked); moving the table under it would move a settled bill.
+    await assertBillEditable(context, src.id, client);
+    await assertBillEditable(context, dst.id, client);
+
+    // A FREE TABLE WITH AN OPEN BILL is an artefact - every release and every
+    // settle closes the bill it finds - and moving a second open bill onto it
+    // would leave two, which GetBillForTable resolves by picking the newest and
+    // quietly ignoring the other. Refuse and name the fix rather than guess
+    // which bill is real or close somebody's money on their behalf.
+    const strayBill = await runQuery<{ n: string }>(
+      `select count(*)::text as n from "Bills"
+        where res_id = $1 and outlet_id = $2 and table_id = $3 and closed_at is null`,
+      [context.res_id, context.outlet_id, dst.id],
+      client,
+    );
+    if (Number(strayBill[0]?.n ?? 0) > 0) {
+      throw new Error(`${dst.table_name} still has an open bill even though nobody is seated there. Release ${dst.table_name} first, then move.`);
+    }
+
+    // 1. THE ORDERS. table_id is what every reader joins on; `food.table` is the
+    //    printed/displayed name and is carried in step with it so a KOT reprint,
+    //    the KDS card and the bill all say the same table.
+    const orders = await runQuery<{ id: string; food: unknown }>(
+      `select id, food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and coalesce(status::text, '1') not in ('4','5','7')
+        order by created_at asc`,
+      [context.res_id, context.outlet_id, src.id],
+      client,
+    );
+    for (const o of orders) {
+      const f = parseJsonObject(o.food) ?? {};
+      f.table = dst.table_name;
+      await runQuery(
+        `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+        [dst.id, JSON.stringify(f), o.id, context.res_id, context.outlet_id],
+        client,
+      );
+    }
+
+    // 2. THE BILL ROW ITSELF. See the header: moved, never rebuilt.
+    const movedBill = await runQuery<{ id: string }>(
+      `update "Bills" set table_id = $1
+        where res_id = $2 and outlet_id = $3 and table_id = $4 and closed_at is null
+        returning id`,
+      [dst.id, context.res_id, context.outlet_id, src.id],
+      client,
+    );
+
+    // 3. THE SEATING, and the repair that keeps it ONE seating. The open session
+    //    is read BEFORE the flags move, because the trigger is about to close it.
+    const openSession = await runQuery<{ id: string }>(
+      `select id from "TableSessions" where table_id = $1 and left_at is null
+        order by seated_at desc limit 1`,
+      [src.id],
+      client,
+    );
+    const sessionId = openSession[0]?.id ?? null;
+
+    // Destination first, so the party is never momentarily seated nowhere.
+    await runQuery(
+      `update "Tables"
+          set is_occupied = true, num_covers = $4, linked_order_id = $5, order_otp = $6
+        where id = $1 and res_id = $2 and outlet_id = $3`,
+      [dst.id, context.res_id, context.outlet_id, covers, src.linked_order_id, src.order_otp],
+      client,
+    );
+    await runQuery(
+      `update "Tables"
+          set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null
+        where id = $1 and res_id = $2 and outlet_id = $3`,
+      [src.id, context.res_id, context.outlet_id],
+      client,
+    );
+
+    let movedSession = false;
+    if (sessionId) {
+      // The row the trigger just opened on the destination, identified by id
+      // rather than by timestamp: every write in this transaction shares one
+      // now(), so seated_at cannot tell the two rows apart.
+      const fresh = await runQuery<{ id: string }>(
+        `select id from "TableSessions" where table_id = $1 and left_at is null
+          order by seated_at desc limit 1`,
+        [dst.id],
+        client,
+      );
+      const freshId = fresh[0]?.id ?? null;
+      if (freshId && freshId !== sessionId) {
+        await runQuery(`delete from "TableSessions" where id = $1`, [freshId], client);
+      }
+      // ...and the party's REAL seating follows them, still open, still carrying
+      // the instant they actually sat down and the covers counted for them.
+      await runQuery(
+        `update "TableSessions" set table_id = $2, table_name = $3, left_at = null where id = $1`,
+        [sessionId, dst.id, dst.table_name],
+        client,
+      );
+      movedSession = true;
+    }
+
+    // 4. THE WAITER. Re-pointed rather than re-assigned: assignTableById runs the
+    //    attendance eligibility gate, which is the right rule for CHOOSING a
+    //    waiter and the wrong one for carrying an existing assignment across -
+    //    a waiter who has since clocked out would silently lose the table they
+    //    are still serving. created_at is bumped so the stale-assignment sweep
+    //    (which compares it against the destination's last left_at) reads this
+    //    as belonging to the session that is open now.
+    const movedWaiter = await runQuery<{ id: string }>(
+      `update "Table_assignments" set table_id = $1, created_at = now()
+        where res_id = $2 and outlet_id = $3 and table_id = $4
+        returning id`,
+      [dst.id, context.res_id, context.outlet_id, src.id],
+      client,
+    );
+
+    // 5. THE RESERVATION, if the party arrived on one. Without this the booking
+    //    still points at the table they left, so releasing the table they are
+    //    actually at would never mark it Completed and it would hold its old
+    //    table as "reserved" on the floor plan.
+    //    A CLUBBED booking's partner set lives inside the slot JSON and is NOT
+    //    rewritten here: moving one half of a joined pair of tables is a
+    //    different act from moving a party, and quietly re-pointing half a club
+    //    would leave the pair describing two different table sets.
+    await moveSeatedBookingsBetweenTables(context, src.id, dst.id, client);
+
+    const total = await sumOrderTotalsForTable(context, dst.id, client);
+    return {
+      success: true as const,
+      from_table: src.table_name,
+      to_table: dst.table_name,
+      covers,
+      moved_orders: orders.length,
+      total_amt: total,
+      moved_bill: movedBill.length > 0,
+      moved_session: movedSession,
+      moved_waiter: movedWaiter.length > 0,
+    };
+  });
+}
+
+/** Carry a SEATED reservation from one table to another. Only seated/arrived
+ *  bookings move: a future reservation for T1 is still a reservation for T1,
+ *  and a completed or cancelled one is history. Best-effort, exactly like
+ *  completeSeatedBookingsForTable - a booking that cannot be re-pointed must
+ *  never roll back the party's move. */
+async function moveSeatedBookingsBetweenTables(
+  context: RestaurantContext,
+  fromTableId: string,
+  toTableId: string,
+  client?: PoolClient,
+): Promise<void> {
+  try {
+    const rows = await runQuery<{ id: string; slot: string; created_at: Date }>(
+      `select id, slot, created_at from "Bookings"
+        where res_id = $1 and outlet_id = $2 and table_id = $3`,
+      [context.res_id, context.outlet_id, fromTableId],
+      client,
+    );
+    for (const r of rows) {
+      const st = String(decodeSlot(r.slot, r.created_at).status ?? "").trim().toLowerCase();
+      if (st !== "seated" && st !== "arrived") {continue;}
+      await runQuery(
+        `update "Bookings" set table_id = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
+        [r.id, context.res_id, context.outlet_id, toTableId],
+        client,
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, "move_seated_bookings_failed");
+  }
+}
+
+/**
+ * MOVE ONE ORDER - one KOT - to a different table.
+ *
+ * The floor case is a mis-key, and it is the commonest one there is: a waiter
+ * takes T7's order and rings it in on T4. The food is right, the table is
+ * wrong, and until now the only ways out were to void the order and re-ring it
+ * (which loses the KOT, the timings and the kitchen's head start) or to leave it
+ * and sort the money out at the till.
+ *
+ * WHAT THIS IS NOT. It is not [MoveTableParty]. That moves a SEATING and
+ * everything attached to it; this moves ONE order and touches the seating only
+ * where it has to:
+ *
+ *   * THE SOURCE IS NOT RELEASED. The party at T4 is still sitting at T4 - the
+ *     ticket was wrong, not the guests. Freeing the table would close their
+ *     bill, cancel their other orders and end their seating, which is a far
+ *     bigger act than the one being corrected. If T4 was only ever occupied
+ *     BECAUSE of the mis-keyed order it now reads as seated with nothing
+ *     ordered, which is the honest state and is visible on the floor plan as
+ *     something to release.
+ *
+ *   * THE DESTINATION IS SEATED IF IT IS NOT ALREADY, because that is exactly
+ *     what placing the order there in the first place would have done (every
+ *     order-save path occupies its table). Covers are PRESERVED, never reset:
+ *     a table already seated keeps the head count somebody entered, and a table
+ *     that was free starts at one - which staff correct with Edit seating, the
+ *     same as any other seating whose party size was not typed in.
+ *
+ * WHY THE PRINTED DOCKET IS THE ROUTE'S PROBLEM AND NOT THIS FUNCTION'S: the
+ * kitchen may already be holding paper that says T4, and deciding what to do
+ * about that is a printing decision. This returns the facts that decision needs
+ * (both table names and ids, the outlet, the order's lines) and the route calls
+ * the printer. See POST /tables/move-order.
+ */
+export async function MoveOrderToTable(
+  restaurantId: string,
+  orderId: string,
+  toTable: string,
+): Promise<{
+  success: true;
+  order_id: string;
+  outlet_id: string;
+  from_table: string;
+  from_table_id: string;
+  to_table: string;
+  to_table_id: string;
+  /** Whether the destination had to be seated by this move. */
+  seated_destination: boolean;
+  /** The destination's running total after the order landed on it. */
+  total_amt: number;
+  /** True when the SOURCE table now has no active orders left on it. The party
+   *  is still seated - this is the "seated, nothing ordered" state, said out
+   *  loud so the caller can tell staff rather than let them find it. */
+  source_now_empty: boolean;
+}> {
+  return withTransaction(async (client) => {
+    await ensureBillWorkflowColumns(client);
+    await ensureTableOccupancyColumns(client);
+    await ensureTableSessionsTable(client);
+    const context = await requireRestaurantContext(restaurantId, client);
+
+    const id = String(orderId ?? "").trim();
+    const to = String(toTable ?? "").trim();
+    if (!id) {throw new Error("An order id is required");}
+    if (!to) {throw new Error("A destination table is required");}
+
+    const orderRows = await runQuery<{ id: string; table_id: string | null; food: unknown; status: unknown }>(
+      `select id, table_id, food, status from "Orders"
+        where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [id, context.res_id, context.outlet_id],
+      client,
+    );
+    const order = orderRows[0];
+    if (!order) {throw new Error("Order not found");}
+    // Paid(4), Cancelled(5), Payment Pending Approval(6) and Closed(7) are all
+    // past the point where the kitchen ticket is the live document. Moving a
+    // settled order would move money that has already been booked against a
+    // table, which is the one thing this must never do.
+    const status = String(order.status ?? "1");
+    if (["4", "5", "6", "7"].includes(status)) {
+      throw new Error("That order has already been settled or cancelled, so it can no longer be moved.");
+    }
+    if (!order.table_id) {throw new Error("That order is not on a table, so there is nothing to move it from.");}
+
+    const rows = await runQuery<{
+      id: string; table_name: string; capacity: unknown; max_capacity: unknown;
+      is_occupied: boolean; num_covers: number | null; is_virtual: boolean;
+    }>(
+      `select id, table_name, capacity, max_capacity,
+              coalesce(is_occupied, false) as is_occupied, num_covers,
+              coalesce(is_virtual, false) as is_virtual
+         from "Tables"
+        where res_id = $1 and outlet_id = $2
+          and (id = $3 or lower(btrim(table_name)) = lower(btrim($4)))
+          and coalesce(is_deleted, false) = false
+        order by id`,
+      [context.res_id, context.outlet_id, order.table_id, to],
+      client,
+    );
+    const src = rows.find((r) => r.id === order.table_id);
+    const dst = rows.find((r) => r.table_name.trim().toLowerCase() === to.toLowerCase());
+    if (!dst) {throw new Error(`${to} is not a table at this outlet`);}
+    if (dst.id === order.table_id) {throw new Error("That order is already on this table");}
+    if (dst.is_virtual) {throw new Error("Takeaway and delivery orders have their own hidden table, so an order cannot be moved onto one");}
+
+    await assertBillEditable(context, order.table_id, client);
+    await assertBillEditable(context, dst.id, client);
+
+    const food = parseJsonObject(order.food) ?? {};
+    food.table = dst.table_name;
+    await runQuery(
+      `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+      [dst.id, JSON.stringify(food), order.id, context.res_id, context.outlet_id],
+      client,
+    );
+
+    // Seat the destination if it was not, exactly as placing the order there
+    // would have. num_covers is left alone (coalesced to at least 1) so a table
+    // already seated keeps its real head count - the APC denominator must not be
+    // rewritten by a ticket correction.
+    const seatedDestination = !dst.is_occupied;
+    if (seatedDestination) {
+      await runQuery(
+        `update "Tables" set is_occupied = true, num_covers = greatest(1, coalesce(num_covers, 1))
+          where id = $1 and res_id = $2 and outlet_id = $3`,
+        [dst.id, context.res_id, context.outlet_id],
+        client,
+      );
+    }
+
+    // Both ends' bills are re-summed from their orders. The source keeps its
+    // OPEN BILL ROW even when the sum falls to zero: the party is still there,
+    // and their bill number, discount and coupon must survive a ticket being
+    // taken off it.
+    await resyncOpenBillTotal(context, order.table_id, client);
+    const total = await resyncOpenBillTotal(context, dst.id, client);
+
+    const remaining = await runQuery<{ n: string }>(
+      `select count(*)::text as n from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and coalesce(status::text, '1') not in ('4','5','7')`,
+      [context.res_id, context.outlet_id, order.table_id],
+      client,
+    );
+
+    return {
+      success: true as const,
+      order_id: order.id,
+      outlet_id: context.outlet_id,
+      from_table: src?.table_name ?? "",
+      from_table_id: order.table_id,
+      to_table: dst.table_name,
+      to_table_id: dst.id,
+      seated_destination: seatedDestination,
+      total_amt: total,
+      source_now_empty: Number(remaining[0]?.n ?? 0) === 0,
+    };
+  });
+}
+
+/** Re-sum a table's open bill from its active orders, creating the bill row if
+ *  the table has orders but no bill yet (the normal state before settle). Returns
+ *  the total. Mirrors what MergeTableBills does on its destination, so a table
+ *  that gains or loses an order never reads a stale running total. */
+async function resyncOpenBillTotal(
+  context: RestaurantContext,
+  tableId: string,
+  client: PoolClient,
+): Promise<number> {
+  const total = await sumOrderTotalsForTable(context, tableId, client);
+  const open = await runQuery<{ id: string }>(
+    `select id from "Bills" where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null
+      order by created_at desc limit 1`,
+    [tableId, context.res_id, context.outlet_id],
+    client,
+  );
+  if (open[0]) {
+    await runQuery(
+      `update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4`,
+      [total, open[0].id, context.res_id, context.outlet_id],
+      client,
+    );
+    return total;
+  }
+  // No bill row yet, and nothing to bill for. Minting one here would burn a bill
+  // number on an empty table.
+  if (total <= 0) {return total;}
+  const billNo = await nextBillNo(context, client);
+  await runQuery(
+    `insert into "Bills" (id, created_at, res_id, outlet_id, table_id, emp_id, status, order_id, total_amt, tax_breakdown, bill_no)
+     values ($1, now(), $2, $3, $4, null, 1, null, $5, '[]'::jsonb, $6)
+     on conflict do nothing`,
+    [randomUUID(), context.res_id, context.outlet_id, tableId, total, billNo],
+    client,
+  );
+  return total;
+}
+
+/**
+ * The KOT number already on paper for a ticket, or null if that content has
+ * never been ticketed today.
+ *
+ * A PURE READ, and that is the entire reason it exists next to
+ * [AllocateKotNumber] rather than being folded into it. Allocation is the right
+ * call when a docket is about to print: it mints a number if there is not one.
+ * Asking "did the kitchen already get paper for this?" must NOT mint anything -
+ * an order that was never ticketed would come back with a freshly burnt number
+ * and a gap in the day's sequence, for a docket nobody printed.
+ *
+ * Degrades the same way everything else on migration 029 does: the caller
+ * (kot_move.ts) treats a throw as "cannot tell", which means no correction
+ * docket rather than a wrong one.
+ */
+export async function LookupKotNumber(
+  restaurantId: string,
+  ticketKey: string,
+  at: Date = new Date(),
+): Promise<{ kot_no: number; business_day: string } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const key = String(ticketKey ?? "").trim();
+  if (!key) {return null;}
+  const businessDay = dateKeyInZone(at, context.timezone);
+  const rows = await runQuery<{ kot_no: number }>(
+    `select kot_no from "KotTickets"
+      where res_id = $1 and outlet_id = $2 and ticket_key = $3
+      limit 1`,
+    [context.res_id, context.outlet_id, key],
+  );
+  const no = rows[0]?.kot_no;
+  return no == null ? null : { kot_no: Number(no), business_day: businessDay };
 }
 
 // Refund a settled bill. Finds it by bill_id or (latest settled) table name and
@@ -20615,13 +21596,27 @@ export async function GetOrderKotContext(
 ): Promise<
   | {
       order_id: string;
+      /**
+       * The order's OWN outlet, so a caller that prints does not have to trust a
+       * request header for it. The row is already outlet-scoped by the predicate
+       * below, so this is that same outlet handed back rather than a new fact —
+       * but it is the one an unauthenticated caller (the guest QR page, which
+       * carries no X-Outlet-Id) has no other way to learn.
+       */
+      outlet_id: string;
       table_id: string;
       table_name: string;
       section: string | null;
       covers: number;
       is_virtual: boolean;
       order_type: string;
-      items: { name: string; price: number; quantity: number; note?: string; variation?: string }[];
+      /**
+       * Status 8 — placed while auto-push is off and not yet accepted to the
+       * kitchen. THE PRINT GATE READS THIS: paper on the pass is the kitchen
+       * being told, so an order still awaiting approval must not produce one.
+       */
+      awaiting_approval: boolean;
+      items: { name: string; price: number; quantity: number; note?: string; variation?: string; held_qty?: number }[];
     }
   | null
 > {
@@ -20632,6 +21627,8 @@ export async function GetOrderKotContext(
 
   const rows = await runQuery<{
     order_id: string;
+    outlet_id: string | null;
+    status: unknown;
     food: unknown;
     table_id: string | null;
     table_name: string | null;
@@ -20640,7 +21637,7 @@ export async function GetOrderKotContext(
     is_virtual: boolean | null;
   }>(
     `
-      select o.id as order_id, o.food, o.table_id,
+      select o.id as order_id, o.outlet_id, o.status, o.food, o.table_id,
              t.table_name, t.section,
              coalesce(t.num_covers, 1) as num_covers,
              coalesce(t.is_virtual, false) as is_virtual
@@ -20661,7 +21658,11 @@ export async function GetOrderKotContext(
 
   // Same merge key as GetBillForTable (name + price + nc + variation), so one
   // order's lines collapse on the docket exactly as they do on the bill.
-  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; variation?: string }>();
+  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; variation?: string; held_qty?: number }>();
+  // Held units per merged line — see the identical note in GetBillForTable. This
+  // read feeds only the KOT, but it keeps the same shape so kot_print.ts has one
+  // rule to apply rather than two.
+  const heldByKey = new Map<string, number>();
   const list = Array.isArray((food as { items?: unknown }).items) ? ((food as { items: unknown[] }).items) : [];
   for (const raw of list) {
     const it = (raw ?? {}) as Record<string, unknown>;
@@ -20672,6 +21673,7 @@ export async function GetOrderKotContext(
     const nc = isNonChargeableLine(it);
     const variation = String(it.variation_name ?? "").trim();
     const key = `${name.toLowerCase()}@@${price}@@${nc ? "nc" : ""}@@${variation.toLowerCase()}`;
+    if (it.course_hold === true && !it.fired_at) {heldByKey.set(key, (heldByKey.get(key) ?? 0) + quantity);}
     const existing = itemMap.get(key);
     if (existing) {
       existing.quantity += quantity;
@@ -20683,6 +21685,10 @@ export async function GetOrderKotContext(
 
   return {
     order_id: String(row.order_id),
+    outlet_id: String(row.outlet_id ?? context.outlet_id ?? ""),
+    // 8 is Pending — placed but not yet accepted to the kitchen. Anything else
+    // (Preparing, Served, …) has been accepted, so it may be printed.
+    awaiting_approval: Number(row.status ?? 0) === 8,
     // A takeaway/delivery order is backed by a hidden virtual "Tables" row, so
     // table_id is populated for those too. An order with NO table row at all
     // cannot be keyed for KOT numbering (the ticket key needs a table
@@ -20694,7 +21700,10 @@ export async function GetOrderKotContext(
     covers: Math.max(1, Number(row.num_covers ?? 1) || 1),
     is_virtual: row.is_virtual === true,
     order_type: orderType,
-    items: [...itemMap.values()],
+    items: [...itemMap.entries()].map(([key, item]) => {
+      const heldQty = heldByKey.get(key) ?? 0;
+      return heldQty > 0 ? { ...item, held_qty: Math.min(heldQty, item.quantity) } : item;
+    }),
   };
 }
 

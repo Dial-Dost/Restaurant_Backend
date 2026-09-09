@@ -1,10 +1,18 @@
-// Auto-printing the kitchen docket when an order is barked.
+// Auto-printing the kitchen docket when an order REACHES THE KITCHEN.
 //
-// THE DEFECT THIS CLOSES. Barking stamps "Orders".barked_at and rebases every
-// prep timer — the kitchen clock starts there — but nothing was printed. Someone
-// had to remember to press Print KOT afterwards, and on a busy pass that is the
-// thing that gets forgotten: every timer in the system says the order is in the
-// kitchen and there is no paper on the pass saying so.
+// THE TRIGGER MOVED, and this file moved with it. It used to be the bark and
+// only the bark; it is now order placed (and, for an order held at the approval
+// gate, order approved), with the bark left in as a fallback for anything those
+// never ticketed.
+//
+// THE DEFECT THE ORIGINAL CHANGE CLOSED. Barking stamps "Orders".barked_at and
+// rebases every prep timer — the kitchen clock starts there — but nothing was
+// printed. Someone had to remember to press Print KOT afterwards, and on a busy
+// pass that is the thing that gets forgotten.
+//
+// THE DEFECT MOVING IT OPENS, and what most of the new cases below are about:
+// with two triggers on one order, the SECOND one must produce no paper. Place
+// then bark has to be one docket carrying one number, not two.
 //
 // THE TRAP THE FIX HAS TO SURVIVE is KOT numbering. AllocateKotNumber is
 // per-outlet, per-business-day and gapless, and "KotTickets" memoises one
@@ -361,6 +369,65 @@ describe("dispatchKot — what the kitchen actually gets", () => {
     expect(tickets()).toHaveLength(0);
   });
 
+  // --- Held courses, end to end ---------------------------------------------
+  // The reads that feed this (GetBillForTable, GetOrderKotContext) merge order
+  // lines by name/price/nc/variation and DELIBERATELY do not key on held-ness —
+  // a bill line must not split in two while a course waits and re-merge when it
+  // is fired. So a merged line arrives here as "3, of which 1 is held", and this
+  // is the only place that becomes two lines of paper.
+  test("a partly-held line becomes two docket lines: cook these now, hold that one", async () => {
+    await kp.dispatchKot(dispatch({
+      items: [{ name: "Gulab Jamun", quantity: 3, held_qty: 1 }],
+    }));
+    const out = paper(enqueued[0]!.esc_base64);
+    const banner = out.indexOf("** HOLD **");
+    expect(banner).toBeGreaterThan(-1);
+    // Two to cook, one waiting — and the totals say so on their own.
+    expect(out.slice(0, banner)).toMatch(/Total Qty {2,}2/);
+    expect(out.slice(banner)).toMatch(/Hold Qty {2,}1/);
+  });
+
+  test("a wholly held line never appears in the cook-now list", async () => {
+    await kp.dispatchKot(dispatch({
+      items: [{ name: "Paneer Tikka", quantity: 2 }, { name: "Gulab Jamun", quantity: 3, held_qty: 3 }],
+    }));
+    const out = paper(enqueued[0]!.esc_base64);
+    const banner = out.indexOf("** HOLD **");
+    expect(out.slice(0, banner)).not.toContain("Gulab Jamun");
+    expect(out.slice(banner)).toContain("Gulab Jamun");
+    expect(out.slice(0, banner)).toMatch(/Total Qty {2,}2/);
+  });
+
+  test("holding a course does NOT mint a new KOT number", async () => {
+    // The ticket key is (outlet, business day, table, item set) and held-ness is
+    // deliberately not in it. Two reasons, and the second is the one that
+    // matters: adding a field to the key would change the hash of EVERY ticket,
+    // so the first reprint of anything printed before the deploy would miss the
+    // migration-029 memo and burn a fresh number — gaps and duplicates at the
+    // pass, on the day of the release, for a formatting change. A fired course
+    // reprinting under its original number is the correct reading anyway: it is
+    // the same order, further along.
+    const held = await kp.dispatchKot(dispatch({ items: [{ name: "Gulab Jamun", quantity: 3, held_qty: 3 }] }));
+    const fired = await kp.dispatchKot(dispatch({ items: [{ name: "Gulab Jamun", quantity: 3 }] }));
+    expect(held.kotNo).toBe(1);
+    expect(fired).toMatchObject({ kotNo: 1, reprint: true });
+    // Same number, and the paper is honestly different: the second docket has
+    // released the course.
+    expect(paper(enqueued[0]!.esc_base64)).toContain("** HOLD **");
+    expect(paper(enqueued[1]!.esc_base64)).not.toContain("** HOLD **");
+    expect(counters()[0]!.seq).toBe(1);
+  });
+
+  test("a restaurant that never holds a course gets the paper it always got", async () => {
+    // held_qty absent everywhere is the only state the overwhelming majority of
+    // tenants are ever in, and it must not be able to produce a hold block.
+    await kp.dispatchKot(dispatch());
+    const out = paper(enqueued[0]!.esc_base64);
+    expect(out).not.toContain("HOLD");
+    expect(out).not.toContain("Hold Qty");
+    expect(out).toMatch(/Total Qty {2,}3/); // 2 Paneer + 1 Papad
+  });
+
   test("every docket of one press is grouped under the caller's bill id", async () => {
     seedMenu([
       { id: "m1", name: "Paneer Tikka", station: "TANDOOR" },
@@ -372,5 +439,209 @@ describe("dispatchKot — what the kitchen actually gets", () => {
     // bill_id would print the tandoor's docket and drop the cold section's.
     expect(enqueued.map((j) => j.bill_id)).toEqual(["order-A", "order-A"]);
     expect(enqueued.every((j) => j.kind === "kot")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. THE TRIGGER MOVED TO ORDER PLACED. Two triggers now fire on one order —
+//    placement and (later) the bark — and the whole safety of that rests on the
+//    second one producing NO PAPER. These drive skipIfTicketed, the interlock
+//    that makes it so.
+// ---------------------------------------------------------------------------
+
+describe("place, then bark", () => {
+  test("the bark prints nothing and reports the number already on the paper", async () => {
+    // The order is placed. This is the print the restaurant asked for.
+    const placed = await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+    expect(placed).toMatchObject({ tickets: 1, kotNo: 1, reprint: false, skipped: false });
+    expect(enqueued).toHaveLength(1);
+
+    // The expo barks it forty seconds later. barked_at is stamped and the prep
+    // timers rebase — but the kitchen already has the paper, so nothing is
+    // built and nothing is queued.
+    const barked = await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+    expect(barked).toMatchObject({ tickets: 0, kotNo: 1, reprint: true, skipped: true });
+    expect(barked.stations).toEqual([]);
+    expect(barked.jobIds).toEqual([]);
+
+    // ONE docket on the pass, ONE number consumed, ONE memo row.
+    expect(enqueued).toHaveLength(1);
+    expect(counters()[0]!.seq).toBe(1);
+    expect(tickets()).toHaveLength(1);
+  });
+
+  test("suppression is per CONTENT, so a second order on the table still prints", async () => {
+    await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+    // A genuinely different order on the same table is different content, so it
+    // is not suppressed — the interlock must not degrade into "one KOT a day".
+    const mains = await kp.dispatchKot(dispatch({ items: MAINS, billId: "order-B", skipIfTicketed: true }));
+    expect(mains).toMatchObject({ tickets: 1, kotNo: 2, skipped: false });
+    expect(enqueued).toHaveLength(2);
+  });
+
+  test("the manual reprint is NOT suppressed — it is the recovery path", async () => {
+    const placed = await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+    expect(placed.kotNo).toBe(1);
+
+    // POST /print/kot/order/:id leaves the flag off, because a reprint button
+    // that refused to reprint would be a dead control. The paper it produces is
+    // the SAME paper — same number, same bytes — not a new ticket.
+    const reprint = await kp.dispatchKot(dispatch());
+    expect(reprint).toMatchObject({ tickets: 1, kotNo: 1, reprint: true, skipped: false });
+    expect(enqueued).toHaveLength(2);
+    expect(enqueued[1]!.esc_base64).toBe(enqueued[0]!.esc_base64);
+    expect(counters()[0]!.seq).toBe(1);
+  });
+
+  test("an unticketed order still prints on the bark — the fallback is real", async () => {
+    // Nothing was dispatched at placement (auto-print was off at the time, or
+    // the placement print died before it could allocate). The bark is the only
+    // trigger left, and it must still put paper on the pass.
+    const barked = await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+    expect(barked).toMatchObject({ tickets: 1, kotNo: 1, skipped: false });
+    expect(enqueued).toHaveLength(1);
+  });
+
+  test("suppression cannot fire on an unnumbered ticket", async () => {
+    // No table id means no key and no allocation, so `reused` is never true and
+    // the flag can never turn into a silent drop. An outlet running ahead of
+    // migration 029 (allocateKotNumber returns null) is the same case.
+    const a = await kp.dispatchKot(dispatch({ tableId: "", skipIfTicketed: true }));
+    const b = await kp.dispatchKot(dispatch({ tableId: "", skipIfTicketed: true }));
+    expect(a).toMatchObject({ kotNo: null, tickets: 1, skipped: false });
+    expect(b).toMatchObject({ kotNo: null, tickets: 1, skipped: false });
+    expect(enqueued).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. ADDING A LINE TO AN ORDER ALREADY ON THE PASS.
+// ---------------------------------------------------------------------------
+
+/** The sweet a waiter adds to a table that is already eating. */
+const ADDED = [{ name: "Gulab Jamun", quantity: 1 }];
+
+describe("a line added to a running order", () => {
+  test("the docket carries the added line and NOT the food already cooking", async () => {
+    await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+
+    // POST /orders/:id/items dispatches only the line it just added, scoped by
+    // that line's id.
+    const added = await kp.dispatchKot(dispatch({
+      items: ADDED, scope: "line-1", skipIfTicketed: false,
+    }));
+    expect(added).toMatchObject({ tickets: 1, kotNo: 2, skipped: false });
+
+    const paperOut = paper(enqueued[1]!.esc_base64);
+    expect(paperOut).toContain("Gulab Jamun");
+    // THE COST OF GETTING THIS WRONG. Re-printing the whole order would ask the
+    // kitchen to cook the starters a second time and the restaurant would eat
+    // them.
+    expect(paperOut).not.toContain("Paneer Tikka");
+    expect(paperOut).not.toContain("Masala Papad");
+  });
+
+  test("two separate adds of the SAME dish are two tickets, not one lost sweet", async () => {
+    // Byte-identical item sets. Without the line id in the key the second add
+    // hashes to the first one's ticket, comes back reused, and the kitchen is
+    // never told about the second Gulab Jamun.
+    const first = await kp.dispatchKot(dispatch({ items: ADDED, scope: "line-1", skipIfTicketed: false }));
+    const second = await kp.dispatchKot(dispatch({ items: ADDED, scope: "line-2", skipIfTicketed: false }));
+    expect(first).toMatchObject({ kotNo: 1, reprint: false });
+    expect(second).toMatchObject({ kotNo: 2, reprint: false });
+    expect(enqueued).toHaveLength(2);
+    expect(counters()[0]!.seq).toBe(2);
+  });
+
+  test("the same add replayed is the same ticket, so a retry cannot double-cook", async () => {
+    // The line id is stable, so an outbox replay or a socket retry that somehow
+    // got past idempotent() still resolves to the ticket already on paper.
+    const a = await kp.dispatchKot(dispatch({ items: ADDED, scope: "line-1", skipIfTicketed: false }));
+    const b = await kp.dispatchKot(dispatch({ items: ADDED, scope: "line-1", skipIfTicketed: false }));
+    expect(a.kotNo).toBe(1);
+    expect(b).toMatchObject({ kotNo: 1, reprint: true });
+    expect(counters()[0]!.seq).toBe(1);
+    expect(tickets()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. THE SCOPE FIELD MUST NOT MOVE ANY EXISTING KEY.
+//    Every live table's docket was keyed without it. If adding the field
+//    changed those hashes, the first reprint after the deploy would burn a
+//    second number for a docket already on the pass.
+// ---------------------------------------------------------------------------
+
+describe("scope is additive", () => {
+  test("absent, empty and whitespace scopes all hash to the pre-change key", () => {
+    const base = keyFor(STARTERS);
+    const mk = (scope: string | null | undefined) =>
+      kp.buildKotTicketKey({ outletId: OUTLET_ID, tableId: TABLE, items: STARTERS, firedAt: FIRED, tz: TZ, scope });
+    expect(mk(undefined)).toBe(base);
+    expect(mk(null)).toBe(base);
+    expect(mk("")).toBe(base);
+    expect(mk("   ")).toBe(base);
+  });
+
+  test("a real scope is a different ticket, and two scopes are two tickets", () => {
+    const base = keyFor(STARTERS);
+    const mk = (scope: string) =>
+      kp.buildKotTicketKey({ outletId: OUTLET_ID, tableId: TABLE, items: STARTERS, firedAt: FIRED, tz: TZ, scope });
+    expect(mk("line-1")).not.toBe(base);
+    expect(mk("line-1")).not.toBe(mk("line-2"));
+    // Normalised like every other component, so casing and padding are noise.
+    expect(mk(" LINE-1 ")).toBe(mk("line-1"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. THE ROUTING KEY. "The beverage KOT goes to one printer and the food KOT
+//    goes to another" is a question about what the backend PUTS ON THE WIRE:
+//    one job per station, each stamped with its own station. The agent's side
+//    of it — station -> printer, and the fallback that stops an unmatched
+//    docket being dropped — is pinned in printer_routing_test.dart.
+// ---------------------------------------------------------------------------
+
+describe("what the printer agent is given to route on", () => {
+  test("one order becomes one job per station, each carrying its own station", async () => {
+    seedMenu([
+      { id: "m1", name: "Paneer Tikka", station: "TANDOOR" },
+      { id: "m2", name: "Masala Papad", station: "TANDOOR" },
+      { id: "m3", name: "Fresh Lime Soda", station: "BAR" },
+    ]);
+
+    const result = await kp.dispatchKot(dispatch({
+      items: [...STARTERS, { name: "Fresh Lime Soda", quantity: 2 }],
+      skipIfTicketed: true,
+    }));
+
+    // TWO dockets, and the station is what tells them apart on the wire.
+    expect(result.tickets).toBe(2);
+    expect([...result.stations].sort()).toEqual(["BAR", "TANDOOR"]);
+    expect(enqueued.map((j) => j.station).sort()).toEqual(["BAR", "TANDOOR"]);
+
+    // The drink is on the bar's docket and nowhere else; the food is on the
+    // kitchen's. A split that leaked either way would print the whole order at
+    // both printers.
+    const bar = paper(enqueued.find((j) => j.station === "BAR")!.esc_base64);
+    const tandoor = paper(enqueued.find((j) => j.station === "TANDOOR")!.esc_base64);
+    expect(bar).toContain("Fresh Lime Soda");
+    expect(bar).not.toContain("Paneer Tikka");
+    expect(tandoor).toContain("Paneer Tikka");
+    expect(tandoor).not.toContain("Fresh Lime Soda");
+
+    // ONE number across both, so the pass can pair them.
+    expect(result.kotNo).toBe(1);
+    expect(counters()[0]!.seq).toBe(1);
+  });
+
+  test("a dish with no station still names a station, so no docket is unroutable", async () => {
+    // The routing key is never null. An unassigned dish falls under "General",
+    // which the agent matches with the any-kitchen rule and, failing that, the
+    // default printer — see printer_routing_test.dart.
+    seedMenu([{ id: "m1", name: "Paneer Tikka", station: "TANDOOR" }]);
+    const result = await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+    expect([...result.stations].sort()).toEqual(["General", "TANDOOR"]);
+    expect(enqueued.every((j) => typeof j.station === "string" && j.station.length > 0)).toBe(true);
   });
 });

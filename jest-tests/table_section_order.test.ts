@@ -180,6 +180,123 @@ describe("compareTableSections — the read order", () => {
   });
 });
 
+describe("compareTableSections — CREATION order is the new tail", () => {
+  const sort = (rows: OrderableSection[]): string[] =>
+    [...rows].sort(compareTableSections).map((r) => r.section);
+
+  const at = (iso: string): number => Date.parse(iso);
+
+  test("unpositioned sections read oldest-first, not A-to-Z", () => {
+    // The reversal migration 041 shipped with. Alphabetical would be
+    // Bar, Entrance, Terrace; the restaurant was built in the other order.
+    const rows: OrderableSection[] = [
+      { section: "Terrace", sort_order: null, created_at: at("2023-05-01T00:00:00Z") },
+      { section: "Entrance", sort_order: null, created_at: at("2021-01-01T00:00:00Z") },
+      { section: "Bar", sort_order: null, created_at: at("2022-03-01T00:00:00Z") },
+    ];
+    expect(sort(rows)).toEqual(["Entrance", "Bar", "Terrace"]);
+  });
+
+  test("a CHOSEN position still beats creation order outright", () => {
+    // Steps 1 and 2 are untouched by this change: an owner who has dragged
+    // something must not have it re-sorted underneath them by an age they never
+    // saw. The newest zone here is pinned first and stays first.
+    const rows: OrderableSection[] = [
+      { section: "Old Room", sort_order: null, created_at: at("2019-01-01T00:00:00Z") },
+      { section: "New Deck", sort_order: 1, created_at: at("2026-08-01T00:00:00Z") },
+    ];
+    expect(sort(rows)).toEqual(["New Deck", "Old Room"]);
+  });
+
+  test("a section created AFTER a reorder still lands at the end", () => {
+    // Unchanged promise: null position appends. Creation order only decides the
+    // order WITHIN the appended tail, so a new zone cannot shoulder into the
+    // middle of a hand-made arrangement just because of when it was made.
+    const rows: OrderableSection[] = [
+      { section: "Entrance", sort_order: 1, created_at: at("2021-01-01T00:00:00Z") },
+      { section: "Terrace", sort_order: 2, created_at: at("2021-01-02T00:00:00Z") },
+      { section: "Annexe", sort_order: null, created_at: at("2020-01-01T00:00:00Z") },
+    ];
+    expect(sort(rows)).toEqual(["Entrance", "Terrace", "Annexe"]);
+  });
+
+  test("sections born in the SAME millisecond fall back to alphabetical", () => {
+    // Not exotic: ReorderTableSections materialises a whole outlet's roster rows
+    // in ONE insert, so equal timestamps are the normal case the first time
+    // anybody rearranges. Without the name tiebreak the list would flap between
+    // renders of identical data.
+    const same = at("2026-09-09T10:00:00Z");
+    const rows: OrderableSection[] = [
+      { section: "Zulu", sort_order: null, created_at: same },
+      { section: "Alpha", sort_order: null, created_at: same },
+      { section: "Mike", sort_order: null, created_at: same },
+    ];
+    expect(sort(rows)).toEqual(["Alpha", "Mike", "Zulu"]);
+    expect(sort([...rows].reverse())).toEqual(["Alpha", "Mike", "Zulu"]);
+  });
+
+  test("an outlet whose birth instants cannot be read is 1.8.5 alphabetical", () => {
+    // The degradation path: readSectionBirthByKey is allowed to come back empty
+    // (unmigrated schema, failed read), and every section is then undated. That
+    // must be the order this app has always shown, not an arbitrary one.
+    const rows: OrderableSection[] = [
+      { section: "Terrace", sort_order: null, created_at: null },
+      { section: "bar", sort_order: null, created_at: null },
+      { section: "Garden", sort_order: null },
+    ];
+    expect(sort(rows)).toEqual(["bar", "Garden", "Terrace"]);
+  });
+
+  test("an undated section sorts AFTER every dated one, never among them", () => {
+    // "No information sorts after information" — the same rule an unpositioned
+    // section already obeys. A zone whose age is unknown must not be able to
+    // claim the top of the floor plan.
+    const rows: OrderableSection[] = [
+      { section: "Unknown", sort_order: null, created_at: null },
+      { section: "Newest", sort_order: null, created_at: at("2026-01-01T00:00:00Z") },
+      { section: "Oldest", sort_order: null, created_at: at("2018-01-01T00:00:00Z") },
+    ];
+    expect(sort(rows)).toEqual(["Oldest", "Newest", "Unknown"]);
+  });
+
+  test("a non-finite birth instant is treated as no instant at all", () => {
+    const rows: OrderableSection[] = [
+      { section: "Broken", sort_order: null, created_at: Number.NaN },
+      { section: "Fine", sort_order: null, created_at: at("2024-01-01T00:00:00Z") },
+    ];
+    expect(sort(rows)).toEqual(["Fine", "Broken"]);
+    expect(sort([...rows].reverse())).toEqual(["Fine", "Broken"]);
+  });
+});
+
+describe("planSectionOrder — the tail it STAMPS is the tail the screen shows", () => {
+  test("the unnamed remainder is appended oldest-first", () => {
+    // This call decides what gets renumbered 1..N, so whatever order it picks
+    // becomes permanent. Appending alphabetically while the screen sorted by
+    // creation would freeze the wrong arrangement on the owner's first drag.
+    const born = new Map([
+      ["terrace", Date.parse("2023-01-01T00:00:00Z")],
+      ["entrance", Date.parse("2021-01-01T00:00:00Z")],
+      ["bar", Date.parse("2022-01-01T00:00:00Z")],
+    ]);
+    expect(planSectionOrder(["Terrace"], ["Terrace", "Bar", "Entrance"], born))
+      .toEqual(["Terrace", "Entrance", "Bar"]);
+  });
+
+  test("with no birth map at all the remainder is alphabetical, as before", () => {
+    expect(planSectionOrder(["Terrace"], ["Terrace", "Zulu", "Alpha"]))
+      .toEqual(["Terrace", "Alpha", "Zulu"]);
+  });
+
+  test("nothing can vanish, birth map or not", () => {
+    // The one invariant this whole file exists to protect, re-asserted on the
+    // new code path: the result is still a permutation of what exists.
+    const born = new Map([["ghost", Date.parse("2020-01-01T00:00:00Z")]]);
+    const out = planSectionOrder(["Nope"], ["Ghost", "Bar"], born);
+    expect([...out].sort()).toEqual(["Bar", "Ghost"]);
+  });
+});
+
 describe("readSectionOrderRequest", () => {
   test("accepts sections, and order as an alias", () => {
     expect(readSectionOrderRequest({ sections: ["Bar", "Terrace"] })).toEqual(["Bar", "Terrace"]);

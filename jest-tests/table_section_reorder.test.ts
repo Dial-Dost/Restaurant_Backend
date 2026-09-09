@@ -277,3 +277,132 @@ describe("GetTableSections — what the floor plan reads back", () => {
     });
   });
 });
+
+describe("creation order, and the materialisation trap it has to survive", () => {
+  test("an outlet that has never reordered reads oldest zone first", () => {
+    // The default the owner asked for. Alphabetical would be Bar, Entrance,
+    // Terrace; the restaurant was built Entrance -> Bar -> Terrace and that is
+    // the order the floor is read in all service.
+    addTable({ table_name: "T1", section: "Terrace", created_at: "2023-05-01T00:00:00.000Z" });
+    addTable({ table_name: "T2", section: "Bar", created_at: "2022-03-01T00:00:00.000Z" });
+    addTable({ table_name: "T3", section: "Entrance", created_at: "2021-01-01T00:00:00.000Z" });
+
+    return db.GetTableSections(RESTAURANT_SLUG).then((roster) => {
+      expect(roster.sections.map((s) => s.section)).toEqual(["Entrance", "Bar", "Terrace"]);
+      // Nothing has been positioned. This is a READ decision, not a stored one.
+      expect(roster.sections.map((s) => s.sort_order)).toEqual([null, null, null]);
+    });
+  });
+
+  test("a zone is dated by its FIRST table, not its newest", () => {
+    // min() across the zone's tables. A room that gained a table last week is
+    // still as old as the day it opened.
+    addTable({ table_name: "T1", section: "Main Hall", created_at: "2019-01-01T00:00:00.000Z" });
+    addTable({ table_name: "T9", section: "Main Hall", created_at: "2026-08-01T00:00:00.000Z" });
+    addTable({ table_name: "T2", section: "Annexe", created_at: "2024-01-01T00:00:00.000Z" });
+
+    return db.GetTableSections(RESTAURANT_SLUG).then((roster) => {
+      expect(roster.sections.map((s) => s.section)).toEqual(["Main Hall", "Annexe"]);
+    });
+  });
+
+  test("an EMPTY zone is dated by its roster row, which is all it has", () => {
+    addZone("Old Snug", null, "2020-06-01T00:00:00.000Z");
+    addTable({ table_name: "T1", section: "New Deck", created_at: "2025-01-01T00:00:00.000Z" });
+
+    return db.GetTableSections(RESTAURANT_SLUG).then((roster) => {
+      // GetTableSections only summarises zones that have tables; the empty one
+      // reaches the list through the route's union, so what is asserted here is
+      // that its instant is published for that union to use.
+      expect(roster.born["old snug"]).toBe("2020-06-01T00:00:00.000Z");
+      expect(roster.born["new deck"]).toBe("2025-01-01T00:00:00.000Z");
+    });
+  });
+
+  test("a DELETED table cannot date the zone it used to be in", () => {
+    // Same predicate the summary and the materialising insert carry. Without it
+    // a table removed years ago would keep back-dating a zone forever.
+    addTable({ table_name: "T1", section: "Bar", created_at: "2018-01-01T00:00:00.000Z", is_deleted: true });
+    addTable({ table_name: "T2", section: "Bar", created_at: "2025-01-01T00:00:00.000Z" });
+    addTable({ table_name: "T3", section: "Atrium", created_at: "2024-01-01T00:00:00.000Z" });
+
+    return db.GetTableSections(RESTAURANT_SLUG).then((roster) => {
+      // 2018 is gone with the deleted row, so Bar is a 2025 zone and Atrium wins.
+      expect(roster.sections.map((s) => s.section)).toEqual(["Atrium", "Bar"]);
+    });
+  });
+
+  test("MATERIALISATION DOES NOT RE-DATE A ZONE THE OWNER HAS ALWAYS HAD", () => {
+    // THE TRAP, stated as a test.
+    //
+    // "Main Hall" and "Annexe" exist only as "Tables".section strings. The first
+    // reorder materialises a roster row for each, and both rows are stamped
+    // created_at = now() by ONE insert — so read the roster after that and the
+    // two zones are exactly the same age, ordering collapses to alphabetical,
+    // and a room from 2019 is filed under a 2026 birthday behind a room from
+    // 2024.
+    //
+    // The tail this produces is not cosmetic: planSectionOrder's remainder is
+    // renumbered 1..N and becomes the outlet's permanent order. Getting it wrong
+    // here writes the wrong floor plan into the database for good.
+    //
+    // What defeats the trap is that the birth instant is a UNION of both
+    // sources and takes the OLDEST: the roster rows are all stamped now(), but
+    // the tables underneath them still carry 2019 and 2024, and min() finds
+    // them. The assertion below on the roster stamps is what proves the roster
+    // alone could not have produced this answer.
+    addTable({ table_name: "T1", section: "Terrace", created_at: "2022-01-01T00:00:00.000Z" });
+    addTable({ table_name: "T2", section: "Main Hall", created_at: "2019-01-01T00:00:00.000Z" });
+    addTable({ table_name: "T3", section: "Annexe", created_at: "2024-01-01T00:00:00.000Z" });
+
+    return db
+      // The owner drags only Terrace to the front and says nothing about the
+      // other two, so both fall into the appended remainder.
+      .ReorderTableSections(RESTAURANT_SLUG, ["Terrace"])
+      .then((res) => {
+        expect(res.ordered).toEqual(["Terrace", "Main Hall", "Annexe"]);
+        // Every roster row was created by the materialising insert in this very
+        // transaction, so the roster alone genuinely cannot tell them apart —
+        // which is what makes the assertion above meaningful rather than lucky.
+        const stamps = zones()
+          .filter((z) => z.name !== "Terrace")
+          .map((z) => z.created_at);
+        expect(new Set(stamps).size).toBe(1);
+        return db.GetTableSections(RESTAURANT_SLUG);
+      })
+      .then((roster) => {
+        expect(roster.sections.map((s) => s.section)).toEqual(["Terrace", "Main Hall", "Annexe"]);
+        expect(roster.sections.map((s) => s.sort_order)).toEqual([1, 2, 3]);
+      });
+  });
+
+  test("the birth read happens BEFORE the materialising insert", () => {
+    // DEFENCE IN DEPTH, pinned so it cannot be lost by accident.
+    //
+    // What actually saves the test above is the UNION: even read after
+    // materialisation, min() over both sources still finds 2019 on the table
+    // itself. Reading first buys two other things, and neither shows up in an
+    // outcome assertion, which is why this one is made against the statement
+    // log instead:
+    //
+    //   * it keeps the read out of the transaction, where a missing
+    //     "Table_sections" (42P01) would abort everything the reorder had done
+    //     rather than degrading to an undated tail;
+    //   * it means the ordering does not DEPEND on the union staying as wide as
+    //     it is. Narrow the roster half at any point and a read taken after
+    //     materialisation starts dating every zone to the reorder.
+    addTable({ table_name: "T1", section: "Main Hall", created_at: "2019-01-01T00:00:00.000Z" });
+    addTable({ table_name: "T2", section: "Annexe", created_at: "2024-01-01T00:00:00.000Z" });
+
+    return db.ReorderTableSections(RESTAURANT_SLUG, ["Annexe"]).then(() => {
+      const log = statements();
+      const birth = log.findIndex((l) => l.includes("select key as name, min(at) as at"));
+      const begin = log.findIndex((l) => l.startsWith("begin"));
+      const materialise = log.findIndex((l) => l.includes('insert into "table_sections" (res_id, outlet_id, name)'));
+      expect(birth).toBeGreaterThanOrEqual(0);
+      expect(materialise).toBeGreaterThanOrEqual(0);
+      expect(birth).toBeLessThan(begin);
+      expect(birth).toBeLessThan(materialise);
+    });
+  });
+});

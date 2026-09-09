@@ -56,6 +56,7 @@ import { registerPosterRoutes } from "./routes/posters.js";
 import { registerMisCaptureRoutes } from "./routes/mis_capture.js";
 import { registerMisReportRoutes } from "./routes/reports_mis.js";
 import { registerMenuTaxonomyRoutes } from "./routes/menu_taxonomy.js";
+import { registerSelfScorecardRoute } from "./routes/me.js";
 
 initObservability();
 const app = express();
@@ -460,6 +461,12 @@ registerTenderRoutes(app);
 // can match, so its position cannot shadow or be shadowed by anything above —
 // including the /menu/* routes it sits conceptually next to.
 registerMenuTaxonomyRoutes(app);
+// The signed-in employee's OWN scorecard (`GET /me/scorecard`) — the read behind
+// a waiter's Overview. Registered last on purpose: /me is a namespace nothing
+// above uses, so a single literal path here can neither shadow an existing route
+// nor be shadowed by one, and appending rather than inserting keeps the route
+// manifest's diff to the one line this actually adds.
+registerSelfScorecardRoute(app);
 
 
 

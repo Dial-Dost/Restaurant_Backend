@@ -47,6 +47,10 @@ export interface TableFix {
   section: string | null;
   is_deleted: boolean;
   is_virtual: boolean;
+  /** "Tables".created_at, ISO. Half of a zone's BIRTH INSTANT — the read order
+   *  dates an unpositioned zone by the first table ever put in it, which is the
+   *  only thing that survives a roster row being materialised years later. */
+  created_at: string;
 }
 
 /** One "Table_sections" roster row (migration 023 + 041's sort_order). */
@@ -54,6 +58,9 @@ export interface ZoneFix {
   id: string;
   name: string;
   sort_order: number | null;
+  /** "Table_sections".created_at, ISO. The OTHER half of the birth instant, and
+   *  the younger one whenever the row was materialised by a reorder. */
+  created_at: string;
 }
 
 interface Store {
@@ -82,13 +89,17 @@ export function addTable(t: Partial<TableFix> & { table_name: string }): void {
     section: null,
     is_deleted: false,
     is_virtual: false,
+    // Default far enough back that a test which cares about creation order has
+    // to say so explicitly, and one that does not gets a stable tie broken by
+    // name — i.e. the alphabetical order these tests were written against.
+    created_at: "2020-01-01T00:00:00.000Z",
     ...t,
   });
 }
 
 /** Seed a roster row — a zone that exists as a NAME, with or without tables. */
-export function addZone(name: string, sortOrder: number | null = null): void {
-  store.zones.push({ id: `z-${String(store.nextId++)}`, name, sort_order: sortOrder });
+export function addZone(name: string, sortOrder: number | null = null, createdAt = "2020-01-01T00:00:00.000Z"): void {
+  store.zones.push({ id: `z-${String(store.nextId++)}`, name, sort_order: sortOrder, created_at: createdAt });
 }
 
 /** The roster as it stands, for assertions. */
@@ -166,6 +177,37 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     };
   }
 
+  // --- readSectionBirthByKey ------------------------------------------------
+  // The union of both sources, oldest instant per zone key. Modelled from the
+  // statement: the "Tables" half applies the same is_deleted / is_virtual /
+  // blank-label predicates the SQL carries, so a deleted table cannot date a
+  // zone it has left.
+  if (s.includes('select key as name, min(at) as at')) {
+    const oldest = new Map<string, number>();
+    const note = (label: string, at: string): void => {
+      const k = key(label);
+      if (!k) {return;}
+      const ms = Date.parse(at);
+      if (!Number.isFinite(ms)) {return;}
+      const seen = oldest.get(k);
+      if (seen === undefined || ms < seen) {oldest.set(k, ms);}
+    };
+    for (const z of store.zones) {
+      if (z.name.trim() === "") {continue;}
+      note(z.name, z.created_at);
+    }
+    const skipDeleted = s.includes("coalesce(is_deleted, false) = false");
+    const skipVirtual = s.includes("coalesce(is_virtual, false) = false");
+    for (const t of store.tables) {
+      if (skipDeleted && t.is_deleted) {continue;}
+      if (skipVirtual && t.is_virtual) {continue;}
+      const label = (t.section ?? "").trim();
+      if (label === "") {continue;}
+      note(label, t.created_at);
+    }
+    return { rows: [...oldest].map(([name, at]) => ({ name, at: new Date(at) })) };
+  }
+
   // --- GetTableSections' group-by over "Tables" -----------------------------
   // Grouped case-INSENSITIVELY with min() picking the display spelling, exactly
   // as the statement says, because that grouping is what stops "Patio"/"patio"
@@ -216,7 +258,11 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
       // `on conflict do nothing` against 023's unique index on
       // (res_id, outlet_id, lower(btrim(name))).
       if (store.zones.some((z) => key(z.name) === k)) {continue;}
-      store.zones.push({ id: `z-${String(store.nextId++)}`, name: label, sort_order: null });
+      // created_at DEFAULT now() — the materialised row is stamped with the
+      // instant of the reorder, not the instant the zone came into use. That is
+      // precisely the trap readSectionBirthByKey exists to avoid, so the fixture
+      // reproduces it rather than quietly back-dating the row.
+      store.zones.push({ id: `z-${String(store.nextId++)}`, name: label, sort_order: null, created_at: new Date().toISOString() });
       inserted += 1;
     }
     return { rows: inserted > 0 && s.includes("returning") ? [] : [] };

@@ -4,9 +4,9 @@
  * split, merge, refund, reopen).
  */
 import type { Express, Request, Response } from "express";
-import type { BillTenderState } from "../database_supabase.js";
+import type { BillSectionAxis, BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges } from "../database_supabase.js";
 import { buildReceiptBase64 } from "../escpos.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
@@ -920,6 +920,12 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			// tenant that has configured neither gets exactly today's header.
 			legalName: settings.bill_legal_name ?? null,
 			address: profile?.outlet_add ?? null,
+			// The outlet's own contact number ("Outlets".outlet_main_ph, surfaced by
+			// GetRestaurantProfile). Address and GSTIN were already on the paper;
+			// the phone was the one statutory-header field a guest could not read
+			// off their own bill. Unset resolves to "" and the renderer prints no
+			// line for "", so an outlet that never filled it in is unchanged.
+			phone: profile?.outlet_phone ?? null,
 			gstin: settings.bill_gstin ?? null,
 			table: tableName,
 			covers: bill.covers ?? 1,
@@ -1213,15 +1219,66 @@ app.post('/bills/item-note', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 	}
 });
 
+/**
+ * WHICH CUT OF THE MENU A SECTION SPLIT DIVIDES A BILL ALONG.
+ *
+ * Read leniently and refused explicitly. A till that sends an axis this build
+ * has never heard of gets a 400 naming the three, rather than a split silently
+ * computed along a different axis than the one the cashier picked — the guest is
+ * about to be asked to pay one of these amounts.
+ *
+ * An ABSENT axis is `category`, because it is the one that works with no
+ * configuration at all: every menu item has a category, and none has a group
+ * until somebody sets them up. See the data layer's SPLITTING A BILL header.
+ */
+function readSectionAxis(raw: unknown): BillSectionAxis | null {
+	const wanted = String(raw ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+	if (!wanted) { return "category"; }
+	if (["category", "categories", "menu_category"].includes(wanted)) { return "category"; }
+	if (["revenue_group", "revenue", "group", "groups"].includes(wanted)) { return "revenue_group"; }
+	if (["production_group", "production"].includes(wanted)) { return "production_group"; }
+	return null;
+}
+
 // Compute a split of a table's bill (read-only — does not change the bill).
+//
+// THREE MODES, and the third is the new one: 'even' N ways, 'item' by
+// caller-named guest groups, 'section' by the part of the menu the food came
+// from (`axis`: category / revenue_group / production_group). Only 'section'
+// reads the menu; the other two are untouched, byte for byte, because they are
+// what every till in the field is calling today.
 app.post('/bills/split', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), validateBody(sBillSplit), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
-	const mode = body.mode === "item" ? "item" : "even";
+	const mode = body.mode === "item" ? "item" : body.mode === "section" ? "section" : "even";
 	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
 	try {
+		if (mode === "section") {
+			const axis = readSectionAxis(body.axis ?? body.by);
+			if (!axis) {
+				res.status(400).json({ error: `Unknown split axis. Use one of: ${BILL_SECTION_AXES.join(", ")}` });
+				return;
+			}
+			const split = await SplitBillForTableBySection(restaurantId, tableName, axis);
+			// THE CEILING IS SAID HERE, NOT DISCOVERED AT THE TILL. A bill settles
+			// across at most MAX_BILL_TENDERS payments (see that constant's header —
+			// `payment_splits` accepts 2..6 and a seventh tender would record and then
+			// be impossible to settle). A menu can easily have more sections than
+			// that, so a split that cannot be taken as separate payments has to say
+			// so while there is still time to take some of the sections together.
+			const overCeiling = split.payable_parts > MAX_BILL_TENDERS;
+			res.json({
+				...split,
+				tender_ceiling: MAX_BILL_TENDERS,
+				exceeds_tender_ceiling: overCeiling,
+				notes: overCeiling
+					? [...split.notes, `This splits into ${String(split.payable_parts)} sections that need paying, but a bill can be settled across at most ${String(MAX_BILL_TENDERS)} payments. Take some of these sections on one payment, or settle the bill whole.`]
+					: split.notes,
+			});
+			return;
+		}
 		const result = await SplitBillForTable(restaurantId, tableName, mode, {
 			parts: Number(body.parts ?? 0) || undefined,
 			groups: Array.isArray(body.groups) ? (body.groups as any) : undefined,

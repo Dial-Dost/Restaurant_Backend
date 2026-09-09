@@ -4,8 +4,8 @@
  */
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "crypto";
-import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrderKotContext, GetOrders, GetOrdersScope, GetRestaurantProfile, GetRestaurantSettings, GetTableFeedbackContext, IsOrderItemServed, OrderTimingAction, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
-import { dispatchKot, logKotDispatched } from "../kot_print.js";
+import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrders, GetOrdersScope, IsOrderItemServed, OrderTimingAction, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
+import { autoPrintOrderKot } from "../kot_print.js";
 import { idempotent } from "../idempotency.js";
 import { resolveServeIntent } from "../order_intent.js";
 import { logger } from "../observability.js";
@@ -21,100 +21,51 @@ const ORDER_ACTION = "4ad474d4-5230-449c-874f-6a238b833bca";
 const PERM_BARK = "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63"; // Bark Order
 
 /**
- * Print the barked order's kitchen docket.
+ * WHERE THE KITCHEN DOCKET IS TRIGGERED FROM, and why it is four places.
+ *
+ * THE TRIGGER MOVED. It used to be the BARK and only the bark. It is now ORDER
+ * PLACED — POST /orders and POST /orders/takeaway below, plus the guest QR page
+ * in routes/guest.ts — because that is the moment the restaurant wants paper on
+ * the pass. Three consequences, all of them deliberate:
+ *
+ *   1. THE APPROVAL GATE STILL HOLDS. An order placed while auto-push is off is
+ *      created Pending, and autoPrintOrderKot refuses to print a Pending order.
+ *      The accept transition (PATCH /orders/:id/status -> Preparing) prints it
+ *      instead. Without that the printer would be approving orders.
+ *
+ *   2. BARK NO LONGER PRINTS, in practice. It still calls in, but the order was
+ *      ticketed at placement, so the content memo answers "already KOT-26" and
+ *      nothing is built. It fires for real only on an order the placement path
+ *      never ticketed — auto-print switched off at the time and switched on
+ *      since, a print that failed before it could allocate. Keeping the call is
+ *      what makes bark the safety net rather than a second docket.
+ *
+ *   3. BARK IS STILL A REAL STEP. barked_at is the KITCHEN CLOCK: un-barked
+ *      orders never age (loadOrderTiming), prep timers rebase on it, and
+ *      bark-to-served is the number the analytics report. Removing it would not
+ *      remove a print, it would remove the timing baseline.
  *
  * WHY THE DOCKET IS ORDER-SCOPED AND NOT TABLE-SCOPED
  * ---------------------------------------------------
  * The manual thermal KOT (POST /print/bill {kind:"kot"}) prints the TABLE: it
  * goes through GetBillForTable, which aggregates every active order on the
- * table. Barking is not that. A party orders starters at 19:00 (barked, cooked,
- * eaten) and mains at 19:40; auto-printing the table aggregate on the second
- * bark would put the starters in front of the kitchen again and the restaurant
- * would cook and eat the cost of them. So this reads the barked ORDER's own
- * lines (GetOrderKotContext) and prints those.
+ * table. Automatic printing is not that. A party orders starters at 19:00
+ * (cooked, eaten) and mains at 19:40; printing the table aggregate for the
+ * second order would put the starters in front of the kitchen again and the
+ * restaurant would cook and eat the cost of them. So every automatic path reads
+ * the ORDER's own lines (GetOrderKotContext) and prints those — and the add-item
+ * path narrows it further, to the one line that was added.
  *
- * WHY THIS CANNOT MINT A SECOND KOT NUMBER
- * ----------------------------------------
- * Two interlocks, and they are independent:
- *
- *   1. BarkOrder is a compare-and-set on a null barked_at. A second bark of the
- *      same order returns already_barked and this function is never reached, so
- *      the ordinary "someone pressed it twice" case never gets as far as
- *      numbering.
- *   2. Even if it were reached — two replicas racing the first bark, or an
- *      offline outbox replay that carries a fresh idempotency key — the ticket
- *      key is (outlet, business day, table, normalised item set). An unchanged
- *      order hashes to the same key, AllocateKotNumber returns the memoised
- *      number with reused:true, and the second docket carries the number that is
- *      already on paper rather than burning the next one.
- *
- * Interlock 2 is what makes the manual reprint (POST /print/kot/order/:id) a
- * genuine REPRINT of this docket rather than a new ticket listing the same food.
- *
- * WHY A FAILURE HERE MUST NOT FAIL THE BARK
- * -----------------------------------------
- * Barking stamps barked_at and rebases every prep timer — it is the kitchen's
- * clock starting, and it has already been committed by the time this runs. A
- * printer problem, an unreadable menu or an unapplied migration must not roll
- * that back or 400 the request, because the alternative is a kitchen that has
- * been told about an order the system now claims was never announced. So this
- * returns a result the response reports and never throws.
+ * WHY NONE OF THESE CAN MINT A SECOND KOT NUMBER
+ * ----------------------------------------------
+ * The ticket key is (outlet, business day, table, normalised item set, scope).
+ * An unchanged order hashes to the same key wherever it is dispatched from, so
+ * AllocateKotNumber returns the memoised number with reused:true — and
+ * skipIfTicketed turns that into "print nothing", which is what makes place-then
+ * -bark one docket instead of two. The manual reprint
+ * (POST /print/kot/order/:id) leaves skipIfTicketed off, so it still reprints
+ * the same number and the same bytes on demand.
  */
-async function autoPrintBarkedKot(
-	req: Request,
-	restaurantId: string,
-	orderId: string,
-): Promise<{ printed: boolean; kot_no: number | null; tickets: number; reason?: string }> {
-	const outletId = extractOutletId(req);
-	if (!outletId) {return { printed: false, kot_no: null, tickets: 0, reason: "no_outlet" };}
-	try {
-		const settings = await GetRestaurantSettings(restaurantId);
-		// DEFAULT ON. kot_auto_print is NULL for every tenant that predates
-		// migration 040 and GetRestaurantSettings reads NULL as true, so the
-		// feature is live without anyone opting in — which is the point.
-		if (settings.kot_auto_print === false) {return { printed: false, kot_no: null, tickets: 0, reason: "disabled" };}
-
-		const order = await GetOrderKotContext(restaurantId, orderId);
-		if (!order) {return { printed: false, kot_no: null, tickets: 0, reason: "order_not_found" };}
-		// An order with no lines has nothing for the kitchen to cook. Printing an
-		// empty docket would burn a KOT number on a blank piece of paper.
-		if (order.items.length === 0) {return { printed: false, kot_no: null, tickets: 0, reason: "no_items" };}
-
-		const [profile, waiterCtx] = await Promise.all([
-			GetRestaurantProfile(restaurantId).catch(() => null),
-			order.table_name ? GetTableFeedbackContext(restaurantId, order.table_name).catch(() => null) : Promise.resolve(null),
-		]);
-		const waiterName = (waiterCtx?.employee_name ?? "").trim();
-		const waiterRole = (waiterCtx?.employee_role ?? "").trim().toLowerCase();
-
-		const dispatched = await dispatchKot({
-			restaurantId, outletId,
-			tableName: order.table_name,
-			tableId: order.table_id,
-			section: order.section,
-			covers: order.covers,
-			isVirtual: order.is_virtual,
-			orderType: order.order_type,
-			items: order.items,
-			assignedTo: waiterName || null,
-			captain: waiterName && (waiterRole === "captain" || waiterRole === "manager") ? waiterName : null,
-			// The same shape POST /print/kot/order/:id uses, so a docket and its
-			// later reprint group together in "PrintJobs".
-			billId: `order-${order.order_id}`,
-			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
-			currency: settings.currency ?? "\u20b9",
-			cols: settings.bill_paper_width === "58mm" ? 32 : 48,
-			tz: settings.timezone || "Asia/Kolkata",
-		});
-		logKotDispatched("bark_auto_print", dispatched, { resId: restaurantId, outletId, orderId });
-		return { printed: true, kot_no: dispatched.kotNo, tickets: dispatched.tickets };
-	} catch (err) {
-		// Loud, because a kitchen that stops getting dockets has to be findable
-		// in the logs — but never fatal to the bark that already happened.
-		logger.error({ err, orderId, restaurantId }, "bark_auto_print_failed");
-		return { printed: false, kot_no: null, tickets: 0, reason: "print_failed" };
-	}
-}
 async function handleTiming(req: Request, res: Response, action: "pause" | "resume" | "serve" | "start" | "unserve", withItem: boolean) {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -219,7 +170,15 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 				Audit_log_category.Orders, { order_id: created.orderId, table: created.table ?? null });
 		} catch (err) { logger.warn({ err }, "log_audit order-create failed"); }
 		emitOrderCreated(restaurantId, created);
-		res.status(201).json(result);
+		// THE KITCHEN DOCKET, at the moment the order is placed. Never throws and
+		// never fails the order: the row is committed and the guest has been told
+		// it was taken, so a printer problem is reported, not raised.
+		const printed = await autoPrintOrderKot({ restaurantId, orderId: result.id, where: "order_placed" });
+		res.status(201).json({
+			...result,
+			kot_printed: printed.printed, kot_no: printed.kot_no, kot_tickets: printed.tickets,
+			...(printed.reason ? { kot_skipped: printed.reason } : {}),
+		});
 	} catch (error: any) {
 		logger.error({ err: error }, "add_order_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to add order") });
@@ -259,7 +218,14 @@ app.post("/orders/takeaway", validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 		};
 		await notifyOrderCreated(restaurantId, createdTakeaway);
 		emitOrderCreated(restaurantId, createdTakeaway);
-		res.status(201).json(result);
+		// Same trigger as dine-in. A takeaway is backed by a hidden virtual
+		// "Tables" row, so it keys and numbers exactly like any other order.
+		const printedTakeaway = await autoPrintOrderKot({ restaurantId, orderId: result.id, where: "order_placed" });
+		res.status(201).json({
+			...result,
+			kot_printed: printedTakeaway.printed, kot_no: printedTakeaway.kot_no, kot_tickets: printedTakeaway.tickets,
+			...(printedTakeaway.reason ? { kot_skipped: printedTakeaway.reason } : {}),
+		});
 	} catch (error: any) {
 		logger.error({ err: error }, "add_takeaway_order_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to add order") });
@@ -317,7 +283,29 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 		try {
 			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Order ${orderId} -> ${status}`, Audit_log_category.Orders, { order_id: orderId, status, ...undoEnvelope });
 		} catch (e) { logger.warn({ err: e }, "log_audit order status failed"); }
-		res.json({ success: true });
+		// THE APPROVAL TRIGGER. An order placed while auto-push is off is created
+		// Pending and the placement path deliberately printed nothing; this is the
+		// transition that accepts it to the kitchen, so this is where its docket
+		// comes out.
+		//
+		// GUARDED BY THE CONTENT MEMO, not by inspecting the previous status. Every
+		// OTHER route into "Preparing" — a Served order corrected back, a re-open —
+		// lands here too, and every one of them is an order that was already
+		// ticketed, so AllocateKotNumber answers reused and skipIfTicketed prints
+		// nothing. One rule covers the approval and every look-alike after it.
+		let approvalPrint: Awaited<ReturnType<typeof autoPrintOrderKot>> | null = null;
+		if (status.trim().toLowerCase() === "preparing") {
+			approvalPrint = await autoPrintOrderKot({ restaurantId, orderId, where: "order_approved" });
+		}
+		res.json({
+			success: true,
+			...(approvalPrint
+				? {
+					kot_printed: approvalPrint.printed, kot_no: approvalPrint.kot_no, kot_tickets: approvalPrint.tickets,
+					...(approvalPrint.reason ? { kot_skipped: approvalPrint.reason } : {}),
+				}
+				: {}),
+		});
 	} catch (error: any) {
 		logger.error({ err: error }, "set_order_status_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to update order status") });
@@ -390,7 +378,51 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 		// ("Update Order - Add Food Item") rather than the generic "Add Orders".
 		try { await log_audit(req, "d6bebeb5-111f-4371-b373-a99158116d71", `Added item ${newItem.id} to order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, item: newItem }); } catch (err) { logger.warn({ err }, 'log_audit add-order-item failed'); }
 
-		res.status(201).json({ success: true, item: newItem });
+		// THE ADDED LINE, AND NOTHING ELSE.
+		//
+		// The rest of this order is on the pass already — cooked, cooking, or in
+		// some cases eaten. Re-printing the whole order because one line was added
+		// asks the kitchen to make all of it a second time, and the restaurant eats
+		// the cost. So the docket carries exactly the line that was just added.
+		//
+		// `scope` IS THE LINE ID AND IT IS LOAD-BEARING. The ticket key is the
+		// content fingerprint, so two separate presses of "add a Gulab Jamun" on the
+		// same table on the same day are byte-identical item sets: without a
+		// discriminator the second hashes to the first one's key, comes back reused
+		// and the kitchen is never told about the second sweet. The line id — a
+		// fresh randomUUID per add — is what makes each one its own ticket with its
+		// own number. And because each key is unique by construction, this is the
+		// one automatic path that does NOT suppress on reused: there is nothing to
+		// suppress, and suppressing would be the bug.
+		//
+		// A retry of this REQUEST is a different question, and idempotent() above
+		// already answers it: the same key replays the stored response without
+		// re-running the handler, so no second docket.
+		// applyMenuPriceFloor is generic in its element type, so the label it stamps
+		// on a variation line is not on the returned type. Read through one narrow
+		// record view rather than an `any`, and carry the same four fields the
+		// ticket key hashes: name, quantity, note and variation.
+		const printedLine = newItem as unknown as Record<string, unknown>;
+		const addedNote = typeof printedLine.note === "string" ? printedLine.note.trim() : "";
+		const addedVariation = typeof printedLine.variation_name === "string" ? printedLine.variation_name.trim() : "";
+		const printedItem = await autoPrintOrderKot({
+			restaurantId, orderId, where: "order_item_added",
+			only: [{
+				name: String(printedLine.name ?? "Item"),
+				quantity: Number(printedLine.quantity ?? 1),
+				price: Number(printedLine.price ?? 0),
+				...(addedNote ? { note: addedNote } : {}),
+				...(addedVariation ? { variation: addedVariation } : {}),
+			}],
+			scope: String(printedLine.id ?? ""),
+			skipIfTicketed: false,
+		});
+
+		res.status(201).json({
+			success: true, item: newItem,
+			kot_printed: printedItem.printed, kot_no: printedItem.kot_no, kot_tickets: printedItem.tickets,
+			...(printedItem.reason ? { kot_skipped: printedItem.reason } : {}),
+		});
 	} catch (err: any) {
 		logger.error({ err }, 'add_order_item_failed');
 		res.status(500).json({ error: String(err?.message ?? 'Unable to add item') });
@@ -528,14 +560,25 @@ app.post("/orders/:id/bark", validateAction(PERM_BARK), idempotent(), async (req
 	if (!orderId) { res.status(400).json({ error: "order id is required" }); return; }
 	try {
 		const result = await BarkOrder(restaurantId, orderId, extractEmployeeId(req));
-		// THE DOCKET PRINTS ON THE FIRST BARK AND ONLY THE FIRST. already_barked
-		// is BarkOrder's compare-and-set telling us this order was announced
-		// before; re-announcing it must not put a second ticket on the pass. A
-		// deliberate second copy is what POST /print/kot/order/:id is for, and
-		// that route is a true reprint (same key, same number).
+		// BARK IS NOW THE SAFETY NET, NOT THE TRIGGER. The order was ticketed when
+		// it was placed (or approved), so this call normally finds the content
+		// already memoised and prints nothing — reporting "already_printed" and
+		// the number that is on the paper. It puts a docket out only for an order
+		// those paths never ticketed: auto-print switched off at the time and
+		// switched on since, or a placement print that failed before it could
+		// allocate a number.
+		//
+		// Two independent interlocks stop it becoming a second ticket, and both
+		// still hold. already_barked is BarkOrder's compare-and-set, which stops a
+		// re-announcement ever reaching the printer at all; skipIfTicketed (the
+		// default inside autoPrintOrderKot) is the content memo, which holds even
+		// when two replicas race the first bark or an offline outbox replay
+		// arrives carrying a fresh idempotency key. A deliberate second copy is
+		// what POST /print/kot/order/:id is for, and that route is a true reprint
+		// (same key, same number, same bytes).
 		const printed = result.already_barked
 			? { printed: false, kot_no: null, tickets: 0, reason: "already_barked" }
-			: await autoPrintBarkedKot(req, restaurantId, orderId);
+			: await autoPrintOrderKot({ restaurantId, orderId, where: "order_barked" });
 		if (!result.already_barked) {
 			try { await log_audit(req, BARK_ORDER_ACTION_ID, `Barked order ${orderId} to the kitchen${printed.kot_no ? ` (KOT-${printed.kot_no})` : ""}`, Audit_log_category.Orders, { order_id: orderId, barked_at: result.barked_at, kot_no: printed.kot_no, auto_printed: printed.printed }); } catch {/* ignore */}
 			try { emitRestaurant(restaurantId, "order:updated", { order_id: orderId, barked: true }); } catch {/* ignore */}

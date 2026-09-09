@@ -9,10 +9,20 @@
  *   1. a waiter presses Print for a TABLE (POST /print/bill {kind:"kot"}) — the
  *      whole running order set, which is the right document for "give me this
  *      table's ticket again";
- *   2. an order is BARKED (POST /orders/:id/bark) — one order announced to the
- *      kitchen, which is the moment the docket should exist;
- *   3. someone asks for that same bark docket again because the printer jammed
+ *   2. an order REACHES THE KITCHEN — placed (POST /orders, POST
+ *      /orders/takeaway, the guest QR page), approved out of Pending, or barked.
+ *      All four go through autoPrintOrderKot below;
+ *   3. a LINE IS ADDED to an order already on the pass (POST /orders/:id/items),
+ *      which prints the added line and nothing else;
+ *   4. someone asks for a docket again because the printer jammed
  *      (POST /print/kot/order/:id).
+ *
+ * WHY 2 IS FOUR EVENTS AND NOT ONE. "Print when the order is placed" is what the
+ * restaurant asked for and what happens for essentially every order — but an
+ * order placed while auto-push is OFF is created Pending (status 8), which is
+ * the approval gate, and paper on the pass IS the kitchen being told. So the
+ * placement path declines to print a Pending order and the approval transition
+ * prints it instead. See autoPrintOrderKot.
  *
  * All three have to agree on four things that are easy to get subtly different
  * if each writes its own copy: which kitchen station each dish belongs to, what
@@ -37,7 +47,14 @@ import { allocateKotNumber, kotOrderContext, kotStamp, kotTicketKey, serviceMode
 import { logger } from "./observability.js";
 import { enqueuePrintJob, printJobPayload } from "./print_jobs.js";
 import { emitOutlet } from "./realtime.js";
-import { GetMenuItems, dayKeyOf } from "./database_supabase.js";
+import {
+  GetMenuItems,
+  GetOrderKotContext,
+  GetRestaurantProfile,
+  GetRestaurantSettings,
+  GetTableFeedbackContext,
+  dayKeyOf,
+} from "./database_supabase.js";
 
 /** One line as the kitchen needs it. Prices are accepted and never printed. */
 export interface KotLine {
@@ -46,6 +63,21 @@ export interface KotLine {
   price?: number;
   note?: string;
   variation?: string;
+  /**
+   * How many of this line's `quantity` are on COURSE HOLD (course_hold set and
+   * not yet fired). Absent or 0 on every line of every restaurant that does not
+   * hold courses.
+   *
+   * A COUNT RATHER THAN A FLAG, because the reads that feed this merge order
+   * lines by (name, price, non-chargeable, variation) — deliberately, so the
+   * printed bill groups the way the guest expects — and held-ness is NOT part of
+   * that key. Adding it would have split a guest's bill line in two the moment a
+   * waiter held one of the two Paneer Tikkas, and re-merged it when the course
+   * was fired: the same table's bill printing differently at 20:00 and 20:30, on
+   * a tax document, for a reason the guest cannot see. So the merge stays as it
+   * is and the docket does the splitting, here, where only the kitchen looks.
+   */
+  held_qty?: number;
 }
 
 export interface KotDispatchInput {
@@ -90,11 +122,59 @@ export interface KotDispatchInput {
    * byte-identical rather than merely equivalent-looking.
    */
   total?: number;
+  /**
+   * Extra ticket-key identity for a docket that is not the order's whole item
+   * set — the added line's id, and nothing else, today. See kotTicketKey.
+   */
+  scope?: string | null;
+  /**
+   * "Only print this if the content has never been ticketed today."
+   *
+   * THE INTERLOCK THAT MAKES PRINT-ON-PLACEMENT SAFE, and the reason placing an
+   * order and then barking it yields ONE docket rather than two. Every AUTOMATIC
+   * trigger sets it; every trigger a human pressed leaves it false, because a
+   * reprint that refused to reprint would be a dead button.
+   *
+   * The test is AllocateKotNumber's own `reused` flag — the migration-029 memo
+   * that maps one content fingerprint to one number for ever. Nothing new is
+   * stored and nothing new can drift: the fact that answers "has this already
+   * been ticketed?" is the same fact that answers "what number is on the paper?".
+   *
+   * WHAT IT COSTS. A placement whose allocation succeeded but whose enqueue then
+   * threw leaves a memo row and no paper, and the bark that follows will be
+   * suppressed too. That is what POST /print/kot/order/:id is for, and it is a
+   * true reprint — same key, same number, same bytes.
+   */
+  skipIfTicketed?: boolean;
+  /**
+   * Print this number instead of allocating one. Nothing is minted and nothing
+   * is memoised.
+   *
+   * THE ONE CALLER, and why the option is narrow on purpose: a docket that
+   * CORRECTS a ticket the kitchen already holds (an order moved to another
+   * table - see kot_move.ts). It has to carry the SAME number as the paper on
+   * the pass, because the number is how a chef pairs the correction with the
+   * ticket it corrects: "KOT-26 is now table 7" is actionable, "KOT-31 is table
+   * 7, and by the way bin 26" is a puzzle. Allocating would also be wrong twice
+   * over - it would burn a number for a re-print of food already ordered, and
+   * the content fingerprint would memoise the corrected table as if it were a
+   * new ticket.
+   *
+   * Null or absent = allocate normally, which is every other caller.
+   */
+  pinnedKotNo?: number | null;
+  /**
+   * Overrides the line at the very top of the docket (normally "Running Table"
+   * or the delivery channel - see kotOrderContext). Used to say, in the first
+   * thing a chef reads, that this piece of paper replaces another one.
+   */
+  contextLine?: string | null;
 }
 
 export interface KotDispatchResult {
   billId: string;
-  /** How many station dockets this ticket became. Never zero. */
+  /** How many station dockets this ticket became. Zero only when skipIfTicketed
+   *  suppressed an already-ticketed docket — see `skipped`. */
   tickets: number;
   stations: string[];
   kotNo: number | null;
@@ -103,6 +183,9 @@ export interface KotDispatchResult {
   reprint: boolean;
   /** One per station docket; null where migration 027 is unapplied. */
   jobIds: (string | null)[];
+  /** True when skipIfTicketed suppressed this dispatch. Nothing was built,
+   *  nothing was enqueued, and kotNo is the number already on paper. */
+  skipped: boolean;
 }
 
 /**
@@ -118,6 +201,9 @@ export function buildKotTicketKey(input: {
   items: KotLine[];
   firedAt: Date;
   tz: string;
+  /** See kotTicketKey — empty for a whole-order docket, which is almost all of
+   *  them, and the added line's id for a partial one. */
+  scope?: string | null;
 }): string {
   return kotTicketKey({
     outletId: input.outletId,
@@ -129,6 +215,7 @@ export function buildKotTicketKey(input: {
       note: it.note ?? null,
       variation: it.variation ?? null,
     })),
+    scope: input.scope ?? null,
   });
 }
 
@@ -140,7 +227,7 @@ export function buildKotTicketKey(input: {
  * under the shared "General" bucket and the kitchen gets one ticket with
  * everything on it, which is what a single-station restaurant gets anyway.
  */
-async function withStations(restaurantId: string, items: KotLine[]): Promise<(KotLine & { price: number; station: string | null })[]> {
+async function withStations(restaurantId: string, items: KotLine[]): Promise<(KotLine & { price: number; station: string | null; held?: boolean })[]> {
   const stationByName = new Map<string, string>();
   try {
     const menu = await GetMenuItems(restaurantId);
@@ -150,14 +237,30 @@ async function withStations(restaurantId: string, items: KotLine[]): Promise<(Ko
   } catch {
     /* menu unavailable — everything falls under a single General ticket */
   }
-  return items.map((it) => ({
-    ...it,
-    // ReceiptItem requires a price and a KOT never prints one, so an absent
-    // price becomes 0 rather than making every caller invent a number for a
-    // column the renderer does not lay out.
-    price: it.price ?? 0,
-    station: stationByName.get(String(it.name).trim().toLowerCase()) ?? null,
-  }));
+  return items.flatMap((it) => {
+    const base = {
+      ...it,
+      // ReceiptItem requires a price and a KOT never prints one, so an absent
+      // price becomes 0 rather than making every caller invent a number for a
+      // column the renderer does not lay out.
+      price: it.price ?? 0,
+      station: stationByName.get(String(it.name).trim().toLowerCase()) ?? null,
+    };
+    // THE ONE PLACE A MERGED LINE BECOMES TWO DOCKET LINES. "Paneer Tikka x3, of
+    // which 1 is held" is one line on the bill and two on the docket: two to
+    // cook now, one waiting under the hold banner. A line that is wholly held
+    // produces exactly one line, in the hold block; a line with no hold produces
+    // exactly one line and does not even carry the `held` key, so a restaurant
+    // that never holds a course gets the object it always got.
+    const quantity = Math.max(1, Math.round(Number(it.quantity) || 1));
+    const heldQty = Math.max(0, Math.min(quantity, Math.round(Number(it.held_qty) || 0)));
+    if (heldQty <= 0) {return [base];}
+    if (heldQty >= quantity) {return [{ ...base, quantity, held: true }];}
+    return [
+      { ...base, quantity: quantity - heldQty },
+      { ...base, quantity: heldQty, held: true },
+    ];
+  });
 }
 
 /**
@@ -177,7 +280,8 @@ async function withStations(restaurantId: string, items: KotLine[]): Promise<(Ko
  * an unnumbered ticket (allocateKotNumber returns null when migration 029 is
  * unapplied) and durability degrades to fire-and-forget (enqueuePrintJob returns
  * null when 027 is unapplied), so the only things left to throw are real
- * failures. The bark path catches them and still barks; see routes/orders.ts.
+ * failures. autoPrintOrderKot below catches those and reports them, so an order
+ * is never rolled back or refused because a printer had a bad day.
  */
 export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchResult> {
   const firedAt = input.firedAt ?? new Date();
@@ -190,13 +294,37 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
   // empty-string key with every other unkeyable ticket in the outlet, which
   // would hand them all the same number.
   const businessDay = dayKeyOf(firedAt, tz);
-  const kot = input.tableId
+  // A PINNED number short-circuits allocation entirely: the caller already knows
+  // what is on the paper it is correcting, so there is nothing to mint and
+  // nothing to memoise. `reused: true` is the truth about it - this number has
+  // been printed before.
+  const pinned = typeof input.pinnedKotNo === "number" && Number.isFinite(input.pinnedKotNo) && input.pinnedKotNo > 0
+    ? { kot_no: Math.round(input.pinnedKotNo), business_day: businessDay, reused: true }
+    : null;
+  const kot = pinned ?? (input.tableId
     ? await allocateKotNumber(
       input.restaurantId,
-      buildKotTicketKey({ outletId: input.outletId, tableId: input.tableId, items: input.items, firedAt, tz }),
+      buildKotTicketKey({ outletId: input.outletId, tableId: input.tableId, items: input.items, firedAt, tz, scope: input.scope ?? null }),
       firedAt,
     )
-    : null;
+    : null);
+
+  // ALREADY ON PAPER. An automatic trigger asked for this docket and the memo
+  // says this exact content was ticketed earlier today, so the kitchen has it —
+  // nothing is built and nothing is enqueued. Placing an order and then barking
+  // it lands here on the bark, which is what makes it one docket and not two.
+  if (input.skipIfTicketed && kot?.reused) {
+    return {
+      billId: input.billId,
+      tickets: 0,
+      stations: [],
+      kotNo: kot.kot_no,
+      businessDay: kot.business_day,
+      reprint: true,
+      jobIds: [],
+      skipped: true,
+    };
+  }
 
   const tickets = buildKotBase64({
     restaurantName: input.restaurantName || "Receipt",
@@ -208,7 +336,7 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     kind: "kot",
     kotNo: kot?.kot_no ?? null,
     printedAt: kotStamp(firedAt, tz),
-    orderContext: kotOrderContext(input.isVirtual, serviceMode),
+    orderContext: input.contextLine?.trim() ? input.contextLine.trim() : kotOrderContext(input.isVirtual, serviceMode),
     serviceMode,
     section: input.section,
     assignedTo: input.assignedTo,
@@ -235,6 +363,7 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     businessDay: kot?.business_day ?? businessDay,
     reprint: kot?.reused ?? false,
     jobIds,
+    skipped: false,
   };
 }
 
@@ -260,4 +389,136 @@ export function logKotDispatched(where: string, result: KotDispatchResult, ctx: 
     { ...ctx, where, tickets: result.tickets, stations: result.stations, kot_no: result.kotNo, reprint: result.reprint },
     "kot_dispatched",
   );
+}
+
+// --- the automatic trigger ---------------------------------------------------
+
+export interface AutoKotOutcome {
+  /** True when dockets were built and queued by THIS call. */
+  printed: boolean;
+  /** The number on the paper — present even when this call printed nothing,
+   *  because "already ticketed as KOT-26" is the useful answer. */
+  kot_no: number | null;
+  tickets: number;
+  /** Why nothing was printed. Absent when something was. */
+  reason?: string;
+}
+
+/**
+ * Put ONE order's docket on the pass, automatically.
+ *
+ * WHEN THIS RUNS. Every moment an order reaches the kitchen:
+ *
+ *   * it is PLACED and goes straight to the kitchen — POST /orders, POST
+ *     /orders/takeaway, the guest QR page. This is the ordinary case and it is
+ *     what "the KOT prints when the order is placed" means;
+ *   * it is APPROVED out of Pending (PATCH /orders/:id/status -> Preparing),
+ *     which is when an order placed under auto-push-off reaches the kitchen;
+ *   * it is BARKED, which now only ever prints an order the two paths above did
+ *     not already ticket.
+ *
+ * WHY IT DOES NOT PRINT A PENDING ORDER, AND WHY THAT IS THE WHOLE POINT
+ * ---------------------------------------------------------------------
+ * With auto-push off, an order is created Pending (status 8) and a staffer must
+ * accept it. That gate exists so the kitchen is not committed to food nobody
+ * approved — and A DOCKET ON THE PASS IS THE COMMITMENT. Printing on placement
+ * regardless would hand the kitchen every unapproved order and leave the accept
+ * button decorating a decision the printer had already made. So the gate is read
+ * here, from the order row itself, and the approval transition is a print
+ * trigger in its own right. Under auto-push ON — the default, and how nearly
+ * every fielded outlet runs — no order is ever Pending and placement always
+ * prints, which is exactly what was asked for.
+ *
+ * WHY A PARTIAL DOCKET NEEDS `only` + `scope`
+ * -------------------------------------------
+ * Adding a line to an order already on the pass must print THE ADDED LINE. The
+ * caller passes it in `only` (the order's other lines are already cooked or
+ * cooking) and the line's id in `scope`, which is what keeps two separate "add a
+ * Gulab Jamun" presses from hashing to one ticket and losing the second sweet.
+ *
+ * WHY A FAILURE HERE MUST NOT FAIL THE CALLER
+ * -------------------------------------------
+ * By the time this runs the order EXISTS — it is committed, it is on the KDS,
+ * the guest has been told it was accepted. A printer problem, an unreadable menu
+ * or an unapplied migration cannot be allowed to roll that back or turn a
+ * successful order into a 400, because the alternative is a guest told their
+ * order failed while the row sits in the database. So this returns an outcome
+ * the response reports and never throws.
+ */
+export async function autoPrintOrderKot(opts: {
+  restaurantId: string;
+  orderId: string;
+  /** Names the trigger in the log line: "order_placed", "order_approved", … */
+  where: string;
+  /** Print only these lines. Absent = the order's whole item set. */
+  only?: KotLine[];
+  /** Ticket-key discriminator for a partial docket. See kotTicketKey. */
+  scope?: string | null;
+  /**
+   * Default TRUE, because every caller of this function is an automatic
+   * trigger. A partial docket passes false: its scope already makes it unique,
+   * and suppressing it would drop a line the kitchen has never seen.
+   */
+  skipIfTicketed?: boolean;
+}): Promise<AutoKotOutcome> {
+  const { restaurantId, orderId } = opts;
+  try {
+    const settings = await GetRestaurantSettings(restaurantId);
+    // DEFAULT ON. kot_auto_print is NULL for every tenant that predates
+    // migration 040 and GetRestaurantSettings reads NULL as true, so the
+    // feature is live without anyone opting in — which is the point.
+    if (settings.kot_auto_print === false) {return { printed: false, kot_no: null, tickets: 0, reason: "disabled" };}
+
+    const order = await GetOrderKotContext(restaurantId, orderId);
+    if (!order) {return { printed: false, kot_no: null, tickets: 0, reason: "order_not_found" };}
+    if (!order.outlet_id) {return { printed: false, kot_no: null, tickets: 0, reason: "no_outlet" };}
+    // THE APPROVAL GATE. Not yet accepted to the kitchen, so the kitchen is not
+    // told. The accept transition calls back in here.
+    if (order.awaiting_approval) {return { printed: false, kot_no: null, tickets: 0, reason: "awaiting_approval" };}
+
+    const items = opts.only ?? order.items;
+    // An order with no lines has nothing for the kitchen to cook. Printing an
+    // empty docket would burn a KOT number on a blank piece of paper.
+    if (items.length === 0) {return { printed: false, kot_no: null, tickets: 0, reason: "no_items" };}
+
+    const [profile, waiterCtx] = await Promise.all([
+      GetRestaurantProfile(restaurantId).catch(() => null),
+      order.table_name ? GetTableFeedbackContext(restaurantId, order.table_name).catch(() => null) : Promise.resolve(null),
+    ]);
+    const waiterName = (waiterCtx?.employee_name ?? "").trim();
+    const waiterRole = (waiterCtx?.employee_role ?? "").trim().toLowerCase();
+
+    const dispatched = await dispatchKot({
+      restaurantId,
+      outletId: order.outlet_id,
+      tableName: order.table_name,
+      tableId: order.table_id,
+      section: order.section,
+      covers: order.covers,
+      isVirtual: order.is_virtual,
+      orderType: order.order_type,
+      items,
+      assignedTo: waiterName || null,
+      captain: waiterName && (waiterRole === "captain" || waiterRole === "manager") ? waiterName : null,
+      // The same shape POST /print/kot/order/:id uses, so a docket and its
+      // later reprint group together in "PrintJobs".
+      billId: `order-${order.order_id}`,
+      restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+      currency: settings.currency ?? "\u20b9",
+      cols: settings.bill_paper_width === "58mm" ? 32 : 48,
+      tz: settings.timezone || "Asia/Kolkata",
+      scope: opts.scope ?? null,
+      skipIfTicketed: opts.skipIfTicketed ?? true,
+    });
+    logKotDispatched(opts.where, dispatched, { resId: restaurantId, outletId: order.outlet_id, orderId });
+    if (dispatched.skipped) {
+      return { printed: false, kot_no: dispatched.kotNo, tickets: 0, reason: "already_printed" };
+    }
+    return { printed: true, kot_no: dispatched.kotNo, tickets: dispatched.tickets };
+  } catch (err) {
+    // Loud, because a kitchen that stops getting dockets has to be findable
+    // in the logs — but never fatal to the order that already exists.
+    logger.error({ err, orderId, restaurantId, where: opts.where }, "order_auto_print_failed");
+    return { printed: false, kot_no: null, tickets: 0, reason: "print_failed" };
+  }
 }

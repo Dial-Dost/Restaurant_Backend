@@ -115,6 +115,8 @@ export interface SplitPart { label: string; subtotal: number; total: number; ite
 // so a split can never lose or invent money.
 //   - "item": allocate the grand proportionally to each guest-group's item subtotal.
 //   - "even": split into N equal parts (N clamped to [2,50]).
+// A THIRD mode — by MENU SECTION (starters / mains / bar) — is computeSectionSplit
+// at the foot of this file. It is a separate function on purpose; its header says why.
 export function computeBillSplit(
   grandTotal: number,
   mode: "even" | "item",
@@ -595,3 +597,354 @@ export function allocateTenderAmounts(grandTotal: number, parts: number): number
   }
   return out;
 }
+
+// ============================================================================
+// SPLITTING A BILL BY MENU SECTION — the third mode
+// ============================================================================
+//
+// "even" splits a bill BETWEEN PEOPLE. "item" splits it between guest groups the
+// CALLER names. This one splits it between SECTIONS OF THE MENU — starters,
+// mains, the bar — which is a different question with a different owner: the
+// caller does not choose the buckets, the menu does. Which axis of the menu
+// ("Starters" the category, or "Liquor" the revenue group of migration 039) is
+// the caller's choice; every line then lands in exactly one bucket on that axis,
+// including the lines that classify to nothing.
+//
+// WHY THIS IS NOT computeBillSplit's "item" mode with server-built groups. That
+// mode allocates ONE number — the grand total — and hands the LAST group
+// whatever rounding is left over. A section split is read as a set of
+// MINI-BILLS ("the bar came to 2,360, of which 360 is GST"), so every rung of
+// the ladder has to be apportioned rather than just the total, and the rounding
+// has to be spread rather than dumped on whoever happens to be last. Bending the
+// existing mode to do that would have changed what its existing callers get,
+// which is a live money path and not worth touching for a new feature.
+//
+// THE TWO INVARIANTS, and they hold TOGETHER, exactly, in whole paisa:
+//
+//   COLUMN — for every rung (discounted subtotal, discount, service charge, each
+//            named tax line, round-off, grand total) the parts sum to the bill's
+//            own figure. Nothing is lost and nothing is invented, which is what
+//            makes the set of parts a tax document instead of an estimate. A
+//            split that drops the GST is a bill that does not add up.
+//   ROW    — each part's own rungs add up to that part's own grand total. A part
+//            IS a bill in miniature and the guest handed one can check it.
+//
+// They pull against each other: rounding every rung independently breaks the
+// row, and deriving every rung from an allocated total breaks the column. They
+// are reconciled by apportioning every rung EXCEPT the grand total and then
+// DERIVING each part's grand total from its own apportioned rungs. The column
+// holds because each rung's own allocation conserves; the row holds by
+// construction. This works because the bill's own ladder satisfies the same
+// identity in paisa — computeBillCharges rounds every rung to 2dp, so
+// grand = discounted_subtotal + service_charge + tax_total exactly — and where a
+// caller hands in a ladder that does NOT, the difference is apportioned as a
+// visible `round_off` rather than quietly lost.
+//
+// WHY THE DISCOUNTED SUBTOTAL IS THE RUNG AND THE GROSS ONE IS DERIVED. If gross
+// and discount were allocated independently, a section whose share of the
+// DISCOUNTED subtotal is under one paisa could be handed a discount one paisa
+// larger than its gross, and the part would come out owing minus one paisa.
+// Allocating the net and deriving gross = net + discount makes every allocated
+// rung non-negative, so no part can ever be negative, and gross still sums to
+// the bill's gross because both of its components do.
+//
+// WHY A NON-CHARGEABLE WEIGHS NOTHING. A comped dish contributes zero to the
+// pre-tax base every bill is built on (see the NC header below), so it must
+// contribute zero to the WEIGHT as well — otherwise a comped starter would drag
+// paid money out of the bar's part and into the kitchen's. The line is still
+// listed under its section, at its menu value, in `nc_value`: the food went to
+// that section and pretending otherwise would hide it.
+
+/** One order line, as a section split reads it. */
+export interface SectionSplitLine {
+  /** Stable grouping key for the section. Two lines share a part iff they share this. */
+  section_key: string;
+  /** What the section is called on the part. */
+  section_label: string;
+  /** True for a classification gap (Unclassified / Unattributed). Never merged away. */
+  section_gap?: boolean;
+  name: string;
+  price: number;
+  quantity: number;
+  /** True when this line is non-chargeable (migration 034). Weighs nothing. */
+  nc?: boolean;
+  nc_kind?: string;
+  /** The variation label snapshotted on the line (migration 039). */
+  variation?: string | null;
+}
+
+/** One line as it appears back on a part. The shape the open bill already prints. */
+export interface SectionSplitItem {
+  name: string;
+  price: number;
+  quantity: number;
+  nc?: true;
+  nc_kind?: string;
+  variation?: string;
+}
+
+/**
+ * The bill's ladder — every rung the split has to apportion.
+ *
+ * computeBillCharges' return value is assignable to this, which is the intended
+ * caller: the split apportions the SAME numbers the guest is being charged
+ * rather than recomputing them from the lines, so it cannot disagree with the
+ * bill it is splitting.
+ */
+export interface SectionSplitLadder {
+  subtotal: number;
+  discount: number;
+  /** Defaults to subtotal - discount, which is exactly how computeBillCharges builds it. */
+  discounted_subtotal?: number;
+  service_charge: number;
+  taxes: BillTaxLine[];
+  tax_total: number;
+  grand_total: number;
+}
+
+/** One section's share of the bill. A bill in miniature. */
+export interface SectionSplitPart {
+  key: string;
+  /** SplitPart-compatible: an existing split client reads `label`, `subtotal`, `total`. */
+  label: string;
+  gap: boolean;
+  /** Gross, pre-discount. Always discounted_subtotal + discount. */
+  subtotal: number;
+  discount: number;
+  discounted_subtotal: number;
+  service_charge: number;
+  taxes: BillTaxLine[];
+  tax_total: number;
+  /** Normally 0. Non-zero only when the ladder handed in did not add up. */
+  round_off: number;
+  grand_total: number;
+  /** Alias of grand_total, so a client written against `even`/`item` still renders. */
+  total: number;
+  /** Units in this section, chargeable and comped alike. */
+  qty: number;
+  /** Menu value of the comped lines in this section. NOT part of any rung above. */
+  nc_value: number;
+  items: SectionSplitItem[];
+}
+
+export interface SectionSplitResult {
+  mode: "section";
+  grand_total: number;
+  parts: SectionSplitPart[];
+  /** Parts that actually need paying. A fully-comped section owes nothing. */
+  payable_parts: number;
+}
+
+/**
+ * Split an integer amount of paisa across integer weights so the parts sum back
+ * to it EXACTLY.
+ *
+ * LARGEST REMAINDER (Hamilton), not "floor everything and give the rest to the
+ * last one". Both conserve; they differ in WHERE the drift lands. With N
+ * sections the last-part rule can pile up to N-1 paisa onto one part chosen
+ * purely by position, which on a printed part reads as an error. Largest
+ * remainder hands the leftover paisa out one each to the sections with the
+ * biggest fractional claim, so no part is ever more than one paisa off its exact
+ * share.
+ *
+ * BIGINT, NOT DOUBLES, for the one multiplication. total x weight on a banquet
+ * bill (a few crore paisa against a weight of the same size) exceeds 2^53, where
+ * a double quietly stops being an integer and floor() starts answering a
+ * different question. Everything else here is small-integer arithmetic; this is
+ * the single place exactness is not free, so it is bought.
+ *
+ * A ZERO-WEIGHT PART IS NEVER HANDED A STRAY PAISA. The leftover goes only to
+ * parts with a positive weight (when any has one), so a section whose every line
+ * was comped comes out at exactly zero rather than at one paisa nobody can
+ * explain. When NOTHING has weight the amount is spread evenly — never all on
+ * one part, and never dropped.
+ */
+export function allocateInPaisa(totalPaisa: number, weights: readonly number[]): number[] {
+  const n = weights.length;
+  if (n === 0) {return [];}
+  const total = Math.round(Number(totalPaisa) || 0);
+  // The sign is handled once, here, so the BigInt division below is always a
+  // true floor (it truncates toward zero, a DIFFERENT operation for negatives).
+  const sign = total < 0 ? -1 : 1;
+  const magnitude = Math.abs(total);
+
+  const w = weights.map((x) => {
+    const v = Number(x);
+    return Number.isFinite(v) && v > 0 ? Math.round(v) : 0;
+  });
+  const anyWeight = w.some((x) => x > 0);
+  const ws = anyWeight ? w : w.map(() => 1);
+  const W = ws.reduce((s, x) => s + x, 0);
+
+  const totalBig = BigInt(magnitude);
+  const wBig = BigInt(W);
+  const out: number[] = [];
+  const claims: { index: number; remainder: bigint }[] = [];
+  let allocated = 0;
+  for (let i = 0; i < n; i++) {
+    const numerator = totalBig * BigInt(ws[i] ?? 0);
+    const share = Number(numerator / wBig);
+    out.push(share);
+    allocated += share;
+    if ((ws[i] ?? 0) > 0) {claims.push({ index: i, remainder: numerator % wBig });}
+  }
+
+  // The leftover is strictly smaller than claims.length by construction (each
+  // dropped fraction being under 1), so this loop always exhausts it.
+  let leftover = magnitude - allocated;
+  claims.sort((a, b) => (a.remainder === b.remainder ? a.index - b.index : (a.remainder > b.remainder ? -1 : 1)));
+  for (let k = 0; k < claims.length && leftover > 0; k++) {
+    const idx = claims[k].index;
+    out[idx] = out[idx] + 1;
+    leftover -= 1;
+  }
+  return sign < 0 ? out.map((x) => -x) : out;
+}
+
+/** The merge key the open bill already uses, so a part lists what the bill lists. */
+function sectionItemKey(line: SectionSplitLine): string {
+  const variation = (line.variation ?? "").trim().toLowerCase();
+  return `${line.name.trim().toLowerCase()}@@${String(orderLinePrice(line))}@@${line.nc === true ? "nc" : ""}@@${variation}`;
+}
+
+/**
+ * Split a bill between the sections its lines belong to.
+ *
+ * The caller resolves each line to a section (see SplitBillForTable, which uses
+ * the SAME menu attribution the Group Summary report uses, so a section here and
+ * a row there are the same bucket under the same name). This function does the
+ * money and nothing else: it knows what a section is called and what it weighs,
+ * and it has never heard of a menu.
+ *
+ * LINES WITH NO SECTION AT ALL. If `lines` is empty — a bill generated before
+ * any order landed, or a table whose every order was voided — the whole bill
+ * comes back as ONE part labelled with `fallbackLabel`. The alternative is
+ * returning no parts, and a split that answers "nothing" for a bill with a grand
+ * total is a split that has lost the money.
+ */
+export function computeSectionSplit(
+  ladder: SectionSplitLadder,
+  lines: readonly SectionSplitLine[],
+  opts: { fallbackLabel?: string } = {},
+): SectionSplitResult {
+  interface Bucket {
+    key: string; label: string; gap: boolean;
+    weight: number; qty: number; ncValue: number;
+    items: Map<string, SectionSplitItem>;
+  }
+  const buckets = new Map<string, Bucket>();
+  for (const line of lines) {
+    const key = String(line.section_key ?? "").trim() || "~";
+    const bucket = buckets.get(key) ?? {
+      key,
+      label: String(line.section_label ?? "").trim() || key,
+      gap: line.section_gap === true,
+      weight: 0, qty: 0, ncValue: 0,
+      items: new Map<string, SectionSplitItem>(),
+    };
+    const qty = orderLineQuantity(line);
+    const value = round2(orderLinePrice(line) * qty);
+    bucket.qty = round2(bucket.qty + qty);
+    if (isNonChargeableLine(line)) {
+      bucket.ncValue = round2(bucket.ncValue + value);
+    } else {
+      // The WEIGHT is chargeable value only — see the header. Accumulated in
+      // paisa so five hundred lines of 33.33 do not drift the section's share.
+      bucket.weight += toPaisa(value);
+    }
+    const itemKey = sectionItemKey(line);
+    const existing = bucket.items.get(itemKey);
+    if (existing) {
+      existing.quantity = round2(existing.quantity + qty);
+    } else {
+      const variation = (line.variation ?? "").trim();
+      bucket.items.set(itemKey, {
+        name: line.name,
+        price: orderLinePrice(line),
+        quantity: qty,
+        ...(line.nc === true ? { nc: true as const, nc_kind: line.nc_kind || undefined } : {}),
+        ...(variation ? { variation } : {}),
+      });
+    }
+    buckets.set(key, bucket);
+  }
+
+  const ordered = [...buckets.values()].sort((a, b) => {
+    // Gaps last: a bucket the menu could not classify is a footnote, not a
+    // headline, and whoever is reading the parts should meet the real sections
+    // first. Heaviest first inside each band, name as the deterministic
+    // tie-break — the same order the Group Summary report puts its rows in.
+    // Sorting BEFORE the allocation also decides who absorbs a tied paisa:
+    // allocateInPaisa breaks a tie by position, and position here is weight, so
+    // the leftover lands on the biggest section rather than on an arbitrary one.
+    if (a.gap !== b.gap) {return a.gap ? 1 : -1;}
+    if (a.weight !== b.weight) {return b.weight - a.weight;}
+    return a.label.localeCompare(b.label);
+  });
+
+  if (ordered.length === 0) {
+    ordered.push({
+      key: "~whole",
+      label: opts.fallbackLabel?.trim() || "Whole bill",
+      gap: true, weight: 0, qty: 0, ncValue: 0,
+      items: new Map<string, SectionSplitItem>(),
+    });
+  }
+
+  const weights = ordered.map((b) => b.weight);
+  const subtotalP = toPaisa(ladder.subtotal);
+  const discountP = toPaisa(ladder.discount);
+  const netP = ladder.discounted_subtotal === undefined
+    ? subtotalP - discountP
+    : toPaisa(ladder.discounted_subtotal);
+  const serviceP = toPaisa(ladder.service_charge);
+  const taxLines = Array.isArray(ladder.taxes) ? ladder.taxes : [];
+  const namedTaxP = taxLines.map((t) => toPaisa(t.amount));
+  const taxTotalP = toPaisa(ladder.tax_total);
+  const grandP = toPaisa(ladder.grand_total);
+
+  const net = allocateInPaisa(netP, weights);
+  const discount = allocateInPaisa(discountP, weights);
+  const service = allocateInPaisa(serviceP, weights);
+  const taxes = taxLines.map((_, i) => allocateInPaisa(namedTaxP[i] ?? 0, weights));
+  // A tax total the named lines do not reconstruct is apportioned as well rather
+  // than dropped: an unnamed rupee of tax is still a rupee of tax.
+  const unnamedTax = allocateInPaisa(taxTotalP - namedTaxP.reduce((s, x) => s + x, 0), weights);
+  const roundOff = allocateInPaisa(grandP - (netP + serviceP + taxTotalP), weights);
+
+  const parts: SectionSplitPart[] = ordered.map((bucket, i) => {
+    const partTaxes: BillTaxLine[] = taxLines.map((t, k) => ({
+      name: t.name,
+      percentage: t.percentage,
+      amount: round2((taxes[k]?.[i] ?? 0) / 100),
+    }));
+    const partTaxTotalP = taxes.reduce((s, line) => s + (line[i] ?? 0), 0) + (unnamedTax[i] ?? 0);
+    const partGrandP = (net[i] ?? 0) + (service[i] ?? 0) + partTaxTotalP + (roundOff[i] ?? 0);
+    const grand = round2(partGrandP / 100);
+    return {
+      key: bucket.key,
+      label: bucket.label,
+      gap: bucket.gap,
+      subtotal: round2(((net[i] ?? 0) + (discount[i] ?? 0)) / 100),
+      discount: round2((discount[i] ?? 0) / 100),
+      discounted_subtotal: round2((net[i] ?? 0) / 100),
+      service_charge: round2((service[i] ?? 0) / 100),
+      taxes: partTaxes,
+      tax_total: round2(partTaxTotalP / 100),
+      round_off: round2((roundOff[i] ?? 0) / 100),
+      grand_total: grand,
+      total: grand,
+      qty: bucket.qty,
+      nc_value: bucket.ncValue,
+      items: [...bucket.items.values()],
+    };
+  });
+
+  return {
+    mode: "section",
+    grand_total: round2(grandP / 100),
+    parts,
+    payable_parts: parts.filter((p) => toPaisa(p.grand_total) !== 0).length,
+  };
+}
+

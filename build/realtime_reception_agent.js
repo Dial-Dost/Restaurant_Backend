@@ -1,3 +1,4 @@
+var _a, _b, _c, _d, _e;
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,46 +10,98 @@ loadEnv({ path: path.resolve(process.cwd(), "../.env") });
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, path.basename(__dirname) === "build" ? ".." : ".", "..");
-const API_BASE_URL = process.env.RECEPTION_SERVER_URL ?? "http://localhost:3000";
-const RESTAURANT_ID = process.env.RECEPTION_RESTAURANT_ID ?? "default";
-const BOOKING_DURATION_MINUTES = Number.parseInt(process.env.RECEPTION_BOOKING_DURATION ?? "120", 10);
-const BOOKING_SOURCE = process.env.RECEPTION_BOOKING_SOURCE ?? "Voice";
-export const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL ?? "gpt-4o-realtime-preview";
+const API_BASE_URL = (_a = process.env.RECEPTION_SERVER_URL) !== null && _a !== void 0 ? _a : "http://localhost:3000";
+const RESTAURANT_ID = (_b = process.env.RECEPTION_RESTAURANT_ID) !== null && _b !== void 0 ? _b : "default";
+const BOOKING_DURATION_MINUTES = Number.parseInt((_c = process.env.RECEPTION_BOOKING_DURATION) !== null && _c !== void 0 ? _c : "120", 10);
+const BOOKING_SOURCE = (_d = process.env.RECEPTION_BOOKING_SOURCE) !== null && _d !== void 0 ? _d : "Voice";
+export const OPENAI_REALTIME_MODEL = (_e = process.env.OPENAI_REALTIME_MODEL) !== null && _e !== void 0 ? _e : "gpt-4o-realtime-preview";
 if (!process.env.OPENAI_API_KEY) {
     console.warn("OPENAI_API_KEY is not configured. Realtime receptionist sessions are disabled.");
 }
 const reservationsCsvPath = path.resolve(repoRoot, "reservations.csv");
+// Validate an IANA zone id; fall back to Asia/Kolkata for empty/invalid input.
+function sanitizeTimezone(raw) {
+    const tz = typeof raw === "string" ? raw.trim() : "";
+    if (!tz) {
+        return "Asia/Kolkata";
+    }
+    try {
+        new Intl.DateTimeFormat(undefined, { timeZone: tz });
+        return tz;
+    }
+    catch (_a) {
+        return "Asia/Kolkata";
+    }
+}
+// Interpret Y-M-D h:mi as wall-clock time in `tz` and return the UTC instant
+// (library-free, DST-safe). Mirrors zonedWallToUtc in database_supabase.ts.
+function zonedWallToUtc(Y, M, D, h, mi, tz) {
+    const utc = Date.UTC(Y, M - 1, D, h, mi);
+    const dtf = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        hourCycle: "h23",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+    });
+    const p = new Map(dtf.formatToParts(new Date(utc)).map((x) => [x.type, x.value]));
+    const g = (t) => { var _a; return Number((_a = p.get(t)) !== null && _a !== void 0 ? _a : 0); };
+    const asUTC = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), g("second"));
+    const off = asUTC - utc;
+    return new Date(utc - off);
+}
+// Wall-clock minutes-from-midnight of an instant AS SEEN in `tz` (so the
+// operating-hours check stays correct on a non-local server).
+function wallMinutesInZone(date, tz) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        hourCycle: "h23",
+        hour: "2-digit",
+        minute: "2-digit",
+    }).formatToParts(date);
+    const get = (t) => { var _a; return Number((_a = parts.find((p) => p.type === t)) === null || _a === void 0 ? void 0 : _a.value); };
+    return get("hour") * 60 + get("minute");
+}
 const fallbackRestaurantKnowledge = {
     infoEntries: [],
     infoContext: "Restaurant knowledge file is unavailable.",
     openingTime: "12:00 PM",
     closingTime: "11:00 PM",
+    timezone: "Asia/Kolkata",
 };
 function loadRestaurantKnowledge() {
-    const openingTime = process.env.RECEPTION_OPENING_TIME?.trim() || fallbackRestaurantKnowledge.openingTime;
-    const closingTime = process.env.RECEPTION_CLOSING_TIME?.trim() || fallbackRestaurantKnowledge.closingTime;
+    var _a, _b;
+    const openingTime = ((_a = process.env.RECEPTION_OPENING_TIME) === null || _a === void 0 ? void 0 : _a.trim()) || fallbackRestaurantKnowledge.openingTime;
+    const closingTime = ((_b = process.env.RECEPTION_CLOSING_TIME) === null || _b === void 0 ? void 0 : _b.trim()) || fallbackRestaurantKnowledge.closingTime;
+    const timezone = sanitizeTimezone(process.env.RECEPTION_TIMEZONE);
     return {
         infoEntries: [],
         infoContext: "",
         openingTime,
         closingTime,
+        timezone,
     };
 }
 const restaurantKnowledge = loadRestaurantKnowledge();
 export function getRestaurantKnowledgeSnapshot() {
     return {
-        infoEntries: restaurantKnowledge.infoEntries.map((entry) => ({ ...entry })),
+        infoEntries: restaurantKnowledge.infoEntries.map((entry) => (Object.assign({}, entry))),
         infoContext: restaurantKnowledge.infoContext,
         openingTime: restaurantKnowledge.openingTime,
         closingTime: restaurantKnowledge.closingTime,
+        timezone: restaurantKnowledge.timezone,
     };
 }
 function normalizePhoneNumber(value) {
     return value.replace(/[^0-9+]/g, "").trim();
 }
 function parseTimeString(value) {
+    var _a, _b;
     const raw = value.trim().toLowerCase();
-    const timeMatch = raw.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?$/i);
+    const timeMatch = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?$/i.exec(raw);
     if (!timeMatch) {
         throw new Error(`Expected a time in HH:MM format (optionally with AM/PM). Received: ${value}`);
     }
@@ -56,8 +109,8 @@ function parseTimeString(value) {
     if (hourText == null) {
         throw new Error(`Hour component could not be parsed from time: ${value}`);
     }
-    const minuteText = timeMatch[2] ?? "0";
-    const meridiem = timeMatch[3]?.toLowerCase();
+    const minuteText = (_a = timeMatch[2]) !== null && _a !== void 0 ? _a : "0";
+    const meridiem = (_b = timeMatch[3]) === null || _b === void 0 ? void 0 : _b.toLowerCase();
     const hour = Number.parseInt(hourText, 10);
     const minute = Number.parseInt(minuteText, 10);
     if (minute < 0 || minute > 59) {
@@ -85,12 +138,17 @@ function parseTimeString(value) {
         .toString()
         .padStart(2, "0")}`;
 }
-function toReservationDateTime(dateIso, timeValue) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso.trim())) {
+function toReservationDateTime(dateIso, timeValue, tz) {
+    const trimmed = dateIso.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
         throw new Error(`Reservation date must be provided as YYYY-MM-DD. Received: ${dateIso}`);
     }
-    const time24 = parseTimeString(timeValue);
-    const combined = new Date(`${dateIso}T${time24}:00`);
+    const time24 = parseTimeString(timeValue); // "HH:MM" (24-hour)
+    // The guest states a wall-clock date+time; interpret it in the restaurant's
+    // timezone so the stored instant is correct regardless of the server's zone.
+    const [Y, M, D] = trimmed.split("-").map(Number);
+    const [hh, mi] = time24.split(":").map(Number);
+    const combined = zonedWallToUtc(Y, M, D, hh, mi, sanitizeTimezone(tz));
     if (Number.isNaN(combined.getTime())) {
         throw new Error(`Unable to interpret reservation slot ${dateIso} ${timeValue}`);
     }
@@ -107,9 +165,6 @@ function minutesFromMidnight(timeLabel) {
     return hour * 60 + minute;
 }
 class ReservationService {
-    info;
-    openingMinutes;
-    closingMinutes;
     constructor(info) {
         this.info = info;
         this.openingMinutes = this.safeMinutes(info.openingTime);
@@ -128,7 +183,7 @@ class ReservationService {
         if (this.openingMinutes === null || this.closingMinutes === null) {
             return true;
         }
-        const minutes = slot.getHours() * 60 + slot.getMinutes();
+        const minutes = wallMinutesInZone(slot, this.info.timezone);
         if (this.closingMinutes < this.openingMinutes) {
             return minutes >= this.openingMinutes || minutes < this.closingMinutes;
         }
@@ -136,7 +191,7 @@ class ReservationService {
     }
     async determineAvailability(request) {
         try {
-            const slot = toReservationDateTime(request.reservationDate, request.reservationTime);
+            const slot = toReservationDateTime(request.reservationDate, request.reservationTime, this.info.timezone);
             if (!this.isWithinOperatingHours(slot)) {
                 return {
                     status: "validation",
@@ -160,14 +215,18 @@ class ReservationService {
             const tablesRaw = (await response.json());
             const tables = tablesRaw
                 .filter((table) => !table.booked)
-                .map((table) => ({
-                tableName: table.table_name ?? table.name ?? "",
-                capacity: table.capacity ?? null,
-            }))
+                .map((table) => {
+                var _a, _b, _c;
+                return ({
+                    tableName: (_b = (_a = table.table_name) !== null && _a !== void 0 ? _a : table.name) !== null && _b !== void 0 ? _b : "",
+                    capacity: (_c = table.capacity) !== null && _c !== void 0 ? _c : null,
+                });
+            })
                 .filter((entry) => Boolean(entry.tableName))
                 .sort((a, b) => {
-                const capacityA = a.capacity ?? Number.MAX_SAFE_INTEGER;
-                const capacityB = b.capacity ?? Number.MAX_SAFE_INTEGER;
+                var _a, _b;
+                const capacityA = (_a = a.capacity) !== null && _a !== void 0 ? _a : Number.MAX_SAFE_INTEGER;
+                const capacityB = (_b = b.capacity) !== null && _b !== void 0 ? _b : Number.MAX_SAFE_INTEGER;
                 if (capacityA !== capacityB) {
                     return capacityA - capacityB;
                 }
@@ -216,7 +275,7 @@ class ReservationService {
             JSON.stringify(payload.guestName),
             JSON.stringify(payload.contactNumber),
             JSON.stringify(String(payload.partySize)),
-            JSON.stringify(`${slot.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true })}`),
+            JSON.stringify(slot.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true })),
             JSON.stringify(tableName),
             JSON.stringify(payload.reservationDate),
             JSON.stringify(freeUp.toISOString()),
@@ -224,6 +283,7 @@ class ReservationService {
         fs.appendFileSync(reservationsCsvPath, `${line}\n`, { encoding: "utf-8" });
     }
     async commitReservationViaApi(payload, slot, tableName) {
+        var _a, _b;
         const body = {
             customer: {
                 name: payload.guestName,
@@ -237,7 +297,7 @@ class ReservationService {
                 source: BOOKING_SOURCE,
                 status: "Confirmed",
                 from: "voice-realtime-agent",
-                notes: payload.specialRequests ?? null,
+                notes: (_a = payload.specialRequests) !== null && _a !== void 0 ? _a : null,
             },
             restaurantId: RESTAURANT_ID,
         };
@@ -255,7 +315,7 @@ class ReservationService {
                 return { success: false };
             }
             const responseBody = (await response.json());
-            return { success: true, referenceId: responseBody?.id ?? null };
+            return { success: true, referenceId: (_b = responseBody === null || responseBody === void 0 ? void 0 : responseBody.id) !== null && _b !== void 0 ? _b : null };
         }
         catch (error) {
             console.error("booking_api_exception", error);
@@ -263,8 +323,9 @@ class ReservationService {
         }
     }
     async createReservation(payload) {
+        var _a, _b, _c, _d;
         try {
-            const slot = toReservationDateTime(payload.reservationDate, payload.reservationTime);
+            const slot = toReservationDateTime(payload.reservationDate, payload.reservationTime, this.info.timezone);
             if (!this.isWithinOperatingHours(slot)) {
                 return {
                     status: "failed",
@@ -277,21 +338,20 @@ class ReservationService {
                 reservationTime: payload.reservationTime,
             });
             if (availability.status === "connectivity") {
-                this.appendReservationCsv(payload, payload.tablePreference ?? "Unassigned", slot);
+                this.appendReservationCsv(payload, (_a = payload.tablePreference) !== null && _a !== void 0 ? _a : "Unassigned", slot);
                 return {
                     status: "queued",
                     message: "Our booking system was momentarily unreachable, so I logged the details for the team to add manually. We'll honour the reservation and confirm shortly.",
                 };
             }
-            if (availability.status === "unavailable" || !availability.tables?.length) {
+            if (availability.status === "unavailable" || !((_b = availability.tables) === null || _b === void 0 ? void 0 : _b.length)) {
                 return {
                     status: "failed",
                     message: "I couldn't find an open table that fits that group at that time. I'm happy to look at another slot if you'd like!",
                 };
             }
             const chosenTable = payload.tablePreference
-                ? availability.tables.find((entry) => entry.tableName === payload.tablePreference) ??
-                    availability.tables[0]
+                ? (_c = availability.tables.find((entry) => entry.tableName === payload.tablePreference)) !== null && _c !== void 0 ? _c : availability.tables[0]
                 : availability.tables[0];
             if (!chosenTable) {
                 return {
@@ -306,7 +366,7 @@ class ReservationService {
                     message: `All set! I've booked ${chosenTable.tableName} for ${payload.guestName} on ${payload.reservationDate} at ${payload.reservationTime}.` +
                         (apiResult.referenceId ? ` Confirmation ID: ${apiResult.referenceId}.` : ""),
                     tableName: chosenTable.tableName,
-                    referenceId: apiResult.referenceId ?? null,
+                    referenceId: (_d = apiResult.referenceId) !== null && _d !== void 0 ? _d : null,
                 };
             }
             this.appendReservationCsv(payload, chosenTable.tableName, slot);
@@ -431,8 +491,8 @@ const createReservationTool = tool({
             partySize,
             reservationDate,
             reservationTime,
-            tablePreference: tablePreference ?? null,
-            specialRequests: specialRequests ?? null,
+            tablePreference: tablePreference !== null && tablePreference !== void 0 ? tablePreference : null,
+            specialRequests: specialRequests !== null && specialRequests !== void 0 ? specialRequests : null,
         });
         return result;
     },
@@ -498,9 +558,10 @@ export const receptionistAgent = new RealtimeAgent({
     tools: [checkAvailabilityTool, createReservationTool, restaurantInfoTool],
 });
 export function createReceptionSession(options) {
+    var _a, _b;
     const session = new RealtimeSession(receptionistAgent, {
-        transport: options?.transport ?? "websocket",
-        context: options?.context ?? {
+        transport: (_a = options === null || options === void 0 ? void 0 : options.transport) !== null && _a !== void 0 ? _a : "websocket",
+        context: (_b = options === null || options === void 0 ? void 0 : options.context) !== null && _b !== void 0 ? _b : {
             restaurantName: "Iron Hill Bengaluru",
         },
         config: {

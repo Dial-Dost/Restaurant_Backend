@@ -3,8 +3,9 @@
  * covers.
  */
 import type { Express, Request, Response } from "express";
-import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableSections, GetTableStatus, GetTables, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
+import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableSections, GetTableStatus, GetTables, MoveOrderToTable, MoveTableParty, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
 import { idempotent } from "../idempotency.js";
+import { printKotTableChange } from "../kot_move.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
 import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
@@ -143,13 +144,34 @@ async function buildSectionRoster(
 			const key = name.trim().toLowerCase();
 			if (seen.has(key)) { continue; }
 			seen.add(key);
-			// An empty zone has no table to be summarised from, so its position has
-			// to come off the raw order map rather than a summary row.
-			roster.sections.push({ section: name, tables: 0, seats: 0, sort_order: roster.order[key] ?? null });
+			// An empty zone has no table to be summarised from, so its position AND
+			// its birth instant both have to come off the raw maps rather than a
+			// summary row. Without the second one, every empty zone would sort into
+			// the undated tail and an owner's brand-new empty section would outrank
+			// the room they have been serving in for years.
+			roster.sections.push({
+				section: name,
+				tables: 0,
+				seats: 0,
+				sort_order: roster.order[key] ?? null,
+				created_at: roster.born[key] ?? null,
+			});
 		}
 	}
-	roster.sections.sort(compareTableSections);
+	// Sorted on the SAME comparator the database reader used, with the ISO
+	// instants converted back to the epoch millis it compares on. A summary whose
+	// created_at is unparseable degrades to "undated" rather than to NaN, which
+	// compareTableSections treats as the alphabetical tail.
+	roster.sections.sort((a, b) => compareTableSections(sortable(a), sortable(b)));
 	return { sections: roster.sections, unassigned: roster.unassigned };
+}
+
+/** A section summary as the shared comparator wants it: the wire carries the
+ *  birth instant as ISO-8601 (readable in a log and in a response), the ordering
+ *  compares epoch millis. */
+function sortable(s: TableSectionSummary): { section: string; sort_order: number | null; created_at: number | null } {
+	const at = s.created_at ? Date.parse(s.created_at) : Number.NaN;
+	return { section: s.section, sort_order: s.sort_order, created_at: Number.isFinite(at) ? at : null };
 }
 
 /**
@@ -798,6 +820,154 @@ app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"
 	} catch (error: any) {
 		logger.error({ err: error }, "table_covers_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to update table covers") });
+	}
+});
+
+/*
+	MOVE A SEATED PARTY — items 10/21.
+
+	POST /tables/move  { "from_table": "T1", "to_table": "T2" }
+
+	One call, one transaction, everything or nothing: the seating, the orders, the
+	running bill row, the waiter and the guest's ordering code all arrive at T2
+	together. See MoveTableParty for why a half-moved guest is the outcome this is
+	built to make unreachable, and for what it deliberately does NOT disturb
+	(covers, the seating's start time, and therefore APC and turnaround).
+
+	PERMISSION: the occupancy gate — the same one seating, changing covers and
+	releasing a table already carry. Moving a party between tables is floor
+	service, not administration; the person who sat them down is the person who
+	moves them.
+
+	IF THE DESTINATION IS OCCUPIED this answers 400 and the message names Merge.
+	The two acts are not interchangeable and the difference is money: a move keeps
+	one party on one bill, a merge puts two parties on one bill.
+
+	NO idempotent() AND NO OFFLINE QUEUE, deliberately, on both counts:
+
+	  * A REPLAY IS ALREADY SAFE. The precondition this write needs — the source
+	    seated, the destination free — is exactly the one the first execution
+	    consumes, so a duplicate request cannot half-apply anything; it bounces
+	    off "T1 is not seated" having changed nothing. A dedup key would turn
+	    that confusing-but-harmless error into a clean 200, which is a nicety,
+	    not a safety property, and it is not worth widening the 27-route
+	    idempotent() opt-in that the app's offline allowlist mirrors exactly
+	    (services/outbox.dart) — every route added to that set becomes queueable,
+	    and this one must not be.
+
+	  * QUEUEING IT WOULD BE WRONG. A move held on a till for twenty minutes and
+	    replayed against a floor that has moved on lands on a destination someone
+	    else has since seated — and by then the waiter who pressed it is long
+	    gone and believes the guests were moved. Same reason settle and KOT stay
+	    online-only. Offline, this refuses and says so.
+*/
+app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const fromTable = typeof body.from_table === "string" ? body.from_table.trim() : "";
+	const toTable = typeof body.to_table === "string" ? body.to_table.trim() : "";
+	if (!fromTable || !toTable) { res.status(400).json({ error: "from_table and to_table are required" }); return; }
+
+	try {
+		const result = await MoveTableParty(restaurantId, fromTable, toTable);
+		// BOTH tables changed, so both floor plans have to. One event naming both
+		// ends rather than two, so a client cannot repaint half a move.
+		try {
+			emitRestaurant(restaurantId, "table:moved", {
+				from_table: result.from_table,
+				to_table: result.to_table,
+				covers: result.covers,
+				moved_orders: result.moved_orders,
+			});
+		} catch { /* ignore realtime errors */ }
+		try {
+			await log_audit(
+				req,
+				"090ea8d4-e348-4e1b-9723-11131a73a085",
+				`Moved the party at ${result.from_table} to ${result.to_table} (${String(result.covers)} covers, ${String(result.moved_orders)} order${result.moved_orders === 1 ? "" : "s"}, ${result.moved_bill ? "bill carried" : "no bill yet"})`,
+				Audit_log_category.Tables,
+				result,
+			);
+		} catch (err) { logger.warn({ err }, "log_audit move-table failed"); }
+		res.json(result);
+	} catch (error: any) {
+		logger.error({ err: error }, "move_table_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to move the table") });
+	}
+});
+
+/*
+	MOVE ONE KOT TO ANOTHER TABLE — item 22.
+
+	POST /tables/move-order  { "order_id": "...", "to_table": "T7" }
+
+	The mis-key correction: the order was rung in on the wrong table. The order,
+	and only that order, moves; the party at the source table stays seated (see
+	MoveOrderToTable).
+
+	AND THEN THE KITCHEN IS TOLD. This is the half that cannot be skipped. The
+	screens update themselves, but the pass may already be holding printed paper
+	that says the old table, and a move that leaves it there makes the system and
+	the paper disagree about where food is going — which is worse than the
+	original mistake, because now nobody is looking for it. printKotTableChange
+	prints a correction carrying the SAME KOT number so the pass can pair it with
+	the docket it replaces, and prints NOTHING when the order was never ticketed
+	(there is no paper to correct, and the ordinary trigger will print it at the
+	right table later). Its outcome rides back in the response, so the till can
+	say "KOT-26 reprinted for T7" or "nothing was printed — the kitchen never had
+	this ticket" instead of leaving staff to guess.
+
+	The print is deliberately AFTER the move has committed and can never fail it:
+	the order really is on T7 by then, and a jammed printer must not undo that.
+
+	PERMISSION: the order/print gate the KOT reprint route already uses — moving a
+	ticket is the same class of act as reprinting one.
+
+	NOT idempotent() AND NOT QUEUEABLE, for the reasons POST /tables/move gives
+	above, plus one of its own: this route PRINTS. A replay stops at "that order
+	is already on this table" before it reaches the printer, so the pass gets one
+	correction docket and not two — which a dedup key would also achieve, but
+	only for the window it retains the key, whereas the precondition holds for
+	ever.
+*/
+app.post("/tables/move-order", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const orderId = typeof body.order_id === "string" ? body.order_id.trim() : "";
+	const toTable = typeof body.to_table === "string" ? body.to_table.trim() : "";
+	if (!orderId || !toTable) { res.status(400).json({ error: "order_id and to_table are required" }); return; }
+
+	try {
+		const moved = await MoveOrderToTable(restaurantId, orderId, toTable);
+		const print = await printKotTableChange({
+			restaurantId,
+			orderId: moved.order_id,
+			previousTableId: moved.from_table_id,
+			previousTableName: moved.from_table,
+		});
+		try {
+			emitRestaurant(restaurantId, "table:order_moved", {
+				order_id: moved.order_id,
+				from_table: moved.from_table,
+				to_table: moved.to_table,
+				kot_no: print.kot_no,
+			});
+		} catch { /* ignore realtime errors */ }
+		try {
+			await log_audit(
+				req,
+				"4ad474d4-5230-449c-874f-6a238b833bca",
+				`Moved order ${moved.order_id} from ${moved.from_table} to ${moved.to_table}${print.printed ? ` (correction docket KOT-${String(print.kot_no)} printed)` : " (no docket was on the pass)"}`,
+				Audit_log_category.Tables,
+				{ ...moved, print },
+			);
+		} catch (err) { logger.warn({ err }, "log_audit move-order failed"); }
+		res.json({ ...moved, print });
+	} catch (error: any) {
+		logger.error({ err: error }, "move_order_failed");
+		res.status(400).json({ error: String(error?.message ?? "Unable to move that order") });
 	}
 });
 

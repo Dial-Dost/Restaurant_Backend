@@ -6,6 +6,7 @@
 import type { Express, Request, Response } from "express";
 import { createHmac, randomUUID } from "crypto";
 import { AddBooking, AddNotification, AddOrder, AddWaitlistMember, AllocateBestTable, ApplyCouponToBill, CancelWaitlistByToken, CheckCoupon, ClaimWaitlistPreorder, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, DeletePushSubscription, FinalizeOnlinePayment, GetBillForTable, GetBookingSummaryById, GetMenuCategories, GetMenuItems, GetPublicBranding, GetQueueMenu, GetRestaurantProfile, GetVisiblePosters, GetRestaurantSettings, GetWaitlistEntryByToken, JoinWaitlist, ListMenuVariations, SavePushSubscription, SetWaitlistPreorder, SubmitCustomerPayment, UpdateBookingDeposit, VerifyTableOtp, getRestaurantIdFromUsername, parseWallClockInZone, publicVariationsByItem, repriceFromMenu, badgeCoveredAllergens, resolveBrandConfig, resolveBrandPalette, resolveMenuBadges, variationPayloadFor, withTenant, type MenuVariationRecord } from "../database_supabase.js";
+import { autoPrintOrderKot } from "../kot_print.js";
 import { logger } from "../observability.js";
 import { decodeTableToken, verifyTable } from "../qr_signing.js";
 import { emitRestaurant } from "../realtime.js";
@@ -285,8 +286,24 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 			// Register the guest as a Customer (best-effort) so QR orders count as
 			// CRM visits instead of leaving everyone at 0 bookings.
 			await linkOrderToCustomer(slug, order.id, customer, customerPhone);
+			// THE KITCHEN DOCKET, at the moment the guest places the order — the
+			// same trigger the till's own POST /orders uses, because a QR order is
+			// an order.
+			//
+			// INSIDE THE withTenant BLOCK on purpose: every read this makes
+			// (settings, the order, the menu that assigns stations) and the
+			// "PrintJobs" row it writes have to run on the same ambient tenant
+			// connection, and the order's own outlet is what it prints to — this
+			// route carries no X-Outlet-Id to trust instead.
+			//
+			// WHEN auto_push_orders IS OFF this prints NOTHING: the order was just
+			// created Pending, and autoPrintOrderKot refuses a Pending order
+			// because paper on the pass is the kitchen being told. The staffer's
+			// approval is what prints it. That is the whole reason the gate is
+			// read from the order row rather than assumed.
+			const printed = await autoPrintOrderKot({ restaurantId: slug, orderId: order.id, where: "guest_order_placed" });
 			const bill = await GetBillForTable(slug, tableName).catch(() => null);
-			return { order_id: order.id, bill_total: bill?.total_amt ?? subtotal, status: orderStatus };
+			return { order_id: order.id, bill_total: bill?.total_amt ?? subtotal, status: orderStatus, kot_no: printed.kot_no };
 		});
 		try {
 			const count = items.reduce((s, it) => s + it.quantity, 0);
