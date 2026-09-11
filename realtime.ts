@@ -401,21 +401,65 @@ export async function initRealtime(httpServer: HttpServer) {
 
   // Redis adapter for multi-process scaling. Required in production for realtime
   // to reach clients across replicas; without it, events stay on one replica.
+  // How long boot will wait for the Redis adapter before going on without it.
+  // Generous enough for a cold container on a shared network, short enough that
+  // a restaurant is never kept off the air by a cache.
+  const REDIS_CONNECT_TIMEOUT_MS = Math.max(1000, Number(process.env.REDIS_CONNECT_TIMEOUT_MS) || 8000);
   const redisUrl = process.env.REDIS_URL;
   if (redisUrl) {
+    // DECLARED OUTSIDE THE TRY so the catch can shut them down. A client that
+    // failed to connect is still retrying, and the handler below has to be able
+    // to reach it — see the note there.
+    let pubClient: ReturnType<typeof createClient> | undefined;
+    let subClient: ReturnType<typeof createClient> | undefined;
     try {
-      const pubClient = createClient({ url: redisUrl });
-      const subClient = pubClient.duplicate();
+      pubClient = createClient({ url: redisUrl });
+      subClient = pubClient.duplicate();
       // node-redis emits 'error' on connection drops; without a listener that can
       // crash the process. Log and let node-redis auto-reconnect.
       pubClient.on("error", (err) => { logger.error({ err }, "socketio_redis_pub_error"); });
       subClient.on("error", (err) => { logger.error({ err }, "socketio_redis_sub_error"); });
-      await Promise.all([pubClient.connect(), subClient.connect()]);
+      // BOUNDED, BECAUSE connect() DOES NOT GIVE UP ON ITS OWN.
+      //
+      // node-redis's default reconnect strategy retries FOREVER, so against an
+      // address with nothing behind it this promise never settles — it does not
+      // reject either, which means the catch below, written to degrade to
+      // single-replica, was unreachable. The whole boot sequence awaits this, so
+      // a Redis that is down, wrong or firewalled did not cost the adapter: it
+      // cost the SERVER. Nobody had hit it because REDIS_URL has only ever been
+      // set where a Redis really was, and nothing in CI called initRealtime
+      // until the print-routing suite did.
+      //
+      // A race rather than a socket timeout because the failure to bound is in
+      // the RETRY LOOP, not in any one attempt: a per-attempt timeout would be
+      // re-armed forever by the same strategy. The clients are told to stop on
+      // the way out so a late connection cannot resurrect a half-built adapter,
+      // and the timer is unref'd so it can never be the thing holding a process
+      // (or a test runner) open.
+      let bail: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          Promise.all([pubClient.connect(), subClient.connect()]),
+          new Promise((_resolve, reject) => {
+            bail = setTimeout(() => { reject(new Error(`redis adapter did not connect within ${String(REDIS_CONNECT_TIMEOUT_MS)}ms`)); }, REDIS_CONNECT_TIMEOUT_MS);
+            bail.unref?.();
+          }),
+        ]);
+      } finally {
+        if (bail) { clearTimeout(bail); }
+      }
       io.adapter(createAdapter(pubClient, subClient));
       adapterReady = true;
       logger.info("Socket.IO redis adapter connected");
     } catch (err) {
       adapterReady = false;
+      // STOP THE CLIENTS. They are still retrying on their own schedule, and a
+      // node-redis client mid-reconnect is an open handle: left alone it keeps
+      // this process — and a test runner — alive forever, and can attach an
+      // adapter to `io` minutes after boot decided to go without one.
+      for (const c of [pubClient, subClient]) {
+        try { void c?.destroy?.(); } catch { /* already gone */ }
+      }
       logger.error({ err }, "Failed to initialize redis adapter for socket.io:");
       if (process.env.NODE_ENV === "production") {
         logger.error(

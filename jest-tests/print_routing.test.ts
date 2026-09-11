@@ -135,6 +135,18 @@ beforeAll(async () => {
   realtime = await import("../realtime");
   routing = await import("../print_routing");
 
+  // NO AMBIENT REDIS. initRealtime builds a REAL node-redis client when
+  // REDIS_URL is set, and CI sets it (to a Redis that is not in its services
+  // block) — so this suite once hung the entire CI run for thirty-three minutes
+  // while node-redis retried an address with nothing behind it, on a step that
+  // takes seventy-five seconds locally where the variable is unset.
+  //
+  // The boot path is now bounded so it degrades instead of hanging, but a test
+  // that behaves differently depending on a variable it never mentions is a
+  // trap whatever the production code does: what is under test here is routing,
+  // not the adapter.
+  delete process.env.REDIS_URL;
+
   // Sets realtime.ts's module-level `io` to the fixture server, so emitDevice,
   // emitOutlet and outletDeviceSockets all run for real over a fake adapter.
   await realtime.initRealtime({} as unknown as Parameters<Realtime["initRealtime"]>[0]);
