@@ -7,7 +7,8 @@ import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
 import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
-import { buildReceiptBase64 } from "../escpos.js";
+import { buildReceiptBase64, buildSplitReceiptsBase64, type SplitReceiptPart } from "../escpos.js";
+import { computeSectionSplit, round2 } from "../billing_math.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
 import { ackPrintJob } from "../print_jobs.js";
@@ -1851,6 +1852,201 @@ app.post('/bills/split', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"),
 	} catch (e: any) {
 		logger.error({ err: e }, 'split_bill_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to split bill') });
+	}
+});
+
+/*
+	F3 — PRINT THE SPLIT. One document per part, on paper.
+
+	POST /print/bill/split  { table_name, mode, parts?, groups?, axis? }
+	  -> 200 { success, parts, jobs: [{ index, of, label, grandTotal, jobId, destination }] }
+
+	============================================================================
+	THE RENDERER EXISTED AND NOTHING CALLED IT
+	============================================================================
+	V3: "Ensure the system successfully generates and PRINTS TWO SEPARATE BILLS
+	when an order is split, and that this split registers correctly on the
+	dashboard."
+
+	`buildSplitReceiptsBase64` (escpos.ts) was written for exactly this, it has a
+	test suite, and grep found its only importer was that suite. `POST /bills/split`
+	computed the parts and handed them back as JSON for the screen to display —
+	so the dashboard half worked and the PAPER half did not exist. That is this
+	codebase's most repeated defect: something correct built on the server that no
+	caller ever reaches, which is why the test below asserts the wiring and not
+	just the bytes.
+
+	============================================================================
+	THE SPLIT IS RECOMPUTED HERE, NOT TAKEN FROM THE REQUEST
+	============================================================================
+	The obvious shape is to let the client post back the parts it is already
+	showing. It is also the one that hands a guest a bill the till will not
+	honour: between the preview and the print somebody adds a round, applies a
+	coupon, or a waiver lands — and the printed parts would then sum to a total
+	nobody owes. So the body carries the same INPUTS `/bills/split` takes and the
+	parts are derived again, from the bill as it stands at this instant, by the
+	same functions that produced the preview.
+
+	============================================================================
+	ITEM-MODE GOES THROUGH THE SECTION LADDER
+	============================================================================
+	`computeBillSplit`'s item mode returns each group's own item value as
+	`subtotal` and its share of the grand total as `total`. On a screen the gap
+	between them is obviously tax and service; on PAPER an unexplained gap between
+	a subtotal and a total is the thing a guest queries. So an item split is fed
+	through `computeSectionSplit` with each guest group as a "section", which
+	allocates the discount, the service charge and every tax line across the parts
+	with the same largest-remainder arithmetic the section split already uses —
+	and the parts come out fully laddered, printing exactly like a whole bill.
+
+	An EVEN split has no items to ladder: `computeBillSplit` gives each part the
+	same tax-inclusive share, so subtotal equals total and the part prints one
+	figure with nothing unexplained between.
+*/
+app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	const outletId = extractOutletId(req);
+	if (!restaurantId || !outletId) { res.status(400).json({ error: 'Missing restaurant/outlet' }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
+	const mode = body.mode === "item" ? "item" : body.mode === "section" ? "section" : "even";
+	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
+
+	try {
+		const [bill, settings, profile] = await Promise.all([
+			GetBillForTable(restaurantId, tableName),
+			GetRestaurantSettings(restaurantId).catch(() => ({ currency: "\u20b9" } as any)),
+			GetRestaurantProfile(restaurantId).catch(() => null),
+		]);
+		if (!bill || !Array.isArray(bill.items) || bill.items.length === 0) {
+			res.status(400).json({ error: 'Nothing to print for this table' });
+			return;
+		}
+
+		// --- the parts, derived NOW -------------------------------------------
+		let parts: SplitReceiptPart[] = [];
+		if (mode === "section") {
+			const axis = readSectionAxis(body.axis ?? body.by);
+			if (!axis) {
+				res.status(400).json({ error: `Unknown split axis. Use one of: ${BILL_SECTION_AXES.join(", ")}` });
+				return;
+			}
+			const split = await SplitBillForTableBySection(restaurantId, tableName, axis);
+			parts = split.parts;
+		} else if (mode === "item" && Array.isArray(body.groups) && body.groups.length > 0) {
+			// Each guest group becomes a "section", so the ladder allocation is the
+			// one already proven rather than a second implementation. See the header.
+			const groups = body.groups as { label?: string; items?: { name: string; price: number; quantity: number }[] }[];
+			const lines = groups.flatMap((g, i) => {
+				const key = `guest-${String(i + 1)}`;
+				const label = String(g.label ?? "").trim() || `Guest ${String(i + 1)}`;
+				return (Array.isArray(g.items) ? g.items : []).map((it) => ({
+					section_key: key,
+					section_label: label,
+					name: String(it.name ?? "Item"),
+					price: Number(it.price) || 0,
+					quantity: Number(it.quantity) || 1,
+				}));
+			});
+			const split = computeSectionSplit(
+				{
+					subtotal: bill.subtotal,
+					discount: bill.discount,
+					discounted_subtotal: round2(Math.max(0, bill.subtotal - bill.discount)),
+					service_charge: bill.service_charge,
+					taxes: bill.taxes,
+					tax_total: bill.tax_total,
+					grand_total: bill.grand_total,
+				},
+				lines,
+				{ fallbackLabel: "Unassigned" },
+			);
+			parts = split.parts;
+		} else {
+			const even = await SplitBillForTable(restaurantId, tableName, "even", {
+				parts: Number(body.parts ?? 0) || undefined,
+			});
+			// subtotal === total on an even part, so nothing is left unexplained
+			// between the two lines. See the header.
+			parts = even.parts.map((pt) => ({
+				label: pt.label,
+				subtotal: pt.subtotal,
+				grand_total: pt.total,
+				items: [],
+			}));
+		}
+
+		// --- the paper ---------------------------------------------------------
+		const is58 = settings.bill_paper_width === "58mm";
+		const cols = is58 ? 32 : 48;
+		const logo = await buildLogoEscPos(restaurantId, is58 ? 384 : 576).catch(() => null);
+		const receipts = buildSplitReceiptsBase64({
+			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+			legalName: settings.bill_legal_name ?? null,
+			address: profile?.outlet_add ?? null,
+			phone: profile?.outlet_phone ?? null,
+			gstin: settings.bill_gstin ?? null,
+			table: tableName,
+			covers: bill.covers ?? 1,
+			items: bill.items,
+			total: bill.subtotal,
+			customer: bill.customer,
+			billNo: bill.bill_no,
+			discount: bill.discount > 0 ? { amount: bill.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
+			// The bill's PERCENTAGE; each part carries its own share as the amount.
+			// A waived charge stays waived on every part — the renderer prints the
+			// word rather than a figure, which is the point of a waiver being
+			// visible on paper instead of inferred from a missing line.
+			serviceCharge: bill.service_charge > 0
+				? { percent: bill.service_charge_percent, amount: bill.service_charge }
+				: (bill.service_charge_waived
+					? { percent: bill.service_charge_percent, amount: 0, optedOut: true }
+					: null),
+			taxes: bill.taxes,
+			grandTotal: bill.grand_total,
+			currency: settings.currency ?? "\u20b9",
+			kind: "bill",
+			logo,
+			// NO FEEDBACK QR ON A SPLIT PART. The QR is signed for the seating, so
+			// every part would carry the same link and the first guest to scan it
+			// would rate the meal on behalf of the table.
+			feedbackUrl: null,
+			serviceChargeNote: bill.service_charge > 0
+				? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."
+				: null,
+		}, parts, cols);
+
+		// --- dispatch, one job per part ----------------------------------------
+		//
+		// SEQUENTIALLY, and that is deliberate. The printer agent takes jobs off a
+		// queue; firing N in parallel lets them interleave on the roll, and "part 2
+		// of 3" printed between the two halves of part 1 is worse than slow.
+		const jobs: { index: number; of: number; label: string; grandTotal: number; jobId: string | null; destination: string | null }[] = [];
+		for (const r of receipts) {
+			const dispatched = await dispatchPrintJob(restaurantId, {
+				outlet_id: outletId,
+				// Its OWN bill_id per part, so each is its own job row and a failed
+				// part can be retried without reprinting the others.
+				bill_id: `${bill.bill_id ?? tableName}-split-${String(r.index)}of${String(r.of)}`,
+				kind: "bill", station: null, esc_base64: r.escBase64,
+			});
+			jobs.push({
+				index: r.index, of: r.of, label: r.label, grandTotal: r.grandTotal,
+				jobId: dispatched.jobId, destination: dispatched.decision.destinationName,
+			});
+		}
+
+		try {
+			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				`Printed ${String(receipts.length)} split bill(s) for table ${tableName} (${mode})`,
+				Audit_log_category.Bill,
+				{ table: tableName, mode, parts: receipts.length, totals: receipts.map((r) => r.grandTotal) });
+		} catch {/* a failed audit write must never fail the print */}
+
+		res.json({ success: true, mode, parts: receipts.length, jobs });
+	} catch (err: any) {
+		logger.error({ err }, 'print_split_bill_failed');
+		res.status(400).json({ error: String(err?.message ?? 'Unable to print the split bills') });
 	}
 });
 
