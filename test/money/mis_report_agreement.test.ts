@@ -626,9 +626,12 @@ describe("the Executive Summary's comparison period", () => {
     expect(exec.growth.grand_total).toBeGreaterThan(0);
   });
 
-  test("an arbitrary drag compares against the equally long window before it", async () => {
+  test("a drag inside one month compares against the SAME DATES a month earlier", async () => {
+    // V3: the comparison is the matching date range, not a rolling window. See
+    // previousWindow's header for what the old answer (2026-05-17 to 05-31) was
+    // measuring and why no owner meant it.
     const exec = await db.GetExecutiveSummaryReport(RID, W);
-    expect(exec.previous_window).toEqual({ from: "2026-05-17", to: "2026-05-31", days: 15, basis: "days" });
+    expect(exec.previous_window).toEqual({ from: "2026-05-01", to: "2026-05-15", days: 15, basis: "same_dates_prev_month" });
   });
 
   test("growth from a zero base is blank, not infinite", async () => {

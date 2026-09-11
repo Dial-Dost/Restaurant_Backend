@@ -30,6 +30,7 @@ import {
   TakeReportDeliveryAttempt,
   MarkReportDeliveryRendered,
   DeliverReportToInbox,
+  MarkReportDelivered,
   RecordReportDeliveryFailure,
   TouchReportScheduleOutcome,
   GetSalesReport,
@@ -51,6 +52,7 @@ import {
   type ProfitAndLoss,
 } from "./database_supabase.js";
 import { renderReport, REPORT_LABELS, type ReportKey, type ReportFormat } from "./report_render.js";
+import { sendMail, normalizeRecipients, isMailNotConfiguredError } from "./mailer.js";
 import { logger } from "./observability.js";
 
 // Diagnostic only. Written to ReportDeliveries.claimed_by so a stuck row names
@@ -195,6 +197,9 @@ interface PendingDelivery {
   /** The channel the occurrence was CLAIMED on, not the schedule's current one:
    *  an in-flight delivery must be routed the way it was accepted. */
   channel: string | null;
+  /** The schedule's CURRENT addresses (migration 044). Deliberately live rather
+   *  than claimed — see ListRetryableReportDeliveries' query comment. */
+  recipients: string[];
 }
 
 export async function runReportScheduleSweep(now: Date = new Date()): Promise<void> {
@@ -235,6 +240,7 @@ async function sweepTenant(resId: string, now: Date): Promise<void> {
     delivery_id: r.id,
     schedule_id: r.schedule_id,
     outlet_id: r.outlet_id,
+    recipients: r.recipients ?? [],
     occurrence_key: r.occurrence_key,
     period_from: r.period_from,
     period_to: r.period_to,
@@ -310,6 +316,7 @@ async function claimDueOccurrences(
           report_key: schedule.report_key,
           format: schedule.format,
           channel: schedule.channel,
+          recipients: schedule.recipients ?? [],
         });
       }
     },
@@ -335,14 +342,18 @@ async function runOccurrence(resId: string, p: PendingDelivery): Promise<void> {
   if (attempts === null) { return; }   // another worker holds this attempt
 
   try {
-    // 'inbox' is the only channel migration 026 admits (026:64) and the only one
-    // with a sender behind it. Widening that CHECK without adding the sender here
-    // would otherwise route an SMS schedule silently to the bell; this makes it a
-    // recorded failure the owner can see instead. INSIDE the try on purpose — an
-    // attempt has already been taken, so throwing before TX2 would leave the row
-    // at 'claimed' with attempts untouched, retried every tick forever and never
-    // reaped (ReapExhaustedReportDeliveries needs attempts >= REPORT_MAX_ATTEMPTS).
-    if (p.channel !== "inbox") { throw new Error(`Unsupported report channel: ${String(p.channel)}`); }
+    // 'inbox' and 'email' are the channels with a sender behind them — migration
+    // 044 widened 026's CHECK and landed mailer.ts in the same change, keeping
+    // 026's rule that nothing is storable before something implements it.
+    // Anything else is a recorded failure the owner can see rather than a report
+    // that silently goes to the bell instead of wherever it was addressed.
+    // INSIDE the try on purpose — an attempt has already been taken, so throwing
+    // before TX2 would leave the row at 'claimed' with attempts untouched,
+    // retried every tick forever and never reaped
+    // (ReapExhaustedReportDeliveries needs attempts >= REPORT_MAX_ATTEMPTS).
+    if (p.channel !== "inbox" && p.channel !== "email") {
+      throw new Error(`Unsupported report channel: ${String(p.channel)}`);
+    }
 
     const artifact = await withTenant(ctx, async () => {
       // isAllOutlets flips getSettledBills / GetExpenses / GetDiscountsReport from
@@ -373,16 +384,79 @@ async function runOccurrence(resId: string, p: PendingDelivery): Promise<void> {
       );
     }
 
+    const period = p.period_from === p.period_to ? p.period_from : `${p.period_from} to ${p.period_to}`;
+    const title = `${reportLabel(p.report_key, p.name)} ready — ${period}`;
+
+    // THE SEND HAPPENS BEFORE THE ROW IS MARKED DELIVERED, and it happens
+    // OUTSIDE withTenant.
+    //
+    // Outside, because withTenant holds a pooled database client for the whole
+    // callback and an SMTP round trip is a network call to somebody else's
+    // server. Holding a connection from a pool of fifteen open across it is how
+    // this project produced a full standstill once already; mailer.ts bounds the
+    // call, but a bounded twenty seconds of a pooled client is still twenty
+    // seconds nobody else can have.
+    //
+    // Before, because a row marked 'delivered' for mail that never left is the
+    // same defect as a print job that acked paper nobody printed — which has
+    // also already shipped here. A throw lands in the catch below, records a
+    // real failure with a real reason, and the occurrence is retried.
+    let deliveredTo: string[] = [];
+    if (p.channel === "email") {
+      const to = normalizeRecipients(p.recipients);
+      if (to.length === 0) {
+        // Migration 044's CHECK normally makes this unreachable. It stays because
+        // the CHECK guards the SCHEDULE and this reads a list that may have been
+        // edited since, and because a delivery that renders a restaurant's
+        // takings and then has nowhere to send them must fail loudly.
+        throw new Error("This email schedule has no valid recipient address.");
+      }
+      const sent = await sendMail({
+        to,
+        subject: title,
+        text:
+          `${reportLabel(p.report_key, p.name)}\n`
+          + `Period: ${period}\n\n`
+          + `The report is attached as ${artifact.filename}.\n`
+          + `It is also available in the dashboard under Accounting → Scheduled reports.\n`,
+        attachments: [{
+          filename: artifact.filename,
+          content: artifact.body,
+          contentType: artifact.mime,
+        }],
+      }).catch((err: unknown) => {
+        // Named so the failure row says something an owner can act on. An
+        // unconfigured deployment is not a transient fault and saying "connection
+        // refused" would send them hunting for a network problem that is not
+        // there.
+        if (isMailNotConfiguredError(err)) {
+          throw new Error(
+            "Email delivery is not configured on this server, so this report could not be sent."
+            + " Ask your administrator to set up the mail settings, or switch this schedule to the in-app inbox.",
+          );
+        }
+        throw err;
+      });
+      deliveredTo = sent.accepted.length > 0 ? sent.accepted : to;
+    }
+
     // TX4 — the CAS and the notification commit together or not at all.
-    await withTenant(ctx, () => DeliverReportToInbox(resId, {
+    await withTenant(ctx, () => MarkReportDelivered(resId, {
       deliveryId: p.delivery_id,
       attempts,
       scheduleId: p.schedule_id,
       occurrenceKey: p.occurrence_key,
-      title: `${reportLabel(p.report_key, p.name)} ready — ${p.period_from === p.period_to ? p.period_from : `${p.period_from} to ${p.period_to}`}`,
-      // No figures. GET /notifications is readable by every authenticated
-      // employee — see DeliverReportToInbox's docstring.
-      body: `Open Accounting → Scheduled reports to download ${artifact.filename}.`,
+      channel: p.channel === "email" ? "email" : "inbox",
+      deliveredTo,
+      title,
+      // NO FIGURES, on either channel. GET /notifications is readable by every
+      // authenticated employee — see MarkReportDelivered's docstring. The
+      // ADDRESSES are named on the email path because the owner reading the bell
+      // is entitled to know where their takings went, and they are the only
+      // person who can notice that one of them is wrong.
+      body: p.channel === "email"
+        ? `Emailed to ${deliveredTo.join(", ")} as ${artifact.filename}.`
+        : `Open Accounting → Scheduled reports to download ${artifact.filename}.`,
     }));
   } catch (err) {
     await recordFailure(resId, p, attempts, err);

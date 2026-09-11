@@ -383,11 +383,41 @@ function shiftMonths(fromKey: string, months: number): { from: string; to: strin
   };
 }
 
+/** The same day-of-month range one calendar month earlier, clamped to fit. */
+function sameDaysPreviousMonth(fromKey: string, toKey: string): { from: string; to: string; short: boolean } {
+  const a = DATE_KEY.exec(fromKey);
+  const b = DATE_KEY.exec(toKey);
+  if (!a || !b) {return { from: fromKey, to: toKey, short: false };}
+  const zero = (Number(a[1]) * 12 + (Number(a[2]) - 1)) - 1;
+  const y = Math.floor(zero / 12);
+  const mo = (zero % 12) + 1;
+  const last = daysInMonth(y, mo);
+  const p2 = (n: number): string => String(n).padStart(2, "0");
+  // CLAMPED, AND THE CLAMP IS REPORTED. 1–31 March has no counterpart in
+  // February, so the comparison is 1–28 (or 29) and the periods are genuinely
+  // unequal. Silently comparing 31 days of trade against 28 and printing a
+  // growth percentage is a lie of roughly 10%; saying so is the whole point.
+  const startDay = Math.min(Number(a[3]), last);
+  const endDay = Math.min(Number(b[3]), last);
+  return {
+    from: `${String(y)}-${p2(mo)}-${p2(startDay)}`,
+    to: `${String(y)}-${p2(mo)}-${p2(endDay)}`,
+    short: endDay < Number(b[3]),
+  };
+}
+
+/** Do both keys fall inside the same calendar month? */
+function inSameMonth(fromKey: string, toKey: string): boolean {
+  const a = DATE_KEY.exec(fromKey);
+  const b = DATE_KEY.exec(toKey);
+  return a !== null && b !== null && a[1] === b[1] && a[2] === b[2];
+}
+
 /**
- * THE IMMEDIATELY-PRECEDING WINDOW, in tenant calendar days.
+ * THE COMPARISON WINDOW, in tenant calendar days.
  *
  * "A 1-month window is not 30 days" — so this is calendar arithmetic on day keys,
- * never milliseconds, and it has two branches:
+ * never milliseconds, and it has three branches:
  *
  *   MONTH-ALIGNED. `from` is the 1st of a month and `to` is the last day of a
  *   month: the window is N whole months, and the comparison an owner means is
@@ -397,19 +427,49 @@ function shiftMonths(fromKey: string, months: number): { from: string; to: strin
  *   financial year. Subtracting a day count would compare August against
  *   "2–31 July", which is not a period any owner has ever asked about.
  *
- *   EVERYTHING ELSE. An arbitrary drag (say 3–17 August) compares against the
- *   equally-long window ending the day before it starts: 19 July – 2 August.
+ *   WITHIN ONE MONTH — THE MATCHING DATE RANGE. This is the branch V3 asked for
+ *   and it is worth spelling out, because the old behaviour was not a rounding
+ *   difference; it compared against a period nobody meant.
  *
- * Both branches return INCLUSIVE day keys in the same zone as the input, because
- * a day key already names a day and needs no zone to shift backwards.
+ *       On the 9th of September, the dashboard's window is 1–9 September.
+ *       The rolling rule made the comparison "the equally-long window ending
+ *       the day before", i.e. 23–31 AUGUST.
+ *
+ *   23–31 August is the END of a month: the weekend distribution is different,
+ *   salaries have been paid, and for a restaurant it is a systematically
+ *   different nine days from the START of one. An owner comparing "this month so
+ *   far" is asking about 1–9 August, and was being shown something else entirely
+ *   under a label that said month-to-date. So any window lying inside a single
+ *   calendar month now compares against the SAME DATES of the previous month —
+ *   which subsumes the 1st-to-today case and also does the right thing for an
+ *   arbitrary drag like 3–17 August (→ 3–17 July).
+ *
+ *   EVERYTHING ELSE. A drag that straddles months without being month-aligned
+ *   (say 20 July – 5 September) has no "matching dates" to speak of, so it keeps
+ *   the equally-long window ending the day before it starts.
+ *
+ * Every branch returns INCLUSIVE day keys in the same zone as the input, because
+ * a day key already names a day and needs no zone to shift backwards. `short` is
+ * true only when the previous month could not supply the same last date, so a
+ * caller can say so rather than printing an unequal comparison as if it were one.
  */
-export function previousWindow(from: string, to: string): { from: string; to: string; basis: "months" | "days" } {
+export function previousWindow(from: string, to: string): {
+  from: string;
+  to: string;
+  basis: "months" | "same_dates_prev_month" | "days";
+  /** The previous month was shorter, so the comparison covers fewer days. */
+  short?: boolean;
+} {
   if (!DATE_KEY.test(from) || !DATE_KEY.test(to) || from > to) {
     return { from, to, basis: "days" };
   }
   if (isMonthStart(from) && isMonthEnd(to)) {
     const months = monthSpan(from, to);
     if (months >= 1) {return { ...shiftMonths(from, months), basis: "months" };}
+  }
+  if (inSameMonth(from, to)) {
+    const prev = sameDaysPreviousMonth(from, to);
+    return { from: prev.from, to: prev.to, basis: "same_dates_prev_month", short: prev.short };
   }
   const span = countDays(from, to);
   const prevTo = addDaysToKey(from, -1);

@@ -319,6 +319,7 @@ import { serviceClock, tableServiceClock, type ServiceClock } from "./service_cl
 export { serviceClock, tableServiceClock } from "./service_clock.js";
 export type { ServiceClock, ServiceClockInput } from "./service_clock.js";
 import { logger } from "./observability.js";
+import { normalizeRecipients } from "./mailer.js";
 
 /**
  * "Close Bill" (a953d044) — the ONE capability that means "may make money leave
@@ -11452,6 +11453,23 @@ export interface OverviewInsights {
   window: ResolvedReportWindow;
   timezone: string;
   generated_at: string;
+  /**
+   * What the headline figures are measured against.
+   *
+   * Explicit because it is no longer derivable from `window_days`: a window that
+   * lies inside one calendar month compares against the SAME DATES of the
+   * previous month, so 1-9 September is measured against 1-9 August rather than
+   * 23-31 August. `label` is the sentence a card can print verbatim.
+   */
+  previous_window: {
+    from: string;
+    to: string;
+    days: number;
+    basis: "months" | "same_dates_prev_month" | "days";
+    /** The previous month was shorter, so the two periods differ in length. */
+    short: boolean;
+    label: string;
+  };
   headline: {
     revenue: OverviewMetric;
     bills: OverviewMetric;
@@ -11469,7 +11487,17 @@ export interface OverviewInsights {
   needs_attention: AttentionRow[];
 }
 
-function overviewMetric(value: number, previous: number, windowDays: number): OverviewMetric {
+/**
+ * One headline figure and what it is being measured against.
+ *
+ * `comparedTo` IS PASSED IN rather than derived from a day count, because a day
+ * count stopped being the truth: a month-to-date window now compares against the
+ * same dates of the previous month, and a label reading "previous 9 days" on a
+ * figure measured against 1-9 August would be worse than no label at all. The
+ * caller resolves the comparison period once and names it once; see
+ * comparisonLabel below.
+ */
+function overviewMetric(value: number, previous: number, comparedTo: string): OverviewMetric {
   const v = round2(Number.isFinite(value) ? value : 0);
   const p = round2(Number.isFinite(previous) ? previous : 0);
   return {
@@ -11477,8 +11505,32 @@ function overviewMetric(value: number, previous: number, windowDays: number): Ov
     previous: p,
     pct_change: p > 0 ? round2(((v - p) / p) * 100) : null,
     direction: v > p ? "up" : v < p ? "down" : "flat",
-    compared_to: `previous ${windowDays} days`,
+    compared_to: comparedTo,
   };
+}
+
+/**
+ * What the headline is compared against, in words an owner reads on a card.
+ *
+ * Every branch names actual DATES rather than a span, because the whole point of
+ * the V3 change is that the period is no longer inferable from the window's
+ * length — and a comparison the reader cannot identify is one they cannot check.
+ */
+function comparisonLabel(prev: { from: string; to: string; basis: string; short?: boolean }): string {
+  // "vs " leads, because both clients print this string immediately after the
+  // percentage — "12.3% vs 2026-08-01 - 2026-08-09 (same dates last month)".
+  const span = prev.from === prev.to ? prev.from : `${prev.from} – ${prev.to}`;
+  if (prev.basis === "same_dates_prev_month") {
+    return prev.short
+      // Said out loud: the previous month was shorter, so this is not a
+      // like-for-like count of days and the percentage carries that.
+      ? `vs ${span} (same dates last month, which was shorter)`
+      : `vs ${span} (same dates last month)`;
+  }
+  if (prev.basis === "months") {
+    return `vs ${span} (the previous whole month)`;
+  }
+  return `vs ${span} (the period immediately before)`;
 }
 
 // --- Needs attention: shaping -------------------------------------------------
@@ -11974,11 +12026,28 @@ export async function GetOverviewInsights(restaurantId: string, days: AnalyticsW
   const todayKey = dayKeyOf(new Date(), tz);
   const curRange = dayRangeOf(win.to, tz);
   const curFromIso = dayRangeOf(win.from, tz).fromIso;
-  // The comparison window is the same length immediately BEFORE this one, so
-  // 1-15 Aug is measured against 17-31 July rather than against a fortnight
-  // counted back from today. For the `days` shorthand this is the identical
-  // instant it has always been.
-  const prevFromIso = dayRangeOf(addDaysToKey(win.from, -window), tz).fromIso;
+
+  // THE COMPARISON PERIOD — previousWindow, the SAME function the Executive
+  // Summary uses, rather than a day-count subtracted here.
+  //
+  // WHAT THIS CHANGES, and it is not cosmetic. Subtracting the span put the
+  // month-to-date card on the dashboard in a position no owner would recognise:
+  // on the 9th of September the window is 1-9 September, and the comparison was
+  // "the equally-long window immediately before", i.e. 23-31 AUGUST. The end of
+  // a month is a systematically different nine days for a restaurant from the
+  // start of one — a different weekend distribution, salaries paid — so
+  // "month-to-date, up N%" was measured against a period nobody meant. It now
+  // compares 1-9 September against 1-9 August. See previousWindow's header.
+  //
+  // THE QUERY BELOW HAD TO CHANGE WITH IT, and that is the half worth watching:
+  // it used to read ONE contiguous span and split it at curFromIso, which is
+  // only correct while the comparison period ends the day before the current one
+  // begins. A matching-dates comparison leaves a GAP (10-31 August), so a single
+  // span would silently pull that gap into the "previous" bucket and inflate it.
+  const prevWin = previousWindow(win.from, win.to);
+  const prevFromIso = dayRangeOf(prevWin.from, tz).fromIso;
+  const prevToIso = dayRangeOf(prevWin.to, tz).toIso;
+  const comparedTo = comparisonLabel(prevWin);
 
   // Covers are NOT on "Bills" — they live on "TableSessions" (one row per seating,
   // covers counted once per table). Joining on the table + the session that was
@@ -11991,7 +12060,7 @@ export async function GetOverviewInsights(restaurantId: string, days: AnalyticsW
         coalesce(sum(b.total_amt), 0)::text as revenue,
         count(*)::text as bills,
         coalesce(sum(coalesce(ts.covers, 0)), 0)::text as covers,
-        case when b.created_at >= $3 then 'cur' else 'prev' end as bucket
+        case when b.created_at >= $3 and b.created_at < $5 then 'cur' else 'prev' end as bucket
       from "Bills" b
       left join lateral (
         select ts.covers
@@ -12002,10 +12071,16 @@ export async function GetOverviewInsights(restaurantId: string, days: AnalyticsW
         limit 1
       ) ts on true
       where b.res_id = $1 and b.outlet_id = $2
-        and b.created_at >= $4 and b.created_at < $5
+        and (
+          -- TWO EXPLICIT RANGES, not one span with a split point. The comparison
+          -- period no longer abuts the current one (see above), and the rows
+          -- between them belong to neither.
+          (b.created_at >= $3 and b.created_at <  $5) or
+          (b.created_at >= $4 and b.created_at <  $6)
+        )
       group by 4
     `,
-    [context.res_id, context.outlet_id, curFromIso, prevFromIso, curRange.toIso],
+    [context.res_id, context.outlet_id, curFromIso, prevFromIso, curRange.toIso, prevToIso],
   );
   const bucket = (b: string) => sums.find((r) => r.bucket === b);
   const cur = bucket("cur");
@@ -12191,11 +12266,22 @@ export async function GetOverviewInsights(restaurantId: string, days: AnalyticsW
     window: windowMeta(win),
     timezone: tz,
     generated_at: new Date().toISOString(),
+    // SHIPPED SO A CLIENT CAN SAY WHAT IT IS SHOWING. A comparison period the
+    // dashboard cannot name is one the owner cannot check, and this codebase's
+    // most repeated defect is a correct thing on the server that no client reads.
+    previous_window: {
+      from: prevWin.from,
+      to: prevWin.to,
+      days: countDays(prevWin.from, prevWin.to),
+      basis: prevWin.basis,
+      short: prevWin.short === true,
+      label: comparisonLabel(prevWin),
+    },
     headline: {
-      revenue: overviewMetric(curRev, prevRev, window),
-      bills: overviewMetric(curBills, prevBills, window),
-      covers: overviewMetric(curCovers, prevCovers, window),
-      apc: overviewMetric(curCovers > 0 ? curRev / curCovers : 0, prevCovers > 0 ? prevRev / prevCovers : 0, window),
+      revenue: overviewMetric(curRev, prevRev, comparedTo),
+      bills: overviewMetric(curBills, prevBills, comparedTo),
+      covers: overviewMetric(curCovers, prevCovers, comparedTo),
+      apc: overviewMetric(curCovers > 0 ? curRev / curCovers : 0, prevCovers > 0 ? prevRev / prevCovers : 0, comparedTo),
       today_revenue: await dayRevenue(todayKey),
       yesterday_revenue: await dayRevenue(addDaysToKey(todayKey, -1)),
     },
@@ -17881,7 +17967,10 @@ export async function BuildTallyXml(restaurantId: string, fromIso?: string, toIs
 
 export const REPORT_SCHEDULE_KEYS = ["sales", "pnl", "gst"] as const;
 export const REPORT_SCHEDULE_FREQUENCIES = ["daily", "weekly", "monthly"] as const;
-export const REPORT_SCHEDULE_CHANNELS = ["inbox"] as const;
+// Migration 044 widened the CHECK behind this and mailer.ts is the sender that
+// made it legitimate to do so. 026's rule holds: a channel appears here only
+// when something on this server can actually deliver it.
+export const REPORT_SCHEDULE_CHANNELS = ["inbox", "email"] as const;
 export const REPORT_SCHEDULE_FORMATS = ["csv"] as const;
 
 /** Max attempts per occurrence before the reaper marks it permanently failed. */
@@ -17900,6 +17989,8 @@ export interface ReportScheduleRecord {
   weekday: number | null;
   day_of_month: number | null;
   channel: string;
+  /** Migration 044. Empty for 'inbox'; at least one address for 'email'. */
+  recipients: string[];
   format: string;
   enabled: boolean;
   last_occurrence_key: string | null;
@@ -17924,6 +18015,8 @@ export interface DueReportSchedule {
   weekday: number | null;
   day_of_month: number | null;
   channel: string;
+  /** Migration 044. Empty for an inbox schedule, at least one for an email one. */
+  recipients: string[];
   format: string;
   created_at: Date;
 }
@@ -17932,6 +18025,8 @@ export interface RetryableReportDelivery {
   id: string;
   schedule_id: string;
   outlet_id: string;
+  /** Migration 044. Read LIVE from the schedule — see the query's comment. */
+  recipients: string[];
   occurrence_key: string | null;
   period_from: string;
   period_to: string;
@@ -17964,11 +18059,77 @@ export interface ReportDeliveryRecord {
 }
 
 const SCHEDULE_COLS = `id, outlet_id, name, report_key, frequency, hour_local, minute_local,
-         weekday, day_of_month, channel, format, enabled, last_occurrence_key,
+         weekday, day_of_month, channel, recipients, format, enabled, last_occurrence_key,
          last_status, last_error, last_run_at, consecutive_failures, created_at, updated_at`;
+
+/** The same list without migration 044's column. See scheduleRead. */
+const SCHEDULE_COLS_PRE_044 = SCHEDULE_COLS.replace(" recipients,", "");
+
+/**
+ * A READ OF "ReportSchedules" THAT SURVIVES AN UNAPPLIED MIGRATION 044.
+ *
+ * THE DEPLOY ORDER THIS EXISTS FOR, and it is a real gap rather than a
+ * hypothetical one. `check-migrations` runs BEFORE the working tree moves, so a
+ * migration arriving in the same push is INVISIBLE to the pre-flight — it
+ * reports on the old commit — and the box's `rd-entry` has no `migrate` verb, so
+ * the automatic apply comes back "exit 64 unknown verb" and stops. Between the
+ * code landing and somebody applying 044 by hand there is a window, and in that
+ * window every select that names `recipients` raises 42703.
+ *
+ * WHAT THAT WOULD COST. `recipients` is in SCHEDULE_COLS, which the schedule
+ * list, the single-schedule read and the sweep's due-list all use. An unguarded
+ * column would therefore take out the whole Scheduled Reports card on a LIVE
+ * restaurant's accounting page — and the sweep with it, so the reports that were
+ * already working would stop too. A feature that has not arrived yet is a
+ * feature nobody misses; a feature that breaks the one already there is an
+ * outage.
+ *
+ * SO IT RETRIES WITHOUT THE COLUMN, once, and mapReportSchedule already reads an
+ * absent `recipients` as an empty list. Self-healing: the moment 044 is applied
+ * the first select succeeds and the fallback is never reached again. No memo,
+ * because a cached "missing" would keep the feature dark until the next restart.
+ *
+ * Lazy DDL is deliberately NOT the answer here. Migration 026's own header
+ * records why: migration 002 grants the app_runtime role USAGE but not CREATE on
+ * the public schema, so a lazy ALTER TABLE does not quietly add the column — it
+ * throws, in production, on the read path.
+ */
+async function scheduleRead<T extends QueryResultRow>(
+  build: (cols: string) => string,
+  params: unknown[],
+): Promise<T[]> {
+  try {
+    return await runQuery<T>(build(SCHEDULE_COLS), params);
+  } catch (err) {
+    if (!isCaptureTableMissing(err)) {throw err;}
+    logger.warn({ what: "ReportSchedules.recipients" }, "report_migration_044_unapplied");
+    return await runQuery<T>(build(SCHEDULE_COLS_PRE_044), params);
+  }
+}
+
+/**
+ * A WRITE that needs 044, with a sentence somebody can act on when it is absent.
+ *
+ * Unlike a read there is no degraded form: a schedule stored without its
+ * recipients would be an email schedule with nowhere to send, which migration
+ * 044's own CHECK exists to refuse. So the write fails — but it fails saying
+ * WHY, because "column recipients does not exist" sent to an owner creating a
+ * report schedule is indistinguishable from the product being broken.
+ */
+function scheduleWriteError(err: unknown): Error {
+  if (isCaptureTableMissing(err)) {
+    return new Error(
+      "Scheduled reports need a database update that has not been applied to this server yet"
+      + " (migration 044). Existing schedules keep running; ask your administrator to apply it"
+      + " before creating or editing one.",
+    );
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
 
 function mapReportSchedule(r: Record<string, any>): ReportScheduleRecord {
   return {
+    recipients: Array.isArray(r.recipients) ? r.recipients.map((x: unknown) => String(x)) : [],
     id: String(r.id),
     outlet_id: String(r.outlet_id),
     name: String(r.name ?? ""),
@@ -18015,11 +18176,27 @@ function normalizeSchedulePayload(
 ): {
   name: string; report_key: string; frequency: string; hour_local: number;
   minute_local: number; weekday: number | null; day_of_month: number | null;
-  channel: string; format: string; enabled: boolean;
+  channel: string; recipients: string[]; format: string; enabled: boolean;
 } {
   const name = String(input.name ?? base?.name ?? "").trim();
   if (!name) { throw new Error("name is required"); }
   const frequency = oneOf(input.frequency ?? base?.frequency ?? "daily", REPORT_SCHEDULE_FREQUENCIES, "frequency");
+  const channel = oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel");
+  // Cleaned the way mailer.ts will read them — trimmed, de-duplicated
+  // case-insensitively, implausible entries dropped, capped at ten — so what the
+  // owner sees saved is exactly what will be used. Normalising at SEND time only
+  // would let a form accept "owner@, owner@" and then quietly send one copy.
+  const recipients = normalizeRecipients(input.recipients ?? base?.recipients ?? []);
+  // REFUSED AT THE FORM, not at 8am tomorrow. Migration 044 has the same rule as
+  // a CHECK, and this exists so the person typing gets a sentence they can act on
+  // instead of a 500 — and so the reason is stated once, in the words of whoever
+  // is looking at the screen.
+  if (channel === "email" && recipients.length === 0) {
+    throw new Error(
+      "An email schedule needs at least one valid recipient address."
+      + " Add one, or set this schedule to deliver to the in-app inbox instead.",
+    );
+  }
   return {
     name: name.slice(0, 120),
     report_key: oneOf(input.report_key ?? base?.report_key ?? "sales", REPORT_SCHEDULE_KEYS, "report_key"),
@@ -18035,7 +18212,8 @@ function normalizeSchedulePayload(
     day_of_month: frequency === "monthly"
       ? boundedInt(input.day_of_month ?? base?.day_of_month ?? 1, 1, 28, "day_of_month")
       : null,
-    channel: oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel"),
+    channel,
+    recipients,
     format: oneOf(input.format ?? base?.format ?? "csv", REPORT_SCHEDULE_FORMATS, "format"),
     enabled: input.enabled === undefined ? (base?.enabled ?? true) : input.enabled !== false,
   };
@@ -18046,8 +18224,8 @@ function normalizeSchedulePayload(
 export async function ListReportSchedules(restaurantId: string): Promise<ReportScheduleRecord[]> {
   const context = await requireRestaurantContext(restaurantId);
   const og = isAllOutlets() ? "true" : "false";
-  const rows = await runQuery<Record<string, any>>(
-    `select ${SCHEDULE_COLS} from "ReportSchedules"
+  const rows = await scheduleRead<Record<string, any>>(
+    (cols) => `select ${cols} from "ReportSchedules"
       where res_id = $1 and (${og} or outlet_id = $2) and archived_at is null
       order by created_at asc`,
     [context.res_id, context.outlet_id],
@@ -18059,8 +18237,8 @@ export async function GetReportSchedule(restaurantId: string, scheduleId: string
   const context = await requireRestaurantContext(restaurantId);
   if (!isUuid(scheduleId)) { return null; }
   const og = isAllOutlets() ? "true" : "false";
-  const rows = await runQuery<Record<string, any>>(
-    `select ${SCHEDULE_COLS} from "ReportSchedules"
+  const rows = await scheduleRead<Record<string, any>>(
+    (cols) => `select ${cols} from "ReportSchedules"
       where id = $3 and res_id = $1 and (${og} or outlet_id = $2) and archived_at is null
       limit 1`,
     [context.res_id, context.outlet_id, scheduleId],
@@ -18075,18 +18253,21 @@ export async function CreateReportSchedule(
 ): Promise<ReportScheduleRecord> {
   const context = await requireRestaurantContext(restaurantId);
   const p = normalizeSchedulePayload(input);
+  // The insert names migration 044's column, so an unapplied 044 raises 42703
+  // here. scheduleWriteError turns that into a sentence an owner can act on —
+  // see its header for why there is no degraded form of this write.
   const rows = await runQuery<Record<string, any>>(
     `insert into "ReportSchedules"
        (res_id, outlet_id, name, report_key, frequency, hour_local, minute_local,
-        weekday, day_of_month, channel, format, enabled, created_by, updated_by)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
+        weekday, day_of_month, channel, recipients, format, enabled, created_by, updated_by)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
      returning ${SCHEDULE_COLS}`,
     [
       context.res_id, context.outlet_id, p.name, p.report_key, p.frequency,
       p.hour_local, p.minute_local, p.weekday, p.day_of_month, p.channel,
-      p.format, p.enabled, (createdBy ?? "").trim() || null,
+      p.recipients, p.format, p.enabled, (createdBy ?? "").trim() || null,
     ],
-  );
+  ).catch((err: unknown) => { throw scheduleWriteError(err); });
   const created = rows[0];
   if (!created) { throw new Error("Failed to create report schedule"); }
   return mapReportSchedule(created);
@@ -18110,16 +18291,17 @@ export async function UpdateReportSchedule(
     `update "ReportSchedules"
         set name = $4, report_key = $5, frequency = $6, hour_local = $7,
             minute_local = $8, weekday = $9, day_of_month = $10, channel = $11,
-            format = $12, enabled = $13, updated_by = $14, updated_at = now(),
-            consecutive_failures = case when $15 then 0 else consecutive_failures end
+            recipients = $12, format = $13, enabled = $14, updated_by = $15,
+            updated_at = now(),
+            consecutive_failures = case when $16 then 0 else consecutive_failures end
       where id = $3 and res_id = $1 and outlet_id = $2 and archived_at is null
       returning ${SCHEDULE_COLS}`,
     [
       context.res_id, context.outlet_id, scheduleId, p.name, p.report_key,
       p.frequency, p.hour_local, p.minute_local, p.weekday, p.day_of_month,
-      p.channel, p.format, p.enabled, (updatedBy ?? "").trim() || null, clearStreak,
+      p.channel, p.recipients, p.format, p.enabled, (updatedBy ?? "").trim() || null, clearStreak,
     ],
-  );
+  ).catch((err: unknown) => { throw scheduleWriteError(err); });
   const updated = rows[0];
   if (!updated) { throw new Error("Unknown report schedule"); }
   return mapReportSchedule(updated);
@@ -18237,9 +18419,12 @@ export async function GetReportDeliveryArtifact(
 // per-occurrence outlet comes from the schedule ROW and is bound by the caller.
 
 export async function ListDueReportSchedules(resId: string, limit = 200): Promise<DueReportSchedule[]> {
-  const rows = await runQuery<Record<string, any>>(
-    `select id, outlet_id, name, report_key, frequency, hour_local, minute_local,
-            weekday, day_of_month, channel, format, created_at
+  // THE SWEEP MUST NOT STOP because 044 has not been applied — every inbox
+  // schedule that was already working goes on working, with an empty recipient
+  // list that only the email channel would have read.
+  const rows = await scheduleRead<Record<string, any>>(
+    (cols) => `select id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+            weekday, day_of_month, channel, ${cols.includes("recipients") ? "recipients," : ""} format, created_at
        from "ReportSchedules"
       where res_id = $1 and enabled = true and archived_at is null
       order by created_at asc
@@ -18257,6 +18442,7 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
     weekday: r.weekday === null || r.weekday === undefined ? null : Number(r.weekday),
     day_of_month: r.day_of_month === null || r.day_of_month === undefined ? null : Number(r.day_of_month),
     channel: String(r.channel),
+    recipients: Array.isArray(r.recipients) ? r.recipients.map((x: unknown) => String(x)) : [],
     format: String(r.format),
     created_at: r.created_at,
   }));
@@ -18271,7 +18457,18 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
     `select d.id, d.schedule_id, d.outlet_id, d.occurrence_key,
             to_char(d.period_from, 'YYYY-MM-DD') as period_from,
             to_char(d.period_to,   'YYYY-MM-DD') as period_to,
-            d.timezone, d.attempts, d.channel, s.name, s.report_key, s.format
+            d.timezone, d.attempts, d.channel, s.name, s.report_key, s.format,
+            -- THE SCHEDULE'S CURRENT LIST, NOT A COPY TAKEN AT CLAIM TIME, and
+            -- that is the opposite choice from d.channel one line above.
+            --
+            -- The channel an occurrence was ACCEPTED on must not change under it:
+            -- a delivery claimed for the bell and retried as an email would send
+            -- figures somewhere nobody agreed to. The ADDRESSES are the other
+            -- way round — the overwhelmingly likely reason an email delivery is
+            -- being retried at all is that the address was wrong, so a retry that
+            -- insisted on the address that just bounced would burn all five
+            -- attempts on a typo the owner has already fixed.
+            s.recipients
        from "ReportDeliveries" d
        join "ReportSchedules" s on s.id = d.schedule_id and s.res_id = d.res_id
       where d.res_id = $1
@@ -18292,6 +18489,7 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
     timezone: String(r.timezone),
     attempts: Number(r.attempts) || 0,
     channel: r.channel ?? null,
+    recipients: Array.isArray(r.recipients) ? r.recipients.map((x: unknown) => String(x)) : [],
     name: String(r.name ?? ""),
     report_key: String(r.report_key),
     format: String(r.format),
@@ -18515,19 +18713,48 @@ export async function MarkReportDeliveryRendered(
  * the bell. The figures live in the artifact, behind the accounting permission on
  * the download route.
  */
-export async function DeliverReportToInbox(
+/**
+ * MARK ONE OCCURRENCE DELIVERED — and this is called AFTER the send, never
+ * before it.
+ *
+ * The ordering is the whole contract and it is not a style preference: this
+ * project has already shipped a print job that acked 'printed' for paper that
+ * never came out of a printer, and a delivery row that says 'delivered' for an
+ * email nobody received is the identical bug with the restaurant's takings in
+ * it. So the caller sends first, and only a send that RESOLVED reaches here.
+ *
+ * The CAS on `attempts` is unchanged: a superseded worker must not be able to
+ * stamp a row another worker already owns.
+ *
+ * `channel` and `deliveredTo` (migration 044) record WHERE it actually went,
+ * from the addresses the transport ACCEPTED rather than from the schedule — an
+ * edited schedule must not be able to rewrite what history says was sent.
+ *
+ * The notification is written on BOTH channels, deliberately. On 'inbox' it IS
+ * the delivery. On 'email' it is the only thing inside this system that tells
+ * the owner the report went out at all, and "did the accountant get the GST
+ * report" is a question somebody asks on the 2nd of every month.
+ */
+export async function MarkReportDelivered(
   resId: string,
   d: {
     deliveryId: string; attempts: number; scheduleId: string;
     occurrenceKey: string | null; title: string; body: string;
+    channel?: string; deliveredTo?: readonly string[];
   },
 ): Promise<void> {
   const rows = await runQuery<{ id: string }>(
     `update "ReportDeliveries"
-        set status = 'delivered', delivered_at = now(), error = null
+        set status = 'delivered', delivered_at = now(), error = null,
+            channel = coalesce($4, channel),
+            delivered_to = $5
       where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'
       returning id`,
-    [d.deliveryId, resId, d.attempts],
+    [
+      d.deliveryId, resId, d.attempts,
+      d.channel ?? null,
+      d.deliveredTo && d.deliveredTo.length > 0 ? [...d.deliveredTo] : null,
+    ],
   );
   if (rows.length === 0) {
     throw new Error("Report delivery was superseded by another attempt");
@@ -18543,8 +18770,20 @@ export async function DeliverReportToInbox(
       schedule_id: d.scheduleId,
       delivery_id: d.deliveryId,
       occurrence_key: d.occurrenceKey,
+      channel: d.channel ?? "inbox",
     },
   });
+}
+
+/** The inbox channel, unchanged. Kept so every existing caller reads the same. */
+export async function DeliverReportToInbox(
+  resId: string,
+  d: {
+    deliveryId: string; attempts: number; scheduleId: string;
+    occurrenceKey: string | null; title: string; body: string;
+  },
+): Promise<void> {
+  await MarkReportDelivered(resId, { ...d, channel: "inbox" });
 }
 
 export async function RecordReportDeliveryFailure(
@@ -34995,7 +35234,7 @@ export interface ExecutiveSummaryReport {
   /** What the group gave away this window, in full. NOT part of the ladder. */
   non_chargeable: MisNonChargeableTotals;
   /** The window `previous` was measured over, and how it was chosen. */
-  previous_window: { from: string; to: string; days: number; basis: "months" | "days" };
+  previous_window: { from: string; to: string; days: number; basis: "months" | "same_dates_prev_month" | "days"; short?: boolean };
   growth: {
     grand_total: number | null;
     net: number | null;
@@ -35126,7 +35365,12 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
         : "Showing one outlet. Switch the outlet selector to All to compare branches.",
       prev.basis === "months"
         ? `The comparison period is the ${String(countDays(prev.from, prev.to))} calendar days of the immediately preceding whole month(s) (${prev.from} to ${prev.to}), not a fixed day count.`
-        : `The comparison period is the equally-long window immediately before this one (${prev.from} to ${prev.to}).`,
+        : prev.basis === "same_dates_prev_month"
+          // NAMED, because the change is invisible in the numbers and an owner
+          // who remembers last month's figure needs to know which period it is
+          // being measured against now.
+          ? `The comparison period is the SAME DATES of the previous month (${prev.from} to ${prev.to}), not the equally-long window immediately before this one.${prev.short ? ` That month was shorter, so it covers ${String(countDays(prev.from, prev.to))} days against this period's ${String(countDays(mc.window.from, mc.window.to))} — the growth figure is between periods of different lengths.` : ""}`
+          : `The comparison period is the equally-long window immediately before this one (${prev.from} to ${prev.to}).`,
       "Growth is blank when the previous period was zero: there is no honest percentage growth from a base of nothing.",
       NOTE_NC_BESIDE_LADDER,
       NOTE_NC_CLOCK,

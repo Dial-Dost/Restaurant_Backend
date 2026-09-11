@@ -8,6 +8,7 @@ import { AddExpense, ArchiveReportSchedule, Audit_log_category, BuildTallyXml, C
 import { logger } from "../observability.js";
 import { renderGstCsv, renderSalesCsv, toCsv } from "../report_render.js";
 import { queueReportScheduleRun } from "../report_schedules.js";
+import { mailerConfigured } from "../mailer.js";
 import { ACCOUNTING_PERM, counterIdFrom, extractEmployeeId, extractRestaurantId, log_audit, requireCounter, validateAction, windowQuery } from "./_shared.js";
 
 
@@ -322,7 +323,22 @@ app.get("/expenses.csv", validateAction(ACCOUNTING_PERM), async (req: Request, r
 app.get("/reports/schedules", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	try { res.json({ schedules: await ListReportSchedules(restaurantId) }); }
+	try {
+		res.json({
+			schedules: await ListReportSchedules(restaurantId),
+			// WHETHER THIS DEPLOYMENT CAN SEND MAIL AT ALL, shipped with the list so
+			// the form can say so BEFORE somebody saves a daily 8am email schedule
+			// that will render a report every morning and fail to deliver it five
+			// times before disabling itself. A capability the client has to guess at
+			// is the recurring shape of this project's bugs; this is the server's
+			// answer, and the client obeys it.
+			//
+			// It is a boolean and nothing more — never the host, the user or the
+			// From address. Those are operator credentials and this endpoint is
+			// readable by anyone holding the accounting permission.
+			email_available: mailerConfigured(),
+		});
+	}
 	catch (e) { logger.error({ err: e }, "list_report_schedules_failed"); res.status(500).json({ error: "Unable to fetch scheduled reports" }); }
 });
 
@@ -333,9 +349,9 @@ app.post("/reports/schedules", validateAction(ACCOUNTING_PERM), async (req: Requ
 		const created = await CreateReportSchedule(restaurantId, (req.body ?? {}) as Record<string, unknown>, extractEmployeeId(req) ?? undefined);
 		try {
 			await log_audit(req, REPORT_SCHEDULE_ACTION_ID,
-				`Created scheduled report "${created.name}" — ${created.report_key} ${created.frequency} at ${String(created.hour_local).padStart(2, "0")}:${String(created.minute_local).padStart(2, "0")} via ${created.channel}`,
+				`Created scheduled report "${created.name}" — ${created.report_key} ${created.frequency} at ${String(created.hour_local).padStart(2, "0")}:${String(created.minute_local).padStart(2, "0")} via ${created.channel}${created.recipients.length > 0 ? ` to ${created.recipients.join(", ")}` : ""}`,
 				Audit_log_category.General,
-				{ schedule_id: created.id, report_key: created.report_key, frequency: created.frequency, hour_local: created.hour_local, minute_local: created.minute_local, channel: created.channel, enabled: created.enabled });
+				{ schedule_id: created.id, report_key: created.report_key, frequency: created.frequency, hour_local: created.hour_local, minute_local: created.minute_local, channel: created.channel, recipients: created.recipients, enabled: created.enabled });
 		} catch {/* ignore */}
 		res.json(created);
 	} catch (e: any) { logger.error({ err: e }, "create_report_schedule_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to create scheduled report") }); }
@@ -348,9 +364,9 @@ app.patch("/reports/schedules/:id", validateAction(ACCOUNTING_PERM), async (req:
 		const updated = await UpdateReportSchedule(restaurantId, req.params.id, (req.body ?? {}) as Record<string, unknown>, extractEmployeeId(req) ?? undefined);
 		try {
 			await log_audit(req, REPORT_SCHEDULE_ACTION_ID,
-				`${updated.enabled ? "Updated" : "Disabled"} scheduled report "${updated.name}" — ${updated.report_key} ${updated.frequency} at ${String(updated.hour_local).padStart(2, "0")}:${String(updated.minute_local).padStart(2, "0")} via ${updated.channel}`,
+				`${updated.enabled ? "Updated" : "Disabled"} scheduled report "${updated.name}" — ${updated.report_key} ${updated.frequency} at ${String(updated.hour_local).padStart(2, "0")}:${String(updated.minute_local).padStart(2, "0")} via ${updated.channel}${updated.recipients.length > 0 ? ` to ${updated.recipients.join(", ")}` : ""}`,
 				Audit_log_category.General,
-				{ schedule_id: updated.id, report_key: updated.report_key, frequency: updated.frequency, hour_local: updated.hour_local, minute_local: updated.minute_local, channel: updated.channel, enabled: updated.enabled });
+				{ schedule_id: updated.id, report_key: updated.report_key, frequency: updated.frequency, hour_local: updated.hour_local, minute_local: updated.minute_local, channel: updated.channel, recipients: updated.recipients, enabled: updated.enabled });
 		} catch {/* ignore */}
 		res.json(updated);
 	} catch (e: any) { logger.error({ err: e }, "update_report_schedule_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to update scheduled report") }); }

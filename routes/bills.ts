@@ -1245,6 +1245,150 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 });
 
 /*
+	E5 — REPRINT A SETTLED BILL, from the accounting module.
+
+	POST /print/bill/settled  body { "bill_id": "<uuid>" }
+	  -> 200 { success, billId, jobId, destination, device }
+
+	============================================================================
+	IT PRINTS WHAT WAS RECORDED. IT DOES NOT RECOMPUTE ANYTHING.
+	============================================================================
+	This is the single rule that makes this route safe, and it is the opposite of
+	what /print/bill above does. That route prints an OPEN table, so it must ask
+	the resolver for the charge configuration and compute the ladder — the bill is
+	still moving. This one prints a bill that was SETTLED: a guest has paid a
+	specific number, that number is in "Bills", and it is on a tax document.
+
+	Recomputing would re-derive the ladder from TODAY's configuration. Between the
+	settlement and the reprint an owner may have changed the GST lines, changed
+	the service-charge percentage, or moved the charge from the restaurant percent
+	to a tax line. Every one of those silently produces a second copy of a tax
+	document with a DIFFERENT total from the one the guest paid — which is the
+	precise failure this file has already been through twice (F2's grand total,
+	and the print that lowered a total the till would not honour). A reprint that
+	disagrees with the original is worse than no reprint at all.
+
+	So every number below comes from GetClosedBill, which reads the settled row,
+	and the only thing this route adds is the REPRINT banner.
+
+	============================================================================
+	WHY IT SAYS "REPRINT" IN THE LARGEST TYPE THE PRINTER HAS
+	============================================================================
+	Off the roll, a second copy is indistinguishable from the original — and a
+	bill that looks like an original gets paid a second time or filed as a second
+	sale. escpos.ts's `reprint` flag puts the word above everything, before the
+	logo. It is not optional here: this route can ONLY produce second copies.
+
+	============================================================================
+	WHO MAY DO IT
+	============================================================================
+	ACCOUNTING_PERM, not the waiter's "Add Orders". The requirement puts the
+	button in the accounting module, and the audience for a settled bill's paper
+	trail is whoever runs the books. A waiter who needs the open table's bill
+	still uses /print/bill and still meets C3's once-only rule there.
+*/
+app.post('/print/bill/settled', validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	const outletId = extractOutletId(req);
+	if (!restaurantId || !outletId) { res.status(400).json({ error: 'Missing restaurant/outlet' }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const billId = typeof body.bill_id === "string" ? body.bill_id.trim() : "";
+	if (!billId) { res.status(400).json({ error: 'bill_id is required' }); return; }
+	try {
+		const [bill, settings, profile] = await Promise.all([
+			GetClosedBill(restaurantId, billId),
+			GetRestaurantSettings(restaurantId).catch(() => ({ currency: "\u20b9" } as any)),
+			GetRestaurantProfile(restaurantId).catch(() => null),
+		]);
+		if (!bill) { res.status(404).json({ error: 'That bill could not be found.' }); return; }
+		if (!Array.isArray(bill.items) || bill.items.length === 0) {
+			// A settled bill whose lines cannot be reconstructed would print a
+			// header, a total and nothing between them. Refusing says why.
+			res.status(400).json({ error: 'This bill has no line items recorded, so it cannot be reprinted.' });
+			return;
+		}
+
+		const is58 = settings.bill_paper_width === "58mm";
+		const cols = is58 ? 32 : 48;
+		// The same raster builder and the same dot widths as the original print
+		// (58mm = 384 dots, 80mm = 576) — a reprint that rendered the logo at a
+		// different width is a different-looking document.
+		const logo = await buildLogoEscPos(restaurantId, is58 ? 384 : 576).catch(() => null);
+
+		// EVERY FIGURE IS THE SETTLED ONE. Read the header: nothing here is
+		// derived from today's tax or service-charge configuration.
+		const escBase64 = buildReceiptBase64({
+			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+			legalName: settings.bill_legal_name ?? null,
+			address: profile?.outlet_add ?? null,
+			phone: profile?.outlet_phone ?? null,
+			gstin: settings.bill_gstin ?? null,
+			table: bill.table_name ?? "",
+			covers: bill.covers ?? 1,
+			items: bill.items.map((i) => ({
+				name: i.variation ? `${i.name} (${i.variation})` : i.name,
+				price: i.price,
+				quantity: i.quantity,
+				note: i.note ?? undefined,
+			})),
+			// The pre-discount line total, as the settled bill reconstructed it.
+			total: bill.items_subtotal,
+			customer: bill.customer,
+			billNo: bill.bill_no,
+			cashier: bill.created_by ?? null,
+			discount: (bill.discount_amount ?? 0) > 0
+				? { amount: bill.discount_amount ?? 0, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" }
+				: null,
+			// Zero is not the same as absent: a bill settled with the charge waived
+			// prints the Opted-out line, exactly as the original did.
+			serviceCharge: bill.service_charge > 0
+				? { percent: bill.service_charge_percent, amount: bill.service_charge }
+				: (bill.service_charge_percent > 0
+					? { percent: bill.service_charge_percent, amount: 0, optedOut: true }
+					: null),
+			taxes: bill.taxes,
+			grandTotal: bill.grand_total,
+			currency: settings.currency ?? "\u20b9",
+			kind: "bill",
+			logo,
+			// NOT OPTIONAL. This route can only ever produce a second copy.
+			reprint: true,
+			// NO FEEDBACK QR ON A REPRINT. The QR is signed for a live seating and
+			// invites a guest who has left to rate a meal they already rated; a
+			// reprint is an accounting document, not a table-side courtesy.
+			feedbackUrl: null,
+			// The disclaimer follows the charge that was ACTUALLY TAKEN, which for a
+			// settled bill is a recorded fact rather than a configuration question.
+			serviceChargeNote: bill.service_charge > 0
+				? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."
+				: null,
+		}, cols);
+
+		const dispatched = await dispatchPrintJob(restaurantId, {
+			outlet_id: outletId, bill_id: bill.id, kind: "bill", station: null, esc_base64: escBase64,
+		});
+		try {
+			await log_audit(req, ACCOUNTING_PERM,
+				`Reprinted settled bill ${bill.bill_no ?? bill.id}${bill.table_name ? ` (table ${bill.table_name})` : ""} \u2014 ${settings.currency ?? "\u20b9"}${bill.grand_total.toFixed(2)}`,
+				Audit_log_category.Bill,
+				{ bill_id: bill.id, bill_no: bill.bill_no, grand_total: bill.grand_total, reprint: true });
+		} catch {/* a failed audit write must never fail the print */}
+
+		res.json({
+			success: true,
+			billId: bill.id,
+			billNo: bill.bill_no,
+			jobId: dispatched.jobId,
+			destination: dispatched.decision.destinationName,
+			device: dispatched.assignedDeviceId,
+		});
+	} catch (err: any) {
+		logger.error({ err }, 'reprint_settled_bill_failed');
+		res.status(500).json({ error: String(err?.message ?? 'Unable to reprint this bill') });
+	}
+});
+
+/*
 	The printer agent reports what it did with one job.
 
 	POST /print/ack  body { "jobId": "<uuid>", "result": "printed" | "failed" }

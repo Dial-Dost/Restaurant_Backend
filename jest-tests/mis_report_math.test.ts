@@ -218,17 +218,72 @@ describe("previousWindow", () => {
     expect(previousWindow("2026-04-01", "2027-03-31")).toEqual({ from: "2025-04-01", to: "2026-03-31", basis: "months" });
   });
 
-  test("an arbitrary drag compares against the equally long window before it", () => {
-    // 3-17 August is 15 days; the 15 days before it are 19 July - 2 August.
-    expect(previousWindow("2026-08-03", "2026-08-17")).toEqual({ from: "2026-07-19", to: "2026-08-02", basis: "days" });
+  // -------------------------------------------------------------------------
+  // V3: MATCHING DATE RANGES, not a rolling window
+  // -------------------------------------------------------------------------
+  // THE REQUIREMENT, and why it is not a preference. On the 9th of September the
+  // dashboard's window is 1-9 September. The old rule compared it against "the
+  // equally-long window immediately before" — 23-31 AUGUST — and that is a
+  // systematically different nine days for a restaurant: a different weekend
+  // distribution, salaries paid, month-end habits. "Month-to-date, up 12%" was
+  // measured against a period nobody meant, under a label that said otherwise.
+  //
+  // The three tests below used to assert the OLD behaviour and are rewritten
+  // rather than deleted, because what each one covers is still worth covering —
+  // and because leaving them asserting the previous answer would have made this
+  // change look like a regression to whoever read them next.
+
+  test("MONTH-TO-DATE compares against the SAME DATES of the previous month", () => {
+    // The example from the requirement, verbatim.
+    expect(previousWindow("2026-09-01", "2026-09-09"))
+      .toEqual({ from: "2026-08-01", to: "2026-08-09", basis: "same_dates_prev_month", short: false });
   });
 
-  test("a single day compares against the day before", () => {
-    expect(previousWindow("2026-08-15", "2026-08-15")).toEqual({ from: "2026-08-14", to: "2026-08-14", basis: "days" });
+  test("an arbitrary drag INSIDE one month matches its own dates a month earlier", () => {
+    // 3-17 August now compares against 3-17 July, not 19 July - 2 August.
+    expect(previousWindow("2026-08-03", "2026-08-17"))
+      .toEqual({ from: "2026-07-03", to: "2026-07-17", basis: "same_dates_prev_month", short: false });
   });
 
-  test("a month-start that is not a month-end is an ordinary span", () => {
-    expect(previousWindow("2026-08-01", "2026-08-15")).toEqual({ from: "2026-07-17", to: "2026-07-31", basis: "days" });
+  test("a single day compares against the same date last month", () => {
+    expect(previousWindow("2026-08-15", "2026-08-15"))
+      .toEqual({ from: "2026-07-15", to: "2026-07-15", basis: "same_dates_prev_month", short: false });
+  });
+
+  test("a month-start that is not a month-end matches the same dates a month back", () => {
+    expect(previousWindow("2026-08-01", "2026-08-15"))
+      .toEqual({ from: "2026-07-01", to: "2026-07-15", basis: "same_dates_prev_month", short: false });
+  });
+
+  test("a shorter previous month is CLAMPED, and says so", () => {
+    // 1-31 March has no counterpart in February. Comparing 31 days of trade
+    // against 28 and printing a growth percentage is a ~10% lie; `short` is what
+    // lets the caller say the periods differ instead of hiding it.
+    expect(previousWindow("2026-03-01", "2026-03-31"))
+      // …except that 1-31 March IS month-aligned, so it takes the months branch,
+      // which already answers 1-28 February. The clamp matters on a drag.
+      .toEqual({ from: "2026-02-01", to: "2026-02-28", basis: "months" });
+    expect(previousWindow("2026-03-15", "2026-03-30"))
+      .toEqual({ from: "2026-02-15", to: "2026-02-28", basis: "same_dates_prev_month", short: true });
+    expect(previousWindow("2028-03-15", "2028-03-30"))
+      .toEqual({ from: "2028-02-15", to: "2028-02-29", basis: "same_dates_prev_month", short: true });
+  });
+
+  test("January reaches back across the year boundary on this branch too", () => {
+    expect(previousWindow("2026-01-01", "2026-01-09"))
+      .toEqual({ from: "2025-12-01", to: "2025-12-09", basis: "same_dates_prev_month", short: false });
+  });
+
+  test("a drag that STRADDLES months keeps the equally-long window before it", () => {
+    // There are no "matching dates" for 20 July - 5 September, so the old rule is
+    // still the only sensible one and is deliberately untouched.
+    expect(previousWindow("2026-07-20", "2026-09-05"))
+      .toEqual({ from: "2026-06-02", to: "2026-07-19", basis: "days" });
+  });
+
+  test("rubbish input is returned unchanged rather than throwing inside a money report", () => {
+    expect(previousWindow("not-a-date", "2026-08-01")).toEqual({ from: "not-a-date", to: "2026-08-01", basis: "days" });
+    expect(previousWindow("2026-08-09", "2026-08-01")).toEqual({ from: "2026-08-09", to: "2026-08-01", basis: "days" });
   });
 });
 
