@@ -4,7 +4,7 @@
  */
 import type { Express, Request, Response } from "express";
 import type { MenuModifierGroup, RecipeItem } from "../database_supabase.js";
-import { Audit_log_category, DeleteMenuCategory, EnsureMenuCategory, GetMenuBadgeCatalogue, GetMenuBadgePresets, GetMenuCategories, GetMenuCosting, GetMenuItemUndoState, GetMenuItems, GetQueueMenuConfig, GetRestaurantSettings, MENU_BADGE_KINDS, MENU_BADGE_LABEL_MAX, MENU_BADGE_PER_ITEM_MAX, MENU_BADGE_PROTECTED_KINDS, MenuBadgeSafetyError, MenuBulkDeleteError, RenameMenuStation, SaveMenuItems, SetMenuBadgeCatalogue, SetMenuItemBadges, SetQueueMenuConfig, SetRestaurantSettings, UpdateMenuItemPrice, UpsertMenuItem } from "../database_supabase.js";
+import { Audit_log_category, DeleteMenuCategory, EnsureMenuCategory, GetMenuBadgeCatalogue, GetMenuBadgePresets, GetMenuCategories, GetMenuCosting, GetMenuItemUndoState, GetMenuItems, GetQueueMenuConfig, GetRestaurantSettings, MENU_BADGE_KINDS, MENU_BADGE_LABEL_MAX, MENU_BADGE_PER_ITEM_MAX, MENU_BADGE_PROTECTED_KINDS, MenuBadgeSafetyError, MenuBulkDeleteError, RenameMenuStation, SaveMenuItems, SetMenuBadgeCatalogue, SetMenuItemAvailability, SetMenuItemBadges, SetQueueMenuConfig, SetRestaurantSettings, UpdateMenuItemPrice, UpsertMenuItem } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { uploadMenuImage } from "../storage_bucket_supabase.js";
 import { PERM_MENU_BULK_REPLACE, PERM_MENU_CAT_DELETE, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
@@ -321,6 +321,55 @@ app.patch("/menu/:id/price", validateAction("ed800655-b937-44ba-a7ca-7458295886c
 	} catch (error: any) {
 		logger.error({ err: error }, "update_menu_price_failed");
 		const msg = String(error?.message ?? "Unable to update price");
+		res.status(/not found/i.test(msg) ? 404 : 400).json({ error: msg });
+	}
+});
+
+// H4 — the quick availability toggle behind the "86 a dish" sidebar.
+//
+// A DEDICATED, MINIMAL WRITE, not POST /menu with the whole item. That route is
+// a full upsert requiring name, category and a positive price, and a control
+// tapped forty times during a rush must be incapable of changing anything but
+// the one flag — see SetMenuItemAvailability's header for the incident that
+// rule comes from.
+//
+// GATED ON "Edit Menu" (ed800655…), the same permission as the price patch:
+// marking a dish off changes what guests can order, which is a menu decision.
+// Deliberately NOT the heavier 88a87943 "create menu item": a manager who may
+// reprice a dish may certainly say it has run out.
+//
+// The audit entry carries an undo envelope in the shape UNDO_REGISTRY already
+// knows (`menu_availability`), so a mis-tap is reversible from the audit log
+// exactly as it is when the same flag is flipped from the menu editor.
+app.patch("/menu/:id/availability", validateAction("ed800655-b937-44ba-a7ca-7458295886c9"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const itemId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+	if (!itemId) { res.status(400).json({ error: "Missing menu item id" }); return; }
+	const raw = (req.body ?? {}) as Record<string, unknown>;
+	// STRICTLY a boolean. Truthiness would make the string "false" — which is
+	// what a form-encoded client sends — mark a dish AVAILABLE when the person
+	// tapping meant the opposite.
+	if (typeof raw.available !== "boolean") {
+		res.status(400).json({ error: "available must be true or false" });
+		return;
+	}
+	try {
+		const result = await SetMenuItemAvailability(restaurantId, itemId, raw.available);
+		try {
+			await log_audit(req, "ed800655-b937-44ba-a7ca-7458295886c9",
+				`Marked ${result.name} ${result.available ? "available" : "unavailable"}`,
+				Audit_log_category.Menu,
+				{
+					id: result.id,
+					available: result.available,
+					undo: { kind: "menu_availability", target_id: result.id, before: result.previous, after: { available: result.available } },
+				});
+		} catch (err) { logger.warn({ err }, "log_audit menu-availability failed"); }
+		res.json({ success: true, ...result });
+	} catch (error: any) {
+		logger.error({ err: error }, "set_menu_availability_failed");
+		const msg = String(error?.message ?? "Unable to change availability");
 		res.status(/not found/i.test(msg) ? 404 : 400).json({ error: msg });
 	}
 });

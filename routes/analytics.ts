@@ -24,7 +24,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { METRIC_EXPLAINERS } from "../analytics_explainers.js";
-import { GetAdvancedAnalytics, GetApcTrends, GetConcerns, GetDailyRevenueSeries, GetKitchenAnalytics, GetMenuPerformanceInsights, GetMonthlyApcInsights, GetMonthlyHistory, GetOperationsAnalytics, GetOutletsComparison, GetOverviewInsights, GetStaffPerformance, GetTimingStats, RunExceptionChecks } from "../database_supabase.js";
+import { GetAdvancedAnalytics, GetApcTrends, GetOverviewHeadline, GetConcerns, GetDailyRevenueSeries, GetKitchenAnalytics, GetMenuPerformanceInsights, GetMonthlyApcInsights, GetMonthlyHistory, GetOperationsAnalytics, GetOutletsComparison, GetOverviewInsights, GetStaffPerformance, GetTimingStats, RunExceptionChecks } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { billingConfigured, getTenantBilling } from "../platform/tenant_billing.js";
 import { extractRestaurantId, validateAction, windowQuery } from "./_shared.js";
@@ -151,6 +151,26 @@ app.get("/orders/timing-stats", validateAction("df75119b-e5f1-4f38-aba5-78a1cf18
 // Overview tab: every quick insight in ONE read. Composed from the same helpers
 // the detailed panels use, so an Overview figure can never disagree with the
 // screen it drills into.
+// H1 — the six headline figures, in one box at the top of the overview.
+//
+// ITS OWN ENDPOINT rather than another field on /analytics/overview, for two
+// reasons. It answers about TODAY and THIS MONTH, not about the page's chosen
+// date window, so folding it into a windowed payload would invite exactly the
+// confusion the card exists to remove. And it is the first thing on the screen:
+// it must not wait on the six analytics reads /analytics/overview fans out to.
+//
+// The SAME analytics permission as everything else here. The figures are the
+// restaurant's takings, and this route widens nothing.
+app.get("/analytics/headline", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try { res.json(await GetOverviewHeadline(restaurantId)); }
+	catch (e) {
+		logger.error({ err: e }, "get_overview_headline_failed");
+		res.status(500).json({ error: "Unable to fetch the headline figures" });
+	}
+});
+
 app.get("/analytics/overview", validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }

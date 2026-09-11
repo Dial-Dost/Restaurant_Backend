@@ -458,6 +458,16 @@ export interface SessionCapabilities {
 	view_roles: boolean;
 	/** POST /roles — C5: who may create and edit a custom role. */
 	manage_roles: boolean;
+	/**
+	 * PATCH /menu/:id/availability — H4's "86 a dish" sidebar.
+	 *
+	 * The SAME "Edit Menu" uuid the price patch is gated on, deliberately: taking
+	 * a dish off changes what a guest can order, which is a menu decision, and
+	 * somebody trusted to reprice a dish is certainly trusted to say it has run
+	 * out. Not the heavier "create menu item" permission — that would put the
+	 * commonest action of a rush behind the rarest one of a quiet morning.
+	 */
+	edit_menu: boolean;
 }
 
 export function sessionCapabilities(input: { actions?: unknown }): SessionCapabilities {
@@ -477,6 +487,7 @@ export function sessionCapabilities(input: { actions?: unknown }): SessionCapabi
 		void_order: has(PERM_VOID_ORDER),
 		view_roles: has("17ba6407-b703-4403-ab59-13235966053f"), // Get Roles
 		manage_roles: has("c0135d18-68b4-45e9-9b51-849158df6efd"), // Create/Update Role
+		edit_menu: has("ed800655-b937-44ba-a7ca-7458295886c9"), // Edit Menu
 	};
 }
 

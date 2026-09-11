@@ -10291,6 +10291,64 @@ export async function UpdateMenuItemPrice(
   });
 }
 
+/**
+ * H4 — TURN ONE DISH ON OR OFF, AND TOUCH NOTHING ELSE.
+ *
+ * V3: "Add a quick-access sidebar menu that allows staff to easily toggle
+ * individual dishes as 'available' or 'unavailable' to save time."
+ *
+ * ----------------------------------------------------------------------------
+ * WHY THIS IS NOT `POST /menu` WITH `{ available: false }`
+ * ----------------------------------------------------------------------------
+ * That route exists and does work — but it is a full UPSERT. It REQUIRES name,
+ * category and a positive price, and it writes every field it is given. A
+ * quick-toggle sidebar sending a whole item on every tap is precisely the shape
+ * of the incident this codebase already has a memory of: a bulk save wiped 56
+ * menu items' images, sections and recipes, because the client sent what it
+ * happened to be holding and the server wrote it.
+ *
+ * A control that gets tapped forty times during a rush must be incapable of
+ * changing anything but the one flag. So this reads the stored description,
+ * flips ONE key, and writes it back — the same shape as UpdateMenuItemPrice,
+ * which exists for the same reason.
+ *
+ * `for update` because two people marking the same dish off at once is the
+ * normal case in a rush, not a rare one: without the lock the second write is a
+ * read-modify-write over a stale description and would silently undo an edit
+ * made between them.
+ */
+export async function SetMenuItemAvailability(
+  restaurantId: string,
+  itemId: string,
+  available: boolean,
+): Promise<{ id: string; name: string; available: boolean; previous: { available: boolean } }> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const rows = await runQuery<{ id: string; name: string; description: string | null }>(
+      `select id, name, description from "Menu"
+         where id = $1 and res_id = $2 and outlet_id = $3
+         limit 1
+         for update`,
+      [itemId, context.res_id, context.outlet_id],
+      client,
+    );
+    if (!rows[0]) {throw new Error("Menu item not found");}
+    const existing = parseMenuDescription(rows[0].description);
+    // Every other key is carried through untouched — that is the whole point.
+    await runQuery(
+      `update "Menu" set description = $4 where id = $1 and res_id = $2 and outlet_id = $3`,
+      [itemId, context.res_id, context.outlet_id, encodeMenuDescription({ ...existing, available })],
+      client,
+    );
+    return {
+      id: rows[0].id,
+      name: rows[0].name,
+      available,
+      previous: { available: existing.available },
+    };
+  });
+}
+
 // Snapshot of the undo-relevant fields of one menu item (name + the parsed
 // description JSON). Used by the routes to record a before-state on the audit
 // entry, and by the undo registry to read the item's CURRENT state.
@@ -14156,6 +14214,83 @@ export async function SetBillItemNote(
     }
     if (updated === 0) {throw new Error("Item not found on this table's bill");}
     return { success: true, updated, note: trimmedNote };
+  });
+}
+
+/**
+ * H6 — CHANGE THE NAME ON A RUNNING TABLE'S BILL.
+ *
+ * V3: "Allow users to update or change the customer's name on the bill directly
+ * within the dashboard."
+ *
+ * ----------------------------------------------------------------------------
+ * WHY IT WRITES EVERY ORDER AND NOT JUST ONE
+ * ----------------------------------------------------------------------------
+ * There is no `customer` column. The name lives inside "Orders".food, and a
+ * table's bill is the SUM of its orders — GetBillForTable walks them in order
+ * and takes the FIRST non-placeholder name it finds (database_supabase.ts, see
+ * `billCustomer`). So a table with three rounds carries up to three names, and
+ * writing only one of them produces a bill whose header depends on which round
+ * happened to be typed into first. Worse, correcting the name on the second
+ * round would appear to do nothing at all, because the first round still wins.
+ *
+ * Every still-owing order on the table therefore gets the same name. That also
+ * means clearing it actually clears it, rather than revealing an older one.
+ *
+ * ----------------------------------------------------------------------------
+ * IT IS THE SAME EDIT GATE AS EVERY OTHER BILL CHANGE
+ * ----------------------------------------------------------------------------
+ * assertBillEditable: an admin-approved or closed bill is FINAL. The name is on
+ * a tax document once the bill settles, and "who was this bill for" is exactly
+ * the field somebody would want to change afterwards — which is why it must not
+ * be changeable afterwards. A settled bill's name is corrected by reopening the
+ * bill, which is audited.
+ *
+ * Blank CLEARS rather than storing an empty string, so the bill falls back to
+ * the header it had before anybody typed a name.
+ */
+export async function SetBillCustomerName(
+  restaurantId: string,
+  tableName: string,
+  rawName: string,
+): Promise<{ success: true; customer: string | null; orders_updated: number }> {
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const tableId = await tableIdByName(context, tableName, client);
+    if (!tableId) {throw new Error("Table not found");}
+    await assertBillEditable(context, tableId, client);
+
+    // 120 is the printed header's practical width at 32 columns with wrapping;
+    // beyond that the name stops being a name and starts being a paragraph on a
+    // thermal roll.
+    const name = String(rawName ?? "").trim().replace(/\s+/g, " ").slice(0, 120);
+
+    const orders = await runQuery<{ id: string; food: unknown }>(
+      `select id, food from "Orders"
+         where res_id = $1 and outlet_id = $2 and table_id = $3
+           and ${stillOwesStatusSql()}
+       order by created_at asc`,
+      [context.res_id, context.outlet_id, tableId],
+      client,
+    );
+    if (orders.length === 0) {throw new Error("This table has no running orders to name.");}
+
+    let updated = 0;
+    for (const o of orders) {
+      const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
+      // "Guest" is what AddOrder writes when nobody typed a name, so CLEARING
+      // restores that rather than leaving an empty header.
+      const next = name || "Guest";
+      if (String(f.customer ?? "") === next) {continue;}
+      const newFood: Record<string, any> = { ...f, customer: next };
+      await runQuery(
+        `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+        [o.id, context.res_id, context.outlet_id, JSON.stringify(newFood)],
+        client,
+      );
+      updated += 1;
+    }
+    return { success: true, customer: name || null, orders_updated: updated };
   });
 }
 
@@ -35624,6 +35759,183 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
       split_bills: splitBills,
       unallocated,
     },
+  };
+}
+
+// ============================================================================
+// H1 — THE OVERVIEW HEADLINE: six figures in one box
+// ============================================================================
+//
+// V3: "Combine the most important and primary statistics into a single distinct
+// box at the top of the overview section containing the following metrics:
+// Today's net sale, Today's gross sale, Online sale net, Online sale gross, Cash
+// collection, Month-to-date sales."
+//
+// ----------------------------------------------------------------------------
+// EVERY FIGURE IS DEFINED, BECAUSE FOUR OF THE SIX ARE AMBIGUOUS
+// ----------------------------------------------------------------------------
+// "Net" and "gross" mean different things in different restaurants, and a card
+// whose numbers the owner cannot reconcile with their own reports is worse than
+// no card. So the definitions here are the SAME ones the MIS reports use — the
+// same closedBillCharges, the same composeBillMoney, the same allocateSettlement
+// — and they are stated on the payload so the screen can state them too:
+//
+//   NET   = taxable_base. Post-discount, PRE service charge, PRE tax. This is the
+//           figure the Sales Summary calls Net and the one an accountant means.
+//   GROSS = "Bills".total_amt. Tax-inclusive, exactly what the guest paid. It is
+//           NOT "net before discount" — that is `gross` inside BillMoney, which
+//           is a different question and deliberately not on this card.
+//   ONLINE = a bill whose orders arrived through an ONLINE channel: an aggregator
+//           (Swiggy, Zomato, anything AddOrder stamped with a source name) or a
+//           DELIVERY order. A counter takeaway is a walk-in and is NOT online;
+//           neither is a QR order placed by a guest sitting at a table, which is
+//           dine-in ordering however it was typed.
+//   CASH  = today's settlement allocated to the Cash mode, split-tender aware, so
+//           a ₹1,000 bill paid ₹600 cash and ₹400 UPI contributes ₹600 — the same
+//           allocation the Settlement Summary and the analytics card use. Two
+//           different answers to "how much cash is in the till" is the one thing
+//           this must never produce.
+//   MTD   = gross, from the 1st of the CURRENT MONTH in the restaurant's own zone
+//           up to and including today.
+//
+// ----------------------------------------------------------------------------
+// ONE READ, NOT SIX
+// ----------------------------------------------------------------------------
+// The month-to-date window CONTAINS today, so today's figures are a slice of the
+// same rows. Six separate aggregates over the same table for one card is the
+// kind of thing that makes an overview page slow enough that people stop opening
+// it.
+//
+// The channel comes from a lateral over "Orders" rather than from a column,
+// because there is no column: order_type lives inside the food JSON blob, and
+// "Bills" has never carried it. EXISTS rather than a join, so a bill with four
+// online orders is still one bill.
+
+/** One figure and the sentence that says what it counts. */
+export interface HeadlineFigure {
+  value: number;
+  label: string;
+  hint: string;
+}
+
+export interface OverviewHeadline {
+  /** The restaurant's own calendar day, and the month window behind MTD. */
+  today: string;
+  month_from: string;
+  timezone: string;
+  today_net: HeadlineFigure;
+  today_gross: HeadlineFigure;
+  online_net: HeadlineFigure;
+  online_gross: HeadlineFigure;
+  cash_collection: HeadlineFigure;
+  month_to_date: HeadlineFigure;
+  /** Bills behind the day's figures, so an empty day reads as empty, not as zero. */
+  today_bills: number;
+  month_bills: number;
+}
+
+interface HeadlineBillRow extends MisBillRow {
+  /** True when any order on this bill came through an online channel. */
+  is_online: boolean;
+}
+
+/**
+ * Is this order_type an ONLINE channel?
+ *
+ * Pure, and deliberately an ALLOWLIST of what is NOT online rather than a list of
+ * aggregator names: a tenant wiring up a new aggregator stamps its own source
+ * string, and a rule that only knew "swiggy" and "zomato" would quietly report
+ * their sales as dine-in. Anything that is not a walk-in is online.
+ */
+export function isOnlineChannel(raw: unknown): boolean {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "" || v === "dine_in" || v === "dinein" || v === "dine-in") {return false;}
+  // A counter takeaway is a person standing at the counter.
+  if (v === "takeaway" || v === "take_away" || v === "pickup") {return false;}
+  return true;
+}
+
+export async function GetOverviewHeadline(restaurantId: string): Promise<OverviewHeadline> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tz = context.timezone;
+  const og = isAllOutlets() ? "true" : "false";
+  const scPct = await getServiceChargePercent(context.res_id).catch(() => 0);
+
+  const today = dayKeyOf(new Date(), tz);
+  // The 1st of the current month, in the restaurant's zone. Built from the day
+  // key rather than from a Date so a shift near midnight cannot land it in the
+  // previous month — the same reason every window in this file is a day key.
+  const monthFrom = `${today.slice(0, 7)}-01`;
+  const from = dayRangeOf(monthFrom, tz).fromIso;
+  const to = dayRangeOf(today, tz).toIso;
+
+  await ensureBillWorkflowColumns();
+  await ensureTableSessionsTable();
+  const rows = await runQuery<HeadlineBillRow>(
+    `select b.id, b.bill_no::text as bill_no, b.outlet_id,
+            coalesce(b.closed_at, b.admin_approved_at) as settled_at,
+            b.total_amt, b.tax_breakdown, b.payment_method, b.payment_splits,
+            b.discount_type, b.discount_value, b.coupon_code,
+            coalesce(b.refund_amount, 0) as refund_amount,
+            null::uuid as session_id, null::int as session_covers,
+            exists (
+              select 1 from "Orders" o
+               where o.res_id = b.res_id and o.outlet_id = b.outlet_id
+                 and o.table_id = b.table_id
+                 and coalesce(o.food->>'order_type', 'dine_in') not in
+                     ('dine_in','dinein','dine-in','takeaway','take_away','pickup')
+            ) as is_online
+       from "Bills" b
+      where b.res_id = $1 and (${og} or b.outlet_id = $2)
+        and ${MIS_SETTLED_PREDICATE}
+      order by coalesce(b.closed_at, b.admin_approved_at) asc, b.id asc`,
+    [context.res_id, context.outlet_id, from, to],
+  );
+
+  const composed = composeMisBills(rows, scPct, tz);
+
+  let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0, cash = 0;
+  let todayBills = 0;
+  for (let i = 0; i < composed.length; i += 1) {
+    const b = composed[i];
+    monthGross = round2(monthGross + b.money.grand_total);
+    if (b.day !== today) {continue;}
+    todayBills += 1;
+    todayNet = round2(todayNet + b.money.net);
+    todayGross = round2(todayGross + b.money.grand_total);
+    if (rows[i].is_online === true) {
+      onlineNet = round2(onlineNet + b.money.net);
+      onlineGross = round2(onlineGross + b.money.grand_total);
+    }
+    // THE SAME ALLOCATION THE SETTLEMENT SUMMARY MAKES. A split tender counts
+    // under each mode it touched; reading payment_method alone would report a
+    // part-cash bill as wholly cash or wholly card.
+    for (const part of allocateSettlement(
+      b.money.grand_total, rows[i].payment_method, parsePaymentSplits(rows[i].payment_splits),
+    )) {
+      if (String(part.method).trim().toLowerCase() === "cash") {cash = round2(cash + part.amount);}
+    }
+  }
+
+  const fig = (value: number, label: string, hint: string): HeadlineFigure => ({ value, label, hint });
+  return {
+    today,
+    month_from: monthFrom,
+    timezone: tz,
+    today_bills: todayBills,
+    month_bills: composed.length,
+    today_net: fig(todayNet, "Today's net sale",
+      "Settled today, after discounts and before service charge and tax. The figure the Sales Summary calls Net."),
+    today_gross: fig(todayGross, "Today's gross sale",
+      "Settled today, tax inclusive \u2014 exactly what guests paid."),
+    online_net: fig(onlineNet, "Online sale (net)",
+      "Today's delivery and aggregator orders, before service charge and tax. A counter takeaway is a walk-in and is not counted."),
+    online_gross: fig(onlineGross, "Online sale (gross)",
+      "Today's delivery and aggregator orders, tax inclusive."),
+    cash_collection: fig(cash, "Cash collection",
+      "Cash taken today. A bill split across modes counts only its cash part."),
+    month_to_date: fig(monthGross, "Month to date",
+      `Gross sales from ${monthFrom} to today, tax inclusive.`),
   };
 }
 

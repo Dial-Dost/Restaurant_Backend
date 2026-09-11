@@ -6,7 +6,7 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
 import { buildReceiptBase64 } from "../escpos.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
@@ -1727,6 +1727,37 @@ app.post('/bills/apply-coupon', validateAction("4ad474d4-5230-449c-874f-6a238b83
 		}
 		logger.error({ err: e }, 'apply_coupon_failed');
 		res.status(400).json({ error: String(e?.message ?? "Unable to apply coupon") });
+	}
+});
+
+// H6 — change the name on a running table's bill.
+//
+// SAME GATE AS EVERY OTHER BILL EDIT, and deliberately not a new permission:
+// 4ad474d4 "Add Orders" is what already lets this person type the name when the
+// order is placed, so requiring something stronger to CORRECT a typo would only
+// mean the wrong name stays on the paper. A settled bill is refused inside
+// SetBillCustomerName by the same assertBillEditable every other edit meets.
+app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
+	const customer = typeof body.customer === "string" ? body.customer : "";
+	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
+	try {
+		const result = await SetBillCustomerName(restaurantId, tableName, customer);
+		try { emitRestaurant(restaurantId, "bill:updated", { table: tableName }); } catch {/* ignore */}
+		try {
+			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				result.customer
+					? `Set the bill name on table ${tableName} to "${result.customer}"`
+					: `Cleared the bill name on table ${tableName}`,
+				Audit_log_category.Bill, { table: tableName, customer: result.customer });
+		} catch {/* ignore */}
+		res.json(result);
+	} catch (e: any) {
+		logger.error({ err: e }, 'set_bill_customer_name_failed');
+		res.status(400).json({ error: String(e?.message ?? 'Unable to change the name on this bill') });
 	}
 });
 
