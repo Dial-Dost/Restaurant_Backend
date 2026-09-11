@@ -1356,6 +1356,31 @@ jobs:
           rd check-migrations > migrations.txt 2>&1
           mrc=$?
           cat migrations.txt
+
+          # ---------------------------------------------------------------------
+          # THE WRAPPER CAN SAY "PENDING" AND STILL EXIT 0, AND ON 2026-09-11 IT
+          # DID. `check-migrations` printed "1 pending migration(s):" for
+          # migration 042 and returned 0, so `mrc` landed in the `0)` arm below,
+          # `migrate_now` was never called in auto mode, and the deploy carried on
+          # and shipped code against a schema that did not exist. Nothing broke
+          # only because that release was written to degrade when its tables are
+          # absent; the next one might not be.
+          #
+          # So the exit code is no longer the only witness. The OUTPUT MARKER is a
+          # documented contract — rd-deploy-migrate.proposed.sh keys on the same
+          # two sentences and says so in as many words ("if that file's wording
+          # changes, THIS breaks and the unrecognised-output branch refuses rather
+          # than guessing") — so reading it here adds no new coupling, it reuses
+          # one that already exists and is already load-bearing.
+          #
+          # ONE DIRECTION ONLY: a marker can promote a 0 to "pending", never
+          # demote a non-zero to clean. Every existing refusal keeps refusing.
+          # ---------------------------------------------------------------------
+          if [ "$mrc" -eq 0 ] && grep -q 'pending migration(s):' migrations.txt; then
+            echo "::warning::'check-migrations' exited 0 but reported pending migration(s). Trusting the OUTPUT over the exit code — see the note in this workflow. The box's rd-deploy should be exiting 65 here."
+            mrc=65
+          fi
+
           case "$mrc" in
             0) ;;
             255)
@@ -1388,6 +1413,13 @@ jobs:
                 rd check-migrations > migrations-recheck.txt 2>&1
                 mrc2=$?
                 cat migrations-recheck.txt
+                # Same normalisation as the pre-flight, and it matters MORE here:
+                # this is the call that decides whether the apply actually worked.
+                # A wrapper that exits 0 while still reporting pending would let a
+                # failed migration through as "clean after the apply".
+                if [ "$mrc2" -eq 0 ] && grep -q 'pending migration(s):' migrations-recheck.txt; then
+                  mrc2=65
+                fi
                 # 127 and 64 get their own cases HERE for the same reason they do
                 # at every other call site: neither means "still pending". 127
                 # means the question was never asked, and putting it under a
