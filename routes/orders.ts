@@ -4,8 +4,8 @@
  */
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "crypto";
-import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrders, GetOrdersScope, IsOrderItemServed, OrderTimingAction, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
-import { autoPrintOrderKot } from "../kot_print.js";
+import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrderKotContext, GetOrders, GetOrdersScope, IsOrderItemServed, OrderTimingAction, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
+import { autoPrintOrderKot, dispatchCancellationKot, type KotLine } from "../kot_print.js";
 import { idempotent } from "../idempotency.js";
 import { resolveServeIntent } from "../order_intent.js";
 import { logger } from "../observability.js";
@@ -297,12 +297,40 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 		if (status.trim().toLowerCase() === "preparing") {
 			approvalPrint = await autoPrintOrderKot({ restaurantId, orderId, where: "order_approved" });
 		}
+		// THE CANCELLATION SLIP. This transition is the commonest way food stops
+		// being cooked and, until now, the kitchen was never told: the KDS card
+		// vanishes and the docket stays on the rail, so the dish is cooked for a
+		// table that has cancelled it. dispatchCancellationKot resolves the number
+		// already on that paper and never mints one — see its header.
+		//
+		// AFTER the `result.changed` guard above, so re-cancelling an already
+		// cancelled order (an offline retry, a double tap) prints nothing: the
+		// early return has already answered.
+		//
+		// `previous_status` is passed because by now the row says Cancelled, and an
+		// order cancelled while still PENDING was never ticketed — a slip for it
+		// would be paper about an order the kitchen has never heard of.
+		let cancelPrint: Awaited<ReturnType<typeof dispatchCancellationKot>> | null = null;
+		if (isCancel) {
+			cancelPrint = await dispatchCancellationKot({
+				restaurantId, orderId, where: "order_cancelled",
+				previousStatus: result.previous_status,
+			});
+		}
 		res.json({
 			success: true,
 			...(approvalPrint
 				? {
 					kot_printed: approvalPrint.printed, kot_no: approvalPrint.kot_no, kot_tickets: approvalPrint.tickets,
 					...(approvalPrint.reason ? { kot_skipped: approvalPrint.reason } : {}),
+				}
+				: {}),
+			// Reported under their own names so a client can tell "the KOT printed"
+			// from "the CANCELLATION printed" — they mean opposite things.
+			...(cancelPrint
+				? {
+					cancel_kot_printed: cancelPrint.printed, cancel_kot_no: cancelPrint.kot_no, cancel_kot_tickets: cancelPrint.tickets,
+					...(cancelPrint.reason ? { cancel_kot_skipped: cancelPrint.reason } : {}),
 				}
 				: {}),
 		});
@@ -447,19 +475,78 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 		const split = (order as any).items_split
 			?? [["Served", []], ["Preparing", Array.isArray((order as any).items) ? (order as any).items : []]];
 		// remove item from both sections
+		// The removed LINE is kept, not just the fact that a line went: the
+		// cancellation slip has to name the dish, and after the filter below there
+		// is nowhere left to read it from.
+		//
+		// StoredOrderLine is a READ VIEW, not a schema. "Orders".food holds
+		// free-form JSON written by four clients over three years, so every field
+		// is `unknown` and every read below narrows it — the alternative is an
+		// `any` that would let a number where a dish name belongs reach the printer
+		// as "[object Object]".
+		interface StoredOrderLine { id?: unknown; name?: unknown; quantity?: unknown; price?: unknown; note?: unknown; variation_name?: unknown; menu_id?: unknown }
+		const asText = (v: unknown): string => (typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "");
+		let removed: StoredOrderLine | null = null;
 		for (const tuple of split) {
 			if (Array.isArray(tuple[1])) {
 				const before = (tuple[1]).length;
+				const hit = (tuple[1] as StoredOrderLine[]).find((it) => asText(it.id) === itemId) ?? null;
 				tuple[1] = (tuple[1]).filter((it) => String(it.id) !== itemId);
 				const after = (tuple[1] as any[]).length;
-				if (after !== before) {break;}
+				if (after !== before) { removed = hit; break; }
 			}
 		}
+
+		// READ BEFORE THE EDIT. A ticket key is a fingerprint of the item SET, so
+		// the instant this line leaves the order the whole-order key no longer
+		// hashes to the one its docket was minted under and the KOT number on the
+		// pass becomes unresolvable. Read here, used after the write commits.
+		// Best-effort: an unreadable context costs the slip, never the delete.
+		const kotContext = removed ? await GetOrderKotContext(restaurantId, orderId).catch(() => null) : null;
 
 		await UpdateOrderItemsSplit(restaurantId, orderId, split as any[]);
 		try { await log_audit(req, "371ecf9f-303e-4114-92fb-3a5120d1565e", `Deleted item ${itemId} from order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, deleted_item_id: itemId }); } catch (err) { logger.warn({ err }, 'log_audit delete-order-item failed'); }
 
-		res.json({ success: true });
+		// THE CANCELLATION SLIP FOR ONE LINE. This route is how a waiter takes a
+		// single dish off an order that is already on the pass, and it printed
+		// nothing — so the line stayed on the kitchen's docket and was cooked.
+		//
+		// THE FOUR FIELDS THE TICKET KEY HASHES — name, quantity, note, variation —
+		// are built here the SAME way POST /orders/:id/items builds them, down to
+		// the trim, because the docket this slip cancels may well be that route's
+		// added-line ticket, scoped by this very item id. Anything spelled
+		// differently would miss that ticket and the slip would print unnumbered.
+		// (price and menu_id are not part of the key: price is never printed on a
+		// KOT, and menu_id rides along so a since-renamed dish still routes to the
+		// station cooking it.)
+		let cancelPrint: Awaited<ReturnType<typeof dispatchCancellationKot>> | null = null;
+		if (removed) {
+			const removedNote = asText(removed.note);
+			const removedVariation = asText(removed.variation_name);
+			const removedMenuId = asText(removed.menu_id);
+			const line: KotLine = {
+				name: typeof removed.name === "string" ? removed.name : "Item",
+				quantity: Number(removed.quantity ?? 1),
+				price: Number(removed.price ?? 0),
+				...(removedNote ? { note: removedNote } : {}),
+				...(removedVariation ? { variation: removedVariation } : {}),
+				...(removedMenuId ? { menu_id: removedMenuId } : {}),
+			};
+			cancelPrint = await dispatchCancellationKot({
+				restaurantId, orderId, where: "order_item_removed",
+				order: kotContext, only: [line], itemId,
+			});
+		}
+
+		res.json({
+			success: true,
+			...(cancelPrint
+				? {
+					cancel_kot_printed: cancelPrint.printed, cancel_kot_no: cancelPrint.kot_no, cancel_kot_tickets: cancelPrint.tickets,
+					...(cancelPrint.reason ? { cancel_kot_skipped: cancelPrint.reason } : {}),
+				}
+				: {}),
+		});
 	} catch (err: any) {
 		logger.error({ err }, 'delete_order_item_failed');
 		res.status(500).json({ error: String(err?.message ?? 'Unable to delete item') });
@@ -480,6 +567,12 @@ app.delete("/orders/:id", validateAction(PERM_ORDER_DELETE), idempotent(), async
 	}
 
 	try {
+		// READ BEFORE THE DELETE, because the delete DESTROYS the row this reads.
+		// This is the one cancellation path with no "after" to work from: the
+		// items, the table, the covers and the approval state all cease to exist
+		// the moment DeleteOrder returns, so the slip is built from facts captured
+		// here. Best-effort — an unreadable order costs the slip, not the delete.
+		const kotContext = await GetOrderKotContext(restaurantId, orderId).catch(() => null);
 		const deleted = await DeleteOrder(restaurantId, orderId);
 		if (!deleted) {
 			res.status(404).json({ error: "Order not found" });
@@ -491,6 +584,19 @@ app.delete("/orders/:id", validateAction(PERM_ORDER_DELETE), idempotent(), async
 			await log_audit(req, PERM_ORDER_DELETE, `Deleted order ${orderId}`,
 				Audit_log_category.Orders, { order_id: orderId });
 		} catch (err) { logger.warn({ err }, "log_audit order-delete failed"); }
+		// THE CANCELLATION SLIP. A deleted order is the most complete way food
+		// stops being cooked — the row itself is gone — and it was the quietest:
+		// nothing on the pass changed, so the kitchen cooked an order that no
+		// longer exists anywhere in the system.
+		//
+		// The RESPONSE STAYS 204. A no-content contract is what both clients parse,
+		// and a printer outcome is not worth reshaping it over; the outcome is in
+		// the kot_dispatched log line, which is where every other automatic docket
+		// is accounted for.
+		await dispatchCancellationKot({
+			restaurantId, orderId, where: "order_deleted",
+			order: kotContext, reason: "order deleted",
+		});
 		res.status(204).send();
 	} catch (error: any) {
 		logger.error({ err: error }, "delete_order_failed");

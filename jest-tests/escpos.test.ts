@@ -768,8 +768,10 @@ describe("buildReceiptBase64 — KOT, held courses", () => {
     // The cook-now list numbers from 1; the hold list numbers from H1, so
     // "fire H2" cannot be heard as "fire 2".
     expect(out).toMatch(/^1 {3}Paneer Tikka \.+ x2$/m);
-    expect(out).toMatch(/^H1 {2}Gulab Jamun \.+ x3$/m);
-    expect(out).toMatch(/^H2 {2}Ice Cream \.+ x1$/m);
+    // …and each held line names the dish and then says "hold", which is the
+    // literal requirement, satisfied inside the block rather than instead of it.
+    expect(out).toMatch(/^H1 {2}Gulab Jamun hold \.+ x3$/m);
+    expect(out).toMatch(/^H2 {2}Ice Cream hold \.+ x1$/m);
   });
 
   test("a held line keeps its kitchen note — that is the reader it was written for", () => {
@@ -991,6 +993,456 @@ describe("buildReceiptBase64 — the order-level note", () => {
     expect(tickets).toHaveLength(2);
     for (const t of tickets) {
       expect(printed(t.escBase64)).toContain("allergy: peanuts");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE DISH NAME (A4).
+//
+// It was the only thing on an item row set in ordinary type: the line number
+// had its own column, the quantity was bold AND double width, the headings were
+// there to be found — and the words the chef actually cooks from were the
+// lightest marks on the row. Bold costs no cells (a bold character is the same
+// width), so every column assertion above still measures the same numbers; what
+// changes is which part of the row the eye lands on first.
+describe("buildReceiptBase64 — KOT, bold dish names", () => {
+  const kot: ReceiptOptions = {
+    ...baseBill,
+    kind: "kot",
+    kotNo: 26,
+    printedAt: "25/08/26 15:23",
+    orderContext: "Running Table",
+    serviceMode: "Dine In",
+    section: null,
+    table: "12",
+    covers: 2,
+    assignedTo: null,
+    captain: null,
+    items: [
+      { name: "Paneer Tikka", quantity: 2, price: 200 },
+      { name: "Naan", quantity: 3, price: 40, note: "no butter" },
+    ],
+  };
+
+  /** Every substring the renderer emitted inside a bold run, in order. */
+  const boldRuns = (b64: string): string[] =>
+    [...decode(b64).matchAll(/\x1bE\x01([\s\S]*?)\x1bE\x00/g)].map((m) => m[1]!);
+
+  test("every dish name is emitted bold", () => {
+    const raw = decode(buildReceiptBase64(kot));
+    expect(raw).toContain("\x1bE\x01Paneer Tikka\x1bE\x00");
+    expect(raw).toContain("\x1bE\x01Naan\x1bE\x00");
+  });
+
+  test("bold costs no cells, so the row keeps the exact layout it always had", () => {
+    // The leaders, the qty column and the wrap width are all unchanged — the
+    // change is invisible to `printed()`, which is the point: nothing moved.
+    for (const cols of [48, 32]) {
+      const b64 = buildReceiptBase64(kot, cols);
+      expect(printed(b64)).toMatch(/^1 {3}Paneer Tikka \.+ x2$/m);
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+    }
+  });
+
+  test("the dot leaders are NOT bold — they bridge the gap, they are not the name", () => {
+    // A bold leader run reads as part of the dish rather than as the space
+    // between the dish and its quantity.
+    expect(decode(buildReceiptBase64(kot))).not.toMatch(/\x1bE\x01[^\x1b]*\.{3}/);
+  });
+
+  test("a name that wraps is bold on its continuation line too", () => {
+    const b64 = buildReceiptBase64({
+      ...kot,
+      items: [{ name: "Slow Cooked Lamb Shank Rogan Josh With Saffron Pulao", quantity: 1, price: 500 }],
+    });
+    // The continuation hangs under the item column: four spaces, then the rest
+    // of the name. However the wrap fell, it must have been emitted bold — half
+    // a bold dish name is worse than none.
+    const cont = printedLines(b64).find((l) => /^ {4}[A-Za-z]/.test(l));
+    expect(cont).toBeTruthy();
+    expect(boldRuns(b64)).toContain(cont!.trim());
+  });
+
+  test("a held line's name is bold as well — it is the same row builder", () => {
+    const raw = decode(buildReceiptBase64({
+      ...kot, items: [{ name: "Gulab Jamun", quantity: 3, price: 90, held: true }],
+    }));
+    expect(raw).toContain("\x1bE\x01Gulab Jamun\x1bE\x00");
+  });
+
+  test("the kitchen note stays in body text — a docket that shouts everything shouts nothing", () => {
+    expect(boldRuns(buildReceiptBase64(kot)).join("|")).not.toContain("no butter");
+    expect(printed(buildReceiptBase64(kot))).toMatch(/^ {4}\* no butter$/m);
+  });
+
+  test("the GUEST's bill is untouched — this is a kitchen-legibility change", () => {
+    const raw = decode(buildReceiptBase64(baseBill));
+    expect(raw).not.toContain("\x1bE\x01Tea - Earl Grey");
+    // The only bold run on a bill is still the Grand Total.
+    expect(boldRuns(buildReceiptBase64(baseBill)).map((s) => s.trim())).toEqual([
+      expect.stringContaining("Grand Total:"),
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE WORD "hold" ON THE LINE (A5) — WITHOUT GIVING UP THE BLOCK.
+//
+// The client asked for one thing: "when an item is placed on hold, the dish
+// name must appear first, followed by the word hold". Read as a REPLACEMENT for
+// the hold block it would undo the fix that block exists for — an annotation
+// that has to be READ to be excluded is exactly what got held food cooked. So
+// the renderer does both: the word where they asked for it, inside the
+// separation the kitchen needs. These tests pin BOTH halves, because either one
+// alone is a regression.
+describe("buildReceiptBase64 — KOT, the word 'hold' on the line", () => {
+  const kot: ReceiptOptions = {
+    ...baseBill,
+    kind: "kot",
+    kotNo: 26,
+    printedAt: "25/08/26 15:23",
+    orderContext: "Running Table",
+    serviceMode: "Dine In",
+    section: null,
+    table: "12",
+    covers: 2,
+    assignedTo: null,
+    captain: null,
+    items: [
+      { name: "Paneer Tikka", quantity: 2, price: 200 },
+      { name: "Gulab Jamun", quantity: 3, price: 90, held: true },
+    ],
+  };
+
+  test("the dish name comes first and the word 'hold' follows it", () => {
+    expect(printed(buildReceiptBase64(kot))).toMatch(/^H1 {2}Gulab Jamun hold \.+ x3$/m);
+  });
+
+  test("and the line is STILL lifted out under the banner, below the total", () => {
+    // The wording does not replace the separation. A kitchen reading only the
+    // words would cook the dessert with the starters.
+    const lines = printedLines(buildReceiptBase64(kot));
+    const banner = lines.findIndex((l) => l.includes("** HOLD **"));
+    expect(banner).toBeGreaterThan(-1);
+    expect(lines.slice(0, banner).join("\n")).not.toContain("Gulab Jamun");
+    expect(lines.slice(banner).join("\n")).toContain("Gulab Jamun hold");
+    expect(printed(buildReceiptBase64(kot))).toMatch(/^Total Qty {2,}2$/m);
+  });
+
+  test("a line the kitchen may cook never says 'hold'", () => {
+    const out = printed(buildReceiptBase64(kot));
+    expect(out).toMatch(/^1 {3}Paneer Tikka \.+ x2$/m);
+    expect(out).not.toContain("Paneer Tikka hold");
+  });
+
+  test("the word rides on the LAST line of a wrapped name, never on its own", () => {
+    // Wrapped away from its dish, "hold" would qualify whatever line it landed
+    // beside — so the name is wrapped against a column shortened by its length.
+    const b64 = buildReceiptBase64({
+      ...kot,
+      items: [{ name: "Slow Cooked Lamb Shank Rogan Josh With Saffron Pulao", quantity: 1, price: 500, held: true }],
+    });
+    const holdLine = printedLines(b64).find((l) => l.includes("hold"));
+    expect(holdLine).toBeTruthy();
+    expect(holdLine).toMatch(/\S+ hold/);           // a word of the dish precedes it
+    expect(holdLine!.trim()).not.toMatch(/^hold/);  // never alone on its line
+  });
+
+  test("a docket with nothing held carries the word nowhere", () => {
+    const out = printed(buildReceiptBase64({
+      ...kot, items: [{ name: "Paneer Tikka", quantity: 2, price: 200 }],
+    }));
+    expect(out).not.toContain("hold");
+    expect(out).not.toContain("HOLD");
+  });
+
+  test("the longer line still fits the narrow roll", () => {
+    for (const cols of [48, 32]) {
+      const b64 = buildReceiptBase64(kot, cols);
+      expect(printed(b64)).toContain("Gulab Jamun hold");
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+    }
+  });
+
+  test("'hold' is a KITCHEN state and never reaches the guest's bill", () => {
+    expect(printed(buildReceiptBase64({
+      ...baseBill, items: [{ name: "Gulab Jamun", quantity: 3, price: 90, held: true }],
+    }))).not.toContain("hold");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REPRINTS (A7, G3).
+//
+// A reprint is indistinguishable from an original once it is off the roll, and
+// that is the whole problem: an unmarked second copy of a docket is cooked
+// twice, and an unmarked second copy of a bill is paid twice or filed as a
+// second sale. A7 asks for the table number, the dish name and the KOT id to be
+// larger and bold on a reprinted docket; G3 asks for the word "Reprint" at the
+// top of a reprinted bill. Two of A7's three were ALREADY the biggest type the
+// printer has, so the only thing that grows is the dish name.
+describe("buildReceiptBase64 — reprints", () => {
+  const kot: ReceiptOptions = {
+    ...baseBill,
+    kind: "kot",
+    kotNo: 26,
+    printedAt: "25/08/26 15:23",
+    orderContext: "Running Table",
+    serviceMode: "Dine In",
+    section: null,
+    table: "12",
+    covers: 2,
+    assignedTo: null,
+    captain: null,
+    items: [{ name: "Paneer Tikka", quantity: 2, price: 200 }],
+  };
+
+  /** Every substring emitted at double WIDTH, whether or not also double height. */
+  const widened = (b64: string): string[] =>
+    [...decode(b64).matchAll(/\x1b!([\s\S])([^\x1b\x1d]*)/g)]
+      .filter((m) => (m[1]!.charCodeAt(0) & 0x20) === 0x20)
+      .map((m) => m[2]!.trim())
+      .filter(Boolean);
+
+  /** …and at double width AND height, the largest type the printer has. */
+  const doubled = (b64: string): string[] =>
+    [...decode(b64).matchAll(/\x1b!([\s\S])([^\x1b\x1d]*)/g)]
+      .filter((m) => (m[1]!.charCodeAt(0) & 0x30) === 0x30)
+      .map((m) => m[2]!.trim())
+      .filter(Boolean);
+
+  test("G3: a reprinted bill says so before anything else on the roll", () => {
+    const lines = printedLines(buildReceiptBase64({ ...baseBill, reprint: true })).filter((l) => l.trim());
+    expect(lines[0]).toBe("** REPRINT **");
+    expect(lines[1]).toBe("Cafe Nicoise");
+  });
+
+  test("G3: the word is the biggest type the printer has, on both rolls", () => {
+    for (const cols of [48, 32]) {
+      const b64 = buildReceiptBase64({ ...baseBill, reprint: true }, cols);
+      // Bold AND double width+height — 13 characters is 26 of the narrow roll's
+      // 32 cells, so it survives `big`'s fit guard instead of degrading.
+      expect(decode(b64)).toContain("\x1bE\x01\x1b!0** REPRINT **");
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+    }
+  });
+
+  test("G3: it sits ABOVE the logo, because 'the top' of a bill with a tall raster is not below it", () => {
+    const logo = Buffer.from([0x1d, 0x76, 0x30, 0x00, 0x01, 0x00, 0x01, 0x00, 0xff]);
+    const buf = bytes(buildReceiptBase64({ ...baseBill, reprint: true, logo }));
+    expect(buf.indexOf(Buffer.from("** REPRINT **", "latin1"))).toBeLessThan(buf.indexOf(logo));
+  });
+
+  test("A7: a reprinted docket enlarges the dish name — the one thing not already big", () => {
+    const b64 = buildReceiptBase64({ ...kot, reprint: true });
+    expect(decode(b64)).toContain("\x1bE\x01\x1b!\x20Paneer Tikka\x1b!\x00\x1bE\x00");
+    // All three of A7's fields, large, on the same ticket.
+    expect(widened(b64)).toEqual(expect.arrayContaining(["KOT - 26", "Table No: 12", "Paneer Tikka"]));
+  });
+
+  test("A7: the table and the KOT id were ALREADY the big type, and still are", () => {
+    // `big()` has printed them at double width AND height since the identity
+    // block was written. There is no larger type to promote them to.
+    expect(doubled(buildReceiptBase64(kot))).toEqual(["KOT - 26", "Table No: 12"]);
+    expect(doubled(buildReceiptBase64({ ...kot, reprint: true })))
+      .toEqual(["** REPRINT **", "KOT - 26", "Table No: 12"]);
+  });
+
+  test("A7: an ordinary docket's dish name is bold but NOT enlarged", () => {
+    expect(widened(buildReceiptBase64(kot))).not.toContain("Paneer Tikka");
+  });
+
+  test("A7: a doubled name is re-wrapped against half the column, so nothing runs off the roll", () => {
+    const long: ReceiptOptions = {
+      ...kot,
+      reprint: true,
+      items: [
+        { name: "Slow Cooked Lamb Shank Rogan Josh With Saffron Pulao", quantity: 12, price: 500 },
+        { name: "Gulab Jamun With Rabri", quantity: 3, price: 90, held: true },
+      ],
+    };
+    for (const cols of [48, 32]) {
+      const b64 = buildReceiptBase64(long, cols);
+      // A doubled character eats TWO cells: a character-count guard would call
+      // this docket safe while the printer wrapped it mid-word.
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+      // Nothing is dropped or truncated to achieve that — it wraps.
+      expect(printed(b64).replace(/\n\s*/g, " ")).toContain("Saffron Pulao");
+      expect(printed(b64)).toContain("hold");
+    }
+  });
+
+  test("a docket that is not a reprint is byte-identical to one printed before the flag existed", () => {
+    const withoutKey = buildReceiptBase64(kot);
+    expect(buildReceiptBase64({ ...kot, reprint: undefined })).toBe(withoutKey);
+    expect(buildReceiptBase64({ ...kot, reprint: false })).toBe(withoutKey);
+    expect(printed(withoutKey)).not.toContain("REPRINT");
+  });
+
+  test("a bill that is not a reprint is byte-identical too", () => {
+    const withoutKey = buildReceiptBase64(baseBill);
+    expect(buildReceiptBase64({ ...baseBill, reprint: undefined })).toBe(withoutKey);
+    expect(buildReceiptBase64({ ...baseBill, reprint: false })).toBe(withoutKey);
+    expect(printed(withoutKey)).not.toContain("REPRINT");
+  });
+
+  test("every station's copy of a reprinted ticket is marked, not just the first", () => {
+    const tickets = buildKotBase64({
+      ...kot,
+      reprint: true,
+      items: [
+        { name: "Paneer Tikka", quantity: 1, price: 250, station: "TANDOOR" },
+        { name: "Mojito", quantity: 2, price: 180, station: "BAR" },
+      ],
+    });
+    expect(tickets).toHaveLength(2);
+    for (const t of tickets) { expect(printed(t.escBase64)).toContain("** REPRINT **"); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TOKEN NO. — EVERY KOT NUMBER THAT FED THIS BILL.
+//
+// From the reference GAIA receipt: "Token No.: 214, 218, 236, 241, 242, 257,
+// 272, 277, 298". A table's bill is the sum of several orders, each fired on
+// its own ticket, and the number the kitchen called each ticket by is the only
+// handle the floor has on "which of these did we send at 8:40" — so the guest's
+// copy carries them, and a query at the till is answered from the paper in the
+// guest's hand instead of a dashboard search.
+describe("buildReceiptBase64 — Token No.", () => {
+  const nine = [214, 218, 236, 241, 242, 257, 272, 277, 298];
+
+  /** The Token No. line plus its wrapped continuations, rejoined. */
+  const tokenLine = (b64: string): string | null => {
+    const lines = printedLines(b64);
+    const start = lines.findIndex((l) => l.startsWith("Token No.:"));
+    if (start < 0) { return null; }
+    let joined = lines[start]!;
+    for (let i = start + 1; i < lines.length && /^\d/.test(lines[i]!); i++) { joined += ` ${lines[i]}`; }
+    return joined;
+  };
+
+  test("lists every ticket, under the Bill No. / Cashier line and above the items", () => {
+    const b64 = buildReceiptBase64({ ...baseBill, kotNumbers: [214, 218, 236] });
+    const lines = printedLines(b64);
+    const at = lines.findIndex((l) => l.startsWith("Token No.:"));
+    expect(lines[at]).toBe("Token No.: 214, 218, 236");
+    expect(lines.findIndex((l) => l.includes("Bill No.: INV-1"))).toBeLessThan(at);
+    expect(lines.findIndex((l) => l.startsWith("Item"))).toBeGreaterThan(at);
+  });
+
+  test("nine tokens wrap to the roll, and a wrap never splits a number", () => {
+    for (const cols of [48, 32]) {
+      const b64 = buildReceiptBase64({ ...baseBill, kotNumbers: nine }, cols);
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+      // Rejoined on the single spaces wrapText broke at: exactly the list given.
+      expect(tokenLine(b64)).toBe(`Token No.: ${nine.join(", ")}`);
+    }
+  });
+
+  test("absent, empty, or unusable prints NOTHING — not a bare label", () => {
+    // The guarantee every restaurant whose bills have never carried tokens
+    // depends on: the paper is byte-identical to what it printed before.
+    const clean = buildReceiptBase64(baseBill);
+    expect(buildReceiptBase64({ ...baseBill, kotNumbers: undefined })).toBe(clean);
+    expect(buildReceiptBase64({ ...baseBill, kotNumbers: [] })).toBe(clean);
+    // migration 029 unapplied -> allocateKotNumber returned null, which reaches
+    // a JSON round trip as 0 or NaN. "Token No.:" with nothing after it is
+    // worse than no line at all, exactly as it is for GSTN and Ph.
+    expect(buildReceiptBase64({ ...baseBill, kotNumbers: [0, NaN] })).toBe(clean);
+    expect(printed(clean)).not.toContain("Token No.");
+  });
+
+  test("one unusable value is dropped from the list, not printed as a hole in it", () => {
+    expect(tokenLine(buildReceiptBase64({ ...baseBill, kotNumbers: [214, 0, 236] })))
+      .toBe("Token No.: 214, 236");
+  });
+
+  test("the renderer does not dedupe — a caller that repeats a ticket has a bug worth seeing", () => {
+    // Distinctness is the caller's job: it is the side that knows which orders
+    // fed the bill. Tidying a duplicate away here would hide the day a bill
+    // double-counted a ticket.
+    expect(tokenLine(buildReceiptBase64({ ...baseBill, kotNumbers: [214, 214] })))
+      .toBe("Token No.: 214, 214");
+  });
+
+  test("the KOT carries no list — the docket IS one of those tickets", () => {
+    const kot: ReceiptOptions = { ...baseBill, kind: "kot", kotNo: 26, table: "12" };
+    expect(buildReceiptBase64({ ...kot, kotNumbers: nine })).toBe(buildReceiptBase64(kot));
+    expect(printed(buildReceiptBase64({ ...kot, kotNumbers: nine }))).not.toContain("Token No.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE CANCELLATION SLIP.
+//
+// A docket whose job is to STOP food being cooked, read in the same second and
+// the same posture as forty ordinary ones. Everything about it is the ordinary
+// docket layout on purpose — same ticket number, same table, same dishes —
+// because the slip has to be MATCHED against the paper already on the rail, and
+// a differently-shaped document is harder to match, not easier. The one
+// difference is the word, and it has to be the first thing the eye lands on.
+describe("buildReceiptBase64 — a cancelled docket", () => {
+  const slip: ReceiptOptions = {
+    ...baseBill,
+    kind: "kot",
+    kotNo: 26,
+    table: "12",
+    orderContext: "*** REASON: GUEST LEFT ***",
+    cancelled: true,
+  };
+
+  test("says CANCELLED, in the biggest type on the ticket", () => {
+    const out = printed(buildReceiptBase64(slip));
+    expect(out).toContain("** CANCELLED **");
+    // `big()` doubles the type; on 48 columns the banner fits and stays doubled.
+    const raw = decode(buildReceiptBase64(slip));
+    expect(raw).toContain("\x1b!\x30");
+  });
+
+  test("the word is ABOVE the context line — below it is already too late", () => {
+    // By the time a chef has read "Running Table 12" they are matching dishes.
+    const out = printed(buildReceiptBase64(slip));
+    const banner = out.indexOf("CANCELLED");
+    const context = out.indexOf("REASON");
+    // BOTH MUST BE PRESENT BEFORE THEY CAN BE ORDERED. indexOf returns -1 for a
+    // missing needle, and -1 is less than every real index — so a bare
+    // `toBeLessThan` here PASSES when the banner is absent, which is precisely
+    // the regression this test exists to catch. Proven: suppressing the banner
+    // left this assertion green.
+    expect(banner).toBeGreaterThanOrEqual(0);
+    expect(context).toBeGreaterThanOrEqual(0);
+    expect(banner).toBeLessThan(context);
+  });
+
+  test("and still names the ticket, the table and the dishes", () => {
+    // The slip is matched against the docket on the rail. Strip its identity and
+    // it becomes a piece of paper saying something is cancelled, somewhere.
+    const out = printed(buildReceiptBase64({ ...slip, items: [{ name: "Paneer Tikka", quantity: 2, price: 0 }] }));
+    expect(out).toContain("26");
+    expect(out).toContain("12");
+    expect(out).toContain("Paneer Tikka");
+  });
+
+  test("absent, false and undefined are byte-identical to a docket printed before the field existed", () => {
+    const withoutKey = buildReceiptBase64({ ...slip, cancelled: undefined });
+    expect(buildReceiptBase64({ ...slip, cancelled: false })).toBe(withoutKey);
+    expect(printed(withoutKey)).not.toContain("CANCELLED");
+  });
+
+  test("a BILL ignores it completely", () => {
+    // Cancelling a kitchen ticket is not a thing that happens to a guest's bill,
+    // and a CANCELLED banner on a tax document would be read as a refund.
+    const clean = buildReceiptBase64({ ...baseBill, cancelled: undefined });
+    expect(buildReceiptBase64({ ...baseBill, cancelled: true })).toBe(clean);
+  });
+
+  test("it fits the narrow roll", () => {
+    for (const cols of [48, 32]) {
+      for (const w of cellWidths(buildReceiptBase64(slip, cols))) {
+        expect(w).toBeLessThanOrEqual(cols);
+      }
     }
   });
 });

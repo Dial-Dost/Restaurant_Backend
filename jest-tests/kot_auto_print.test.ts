@@ -802,3 +802,65 @@ describe("station identity", () => {
     expect(result.stations).toEqual(["Bar"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 12. THE NUMBER REACHES THE QUEUE.
+//
+//     Migration 043 adds "PrintJobs".kot_no so a printed docket can be found
+//     again by the number the kitchen calls it by — that is what puts a KOT
+//     number on a kitchen card, on an order row, and in a bill's Token No. line.
+//     The column, the reads and all three screens were built in one pass; the
+//     single line that WRITES it was not, and 043 sat completely inert as a
+//     result: the column existed, every read returned empty, and no number
+//     reached any screen.
+//
+//     One line is exactly the kind of thing that regresses without a witness.
+// ---------------------------------------------------------------------------
+
+describe("the KOT number on the print job", () => {
+  // THE LATCH IS OFF BY DEFAULT AND THAT IS THE SHIPPED BEHAVIOUR. It is set
+  // once at boot by probing the catalogue, so in a test it is false — which is
+  // the pre-043 tenant, and worth pinning in its own right (last test below).
+  beforeEach(() => { db.__kotNumberLinkTestSeam.setSchemaReady(true); });
+  afterEach(() => { db.__kotNumberLinkTestSeam.setSchemaReady(false); });
+
+  test("every docket of a ticket carries the number that ticket was allocated", async () => {
+    seedMenu([
+      { id: "m1", name: "Paneer Tikka", station: "TANDOOR" },
+      { id: "m3", name: "Fresh Lime Soda", station: "BAR" },
+    ]);
+
+    const result = await kp.dispatchKot(dispatch({
+      items: [{ name: "Paneer Tikka", quantity: 1 }, { name: "Fresh Lime Soda", quantity: 2 }],
+      skipIfTicketed: true,
+    }));
+
+    // ONE number across both station dockets — they are one ticket, and the
+    // pass pairs them by that number.
+    expect(result.tickets).toBe(2);
+    expect(enqueued.map((j) => j.kot_no)).toEqual([result.kotNo, result.kotNo]);
+    expect(result.kotNo).toBe(1);
+  });
+
+  test("an unnumbered ticket enqueues with no number rather than a fabricated one", async () => {
+    // A docket with no table row cannot be keyed, so it prints unnumbered. A
+    // zero or a -1 here would become a KOT number on a kitchen card that names
+    // no ticket at all.
+    seedMenu([{ id: "m1", name: "Paneer Tikka", station: "TANDOOR" }]);
+    const result = await kp.dispatchKot(dispatch({ tableId: "", skipIfTicketed: true }));
+    expect(result.kotNo).toBeNull();
+    expect(enqueued.every((j) => j.kot_no === null)).toBe(true);
+  });
+
+  test("a tenant whose 043 has not applied enqueues exactly today's row", async () => {
+    // The whole degradation contract in one assertion: with the column absent,
+    // EnqueuePrintJob issues the statement it always did, the docket still
+    // prints, and nothing anywhere carries a number.
+    db.__kotNumberLinkTestSeam.setSchemaReady(false);
+    seedMenu([{ id: "m1", name: "Paneer Tikka", station: "TANDOOR" }]);
+    const result = await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
+    expect(result.tickets).toBeGreaterThan(0);
+    expect(result.kotNo).toBe(1);
+    expect(enqueued.every((j) => j.kot_no === null)).toBe(true);
+  });
+});

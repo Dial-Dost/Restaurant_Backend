@@ -903,6 +903,27 @@ export interface OrderRecord {
   // NULL on rows that have not been touched since the column was added — never
   // backfilled, because a fabricated edit time is worse than an absent one.
   updated_at?: string | null;
+  /**
+   * The KOT number(s) this order has had printed, oldest first (migration 043).
+   *
+   * WHY A LIST AND NOT A NUMBER. One order can be ticketed more than once and
+   * legitimately so: a line added to an order already on the pass prints its own
+   * docket (POST /orders/:id/items), a fired course prints its own, and each gets
+   * its OWN number because they are separate pieces of paper the kitchen holds
+   * separately. That is requirement B3 stated as data — "5 items ordered at
+   * different intervals are 5 distinct KOTs with their own numbers, not one long
+   * stacked list" — so the array is the requirement, not a generalisation of it.
+   *
+   * ABSENT, never empty, when there is nothing to say: no number was found, the
+   * tenant has not applied 043, or the docket predates it. Every consumer that
+   * existed before this field keeps receiving the exact JSON it received before,
+   * which is what makes the addition invisible to a restaurant that has printed
+   * nothing new.
+   *
+   * DISPLAY ONLY. It is what a human reprints, cancels or moves a KOT BY (B1/B2);
+   * it is never what the server prints from — see GetKotNumbersForOrders.
+   */
+  kot_nos?: number[];
 }
 
 export type PaymentMethod =
@@ -3874,7 +3895,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -4104,6 +4125,25 @@ export async function GetBillForTable(
     }
   }
 
+  // THE "Token No." LINE (migration 043). A table-scoped bill is the sum of
+  // several orders, so the numbers that fed it are the distinct KOT numbers
+  // across ALL of them, in the order the kitchen saw them — which is exactly the
+  // "Token No.: 214, 218, 236, …" run on the real printed bill the client
+  // supplied.
+  //
+  // COMPUTED FROM order_ids, THE SAME LIST THIS FUNCTION ALREADY RETURNS, so the
+  // line can never describe a different set of orders than the items above it do.
+  // Outlet-fenced rather than outlet-selected: bill_id already carries the order
+  // uuid and is selective on its own, and orderRows is already scoped to this
+  // outlet, so the term only stops a moved-order edge case from reaching across.
+  //
+  // NOTHING ELSE IN THIS FUNCTION CHANGES. GetKotNumbersForBill returns [] when
+  // 043 has not applied and never throws, the bill line merge below is untouched
+  // (it is what the guest is handed, and no key of it may move), and an empty
+  // list must render as no line at all.
+  const orderIds = orderRows.map((row) => row.id);
+  const kotNos = await GetKotNumbersForBill(context.res_id, context.outlet_id, orderIds);
+
   return {
     bill_id: bill?.id ?? null,
     table_id: tableId,
@@ -4132,7 +4172,11 @@ export async function GetBillForTable(
     nc_total: ncTotal,
     covers,
     apc: tableApc,
-    order_ids: orderRows.map((row) => row.id),
+    order_ids: orderIds,
+    // Every KOT number that fed this bill, in allocation order. Empty on a
+    // restaurant that has printed nothing since migration 043 — and empty MUST
+    // print nothing, not "Token No.: ".
+    kot_nos: kotNos,
     // The whole-order instructions on this table. Consumed by the KITCHEN
     // docket only; every bill renderer ignores it by construction.
     order_notes: orderNotes,
@@ -10235,7 +10279,41 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
   });
 
   // Orders with no items for the requested station were mapped to null — drop them.
-  return (stationFilter ? result.filter((o) => o !== null) : result) as OrderRecord[];
+  const visible = (stationFilter ? result.filter((o) => o !== null) : result) as OrderRecord[];
+
+  // KOT NUMBERS (migration 043), attached here so the kitchen display and the
+  // orders grid get them without a second round trip from the client — which is
+  // the whole reason this rides the existing read rather than being its own
+  // endpoint: this list is polled, and a per-order fetch would multiply that poll
+  // by the number of open orders.
+  //
+  // ONE EXTRA INDEXED QUERY, AND ONLY ON A MIGRATED TENANT. GetKotNumbersForOrders
+  // checks the column latch before it issues anything, so a tenant without 043
+  // pays nothing at all and this whole block is a no-op that adds no key to any
+  // order. It also never throws, so a failure here can only cost the numbers.
+  //
+  // The outlet argument follows the SAME scoping as the query above: in
+  // all-outlets mode the grid genuinely spans branches, so pinning the numbers to
+  // context.outlet_id would blank them for every order from another branch that
+  // the caller is already being shown.
+  if (visible.length > 0) {
+    const kotNos = await GetKotNumbersForOrders(
+      context.res_id,
+      isAllOutlets() ? null : context.outlet_id,
+      visible.map((o) => o.id),
+    );
+    if (kotNos.size > 0) {
+      for (const order of visible) {
+        const nos = kotNos.get(order.id);
+        // Set only when there is something to say. An empty array would be a new
+        // key in every order of every restaurant that has printed nothing new,
+        // and "no numbers" already has a representation: the field is not there.
+        if (nos && nos.length > 0) { order.kot_nos = nos; }
+      }
+    }
+  }
+
+  return visible;
 }
 
 // How many days back GetOrders' live grid reaches for orders whose bill is
@@ -29176,6 +29254,26 @@ export interface PrintJobInput {
   /** KOT only — the kitchen station this ticket belongs to. */
   station: string | null;
   esc_base64: string;
+  /**
+   * The KOT number printed on THIS docket (migration 043), copied into the row so
+   * it can be read back. Absent/null on a customer bill and on a docket that
+   * could not be numbered (029 unapplied — dispatchKot prints unnumbered rather
+   * than refusing to print), and absent on every producer that has not been
+   * taught to pass it, which is why it is optional.
+   *
+   * IT IS A COPY AND NEVER A SOURCE. allocateKotNumber against 029's "KotTickets"
+   * memo is the only thing that may mint or re-find a number; this rides one line
+   * below that call in kot_print.ts:dispatchKot so nothing new can drift. Writing
+   * it is best-effort: see EnqueuePrintJob, which falls back to today's exact
+   * INSERT when 043 has not landed, because a docket must never fail to enqueue
+   * for want of a display column.
+   *
+   * OPTIONAL ON THE INTERFACE RATHER THAN ON A SEPARATE PARAMETER so it rides
+   * through dispatchPrintJob (print_routing.ts) and enqueuePrintJob
+   * (print_jobs.ts) untouched — both hand this object straight through, so no
+   * other module has to change a signature to carry it.
+   */
+  kot_no?: number | null;
 }
 
 /**
@@ -29244,6 +29342,94 @@ export interface PrintJobAssignment {
   assign_expires_at: Date;
 }
 
+// --- migration 043: the KOT number link ---------------------------------------
+//
+// "PrintJobs".kot_no is a COPY of the number 029 already minted, written at
+// enqueue so that six display features (A1/A3/B1/B2/B3 and the bill's "Token No."
+// line) can read back a number that is otherwise only rendered pixels inside
+// esc_base64. Nothing here allocates, and nothing here decides what to print.
+//
+// A BOOT LATCH, EXACTLY LIKE printRoutingSchemaReady, AND FOR A SHARPER REASON.
+// runQuery runs on the AMBIENT tenant connection, which on a settle or a split is
+// inside an open transaction. A statement that raises 42703 there aborts the whole
+// transaction, so "try the new INSERT, catch undefined_column, retry the old one"
+// would turn a missing display column into a FAILED SETTLE (25P02 on the retry).
+// A latch resolved once, before the listener, is the only shape that cannot do
+// that: on the false side every statement below is today's, to the character.
+//
+// AND IT IS RESOLVED AT BOOT RATHER THAN LAZILY ON FIRST USE, because the readers
+// are GetOrders (the hot-polled live orders grid) and GetBillForTable (every bill
+// preview and every print). A lazy probe would hang an extra statement off both of
+// those, in every process, for a question one statement at startup answers for
+// good — and it would hang it there for tenants that have not applied 043 either.
+//
+// NOT ensureLazyTable AND NOT AN ALTER. app_runtime holds DML rights only; an
+// ALTER here would be a guaranteed no-op that ensureLazyTable memoises as SUCCESS
+// (migration 026's outage), and ALTER TABLE wants ACCESS EXCLUSIVE on "PrintJobs"
+// while concurrent settles hold row locks on it — the convoy that IS the
+// 2026-08-24 standstill. 043 brings the column; this only ever looks.
+let kotNumberLinkSchemaReady = false;
+
+/**
+ * The latch, for producers that want to explain an empty list, and for tests.
+ * False means every read below returns nothing and every INSERT below is the one
+ * that shipped in 027/042 — never an error.
+ */
+export function isKotNumberLinkSchemaReady(): boolean {
+  return kotNumberLinkSchemaReady;
+}
+
+/**
+ * Set the latch at BOOT by asking the catalogue.
+ *
+ * CALLED FROM initPrintRoutingSchema, which index.ts already runs unconditionally
+ * at startup, and exported as well so it can be wired on its own. Piggy-backing is
+ * not laziness: both latches answer "which columns does "PrintJobs" have here?",
+ * they must be resolved at the same moment in boot for the same reason (before the
+ * listener, off every request path), and a latch whose only wiring lives in a file
+ * this change does not own is a feature that silently never turns on.
+ *
+ * information_schema.columns rather than `select kot_no from "PrintJobs" limit 0`
+ * (which is how the 042 probe asks): both are correct at boot, but this one is
+ * also safe to call from anywhere later, because a missing column is a missing ROW
+ * here rather than a 42703 that would poison an open transaction. Given the
+ * choice, keep the probe that can never abort its caller.
+ *
+ * It also answers the half-applied case the way we want it answered: the view only
+ * shows columns the current role has SOME privilege on, so a 043 whose grants did
+ * not land reads as "absent" now instead of as a 42501 inside a print later.
+ *
+ * NEVER THROWS. A failure means the latch stays false, which means dockets carry
+ * no stored number — exactly what every restaurant does today.
+ */
+export async function initKotNumberLinkSchema(): Promise<boolean> {
+  try {
+    const rows = await runQuery<{ column_name: string }>(
+      `select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'PrintJobs' and column_name = 'kot_no'`,
+    );
+    kotNumberLinkSchemaReady = rows.length > 0;
+  } catch (err) {
+    kotNumberLinkSchemaReady = false;
+    logger.warn({ err }, "kot_number_link_boot_probe_failed");
+  }
+  if (!kotNumberLinkSchemaReady) {
+    logger.warn(
+      "KOT number link is OFF — migration 043 is not applied here. Dockets print " +
+        "exactly as they do today; the KOT number simply is not readable back, so " +
+        "kitchen cards and the Token No. line on a bill stay empty.",
+    );
+  }
+  return kotNumberLinkSchemaReady;
+}
+
+// Test seam (jest only). Mirrors __printRoutingTestSeam: the latch's whole point
+// is the behaviour on the false side, and a test cannot reach that by luck.
+export const __kotNumberLinkTestSeam = {
+  setSchemaReady(ready: boolean): void { kotNumberLinkSchemaReady = ready; },
+  isSchemaReady(): boolean { return kotNumberLinkSchemaReady; },
+};
+
 /**
  * Persist one print job. Returns its uuid — THE identity every other guard keys
  * on (see the migration header for why bill_id cannot be that key).
@@ -29273,47 +29459,246 @@ export interface PrintJobAssignment {
  * (see printRoutingSchemaReady). That is not a lost feature: the emit still
  * goes out directed, the device still prints, and its 'printed' ack still lands
  * — AckPrintJobRouted treats a null assigned_device_id as "mine".
+ *
+ * `job.kot_no` (migration 043) degrades the same way and for a much smaller
+ * stake: when the column is absent this issues today's statement to the
+ * character, in BOTH arms, and the docket is enqueued exactly as it is today. A
+ * piece of paper the kitchen is waiting for does not get to fail because a
+ * column that only feeds a screen is missing.
  */
 export async function EnqueuePrintJob(
   resId: string,
   job: PrintJobInput,
   assign?: PrintJobAssignment | null,
 ): Promise<string> {
+  // Normalised HERE rather than trusted: 029's numbers are positive integers
+  // (kottickets_no_unique CHECK kot_no > 0), and a 0/NaN/negative reaching the
+  // column would be a fabricated KOT number on a kitchen card.
+  const kotNo = typeof job.kot_no === "number" && Number.isFinite(job.kot_no) && job.kot_no > 0
+    ? Math.round(job.kot_no)
+    : null;
+  // The latch was resolved at boot (initKotNumberLinkSchema), so this costs
+  // nothing and — the point of a latch rather than a try/catch — cannot issue a
+  // statement that would abort a caller's open transaction. False here means the
+  // INSERT below is byte-for-byte the one that shipped, in BOTH arms.
+  const withKotNo = kotNo !== null && kotNumberLinkSchemaReady;
+
   if (assign && printRoutingSchemaReady) {
+    const assignedParams = [
+      resId, job.outlet_id, job.bill_id, job.kind, job.station, job.esc_base64,
+      // Diagnostic only, and the same shape realtime.ts writes for a socket:
+      // claimed_until and assigned_device_id are the guards, not this string.
+      `device:${assign.assigned_device_id}`,
+      assign.assign_expires_at.toISOString(),
+      assign.assigned_device_id, assign.assigned_target, assign.destination_id,
+      // The lease, from the env knob and from Postgres' clock — NOT from the
+      // caller's deadline, and not from this process's clock either, so a
+      // replica whose time has drifted cannot shorten another till's guard.
+      Math.max(1, Math.round(PRINT_JOB_LEASE_MIN())),
+    ];
     const assigned = await runQuery<{ id: string }>(
-      `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64,
+      withKotNo
+        ? `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64,
+                                status, attempts, claimed_by, claimed_until, delivered_at,
+                                assigned_device_id, assigned_target, destination_id, assign_expires_at, kot_no)
+       values ($1,$2,$3,$4,$5,$6,
+               'delivered', 1, $7, now() + make_interval(mins => $12::int), now(),
+               $9::uuid, $10, $11::uuid, $8::timestamptz, $13::int)
+       returning id`
+        : `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64,
                                 status, attempts, claimed_by, claimed_until, delivered_at,
                                 assigned_device_id, assigned_target, destination_id, assign_expires_at)
        values ($1,$2,$3,$4,$5,$6,
                'delivered', 1, $7, now() + make_interval(mins => $12::int), now(),
                $9::uuid, $10, $11::uuid, $8::timestamptz)
        returning id`,
-      [
-        resId, job.outlet_id, job.bill_id, job.kind, job.station, job.esc_base64,
-        // Diagnostic only, and the same shape realtime.ts writes for a socket:
-        // claimed_until and assigned_device_id are the guards, not this string.
-        `device:${assign.assigned_device_id}`,
-        assign.assign_expires_at.toISOString(),
-        assign.assigned_device_id, assign.assigned_target, assign.destination_id,
-        // The lease, from the env knob and from Postgres' clock — NOT from the
-        // caller's deadline, and not from this process's clock either, so a
-        // replica whose time has drifted cannot shorten another till's guard.
-        Math.max(1, Math.round(PRINT_JOB_LEASE_MIN())),
-      ],
+      withKotNo ? [...assignedParams, kotNo] : assignedParams,
     );
     const assignedId = assigned[0]?.id;
     if (!assignedId) { throw new Error("PrintJobs insert returned no id"); }
     return assignedId;
   }
+  const baseParams = [resId, job.outlet_id, job.bill_id, job.kind, job.station, job.esc_base64];
   const rows = await runQuery<{ id: string }>(
-    `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64)
+    withKotNo
+      ? `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64, kot_no)
+     values ($1,$2,$3,$4,$5,$6,$7::int)
+     returning id`
+      : `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64)
      values ($1,$2,$3,$4,$5,$6)
      returning id`,
-    [resId, job.outlet_id, job.bill_id, job.kind, job.station, job.esc_base64],
+    withKotNo ? [...baseParams, kotNo] : baseParams,
   );
   const id = rows[0]?.id;
   if (!id) { throw new Error("PrintJobs insert returned no id"); }
   return id;
+}
+
+// --- reading the numbers back -------------------------------------------------
+//
+// THE CONVENTION THESE REST ON, verified against the producers rather than
+// assumed: an ORDER-scoped docket is enqueued with bill_id = `order-${order_id}`.
+// Both producers spell that literal — kot_print.ts:autoPrintOrderKot (which
+// covers placement, approval, bark and a fired course) and routes/bills.ts's
+// POST /print/kot/order/:id (the reprint), each with a comment saying they share
+// the shape ON PURPOSE so a docket and its reprint group together. "PrintJobs"
+// has no FK to "Orders" and 027 says why it never will, so this string IS the
+// join and it is stated here so a future producer can find the contract.
+//
+// WHAT IS DELIBERATELY NOT COVERED. A docket printed through the TABLE-scoped
+// path (POST /print/bill with kind:'kot') carries a table-scoped bill_id and is
+// attributable to a TABLE, not to one order — a table's running bill is the sum
+// of several orders, so there is no single order to credit. Those numbers appear
+// on nothing here; the bill's own Token No. line is where they belong, and
+// GetKotNumbersForBill takes the same order-id route for consistency rather than
+// mixing two bill_id shapes into one list.
+//
+// NEITHER FUNCTION THROWS, EVER. Both are pure display reads on hot paths —
+// GetOrders is the polled live grid and GetBillForTable runs on every bill
+// preview — and the honest answer to any failure is the answer a pre-043 tenant
+// gets anyway: no numbers. A KOT number that cannot be fetched must not be able
+// to blank an orders grid or refuse a bill.
+
+/** Everything both reads share: the id hygiene and the `order-` mapping. */
+function kotLinkBillIds(orderIds: string[]): { ids: string[]; billIds: string[] } {
+  // De-duplicated because GetOrders can hand over the same id twice across a
+  // split representation, and a duplicate would widen the `any()` array for
+  // nothing.
+  const ids = [...new Set(orderIds.map((id) => String(id ?? "").trim()).filter((id) => id.length > 0))];
+  return { ids, billIds: ids.map((id) => `order-${id}`) };
+}
+
+let kotNumberReadWarnedAt = 0;
+function warnKotNumberReadFailed(where: string, err: unknown): void {
+  const now = Date.now();
+  if (now - kotNumberReadWarnedAt < 10 * 60_000) { return; }
+  kotNumberReadWarnedAt = now;
+  logger.error(
+    { err, where },
+    "kot_number_read_failed — KOT numbers are omitted from this response. The " +
+      "orders grid and the bill render exactly as they did before migration 043.",
+  );
+}
+
+/**
+ * The KOT numbers each of these orders has had printed, keyed by order id.
+ *
+ * ORDER WITHIN EACH LIST IS ALLOCATION ORDER, and it is taken from
+ * "PrintJobs".seq rather than from the numbers themselves. seq is the bigserial
+ * 027 added because it is the ONLY total order this table has; sorting by kot_no
+ * would be the same thing on almost every day and quietly wrong on the one that
+ * matters, because 029's counter restarts at 1 each business day (a table open
+ * across midnight, or a docket reprinted the next morning, would sort tomorrow's
+ * "3" before tonight's "212").
+ *
+ * DISTINCT because one KOT is N station dockets — buildKotBase64 splits a ticket
+ * per kitchen station and every one of those rows carries the same number, which
+ * is exactly what lets the expo pair "KOT 26 / TANDOOR" with "KOT 26 / BEVERAGES".
+ * The floor wants the ticket, not the dockets.
+ *
+ * `outletId` may be null, meaning "any outlet of this tenant" — the all-outlets
+ * orders grid (isAllOutlets) genuinely spans branches. RLS still fences it to the
+ * tenant, and outside a tenant connection `current_setting('app.res_id')` is unset
+ * so this returns nothing rather than another restaurant's numbers.
+ *
+ * Returns an EMPTY MAP when 043 has not applied here, when nothing was asked for,
+ * or when the read failed. Callers must treat "absent" and "none printed" the
+ * same, because they are indistinguishable by design.
+ */
+export async function GetKotNumbersForOrders(
+  resId: string,
+  outletId: string | null,
+  orderIds: string[],
+): Promise<Map<string, number[]>> {
+  const out = new Map<string, number[]>();
+  const { billIds } = kotLinkBillIds(orderIds);
+  if (billIds.length === 0) { return out; }
+  if (!kotNumberLinkSchemaReady) { return out; }
+  try {
+    const rows = await runQuery<{ bill_id: string; kot_no: number }>(
+      // `kot_no is not null` is not just a filter — it is the predicate of
+      // printjobs_kot_link_idx (migration 043), so stating it is what lets this ride
+      // the partial index instead of scanning a table that grows by one row per
+      // docket for ever. It also implies kind='kot': nothing ever writes a number
+      // on a customer bill.
+      `select bill_id, kot_no
+         from "PrintJobs"
+        where res_id = $1
+          and ($2::uuid is null or outlet_id = $2::uuid)
+          and kot_no is not null
+          and bill_id = any($3::text[])
+        group by bill_id, kot_no
+        order by min(seq)`,
+      [resId, outletId, billIds],
+    );
+    for (const row of rows) {
+      const billId = String(row.bill_id ?? "");
+      if (!billId.startsWith("order-")) { continue; }
+      const orderId = billId.slice("order-".length);
+      const no = Number(row.kot_no);
+      if (!Number.isFinite(no) || no <= 0) { continue; }
+      const list = out.get(orderId);
+      if (list) { list.push(no); } else { out.set(orderId, [no]); }
+    }
+  } catch (err) {
+    warnKotNumberReadFailed("orders", err);
+    return new Map();
+  }
+  return out;
+}
+
+/**
+ * Every KOT number that fed one bill, in allocation order — the "Token No.: 214,
+ * 218, 236, …" line the client photographed on a real printed GAIA bill.
+ *
+ * A separate query rather than a merge of GetKotNumbersForOrders' per-order lists
+ * because the ordering key does not survive that merge: each list is ordered by
+ * its own min(seq), and concatenating them would group the numbers by order
+ * instead of by the sequence the kitchen actually saw them in. One `group by
+ * kot_no order by min(seq)` gives the single global allocation order the printed
+ * line wants, and the guest reads it as the run of tickets their table generated.
+ *
+ * DISTINCT ACROSS THE WHOLE SET, not merely within one order. A docket can be
+ * reprinted carrying its ORIGINAL number rather than a fresh one — kot_move.ts
+ * pins the number when an order changes table, deliberately, so the chef can pair
+ * the correction with the paper already on the pass — so one number legitimately
+ * owns several rows. The same Token printed twice on a guest's bill is a question
+ * nobody at the table can answer.
+ *
+ * Empty when 043 has not applied, when the table has no orders, or on failure —
+ * and an empty list must render as NO Token No. line at all, so a restaurant that
+ * has printed nothing new gets a byte-identical bill.
+ */
+export async function GetKotNumbersForBill(
+  resId: string,
+  outletId: string | null,
+  orderIds: string[],
+): Promise<number[]> {
+  const { billIds } = kotLinkBillIds(orderIds);
+  if (billIds.length === 0) { return []; }
+  if (!kotNumberLinkSchemaReady) { return []; }
+  try {
+    const rows = await runQuery<{ kot_no: number }>(
+      `select kot_no
+         from "PrintJobs"
+        where res_id = $1
+          and ($2::uuid is null or outlet_id = $2::uuid)
+          and kot_no is not null
+          and bill_id = any($3::text[])
+        group by kot_no
+        order by min(seq)`,
+      [resId, outletId, billIds],
+    );
+    const out: number[] = [];
+    for (const row of rows) {
+      const no = Number(row.kot_no);
+      if (Number.isFinite(no) && no > 0) { out.push(no); }
+    }
+    return out;
+  } catch (err) {
+    warnKotNumberReadFailed("bill", err);
+    return [];
+  }
 }
 
 /**
@@ -30576,6 +30961,15 @@ export async function initPrintRoutingSchema(): Promise<boolean> {
     printRoutingSchemaReady = false;
     warnPrintRoutingSchemaMissing("boot_probe", err);
   }
+  // Migration 043's latch rides this boot step. It asks the same question about
+  // the same table at the same moment — "which columns does "PrintJobs" have on
+  // this box?" — and it must be answered HERE, before the listener, because the
+  // alternative is a probe on the hot orders poll (see initKotNumberLinkSchema).
+  // index.ts already calls this function unconditionally; a second boot hook would
+  // have to be added in a file this change does not own, and an unwired latch is a
+  // feature that silently never turns on. It never throws, and its own failure
+  // means KOT numbers are simply not stored — which is today.
+  await initKotNumberLinkSchema();
   return printRoutingSchemaReady;
 }
 

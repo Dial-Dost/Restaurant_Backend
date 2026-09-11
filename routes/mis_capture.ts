@@ -120,6 +120,7 @@ import {
 	VoidOrderWithReason,
 	WaiveServiceCharge,
 } from "../database_supabase.js";
+import { dispatchCancellationKot } from "../kot_print.js";
 import { NON_CHARGEABLE_KINDS, SERVICE_CHARGE_WAIVER_KINDS, VOID_KINDS } from "../mis_capture.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
@@ -480,7 +481,31 @@ app.post("/orders/:id/void", validateAction(PERM_VOID_ORDER), validateBody(sVoid
 				},
 			);
 		} catch (err) { logger.warn({ err }, "log_audit void_order failed"); }
-		res.json({ void: rec, previous_status: result.previous_status });
+		// THE CANCELLATION SLIP. The void is committed — money off the bill, row at
+		// status 5, floor told — and the kitchen's docket is still on the rail.
+		// Until this printed, the only path in the system that records WHY food was
+		// cancelled was also a path that never told the kitchen it had been.
+		//
+		// `void_kind` rather than `reason` on the paper: it is a controlled
+		// vocabulary, so it is short by construction and fits a 32-column roll
+		// without truncation, and it is the half a chef can act on. The free-text
+		// reason is a control document for the auditor and lives on the
+		// "OrderVoids" row and in the audit entry above.
+		//
+		// NON-FATAL BY CONSTRUCTION: dispatchCancellationKot returns its outcome
+		// and never throws, so a dead printer cannot turn a completed void into a
+		// 400 and send a waiter round to void it a second time.
+		const cancelPrint = await dispatchCancellationKot({
+			restaurantId, orderId, where: "order_voided",
+			reason: rec.void_kind, previousStatus: result.previous_status,
+		});
+		res.json({
+			void: rec, previous_status: result.previous_status,
+			cancel_kot_printed: cancelPrint.printed,
+			cancel_kot_no: cancelPrint.kot_no,
+			cancel_kot_tickets: cancelPrint.tickets,
+			...(cancelPrint.reason ? { cancel_kot_skipped: cancelPrint.reason } : {}),
+		});
 	} catch (err) {
 		failCapture(res, err, "void_order_failed", "That order has already been voided.");
 	}

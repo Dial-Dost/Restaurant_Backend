@@ -103,6 +103,29 @@ export interface ReceiptOptions {
   customer?: string | null;
   billNo?: string | null;
   cashier?: string | null;
+  /**
+   * BILL ONLY: every KOT number that fed this bill, in allocation order —
+   * printed as "Token No.: 214, 218, 236, ..." under the Bill No./Cashier line,
+   * where the reference GAIA receipt carries it.
+   *
+   * A table's bill is the sum of SEVERAL orders, each fired on its own ticket,
+   * and the number the kitchen called each ticket by is the only handle the
+   * floor has on "which of these did we send at 8:40". Printing them on the
+   * guest's copy is what lets a query at the till be answered from the paper in
+   * the guest's hand instead of a dashboard search.
+   *
+   * PRE-RESOLVED BY THE CALLER, like every other number on this document: the
+   * renderer does not know which orders fed the bill, and it does NOT dedupe
+   * the list either — a caller that supplies the same ticket twice has a bug
+   * that must stay visible rather than be tidied away behind the printer. Only
+   * unusable values are dropped (a null, a zero, a NaN from an unapplied
+   * migration 029), which is the same rule `kotNo` obeys on the docket.
+   *
+   * Absent or empty prints NOTHING — not a bare "Token No.:" label. A
+   * restaurant whose bills have never carried tokens must see byte-identical
+   * paper.
+   */
+  kotNumbers?: number[];
   // Optional discount line (off the subtotal), shown before service charge.
   discount?: { amount: number; label?: string } | null;
   // Optional service charge line (amount + percent), shown before taxes. When
@@ -112,10 +135,45 @@ export interface ReceiptOptions {
   // Optional tax breakdown. When present, the receipt shows a Subtotal line,
   // each tax line, and a tax-inclusive TOTAL (= total + service charge + taxes).
   taxes?: ReceiptTax[];
+  /**
+   * KOT ONLY: this docket is a CANCELLATION SLIP — the ticket it names is off,
+   * and nothing on it is to be cooked.
+   *
+   * It prints "CANCELLED" in the largest type the printer has, as the first
+   * thing under the restaurant name and ABOVE the context line, because that is
+   * where a chef's eye lands on a docket pulled off a rail. Everything else on
+   * the slip is deliberately the ORDINARY docket layout — the same ticket
+   * number, the same table, the same dish names — because the whole job of this
+   * piece of paper is to be matched against the one already on the rail, and a
+   * differently-shaped document is harder to match, not easier.
+   *
+   * Absent or false prints nothing and renders byte-identically to any docket
+   * printed before this field existed.
+   */
+  cancelled?: boolean;
   kind?: "bill" | "kot";
   // KOT only: the kitchen station/zone this ticket is for. When set, it is
   // printed in the header so a per-station split ticket is self-identifying.
   station?: string | null;
+  /**
+   * THIS PAPER IS A SECOND COPY OF A DOCUMENT THAT WAS ALREADY PRINTED.
+   *
+   * A reprint is indistinguishable from an original once it is off the roll,
+   * and that is the whole problem: a reprinted docket that looks like a fresh
+   * one gets cooked a second time, and a reprinted bill that looks like an
+   * original gets paid a second time or filed as a second sale. So a reprint
+   * says so, in the largest type the printer has, at the very top of the paper
+   * — before the logo, because "at the top" of a bill with a tall raster logo
+   * is not "below the logo".
+   *
+   * On a KOT it additionally enlarges the dish name (see `dishName` in the item
+   * block). The other two things A7 asks to enlarge — the table number and the
+   * KOT id — are ALREADY the biggest type on every docket, reprint or not.
+   *
+   * Absent/false renders exactly what this renderer rendered before the flag
+   * existed, down to the byte.
+   */
+  reprint?: boolean;
 
   // --- KOT header (all optional; each line is omitted when unknown) ---------
   //
@@ -342,6 +400,19 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
 
   // --- Header (centered): logo, restaurant name, address ---------------------
   raw(ESC, 0x61, 0x01); // center
+  // THE FIRST THING ON A REPRINTED ROLL IS THAT IT IS A REPRINT.
+  //
+  // Above the logo, not under it: a bill carrying a tall raster logo would
+  // otherwise put the word several centimetres down a slip that gets glanced at
+  // and put in a till drawer. Thirteen characters survive double width on 58mm
+  // paper (26 of 32 cells), so it prints at full size on both rolls rather than
+  // degrading through `big`'s fallback.
+  //
+  // It goes on the kitchen docket too, for the harder version of the same
+  // failure: an unmarked second copy of a ticket is cooked twice.
+  if (opts.reprint) {
+    big("** REPRINT **", width);
+  }
   if (opts.logo && opts.logo.length > 0) {
     parts.push(opts.logo);
     line();
@@ -364,6 +435,20 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     raw(ESC, 0x21, 0x00); // normal
   }
   if (isKot) {
+    // THE CANCELLATION BANNER GOES FIRST, ABOVE EVERYTHING ELSE ON THE TICKET.
+    //
+    // A cancellation slip's entire job is to stop food being cooked, and it is
+    // read in the same second and the same posture as forty ordinary dockets.
+    // Anything below the context line is already too late: by then a chef has
+    // read "Running Table 12" and started matching dishes. So the word is the
+    // first thing under the restaurant name, in the biggest type the printer
+    // has, and `big()` degrades it to normal width rather than letting it wrap
+    // on a 58mm roll.
+    if (opts.cancelled === true) {
+      big("** CANCELLED **", width);
+      line("DO NOT COOK — THIS TICKET IS OFF");
+      line(sep);
+    }
     // Context first, then the ticket's own identity — the order the reference
     // thermal KOT prints them in, and the order a chef reads them in: what kind
     // of order this is, which ticket it is, when it was fired, and which station
@@ -460,6 +545,20 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     } else if (cashier) {
       line(`Cashier: ${cashier}`);
     }
+    // EVERY KOT NUMBER THAT FED THIS BILL — see `kotNumbers` for why the guest's
+    // copy carries them and why the renderer neither derives nor dedupes them.
+    //
+    // Wrapped, because the real receipt this mirrors listed NINE tokens: "Token
+    // No.: 214, 218, 236, 241, 242, 257, 272, 277, 298" is 56 characters, which
+    // is over even the wide roll and nearly twice the narrow one. wrapText
+    // breaks on the spaces that already follow each comma, so a wrapped list
+    // never splits a number in half.
+    const tokens = (opts.kotNumbers ?? [])
+      .map((n) => Math.round(Number(n)))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (tokens.length > 0) {
+      for (const l of wrapText(`Token No.: ${tokens.join(", ")}`, width)) {line(l);}
+    }
   }
   line(sep);
 
@@ -500,6 +599,45 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     const padL = (s: string, n: number) => s.length >= n ? s : " ".repeat(n - s.length) + s;
 
     /**
+     * ON A REPRINT THE DISH NAME IS ENLARGED AS WELL AS BOLD (A7).
+     *
+     * A7 asks for three things to be larger and bold on a reprint — the table
+     * number, the dish name and the KOT id — and two of them ALREADY ARE on
+     * every docket: `big()` prints "KOT - n" and "Table No: n" at double width
+     * AND height at the top of the ticket, reprint or not. Enlarging them again
+     * is not a thing the printer can do. So only the dish name changes here.
+     *
+     * Double WIDTH, never height, for the reason the quantity gives below:
+     * double height re-pitches every row and doubles the length of a
+     * fifteen-item docket. And the name is re-wrapped against HALF the item
+     * column, because a doubled character eats two cells — a 21-character name
+     * on 58mm paper is 42 cells of a 32-cell roll, i.e. the printer wrapping it
+     * mid-word, which is the failure every width guard in this file exists to
+     * stop.
+     */
+    const wideName = opts.reprint === true;
+
+    /**
+     * THE DISH NAME, BOLD (A4).
+     *
+     * It was the only thing on the row set in ordinary type: the line number,
+     * the quantity and the two headings all carried weight, and the words the
+     * chef is actually cooking from did not. Bold costs no cells and no paper —
+     * a bold character is the same width — so the row keeps its exact layout and
+     * every column assertion in the tests still measures the same numbers.
+     *
+     * The leaders are deliberately left OUTSIDE this run: a bold dot leader
+     * reads as part of the name rather than as the gap it is bridging.
+     */
+    const dishName = (s: string) => {
+      raw(ESC, 0x45, 0x01);                  // bold
+      if (wideName) {raw(ESC, 0x21, 0x20);}  // double width (reprints only)
+      text(s);
+      if (wideName) {raw(ESC, 0x21, 0x00);}
+      raw(ESC, 0x45, 0x00);
+    };
+
+    /**
      * One item row.
      *
      * THE QUANTITY IS THE POINT OF THIS FUNCTION. It used to be a bare digit set
@@ -520,8 +658,17 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
      *                  when the name wraps, because a leader run that ends where
      *                  the name continues below reads as the end of the name.
      */
-    const itemRow = (no: string, it: ReceiptItem, qty: number) => {
-      const nameLines = wrapText(itemLabel(it), COL_ITEM - 1);
+    const itemRow = (no: string, it: ReceiptItem, qty: number, suffix = "") => {
+      // `suffix` is the word that must follow the dish name — today only "hold"
+      // (see the hold block below). It rides on the LAST line of the name, and
+      // the name is wrapped against a column shortened by its length, so the
+      // word sits immediately after the dish it qualifies even when the name
+      // wraps, and can never be pushed off the end of the row.
+      const tail = suffix ? ` ${suffix}` : "";
+      const nameW = Math.max(4, wideName
+        ? Math.floor((COL_ITEM - 1 - tail.length) / 2)
+        : COL_ITEM - 1 - tail.length);
+      const nameLines = wrapText(itemLabel(it), nameW);
       const first = nameLines[0] ?? "";
       const q = `x${qty}`;
       const double = q.length * 2 <= COL_QTY;
@@ -529,12 +676,19 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       // way UP TO IT, so the row is anchored end to end. Measured in CELLS: a
       // double-width "x12" eats six of them, not three, and leaders that stopped
       // at a fixed column would leave a gap exactly where the eye is travelling.
+      // The NAME is measured in cells for the same reason — on a reprint it is
+      // double width too, and a character count would run the row off the roll.
       const runway = COL_ITEM + COL_QTY - q.length * (double ? 2 : 1);
-      const gap = runway - first.length;
-      const itemCell = nameLines.length === 1 && gap >= 4
-        ? `${first} ${".".repeat(gap - 2)} `
-        : pad(first, runway);
-      text(pad(no, COL_NO) + itemCell);
+      const single = nameLines.length === 1;
+      const headCells = first.length * (wideName ? 2 : 1) + (single ? tail.length : 0);
+      const gap = runway - headCells;
+      const leaders = single && gap >= 4
+        ? ` ${".".repeat(gap - 2)} `
+        : " ".repeat(Math.max(0, gap));
+      text(pad(no, COL_NO));
+      dishName(first);
+      if (single && tail) {text(tail);}
+      text(leaders);
       raw(ESC, 0x45, 0x01);               // bold
       if (double) {raw(ESC, 0x21, 0x20);} // double width (NOT height)
       text(q);
@@ -543,8 +697,16 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       line();
       // Continuations and notes hang under the ITEM column, so the No. and Qty
       // columns stay a clean vertical run down the docket.
-      for (let i = 1; i < nameLines.length; i++) {line(" ".repeat(COL_NO) + (nameLines[i] ?? ""));}
-      // The one thing on a KOT that is more important than the dish name.
+      for (let i = 1; i < nameLines.length; i++) {
+        text(" ".repeat(COL_NO));
+        dishName(nameLines[i] ?? "");
+        if (tail && i === nameLines.length - 1) {text(tail);}
+        line();
+      }
+      // The one thing on a KOT that is more important than the dish name. Left
+      // in body text on purpose: it is already set apart by its "*" and its
+      // indent, and a docket on which everything is emphasised emphasises
+      // nothing.
       const note = String(it.note ?? "").trim();
       if (note) {
         for (const l of wrapText(`* ${note}`, COL_ITEM - 1)) {line(" ".repeat(COL_NO) + l);}
@@ -566,6 +728,21 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
      * total counts only those lines. Everything below the banner is not yours
      * yet. Held lines keep their own H-numbering so the pass can still call one
      * out ("fire H2") without colliding with the cook-now numbers.
+     *
+     * AND EACH HELD LINE ALSO READS "Gulab Jamun hold" — DELIBERATELY BOTH.
+     *
+     * The client asked for exactly one thing: "when an item is placed on hold,
+     * the dish name must appear first, followed by the word hold". Read
+     * literally that is a marker beside the name, which is precisely the
+     * treatment this block exists because it is NOT enough — a line that has to
+     * be read to be excluded gets cooked. Read as a replacement it would undo
+     * the fix. So the word is printed where they asked for it, ON the line,
+     * after the dish, INSIDE the banner that keeps the line out of the cook-now
+     * list: the wording the client wants and the separation the kitchen needs,
+     * neither standing in for the other.
+     *
+     * Lower case and unemphasised, unlike the banner above it, because it is a
+     * confirmation of what the block already says rather than a second alarm.
      */
     const fire: ReceiptItem[] = [];
     const held: ReceiptItem[] = [];
@@ -601,7 +778,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       for (const [idx, it] of held.entries()) {
         const qty = qtyOf(it);
         heldQty += qty;
-        itemRow(`H${idx + 1}`, it, qty);
+        itemRow(`H${idx + 1}`, it, qty, "hold");
       }
       line(sep);
       line(twoCol("Hold Qty", String(heldQty), width));

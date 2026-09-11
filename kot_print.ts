@@ -16,6 +16,10 @@
  *      which prints the added line and nothing else;
  *   4. someone asks for a docket again because the printer jammed
  *      (POST /print/kot/order/:id).
+ *   5. food STOPS being cooked — an order or a line is cancelled, voided or
+ *      deleted. dispatchCancellationKot at the foot of this file, and it is the
+ *      one docket here that never mints a number: it names the ticket already on
+ *      the rail. See its own header for why that distinction is the whole design.
  *
  * WHY 2 IS FOUR EVENTS AND NOT ONE. "Print when the order is placed" is what the
  * restaurant asked for and what happens for essentially every order — but an
@@ -42,7 +46,7 @@
  * reprint. Nothing in this file invents a number.
  */
 
-import { buildKotBase64 } from "./escpos.js";
+import { buildKotBase64, type ReceiptOptions } from "./escpos.js";
 import { allocateKotNumber, kotOrderContext, kotStamp, kotTicketKey, serviceModeLabel } from "./kot_numbers.js";
 import { logger } from "./observability.js";
 import { dispatchPrintJob } from "./print_routing.js";
@@ -52,8 +56,32 @@ import {
   GetRestaurantProfile,
   GetRestaurantSettings,
   GetTableFeedbackContext,
+  LookupKotNumber,
   dayKeyOf,
 } from "./database_supabase.js";
+
+/**
+ * The renderer's options, plus the one field the CANCELLATION slip needs.
+ *
+ * WHY AN INTERSECTION RATHER THAN JUST PASSING THE FIELD. `cancelled` belongs in
+ * ReceiptOptions and escpos.ts is adding it there — it is the renderer's job to
+ * decide how big the word "CANCELLED" is and where on the paper it sits, and
+ * this file must not grow a second opinion about layout. But escpos.ts is
+ * another lane's file, so until that lands a bare `cancelled: true` in the
+ * literal below would be an excess property and this file would not compile.
+ *
+ * The intersection makes the two lanes independent in BOTH directions: it
+ * compiles today against a ReceiptOptions that has no such field, and the day
+ * the field appears the intersection is simply redundant and everything keeps
+ * working — no coordinated merge, no window in which either lane is broken.
+ * Delete the `& { … }` once the field is in ReceiptOptions.
+ *
+ * WHAT HAPPENS IF THE RENDERER SIDE NEVER LANDS: the flag is ignored and the
+ * slip prints as an ordinary-looking docket carrying the "*** CANCELLED ***"
+ * context line built below. That is the reason the word is ALSO on the context
+ * line and not only in the banner — see cancellationBanner.
+ */
+type KotRenderOptions = ReceiptOptions & { cancelled?: boolean };
 
 /** One line as the kitchen needs it. Prices are accepted and never printed. */
 export interface KotLine {
@@ -188,6 +216,32 @@ export interface KotDispatchInput {
    * Null or absent = allocate normally, which is every other caller.
    */
   pinnedKotNo?: number | null;
+  /**
+   * Refuse to MINT a number. With no `pinnedKotNo` the docket prints unnumbered.
+   *
+   * THE ONE CALLER is the cancellation slip (dispatchCancellationKot), and the
+   * reason it needs a flag of its own rather than relying on pinnedKotNo is that
+   * its number may legitimately be UNRESOLVABLE. `pinnedKotNo: null` alone falls
+   * through to allocateKotNumber below, which would burn a fresh gapless number
+   * on a piece of paper whose entire job is to cancel a DIFFERENT one — leaving
+   * a hole in the sequence the kitchen counts by and printing a number that
+   * names no ticket on the rail.
+   *
+   * Absent on every other caller, so every other docket allocates exactly as it
+   * always has.
+   */
+  neverAllocate?: boolean;
+  /**
+   * This docket CANCELS food rather than ordering it.
+   *
+   * Passed straight to the renderer, which prints "CANCELLED" in the biggest
+   * type it has at the top of the ticket. Nothing else about the dispatch
+   * changes: same station split, same "kot" kind, same router — the slip has to
+   * reach the kitchen that is cooking the food, not the bill printer.
+   *
+   * Absent (the default) on every ordinary docket, so their bytes are untouched.
+   */
+  cancelled?: boolean;
   /**
    * Overrides the line at the very top of the docket (normally "Running Table"
    * or the delivery channel - see kotOrderContext). Used to say, in the first
@@ -419,7 +473,11 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
   const pinned = typeof input.pinnedKotNo === "number" && Number.isFinite(input.pinnedKotNo) && input.pinnedKotNo > 0
     ? { kot_no: Math.round(input.pinnedKotNo), business_day: businessDay, reused: true }
     : null;
-  const kot = pinned ?? (input.tableId
+  // NEVER-ALLOCATE short-circuits the same way a pin does, and for the inverse
+  // reason: the caller knows there is nothing it is entitled to mint. Ordered
+  // after `pinned` so a caller that supplies both still prints the number it
+  // resolved — "do not mint" and "here is the number" are not in conflict.
+  const kot = pinned ?? (input.tableId && !input.neverAllocate
     ? await allocateKotNumber(
       input.restaurantId,
       buildKotTicketKey({ outletId: input.outletId, tableId: input.tableId, items: input.items, firedAt, tz, scope: input.scope ?? null }),
@@ -445,7 +503,11 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     };
   }
 
-  const tickets = buildKotBase64({
+  // Named and annotated rather than passed inline ONLY so `cancelled` can ride
+  // along before ReceiptOptions declares it — see KotRenderOptions. Every field
+  // below is the one that was passed before, in the same order, so an ordinary
+  // docket renders the same bytes it always did.
+  const renderOptions: KotRenderOptions = {
     restaurantName: input.restaurantName || "Receipt",
     table: input.tableName,
     covers: input.covers,
@@ -461,7 +523,12 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     assignedTo: input.assignedTo,
     captain: input.captain,
     orderNote: input.orderNote ?? null,
-  }, input.cols);
+    // Set ONLY on a cancellation slip. Spread-conditional rather than
+    // `cancelled: false` so an ordinary docket's options object is byte-for-byte
+    // the object it was before this field existed.
+    ...(input.cancelled ? { cancelled: true } : {}),
+  };
+  const tickets = buildKotBase64(renderOptions, input.cols);
 
   // PERSIST-THEN-EMIT, VIA THE ROUTER. dispatchPrintJob does exactly what the
   // enqueue+emit pair here used to do — same order, same payload — and adds one
@@ -484,6 +551,18 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
   for (const t of tickets) {
     const dispatched = await dispatchPrintJob(input.restaurantId, {
       outlet_id: input.outletId, bill_id: input.billId, kind: "kot", station: t.station, esc_base64: t.escBase64,
+      // THE ONE LINE THAT MAKES MIGRATION 043 DO ANYTHING. Without it the column
+      // exists, every read returns empty, and no KOT number reaches a kitchen
+      // card, an order row or a bill's Token No. line — the whole point of the
+      // link, silently absent.
+      //
+      // DIAGNOSTIC, NEVER A SOURCE. `kot` is the number this ticket was ALREADY
+      // allocated a few lines above; this copies it onto the print job so a
+      // docket can be found again by the number the kitchen calls it by. It is
+      // never read back to decide what to print, and EnqueuePrintJob normalises
+      // it at the door, so a null here is simply an unnumbered job — which is
+      // exactly what a docket printed while migration 029 is unapplied is.
+      kot_no: kot?.kot_no ?? null,
     });
     jobIds.push(dispatched.jobId);
     devices.push(dispatched.assignedDeviceId);
@@ -668,6 +747,286 @@ export async function autoPrintOrderKot(opts: {
     // Loud, because a kitchen that stops getting dockets has to be findable
     // in the logs — but never fatal to the order that already exists.
     logger.error({ err, orderId, restaurantId, where: opts.where }, "order_auto_print_failed");
+    return { printed: false, kot_no: null, tickets: 0, reason: "print_failed" };
+  }
+}
+
+// --- the cancellation slip ---------------------------------------------------
+
+/**
+ * WHAT THE KITCHEN SEES WHEN FOOD STOPS BEING COOKED.
+ *
+ * THE FAILURE MODE THIS CLOSES
+ * ----------------------------
+ * Cancelling is instant and complete on every screen: the KDS card goes, the
+ * table clears, the bill drops the money. PAPER DOES NOT RE-RENDER. The docket
+ * the kitchen is cooking from is still on the rail and nothing that happens in
+ * the database will ever take it off, so the dish is cooked, plated and called —
+ * for a table that is not expecting it, or has already left. The restaurant eats
+ * the cost, and the waiter who cancelled believes they stopped it.
+ *
+ * It is the same screens-and-paper disagreement kot_move.ts exists for, with a
+ * worse ending: a move sends food to the wrong table, where somebody at least
+ * notices; a cancel sends food nowhere at all.
+ *
+ * IT MUST NOT ALLOCATE A KOT NUMBER, AND THAT IS THE DESIGN CONSTRAINT
+ * -------------------------------------------------------------------
+ * allocateKotNumber is GAPLESS per outlet-day and the kitchen counts tickets by
+ * it. Minting a number for a slip that cancels a ticket would do two wrong
+ * things at once: put an entry in the day's sequence for a docket nobody ordered
+ * (214, 215, 216-is-a-cancellation, 217 — and the pass now believes 216 is
+ * food), and print a number that names no ticket on the rail, which is exactly
+ * the number a chef would go looking for. So the number is RESOLVED, by a pure
+ * read of migration 029's memo (LookupKotNumber), and pinned; where it cannot be
+ * resolved the slip prints with NO number, which is honest, rather than with the
+ * next one, which is a lie about an existing ticket. `pinnedKotNo` alone is not
+ * enough to guarantee that — a null pin falls through to allocation — hence
+ * `neverAllocate`.
+ *
+ * WHY A PENDING ORDER PRINTS NOTHING
+ * ----------------------------------
+ * autoPrintOrderKot refuses to print an order still awaiting approval, because
+ * paper on the pass IS the kitchen being told and the approval gate exists so
+ * the kitchen is not committed to food nobody approved. An order cancelled while
+ * still Pending was therefore NEVER on the rail, and a slip cancelling a docket
+ * that does not exist is not a correction — it is a piece of paper about an
+ * order the kitchen has never heard of, which is the one thing more confusing
+ * than no paper at all. Every OTHER state prints, numbered when the number is
+ * resolvable and unnumbered when it is not.
+ *
+ * WHY IT CARRIES NO ORDER NOTE
+ * ----------------------------
+ * An ordinary docket carries "Orders".food.note because it tells the kitchen how
+ * to cook the food. This one tells them not to. Reprinting the allergy under a
+ * CANCELLED banner is at best noise and at worst read as an instruction.
+ *
+ * NOTHING HERE MAY THROW AT THE CALLER
+ * ------------------------------------
+ * By the time this runs the cancellation is COMMITTED — the money is off the
+ * bill, the row says Cancelled, the floor has been told. A printer that is
+ * unreachable, a menu that will not load or an unapplied migration must not turn
+ * a completed void into a failed request, because the alternative is a waiter
+ * told the cancel failed while the order is already gone, who then cancels it
+ * again. Same contract as autoPrintOrderKot: the outcome is returned and
+ * reported, never raised.
+ */
+
+/** The order facts a slip needs, exactly as GetOrderKotContext hands them over. */
+export type OrderKotContext = NonNullable<Awaited<ReturnType<typeof GetOrderKotContext>>>;
+
+export interface CancellationKotOutcome {
+  /** True when a slip was built and queued by this call. */
+  printed: boolean;
+  /** The number of the ticket being cancelled, when it could be resolved. */
+  kot_no: number | null;
+  /** How many station slips the cancellation became. */
+  tickets: number;
+  /** Why nothing printed. Absent when something did. */
+  reason?: string;
+}
+
+/**
+ * The line at the very top of the slip.
+ *
+ * THE WORD IS NO LONGER PRINTED TWICE, and the reason it briefly was is worth
+ * keeping. This line used to read "*** CANCELLED - <REASON> ***" because
+ * ReceiptOptions.cancelled did not exist yet: the two halves were built in
+ * different lanes, and a slip that failed to say CANCELLED is a docket the
+ * kitchen cooks from, so saying it twice was the cheap side of that trade while
+ * the banner was in doubt. The banner has landed, in the biggest type the
+ * printer has, above everything else on the ticket — so this line carries the
+ * REASON alone. Two shouts compete; one shout and one explanation do not.
+ *
+ * If the banner is ever removed, restore the word here in the same commit.
+ *
+ * TRUNCATED TO THE PAPER, because the renderer prints the context line verbatim
+ * and a thermal printer hard-wraps an over-wide line mid-word — turning the one
+ * line that has to be unmissable into two ragged halves. The full reason is on
+ * the "OrderVoids" row and in the audit log; the slip only has to tell the pass
+ * enough to stop cooking.
+ */
+function cancellationBanner(reason: string | null | undefined, cols: number): string {
+  const detail = (reason ?? "").trim().replace(/[_\s]+/g, " ").toUpperCase();
+  // No reason given: the banner above has already said everything there is to
+  // say, so this line is omitted rather than printed empty or restated.
+  if (!detail) {return "";}
+  const room = cols - "*** REASON:  ***".length;
+  if (room < 4) {return "";}
+  return `*** REASON: ${detail.length > room ? `${detail.slice(0, room - 1)}…` : detail} ***`;
+}
+
+/**
+ * The number already on the paper this slip cancels, or null.
+ *
+ * A PURE READ, ALWAYS. Every candidate goes through LookupKotNumber, which does
+ * not mint — see its header, and see the constraint at the top of this section.
+ *
+ * TWO CANDIDATE KEYS, TRIED IN ORDER OF PRECISION:
+ *
+ *   1. THE ADDED-LINE TICKET. POST /orders/:id/items dispatches a docket for the
+ *      one line it added, keyed with that line's id as `scope`. So a line
+ *      cancelled by DELETE /orders/:id/items/:itemId is looked up under exactly
+ *      that key first — it is the ticket the kitchen is actually holding for it.
+ *
+ *   2. THE WHOLE-ORDER TICKET, keyed over the order's full item set with no
+ *      scope: the docket autoPrintOrderKot printed at placement or approval.
+ *
+ * WHY EITHER CAN MISS, AND WHY A MISS IS NOT AN ERROR. The ticket key is a
+ * fingerprint of the item SET, so an order that has been edited since it printed
+ * (a line added, a quantity changed) no longer hashes to the key its docket was
+ * minted under. There is no column joining a KOT number back to an order, so
+ * there is nothing else to ask. The slip then prints unnumbered — which still
+ * names the table and the dishes, and is what the requirement asks for.
+ *
+ * WHEN "PrintJobs".kot_no LANDS, this is where it goes: the jobs for this order
+ * are already grouped under bill_id `order-<id>`, so the distinct kot_no across
+ * them is a direct, edit-proof answer and becomes candidate 0. Nothing else in
+ * this function needs to change.
+ */
+async function resolveCancelledKotNumber(
+  restaurantId: string,
+  order: OrderKotContext,
+  opts: { cancelledLines: KotLine[]; itemId?: string | null; firedAt: Date; tz: string },
+): Promise<number | null> {
+  if (!order.table_id) {return null;}
+  const itemId = (opts.itemId ?? "").trim();
+  const candidates: { items: KotLine[]; scope: string | null }[] = [];
+  if (itemId) {candidates.push({ items: opts.cancelledLines, scope: itemId });}
+  candidates.push({ items: order.items, scope: null });
+
+  for (const candidate of candidates) {
+    if (candidate.items.length === 0) {continue;}
+    const key = buildKotTicketKey({
+      outletId: order.outlet_id,
+      tableId: order.table_id,
+      items: candidate.items,
+      firedAt: opts.firedAt,
+      tz: opts.tz,
+      scope: candidate.scope,
+    });
+    // Numbering unreadable (migration 029 unapplied, or its grants missing) is
+    // "cannot tell", not "no ticket" — and it degrades to the same unnumbered
+    // slip a miss does, so one warn covers both without failing the print.
+    const hit = await LookupKotNumber(restaurantId, key, opts.firedAt).catch((err: unknown) => {
+      logger.warn({ err, orderId: order.order_id }, "cancellation_kot_number_lookup_failed");
+      return null;
+    });
+    if (hit) {return hit.kot_no;}
+  }
+  return null;
+}
+
+/**
+ * Put a CANCELLED slip on the pass for an order, or for one of its lines.
+ *
+ * `order` may be supplied by the caller, and for DELETE /orders/:id it MUST be:
+ * that route destroys the row, so the only moment its items, table and covers
+ * can be read is before the delete. Every other caller can leave it out and the
+ * order is re-read here.
+ *
+ * `only` + `itemId` narrow the slip to a single cancelled line. Omit both and
+ * the slip covers the whole order.
+ */
+export async function dispatchCancellationKot(opts: {
+  restaurantId: string;
+  orderId: string;
+  /** Names the trigger in the log line: "order_cancelled", "order_voided", … */
+  where: string;
+  /** Pre-read order facts, for a caller whose write destroys or edits them. */
+  order?: OrderKotContext | null;
+  /** Cancel only these lines. Absent = the order's whole item set. */
+  only?: KotLine[];
+  /** The cancelled line's id, for an item-scoped slip. See resolveCancelledKotNumber. */
+  itemId?: string | null;
+  /** Why, when the path that cancelled recorded one. Printed on the banner. */
+  reason?: string | null;
+  /**
+   * The order's status BEFORE the cancel, where the caller knows it. "Pending"
+   * suppresses the slip — see the approval-gate note above. A caller that passes
+   * a pre-read `order` does not need it: its awaiting_approval says the same
+   * thing.
+   */
+  previousStatus?: string | null;
+}): Promise<CancellationKotOutcome> {
+  const { restaurantId, orderId } = opts;
+  try {
+    const settings = await GetRestaurantSettings(restaurantId);
+    // The same switch that governs every automatic docket (migration 040). A
+    // restaurant that calls its orders verbally and prints on demand has no
+    // paper on the pass to cancel.
+    if (settings.kot_auto_print === false) {return { printed: false, kot_no: null, tickets: 0, reason: "disabled" };}
+
+    const order = opts.order ?? await GetOrderKotContext(restaurantId, orderId);
+    if (!order) {return { printed: false, kot_no: null, tickets: 0, reason: "order_not_found" };}
+    if (!order.outlet_id) {return { printed: false, kot_no: null, tickets: 0, reason: "no_outlet" };}
+    // THE APPROVAL GATE, READ BACKWARDS. Never ticketed means nothing to cancel.
+    // Both readings are needed: a pre-read context still carries status 8, while
+    // a route that has already flipped the row to Cancelled can only report what
+    // the status USED to be.
+    const wasPending = order.awaiting_approval
+      || (opts.previousStatus ?? "").trim().toLowerCase() === "pending";
+    if (wasPending) {return { printed: false, kot_no: null, tickets: 0, reason: "never_ticketed" };}
+
+    const cancelledLines = opts.only ?? order.items;
+    // Nothing came off the pass, so there is nothing to say. An empty CANCELLED
+    // slip is a docket the kitchen cannot act on.
+    if (cancelledLines.length === 0) {return { printed: false, kot_no: null, tickets: 0, reason: "no_items" };}
+
+    const tz = settings.timezone || "Asia/Kolkata";
+    const cols = settings.bill_paper_width === "58mm" ? 32 : 48;
+    const firedAt = new Date();
+    const kotNo = await resolveCancelledKotNumber(restaurantId, order, {
+      cancelledLines, itemId: opts.itemId ?? null, firedAt, tz,
+    });
+
+    const [profile, waiterCtx] = await Promise.all([
+      GetRestaurantProfile(restaurantId).catch(() => null),
+      order.table_name ? GetTableFeedbackContext(restaurantId, order.table_name).catch(() => null) : Promise.resolve(null),
+    ]);
+    const waiterName = (waiterCtx?.employee_name ?? "").trim();
+    const waiterRole = (waiterCtx?.employee_role ?? "").trim().toLowerCase();
+
+    const dispatched = await dispatchKot({
+      restaurantId,
+      outletId: order.outlet_id,
+      tableName: order.table_name,
+      tableId: order.table_id,
+      section: order.section,
+      covers: order.covers,
+      isVirtual: order.is_virtual,
+      orderType: order.order_type,
+      // The cancelled lines, and their stations. Routing by station is what
+      // sends the slip to the kitchen that is cooking the food rather than to
+      // the bill printer — cancelling a cocktail has to reach the bar.
+      items: cancelledLines,
+      assignedTo: waiterName || null,
+      captain: waiterName && (waiterRole === "captain" || waiterRole === "manager") ? waiterName : null,
+      // Deliberately not carried. See "WHY IT CARRIES NO ORDER NOTE" above.
+      orderNote: null,
+      // Grouped with the order's other print jobs, so the slip and the docket it
+      // cancels sit together in "PrintJobs".
+      billId: `order-${order.order_id}`,
+      restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+      currency: settings.currency ?? "₹",
+      cols,
+      tz,
+      firedAt,
+      // Resolved, never minted — and null is a legitimate answer that must NOT
+      // fall through to allocation. Both halves of that are load-bearing.
+      pinnedKotNo: kotNo,
+      neverAllocate: true,
+      cancelled: true,
+      contextLine: cancellationBanner(opts.reason, cols),
+      // Never suppressed. This is by definition a docket whose content "has
+      // already been ticketed today" — that is the reason it is printing.
+      skipIfTicketed: false,
+    });
+    logKotDispatched(opts.where, dispatched, { resId: restaurantId, outletId: order.outlet_id, orderId, cancelled: true });
+    return { printed: dispatched.tickets > 0, kot_no: kotNo, tickets: dispatched.tickets };
+  } catch (err) {
+    // Loud, because a kitchen that keeps cooking cancelled food has to be
+    // findable in the logs — but never fatal to a void that already committed.
+    logger.error({ err, orderId, restaurantId, where: opts.where }, "cancellation_print_failed");
     return { printed: false, kot_no: null, tickets: 0, reason: "print_failed" };
   }
 }

@@ -109,7 +109,7 @@ function freshStore(): Store {
  * the honest replacement: it records what the queue was actually told, one layer
  * below where the old recorder sat, and it cannot drift out of the path again.
  */
-export const printJobRows: { outlet_id: string; bill_id: string; kind: string; station: string | null; esc_base64: string }[] = [];
+export const printJobRows: { outlet_id: string; bill_id: string; kind: string; station: string | null; esc_base64: string; kot_no: number | null }[] = [];
 
 export function resetStore(): void {
   printJobRows.length = 0;
@@ -339,12 +339,19 @@ async function query(connId: number, sqlRaw: string, params: unknown[] = []): Pr
   // handed, and the queue's own statements are driven for real by
   // print_jobs.test.ts and print_routing.test.ts over their own fixtures.
   if (s.startsWith('insert into "printjobs"')) {
+    // kot_no is the LAST parameter and only present on the migrated arm — see
+    // EnqueuePrintJob, which issues today's exact statement when the column is
+    // absent. Read positionally off the statement rather than assumed, so the
+    // fixture cannot claim a number the INSERT never carried.
+    const kotIdx = s.includes("kot_no") ? params.length - 1 : -1;
+    const kotRaw = kotIdx >= 0 ? params[kotIdx] : null;
     printJobRows.push({
       outlet_id: str(params[1]),
       bill_id: str(params[2]),
       kind: str(params[3]),
       station: params[4] === null || params[4] === undefined ? null : str(params[4]),
       esc_base64: str(params[5]),
+      kot_no: kotRaw === null || kotRaw === undefined ? null : Number(kotRaw),
     });
     return { rows: [{ id: `job-${String(printJobRows.length)}` }] };
   }
