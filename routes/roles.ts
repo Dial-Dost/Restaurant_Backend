@@ -1,10 +1,69 @@
 /**
  * Roles, actions and role assignment (the RBAC surface).
+ *
+ * ============================================================================
+ * C5 / C6 — WHO MAY SEE AND EDIT ROLES, AND WHY CORE ROLES WERE UNCLICKABLE
+ * ============================================================================
+ *
+ * C6 ASKS FOR "the issue preventing users from clicking and viewing core roles"
+ * TO BE FIXED. There were two, and neither was a broken click handler:
+ *
+ *   1. THE LIST WAS EMPTY, so there was nothing to click. GET /core-roles is
+ *      gated on "Get Roles" (17ba6407…), and until now NO core role held that id
+ *      — only an admin, via the "*" wildcard, could load it. Every other
+ *      identity got a 403, the dashboard's `catch` set `coreRoles` to `[]`, and
+ *      the card rendered "No core roles available". A manager opening the
+ *      access-control screen saw a screen with no roles on it and no error. The
+ *      fix is in CORE_ROLES (database_supabase.ts): the core `manager` now holds
+ *      Get Roles, Get Actions and Create/Update Role, which is also exactly what
+ *      C5 asks for — "Super Admins and Managers can view and edit custom roles".
+ *
+ *   2. WHAT CAME BACK WAS UNREADABLE EVEN WHEN IT LOADED. The response was
+ *      `{ role, actions: ["4ad474d4-…", "98b10bde-…"] }` — bare uuids. To render
+ *      a core role a client had to fetch GET /actions and join, and /actions is
+ *      gated on a DIFFERENT permission (2b6f7948…). Any caller holding one and
+ *      not the other opened a core role and was shown a column of uuids, which
+ *      is "viewing" a role in the same sense that a hex dump is reading a
+ *      photograph. So each row now carries `permissions`: the same list, in the
+ *      same order, with the name, description and group already attached. One
+ *      call renders a readable core role.
+ *
+ * `actions` IS UNCHANGED AND STILL FIRST. The shipped dashboard reads
+ * `r.actions` as an array of strings; turning it into objects would break it on
+ * the next deploy. `permissions` is strictly additive beside it.
  */
 import type { Express, Request, Response } from "express";
 import { AssignRoleToEmployee, Audit_log_category, CORE_ROLES, CreateRole, DeleteRole, GetActions, GetEmployeeIdsWithRole, GetRoles, RemoveRoleFromEmployee, readEmployeeRolesForUndo } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { callerIsAdmin, callerIsSuperadmin, extractRestaurantId, isAdminRoleName, isPrivilegedRoleName, log_audit, revokeEmployeeSessions, validateAction } from "./_shared.js";
+
+/** One permission as a role screen needs to render it. `action_name` is null for an id with no "Actions" row. */
+interface RolePermissionView {
+	id: string;
+	action_name: string | null;
+	action_desc: string | null;
+	group: string | null;
+}
+
+/**
+ * Attach names to a role's action ids, IN THE SAME ORDER, NEVER DROPPING ONE.
+ *
+ * An id with no row in "Actions" keeps its place with `action_name: null`, so a
+ * client renders "Unknown permission" rather than silently showing a core role
+ * with fewer permissions than it actually grants. Quietly shortening the list is
+ * how a reviewer concludes a role is safe when it is not.
+ */
+function describePermissions(ids: readonly string[], catalog: Map<string, RolePermissionView>): RolePermissionView[] {
+	return ids.map((id) => {
+		// The admin wildcard is not an "Actions" row and never will be — it is the
+		// absence of a check. Named here so the admin core role reads as something
+		// rather than as one unknown uuid.
+		if (id === "*") {
+			return { id, action_name: "All actions", action_desc: "Every permission in the system, including any added later", group: null };
+		}
+		return catalog.get(id) ?? { id, action_name: null, action_desc: null, group: null };
+	});
+}
 
 
 export function registerCoreRolesRoute(app: Express): void {
@@ -12,7 +71,35 @@ export function registerCoreRolesRoute(app: Express): void {
 app.get('/core-roles', validateAction("17ba6407-b703-4403-ab59-13235966053f"), async (req: Request, res: Response) => {
 	try {
 		/* read action — not audited (avoids log clutter) */
-		const rows = Object.keys(CORE_ROLES).map((role) => ({ role, actions: CORE_ROLES[role as keyof typeof CORE_ROLES] }));
+		// The catalogue is a small global table and this is a screen-open read, so
+		// one query serves every role rather than one per role. A failure to load it
+		// DEGRADES rather than fails: the core roles still come back, with
+		// `permissions` carrying null names. A roles screen that renders uuids is
+		// poor; a roles screen that 500s because the name lookup was unavailable is
+		// worse, and it is the regression C6 is about.
+		const catalog = new Map<string, RolePermissionView>();
+		try {
+			for (const a of await GetActions()) {
+				catalog.set(a.id, { id: a.id, action_name: a.action_name, action_desc: a.action_desc ?? null, group: a.group ?? null });
+			}
+		} catch (err) {
+			logger.warn({ err }, 'core_roles_action_catalog_unavailable');
+		}
+		const rows = Object.keys(CORE_ROLES).map((role) => {
+			const actions = CORE_ROLES[role as keyof typeof CORE_ROLES] as readonly string[];
+			return {
+				role,
+				// UNCHANGED SHAPE, UNCHANGED POSITION — the shipped dashboard reads this.
+				actions,
+				// C6: the same ids, already readable. Additive.
+				permissions: describePermissions(actions, catalog),
+				// A core role is defined in code and cannot be edited through the API, so
+				// the client can say so instead of drawing a Save button that 404s. C5
+				// asks for CUSTOM roles to be editable; core roles are the fixed floor
+				// they are built against.
+				editable: false,
+			};
+		});
 		res.json(rows);
 	} catch (err: any) {
 		logger.error({ err }, 'error_fetching_core_roles');
@@ -33,7 +120,26 @@ app.get("/roles", validateAction("17ba6407-b703-4403-ab59-13235966053f"), async 
 
 	try {
 		const roles = await GetRoles(restaurantId);
-		res.json(roles);
+		// C5/C6, same treatment as /core-roles: a custom role comes back with its
+		// permission ids ALREADY NAMED, so the role screen renders without a second
+		// call to /actions. `actions_performable` is untouched and still the field
+		// the shipped clients read; `permissions` rides beside it.
+		const catalog = new Map<string, RolePermissionView>();
+		try {
+			for (const a of await GetActions()) {
+				catalog.set(a.id, { id: a.id, action_name: a.action_name, action_desc: a.action_desc ?? null, group: a.group ?? null });
+			}
+		} catch (err) {
+			logger.warn({ err }, 'roles_action_catalog_unavailable');
+		}
+		res.json(roles.map((role) => ({
+			...role,
+			permissions: describePermissions(role.actions_performable.map(String), catalog),
+			// A custom role IS editable — that is the whole of C5 — and saying so here
+			// means a client renders one list of roles with one rule for which ones
+			// open an editor, instead of re-deriving "is this name a core role".
+			editable: true,
+		})));
 	} catch (error) {
 		logger.error({ err: error }, "get_roles_failed");
 		res.status(500).json({ error: "Unable to fetch roles" });
@@ -62,6 +168,47 @@ app.post("/roles", validateAction("c0135d18-68b4-45e9-9b51-849158df6efd"), async
 	const actions = Array.isArray(req.body?.actions_performable)
 		? req.body.actions_performable.map((entry: unknown) => String(entry))
 		: [];
+
+	// ============================================================================
+	// C5 — DELEGATION MUST NOT BE ESCALATION.
+	// ============================================================================
+	//
+	// C5 opens role editing to managers. The moment a non-admin can write
+	// `actions_performable`, "edit a custom role" becomes "grant myself anything":
+	// a manager creates (or edits) a role carrying Manage User Passwords, Manage
+	// Restaurant Settings and Delete Role, has it assigned, and is an
+	// administrator by a route whose name says "roles". Nothing downstream would
+	// catch it — CreateRole validates that the ids EXIST, not that the caller may
+	// hand them out, and the session's action set is rebuilt from whatever the row
+	// says at next login.
+	//
+	// THE RULE: a non-admin may only put into a role what they themselves hold.
+	// It is the ordinary delegation rule — you cannot give away authority you were
+	// never given — and it needs no new configuration to be correct for a tenant
+	// nobody has thought about.
+	//
+	// AN ADMIN LOSES NOTHING: callerIsAdmin short-circuits the whole check, so the
+	// owner and every admin keep granting every permission exactly as today. This
+	// is also why the check is here and not inside CreateRole: the data layer has
+	// no caller, and a rule about WHO is asking belongs where the session is.
+	//
+	// The 403 NAMES THE IDS it refused. "Forbidden" on a save of fourteen
+	// checkboxes is unactionable; a list is something an owner can either grant to
+	// the manager or untick.
+	if (!callerIsAdmin(req)) {
+		const held = new Set(req.auth?.actions ?? []);
+		const ungrantable = actions.filter((id: string) => id !== "*" && !held.has(id));
+		// "*" is refused for everyone who is not an admin, unconditionally: it is the
+		// absence of a permission check, not a permission, and a custom role carrying
+		// it would be an unnamed second admin.
+		if (actions.includes("*") || ungrantable.length > 0) {
+			res.status(403).json({
+				error: "You cannot grant permissions you do not hold yourself.",
+				ungrantableActionIds: actions.includes("*") ? ["*", ...ungrantable] : ungrantable,
+			});
+			return;
+		}
+	}
 
 	try {
 		// CreateRole upserts by name — capture the prior permission set so an EDIT
@@ -144,9 +291,11 @@ app.post("/roles/assign", validateAction("4bf54bd9-9124-46c0-a7cc-011ea4c4e172")
 		res.status(400).json({ error: "employeeId and role_name are required" });
 		return;
 	}
-	// Privilege-escalation guard: the core "admin"/"manager" roles expand to ["*"]
-	// (all permissions). Only a REAL admin may grant them — otherwise the mere
-	// assign-role permission on a custom role could bootstrap an employee to full admin.
+	// Privilege-escalation guard. "admin" expands to the ["*"] wildcard; "manager"
+	// resolves to a concrete list that carries the till (C2) and view/edit of
+	// custom roles (C5). Either one changes who runs the restaurant, so only a REAL
+	// admin may grant them — otherwise the mere assign-role permission on a custom
+	// role could bootstrap an employee to full admin.
 	if (isPrivilegedRoleName(roleName) && !callerIsAdmin(req)) {
 		res.status(403).json({ error: "Only an admin can assign the admin or manager role." });
 		return;

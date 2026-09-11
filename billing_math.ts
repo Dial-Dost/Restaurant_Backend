@@ -259,6 +259,87 @@ export function nonChargeableValue(lines: readonly (OrderLineMoney | null | unde
 }
 
 // ============================================================================
+// A CHARGE IS NEVER NEGATIVE
+// ============================================================================
+//
+// THE DOOR THIS CLOSES, and it was the last one open in the census.
+//
+// applyMenuPriceFloor floors every line that resolves to a menu row, and
+// deliberately bills an UNRESOLVED line exactly as typed — a valet fee, an
+// aggregator line, a one-off "open item" are real charges that are not on the
+// menu, and refusing them would break the till for the sake of a rule.
+//
+// The gap is that "exactly as typed" accepted a NEGATIVE number. A line reading
+//
+//     { name: "Adjustment", price: -4000, quantity: 1 }
+//
+// resolves to no menu row, keeps its price, and chargeableSubtotal sums it — so
+// the order subtotal drops by 4,000 and the table's bill drops with it. No
+// discount was recorded, no coupon, no void, no NC line. GetTableReleaseImpact
+// then values the table at what is left, and every gate this block built —
+// settle, release, discount, coupon, loyalty, item-strip — measures a table that
+// is already empty and finds nothing to protect. It is the same outcome as
+// writing the bill off, reached by a door none of them watch, under an audit
+// line that says an item was ADDED.
+//
+// THE RULE: a line may cost nothing, and may cost anything above nothing, and
+// may never cost LESS than nothing. Money comes OFF a bill through a discount, a
+// coupon, an NC flag, a void or a refund — every one of which is gated, recorded
+// and reportable. A negative price is none of those; it is a discount wearing a
+// dish's name.
+//
+// WHY ZERO RATHER THAN A REFUSAL. Refusing the write would turn a typo into a
+// failed order at the pass, and the floor's whole design is that a menu outage
+// or an odd line never blocks order entry. Clamping keeps the order, keeps the
+// line visible on the ticket and the bill, and simply declines to let it pay the
+// guest. A genuinely free line is what `nc` is for, and it is recorded.
+//
+// QUANTITY WAS ALREADY SAFE FOR THE MONEY — orderLineQuantity clamps to at least
+// 1, so a negative quantity has never been able to reverse a line's sign. What is
+// normalised here is only the STORED value, so a ticket cannot print "-3x
+// Biryani" beside a positive total and invite an argument at the table.
+//
+// AND ONLY WHEN IT IS NOT A QUANTITY AT ALL. Zero, negative and non-numeric
+// become 1; a FRACTION does not. Selling by weight is ordinary — 0.5 kg of
+// something priced per kilo — and rounding that up to 1 here would double what
+// the ticket says the guest ordered. (orderLineQuantity's own floor already
+// charges such a line as 1, which is a separate and older inconsistency; this
+// clamp deliberately does not make it worse by writing it into the order.)
+
+/** What a line was typed as, before any of this is applied. */
+export interface LineChargeInput {
+  price?: unknown;
+  quantity?: unknown;
+}
+
+export interface ClampedLineCharge {
+  /** Never below zero. */
+  price: number;
+  /** Always a positive number. A fraction stays a fraction; see the header. */
+  quantity: number;
+  /** True when either value had to be moved. Callers log on this. */
+  clamped: boolean;
+}
+
+/**
+ * The non-negative form of one order line's money.
+ *
+ * Pure, so both order paths can share one answer and it can be argued with in a
+ * test that needs no database. Applied by applyMenuPriceFloor (the staff path,
+ * including the off-menu lines it deliberately does not re-price) and by
+ * repriceFromMenu (the guest and waitlist paths).
+ */
+export function clampLineCharge(line: LineChargeInput | null | undefined): ClampedLineCharge {
+  const rawPrice = Number((line ?? {}).price);
+  const rawQty = Number((line ?? {}).quantity);
+  const price = round2(Number.isFinite(rawPrice) ? rawPrice : 0);
+  const quantity = Number.isFinite(rawQty) ? rawQty : 1;
+  const safePrice = price < 0 ? 0 : price;
+  const safeQty = quantity > 0 ? quantity : 1;
+  return { price: safePrice, quantity: safeQty, clamped: safePrice !== price || safeQty !== quantity };
+}
+
+// ============================================================================
 // THE PRICE FLOOR OF ONE ORDER LINE — migration 039 (variations)
 // ============================================================================
 //
@@ -1070,3 +1151,81 @@ export function computeSectionSplit(
   };
 }
 
+
+// ============================================================================
+// "AN ORDER THAT STILL OWES MONEY" — THE ONE DEFINITION
+// ============================================================================
+//
+// THE BUG THIS ENDS. There were THREE copies of this status list in the
+// codebase and they did not agree:
+//
+//   * activeOrderSubtotal (the bill math) skipped Paid / Cancelled / Closed —
+//     so status 6 "Payment Pending Approval" WAS charged for;
+//   * eight SQL readers wrote `not in ('4','5','7')` — the same rule;
+//   * GetTableReleaseImpact (the release preflight) wrote
+//     `not in ('4','5','6','7')` — a FOURTH status excluded.
+//
+// So a table whose orders sat at status 6 read as ₹0 to the preflight that
+// decides whether releasing it is a write-off, while the bill math that would
+// later charge for those same orders counted every rupee of them. The gate
+// built to stop a waiter walking a table's money out of the system reported
+// nothing to stop. A comment on the preflight said the two filters "must
+// agree"; a comment is not a mechanism, which is why this is code.
+//
+// THE DEFINITION: an order still owes money unless it has been Paid (4),
+// Cancelled (5) or Closed (7). Everything else — Preparing, Served, Bill
+// Verification, Pending, and Payment Pending Approval (6) — is still on the
+// bill. Status 6 is INCLUDED deliberately: the guest has tendered but nothing
+// has been approved or closed, the money is still owed to the restaurant on
+// this bill, and the bill math has always charged for it.
+//
+// EVERY reader of this rule — SQL or TypeScript — goes through this block.
+// `stillOwesStatusSql` builds the SQL predicate from the SAME array
+// `orderStatusStillOwes` tests, so the two cannot drift; a second list that
+// agrees today is exactly how this happened.
+
+/** Status codes of an order that is FINISHED WITH: 4 Paid, 5 Cancelled, 7 Closed. */
+export const SETTLED_ORDER_STATUS_CODES: readonly string[] = ["4", "5", "7"];
+
+/**
+ * Status codes ReleaseTable must NOT void, which is the settled set PLUS 6
+ * (Payment Pending Approval): the guest has already tendered, so cancelling
+ * their orders would delete collected money rather than free a table.
+ *
+ * DERIVED from SETTLED_ORDER_STATUS_CODES rather than written out, so this is
+ * not a second list. It is a DIFFERENT QUESTION with a different answer — "what
+ * may I void" is not "what still owes money" — and the release preflight must
+ * use the owing rule, never this one. See GetTableReleaseImpact.
+ */
+export const RELEASE_VOID_EXEMPT_STATUS_CODES: readonly string[] = [...SETTLED_ORDER_STATUS_CODES, "6"];
+
+/**
+ * Does this order still owe money? Takes the RAW `"Orders".status` value — a
+ * number, a numeric string, or null — and coerces it the way the SQL predicate
+ * does: anything unreadable is treated as 1 (Preparing), which still owes.
+ * Failing towards "owes" is the safe direction: over-reporting value costs one
+ * escalation, under-reporting it is the defect above.
+ */
+export function orderStatusStillOwes(status: unknown): boolean {
+  const n = Number(status);
+  const code = Number.isFinite(n) ? String(Math.round(n)) : "1";
+  return !SETTLED_ORDER_STATUS_CODES.includes(code);
+}
+
+/** Quote a status-code list as a SQL `in` tuple. Codes are module constants. */
+function statusTuple(codes: readonly string[]): string {
+  return codes.map((c) => `'${c}'`).join(",");
+}
+
+/**
+ * The SQL half of `orderStatusStillOwes`, built from the same array. Pass the
+ * column expression when the query aliases "Orders" (e.g. `o.status`).
+ */
+export function stillOwesStatusSql(column = "status"): string {
+  return `coalesce(${column}::text, '1') not in (${statusTuple(SETTLED_ORDER_STATUS_CODES)})`;
+}
+
+/** The SQL predicate for "orders ReleaseTable may void". See the constant. */
+export function releaseVoidableStatusSql(column = "status"): string {
+  return `coalesce(${column}::text, '1') not in (${statusTuple(RELEASE_VOID_EXEMPT_STATUS_CODES)})`;
+}

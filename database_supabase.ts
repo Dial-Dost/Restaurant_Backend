@@ -62,6 +62,7 @@ import {
   // Migration 039. The ONE rule both order-write paths floor a line with, so a
   // Half plate cannot be ₹150 to a guest and ₹250 to a waiter.
   anyLineNamesVariation,
+  clampLineCharge,
   resolveLinePriceFloor,
   type BillTaxLine,
   type BillDiscount,
@@ -71,7 +72,29 @@ import {
   type SectionSplitLine,
   type SectionSplitResult,
   type VariationPriceRef,
+  // THE ONE DEFINITION of "an order that still owes money" (and the derived
+  // "…that ReleaseTable may void"). Three copies of this status list had already
+  // drifted apart — see billing_math.ts's header — so every reader in this file,
+  // SQL and TypeScript alike, goes through these.
+  orderStatusStillOwes,
+  stillOwesStatusSql,
+  releaseVoidableStatusSql,
 } from "./billing_math.js";
+// The write-off rule for a DISCOUNT. Pure, for the same reason
+// release_authority.ts is: it decides who may make a bill disappear.
+import { DiscountAuthorityError, mayDiscountBill } from "./discount_authority.js";
+// C3's print state. ONE rule, applied to BOTH payloads that answer "has this
+// bill been printed" — /bill-for-table and the /get-tables row the floor grid
+// renders. See its header for why the floor grid had nothing to read.
+import {
+  BILL_PRINT_JOB_KIND,
+  COUNTED_PRINT_JOB_STATUSES,
+  NO_BILL_PRINTS,
+  summarizeBillPrints,
+  type BillPrintJobRow,
+  type BillPrintSeating,
+  type BillPrintState,
+} from "./bill_print_state.js";
 // The floor-section ordering rules (migration 041). Kept out of SQL on purpose:
 // see that module's header for why the decision lives in a pure function and
 // the database is left holding a dumb renumber.
@@ -288,7 +311,31 @@ export {
   LEGACY_LOW_STOCK_THRESHOLD,
 } from "./inventory_units.js";
 export type { InventoryStatus, ReorderLevel, ThresholdBasis, UnitDimension } from "./inventory_units.js";
+// D2's one duration: order placed -> bill settled, computed on the server so the
+// owner app and the dashboard cannot disagree about the same table. Re-exported
+// (the report_window.ts arrangement) so route code reaches it through the data
+// layer rather than growing a second subtraction of its own.
+import { serviceClock, tableServiceClock, type ServiceClock } from "./service_clock.js";
+export { serviceClock, tableServiceClock } from "./service_clock.js";
+export type { ServiceClock, ServiceClockInput } from "./service_clock.js";
 import { logger } from "./observability.js";
+
+/**
+ * "Close Bill" (a953d044) — the ONE capability that means "may make money leave
+ * this system": settling a bill (enforceSettleAuthority), releasing a table that
+ * still carries value (release_authority.ts) and discounting a bill down to
+ * nothing (discount_authority.ts) are three shapes of the same act and ask the
+ * same question.
+ *
+ * It is spelled out here because the data layer needs it (the discount gate runs
+ * inside SetBillDiscountWithApproval's transaction, where the subtotal is read)
+ * and routes/_shared.ts — which exports it as PERM_CLOSE_BILL — imports THIS
+ * module, so the dependency cannot run the other way. Two literals for one uuid
+ * is a drift risk, so discount_write_off.test.ts asserts this id is exactly the
+ * one CORE_ROLES.cashier/.captain/.manager hold and the one the waiter does not.
+ * NEVER mint a new id for this (migration 025's rule).
+ */
+export const CLOSE_BILL_ACTION_ID = "a953d044-31ba-4e31-b96f-99304fe43dfa";
 
 export const CORE_ROLES = {
   admin: ["*"],
@@ -303,7 +350,62 @@ export const CORE_ROLES = {
     "b8e02c25-b91c-427c-b462-8df009ede055",
     "5ef876a7-eb92-4602-b4d3-5590ce379540",
   ],
-  cashier: ["9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "2393edd7-cdd9-439c-9ff3-d563d5216967", "fc57d407-4bba-442c-97a2-9e6f3c57f288", "a953d044-31ba-4e31-b96f-99304fe43dfa", "4ad474d4-5230-449c-874f-6a238b833bca"],
+  // ==================================================================
+  // THE TILL ROLE, DIAGNOSED THE SAME WAY THE MANAGER WAS — AND FIXED
+  // THE SAME WAY: BY ADDING THE READS, NEVER BY ADDING A WRITE.
+  // ==================================================================
+  // The five ids the cashier has always held are all WRITES: create a bill,
+  // confirm the payment method, approve the payment, close the bill, and move
+  // the order to Paid. Not one of them is a READ. So the core cashier — the
+  // role whose entire name is "the person at the till" — was 403'd on
+  // GET /bill-for-table, GET /bills/open, GET /bills/closed, GET /bills/order/:id
+  // and GET /bills/closed/:id (all gated on 98b10bde "View Bill"), and on
+  // GET /table-status, GET /get-tables and POST /release-table (all gated on
+  // 090ea8d4). Read plainly: a cashier could SETTLE a bill they were not
+  // allowed to READ, and then could not FREE the table they had just settled.
+  //
+  // That is the identical hole this block already found and closed in the
+  // MANAGER role (see the long note above the manager entry), and the till role
+  // deserves the same treatment. It is PRE-EXISTING — no gate added by this
+  // block created it — but a permissions pass that leaves it standing has
+  // simply not finished.
+  //
+  // WHAT IS ADDED, all of it read-only, all of it already existing (migration
+  // 025's rule: never mint a new id for a capability roles already hold):
+  //
+  //   98b10bde View Bill ..... the total being settled. Settling a number you
+  //                            are not allowed to look at is not a workflow,
+  //                            and /bills/open is how the till finds the bill
+  //                            in the first place.
+  //   090ea8d4 Table status / occupy / release — the table has to be freed
+  //                            after the money is taken, and the floor grid is
+  //                            how a cashier finds the table at all. Note this
+  //                            ONE id is both the read and the write, on
+  //                            purpose, so the pair can never drift apart.
+  //   f4177b38 View Menu ..... the cashier already holds 4ad474d4 "Add Orders",
+  //                            so it may ring an item up at the counter; doing
+  //                            that against a menu it cannot GET is the same
+  //                            broken shape. Read-only, and the WAITER — a
+  //                            strictly less trusted role — already holds this
+  //                            exact id, so it exposes no new tier of data.
+  //
+  // WHAT IS NOT ADDED: nothing that REDUCES what a guest pays. Comp an item
+  // (b4e7a1c9), void with a reason (c1f83b26) and waive a service charge
+  // (d5a06e73) stay with the manager, exactly as the manager entry says, for
+  // the same reason: an approval the person doing it can grant themselves is
+  // not an approval. No role loses anything here — this entry is additive, and
+  // role_capability_scope.test.ts asserts every id listed before today is still
+  // listed today.
+  cashier: [
+    // --- the writes (unchanged, and in their original order) ---
+    "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "2393edd7-cdd9-439c-9ff3-d563d5216967",
+    "fc57d407-4bba-442c-97a2-9e6f3c57f288", "a953d044-31ba-4e31-b96f-99304fe43dfa",
+    "4ad474d4-5230-449c-874f-6a238b833bca",
+    // --- the reads those writes depend on (added; see the note above) ---
+    "98b10bde-802d-4a5b-a726-53a826424f79", // View Bill
+    "090ea8d4-e348-4e1b-9723-11131a73a085", // Table status / occupy / release
+    "f4177b38-77fa-4d8c-9fbd-c4f06bf28610", // View Menu
+  ],
   // Waiter: front-of-house — place & approve orders, manage tables, assign booking
   // tables, and VIEW the menu (f4177b38…) so they can actually take orders.
   // "98b10bde…" = View Bill: a waiter could see the floor grid and the global
@@ -317,7 +419,58 @@ export const CORE_ROLES = {
   // but not read one back. Nothing else about the role changes.
   // NOTE: barking (3f6a9c1e "Bark Order") is deliberately NOT in the waiter set —
   // waiters take orders, the pass pushes them to the kitchen. Captains/managers keep it.
-  captain: ["4ad474d4-5230-449c-874f-6a238b833bca", "9186e53e-0fda-4ec8-ad20-2f9feaadb77f", "c7699d46-0e2f-4448-b325-8ca490a5296b", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610", "98b10bde-802d-4a5b-a726-53a826424f79", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63"],
+  //
+  // ================================================================
+  // THE CAPTAIN QUESTION, ANSWERED OUT LOUD: A CAPTAIN STILL SETTLES.
+  // ================================================================
+  // C2 routed every settle path through enforceSettleAuthority, which requires
+  // a953d044 "Close Bill". A captain did not hold it — and did not need to
+  // before, because the settle a captain actually makes is
+  // `PATCH /orders/:id/status -> Paid`, which was gated on 4ad474d4 "Add
+  // Orders" alone. So C2, read literally, took the till away from every captain
+  // in the field on the next deploy, silently, with a 403 that named a
+  // permission nobody had been told to grant. That is not a decision anybody
+  // made; it is a side effect, and a side effect that stops somebody's till.
+  //
+  // THE DECISION, so it can be argued with and communicated: A CAPTAIN
+  // SUPERVISES A SECTION AND TAKES PAYMENT FOR IT. That is what the role is in
+  // an Indian restaurant, it is what role_scope.ts already says by listing
+  // `captain` in ROLES_OUTRANKING_WAITER (a captain is NOT a scoped floor role
+  // and has always seen money), and it is what these tenants' captains were
+  // doing yesterday. C2's requirement is "waiters must be restricted", and a
+  // captain is not a waiter — restricting one is collateral, not compliance.
+  //
+  // WHAT IS ADDED: the ONE existing id, a953d044. No new Action is minted
+  // (migration 025's rule), nothing is taken from anybody, and the change is
+  // resolved at LOGIN by resolveEmployeeActionSet — so it reaches every existing
+  // tenant on their captains' next sign-in with no migration and no backfill.
+  //
+  // WHAT IS NOT ADDED: 2393edd7 (Confirm Payment Method) and fc57d407 (Approve
+  // Payment). A captain never held those, so the two-step waiter-confirm /
+  // admin-approve review flow is still a manager's. This restores exactly the
+  // capability C2 removed and not one permission more.
+  //
+  // A TENANT THAT DISAGREES — one where captains genuinely must not take money —
+  // removes the capability the same way it grants any other: by moving those
+  // staff to a custom role without a953d044. The core role is the default, not
+  // the ceiling.
+  //
+  // THE SAME READ GAP, ONE ROLE OVER: a captain was given a953d044 above so it
+  // could keep settling, but it has never held 090ea8d4 either — so a captain
+  // could take payment for its section and then not free the table, and could
+  // not open the floor grid (GET /table-status, GET /get-tables) that the
+  // sentence "A CAPTAIN SUPERVISES A SECTION" depends on. 090ea8d4 is added for
+  // exactly the reason it is added to the cashier, and it is not an escalation:
+  // it is ordinary floor work that the WAITER this role outranks already does.
+  // Nothing is removed, and the payment-review pair (2393edd7 / fc57d407) is
+  // still deliberately absent.
+  captain: [
+    "4ad474d4-5230-449c-874f-6a238b833bca", "9186e53e-0fda-4ec8-ad20-2f9feaadb77f",
+    "c7699d46-0e2f-4448-b325-8ca490a5296b", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610",
+    "98b10bde-802d-4a5b-a726-53a826424f79", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63",
+    "a953d044-31ba-4e31-b96f-99304fe43dfa",
+    "090ea8d4-e348-4e1b-9723-11131a73a085", // Table status / occupy / release
+  ],
   // "2e7b9c40…" = Review Attendance: managers previously reached GET /attendance
   // via an admin/manager role check; now that the attendance endpoints are gated
   // by that granted Action, keep managers' access by granting them the UUID here.
@@ -327,7 +480,62 @@ export const CORE_ROLES = {
   // the person doing it can grant themselves is not an approval. A tenant that
   // wants a senior cashier to comp grants the UUID to a custom role; that is what
   // the grantable "Actions" rows in ensureFeaturePermissionActions() are for.
-  manager: ["faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd", "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63", "b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472", "c1f83b26-5a97-4e40-b8d3-7e02a9c4f156", "d5a06e73-9c41-4b28-8f6a-1b74d3e08c95"],
+  //
+  // C2 + C5 — WHAT A MANAGER COULD NOT DO, AND HAD TO BE ABLE TO.
+  //
+  // The seven ids above are everything the core `manager` role has ever granted:
+  // assign tables, add a customer, review attendance, bark an order, and the
+  // three MIS-capture acts. That list has a hole big enough to walk a service
+  // through — a manager could not VIEW a bill, could not CREATE one, could not
+  // SETTLE one, and could not open the access-control screen at all. C2 names
+  // managers as THE role that settles bills; a rule that restricts waiters from
+  // settling while leaving managers unable to settle either does not leave a
+  // restaurant with anyone at the till but the owner.
+  //
+  // So the block below is PURELY ADDITIVE and every id in it already exists
+  // (migration 025's rule — no new id is minted for an existing capability):
+  //
+  //   4ad474d4 Add Orders ............ PATCH /orders/:id/status is how an order is
+  //                                    moved to Paid; without it the manager is
+  //                                    refused before the settle gate is reached.
+  //   9186e53e Create Bill ........... a table with no bill row cannot be settled.
+  //   98b10bde View Bill ............. GET /bill-for-table. Settling a total you
+  //                                    are not allowed to read is not a workflow.
+  //   2393edd7 Confirm Payment Method  step 1 of the settle.
+  //   fc57d407 Approve Payment ....... step 2 — the call that closes the bill.
+  //   a953d044 Close Bill ............ THE capability enforceSettleAuthority
+  //                                    checks. This line is what makes C2's
+  //                                    "only Managers may settle" true rather
+  //                                    than "only admins and cashiers may".
+  //   090ea8d4 Table status/occupy/release — the table has to be freed after.
+  //   f4177b38 View Menu ............. GET /menu, which the bill view needs.
+  //   17ba6407 Get Roles ............. C5: "Super Admins and Managers can view and
+  //   2b6f7948 Get Actions ..........  edit custom roles". These three are what
+  //   c0135d18 Create/Update Role ...  make that sentence true; before them every
+  //                                    roles endpoint 403'd for a manager and the
+  //                                    screen rendered empty (that is also C6 —
+  //                                    see routes/roles.ts).
+  //
+  // WHAT IS DELIBERATELY *NOT* HERE. Delete Role (53d0927d), role assign/remove
+  // (4bf54bd9 / 9acc9097), user passwords, settings, branding and billing stay
+  // admin-only: C5 asks for view and EDIT of custom roles, not for a second
+  // account administrator. A manager editing roles also cannot escalate, because
+  // POST /roles refuses a non-admin any action id the caller does not itself
+  // hold (see routes/roles.ts).
+  manager: [
+    "faf2745b-580c-4529-bbe1-033200cbcf67", "daf1d71f-2b37-4cd1-b951-28fece7719cd",
+    "2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047", "3f6a9c1e-8d24-4b7a-b5c9-2e1f7d4a8b63",
+    "b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472", "c1f83b26-5a97-4e40-b8d3-7e02a9c4f156",
+    "d5a06e73-9c41-4b28-8f6a-1b74d3e08c95",
+    // --- the till (C2) ---
+    "4ad474d4-5230-449c-874f-6a238b833bca", "9186e53e-0fda-4ec8-ad20-2f9feaadb77f",
+    "98b10bde-802d-4a5b-a726-53a826424f79", "2393edd7-cdd9-439c-9ff3-d563d5216967",
+    "fc57d407-4bba-442c-97a2-9e6f3c57f288", "a953d044-31ba-4e31-b96f-99304fe43dfa",
+    "090ea8d4-e348-4e1b-9723-11131a73a085", "f4177b38-77fa-4d8c-9fbd-c4f06bf28610",
+    // --- access control, view + edit (C5/C6) ---
+    "17ba6407-b703-4403-ab59-13235966053f", "2b6f7948-0b27-41a9-9727-c04ccc9f4db1",
+    "c0135d18-68b4-45e9-9b51-849158df6efd",
+  ],
 };
 
 export enum Audit_log_category {
@@ -911,6 +1119,10 @@ export interface OrderRecord {
   // NULL on rows that have not been touched since the column was added — never
   // backfilled, because a fabricated edit time is worse than an absent one.
   updated_at?: string | null;
+  // D2: order placed -> bill settled, computed once on the server. Optional
+  // because the readers that build an OrderRecord by hand (history, reports) do
+  // not carry a bill join — see service_clock.ts for why absent is not zero.
+  service?: ServiceClock;
   /**
    * The KOT number(s) this order has had printed, oldest first (migration 043).
    *
@@ -3625,6 +3837,212 @@ export async function UpdateTableCovers(
   };
 }
 
+/**
+ * WHAT HAS ALREADY BEEN STRIPPED OFF THESE ORDERS — the ledgered value of every
+ * LINE-level void ("OrderVoids".scope = 'item', migration 035) recorded against
+ * a given set of orders.
+ *
+ * ============================================================================
+ * WHY THIS READ HAS TO EXIST AT ALL
+ * ============================================================================
+ * DELETE /orders/:id/items/:itemId re-prices an order to whatever lines remain.
+ * Strip every line and the order's subtotal is 0 WHILE THE ORDER IS STILL
+ * ACTIVE — so the table reads as worth nothing to every reader in this file,
+ * including GetTableReleaseImpact, which is the preflight the release write-off
+ * gate depends on. The money left through a door that recorded nothing, and the
+ * release that followed then looked exactly like freeing an empty table.
+ *
+ * Two different callers need this one number and they need it to be the SAME
+ * number:
+ *
+ *   1. THE GATE (UpdateOrderItemsSplit). A per-line rule is trivially evaded by
+ *      six deletions of a sixth each, so the judgement is made on the CUMULATIVE
+ *      effect on the table: the baseline a removal is measured against is what
+ *      the table is worth NOW plus everything already taken off it, and the
+ *      money handed back is everything already taken off it plus this removal.
+ *      Without this read the baseline shrinks with every strip and the gate
+ *      grades itself against its own damage.
+ *
+ *   2. THE PREFLIGHT (GetTableReleaseImpact). A release that frees a table whose
+ *      orders were STRIPPED rather than cancelled must not read as an ordinary
+ *      release of an empty table in the audit log. The value is reported beside
+ *      the live figures rather than added into them, because it has ALREADY been
+ *      destroyed: folding it into active_order_total would make the release gate
+ *      refuse a genuinely empty table, and a floor that cannot recycle its own
+ *      tables is a worse outage than the bug.
+ *
+ * SCOPED TO THE CURRENT SEATING BY THE ORDERS THEMSELVES, NOT BY A TIME WINDOW.
+ * The table form joins "Orders" and applies stillOwesStatusSql — the one
+ * definition of "this session's orders" (billing_math.ts), the same predicate the
+ * figures it sits beside are reduced by, so no second copy of "what counts as the
+ * current seating" is written here. A previous party's orders are
+ * Paid/Closed/Cancelled, so their voids can never leak into this party's
+ * baseline. The order form exists for a ticket with no table at all (takeaway,
+ * delivery, an aggregator order), where the order IS the session.
+ *
+ * DEGRADES TO ZERO, LOUDLY. "OrderVoids" belongs to migration 035 and a tenant
+ * that has not applied it must still be able to run a floor. Losing this number
+ * costs the CUMULATIVE limb of the gate and nothing else: the per-write limb
+ * still measures each removal against the value that remains, which is what
+ * makes a table unreachable-to-zero even with this read dead (the last removal
+ * is always 100% of what is left). See the gate in UpdateOrderItemsSplit.
+ */
+async function strippedItemVoidValue(
+  context: RestaurantContext,
+  scope: { tableId?: string | null; orderId?: string | null },
+  client?: PoolClient,
+): Promise<{ value: number; lines: number }> {
+  const tableId = String(scope.tableId ?? "").trim();
+  const orderId = String(scope.orderId ?? "").trim();
+  if (!tableId && !orderId) {return { value: 0, lines: 0 };}
+  return captureRead("OrderVoids(item)", async () => {
+    const rows = await runQuery<{ value: unknown; lines: unknown }>(
+      tableId
+        ? `select coalesce(sum(v.value_voided), 0) as value, count(*) as lines
+             from "OrderVoids" v
+             join "Orders" o
+               on o.id = v.order_id and o.res_id = v.res_id and o.outlet_id = v.outlet_id
+            where v.res_id = $1 and v.outlet_id = $2 and v.scope = 'item'
+              and o.table_id = $3 and ${stillOwesStatusSql("o.status")}`
+        : `select coalesce(sum(value_voided), 0) as value, count(*) as lines
+             from "OrderVoids"
+            where res_id = $1 and outlet_id = $2 and scope = 'item' and order_id = $3`,
+      [context.res_id, context.outlet_id, tableId || orderId],
+      client,
+    );
+    return {
+      value: round2(parseNumeric(rows[0]?.value)),
+      lines: Math.max(0, Math.round(parseNumeric(rows[0]?.lines))),
+    };
+  }, { value: 0, lines: 0 });
+}
+
+/**
+ * WHAT RELEASING THIS TABLE WOULD DESTROY — the read the release gate asks
+ * BEFORE ReleaseTable is allowed to run.
+ *
+ * ReleaseTable voids every active order on the table and closes its open bill at
+ * total_amt = 0. That is a write-off, and release_authority.ts decides who may
+ * make one; this function supplies the only input that decision needs. It is a
+ * PURE READ — nothing here writes, nothing here mints a bill row, and it must
+ * stay that way, because it runs on the refusal path as well as the permitted
+ * one.
+ *
+ * BOTH NUMBERS, NOT ONE. See release_authority.ts's header: the open bill's
+ * running total and the sum of the table's active orders can legitimately
+ * disagree (a table with orders but no bill row yet; a bill that has been
+ * discounted or couponed), and the gate takes the greater. Collapsing them here
+ * would throw away the ability to say WHY a release was refused.
+ *
+ * THE PREFLIGHT AND THE BILL MATH READ THE SAME ORDERS. THEY DID NOT.
+ * ----------------------------------------------------------------
+ * This query used to exclude status 6 (Payment Pending Approval) as well as
+ * 4/5/7, matched to ReleaseTable's VOID statement, on the reasoning that a
+ * release is refused outright when a payment is awaiting approval. The two are
+ * not the same question, and the difference was a hole: the pending-payment
+ * guard keys on a BILL row (waiter_confirmed_at set, admin_approved_at not), so
+ * a table whose orders sit at 6 with no such bill — the bill reopened, merged
+ * away, or never written — read as ₹0 here while activeOrderSubtotal, and
+ * therefore every bill this table would ever print, charged for every rupee of
+ * them. The preflight reported nothing to protect on exactly the table a release
+ * would empty.
+ *
+ * So it now uses THE ONE DEFINITION of an order that still owes money
+ * (stillOwesStatusSql / orderStatusStillOwes, billing_math.ts), which is the
+ * same rule activeOrderSubtotal reduces by and the same rule the other eleven
+ * readers in this file use. "What may be VOIDED" is a different question with a
+ * different answer and its own derived constant — see ReleaseTable below.
+ * Over-reporting costs one escalation; under-reporting is the bug.
+ *
+ * WHAT WAS TAKEN OFF THE TABLE BEFORE THE RELEASE — `stripped_value`.
+ * ------------------------------------------------------------------
+ * The two live figures above describe what a release would destroy NEXT. They
+ * are both blind to value that has ALREADY been destroyed without a
+ * cancellation: DELETE /orders/:id/items/:itemId re-prices an order to the lines
+ * that remain, so a stripped order is still ACTIVE and worth 0, and a table
+ * emptied that way reported ₹0 here and was waved through as "an ordinary
+ * release of an empty table". `stripped_value` is the ledgered value of every
+ * line-level void recorded against THIS seating's orders (see
+ * strippedItemVoidValue), so the preflight is no longer blind to it and a
+ * release of a hollowed-out table can say so.
+ *
+ * IT IS REPORTED BESIDE THE LIVE FIGURES AND NEVER ADDED INTO THEM, and that is
+ * the whole design. releaseWriteOffValue takes the greater of open_bill_total
+ * and active_order_total; folding already-destroyed money into either would make
+ * the gate refuse a release of a table that genuinely has nothing left on it —
+ * i.e. it would put a waiter in front of a table they cannot free, which
+ * release_authority.ts's header calls a worse outcome than the bug. The number
+ * is here to be REPORTED (in the audit detail the release route already spreads,
+ * and in the line it writes), not to move the verdict.
+ *
+ * Returns null when the table does not exist, so the caller reports "Table not
+ * found" rather than silently treating an unknown table as empty.
+ */
+export async function GetTableReleaseImpact(
+  restaurantId: string,
+  table_name: string,
+): Promise<{
+  table_id: string;
+  open_bill_total: number;
+  active_order_total: number;
+  active_order_count: number;
+  has_open_bill: boolean;
+  /** Pre-tax value already stripped off this seating's orders, line by line. */
+  stripped_value: number;
+  /** How many lines that value came off, so "₹0 of 1 line" reads differently from "₹0". */
+  stripped_line_count: number;
+} | null> {
+  const context = await requireRestaurantContext(restaurantId);
+
+  const normalized = table_name.trim();
+  if (!normalized) { return null; }
+
+  const tableRows = await runQuery<{ id: string }>(
+    `select id from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+        and coalesce(is_deleted, false) = false
+      limit 1`,
+    [context.res_id, context.outlet_id, normalized],
+  );
+  if (!tableRows[0]) { return null; }
+  const tableId = tableRows[0].id;
+
+  const billRows = await runQuery<{ total_amt: unknown }>(
+    `select total_amt from "Bills"
+      where res_id = $1 and outlet_id = $2 and table_id = $3 and closed_at is null`,
+    [context.res_id, context.outlet_id, tableId],
+  );
+  let openBillTotal = 0;
+  for (const b of billRows) { openBillTotal += parseNumeric(b.total_amt); }
+
+  const orderRows = await runQuery<{ food: unknown; status: unknown }>(
+    `select food, status from "Orders"
+      where res_id = $1 and outlet_id = $2 and table_id = $3
+        and ${stillOwesStatusSql()}`,
+    [context.res_id, context.outlet_id, tableId],
+  );
+  // activeOrderSubtotal re-applies the SAME predicate in TypeScript, and that is
+  // no longer belt and braces over a lookalike copy: both halves are now built
+  // from one array in billing_math.ts, so they cannot disagree without the
+  // definition itself changing. owing_status_definition.test.ts pins it.
+  const active = activeOrderSubtotal(orderRows);
+  // A SEPARATE STATEMENT, deliberately, rather than widening the one above: that
+  // statement is the shipped expression of the owing rule and
+  // owing_status_definition.test.ts drives it by its exact text. This one applies
+  // the SAME rule (stillOwesStatusSql, one definition) to the join it needs.
+  const stripped = await strippedItemVoidValue(context, { tableId });
+
+  return {
+    table_id: tableId,
+    open_bill_total: round2(openBillTotal),
+    active_order_total: active.subtotal,
+    active_order_count: active.order_count,
+    has_open_bill: billRows.length > 0,
+    stripped_value: stripped.value,
+    stripped_line_count: stripped.lines,
+  };
+}
+
 export async function ReleaseTable(
   restaurantId: string,
   table_name: string,
@@ -3673,11 +4091,18 @@ export async function ReleaseTable(
 
   // Releasing without payment voids the table's still-active orders so they don't
   // carry into the next session. Status 6 (Payment Pending Approval) is EXCLUDED
-  // alongside Paid/Cancelled/Closed: the guest has paid, so it is not "active".
+  // alongside Paid/Cancelled/Closed: the guest has tendered, so cancelling their
+  // orders would delete collected money rather than free a table.
+  //
+  // THIS IS A DIFFERENT QUESTION FROM "WHAT STILL OWES MONEY", and it now says so
+  // in code: releaseVoidableStatusSql is DERIVED from the owing definition
+  // (billing_math.ts) by adding 6, so it can never drift from it and can never be
+  // mistaken for it. GetTableReleaseImpact — the preflight that decides whether
+  // this release is a write-off — must use the OWING rule, and does.
   await runQuery(
     `update "Orders" set status = 5
        where res_id = $1 and outlet_id = $2 and table_id = $3
-         and coalesce(status::text, '1') not in ('4','5','6','7')`,
+         and ${releaseVoidableStatusSql()}`,
     [context.res_id, context.outlet_id, tableId],
   );
 
@@ -3903,7 +4328,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -3964,7 +4389,7 @@ export async function GetBillForTable(
       select id, food, created_at
       from "Orders"
       where res_id = $1 and outlet_id = $2 and table_id = $3
-        and coalesce(status::text, '1') not in ('4', '5', '7')
+        and ${stillOwesStatusSql()}
       order by created_at asc
     `,
     [context.res_id, context.outlet_id, tableId],
@@ -4152,6 +4577,21 @@ export async function GetBillForTable(
   const orderIds = orderRows.map((row) => row.id);
   const kotNos = await GetKotNumbersForBill(context.res_id, context.outlet_id, orderIds);
 
+  // C3 — HOW MANY TIMES THIS SEATING'S BILL HAS BEEN PRINTED. The "once" in
+  // "a waiter may print the bill once" has to be counted somewhere one
+  // restaurant can agree on, and until now it was counted in each device's own
+  // memory. See billPrintHistoryForTable.
+  const prints = await billPrintHistoryForTable(
+    context,
+    tableId,
+    bill?.id ?? null,
+    normalized,
+    // The seating starts at the bill row when there is one and at the earliest
+    // still-active order when there is not. Both are "the current party", and
+    // anything printed before it belongs to the previous one.
+    bill?.created_at ?? (orderRows[0]?.created_at as Date | null) ?? null,
+  );
+
   return {
     bill_id: bill?.id ?? null,
     table_id: tableId,
@@ -4211,7 +4651,126 @@ export async function GetBillForTable(
     last_order_at: orderRows.length > 0 && orderRows[orderRows.length - 1].created_at
       ? new Date(orderRows[orderRows.length - 1].created_at as Date).toISOString()
       : null,
+    // D2 — THE TABLE'S SERVICE CLOCK, the same figure the order feed carries per
+    // ticket, aggregated to the seating. ALWAYS RUNNING HERE by construction:
+    // this reader returns only the OPEN bill (status != 3 and closed_at is null)
+    // and only ACTIVE orders, so nothing it can see has been settled. It is
+    // stated as `settled_at: null` rather than left to a join that is not in this
+    // query, so the shape cannot quietly start lying if the filter ever changes.
+    //
+    // The start is the EARLIEST order, not the latest — see tableServiceClock:
+    // a guest ordering a second round must not reset how long they have been
+    // sitting there, which is the exact behaviour D2 is replacing.
+    service: tableServiceClock(orderRows.map((r) => ({ placed_at: r.created_at, settled_at: null }))),
+    // C3 — THE PRINT STATE OF THIS SEATING'S BILL, three fields because the
+    // shipped client reads three names and a field nobody reads is not a
+    // contract. `print_count` is the answer; `bill_printed_at` is the FIRST bill
+    // print (the one that used up a waiter's single attempt) and `printed_at` is
+    // the LATEST (so a till can say "last printed 19:42" without a second call).
+    // All three are 0/null on a table whose bill has never been printed, and on
+    // a deployment where migration 027 has not been applied — see
+    // billPrintHistoryForTable for why that degrades rather than throws.
+    // THE SAME THREE SPELLINGS THE /get-tables ROW NOW CARRIES. Written out
+    // rather than spread so a grep for either name finds BOTH payloads — see
+    // table_list_print_state.test.ts, which fails when either stops sending them.
+    print_count: prints.print_count,
+    bill_printed_at: prints.bill_printed_at,
+    printed_at: prints.printed_at,
   };
+}
+
+/**
+ * C3 — HOW MANY TIMES THIS TABLE'S CURRENT BILL HAS BEEN PRINTED, from the
+ * durable "PrintJobs" ledger (migration 027).
+ *
+ * WHY THE SERVER HAS TO ANSWER THIS. "Waiters can only execute Print Bill ONCE"
+ * was, until now, remembered per DEVICE. A per-device memory does not survive a
+ * reinstall, does not cross to the second tablet, and does not exist at all for
+ * a bare curl — so the rule meant something different on every device in the
+ * building, which is the same defect role_scope.ts and service_clock.ts were
+ * written to end. There is one restaurant; there has to be one count.
+ *
+ * WHICH JOBS COUNT, AND WHICH BELONG TO THIS SEATING, is bill_print_state.ts's
+ * rule now, not this function's — because the FLOOR GRID asks the same question
+ * of a different payload and a second copy of the rule is how the release
+ * preflight and the bill math ended up disagreeing about status 6. This is the
+ * one-table wrapper over billPrintStateForSeatings below; both /bill-for-table
+ * and /get-tables reduce through the same module and return the same three
+ * field names.
+ */
+async function billPrintHistoryForTable(
+  context: RestaurantContext,
+  tableId: string,
+  openBillId: string | null,
+  tableName: string,
+  seatingStart: Date | string | null,
+): Promise<BillPrintState> {
+  // `tableId` is not in the predicate — bill_id already identifies the bill, and
+  // the fallback shape is per-table-name. It is taken so callers cannot pass a
+  // name and an id that disagree, and so this signature does not have to change
+  // when the fallback shape eventually goes away.
+  void tableId;
+  const seatings = [{ open_bill_id: openBillId, table_name: tableName, seating_start: seatingStart }];
+  const byName = await billPrintStateForSeatings(context, seatings);
+  return byName.get(tableName) ?? NO_BILL_PRINTS;
+}
+
+/**
+ * THE SAME QUESTION FOR MANY TABLES AT ONCE — what /get-tables needs.
+ *
+ * ONE query, not one per table. /get-tables is the most-polled endpoint in the
+ * product and a per-table aggregate would add forty round trips to every poll of
+ * every device on the floor. The rows are fetched with the cheap, index-served
+ * half of the predicate (tenant, kind, status, and a lower time bound that is the
+ * EARLIEST seating any caller asked about) and the expensive half — which bill
+ * each job is addressed to, and which seating it falls inside — is decided by
+ * bill_print_state.ts, the one module both payloads reduce with.
+ *
+ * THE LIKE PATTERN IS GONE, and that is a fix rather than a port: matching
+ * `<table name>-%` in SQL meant escaping LIKE metacharacters, and a table called
+ * "T_1" would otherwise have counted "TX1-…" as its own print. A prefix test in
+ * TypeScript has no metacharacters to escape.
+ *
+ * DEGRADES, NEVER THROWS. On a deployment where migration 027 has not been
+ * applied this raises 42P01/42501; captureRead turns that into "nothing has been
+ * printed", which is exactly the behaviour before C3 existed and lets the
+ * restaurant keep printing. A floor plan that 500s because its print ledger is
+ * one migration behind would be a far worse outage than the rule it enforces.
+ */
+async function billPrintStateForSeatings(
+  context: RestaurantContext,
+  seatings: readonly BillPrintSeating[],
+): Promise<Map<string, BillPrintState>> {
+  const out = new Map<string, BillPrintState>();
+  for (const s of seatings) { out.set(s.table_name, NO_BILL_PRINTS); }
+  if (seatings.length === 0) { return out; }
+
+  // The lower bound is the EARLIEST seating asked about; each table's own bound
+  // is then applied per row by billPrintJobBelongsToSeating. A seating with no
+  // start at all (a table with neither a bill nor an order) removes the bound —
+  // it cannot be narrowed without dropping prints that belong to somebody.
+  let floor: number | null = null;
+  for (const s of seatings) {
+    if (s.seating_start === null || s.seating_start === undefined) { floor = null; break; }
+    const t = new Date(s.seating_start as string | number | Date).getTime();
+    if (!Number.isFinite(t)) { floor = null; break; }
+    floor = floor === null ? t : Math.min(floor, t);
+  }
+
+  const rows = await captureRead("PrintJobs", () => runQuery<BillPrintJobRow>(
+    `select bill_id, created_at from "PrintJobs"
+      where res_id = $1 and outlet_id = $2 and kind = $3
+        and status = any($4::text[])
+        and ($5::timestamptz is null or created_at >= $5)`,
+    [
+      context.res_id, context.outlet_id, BILL_PRINT_JOB_KIND,
+      [...COUNTED_PRINT_JOB_STATUSES],
+      floor === null ? null : new Date(floor).toISOString(),
+    ],
+  ), [] as BillPrintJobRow[]);
+
+  for (const s of seatings) { out.set(s.table_name, summarizeBillPrints(rows, s)); }
+  return out;
 }
 
 export async function AddBooking(
@@ -4428,7 +4987,7 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null }[] | null> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
@@ -4533,27 +5092,49 @@ export async function GetTables(
   const bookedTables = new Set(active.flat());
   const reservedTables = new Set(upcoming.flat());
 
-  // Tables whose open bill is awaiting staff approval (customer paid via QR).
-  const pendingRows = await runQuery<{ table_id: string | null }>(
+  // THE OPEN BILLS ON THIS FLOOR — read ONCE and used for two things.
+  //
+  // It used to be `select distinct table_id ... and waiter_confirmed_at is not
+  // null and admin_approved_at is null`, answering only "which tables are
+  // awaiting approval". C3's print state needs the open bill's ID and the
+  // instant it was opened for the same tables, so the predicate is widened to
+  // every open bill and the pending test moves into TypeScript, byte-for-byte
+  // (`status <> 3`, waiter-confirmed, not admin-approved). ONE query still, and
+  // the floor plan does not pay a second round trip for the print fields.
+  const openBillRows = await runQuery<{ id: string; table_id: string | null; created_at: Date | null; status: unknown; waiter_confirmed_at: Date | null; admin_approved_at: Date | null }>(
     `
-      select distinct table_id
+      select id, table_id, created_at, status, waiter_confirmed_at, admin_approved_at
       from "Bills"
       where res_id = $1 and outlet_id = $2 and table_id is not null
-        and closed_at is null and status <> 3
-        and waiter_confirmed_at is not null and admin_approved_at is null
+        and closed_at is null
     `,
     [context.res_id, context.outlet_id],
-  ).catch(() => [] as { table_id: string | null }[]);
-  const pendingTables = new Set(pendingRows.map((r) => r.table_id).filter(Boolean));
+  ).catch(() => [] as { id: string; table_id: string | null; created_at: Date | null; status: unknown; waiter_confirmed_at: Date | null; admin_approved_at: Date | null }[]);
+  const pendingTables = new Set(
+    openBillRows
+      .filter((r) => Math.round(parseNumeric(r.status)) !== 3 && r.waiter_confirmed_at != null && r.admin_approved_at == null)
+      .map((r) => r.table_id)
+      .filter(Boolean),
+  );
+  // The open bill per table, newest first, so a table that somehow carries two
+  // open rows is described by the one the till is actually running.
+  const openBillByTable = new Map<string, { id: string; created_at: Date | null }>();
+  for (const b of [...openBillRows].sort((a, z) => (new Date(z.created_at ?? 0).getTime()) - (new Date(a.created_at ?? 0).getTime()))) {
+    if (b.table_id && !openBillByTable.has(b.table_id)) { openBillByTable.set(b.table_id, { id: b.id, created_at: b.created_at }); }
+  }
 
   // Per-table running total (active orders) → APC status vs the restaurant target.
   const target = await getTargetApc(context).catch(() => 0);
-  const activeOrders = await runQuery<{ table_id: string | null; food: unknown }>(
-    `select table_id, food from "Orders"
-       where res_id = $1 and outlet_id = $2 and coalesce(status::text, '1') not in ('4', '5', '7')`,
+  // created_at rides along for C3: when a table has no "Bills" row yet, its
+  // seating starts at the EARLIEST still-owing order — the same fallback
+  // GetBillForTable uses, so both payloads bound a seating identically.
+  const activeOrders = await runQuery<{ table_id: string | null; food: unknown; created_at: Date | null }>(
+    `select table_id, food, created_at from "Orders"
+       where res_id = $1 and outlet_id = $2 and ${stillOwesStatusSql()}`,
     [context.res_id, context.outlet_id],
-  ).catch(() => [] as { table_id: string | null; food: unknown }[]);
+  ).catch(() => [] as { table_id: string | null; food: unknown; created_at: Date | null }[]);
   const totalByTable = new Map<string, number>();
+  const firstOrderAtByTable = new Map<string, number>();
   // WHICH TABLES HAVE AN ORDER ON THEM - tracked as its own set rather than
   // inferred from a total, because a table can genuinely be running a bill of
   // ZERO (every line comped under migration 034, or a round that has only been
@@ -4566,7 +5147,43 @@ export async function GetTables(
     const p = parseJsonObject(o.food) ?? {};
     const t = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     totalByTable.set(o.table_id, (totalByTable.get(o.table_id) ?? 0) + t);
+    const placed = o.created_at ? new Date(o.created_at).getTime() : NaN;
+    if (Number.isFinite(placed)) {
+      const seen = firstOrderAtByTable.get(o.table_id);
+      if (seen === undefined || placed < seen) { firstOrderAtByTable.set(o.table_id, placed); }
+    }
   }
+
+  // C3 — THE PRINT STATE OF EVERY TABLE'S CURRENT BILL, in ONE query for the
+  // whole floor.
+  //
+  // THIS IS THE FIELD THE FLOOR GRID WAS ALREADY READING AND NOBODY WAS SENDING.
+  // The Flutter grid decides whether a printed table leaves a waiter's screen by
+  // asking this row for print state; the row never carried any, so it fell
+  // through to a per-DEVICE memory that survives neither a reinstall nor a
+  // second tablet — one restaurant with a different answer per device, which is
+  // the defect C3 exists to remove. bill_print_state.ts holds the rule and BOTH
+  // payloads reduce through it.
+  //
+  // The seating bound is the open bill's created_at, or the earliest still-owing
+  // order when there is no bill row yet — exactly GetBillForTable's fallback.
+  // A table with neither has nothing to have printed, so it is left out of the
+  // read entirely rather than dropping the time bound for the whole floor.
+  const printSeatings: BillPrintSeating[] = [];
+  for (const row of tableRows) {
+    const bill = openBillByTable.get(row.id) ?? null;
+    const billAt = bill?.created_at ? new Date(bill.created_at).getTime() : null;
+    const orderAt = firstOrderAtByTable.get(row.id) ?? null;
+    const start = billAt !== null && Number.isFinite(billAt) ? billAt : orderAt;
+    if (start === null) { continue; }
+    printSeatings.push({ open_bill_id: bill?.id ?? null, table_name: row.table_name, seating_start: new Date(start) });
+  }
+  // Never fails the floor plan: billPrintStateForSeatings already degrades to
+  // "nothing printed" when migration 027 is not applied, and this catch covers
+  // everything else for the same reason — a grid that 500s is a worse outage
+  // than a print flag that reads 0.
+  const printStateByTable = await billPrintStateForSeatings(context, printSeatings)
+    .catch(() => new Map<string, BillPrintState>());
 
   // The outlet's chosen section order (migration 041), so the floor plan groups
   // in the order the owner arranged rather than alphabetically.
@@ -4595,6 +5212,7 @@ export async function GetTables(
     const tCovers = Math.max(1, parseNumeric(row.num_covers) ?? 1);
     const tTotal = totalByTable.get(row.id) ?? 0;
     const tApc = occupied && tTotal > 0 ? round2(tTotal / tCovers) : 0;
+    const prints = printStateByTable.get(row.table_name) ?? NO_BILL_PRINTS;
     return {
       table_name: row.table_name,
       capacity: parseNumeric(row.capacity),
@@ -4652,6 +5270,16 @@ export async function GetTables(
       // shown anywhere, and a stale code left on a row from a previous ON period
       // must not leak back into the UI when the toggle is flipped off.
       order_otp: requireOtp ? (row.order_otp ?? null) : null,
+      // C3 — THE PRINT STATE OF THIS TABLE'S CURRENT BILL. THE SAME THREE
+      // SPELLINGS /bill-for-table carries, because the floor grid reads the same
+      // three names off this row and a client read with no server field behind
+      // it is not a contract — it is a per-device guess wearing one. All three
+      // are 0/null on a table whose bill has never been printed, on a table with
+      // no seating at all, and on a deployment where migration 027 has not been
+      // applied. table_list_print_state.test.ts fails if they stop being sent.
+      print_count: prints.print_count,
+      bill_printed_at: prints.bill_printed_at,
+      printed_at: prints.printed_at,
     };
   });
 }
@@ -10180,6 +10808,12 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
     String(stationById.get(String(entry?.menu_id ?? "")) ?? stationById.get(String(entry?.id ?? "")) ?? stationByName.get(String(entry?.name ?? "").trim().toLowerCase()) ?? "").trim().toLowerCase();
   const entryMatches = (entry: any): boolean => entryStation(entry) === stationFilter;
 
+  // ONE INSTANT FOR THE WHOLE PAYLOAD (D2). Every order's service clock is
+  // measured against the same `nowMs`, so two tickets placed a second apart
+  // never come back with durations that imply the response took a second to
+  // build. It is also what `as_of` on each clock refers to.
+  const clockNowMs = Date.now();
+
   const result = rows.map((row) => {
     const payload = parseJsonObject(row.food) ?? {};
     // payload may contain a tuple-form items_split or legacy items array
@@ -10272,6 +10906,18 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       // When the row last CHANGED (status move, item edit, settle). NULL means
       // "never touched since the column existed" — see ensureRecordTimestampColumns.
       updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+      // D2 — THE FIGURE THAT REPLACES THE KOT TIME ON A TABLE'S ORDER: placed ->
+      // settled, measured on the server. ADDITIVE: every field above is
+      // unchanged, so a shipped client that has never heard of `service` renders
+      // exactly what it renders today.
+      //
+      // `bill_closed_at` is the end, NOT waiter_confirmed_at or
+      // admin_approved_at. A bill whose payment method has been recorded is not
+      // a bill that has been paid — ConfirmBillPaymentByWaiter leaves the bill
+      // OPEN and moves the order to "Payment Pending Approval" — so stopping the
+      // clock there would report a table as finished while the money is still
+      // outstanding and the guests are still sitting there.
+      service: serviceClock({ placed_at: row.created_at, settled_at: row.closed_at }, clockNowMs),
     };
 
     // include flattened and split representations if available
@@ -12361,21 +13007,110 @@ export async function GetExpoView(restaurantId: string): Promise<{ tables: ExpoT
   return { tables };
 }
 
+/**
+ * ============================================================================
+ * STRIPPING A TABLE'S LINES IS A WRITE-OFF, AND THIS IS WHERE THAT IS ENFORCED.
+ * ============================================================================
+ * THE HOLE. This function re-prices an order to whatever lines remain. Remove
+ * every line and the subtotal is 0 and the total is 0 WHILE THE ORDER STAYS
+ * ACTIVE — no cancellation, so no reason, no "OrderVoids" row, nothing in the
+ * void report. GetTableReleaseImpact then computes 0 for the table, the release
+ * write-off gate waves the release through, and the audit line reads like a
+ * waiter freeing an empty table. Its route, DELETE /orders/:id/items/:itemId, is
+ * gated on 4ad474d4 "Add Orders", which the CORE WAITER ROLE holds. That is the
+ * same money leaving by a sixth door, and it is the worst of them because it
+ * DEFEATS the release gate rather than going around it.
+ *
+ * THE SAME JUDGEMENT AS EVERY OTHER DOOR, NOT A SIXTH COPY OF IT. The verdict is
+ * mayDiscountBill (discount_authority.ts) — the identical function
+ * SetBillDiscountWithApproval and ApplyCouponToBill ask, sized in rupees on what
+ * is HANDED BACK, and answered with PERM_CLOSE_BILL, never a new Action uuid
+ * (migration 025: a new id strips the capability from every role that holds it
+ * today). If a waiter may not discount 3,000 off this table, they may not strip
+ * 3,000 of lines off it either: the instrument is not the question.
+ *
+ * REMOVING ONE MIS-KEYED LINE STAYS INSTANT. That is the other half of the rule
+ * and the half a narrow fix gets wrong. A waiter who must fetch a manager to
+ * take off a wrongly-rung 180 starter will stop correcting wrong entries, and a
+ * worked-around rule protects nothing. mayDiscountBill refuses only write-off
+ * scale: more than HALF the table handed back, or (with no approval queue in
+ * play) more than DEFAULT_FLOOR_DISCOUNT_CEILING in rupees.
+ *
+ * THE JUDGEMENT IS CUMULATIVE, BECAUSE A PER-LINE RULE HAS AN OBVIOUS EVASION.
+ * Six deletions of a sixth each defeat any rule stated about one line. So the
+ * baseline is the table as it stood BEFORE any of this seating's strips — what
+ * it is worth now PLUS everything already ledgered as stripped off it
+ * (strippedItemVoidValue) — and the money handed back is everything already
+ * stripped PLUS this write. The gate therefore grades a removal against the
+ * table the guest sat down to, not against the table the previous five removals
+ * left behind.
+ *
+ * AND IT STILL HOLDS IF THE CUMULATIVE READ IS DEAD. On a tenant that has not
+ * applied migration 035 the prior-strip figure degrades to 0, and the gate falls
+ * back to measuring each write against what REMAINS. That alone makes zero
+ * unreachable: the removal that empties a table is by definition 100% of what is
+ * left, which is the first limb's clearest case. The cumulative read is what
+ * additionally stops "strip it down to a fifth and then release it".
+ *
+ * `approvalThreshold` IS PASSED AS 0 ON PURPOSE — see discount_authority.ts's
+ * limb 2, which yields to a tenant that has configured its own threshold BECAUSE
+ * that tenant then has the DiscountRequests queue as its answer to a large
+ * discount. There is no approval queue for stripping a line. Passing the
+ * tenant's discount threshold here would switch the magnitude limb off for an
+ * instrument the threshold has no workflow for; passing 0 states the truth about
+ * this path, and is not a second judgement.
+ *
+ * `opts.actions` ABSENT IS TREATED AS EMPTY, NEVER AS "SKIP THE CHECK" — the
+ * same posture, and for the same reason, as SetBillDiscountWithApproval's own
+ * `actions` parameter: a caller that forgets to pass them is refused a write-off
+ * rather than granted one, which is the only safe direction for a missing input
+ * on a money gate. One caller is currently un-wired,
+ * PATCH /bills/order/:orderId/status (routes/bills.ts), which accepts a whole
+ * items_split. That route exists to move lines between the Served and Preparing
+ * tuples, and a payload that does that hands back nothing and is untouched here;
+ * only a payload that destroys more than half a table's value through it is
+ * refused, and that is not what the route is for. Wiring it is one line —
+ * `{ actions: req.auth?.actions ?? [] }` — and belongs to that file's owner.
+ */
 export async function UpdateOrderItemsSplit(
   restaurantId: string,
   orderId: string,
   items_split: any[],
+  opts?: {
+    /** The caller's granted actions. Absent = empty = refused a write-off. */
+    actions?: readonly string[] | null;
+    /** PERM_CLOSE_BILL, from routes/_shared.ts. Never a new uuid — see above. */
+    closeBillPermission?: string;
+    /**
+     * The owner, short-circuiting the gate — the same escape the discount, coupon
+     * and loyalty gates carry, and it is here because its absence was a REAL
+     * REGRESSION rather than a tidiness point: one call site
+     * (PATCH /bills/order/:orderId/status) passed no identity at all, so an
+     * ADMIN was judged against an empty action set and refused their own
+     * items-split. A write-off gate that refuses the person allowed to write
+     * bills off is not a stricter gate; it is a broken screen.
+     */
+    isAdmin?: boolean;
+  },
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
   if (!Array.isArray(items_split)) {throw new Error('items_split must be an array');}
-  await assertOrderStatusEditable(context, orderId);
+  // `refuseWhilePaymentPending` — status 6 is the window between the guest paying
+  // and the bill being approved, and ApproveBillPaymentByAdmin RE-PRICES at
+  // approval. A line stripped in that window settles the bill at a number the
+  // guest has already overpaid, with no record that anything went. This is the
+  // caller that edits order CONTENT, so this is the caller that opts in; see the
+  // guard's header for the callers that must not.
+  await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
 
   // build flattened items
   const flattened = (items_split).flatMap((t) => Array.isArray(t[1]) ? t[1] : []);
 
   // fetch existing order to preserve other fields
-  const existing = await runQuery<{ food: unknown }>(
-    `select food from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+  // `table_id` rides along for the write-off gate below, which judges the whole
+  // TABLE rather than this one order — see the header.
+  const existing = await runQuery<{ food: unknown; table_id: string | null }>(
+    `select food, table_id from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
     [orderId, context.res_id, context.outlet_id],
   );
   if (!existing[0]) {throw new Error('Order not found');}
@@ -12401,6 +13136,97 @@ export async function UpdateOrderItemsSplit(
       return acc + parseNumeric(item.price) * Math.max(1, parseNumeric(item.quantity) || 1);
     }, 0),
   );
+
+  // ==========================================================================
+  // THE WRITE-OFF GATE. See this function's header for the rule and the reuse.
+  // ==========================================================================
+  // MEASURED ON THE CHARGEABLE LINES ON BOTH SIDES, so a comped line (migration
+  // 034) cannot make a removal look bigger or smaller than it is: the money it
+  // represents was already given away by somebody who held PERM_NON_CHARGEABLE,
+  // and it is already out of every figure the table is judged by.
+  const chargeableOf = (raw: unknown[]): number => chargeableSubtotal(
+    raw.map((r) => (parseJsonObject(r) ?? {}) as { price?: unknown; quantity?: unknown; nc?: unknown }),
+  );
+  const previousLines = Array.isArray(payload.items) ? payload.items as unknown[] : [];
+  const previousChargeable = chargeableOf(previousLines);
+  const nextChargeable = chargeableOf(flattened as unknown[]);
+  // What THIS write hands back. Additions and pure re-labelling (drag a line from
+  // Preparing to Served) hand back nothing, cost no extra read, and are untouched
+  // by everything below — which is what keeps the everyday paths instant.
+  const handedBackNow = round2(Math.max(0, previousChargeable - nextChargeable));
+
+  const closeBillPermission = opts?.closeBillPermission ?? CLOSE_BILL_ACTION_ID;
+  const callerActions = Array.isArray(opts?.actions) ? opts.actions.map((a) => String(a).trim()) : [];
+  // `isAdmin` FIRST, and it is not belt-and-braces: the regression this closes was
+  // a call site that passed no identity at all, so an admin met an empty action
+  // set and was refused their own items-split. An owner resolved by
+  // callerIsAdmin() does not always carry a literal "*" in `actions`, so asking
+  // only the action set is exactly the question that got this wrong once.
+  const mayWriteOff = opts?.isAdmin === true
+    || callerActions.includes("*")
+    || callerActions.includes(closeBillPermission);
+  // THE READS ARE SKIPPED ENTIRELY FOR ANYONE WHO ALREADY HOLDS Close Bill, for
+  // the reason the release gate skips its preflight: an owner, a manager, a
+  // cashier or a captain pays no extra query and meets no new failure mode on a
+  // check whose answer is already yes.
+  if (handedBackNow > 0 && !mayWriteOff) {
+    const tableId = existing[0].table_id;
+    let baselineNow = previousChargeable;
+    if (tableId) {
+      // The SAME read GetTableReleaseImpact makes, reduced by the SAME function,
+      // so "what is this table worth" has one answer whichever gate asks it.
+      const siblingRows = await runQuery<{ food: unknown; status: unknown }>(
+        `select food, status from "Orders"
+          where res_id = $1 and outlet_id = $2 and table_id = $3
+            and ${stillOwesStatusSql()}`,
+        [context.res_id, context.outlet_id, tableId],
+      );
+      baselineNow = activeOrderSubtotal(siblingRows).subtotal;
+    }
+    // A ticket with no table (takeaway, delivery, an aggregator order) is its own
+    // session, so the order is the scope.
+    const alreadyStripped = await strippedItemVoidValue(
+      context, tableId ? { tableId } : { orderId },
+    );
+    // The table as the guest sat down to it, and everything handed back off it.
+    const subtotal = round2(baselineNow + alreadyStripped.value);
+    const discount_amount = round2(alreadyStripped.value + handedBackNow);
+
+    const verdict = mayDiscountBill({
+      actions: callerActions,
+      impact: { subtotal, discount_amount },
+      // 0, not the tenant's discount threshold — see the header.
+      approvalThreshold: 0,
+      closeBillPermission,
+    });
+    if (!verdict.allowed) {
+      // The table's NAME, read only on the refusal path: the waiter standing at
+      // the table is the person best placed to notice it is the wrong one, and
+      // the sentence is much weaker without it. A name that cannot be read
+      // degrades to the order id rather than failing the refusal.
+      const namedRows = tableId
+        ? await runQuery<{ table_name: string }>(
+          `select table_name from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+          [tableId, context.res_id, context.outlet_id],
+        ).catch(() => [] as { table_name: string }[])
+        : [];
+      const named = namedRows[0]?.table_name ?? "";
+      const where = named ? ` on table ${named}` : ` from order ${orderId}`;
+      const cumulative = alreadyStripped.value > 0
+        ? ` ${String(alreadyStripped.lines)} line(s) worth \u20b9${alreadyStripped.value.toFixed(2)} have already come off this table, and this one counts with them.`
+        : "";
+      // NAMES THE PERMISSION AND EVERY NUMBER, for the same reason
+      // enforceSettleAuthority's, mayReleaseTable's and the discount refusal's
+      // messages do: "Forbidden" sends an owner hunting through the role editor
+      // and tells the waiter at the table nothing at all.
+      const details =
+        `Removing this line${where} would hand back \u20b9${handedBackNow.toFixed(2)} of a \u20b9${subtotal.toFixed(2)} table and leave only \u20b9${verdict.remaining_value.toFixed(2)} on it.`
+        + cumulative
+        + ` Taking most of a table's value back off the bill is the same act as writing the bill off, so it requires the 'Close Bill' permission.`
+        + ` Remove fewer items, or ask a manager.`;
+      throw new DiscountAuthorityError({ ...verdict, details }, closeBillPermission);
+    }
+  }
 
   // include status in the food JSON payload so UI can read textual status
   const newPayload = {
@@ -12938,8 +13764,14 @@ function activeOrderSubtotal(
   for (const r of rows) {
     // Only the CURRENT occupancy counts: skip cancelled/paid/closed orders so a
     // re-occupied table never re-sums a previous session's (closed) orders.
-    const st = String(fromOrderStatusCode(r.status) ?? "").toLowerCase();
-    if (st === "cancelled" || st === "paid" || st === "closed") {continue;}
+    //
+    // THE PREDICATE IS NOT WRITTEN HERE ANY MORE. It used to be a hand-rolled
+    // name test — cancelled/paid/closed — sitting next to twelve SQL copies of
+    // the same list and one that had already drifted (the release preflight also
+    // excluded status 6, so it read ₹0 for orders this reduction was charging
+    // for). Both halves now come from billing_math.ts. Behaviour is unchanged:
+    // orderStatusStillOwes excludes exactly 4, 5 and 7.
+    if (!orderStatusStillOwes(r.status)) {continue;}
     const p = parseJsonObject(r.food) ?? {};
     // This sum is the PRE-TAX base that computeBillCharges then adds service
     // charge and taxes to, so it must never include them. Prefer the order's
@@ -12995,17 +13827,51 @@ async function tableIdByName(context: RestaurantContext, tableName: string, clie
 // bill) from a table's active orders — across however many orders it spans.
 // Recomputes order totals (voids empty orders) and re-syncs the open bill.
 // Returns the removed aggregate, or null if nothing matched.
+/** One line exactly as it sat on the bill, so a move can put it back unchanged. */
+export interface RemovedBillLine {
+  name: string;
+  price: number;
+  quantity: number;
+}
+
+/**
+ * WHY THIS RETURNS EVERY LINE AND NOT A SUMMARY — the money hole it closes.
+ *
+ * This helper matches on NAME, and matches on price only when the caller gave
+ * one (`/bills/move-item` sends `Number(body.price ?? 0) || 0`, so an omitted
+ * price means "any price"). It therefore routinely removes SEVERAL lines in one
+ * call — the same dish ordered twice, or the same dish at two different
+ * VARIATION prices, which migration 039 made ordinary.
+ *
+ * It used to collapse all of that into one `{ name, price, quantity }`, where
+ * `price` was whichever line happened to be matched LAST and `quantity` was the
+ * SUM across every line. MoveBillItem then rebuilt the destination as
+ * `price x quantity` — so a table holding "Biryani" at 1,000 and a half portion
+ * of "Biryani" at 400 lost 1,400 and the destination gained 800.
+ *
+ * FOUR HUNDRED RUPEES LEFT THE HOUSE'S BOOKS and nothing looked stripped: the
+ * source table shows an item moved away, the destination shows it arrive, the
+ * bill total simply differs. It is not caught by any of the write-off gates
+ * because a move is not a write-off — value is supposed to be CONSERVED, and
+ * conservation is exactly what the collapse broke. The reverse case is worse in
+ * a different way: when the last match is the dearer line, the guest at the
+ * DESTINATION table is overcharged for a dish they did receive.
+ *
+ * So every removed line is returned as it stood. The `{ name, price, quantity }`
+ * summary is kept for the callers and the audit line that already read it, and
+ * `value` is the one number a move must preserve.
+ */
 async function removeItemFromTableOrders(
   context: RestaurantContext,
   tableId: string,
   itemName: string,
   itemPrice: number,
   client: PoolClient,
-): Promise<{ name: string; price: number; quantity: number } | null> {
+): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number } | null> {
   const orders = await runQuery<{ id: string; food: unknown }>(
     `select id, food from "Orders"
        where res_id = $1 and outlet_id = $2 and table_id = $3
-         and coalesce(status::text, '1') not in ('4','5','7')
+         and ${stillOwesStatusSql()}
      order by created_at asc`,
     [context.res_id, context.outlet_id, tableId],
     client,
@@ -13018,6 +13884,7 @@ async function removeItemFromTableOrders(
   let removedName = "";
   let removedPrice = 0;
   let removedQty = 0;
+  const removedLines: RemovedBillLine[] = [];
 
   for (const o of orders) {
     const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
@@ -13025,7 +13892,18 @@ async function removeItemFromTableOrders(
     const keep = items.filter((it) => !matches(it));
     if (keep.length === items.length) {continue;} // nothing removed from this order
     for (const it of items) {
-      if (matches(it)) { removedName = String(it?.name ?? "Item"); removedPrice = Number(it?.price) || 0; removedQty += Math.max(1, Math.round(Number(it?.quantity) || 1)); }
+      if (!matches(it)) {continue;}
+      const lineName = String(it?.name ?? "Item");
+      // Clamped for the same reason order entry is: a line that somehow carries a
+      // negative price must not pay the guest on the way to another table.
+      const safe = clampLineCharge(it as { price?: unknown; quantity?: unknown });
+      const lineQty = Math.max(1, Math.round(safe.quantity));
+      removedLines.push({ name: lineName, price: safe.price, quantity: lineQty });
+      // The summary the existing callers and the audit line read. `price` is the
+      // FIRST match rather than the last, so the name and the price in the audit
+      // sentence describe the same line; `lines` is what money is computed from.
+      if (removedQty === 0) { removedName = lineName; removedPrice = safe.price; }
+      removedQty += lineQty;
     }
     let split = f.items_split;
     if (Array.isArray(split)) {
@@ -13053,7 +13931,8 @@ async function removeItemFromTableOrders(
     await runQuery(`update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4`,
       [consolidated, openBill[0].id, context.res_id, context.outlet_id], client);
   }
-  return { name: removedName || itemName, price: removedPrice, quantity: removedQty };
+  const value = round2(removedLines.reduce((sum, l) => sum + l.price * l.quantity, 0));
+  return { name: removedName || itemName, price: removedPrice, quantity: removedQty, lines: removedLines, value };
 }
 
 // Admin: remove a wrongly-added item (by name+price) from a table's bill.
@@ -13097,7 +13976,7 @@ async function assertTableSessionOpen(
   const rows = await runQuery<{ n: number | string }>(
     `select count(*)::int as n from "Orders"
        where res_id = $1 and outlet_id = $2 and table_id = $3
-         and coalesce(status::text, '1') not in ('4','5','7')`,
+         and ${stillOwesStatusSql()}`,
     [context.res_id, context.outlet_id, tableId],
     client,
   );
@@ -13166,7 +14045,7 @@ export async function SetBillItemNote(
     const orders = await runQuery<{ id: string; food: unknown }>(
       `select id, food from "Orders"
          where res_id = $1 and outlet_id = $2 and table_id = $3
-           and coalesce(status::text, '1') not in ('4','5','7')
+           and ${stillOwesStatusSql()}
        order by created_at asc`,
       [context.res_id, context.outlet_id, tableId],
       client,
@@ -13224,12 +14103,25 @@ export async function MoveBillItem(
       [toId, context.res_id, context.outlet_id], client);
 
     const newOrderId = randomUUID();
-    const lineTotal = round2(moved.price * moved.quantity);
+    // EVERY LINE THAT LEFT THE SOURCE, AT THE PRICE IT LEFT AT.
+    //
+    // This used to be a single line priced `moved.price x moved.quantity`, which
+    // is only correct when exactly one line matched — and `/bills/move-item`
+    // matches on NAME ALONE whenever the caller omits a price, which the web
+    // dashboard does. Two "Biryani" lines at different variation prices then
+    // left the source at their real prices and arrived as two of the cheaper
+    // one. See removeItemFromTableOrders' header for the money that went
+    // missing. A move must CONSERVE: what the destination gains is exactly what
+    // the source lost, line for line.
+    const movedItems = moved.lines.map((l) => ({
+      id: randomUUID(), name: l.name, price: l.price, quantity: l.quantity,
+    }));
+    const lineTotal = round2(movedItems.reduce((sum, l) => sum + l.price * l.quantity, 0));
     const food = {
       id: newOrderId,
       table: toTable.trim(),
       customer: "Moved item",
-      items: [{ id: randomUUID(), name: moved.name, price: moved.price, quantity: moved.quantity }],
+      items: movedItems,
       subtotal: lineTotal,
       total: lineTotal,
       taxes: [],
@@ -13413,7 +14305,21 @@ export async function SetBillDiscountWithApproval(
   tableName: string,
   typeRaw: unknown,
   valueRaw: unknown,
-  opts: { isAdmin: boolean; requestedBy?: string | null; reason?: string | null },
+  opts: {
+    isAdmin: boolean;
+    requestedBy?: string | null;
+    reason?: string | null;
+    /**
+     * THE CALLER'S GRANTED ACTIONS, so the write-off gate below can run where the
+     * subtotal is read. Absent is treated as EMPTY, never as "skip the check":
+     * a caller that forgets to pass them is refused a write-off rather than
+     * granted one, which is the only safe direction for a missing input on a
+     * money gate. Ordinary discounts are unaffected either way.
+     */
+    actions?: readonly string[] | null;
+    /** PERM_CLOSE_BILL, from routes/_shared.ts. Never a new uuid — see below. */
+    closeBillPermission?: string;
+  },
 ): Promise<BillDiscountOutcome> {
   await ensureDiscountRequestsTable();
   return withTransaction(async (client) => {
@@ -13434,12 +14340,47 @@ export async function SetBillDiscountWithApproval(
 
     if (type !== null && !opts.isAdmin) {
       const threshold = await getDiscountApprovalThreshold(context.res_id, client);
-      if (threshold > 0) {
-        // Size the discount the same way the bill math will (percent off the
-        // items subtotal, flat clamped to it) so the gate matches what would be given.
-        const subtotal = await sumOrderTotalsForTable(context, tableId, client);
-        const amount = type === "flat" ? round2(Math.min(value, subtotal)) : round2((subtotal * Math.min(value, 100)) / 100);
-        if (amount > threshold) {
+      // Size the discount the same way the bill math will (percent off the items
+      // subtotal, flat clamped to it) so both gates below match what would be
+      // given. Read ONCE and used twice — the write-off gate and the approval
+      // queue must be deciding about the same number.
+      const subtotal = await sumOrderTotalsForTable(context, tableId, client);
+      const amount = type === "flat" ? round2(Math.min(value, subtotal)) : round2((subtotal * Math.min(value, 100)) / 100);
+
+      // ======================================================================
+      // THE WRITE-OFF GATE — BEFORE the approval queue, and independent of it.
+      // ======================================================================
+      // A 100% discount zeroes a bill, and 4ad474d4 "Add Orders" (this route's
+      // gate) is held by the core WAITER role. The approval queue was said to
+      // cover this; it does not on a default tenant, because
+      // discount_approval_threshold DEFAULTS TO 0 and the queue only engages
+      // above zero (see getDiscountApprovalThreshold, and the `if (threshold > 0)`
+      // below). discount_authority.ts holds the rule and argues where the line
+      // sits; it refuses only WRITE-OFF-sized discounts, so the ordinary ₹50 a
+      // floor gives is untouched.
+      //
+      // IT RUNS HERE, INSIDE THE TRANSACTION, rather than in the route, because
+      // the subtotal it is sized against is read here: a route-level pre-check
+      // would decide on a number another order could change before the write.
+      //
+      // THE SAME UUID AS SETTLING AND RELEASING. No new Action id is minted
+      // (migration 025's rule) — a new one would strip the capability from every
+      // role that holds it today. CORE_ROLES.manager, .cashier and .captain all
+      // carry a953d044 and an admin passes on "*", so nobody who runs a till
+      // loses anything here.
+      const verdict = mayDiscountBill({
+        actions: opts.actions ?? [],
+        impact: { subtotal, discount_amount: amount },
+        approvalThreshold: threshold,
+        closeBillPermission: opts.closeBillPermission ?? CLOSE_BILL_ACTION_ID,
+        tableName: tableName.trim(),
+      });
+      if (!verdict.allowed) {
+        throw new DiscountAuthorityError(verdict, opts.closeBillPermission ?? CLOSE_BILL_ACTION_ID);
+      }
+
+      if (threshold > 0 && amount > threshold) {
+        {
           const billId = await ensureOpenBillIdForTable(context, tableId, client);
           const requestedBy = opts.requestedBy
             ? (await resolveEmployeeByUsername(context, opts.requestedBy, client))?.username ?? opts.requestedBy
@@ -13495,11 +14436,61 @@ export async function GetDiscountRequests(
 // Admin approves (or rejects) a pending discount request. Approval applies the
 // discount to the bill through the SAME code path a direct discount uses; if the
 // bill was settled in the meantime the whole decision rolls back.
+/** A refusal that is about WHO decided, not about the money. */
+export class DiscountDecisionError extends Error {
+  readonly code = "DISCOUNT_DECISION_REFUSED";
+  readonly status = 403;
+  constructor(message: string) { super(message); this.name = "DiscountDecisionError"; }
+}
+
+export function isDiscountDecisionError(e: unknown): e is DiscountDecisionError {
+  return typeof e === "object" && e !== null && (e as { code?: unknown }).code === "DISCOUNT_DECISION_REFUSED";
+}
+
+/**
+ * APPROVE OR REJECT A PARKED DISCOUNT — and the two things that were missing.
+ *
+ * ONE: THE SAME PERSON COULD ASK AND ANSWER.
+ *
+ * The approval queue exists for exactly one reason - a discount above the
+ * tenant's threshold needs a SECOND pair of eyes. Nothing checked that the eyes
+ * were different. Anyone holding "Approve Discounts" could raise a request and
+ * approve it in the very next call, and the audit trail then read as a properly
+ * reviewed decision: requested_by raju, decided_by raju, status approved. That is
+ * not a weaker control than having no queue; it is a control that actively
+ * misreports. An ADMIN is exempt, because an admin never needed the queue in the
+ * first place - SetBillDiscountWithApproval hands them the discount directly - so
+ * refusing them here would only make them take the other door.
+ *
+ * TWO: THE REQUEST WAS JUDGED WHEN IT WAS MADE, AND APPLIED MUCH LATER.
+ *
+ * The write-off gate runs at REQUEST time, against the table as it stood then.
+ * `discount_value` is stored and applied verbatim on approval - and for a FLAT
+ * discount that is a fixed number of rupees against a table that has since moved:
+ *
+ *     A 2,000 flat request off a 10,000 table passes (20%) and is parked.
+ *     Lines are legitimately removed; the table is now worth 2,100.
+ *     Approval applies 2,000 - a 95% write-off, decided by someone who holds
+ *     "Approve Discounts" and may hold nothing else.
+ *
+ * So the table is re-read and re-judged HERE, against what it is worth NOW, with
+ * the DECIDER's authority - which is the authority that should have counted all
+ * along. Nobody who runs a till is affected: Close Bill and the "*" wildcard pass
+ * mayDiscountBill at any size, and an ordinary discount passes for everyone.
+ */
 export async function DecideDiscountRequest(
   restaurantId: string,
   requestId: string,
   approve: boolean,
   decidedBy?: string | null,
+  opts?: {
+    /** The DECIDER's granted actions. Absent = empty = ordinary discounts only. */
+    actions?: readonly string[] | null;
+    /** PERM_CLOSE_BILL. Never a new uuid - migration 025's rule. */
+    closeBillPermission?: string;
+    /** The owner: exempt from both checks, for the reason in the header. */
+    isAdmin?: boolean;
+  },
 ): Promise<DiscountRequestRecord> {
   await ensureDiscountRequestsTable();
   return withTransaction(async (client) => {
@@ -13519,6 +14510,19 @@ export async function DecideDiscountRequest(
     if (!rows[0]) {throw new Error("Discount request not found or already decided");}
     const request = mapDiscountRequest(rows[0]);
 
+    // NOBODY ANSWERS THEIR OWN QUESTION. Checked for a REJECTION too: a requester
+    // who can reject their own request can also clear the queue of the evidence
+    // that they ever asked. Compared on the resolved username, which is what both
+    // sides are stored as - see the insert in SetBillDiscountWithApproval.
+    if (opts?.isAdmin !== true && decider && request.requested_by
+      && String(decider).trim().toLowerCase() === String(request.requested_by).trim().toLowerCase()) {
+      throw new DiscountDecisionError(
+        `This discount was requested by ${request.requested_by}, and the same person cannot decide it.`
+        + ` The approval queue exists so that a discount above the restaurant's threshold is seen by somebody else.`
+        + ` Ask a manager or the owner to decide it.`,
+      );
+    }
+
     if (approve) {
       const bill = await runQuery<{ id: string; table_id: string | null; closed_at: Date | null }>(
         `select id, table_id, closed_at from "Bills" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
@@ -13528,6 +14532,53 @@ export async function DecideDiscountRequest(
       if (!bill[0] || bill[0].closed_at || !bill[0].table_id) {
         throw new Error("The bill has already been settled — discount not applied");
       }
+
+      // RE-JUDGED AGAINST THE TABLE AS IT IS NOW, with the DECIDER's authority.
+      // Skipped entirely for anyone who already holds Close Bill, so an owner, a
+      // manager, a cashier or a captain pays no extra read - the same shape every
+      // other gate in this block uses.
+      const closeBillPermission = opts?.closeBillPermission ?? CLOSE_BILL_ACTION_ID;
+      const deciderActions = Array.isArray(opts?.actions) ? opts.actions.map((a) => String(a).trim()) : [];
+      const mayWriteOff = opts?.isAdmin === true
+        || deciderActions.includes("*")
+        || deciderActions.includes(closeBillPermission);
+      if (!mayWriteOff) {
+        // Sized the way the bill math will size it - percent off the CURRENT
+        // subtotal, flat clamped to it - so the gate and the write agree about the
+        // number, exactly as they do at request time.
+        const subtotalNow = await sumOrderTotalsForTable(context, bill[0].table_id, client);
+        const amountNow = request.discount_type === "flat"
+          ? round2(Math.min(request.discount_value, subtotalNow))
+          : round2((subtotalNow * Math.min(request.discount_value, 100)) / 100);
+        const verdict = mayDiscountBill({
+          actions: deciderActions,
+          impact: { subtotal: subtotalNow, discount_amount: amountNow },
+          // 0, not the tenant's threshold: the threshold decided whether this
+          // needed approving at all. This asks the separate question of whether
+          // approving it is a WRITE-OFF, and that line does not move per tenant.
+          approvalThreshold: 0,
+          closeBillPermission,
+          tableName: request.table_name ?? undefined,
+        });
+        if (!verdict.allowed) {
+          // ALWAYS STATED, because the drift is the whole point and it is not
+          // always visible in the AMOUNT: a flat request is clamped to the table,
+          // so a 2,000 ask against a 10,000 table and the same ask against a
+          // 2,100 table are both "2,000" - what moved is the TABLE. Naming both
+          // numbers is what lets the manager being fetched see it at a glance.
+          const drifted =
+            ` It was raised as a \u20b9${round2(request.amount).toFixed(2)} discount, and the table has changed to \u20b9${subtotalNow.toFixed(2)} since.`;
+          throw new DiscountAuthorityError({
+            ...verdict,
+            details:
+              `Approving this would take \u20b9${amountNow.toFixed(2)} off a \u20b9${subtotalNow.toFixed(2)} table and leave only \u20b9${verdict.remaining_value.toFixed(2)} on it.`
+              + drifted
+              + ` Writing most of a bill off requires the 'Close Bill' permission, not only 'Approve Discounts'.`
+              + ` Ask a manager or the owner to approve it.`,
+          }, closeBillPermission);
+        }
+      }
+
       await applyDiscountToOpenBill(context, bill[0].table_id, request.discount_type, request.discount_value, client);
     }
     return request;
@@ -13658,7 +14709,7 @@ async function sectionLinesForTable(
       select food
       from "Orders"
       where res_id = $1 and outlet_id = $2 and table_id = $3
-        and coalesce(status::text, '1') not in ('4', '5', '7')
+        and ${stillOwesStatusSql()}
       order by created_at asc
     `,
     [context.res_id, context.outlet_id, tableId],
@@ -13819,7 +14870,7 @@ export async function MergeTableBills(
     const orders = await runQuery<{ id: string; food: unknown }>(
       `select id, food from "Orders"
          where res_id = $1 and outlet_id = $2 and table_id = $3
-           and coalesce(status::text, '1') not in ('4','5','7')
+           and ${stillOwesStatusSql()}
        order by created_at asc`,
       [context.res_id, context.outlet_id, fromId],
       client,
@@ -14063,7 +15114,7 @@ export async function MoveTableParty(
     const orders = await runQuery<{ id: string; food: unknown }>(
       `select id, food from "Orders"
         where res_id = $1 and outlet_id = $2 and table_id = $3
-          and coalesce(status::text, '1') not in ('4','5','7')
+          and ${stillOwesStatusSql()}
         order by created_at asc`,
       [context.res_id, context.outlet_id, src.id],
       client,
@@ -14350,7 +15401,7 @@ export async function MoveOrderToTable(
     const remaining = await runQuery<{ n: string }>(
       `select count(*)::text as n from "Orders"
         where res_id = $1 and outlet_id = $2 and table_id = $3
-          and coalesce(status::text, '1') not in ('4','5','7')`,
+          and ${stillOwesStatusSql()}`,
       [context.res_id, context.outlet_id, order.table_id],
       client,
     );
@@ -14792,6 +15843,8 @@ export interface ClosedBillDetail extends ClosedBillSummary {
   reason: string | null;
   created_by: string | null;
   totals_reconciled: boolean;
+  /** D2: earliest order placed -> settled, frozen. See service_clock.ts. */
+  service: ServiceClock;
 }
 
 /** Terminal order statuses that belong to a settled bill (Paid, Pending-approval, Closed). */
@@ -15257,6 +16310,19 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
     reason: row.reason,
     created_by: `${row.created_by_fname ?? ""} ${row.created_by_lname ?? ""}`.trim() || null,
     totals_reconciled: reconciled,
+    // D2 on a FINISHED service: the same clock the live table showed, frozen at
+    // the settle. Built from the bill's own orders (agg.orders carries each
+    // one's created_at) against `settled_at`, so the history screen and the
+    // floor screen report one duration for one table rather than two.
+    //
+    // `settled_at` and not `closed_at` alone: it is already the alias this
+    // reader defines as "closed_at, falling back to admin_approved_at", and a
+    // bill approved on a build that predates the close step has no closed_at at
+    // all. Falling back keeps those bills reporting a real duration instead of
+    // an eternally running clock on a table that went home months ago.
+    service: tableServiceClock(
+      agg.orders.map((o) => ({ placed_at: o.created_at, settled_at: summary.settled_at })),
+    ),
   };
 }
 
@@ -18123,6 +19189,28 @@ export async function ApplyCouponToBill(
   tableName: string,
   code: string,
   customerPhone?: string,
+  /**
+   * THE WRITE-OFF GATE'S INPUTS — the same ones SetBillDiscountWithApproval takes,
+   * because a coupon reaches the SAME OUTCOME BY THE SAME MECHANISM: the line
+   * below writes `discount_type='flat', discount_value=<the coupon's amount>`,
+   * which is character-for-character what the manual discount writes.
+   *
+   * Gating one door and not the other would have been security theatre. A waiter
+   * refused a 100% discount could apply a 100% coupon and zero the identical bill
+   * on the identical permission, and the audit trail would read "coupon applied"
+   * rather than "bill written off".
+   *
+   * WHAT IS DELIBERATELY NOT GATED: an ordinary coupon. The rule is about the
+   * OUTCOME, not the instrument — hand back a tenth of the bill and nothing
+   * changes; hand back more than half and it needs the till's authority. That is
+   * the same threshold the manual discount uses, so a restaurant only has to
+   * understand one rule about how much money a floor role may give away.
+   *
+   * Optional so every existing caller compiles and behaves exactly as before;
+   * an absent `actions` is treated as EMPTY, i.e. refuse a write-off — never as
+   * "skip the check", which is how a gate becomes decorative.
+   */
+  opts?: { actions?: unknown; closeBillPermission?: string; isAdmin?: boolean },
 ): Promise<{ success: true; code: string; discount: number }> {
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
@@ -18156,6 +19244,26 @@ export async function ApplyCouponToBill(
         [billId, context.res_id, context.outlet_id, tableId, subtotal, billNo], client);
       billId = ins[0]?.id ?? (await existingOpenBillId(context, tableId, client)) ?? billId;
     }
+    // THE WRITE-OFF GATE, BEFORE THE WRITE AND INSIDE THE TRANSACTION — the same
+    // placement as the manual discount's, so the subtotal it judges cannot be
+    // changed by a concurrent order between the decision and the write.
+    //
+    // `v.discount` is the coupon's OWN computed amount, after its cap and its
+    // minimum-order rule, so this judges what the guest actually stops paying
+    // rather than what the code advertises.
+    if (opts?.isAdmin !== true) {
+      const verdict = mayDiscountBill({
+        actions: opts?.actions ?? [],
+        impact: { subtotal, discount_amount: v.discount },
+        approvalThreshold: await getDiscountApprovalThreshold(context.res_id, client),
+        closeBillPermission: opts?.closeBillPermission ?? CLOSE_BILL_ACTION_ID,
+        tableName: tableName.trim(),
+      });
+      if (!verdict.allowed) {
+        throw new DiscountAuthorityError(verdict, opts?.closeBillPermission ?? CLOSE_BILL_ACTION_ID);
+      }
+    }
+
     // Store the coupon's effect as a flat discount so all existing bill math + the
     // printed bill honour the cap/min-order computed here.
     await runQuery(
@@ -18324,14 +19432,143 @@ export async function GetLoyaltyAccount(
   };
 }
 
+/**
+ * THE TABLE/ACCOUNT LINK, AND WHY THE REFUSAL IS ITS OWN ERROR.
+ *
+ * A redemption names a TABLE in the request body and an ACCOUNT by phone
+ * number, and nothing in the shipped code ties the two together: any waiter can
+ * spend any customer's accumulated balance against any table in the outlet. The
+ * write-off gate below bounds HOW MUCH of a stranger's balance can be burned in
+ * one go; it cannot tell whose balance it is.
+ *
+ * WHAT IS GUARDED, AND WHAT DELIBERATELY IS NOT. The guard fires ONLY when the
+ * table's live session already names a customer — a QR/takeaway/pre-order order
+ * carrying `customer_phone` — and that number is not the one being spent. That
+ * is the one case where the system positively knows somebody else is sitting
+ * there. It is SILENT on a table whose orders were punched in at the POS and
+ * carry no phone at all, which is the ordinary dine-in case and the reason a
+ * stricter link was rejected: requiring a phone on the session would refuse the
+ * everyday "I'm a member, here's my number" redemption at the till, and a guard
+ * that breaks the till is worse than the exposure it closes.
+ *
+ * IT IS NOT A DEAD END EITHER. A close-bill holder (cashier, captain, manager,
+ * admin) may still redeem across the mismatch — spending a balance that is not
+ * demonstrably the payer's is a till decision, not a floor one. Same uuid as
+ * everything else in this block; nothing new is minted.
+ *
+ * Tagged rather than `instanceof` for the reason DiscountAuthorityError is: a
+ * mocked data layer and a double-bundled module both break `instanceof`.
+ */
+export const LOYALTY_ACCOUNT_MISMATCH = "LOYALTY_ACCOUNT_MISMATCH";
+
+export class LoyaltyAccountMismatchError extends Error {
+  readonly code = LOYALTY_ACCOUNT_MISMATCH;
+  readonly status = 403;
+  readonly details: string;
+  readonly requiredPermission: string;
+  constructor(details: string, requiredPermission: string) {
+    super(details);
+    this.name = "LoyaltyAccountMismatchError";
+    this.details = details;
+    this.requiredPermission = requiredPermission;
+  }
+}
+
+/** Is this the table/account mismatch refusal above? Tag test — see the header. */
+export function isLoyaltyAccountMismatchError(err: unknown): err is LoyaltyAccountMismatchError {
+  return Boolean(err) && (err as { code?: unknown }).code === LOYALTY_ACCOUNT_MISMATCH;
+}
+
+/**
+ * Comparable form of a mobile number: digits only, last 10. The ledger is keyed
+ * on the phone string EXACTLY as stored, but the guard above compares a number
+ * typed at the till against one captured by a guest QR form months earlier, and
+ * refusing a redemption because one of them carries "+91 " would be the guard
+ * breaking the till over formatting.
+ */
+function loyaltyPhoneKey(raw: unknown): string {
+  const digits = String(raw ?? "").replace(/[^0-9]/g, "");
+  return digits.length > 10 ? digits.slice(-10) : digits;
+}
+
+/**
+ * The distinct customer phones on the table's CURRENT session — `stillOwes`
+ * orders only, the same predicate assertTableSessionOpen uses, so a number left
+ * behind by the party that sat here an hour ago cannot refuse this one.
+ *
+ * FAILS OPEN, on purpose and narrowly: `(food)::jsonb` throws on a legacy row
+ * whose payload is not valid JSON, and this is a heuristic identity check, not
+ * the money gate. A tenant with one malformed order must not lose loyalty
+ * redemption altogether; the write-off gate — which fails CLOSED — is the one
+ * that decides how much money may move.
+ */
+async function tableSessionCustomerPhones(
+  context: RestaurantContext,
+  tableId: string,
+  client?: PoolClient,
+): Promise<string[]> {
+  try {
+    const rows = await runQuery<{ phone: string | null }>(
+      `select distinct nullif(trim((food)::jsonb->>'customer_phone'), '') as phone
+         from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and nullif(trim((food)::jsonb->>'customer_phone'), '') is not null
+          and ${stillOwesStatusSql()}`,
+      [context.res_id, context.outlet_id, tableId], client,
+    );
+    return rows.map((r) => loyaltyPhoneKey(r.phone)).filter((k) => k.length > 0);
+  } catch (err) {
+    logger.warn({ err }, "loyalty_session_phone_lookup_failed");
+    return [];
+  }
+}
+
 // Redeem N points against a table's OPEN bill: converts points × point_value
 // into a flat bill discount through the same internal path SetBillDiscount
-// uses (admin-level — staff access is gated at the route), and records the
-// negative ledger row. Validates the balance and keeps the discount within the
-// bill subtotal so points can't be burned for value that doesn't exist.
+// uses, and records the negative ledger row. Validates the balance and keeps
+// the discount within the bill subtotal so points can't be burned for value
+// that doesn't exist.
+//
+// ===========================================================================
+// THIS IS THE THIRD DOOR ONTO THE SAME WRITE, AND IT IS GATED LIKE THE OTHER TWO
+// ===========================================================================
+// The line at the bottom of this function is `applyDiscountToOpenBill(…,
+// "flat", discount, …)` — character-for-character the write
+// SetBillDiscountWithApproval and ApplyCouponToBill make, on the same 4ad474d4
+// "Add Orders" permission the core waiter role holds. It shipped with ONE clamp,
+// `if (discount > subtotal) throw`, which permits a redemption EXACTLY EQUAL to
+// the subtotal: the bill went to zero by design, on floor authority, while the
+// manual discount and the coupon that reach the identical state were both
+// refused. Gating two of three doors is theatre.
+//
+// So the SAME rule decides here: discount_authority.ts, judged on what is
+// actually handed back, skipped for an admin, refused with the SAME
+// PERM_CLOSE_BILL uuid (a953d044). No new Action id is minted — migration 025's
+// rule — and nobody who runs a till loses anything, because CORE_ROLES.manager,
+// .cashier and .captain all carry a953d044 already and an admin passes on "*".
+//
+// AN ORDINARY REDEMPTION IS UNTOUCHED. 200 points off a ₹2,400 table is what
+// the programme is for and never reaches the gate; the refusal is for the
+// redemption that hands back most of the bill, which is a write-off wearing a
+// loyalty card.
 export async function RedeemLoyaltyPoints(
   restaurantId: string,
-  opts: { phone: string; points: number; table_name: string },
+  opts: {
+    phone: string;
+    points: number;
+    table_name: string;
+    /**
+     * THE CALLER'S GRANTED ACTIONS. Absent is treated as EMPTY — refuse a
+     * write-off rather than grant one — which is the same direction
+     * SetBillDiscountWithApproval and ApplyCouponToBill take for a missing input
+     * on a money gate. An ordinary redemption is unaffected either way.
+     */
+    actions?: readonly string[] | null;
+    /** PERM_CLOSE_BILL, from routes/_shared.ts. Never a new uuid. */
+    closeBillPermission?: string;
+    /** An admin skips the gate, exactly as on the other two doors. */
+    isAdmin?: boolean;
+  },
 ): Promise<{ success: true; points: number; discount: number; balance: number }> {
   await ensureLoyaltyTable();
   await ensureLoyaltyRedeemAction();
@@ -18351,11 +19588,67 @@ export async function RedeemLoyaltyPoints(
     const tableId = await tableIdByName(context, opts.table_name, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
+    // POST-SETTLE LOCK — the one the discount and coupon paths carry and this
+    // one did not. Without it a redemption on a fully-settled session fell
+    // through to ensureOpenBillIdForTable and MINTED A PHANTOM BILL on the
+    // closed seating (burnt bill number, a discount recorded against nothing),
+    // which GET /bill-for-table then served as if it were live — and burnt the
+    // customer's points doing it. /bills/:id/reopen is the way back in.
+    await assertTableSessionOpen(context, tableId, "redeeming loyalty points", client);
+
+    const closeBillPermission = opts.closeBillPermission ?? CLOSE_BILL_ACTION_ID;
+    const grantedActions = Array.isArray(opts.actions) ? opts.actions.map((a) => String(a).trim()) : [];
+    const holdsTillAuthority = grantedActions.includes("*") || grantedActions.includes(closeBillPermission);
+
+    // THE TABLE/ACCOUNT LINK — see LoyaltyAccountMismatchError's header for what
+    // it does and does not claim to close, and why it yields to the till. The
+    // query only runs for an identity the guard could actually refuse.
+    if (opts.isAdmin !== true && !holdsTillAuthority) {
+      const sessionPhones = await tableSessionCustomerPhones(context, tableId, client);
+      if (sessionPhones.length > 0 && !sessionPhones.includes(loyaltyPhoneKey(phone))) {
+        throw new LoyaltyAccountMismatchError(
+          `Table ${opts.table_name.trim()} is running under a different customer's phone number, so ${phone}'s points cannot be spent on it. ` +
+          `Redeeming one guest's points against another guest's table requires the 'Close Bill' permission — ask a manager, or redeem against the right table.`,
+          closeBillPermission,
+        );
+      }
+    }
+
     const subtotal = await sumOrderTotalsForTable(context, tableId, client);
     if (subtotal <= 0) {throw new Error("This table has no active orders to discount");}
     const discount = round2(points * cfg.point_value);
     if (discount > subtotal) {
       throw new Error(`${points} points are worth ₹${discount} — more than the bill subtotal (₹${subtotal}). Redeem fewer points.`);
+    }
+
+    // ======================================================================
+    // THE WRITE-OFF GATE — BEFORE THE WRITE AND INSIDE THE TRANSACTION.
+    // ======================================================================
+    // The same placement as the manual discount's and the coupon's, for the same
+    // reason: the subtotal this is judged against is read HERE, so a route-level
+    // pre-check would be deciding about a number another order could change
+    // before the write lands.
+    //
+    // `discount` is what the guest actually stops paying (points × point_value,
+    // already proven to be within the subtotal), so this judges the money handed
+    // back rather than the instrument that hands it back — which is the whole
+    // rule: hand back a tenth of the bill and nothing changes, hand back most of
+    // it and it needs the authority to settle.
+    //
+    // The tenant's approval threshold is passed exactly as ApplyCouponToBill
+    // passes it, so limb 2 behaves identically on all three doors and a
+    // restaurant has ONE number to understand. Limb 1 fires regardless.
+    if (opts.isAdmin !== true) {
+      const verdict = mayDiscountBill({
+        actions: grantedActions,
+        impact: { subtotal, discount_amount: discount },
+        approvalThreshold: await getDiscountApprovalThreshold(context.res_id, client),
+        closeBillPermission,
+        tableName: opts.table_name.trim(),
+      });
+      if (!verdict.allowed) {
+        throw new DiscountAuthorityError(verdict, closeBillPermission);
+      }
     }
 
     // Same internal flat-discount path as SetBillDiscount (replaces any
@@ -18401,7 +19694,7 @@ async function updateOrderWorkflowStatus(
         set status = $1,
             food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
         where table_id = $3 and res_id = $4 and outlet_id = $5
-          and coalesce(status::text, '1') not in ('4','5','7')
+          and ${stillOwesStatusSql()}
       `,
       [toOrderStatusCode(status), status, tableId, context.res_id, context.outlet_id],
       client,
@@ -18861,7 +20154,7 @@ async function closeActiveOrdersForTable(
   await runQuery(
     `update "Orders" set status = $4
        where res_id = $1 and outlet_id = $2 and table_id = $3
-         and coalesce(status::text, '1') not in ('4','5','7')`,
+         and ${stillOwesStatusSql()}`,
     [context.res_id, context.outlet_id, tableId, statusCode],
     client,
   );
@@ -19346,6 +20639,44 @@ async function assertOrderNotCancelled(
   }
 }
 
+/**
+ * STATUS 6 — "PAYMENT PENDING APPROVAL" — AND WHY IT IS AN OPT-IN REFUSAL.
+ *
+ * THE HOLE. ConfirmBillPaymentByWaiter moves a table's orders to 6 and takes the
+ * guest's money; ApproveBillPaymentByAdmin RE-PRICES the bill at approval time
+ * (`subtotalAtApproval = sumOrderTotalsForTable(...)` — see its comment, which
+ * exists because a bill edit landing in that window used to be frozen out). So a
+ * line stripped between the two steps is re-priced DOWN at approval with the
+ * cash already in the drawer: the guest paid ₹4,000, the books record ₹1,200,
+ * and the difference is unaccounted for with nothing anywhere saying a line went.
+ * The order-content paths must refuse 6.
+ *
+ * WHY IT IS NOT SIMPLY ADDED TO THE LIST BELOW. This guard is the choke-point for
+ * ELEVEN callers, and 6 is a legitimate, non-terminal state for several of them:
+ *
+ *   * ReopenBill deliberately puts a settled session's orders BACK to 6 (keeping
+ *     waiter_confirmed_at) so a closed bill can be corrected and re-approved. A
+ *     blanket refusal would make re-opening a bill useless — the one thing you
+ *     re-open a bill to do is the thing that would then be refused.
+ *   * ConfirmBillPaymentByWaiter itself calls this guard, and on a re-opened bill
+ *     the order is ALREADY at 6 — so a blanket refusal would stop a re-opened
+ *     bill from being re-settled at all. "The fix emptied the till" is the exact
+ *     failure that must not happen here.
+ *   * The kitchen-timing paths (OrderTimingAction, FireOrderItems, BarkOrder)
+ *     move no money and have no business being refused.
+ *
+ * Flipping those call sites one at a time is a real decision each — and each of
+ * them lives in a function this change does not own. So the RULE lives here, in
+ * one place, and the callers that must not re-price a paid bill opt in. The
+ * option is named for what it protects, it defaults to today's behaviour so no
+ * caller changes by accident, and the next caller that edits order CONTENT has
+ * one named flag to reach for rather than a fourth copy of `code === 6`.
+ */
+export const ORDER_PAYMENT_PENDING_MESSAGE =
+  "A payment for this order is awaiting approval, so its items are frozen. "
+  + "Approving the bill re-prices it, so changing the order now would settle it at a different number than the guest has already paid. "
+  + "Approve the payment first (or re-open the bill after it closes), then correct it.";
+
 // A settled order (Paid = 4, Closed = 7) is final — its status must never change
 // again (the bill is view-once after settlement). A CANCELLED order (5) is final
 // too, and permanently so. Throws when it's locked.
@@ -19358,6 +20689,14 @@ async function assertOrderStatusEditable(
   context: RestaurantContext,
   orderId: string,
   client?: PoolClient,
+  opts?: {
+    /**
+     * Also refuse status 6, "Payment Pending Approval". Set by the callers that
+     * change what the guest OWES — see the header above for why it is opt-in and
+     * which callers must never set it.
+     */
+    refuseWhilePaymentPending?: boolean;
+  },
 ): Promise<void> {
   const code = await readOrderStatusCode(context, orderId, client);
   if (code === null) {return;} // not found — leave not-found handling to the caller
@@ -19366,6 +20705,9 @@ async function assertOrderStatusEditable(
   }
   if (code === 4 || code === 7) {
     throw new Error("This order's bill is already settled and locked — its status can no longer be changed.");
+  }
+  if (code === 6 && opts?.refuseWhilePaymentPending === true) {
+    throw new Error(ORDER_PAYMENT_PENDING_MESSAGE);
   }
 }
 
@@ -19969,8 +21311,13 @@ export async function repriceFromMenu(restaurantId: string, items: WaitlistItem[
     if (!m) {continue;}
     const floor = resolveLinePriceFloor(it.variation_id, { id: String(m.id), price: m.price }, variations as ReadonlyMap<string, VariationPriceRef>);
     const price = floorOnly ? Math.max(floor.base, round2(parseNumeric(it.price))) : floor.base;
+    // The guest path already refuses any line that is not on the menu, so the
+    // off-menu hole does not exist here — but the QUANTITY is still whatever the
+    // phone sent, and the price is only as sane as the menu row behind it. One
+    // rule for both paths, so neither can drift.
+    const safe = clampLineCharge({ price, quantity: it.quantity });
     out.push({
-      id: String(m.id), menu_id: String(m.id), name: m.name, price, quantity: it.quantity,
+      id: String(m.id), menu_id: String(m.id), name: m.name, price: safe.price, quantity: safe.quantity,
       ...(it.note ? { note: it.note } : {}),
       ...(floor.variation ? { variation_id: floor.variation.id, variation_name: floor.variation.name } : {}),
     });
@@ -20039,7 +21386,19 @@ export async function applyMenuPriceFloor<T>(restaurantId: string, items: T[]): 
     const it = parsed[i];
     if (!it) {return raw;}
     const m = byId.get(String(it.id ?? "")) ?? byName.get(String(it.name ?? "").trim().toLowerCase());
-    if (!m) {return raw;} // off-menu / custom charge — bill it as typed
+    if (!m) {
+      // OFF-MENU / CUSTOM CHARGE — a valet fee, an aggregator line, a one-off
+      // "open item". Billed as typed, which is the deliberate difference from
+      // repriceFromMenu… except that "as typed" once accepted a NEGATIVE number,
+      // and a negative line walks money off the bill through a door no write-off
+      // gate watches. See clampLineCharge for the whole argument.
+      const safe = clampLineCharge(it);
+      if (!safe.clamped) {return raw;}
+      logger.warn({
+        name: String(it.name ?? ""), price: it.price, quantity: it.quantity,
+      }, "order_line_charge_clamped");
+      return { ...it, price: safe.price, quantity: safe.quantity } as unknown as T;
+    }
     // ONE rule, shared with repriceFromMenu — a variation is honoured only when
     // it belongs to the dish this line resolved to and is still sold. See
     // resolveLinePriceFloor in billing_math.ts for why each refusal exists.
@@ -20053,6 +21412,11 @@ export async function applyMenuPriceFloor<T>(restaurantId: string, items: T[]): 
       stamped.variation_name = floor.variation.name;
     }
     if (round2(parseNumeric(it.price)) < floor.base) {stamped.price = floor.base;}
+    // …and never below zero even then: a menu row saved with a negative price
+    // would otherwise make the floor itself the leak.
+    const safe = clampLineCharge(stamped);
+    stamped.price = safe.price;
+    stamped.quantity = safe.quantity;
     return stamped as unknown as T;
   });
 }
@@ -21667,7 +23031,7 @@ export async function GetKotTableContext(
              coalesce(t.is_virtual, false) as is_virtual,
              (select o.food from "Orders" o
                where o.res_id = t.res_id and o.outlet_id = t.outlet_id and o.table_id = t.id
-                 and coalesce(o.status::text, '1') not in ('4', '5', '7')
+                 and ${stillOwesStatusSql("o.status")}
                order by o.created_at desc
                limit 1) as latest_food
       from "Tables" t
@@ -32953,6 +34317,20 @@ export interface VoidKotRow {
   /** Σ price × quantity — the menu-price value that did NOT become revenue. */
   value: number;
   items: { name: string; quantity: number; price: number }[];
+  /**
+   * A2 — WHY IT WAS VOIDED, from the "OrderVoids" ledger (migration 035).
+   *
+   * Null means NO REASON WAS EVER RECORDED, and that is a truthful answer rather
+   * than a missing one: the cancel paths do not demand a reason (a shipped till
+   * that sends none must keep working, or a live floor cannot cancel), and every
+   * order cancelled before 035 has no row by design. A blank here is the gap the
+   * report's notes say to expect; it is never back-derived.
+   */
+  reason: string | null;
+  /** The seven-value category, when the client sent a recognised one. */
+  void_kind: string | null;
+  /** before_print | after_print | after_bill — SERVER-derived, never self-reported. */
+  stage: string | null;
 }
 
 export interface VoidKotReport {
@@ -32973,6 +34351,8 @@ const VOID_KOT_COLUMNS: MisColumn[] = [
   { key: "qty", label: "Qty", type: "int", total: true },
   { key: "value", label: "Value", type: "money", total: true },
   { key: "voided_by", label: "Voided by", type: "text" },
+  { key: "reason", label: "Reason", type: "text" },
+  { key: "stage", label: "Stage", type: "text" },
 ];
 
 /**
@@ -33076,6 +34456,31 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
     params,
   );
 
+  // A2 — THE RECORDED REASONS FOR THE ORDERS ON THIS PAGE.
+  //
+  // A SECOND, SEPARATELY-DEGRADING READ rather than a join in the statement
+  // above, deliberately: "OrderVoids" is migration 035's table, and a deployment
+  // that is one migration behind would 500 the whole Void KOT report if the join
+  // were inline. captureRead turns that into "no reasons known", which is
+  // precisely what the report already says about every pre-035 void, so the
+  // unapplied case degrades into an existing, documented state instead of an
+  // outage. Scoped to the page's order ids, so it is one small indexed read.
+  const voidReasons = new Map<string, { reason: string; void_kind: string; stage: string }>();
+  const pageOrderIds = rows.map((r) => String(r.id)).filter((id) => isUuid(id));
+  if (pageOrderIds.length > 0) {
+    const reasonRows = await captureRead("OrderVoids", () => runQuery<{
+      order_id: string; reason: string; void_kind: string; stage: string;
+    }>(
+      `select order_id, reason, void_kind, stage
+         from "OrderVoids"
+        where res_id = $1 and scope = 'order' and order_id = any($2::uuid[])`,
+      [mc.context.res_id, pageOrderIds],
+    ), [] as { order_id: string; reason: string; void_kind: string; stage: string }[]);
+    for (const r of reasonRows) {
+      voidReasons.set(String(r.order_id), { reason: r.reason, void_kind: r.void_kind, stage: r.stage });
+    }
+  }
+
   const out: VoidKotRow[] = rows.map((r) => {
     const food = parseJsonObject(r.food) ?? {};
     const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
@@ -33101,6 +34506,9 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
       qty,
       value,
       items,
+      reason: voidReasons.get(String(r.id))?.reason ?? null,
+      void_kind: voidReasons.get(String(r.id))?.void_kind ?? null,
+      stage: voidReasons.get(String(r.id))?.stage ?? null,
     };
   });
 
@@ -33108,7 +34516,8 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
   return {
     meta: await misMeta(mc, "void_kot", "Void KOT", [
       "Bucketed by when the order was PLACED, since that is the ticket's own moment. The cancellation time is shown separately.",
-      "A void is an order with status Cancelled. The schema records no void reason, no void stage and no authoriser field, so none are shown.",
+      "Reason and Stage come from the void ledger. Blank means no reason was recorded — the cancel paths accept a cancellation without one so a till that cannot send it can still work, and every order cancelled before the ledger existed has no row. Blanks are never back-derived.",
+      "Stage is derived by the server from facts it holds (was a bill already raised, had the ticket already reached the kitchen), never self-reported by the client that made the void.",
       "Voided by / voided at come from the audit trail entry the cancel path writes. An order cancelled before that entry existed, or by a path that wrote none, shows blank.",
       "KOT numbers are keyed by a fingerprint of the ticket's CONTENT, not by order id, so a printed KOT number cannot be tied back to an order with certainty. The order id is the ticket identity here.",
       "Value is the menu-price value of the cancelled lines (price × quantity). It never appeared in revenue.",

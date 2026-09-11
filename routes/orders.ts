@@ -4,14 +4,15 @@
  */
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "crypto";
-import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrderKotContext, GetOrders, GetOrdersScope, IsOrderItemServed, OrderTimingAction, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
+import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrderKotContext, GetOrders, GetOrdersScope, IsOrderItemServed, OrderTimingAction, RecordOrderVoid, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
+import { isDiscountAuthorityError } from "../discount_authority.js";
 import { autoPrintOrderKot, dispatchCancellationKot, type KotLine } from "../kot_print.js";
 import { idempotent } from "../idempotency.js";
 import { resolveServeIntent } from "../order_intent.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforcePermission, extractEmployeeId, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, validateAction } from "./_shared.js";
+import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, validateAction } from "./_shared.js";
 
 
 // --- Order/item preparation timers (pause/resume, mark item served) ---------
@@ -243,7 +244,7 @@ app.post("/orders/takeaway", validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 // carries no guard from idempotency.ts. SetOrderStatus touches neither counter.
 // What the key buys here is the everyday transition a waiter makes fifty times a
 // service — and since it is additive, a Paid transition behaves exactly as it
-// does today: still gated on PERM_CLOSE_BILL below, still refused by
+// does today: still gated on enforceSettleAuthority below, still refused by
 // assertOrderStatusEditable on a settled order. A key never makes a request
 // succeed that would otherwise fail.
 app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idempotent(), async (req: Request, res: Response) => {
@@ -256,8 +257,28 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 	// transitions (Preparing → Served …) stay with "Add Orders" so waiters keep
 	// working, but marking an order PAID additionally requires "Close Bill" —
 	// previously any waiter could settle a bill.
+	//
+	// C2: the check itself moved to enforceSettleAuthority so that every settle
+	// path in the codebase asks ONE function rather than repeating one uuid. Same
+	// capability, same verdict — what changes is that a fifth settle path added
+	// later cannot quietly disagree with this one, and the 403 now names the
+	// permission the operator has to grant.
 	const settles = ["paid", "closed"].includes(status.toLowerCase());
-	if (settles && !(await enforcePermission(req, res, PERM_CLOSE_BILL))) {return;}
+	if (settles && !(await enforceSettleAuthority(req, res))) {return;}
+	// A2 — THE REASON THE CLIENTS ALREADY SEND, WHICH THIS ROUTE USED TO DISCARD.
+	//
+	// "A reason is required before the action is processed and finalized" was
+	// true of the prompt and false of the database: the owner app and the
+	// dashboard both prompt unconditionally before a cancel and put the answer in
+	// the body, and this handler read `status` and nothing else. The reason
+	// reached the server, was parsed by nobody, and the void report went on
+	// showing "unknown" beside every cancelled ticket.
+	//
+	// READ HERE, ACTED ON BELOW, AND NOT MANDATORY — see the recording block
+	// after the status write for why the server records what it is given rather
+	// than refusing what it is not.
+	const cancelReason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+	const cancelKind = typeof req.body?.void_kind === "string" ? req.body.void_kind.trim() : "";
 	try {
 		const result = await SetOrderStatus(restaurantId, orderId, status);
 		if (!result.ok) { res.status(404).json({ error: "Order not found" }); return; }
@@ -280,8 +301,85 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 				},
 			}
 			: {};
+		// A2 — PERSIST THE REASON AGAINST THE CANCELLED ORDER.
+		//
+		// WHERE IT GOES: "OrderVoids" (migration 035), scope='order'. That is not a
+		// new home invented here — 035's own header names "PATCH /orders/:id/status
+		// -> Cancelled" as one of the two writes it exists to record, and it was
+		// simply never wired. Writing it there rather than into a new column is
+		// what makes the reason reach the void report, the stage derivation (which
+		// is the fraud signal, and which the server derives — a client cannot
+		// self-report it) and the money figure, all of which already exist.
+		//
+		// WHY IT IS NOT MANDATORY SERVER-SIDE, STATED PLAINLY: every till in the
+		// field today is a shipped binary, and some of them do not send a reason.
+		// A 400 on a missing reason would mean a live floor cannot cancel a
+		// mis-keyed order, which is a service-stopping outage traded for a
+		// reporting improvement. So the rule is RECORD WHAT YOU ARE GIVEN: a cancel
+		// with a reason is ledgered, a cancel without one behaves exactly as it did
+		// yesterday and shows in the report as "unknown", and the report already
+		// counts that gap. Making it mandatory is a separate, deliberate step to
+		// take once the fleet has turned over — not a side effect of this fix.
+		//
+		// BEST-EFFORT, AFTER THE FACT, AND IT CANNOT FAIL THE CANCEL. The order is
+		// already cancelled by the time this runs; a ledger write that throws (035
+		// unapplied on this deployment, a constraint, a dead connection) must not
+		// turn a completed cancellation into a 400 the till will retry. It is
+		// logged loudly instead, and the audit entry below still carries the reason
+		// verbatim, so the reason is never lost to both records at once.
+		//
+		// `void_kind` defaults to 'other' because the clients send free text: 035's
+		// CHECK constraint only accepts its seven vocabulary values, and rejecting
+		// a real reason for want of a category would discard exactly the thing this
+		// change exists to keep. A client that sends a recognised kind gets it.
+		let voidRecord: Awaited<ReturnType<typeof RecordOrderVoid>> | null = null;
+		if (isCancel && cancelReason) {
+			try {
+				voidRecord = await RecordOrderVoid(restaurantId, {
+					order_id: orderId,
+					scope: "order",
+					void_kind: cancelKind || "other",
+					reason: cancelReason,
+					actor: {
+						employee_id: extractEmployeeId(req),
+						username: extractEmployeeUsername(req) ?? extractEmployeeId(req) ?? "unknown",
+						// SELF-AUTHORISED, AND THE ROW SAYS SO. 035 requires an
+						// authoriser name and refuses to infer one from a blank. This
+						// route is the everyday cancel, not the manager-void route
+						// (POST /orders/:id/void, gated on PERM_VOID_ORDER, which is
+						// where a second name is demanded and permission-checked by
+						// ResolveAuthoriser). Recording the actor as their own
+						// authoriser is the honest shape 034's header describes for a
+						// manager acting alone — it says who did it and claims nothing
+						// more. An auditor reading `voided_by = authorised_by` can see
+						// at a glance that nobody countersigned.
+						authorised_by_employee_id: extractEmployeeId(req),
+						authorised_by_username: extractEmployeeUsername(req) ?? extractEmployeeId(req) ?? "unknown",
+					},
+				});
+			} catch (e) {
+				logger.error({ err: e, order_id: orderId }, "record_order_void_reason_failed");
+			}
+		}
 		try {
-			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Order ${orderId} -> ${status}`, Audit_log_category.Orders, { order_id: orderId, status, ...undoEnvelope });
+			// THE REASON IS IN THE AUDIT LINE ITSELF, not only in the details blob.
+			// The audit trail is what a manager reads at the end of a service, and a
+			// reason that is only reachable by expanding a JSON column is a reason
+			// nobody reads.
+			const reasonNote = isCancel && cancelReason ? ` — reason: ${cancelReason}` : "";
+			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Order ${orderId} -> ${status}${reasonNote}`, Audit_log_category.Orders, {
+				order_id: orderId, status,
+				...(isCancel && cancelReason
+					? {
+						reason: cancelReason,
+						void_kind: voidRecord?.void_kind ?? (cancelKind || "other"),
+						void_id: voidRecord?.id ?? null,
+						void_stage: voidRecord?.stage ?? null,
+						void_recorded: voidRecord !== null,
+					}
+					: {}),
+				...undoEnvelope,
+			});
 		} catch (e) { logger.warn({ err: e }, "log_audit order status failed"); }
 		// THE APPROVAL TRIGGER. An order placed while auto-push is off is created
 		// Pending and the placement path deliberately printed nothing; this is the
@@ -331,6 +429,19 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 				? {
 					cancel_kot_printed: cancelPrint.printed, cancel_kot_no: cancelPrint.kot_no, cancel_kot_tickets: cancelPrint.tickets,
 					...(cancelPrint.reason ? { cancel_kot_skipped: cancelPrint.reason } : {}),
+				}
+				: {}),
+			// A2 — DID THE REASON LAND? Reported rather than assumed, because the
+			// ledger write is best-effort: a till that sent a reason and got
+			// `void_reason_recorded: false` knows the audit line still carries it and
+			// the void report will not, which is a fact somebody can act on. Absent
+			// entirely when no reason was sent, so a shipped client that never sends
+			// one reads the same body it always did.
+			...(isCancel && cancelReason
+				? {
+					void_reason_recorded: voidRecord !== null,
+					void_id: voidRecord?.id ?? null,
+					void_stage: voidRecord?.stage ?? null,
 				}
 				: {}),
 		});
@@ -401,7 +512,15 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 
 		const split = normalizedSplit;
 
-		await UpdateOrderItemsSplit(restaurantId, orderId, split);
+		// The caller's actions travel with the write for the reason the delete path
+		// below spells out. ADDING a line hands nothing back, so the write-off gate
+		// inside UpdateOrderItemsSplit never engages here and this costs nothing —
+		// but a client that sent a split which happened to DROP lines would be
+		// judged, and judged with the right identity rather than with an empty one.
+		await UpdateOrderItemsSplit(restaurantId, orderId, split, {
+			actions: req.auth?.actions ?? [],
+			closeBillPermission: PERM_CLOSE_BILL,
+		});
 		// Titled by the action's NAME in the audit log, so use the item-level action
 		// ("Update Order - Add Food Item") rather than the generic "Add Orders".
 		try { await log_audit(req, "d6bebeb5-111f-4371-b373-a99158116d71", `Added item ${newItem.id} to order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, item: newItem }); } catch (err) { logger.warn({ err }, 'log_audit add-order-item failed'); }
@@ -457,13 +576,54 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 	}
 });
 
-// Delete single item from order
+/*
+	REMOVE ONE LINE FROM AN ORDER — and the sixth door, which is the worst of the
+	six because it DEFEATS a gate this block had just built.
+
+	THE HOLE. UpdateOrderItemsSplit re-prices an order to whatever lines remain,
+	so stripping every line leaves subtotal 0 and total 0 WHILE THE ORDER STAYS
+	ACTIVE. It is not a cancellation, so — unlike PATCH /orders/:id/status ->
+	Cancelled, which is deliberately open to the floor precisely because it
+	records a reason — it wrote NO "OrderVoids" row, carried NO reason, and never
+	reached the void report. The release write-off preflight then computed 0 for
+	the table and let the SAME waiter release it, with an audit line that read
+	like an ordinary release of an empty table. This route is gated on 4ad474d4
+	"Add Orders", which the core WAITER role holds.
+
+	THE GATE DEPENDS ON WHAT IS HANDED BACK, NOT ON THE ROUTE. Taking off one
+	mis-keyed line is ordinary floor work and stays instant for every waiter:
+	a rule that makes correcting a wrong entry need a manager will be worked
+	around, and a worked-around rule protects nothing. Taking off MOST of a
+	table's value is the same act as discounting it to nothing and meets the same
+	authority — PERM_CLOSE_BILL, via the SAME mayDiscountBill the discount and
+	coupon doors answer to. The rule, the cumulative baseline and the refusal live
+	in UpdateOrderItemsSplit; this handler supplies the identity and turns the
+	tagged refusal into the 403 shape every other money gate in the codebase uses.
+
+	AND THE REMOVAL IS NOW TRACEABLE. Every line that comes off writes an
+	"OrderVoids" row (scope='item', migration 035 — which names this route as one
+	of the two writes it exists to record and was never wired to it), carrying the
+	dish, the quantity and the money. The audit line carries the same, instead of
+	the bare uuid it used to carry: a manager reading the log can now see WHAT was
+	taken off a bill and WHAT IT WAS WORTH.
+*/
 app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: 'Missing restaurantId' }); return; }
 	const orderId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
 	const itemId = typeof req.params.itemId === 'string' ? req.params.itemId.trim() : '';
 	if (!orderId || !itemId) { res.status(400).json({ error: 'Missing order id or item id' }); return; }
+	// RECORD WHAT YOU ARE GIVEN, exactly as PATCH /orders/:id/status does with the
+	// cancel reason, and for the same stated reason: every till in the field today
+	// is a shipped binary and none of them send a reason on THIS route yet. A 400
+	// on a missing reason would mean a live floor cannot correct a mis-keyed line,
+	// which is a service-stopping outage traded for a reporting improvement. So a
+	// removal with a reason is ledgered with it, and one without is ledgered as
+	// exactly that — see the void write below for why a placeholder is written
+	// rather than the row being skipped.
+	const removeBody = (req.body ?? {}) as Record<string, unknown>;
+	const removeReason = typeof removeBody.reason === 'string' ? removeBody.reason.trim() : '';
+	const removeKind = typeof removeBody.void_kind === 'string' ? removeBody.void_kind.trim() : '';
 	try {
 		const existing = await GetOrders(restaurantId);
 		const order = existing.find(o => o.id === orderId);
@@ -484,7 +644,7 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 		// is `unknown` and every read below narrows it — the alternative is an
 		// `any` that would let a number where a dish name belongs reach the printer
 		// as "[object Object]".
-		interface StoredOrderLine { id?: unknown; name?: unknown; quantity?: unknown; price?: unknown; note?: unknown; variation_name?: unknown; menu_id?: unknown }
+		interface StoredOrderLine { id?: unknown; name?: unknown; quantity?: unknown; price?: unknown; note?: unknown; variation_name?: unknown; menu_id?: unknown; nc?: unknown }
 		const asText = (v: unknown): string => (typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "");
 		let removed: StoredOrderLine | null = null;
 		for (const tuple of split) {
@@ -504,8 +664,134 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 		// Best-effort: an unreadable context costs the slip, never the delete.
 		const kotContext = removed ? await GetOrderKotContext(restaurantId, orderId).catch(() => null) : null;
 
-		await UpdateOrderItemsSplit(restaurantId, orderId, split as any[]);
-		try { await log_audit(req, "371ecf9f-303e-4114-92fb-3a5120d1565e", `Deleted item ${itemId} from order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, deleted_item_id: itemId }); } catch (err) { logger.warn({ err }, 'log_audit delete-order-item failed'); }
+		// WHAT THIS LINE IS WORTH, computed BEFORE the write because the write
+		// destroys it. A comped line (migration 034) is worth nothing to the
+		// restaurant — it was already given away by somebody holding
+		// PERM_NON_CHARGEABLE and is already out of every figure the table is
+		// judged by — so removing one hands nothing back, which is the same answer
+		// the gate inside UpdateOrderItemsSplit reaches.
+		const removedQty = Math.max(1, Number(removed?.quantity ?? 1) || 1);
+		const removedUnit = Number(removed?.price ?? 0) || 0;
+		const removedValue = removed && removed.nc !== true
+			? Math.round(removedUnit * removedQty * 100) / 100
+			: 0;
+		const removedName = (removed && typeof removed.name === 'string' ? removed.name.trim() : '') || 'item';
+
+		// THE IDENTITY TRAVELS WITH THE WRITE. The gate has to be sized against the
+		// table's subtotal and the value already stripped off it, both of which are
+		// read in the data layer, so the verdict is reached there and arrives here
+		// as a tagged error — the same shape, and for the same reasons, as the
+		// discount write-off refusal (discount_authority.ts's header). Passing the
+		// actions rather than pre-checking here is what makes a stale client, a
+		// deep link or a bare curl meet the same answer as the button.
+		try {
+			await UpdateOrderItemsSplit(restaurantId, orderId, split as any[], {
+				actions: req.auth?.actions ?? [],
+				closeBillPermission: PERM_CLOSE_BILL,
+			});
+		} catch (e: unknown) {
+			if (isDiscountAuthorityError(e)) {
+				// AUDITED EVEN THOUGH NOTHING HAPPENED, exactly as the refused release
+				// is. An attempt to walk a table's value off the bill is precisely the
+				// event a manager wants to see, and a refusal that leaves no trace is
+				// indistinguishable from one that was never made. Best-effort: a failed
+				// audit write must never turn a 403 into a 500.
+				try {
+					await log_audit(
+						req, "371ecf9f-303e-4114-92fb-3a5120d1565e",
+						`REFUSED removal of ${String(removedQty)}x ${removedName} (${removedValue.toFixed(2)}) from order ${orderId} — would have written off ${e.discount_amount.toFixed(2)}, leaving ${e.remaining_value.toFixed(2)}, without Close Bill`,
+						Audit_log_category.Bill,
+						{
+							order_id: orderId, deleted_item_id: itemId, item_name: removedName,
+							quantity: removedQty, unit_price: removedUnit, value_removed: removedValue,
+							refused: true, discount_amount: e.discount_amount, remaining_value: e.remaining_value,
+						},
+					);
+				} catch (err) { logger.warn({ err }, 'log_audit delete-order-item refusal failed'); }
+				res.status(403).json({
+					error: "Forbidden",
+					details: e.details,
+					requiredPermission: e.requiredPermission,
+					// Named for what they are on THIS route: the money this removal (with
+					// everything already stripped off the table) hands back, and what
+					// would still be on the bill afterwards.
+					value_removed: removedValue,
+					write_off_value: e.discount_amount,
+					remaining_value: e.remaining_value,
+				});
+				return;
+			}
+			throw e;
+		}
+
+		// THE LEDGER ROW — "OrderVoids", scope='item' (migration 035). Without it a
+		// line could leave a live bill and appear in no report at all: the void
+		// report, the stage derivation (the fraud signal, which the SERVER derives
+		// because the person whose void it is has an obvious interest in it reading
+		// "before_print") and the money figure all already existed and this route
+		// simply never wrote to them.
+		//
+		// A PLACEHOLDER REASON IS WRITTEN RATHER THAN THE ROW BEING SKIPPED. 035
+		// requires a non-empty reason, and no shipped till sends one here yet; a
+		// row that says plainly that none was given is honest, and it is strictly
+		// better than the alternative on offer, which is that the worst of the six
+		// doors keeps leaving no trace at all. `void_kind` defaults to 'other'
+		// because the clients send free text and 035's CHECK accepts only its seven
+		// values — rejecting a real reason for want of a category would discard the
+		// thing this is here to keep.
+		//
+		// AFTER THE FACT AND BEST-EFFORT, for the reason the cancel path states: the
+		// line is already gone by the time this runs, and a ledger write that throws
+		// (035 unapplied on this deployment, a constraint, a dead connection) must
+		// not turn a completed removal into a 500 the till will retry. `value_voided`
+		// is passed explicitly BECAUSE the line no longer exists to be read.
+		let voidRecord: Awaited<ReturnType<typeof RecordOrderVoid>> | null = null;
+		if (removed) {
+			try {
+				voidRecord = await RecordOrderVoid(restaurantId, {
+					order_id: orderId,
+					scope: "item",
+					item_id: itemId,
+					item_name: removedName,
+					void_kind: removeKind.length > 0 ? removeKind : "other",
+					reason: removeReason.length > 0 ? removeReason : "Line removed from order (no reason given)",
+					value_voided: removedValue,
+					actor: {
+						employee_id: extractEmployeeId(req),
+						username: extractEmployeeUsername(req) ?? extractEmployeeId(req) ?? "unknown",
+						// SELF-AUTHORISED, AND THE ROW SAYS SO — the same honest shape the
+						// everyday cancel records. An auditor reading voided_by =
+						// authorised_by can see at a glance that nobody countersigned.
+						authorised_by_employee_id: extractEmployeeId(req),
+						authorised_by_username: extractEmployeeUsername(req) ?? extractEmployeeId(req) ?? "unknown",
+					},
+				});
+			} catch (e) { logger.error({ err: e, order_id: orderId, item_id: itemId }, "record_item_void_failed"); }
+		}
+
+		// THE AUDIT LINE NAMES THE DISH AND THE MONEY. It used to read "Deleted item
+		// <uuid> from order <uuid>" — no dish, no price, no money — which is a line
+		// nobody can act on. The audit log is what a manager reads at the end of a
+		// service, and a fact that is only reachable by joining two uuids to a JSON
+		// column is a fact nobody reads.
+		try {
+			const reasonNote = removeReason ? ` — reason: ${removeReason}` : "";
+			await log_audit(
+				req, "371ecf9f-303e-4114-92fb-3a5120d1565e",
+				`Removed ${String(removedQty)}x ${removedName} (${removedValue.toFixed(2)}) from order ${orderId}${order.table ? ` on table ${order.table}` : ""}${reasonNote}`,
+				Audit_log_category.Bill,
+				{
+					order_id: orderId, deleted_item_id: itemId, item_name: removedName,
+					quantity: removedQty, unit_price: removedUnit, value_removed: removedValue,
+					table: order.table,
+					...(removeReason ? { reason: removeReason } : {}),
+					void_id: voidRecord?.id ?? null,
+					void_kind: voidRecord?.void_kind ?? (removeKind.length > 0 ? removeKind : "other"),
+					void_stage: voidRecord?.stage ?? null,
+					void_recorded: voidRecord !== null,
+				},
+			);
+		} catch (err) { logger.warn({ err }, 'log_audit delete-order-item failed'); }
 
 		// THE CANCELLATION SLIP FOR ONE LINE. This route is how a waiter takes a
 		// single dish off an order that is already on the pass, and it printed
@@ -544,6 +830,19 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 				? {
 					cancel_kot_printed: cancelPrint.printed, cancel_kot_no: cancelPrint.kot_no, cancel_kot_tickets: cancelPrint.tickets,
 					...(cancelPrint.reason ? { cancel_kot_skipped: cancelPrint.reason } : {}),
+				}
+				: {}),
+			// ADDITIVE, and reported rather than assumed: the ledger write is
+			// best-effort, so a till that gets `void_recorded: false` knows the audit
+			// line still carries the removal and the void report will not — which is a
+			// fact somebody can act on. Present only when a line actually went, so a
+			// request for an id that was not on the order reads exactly as it did.
+			...(removed
+				? {
+					value_removed: removedValue,
+					void_recorded: voidRecord !== null,
+					void_id: voidRecord?.id ?? null,
+					void_stage: voidRecord?.stage ?? null,
 				}
 				: {}),
 		});

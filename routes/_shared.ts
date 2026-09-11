@@ -65,11 +65,26 @@ export function validate(_req: Request, _res: Response, next: NextFunction) {
 
 // Authorize against the permitted action UUIDs resolved at login and stored on
 // the verified session (req.auth) — never from a client-supplied header.
+//
+// THE REFUSAL CARRIES A BODY. This is the commonest 403 in the product, and for
+// most of its life it was the bare word "Action not permitted" — which tells the
+// waiter standing at the table nothing and sends the owner hunting through the
+// role editor with no idea which checkbox is missing. `details` is the sentence
+// a client shows; `requiredPermission` is the id an owner (or a support ticket)
+// can match against the role editor without guessing from the URL. Additive:
+// `error` is unchanged, so anything already keying on it still works. Same shape
+// as enforceSettleAuthority, mayReleaseTable and the discount write-off refusal,
+// deliberately — three refusals in three shapes is how a client ends up handling
+// none of them.
 export function validateAction(expectedUUID: string) {
 	return (req: Request, res: Response, next: NextFunction) => {
 		const actions = req.auth?.actions ?? [];
 		if (!actions.includes(expectedUUID) && !actions.includes("*")) {
-			res.status(403).json({ error: "Action not permitted" });
+			res.status(403).json({
+				error: "Action not permitted",
+				details: "Your role does not have permission for this action. Ask an admin to grant it in Roles & Permissions.",
+				requiredPermission: expectedUUID,
+			});
 			return;
 		}
 		next();
@@ -353,6 +368,118 @@ export async function enforcePermission(req: Request, res: Response, actionId: s
 	return { restaurantId: auth.res_id, outletId: extractOutletId(req) };
 }
 
+/**
+ * C2 — SETTLING A BILL IS ONE ACT WITH ONE GATE, and this is it.
+ *
+ * THE REQUIREMENT: "Only Managers are permitted to settle bills. Waiters must be
+ * restricted."
+ *
+ * WHY A CAPABILITY AND NOT THE WORD "manager". A tenant configures its own
+ * roles. A rule that asks `role == "manager"` is a test on SPELLING rather than
+ * on authority — which is exactly the defect role_scope.ts exists to document:
+ * a restaurant whose senior cashier settles the till, or whose "Floor Manager"
+ * is a CUSTOM role (and therefore a uuid), would either be locked out of its own
+ * money or, when the test is written the other way round, let everyone through.
+ * So "manager" here means WHOEVER THE TENANT HAS GRANTED "Close Bill"
+ * (a953d044…) — the core `manager` and `cashier` roles hold it, an admin passes
+ * on "*", and a tenant that wants a named custom role to settle ticks one
+ * existing checkbox. No new Action id is minted (migration 025's rule): a new id
+ * would strip settling from every role that holds it today.
+ *
+ * WHY IT IS A FUNCTION AND NOT FOUR COPIES OF validateAction. There is no single
+ * "settle" endpoint — a settlement is spread over waiter-confirm-payment,
+ * admin-approve-payment, close, and the two status writes — and four literals
+ * scattered across two route modules is how one of them gets missed. Everything
+ * that can move a bill to settled calls THIS, so adding a fifth settle path
+ * means calling one named function rather than remembering one uuid.
+ *
+ * THE HIDDEN-BUTTON RULE. The clients also hide their Settle control (see
+ * sessionCapabilities below, which hands them THIS answer rather than letting
+ * them derive one). That is the courtesy. This is the control: a deep link, a
+ * back-navigation, a stale cached screen or a bare curl all arrive here.
+ */
+export async function enforceSettleAuthority(req: Request, res: Response): Promise<{ restaurantId: string; outletId: string } | null> {
+	const auth = req.auth;
+	if (!auth) { res.status(401).json({ error: "Unauthorized", details: "Missing session" }); return null; }
+	const actions = auth.actions ?? [];
+	if (!actions.includes(PERM_CLOSE_BILL) && !actions.includes("*")) {
+		// The message NAMES THE PERMISSION on purpose. "Forbidden" sends an owner
+		// hunting through the role editor; "requires Close Bill" is the checkbox.
+		res.status(403).json({
+			error: "Forbidden",
+			details: "Settling a bill requires the 'Close Bill' permission. Ask an admin to grant it to your role.",
+			requiredPermission: PERM_CLOSE_BILL,
+		});
+		return null;
+	}
+	return { restaurantId: auth.res_id, outletId: extractOutletId(req) };
+}
+
+/**
+ * THE ANSWERS A CLIENT MUST NOT WORK OUT FOR ITSELF.
+ *
+ * role_scope.ts settled "is this identity a scoped floor role"; this settles the
+ * other half of the same question — "may this identity DO x" — for the handful
+ * of controls the V3 requirements ask the clients to hide (C1, C2, C5, C7, D5,
+ * H8). It is shipped inside the same `scope` block on /auth/employee-login and
+ * /auth/me, because that is the block the clients already read and adding a
+ * field to it is additive.
+ *
+ * WHY THE SERVER SENDS THE ANSWER AND NOT THE INPUTS. `actions_set` is already
+ * on the payload, so in principle every client could test for the uuid itself.
+ * That is precisely what must not happen: the uuid would then be written out in
+ * Dart, in TypeScript and in whatever ships next, the gate on the route would be
+ * free to move, and the three would drift — the csrorganics failure mode with a
+ * different constant. There is ONE list of which uuid backs which control, it is
+ * this one, and it sits beside the guards it describes.
+ *
+ * EVERY FLAG IS BACKED BY A SERVER GATE ON THE ROUTE IT DESCRIBES. A flag that
+ * only hides a button is a lie, because the button is not the control — see the
+ * route named in each comment. Nothing is listed here that is not enforced.
+ *
+ * AN ADMIN LOSES NOTHING: "*" satisfies every entry.
+ */
+export interface SessionCapabilities {
+	/** POST /bills/order/:id/waiter-confirm-payment | /admin-approve-payment | /close, PATCH /orders/:id/status -> Paid. See enforceSettleAuthority. */
+	settle_bill: boolean;
+	/** DELETE /table/:name — C7/H8. No core role holds this; it is granted, never assumed. */
+	delete_table: boolean;
+	/** POST /add-table, PATCH /table/:name — the floor-plan writes D5 keeps out of the Tables view. */
+	edit_table: boolean;
+	/** POST/PATCH/DELETE /table-sections — creating, renaming and removing zones. */
+	manage_table_sections: boolean;
+	/** POST /orders/:id/items/:itemId/non-chargeable — "Comp an item" (C1: completely hidden for waiters). */
+	comp_item: boolean;
+	/** POST /bills/service-charge-waiver — "Waive service charge" (C1). */
+	waive_service_charge: boolean;
+	/** POST /orders/:id/void — cancel a rung-up order with a recorded reason. */
+	void_order: boolean;
+	/** GET /roles, GET /core-roles — C5/C6: who may OPEN the access-control screen. */
+	view_roles: boolean;
+	/** POST /roles — C5: who may create and edit a custom role. */
+	manage_roles: boolean;
+}
+
+export function sessionCapabilities(input: { actions?: unknown }): SessionCapabilities {
+	const actions = Array.isArray(input.actions) ? input.actions.map((a) => String(a).trim()) : [];
+	const set = new Set(actions);
+	const has = (id: string): boolean => set.has("*") || set.has(id);
+	return {
+		settle_bill: has(PERM_CLOSE_BILL),
+		// The literals below are the ones written in registration position on the
+		// routes named above. Kept as literals rather than new constants so a
+		// reader can grep one string and find both the gate and this answer.
+		delete_table: has("5777c4aa-29df-4ea1-9c45-c1038d25f746"), // Table Deleted
+		edit_table: has("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), // Table Added (covers PATCH /table/:name)
+		manage_table_sections: has(PERM_TABLE_SECTIONS),
+		comp_item: has(PERM_NON_CHARGEABLE),
+		waive_service_charge: has(PERM_SERVICE_CHARGE_WAIVER),
+		void_order: has(PERM_VOID_ORDER),
+		view_roles: has("17ba6407-b703-4403-ab59-13235966053f"), // Get Roles
+		manage_roles: has("c0135d18-68b4-45e9-9b51-849158df6efd"), // Create/Update Role
+	};
+}
+
 // Revoke every live session of an employee. Must run whenever the identity or
 // the permissions behind an issued token change — the employee is deleted, their
 // password is reset, or their roles change — because session.actions is resolved
@@ -382,7 +509,16 @@ export function callerIsAdmin(req: Request): boolean {
 	return [auth.role, ...(auth.role_all ?? [])].map((r) => String(r).toLowerCase()).includes("admin");
 }
 
-// Core roles that expand to elevated/["*"] permissions — grantable only by an admin.
+// The two core roles that carry house-wide authority, and are therefore
+// grantable only by an admin.
+//
+// "admin" expands to the ["*"] wildcard. "manager" does NOT and never has — it
+// resolves to a concrete list (CORE_ROLES.manager) that now includes the till
+// (C2) and view/edit of custom roles (C5). It is on this list anyway, because
+// the question this predicate answers is "does handing someone this role change
+// who runs the restaurant", and for a manager it does: they can settle money and
+// rewrite what other roles may do. Naming it by its authority rather than by the
+// wildcard is also what keeps the guard correct as CORE_ROLES.manager grows.
 export function isPrivilegedRoleName(roleName: string): boolean {
 	return ["admin", "manager"].includes(roleName.trim().toLowerCase());
 }

@@ -13,8 +13,10 @@ import { logger } from "../observability.js";
 import { ackPrintJob } from "../print_jobs.js";
 import { dispatchPrintJob } from "../print_routing.js";
 import { emitRestaurant } from "../realtime.js";
+import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
-import { ACCOUNTING_PERM, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, endOfDayBound, enforceAdmin, enforcePermission, enforceRoles, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { isDiscountAuthorityError } from "../discount_authority.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, endOfDayBound, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -444,11 +446,37 @@ app.patch('/bills/order/:orderId/status', validateAction("07e364cc-f40d-46f3-b69
 		return;
 	}
 
+	// C2 — THE SETTLE GATE ON THE BACK DOOR.
+	//
+	// This route writes "Bills".status as a RAW NUMBER, and the numbers are not
+	// decorative: 1 = payment recorded, 2 = approved, 3 = closed. Writing 2 or 3
+	// here marks a bill approved or settled without going through
+	// admin-approve-payment or close — no re-pricing, no tender reconciliation, no
+	// closed_at — and until now it needed only "Update Order Status"
+	// (07e364cc…), which is a workflow permission, not a money one. Hiding the
+	// Settle button while leaving this reachable is not a permission; it is a
+	// button that is hard to find.
+	//
+	// Anything BELOW 2 is the everyday workflow write this route exists for and is
+	// untouched, as is the items_split branch below it.
+	const settlesBill = Number.isFinite(status) && status >= 2;
+	if (settlesBill && !(await enforceSettleAuthority(req, res))) {return;}
+
 	try {
 		// If items_split is provided, update per-item statuses on the order
 		if (Array.isArray(body.items_split)) {
 			try {
-				await UpdateOrderItemsSplit(restaurantId, orderId, body.items_split);
+				// THE CALLER'S IDENTITY, AND IT IS NOT OPTIONAL. UpdateOrderItemsSplit
+				// now refuses a strip that hands back most of a table's value without
+				// Close Bill. This call site passed NOTHING, so the gate judged every
+				// caller — an owner included — against an EMPTY action set and refused
+				// them. A write-off gate that refuses the person who is allowed to
+				// write bills off is not a stricter gate, it is a broken screen.
+				await UpdateOrderItemsSplit(restaurantId, orderId, body.items_split, {
+					isAdmin: callerIsAdmin(req),
+					actions: req.auth?.actions ?? [],
+					closeBillPermission: PERM_CLOSE_BILL,
+				});
 				await log_audit(req, "07e364cc-f40d-46f3-b691-0f719dd38e0f", `Updated per-item statuses for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId });
 			} catch (err) {
 				logger.error({ err }, 'update_order_items_split_failed');
@@ -515,8 +543,22 @@ app.post("/billing/upload-payment-proof", validateAction("2393edd7-cdd9-439c-9ff
 });
 
 app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967"), async (req: Request, res: Response) => {
-	// Permission is enforced by validateAction above, so any role (admin or a
-	// custom role granted this permission) may record payment.
+	// C2 — THE SETTLE GATE, and it is the SECOND gate on this route rather than a
+	// replacement for the first.
+	//
+	// "Captain Confirm Payment Method" (2393edd7…) says WHICH SCREEN a person may
+	// reach. It does not say they may take the restaurant's money, and this route
+	// is where the money is taken: it re-prices the bill, writes the tender ledger
+	// (migration 037), stamps waiter_confirmed_at and moves the order to "Payment
+	// Pending Approval". A tenant that had granted a floor role the confirm
+	// permission — which reads like a screen permission — had thereby granted it
+	// the till.
+	//
+	// So settling additionally requires "Close Bill", checked by the ONE function
+	// every settle path calls. An admin ("*") and the core cashier hold both and
+	// are unchanged; the core manager now holds both (see CORE_ROLES in
+	// database_supabase.ts) because C2 names managers as the role that settles.
+	if (!(await enforceSettleAuthority(req, res))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const auth = { restaurantId };
@@ -692,8 +734,13 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
 });
 
 app.post('/bills/order/:orderId/admin-approve-payment', validateAction("fc57d407-4bba-442c-97a2-9e6f3c57f288"), async (req: Request, res: Response) => {
-	// Approval is gated by the permission (validateAction), so admin OR any
-	// custom role granted "approve payment" can approve.
+	// C2 — THE SETTLE GATE. "Approve Payment" (fc57d407…) opens the door; THIS is
+	// the call that CLOSES the bill: ApproveBillPaymentByAdmin re-prices at
+	// approval time, reconciles the tenders and stamps closed_at, after which the
+	// table is free and the sale is booked. It is a settle in every sense that
+	// matters, so it answers to the same capability as every other settle path
+	// rather than to a permission of its own.
+	if (!(await enforceSettleAuthority(req, res))) {return;}
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const auth = { restaurantId };
@@ -728,7 +775,11 @@ app.post('/bills/order/:orderId/admin-approve-payment', validateAction("fc57d407
 });
 
 app.post('/bills/order/:orderId/close', validateAction("a953d044-31ba-4e31-b96f-99304fe43dfa"), async (req: Request, res: Response) => {
-	// Gated by the close permission (validateAction) — admin or permissioned custom role.
+	// C2 — THE SETTLE GATE, already in registration position and left there. The
+	// literal above IS PERM_CLOSE_BILL, the same capability enforceSettleAuthority
+	// checks for the other settle paths; a guard that can be read on the route line
+	// is strictly better than one buried in the handler, so this one stays where it
+	// is rather than being moved into the body for symmetry's sake.
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const auth = { restaurantId };
@@ -852,6 +903,61 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		]);
 		if (!bill || !Array.isArray(bill.items) || bill.items.length === 0) {
 			res.status(400).json({ error: 'Nothing to print for this table' });
+			return;
+		}
+		// C3 — A WAITER MAY PRINT THE BILL ONCE; THE SECOND ONE IS SOMEBODY ELSE'S.
+		//
+		// THE HALF THAT WAS MISSING. The requirement is "Waiters can only execute
+		// Print Bill ONCE. Any subsequent actions (reprinting, overrides) must be
+		// restricted." The clients implemented it by hiding the button and
+		// remembering the press IN THE DEVICE. A device memory survives a
+		// back-navigation and an app restart; it does not survive a reinstall, a
+		// second tablet or a bare curl, and this route was gated only on "Add
+		// Orders" (4ad474d4…), which every waiter holds. So the rule meant
+		// something different on every device in the building. A hidden control
+		// must be UNREACHABLE, not merely undrawn — the button is the courtesy,
+		// this is the control.
+		//
+		// THE COUNT IS THE SERVER'S. bill.print_count comes from the durable
+		// "PrintJobs" ledger (migration 027) scoped to this seating, counting only
+		// jobs that printed or are still on their way — see
+		// billPrintHistoryForTable for why a jammed printer does not burn the
+		// waiter's one attempt.
+		//
+		// WHO IS NARROWED: waiter-only identities, decided by isWaiterOnly — the
+		// SAME predicate role_scope.ts ships on every session payload, so the
+		// button the client hides and the door the server shuts are one rule
+		// rather than two that will drift. A manager, cashier, captain or admin
+		// reprints exactly as many times as they always have; the requirement
+		// names "Super Admins" as who a WAITER escalates to, not as a new ceiling
+		// on everyone who runs the floor.
+		//
+		// KOT IS UNTOUCHED. `kind === "kot"` is a kitchen docket, not a bill: a
+		// waiter reprints a lost ticket all shift and always could.
+		if (kind === "bill" && bill.print_count > 0 && isWaiterOnly({
+			role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions,
+		})) {
+			try {
+				await log_audit(
+					req, "4ad474d4-5230-449c-874f-6a238b833bca",
+					`REFUSED reprint of table ${tableName}'s bill — already printed ${String(bill.print_count)} time(s); reprints need a senior role`,
+					Audit_log_category.Bill,
+					{ table: tableName, kind, refused: true, print_count: bill.print_count, first_printed_at: bill.bill_printed_at },
+				);
+			} catch {/* a failed audit write must not turn a 403 into a 500 */}
+			// THE REFUSAL SAYS WHO CAN DO IT INSTEAD. A waiter handed a blank space
+			// where a control was will press it again on the next device they find;
+			// a waiter told "ask a manager" walks to the pass.
+			res.status(403).json({
+				error: "Forbidden",
+				details:
+					`This table's bill has already been printed. A reprint has to be made by a ${ROLES_OUTRANKING_WAITER.join(", ")} — ask one of them.`,
+				reprint_needs_senior: true,
+				print_count: bill.print_count,
+				bill_printed_at: bill.bill_printed_at,
+				printed_at: bill.printed_at,
+				allowed_roles: ROLES_OUTRANKING_WAITER,
+			});
 			return;
 		}
 		// THE CHARGE CONFIG COMES FROM THE RESOLVER, NOT FROM RAW SETTINGS (F2,
@@ -1329,10 +1435,30 @@ app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 	}
 });
 
-// Set or clear a discount on a table's open bill (% or flat, off the subtotal).
-// When the restaurant configures a discount-approval threshold, a NON-admin
-// discount above it is parked as a pending request (managers get a bell ping)
-// instead of applying — the response then carries { pending: true, request_id }.
+/*
+	Set or clear a discount on a table's open bill (% or flat, off the subtotal).
+	When the restaurant configures a discount-approval threshold, a NON-admin
+	discount above it is parked as a pending request (managers get a bell ping)
+	instead of applying — the response then carries { pending: true, request_id }.
+
+	THE ROUTE GATE IS STILL 4ad474d4 "Add Orders", AND THAT IS DELIBERATE. Taking
+	₹50 off for a slow starter is why this control exists and every floor role
+	must keep it. What a waiter must NOT be able to do is write the bill off: a
+	100% discount zeroes a table exactly as releasing it does, through a wider
+	door, and the rationale that "large discounts need approval" is FALSE on a
+	default tenant — "Restaurant".discount_approval_threshold defaults to 0 and
+	the approval queue only engages above zero, so an unconfigured restaurant
+	auto-applies whatever is typed.
+
+	So the gate is on the DISCOUNT, not on the route, and it lives beside the
+	subtotal it is sized against (SetBillDiscountWithApproval, inside the
+	transaction) rather than here, where a pre-check would decide against a number
+	another order could change before the write. This handler's job is to hand the
+	data layer the caller's actions and to turn its refusal into a 403 THAT STILL
+	HAS A BODY — see the catch: a bare 400 {error} would flatten the sentence
+	naming the permission and the money into a "couldn't-do-that" toast, which is
+	the very defect both clients were just fixed for.
+*/
 app.post('/bills/discount', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), validateBody(sBillDiscount), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -1347,6 +1473,12 @@ app.post('/bills/discount', validateAction("4ad474d4-5230-449c-874f-6a238b833bca
 			isAdmin: callerIsAdmin(req),
 			requestedBy: extractEmployeeId(req),
 			reason: reason || null,
+			// THE WRITE-OFF GATE'S INPUTS. PERM_CLOSE_BILL is the SAME uuid
+			// enforceSettleAuthority and the release gate check — never a new one
+			// (migration 025's rule) — so a tenant that has decided who settles has
+			// already decided who may write a bill off by discounting it.
+			actions: req.auth?.actions ?? [],
+			closeBillPermission: PERM_CLOSE_BILL,
 		});
 		if (result.pending) {
 			const label = `${value}${type === "percent" ? "%" : ""} (≈${result.amount})`;
@@ -1371,6 +1503,32 @@ app.post('/bills/discount', validateAction("4ad474d4-5230-449c-874f-6a238b833bca
 		} catch {/* ignore */}
 		res.json(result);
 	} catch (e: any) {
+		// A REFUSED WRITE-OFF IS A 403 WITH A BODY, NOT A 400 WITH A SENTENCE
+		// NOBODY SEES. `details` carries the rupee figures and names the
+		// permission, which is both the explanation for the waiter standing at the
+		// table and the checkbox for the owner in the role editor. AUDITED because
+		// an attempt to write a bill off is exactly the event a manager wants to
+		// see, and a refusal that leaves no trace is indistinguishable from one
+		// that was never made; best-effort, so a failed audit write cannot turn a
+		// 403 into a 500.
+		if (isDiscountAuthorityError(e)) {
+			try {
+				await log_audit(
+					req, "4ad474d4-5230-449c-874f-6a238b833bca",
+					`REFUSED ${value}${type === "percent" ? "%" : ""} discount on table ${tableName} — would have written off ${e.discount_amount.toFixed(2)}, leaving ${e.remaining_value.toFixed(2)}, without Close Bill`,
+					Audit_log_category.Bill,
+					{ table: tableName, type, value, refused: true, discount_amount: e.discount_amount, remaining_value: e.remaining_value },
+				);
+			} catch (err) { logger.warn({ err }, 'log_audit discount refusal failed'); }
+			res.status(403).json({
+				error: "Forbidden",
+				details: e.details,
+				requiredPermission: e.requiredPermission,
+				discount_amount: e.discount_amount,
+				remaining_value: e.remaining_value,
+			});
+			return;
+		}
 		logger.error({ err: e }, 'set_bill_discount_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to set discount') });
 	}
@@ -1390,11 +1548,42 @@ app.post('/bills/apply-coupon', validateAction("4ad474d4-5230-449c-874f-6a238b83
 	const phone = typeof body.customer_phone === "string" ? body.customer_phone.trim() : undefined;
 	if (!tableName || !code) { res.status(400).json({ error: "table_name and code are required" }); return; }
 	try {
-		const result = await ApplyCouponToBill(restaurantId, tableName, code, phone);
+		const result = await ApplyCouponToBill(restaurantId, tableName, code, phone, {
+			// THE SAME GATE AS THE MANUAL DISCOUNT, because a coupon writes the same
+			// flat discount onto the same bill. Gating one and not the other would
+			// leave a refused waiter one keystroke from the identical outcome, under
+			// an audit line that says "coupon applied" instead of "written off".
+			isAdmin: callerIsAdmin(req),
+			actions: req.auth?.actions ?? [],
+			closeBillPermission: PERM_CLOSE_BILL,
+		});
 		try { emitRestaurant(restaurantId, "bill:updated", { table: tableName }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Applied coupon ${result.code} to table ${tableName}`, Audit_log_category.Bill, { table: tableName, code: result.code }); } catch {/* ignore */}
 		res.json(result);
-	} catch (e: any) { logger.error({ err: e }, 'apply_coupon_failed'); res.status(400).json({ error: String(e?.message ?? "Unable to apply coupon") }); }
+	} catch (e: any) {
+		// A refused write-off is a 403 WITH A BODY and an audit row — see the same
+		// block on /bills/discount. Anything else stays a 400, unchanged.
+		if (isDiscountAuthorityError(e)) {
+			try {
+				await log_audit(
+					req, "4ad474d4-5230-449c-874f-6a238b833bca",
+					`REFUSED coupon ${code} on table ${tableName} — would have written off ${e.discount_amount.toFixed(2)}, leaving ${e.remaining_value.toFixed(2)}, without Close Bill`,
+					Audit_log_category.Bill,
+					{ table: tableName, code, refused: true, discount_amount: e.discount_amount, remaining_value: e.remaining_value },
+				);
+			} catch (err) { logger.warn({ err }, 'log_audit coupon refusal failed'); }
+			res.status(403).json({
+				error: "Forbidden",
+				details: e.details,
+				requiredPermission: e.requiredPermission,
+				discount_amount: e.discount_amount,
+				remaining_value: e.remaining_value,
+			});
+			return;
+		}
+		logger.error({ err: e }, 'apply_coupon_failed');
+		res.status(400).json({ error: String(e?.message ?? "Unable to apply coupon") });
+	}
 });
 
 // Add / edit / clear the kitchen note on a single bill item (by name + price),

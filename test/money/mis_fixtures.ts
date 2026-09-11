@@ -205,6 +205,26 @@ export interface FixtureTender {
   voided_at?: string | null;
 }
 
+/**
+ * 035 — ONE RECORDED VOID REASON, keyed to the order it explains.
+ *
+ * Deliberately SEPARATE from FixtureOrder.status, because the whole point of the
+ * A2 change is that a cancelled order MAY have a reason and may not: the cancel
+ * paths accept a cancellation without one (a shipped till that cannot send it
+ * must still be able to cancel), and every order cancelled before migration 035
+ * has no row by design. A fixture that attached a reason to every status-5 order
+ * would quietly assert the opposite.
+ */
+export interface FixtureOrderVoid {
+  res_id?: string;
+  outlet_id?: string;
+  order_id: string;
+  scope?: "order" | "item";
+  reason: string;
+  void_kind: string;
+  stage: string;
+}
+
 /** 038 — a till identity. */
 export interface FixtureCounter {
   id: string;
@@ -244,6 +264,7 @@ export interface FixtureDb {
   tenders: FixtureTender[];
   counters: FixtureCounter[];
   cash_sessions: FixtureCashSession[];
+  order_voids: FixtureOrderVoid[];
 }
 
 export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
@@ -267,6 +288,7 @@ export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
     tenders: [],
     counters: [],
     cash_sessions: [],
+    order_voids: [],
     ...over,
   };
 }
@@ -1000,6 +1022,20 @@ function dispatch(q: string, params: unknown[]): unknown[] {
         additional_details: a.details,
         fname: a.fname ?? null, lname: a.lname ?? null, emp_username: a.username ?? null,
       }));
+  }
+
+  // --- "OrderVoids" (035) — WHY a ticket was cancelled ------------------------
+  //
+  // The Void KOT report reads this SEPARATELY from its main statement so that a
+  // deployment one migration behind degrades to "no reasons known" instead of
+  // 500ing the whole report. Modelled here so that degradation is exercised by
+  // a fixture with no rows rather than merely asserted in a comment.
+  if (/from "OrderVoids"/i.test(q)) {
+    requireShape(q, "res_id = $1", "the tenant predicate");
+    const ids = Array.isArray(params[1]) ? (params[1] as string[]) : [];
+    return d.order_voids
+      .filter((v) => resOf(v) === params[0] && (v.scope ?? "order") === "order" && ids.includes(v.order_id))
+      .map((v) => ({ order_id: v.order_id, reason: v.reason, void_kind: v.void_kind, stage: v.stage }));
   }
 
   throw new Error(`mis fixture: unstubbed SQL — ${q.slice(0, 260)}`);

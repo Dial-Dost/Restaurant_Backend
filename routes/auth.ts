@@ -11,7 +11,7 @@ import { sessionRoleScope } from "../role_scope.js";
 // Seeding a tenant is shared with the operator console's POST /platform/restaurants
 // — see provisioning.ts for why it is not duplicated in either route module.
 import { normalizeRestaurantSlug, provisionRestaurant, RestaurantExistsError } from "../provisioning.js";
-import { extractBearerToken, extractRestaurantUsername, passwordPolicyError, rateLimit, validate, validateBody } from "./_shared.js";
+import { extractBearerToken, extractRestaurantUsername, passwordPolicyError, rateLimit, sessionCapabilities, validate, validateBody } from "./_shared.js";
 
 
 // (extractActionList removed — permissions now come from the verified session.)
@@ -187,7 +187,17 @@ app.post("/auth/employee-login", rateLimit("login", 15, 60_000), validate, async
 			// any tenant whose waiters carried a custom role (stored as a uuid) or
 			// the "employee" fallback — both of which silently removed every
 			// restriction, money included.
-			scope: sessionRoleScope({ role: user.role, role_all: user.role_all, actions: Array.from(user.actions_set) }),
+			// The capability half of the same block (C1/C2/C5/C7/D5/H8): "may I
+			// settle", "may I delete a table", "may I open the roles screen". Merged
+			// into `scope` rather than added as a second top-level key, exactly as
+			// role_scope.ts's header argues — clients already read `scope`, and a
+			// field added to it is additive while a new key is another thing every
+			// client has to learn about. See sessionCapabilities for why the server
+			// ships the ANSWER and not the uuid to test against.
+			scope: {
+				...sessionRoleScope({ role: user.role, role_all: user.role_all, actions: Array.from(user.actions_set) }),
+				...sessionCapabilities({ actions: Array.from(user.actions_set) }),
+			},
 			features: plan.features,
 			limits: plan.limits,
 		});
@@ -241,7 +251,13 @@ app.get("/auth/me", async (req: Request, res: Response) => {
 		// Recomputed on every /auth/me rather than stored on the session: a role
 		// change must take effect on the next launch, not on the next login. It is
 		// a pure function of fields already in hand, so it costs nothing.
-		scope: sessionRoleScope({ role: session.role, role_all: session.role_all, actions: session.actions }),
+		scope: {
+			...sessionRoleScope({ role: session.role, role_all: session.role_all, actions: session.actions }),
+			// Recomputed here for the same reason waiter_only is: a permission
+			// granted or revoked while the app was closed must be in force at the
+			// next launch, not at the next password prompt.
+			...sessionCapabilities({ actions: session.actions }),
+		},
 		features: session.features ?? {},
 		limits: session.limits ?? {},
 	});

@@ -3,13 +3,14 @@
  * covers.
  */
 import type { Express, Request, Response } from "express";
-import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableSections, GetTableStatus, GetTables, MoveOrderToTable, MoveTableParty, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
+import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableReleaseImpact, GetTableSections, GetTableStatus, GetTables, MoveOrderToTable, MoveTableParty, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
 import { idempotent } from "../idempotency.js";
 import { printKotTableChange } from "../kot_move.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
+import { mayReleaseTable } from "../release_authority.js";
 import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
-import { AUDIT_TABLE_UPDATED, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
+import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
 
 
 /*
@@ -971,7 +972,34 @@ app.post("/tables/move-order", validateAction("4ad474d4-5230-449c-874f-6a238b833
 	}
 });
 
-// Release/unoccupy a table
+/*
+	RELEASE/UNOCCUPY A TABLE — and the side door C2 left open.
+
+	THE HOLE. C2 put all five settle paths behind PERM_CLOSE_BILL. This route was
+	not one of them, and ReleaseTable voids every active order on the table AND
+	closes its open bill at total_amt = 0 (see its money-guard comments). Its
+	permission, 090ea8d4, is held by the CORE WAITER ROLE. So the front door was
+	bolted and the side door was open: a waiter could not settle a bill for what
+	it was worth, and could still make it disappear for nothing — which is worse
+	than not restricting settle at all, because the restriction is visible and is
+	therefore trusted.
+
+	THE GATE DEPENDS ON THE BILL, NOT ON THE ROUTE. Releasing an EMPTY table is
+	the commonest floor action there is and stays on 090ea8d4 for every waiter:
+	moving the whole route to PERM_CLOSE_BILL would mean fetching a manager to
+	free a table nobody ordered at, and a floor that cannot recycle its own
+	tables is a worse outage than the bug. Releasing a table that still carries
+	VALUE is a write-off and needs the authority to settle that value — the SAME
+	uuid enforceSettleAuthority checks, never a new one (migration 025's rule).
+	release_authority.ts holds the rule and argues where the line sits.
+
+	THE PREFLIGHT IS SKIPPED ENTIRELY FOR ANYONE WHO ALREADY HOLDS Close Bill,
+	so an owner, a manager or a cashier pays no extra query, meets no new failure
+	mode, and cannot be locked out of their own floor by a read that went wrong.
+	For everyone else the preflight is REQUIRED to succeed: if we cannot see what
+	a release would destroy we refuse it, because a refused release costs one
+	escalation and an un-refused one can cost a service's takings.
+*/
 app.post("/release-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), idempotent(), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {
@@ -987,10 +1015,67 @@ app.post("/release-table", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"
 		return;
 	}
 
+	const actions = req.auth?.actions ?? [];
+	const mayWriteOff = actions.includes("*") || actions.includes(PERM_CLOSE_BILL);
+	let writeOffValue = 0;
+	{
+		let impact: Awaited<ReturnType<typeof GetTableReleaseImpact>> = null;
+		let impactFailed = false;
+		try {
+			impact = await GetTableReleaseImpact(restaurantId, tableName);
+		} catch (err) {
+			impactFailed = true;
+			logger.error({ err, table: tableName }, "release_table_impact_read_failed");
+		}
+		// THE READ FAILING MEANS DIFFERENT THINGS TO DIFFERENT CALLERS, and that
+		// asymmetry is the point. To somebody who may already write a bill off it
+		// costs one line of audit detail and nothing else — they are not blocked by
+		// a read they never needed. To everybody else it is the whole gate, and an
+		// ungated release is the bug, so it is a refusal.
+		if (impactFailed && !mayWriteOff) {
+			res.status(503).json({
+				error: "Forbidden",
+				details: "Could not check whether releasing this table would write off an unpaid bill. Try again, or ask a manager to release it.",
+				requiredPermission: PERM_CLOSE_BILL,
+			});
+			return;
+		}
+		// A table that does not exist is ReleaseTable's 400 to give, not ours.
+		if (impact) {
+			const verdict = mayReleaseTable({ actions, impact, closeBillPermission: PERM_CLOSE_BILL, tableName });
+			if (!verdict.allowed) {
+				// AUDITED EVEN THOUGH NOTHING HAPPENED. An attempt to walk a table's
+				// money out of the system is exactly the event a manager wants to see,
+				// and a refusal that leaves no trace is indistinguishable from one that
+				// was never made. Best-effort: a failed audit write must not turn a
+				// 403 into a 500.
+				try {
+					await log_audit(
+						req, "090ea8d4-e348-4e1b-9723-11131a73a085",
+						`REFUSED release of table ${tableName} — would have written off ${verdict.write_off_value.toFixed(2)} without Close Bill`,
+						Audit_log_category.Tables,
+						{ table_name: tableName, refused: true, write_off_value: verdict.write_off_value, ...impact },
+					);
+				} catch (err) { logger.warn({ err }, "log_audit release-table refusal failed"); }
+				res.status(403).json({
+					error: "Forbidden",
+					details: verdict.details,
+					requiredPermission: PERM_CLOSE_BILL,
+					write_off_value: verdict.write_off_value,
+				});
+				return;
+			}
+			writeOffValue = verdict.write_off_value;
+		}
+	}
+
 	try {
 		const result = await ReleaseTable(restaurantId, tableName);
 		try {
-			await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Released table ${tableName}`, Audit_log_category.Tables, { table_name: tableName });
+			// The audit line SAYS WHAT WAS DESTROYED when something was. A release of
+			// an empty table reads exactly as it always has.
+			const note = writeOffValue > 0 ? ` (wrote off ${writeOffValue.toFixed(2)} of unpaid orders)` : "";
+			await log_audit(req, "090ea8d4-e348-4e1b-9723-11131a73a085", `Released table ${tableName}${note}`, Audit_log_category.Tables, { table_name: tableName, write_off_value: writeOffValue });
 		} catch (err) {
 			logger.warn({ err }, 'log_audit release-table failed');
 		}

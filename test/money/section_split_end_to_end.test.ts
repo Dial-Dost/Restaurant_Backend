@@ -94,6 +94,10 @@ function dispatch(q: string): unknown[] {
     return fixture.menu.map((m) => ({ id: m.id, name: m.name, group_id: m.group_id, group_name: m.group_name }));
   }
   if (/from "MenuVariations"/i.test(q)) { return []; }
+  // C3's print count (billPrintHistoryForTable). Nothing has been printed on
+  // this fixture, and nothing here depends on it — the money this suite asserts
+  // on must be identical whether the bill has been on paper or not.
+  if (/from "PrintJobs"/i.test(q)) { return [{ n: "0", first_at: null, last_at: null }]; }
   // liveServiceChargeWaiver (migration 036), reached once a bill row exists: no
   // waiver is live on this fixture, so the charge stands.
   if (/waived_at/i.test(q)) { return []; }

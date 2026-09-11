@@ -182,6 +182,12 @@ function standardDb(over: Partial<FixtureDb> = {}): FixtureDb {
       { id: "ax", created_at: "2026-06-05T07:50:00.000Z", res_id: OTHER_RES_ID, outlet_id: OTHER_OUTLET, action_id: CATCH_ALL, action_name: "Add Orders", reason: "Removed item Secret from table Z1", details: { table: "Z1", item: "Secret" }, fname: "Nobody", lname: "Else" },
     ],
     menu: [{ name: "Paneer Tikka", category: "Starters" }, { name: "Dal", category: "Mains" }],
+    // A2/035 — THE RECORDED REASON for the void above. Deliberately the ONLY
+    // one: OTHER_VOID_ID has none, which is the pre-035 / no-reason-sent shape
+    // the report has to render as a truthful blank rather than a guess.
+    order_voids: [
+      { order_id: VOID_ID, reason: "Guest changed their mind", void_kind: "guest_changed_mind", stage: "after_print" },
+    ],
     ...over,
   });
 }
@@ -292,6 +298,33 @@ describe("cancelled orders are not sales", () => {
     expect(voids.rows[0]?.voided_by).toBe("Asha Rao");
     expect(voids.rows[0]?.voided_at).toBe("2026-06-06T10:05:00.000Z");
     expect(voids.rows[0]?.kot_no).toBeNull();
+  });
+
+  test("A2: the recorded REASON reaches the Void report, and an unrecorded one reads blank", async () => {
+    // THE POINT OF THE A2 CHANGE. The clients have been sending a reason all
+    // along and PATCH /orders/:id/status discarded it, so this column was
+    // permanently empty and the requirement ("a reason is required before the
+    // action is processed and finalized") was true of the prompt and false of
+    // the database.
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    expect(voids.rows[0]?.reason).toBe("Guest changed their mind");
+    expect(voids.rows[0]?.void_kind).toBe("guest_changed_mind");
+    // SERVER-DERIVED, never self-reported — a void's stage is the fraud signal.
+    expect(voids.rows[0]?.stage).toBe("after_print");
+    // And the column is declared, so the CSV and the table render it.
+    expect(voids.columns.map((c) => c.key)).toEqual(expect.arrayContaining(["reason", "stage"]));
+  });
+
+  test("A2: a cancel with NO recorded reason is a truthful blank, not a fabricated one", async () => {
+    // Every order cancelled before 035, and every cancel a shipped till makes
+    // without sending a reason. The report counts them; it does not invent a
+    // reason or a stage for them, because a stage computed from the wrong
+    // instant is a fabricated fraud signal pointing at a named employee.
+    useFixtureDb(standardDb({ order_voids: [] }));
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    expect(voids.totals.voids).toBe(1);
+    expect(voids.rows[0]?.reason).toBeNull();
+    expect(voids.rows[0]?.stage).toBeNull();
   });
 
   test("an unsettled bill is not revenue either", async () => {

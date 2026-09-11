@@ -389,7 +389,24 @@ app.post("/qr/:slug/coupon", rateLimit("coupon", 20, 60_000), async (req: Reques
 	if (!tableName) { res.status(403).json({ error: "Invalid table code. Please re-scan the QR at your table." }); return; }
 	if (!code) { res.status(400).json({ error: "code is required" }); return; }
 	try {
-		const result = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => ApplyCouponToBill(slug, tableName, code, phone));
+		// THE WRITE-OFF GATE IS ABOUT STAFF DISCRETION, AND A GUEST HAS NONE.
+		//
+		// ApplyCouponToBill now refuses a reduction bigger than half the bill
+		// unless the caller holds Close Bill — the rule that stops a waiter zeroing
+		// a table with a 100% coupon. THIS caller is not a waiter: it is the guest's
+		// own phone, scanning the QR at their table, with no session and therefore
+		// no actions at all. Passing them through the staff gate refused a genuine
+		// 100% gift voucher with a bare 400 — the restaurant's own promotion,
+		// declined at the table, for a permission the guest could never hold.
+		//
+		// What actually controls this path is the COUPON, not the caller:
+		// validateCoupon has already checked it exists, is active, is within its
+		// usage and per-customer limits, meets the minimum order and honours its
+		// cap. A voucher for the whole bill is a voucher the owner created and the
+		// guest is entitled to spend. So the staff-discretion gate is explicitly
+		// stood down here, and is NOT stood down anywhere a staff identity applies
+		// a coupon (/bills/apply-coupon still passes the real session).
+		const result = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () => ApplyCouponToBill(slug, tableName, code, phone, { isAdmin: true }));
 		try { emitRestaurant(resId, "bill:updated", { table: tableName }); } catch {/* ignore */}
 		res.json(result);
 	} catch (e: any) { logger.error({ err: e }, "qr_apply_coupon_failed"); res.status(400).json({ error: safeClientError(e, "Unable to apply coupon") }); }
