@@ -489,6 +489,128 @@ export function quoteServiceChargeWaiver(
 }
 
 // ============================================================================
+// TURNING THE SERVICE CHARGE OFF — the ONE answer (F2)
+// ============================================================================
+//
+// THE CLIENT'S SENTENCE, VERBATIM, from a running restaurant: "bills printed
+// WITHOUT a service charge incorrectly show the same total as bills WITH a
+// service charge."
+//
+// THE FAILURE MODE, NAMED. "Off" only ever meant ONE of the two shapes above.
+// computeBillCharges' `includeServiceCharge=false` zeroes the restaurant_percent
+// leg and nothing else, so on a tenant carrying the charge as a TAX LINE — which
+// is the shipped seed (migrations/000_base_schema.sql:266), i.e. the default,
+// i.e. the tenant that reported this — the charge sails straight through
+// computeBillTaxes untouched and the "without" bill equals the "with" bill TO
+// THE PAISA. The guest is charged for a thing the bill says was not charged.
+//
+// So `includeServiceCharge=false` is not, on its own, a truthful answer to
+// "print this without the charge": it has to be PAIRED with a tax config the
+// charge has been lifted out of. Four call sites paired those two by hand and
+// four of them got it wrong, which is why they are paired HERE, once, and every
+// caller asks this instead of assembling the pair itself.
+//
+// IT ALSO ANSWERS "WAS ANYTHING ACTUALLY REMOVED", because the printers need
+// that and were deriving it wrongly too: the Opted-out line and the
+// voluntary-charge disclaimer both keyed off `settings.service_charge > 0`,
+// which is 0 on precisely the tax_line tenant being overcharged — so that bill
+// did not merely charge the guest, it declined to admit the charge existed.
+// `service_charge_removed` / `service_charge_applied` are that answer in both
+// shapes, so no printer has to re-derive it from a config it cannot read.
+//
+// WHY NOT JUST CALL quoteServiceChargeWaiver. That function prices a waiver on a
+// SPECIFIC bill — it needs the subtotal and the discount, and it returns money.
+// A printer deciding how to render a header has neither yet; it needs the
+// CONFIG. This is the config half, and it is deliberately built out of the same
+// taxConfigWithoutServiceCharge the quote is built out of, so the config a bill
+// is charged through and the config its recorded saving was measured against are
+// the same subtraction. (`resolveServiceChargeConfig` returns the quote's
+// `tax_config_waived` and `service_charge_percent_waived` exactly — pinned in
+// test/money/service_charge_off.test.ts.)
+//
+// A TENANT WITH NO CHARGE IN EITHER SHAPE IS UNTOUCHED BY CONSTRUCTION: `basis`
+// is "none", both booleans are false, and `taxConfig` is handed back as THE SAME
+// OBJECT that came in — not a normalised copy — so a tenant who has never used
+// this feature cannot tell that it shipped.
+
+export interface ServiceChargeConfigResolution {
+  /** Hand straight to computeBillCharges. Charge-free when the charge was removed. */
+  taxConfig: Record<string, number> | { name: string; percentage: number }[] | null | undefined;
+  /** Hand straight to computeBillCharges. 0 when the charge was removed. */
+  scPct: number;
+  /** Hand straight to computeBillCharges. false when the charge was removed. */
+  includeServiceCharge: boolean;
+  /** Which shape CARRIED the charge, before any removal. "none" = none configured. */
+  basis: ServiceChargeBasis;
+  /** The NOMINAL percent of the configured charge, for a display line. See below. */
+  service_charge_percent: number;
+  /** True iff a charge was configured AND this resolution took it off. */
+  service_charge_removed: boolean;
+  /** True iff the resolved config still charges one. This gates the disclaimer. */
+  service_charge_applied: boolean;
+}
+
+/**
+ * Resolve what a bill's charge configuration is, with the service charge left on
+ * or taken off — in BOTH shapes.
+ *
+ * `off` is the "print/charge this without the service charge" request: the
+ * `no_service_charge` flag on /print/bill, a live waiver on an open bill
+ * (migration 036), the dashboard's opt-out. One flag, one answer, both legs.
+ */
+export function resolveServiceChargeConfig(
+  taxConfig: Record<string, number> | { name: string; percentage: number }[] | null | undefined,
+  serviceChargePercent: number,
+  off = false,
+): ServiceChargeConfigResolution {
+  const scPct = Math.max(0, Number(serviceChargePercent) || 0);
+  const { taxes, service_line } = taxConfigWithoutServiceCharge(taxConfig);
+  // Same precedence as quoteServiceChargeWaiver: a tenant carrying BOTH is
+  // reported under the tax_line shape, because that is the shape the settled
+  // bill is read back through. Keeping the two in step matters — the waiver
+  // record's `basis` column and this field describe the same charge.
+  const basis: ServiceChargeBasis =
+    service_line !== null ? "tax_line" : (scPct > 0 ? "restaurant_percent" : "none");
+  // NOMINAL, not effective. In either single shape this IS the configured
+  // percentage, which is what the Opted-out line prints. A tenant carrying both
+  // is charging twice and the two legs sit on DIFFERENT bases (the percent leg
+  // on the discounted subtotal, the tax line on subtotal + that leg), so their
+  // sum is a label rather than an arithmetic claim; the money-truth for that
+  // tenant is quoteServiceChargeWaiver's difference, which is derived from two
+  // ladders rather than from any percentage. Never print money from this.
+  const service_charge_percent = round2(scPct + (service_line?.percentage ?? 0));
+
+  if (!off || basis === "none") {
+    // Either the caller did not ask, or there is nothing to remove. Hand back the
+    // caller's OWN config object rather than the normalised array: the charge-on
+    // path is the path every existing bill takes, and it must not be rebuilt
+    // underneath a fleet of live tenants for a feature they are not using.
+    return {
+      taxConfig,
+      scPct,
+      includeServiceCharge: !off,
+      basis,
+      service_charge_percent,
+      service_charge_removed: false,
+      service_charge_applied: !off && basis !== "none",
+    };
+  }
+
+  // BOTH LEGS, which is the whole fix: the tax-line leg comes out of the config
+  // AND the restaurant_percent leg is zeroed. Removing only one of them is the
+  // bug this function exists to make unrepeatable.
+  return {
+    taxConfig: taxes,
+    scPct: 0,
+    includeServiceCharge: false,
+    basis,
+    service_charge_percent,
+    service_charge_removed: true,
+    service_charge_applied: false,
+  };
+}
+
+// ============================================================================
 // TENDERS — migration 037
 // ============================================================================
 //

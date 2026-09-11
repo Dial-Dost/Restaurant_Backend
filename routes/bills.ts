@@ -6,7 +6,7 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
 import { buildReceiptBase64 } from "../escpos.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
@@ -854,14 +854,79 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			res.status(400).json({ error: 'Nothing to print for this table' });
 			return;
 		}
-		// Reprint without service charge on request (waiver). Recompute taxes on the
-		// (discounted) subtotal so the printed total matches the actual bill.
-		const includeServiceCharge = body.no_service_charge !== true;
+		// THE CHARGE CONFIG COMES FROM THE RESOLVER, NOT FROM RAW SETTINGS (F2,
+		// root cause 1).
+		//
+		// THE FAILURE THIS CLOSES. This route used to call computeBillCharges
+		// itself with `settings.taxes` and `settings.service_charge` — the RAW
+		// outlet config — and suppress the charge by passing
+		// includeServiceCharge=false. That flag zeroes ONE leg: the
+		// "Restaurant".service_charge percent. A tenant carrying its service
+		// charge as a LINE IN Outlets.default_tax — the tax_line shape, which is
+		// the shipped seed and therefore the tenant that reported this — sailed
+		// straight through computeBillTaxes untouched, so the bill printed WITHOUT
+		// the charge came out to the same paisa as the bill printed WITH it.
+		//
+		// Pairing "off" with a tax config the charge has been lifted out of is now
+		// one function's job (resolveServiceChargeConfig, reached through
+		// GetBillChargeConfigForTable) rather than four call sites' — see its
+		// header for why doing that pairing by hand at a call site IS the bug.
+		//
+		// Reading the raw config had a second consequence: it ignored a LIVE
+		// WAIVER (migration 036), which openBillChargeConfig had already applied to
+		// the bill on screen. A waived table was shown one total and handed
+		// another on paper — precisely the divergence that resolver was
+		// consolidated to make impossible. The stored waiver now reaches this route
+		// through the same resolver the bill view and every settle path use, so the
+		// printed bill and the till's bill are built from one answer.
+		//
+		// `no_service_charge` NO LONGER MOVES THE TOTAL — THE PAPER IS THE DRAWER.
+		//
+		// THE FAILURE MODE, NAMED: THE PAPER DISAGREEING WITH THE DRAWER. This
+		// route used to hand the flag down as `withoutServiceCharge`, so the charge
+		// came off the PRINTED ladder. No settle path has ever heard of the flag —
+		// ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin and the two
+		// customer-payment paths all resolve through
+		// `openBillChargeConfig(context, tableId, client)` with no options, and a
+		// print-time request is not stored anywhere they could read it. On the
+		// seeded tax shape at 10%, subtotal 5499: the guest was CHARGED 6323.84 and
+		// HANDED a bill for 5773.94. That is worse than the F2 bug it came in with
+		// — F2 printed a number that was too high, this printed one the till would
+		// not honour — and it is on a tax document.
+		//
+		// A PRINT MUST NOT BE THE THING THAT DECIDES WHAT A GUEST PAYS, so the fix
+		// is not to teach settle about the flag; it is to stop the flag from being
+		// a way to reduce a total. The ONE way the charge comes off a bill is the
+		// RECORDED WAIVER (migration 036): quoteServiceChargeWaiver prices it,
+		// "ServiceChargeWaivers" records who asked and who authorised and why, the
+		// waiver report and the audit log show it, and openBillChargeConfig honours
+		// it on every read — so a waived bill prints less AND charges less AND
+		// names the person who allowed it. `no_service_charge` keeps its name and
+		// becomes what the name says on a bill that already carries a waiver; on an
+		// un-waived bill the paper shows what the guest owes.
+		//
+		// THE ARGUMENTS BELOW ARE DELIBERATELY IDENTICAL TO THE SETTLE PATHS'. If a
+		// reprint ever needs a "what would this cost without the charge" preview,
+		// it must not be built here: whatever this route renders is what a guest is
+		// handed, and the only honest way to lower it is to record the waiver first.
+		const askedWithoutServiceCharge = body.no_service_charge === true;
+		const chargeCfg = await GetBillChargeConfigForTable(restaurantId, tableName);
+		// The flag was asked for, there IS a charge, and nobody authorised taking it
+		// off. The bill below therefore prints WITH the charge and the till takes
+		// the same number — so the ask itself is reported to the caller and written
+		// to the audit log, because a waiter who asked for less and handed over
+		// more has to be able to find out why, and a manager has to be able to see
+		// that it was asked for at all.
+		const waiverRequired = askedWithoutServiceCharge
+			&& !chargeCfg.service_charge_removed
+			&& chargeCfg.basis !== "none";
 		const charges = computeBillCharges(
 			bill.subtotal ?? bill.total_amt ?? 0,
-			settings.taxes ?? [],
-			settings.service_charge ?? 0,
-			includeServiceCharge,
+			chargeCfg.taxConfig,
+			chargeCfg.scPct,
+			chargeCfg.includeServiceCharge,
+			// The discount exactly as GetBillForTable read it, so the printed ladder
+			// is built on the same base as the one the till is showing.
 			bill.discount_value > 0 ? { type: bill.discount_type ?? "percent", value: bill.discount_value } : undefined,
 		);
 		// Column layout + logo raster width follow the configured paper size
@@ -949,11 +1014,29 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 				cashier = `${emp?.emp_Fname ?? ""} ${emp?.emp_Lname ?? ""}`.trim();
 			} catch {/* cashier optional */}
 		}
-		// Show the service-charge line even when waived ("Opted-out"), matching the web bill.
-		const scPercent = charges.service_charge_percent || settings.service_charge || 0;
+		// THE OPTED-OUT LINE KEYS OFF A CHARGE HAVING ACTUALLY BEEN REMOVED — not
+		// off a percent that is structurally zero on the broken tenant (F2, root
+		// cause 2).
+		//
+		// It used to read `charges.service_charge_percent || settings.service_charge`,
+		// and `settings.service_charge` is 0 on a tenant carrying the charge as a
+		// tax line. So on exactly the tenant whose opt-out was already silently
+		// failing, the bill did not even admit the line existed: no charge line, no
+		// Opted-out line, and a total identical to the one with the charge.
+		// `service_charge_removed` is the resolver's answer in BOTH shapes and
+		// `service_charge_percent` is the configured percentage whichever shape
+		// carries it, so the line now prints on a tax-line tenant too, at the
+		// percentage the guest would otherwise have been charged.
+		//
+		// IT ALSO NOW PRINTS ON A LIVE WAIVER, not just on a `no_service_charge`
+		// reprint: the resolver removes the charge for both, and a waived table
+		// whose bill simply omitted the line left the guest no way to see that the
+		// charge had been dropped rather than never applied.
 		const serviceCharge = charges.service_charge > 0
 			? { percent: charges.service_charge_percent, amount: charges.service_charge }
-			: (!includeServiceCharge && scPercent > 0 ? { percent: scPercent, amount: 0, optedOut: true } : null);
+			: (chargeCfg.service_charge_removed
+				? { percent: chargeCfg.service_charge_percent, amount: 0, optedOut: true }
+				: null);
 		const escBase64 = buildReceiptBase64({
 			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
 			// Legal entity + GSTIN are tenant settings, not profile fields: they are
@@ -996,7 +1079,17 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			// valet line inside the renderer, so an unconfigured tenant is unchanged.
 			qrNote: settings.bill_qr_note ?? null,
 			logo,
-			serviceChargeNote: isBill && charges.service_charge > 0
+			// THE DISCLAIMER FOLLOWS THE CHARGE, NOT ONE LEG OF IT (G2; F2 root
+			// cause 3). This predicate was `charges.service_charge > 0` — the
+			// restaurant_percent leg alone — and so carried the same blind spot as
+			// the Opted-out line above it: a tenant charging through a tax line
+			// never printed the sentence the requirement makes mandatory, and would
+			// have gone on printing it on opted-out bills once the opt-out started
+			// working. `service_charge_applied` is the resolver's "does this
+			// configuration still charge for service", in both shapes, so the
+			// sentence appears when and only when the guest is actually being
+			// charged for one.
+			serviceChargeNote: isBill && chargeCfg.service_charge_applied
 				? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."
 				: null,
 		}, cols);
@@ -1012,14 +1105,32 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		const dispatched = await dispatchPrintJob(restaurantId, {
 			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
 		});
-		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${includeServiceCharge ? "" : " (no service charge)"}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: !includeServiceCharge }); } catch {/* ignore */}
+		// THE AUDIT LINE SAYS WHAT THE PAPER ACTUALLY SAYS. It used to read "(no
+		// service charge)" off the REQUEST, which is how a print that reduced a
+		// total nobody authorised left a trail claiming it was fine. It now
+		// describes the bill that came out: removed (and by whose waiver), or asked
+		// for and refused — which is the line a manager scans for.
+		const scNote = chargeCfg.service_charge_removed
+			? ` (no service charge — waiver by ${chargeCfg.waiver?.authorised_by_username ?? "unknown"})`
+			: waiverRequired
+				? " (asked WITHOUT the service charge; no waiver is recorded, so the charge is ON this bill)"
+				: "";
+		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null }); } catch {/* ignore */}
 		// Additive, exactly as on /publish/bill: null for every unrouted outlet.
+		//
+		// The two service-charge fields are additive too, and a shipped till that
+		// ignores them is unchanged. They exist so a till that SENT
+		// `no_service_charge` can tell the waiter the charge is still on the paper
+		// and that a manager has to record a waiver — without them the only signal
+		// is a total that silently did not move.
 		res.json({
 			success: true,
 			billId,
 			jobId: dispatched.jobId,
 			destination: dispatched.decision.destinationName,
 			device: dispatched.assignedDeviceId,
+			service_charge_removed: chargeCfg.service_charge_removed,
+			service_charge_waiver_required: waiverRequired,
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');

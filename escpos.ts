@@ -237,6 +237,38 @@ export interface ReceiptOptions {
   // derives and whole-rupee-rounds a total, so callers that predate this field
   // keep their exact present behaviour.
   grandTotal?: number | null;
+  /**
+   * THE ROUND-OFF THE BILLING LAYER ALREADY COMPUTED — disclosed, never created.
+   *
+   * Printed immediately above a SUPPLIED grand total, and only when it is
+   * non-zero, so the rungs a guest can add up on the paper reach the number they
+   * are asked to pay. The total itself is still printed verbatim and nothing
+   * here is re-rounded: this line reports a difference, it does not make one.
+   *
+   * A whole bill never carries one. computeBillCharges rounds every rung to 2dp,
+   * so discounted_subtotal + service_charge + tax_total IS the grand total and
+   * there is nothing to disclose — which is why every receipt printed before
+   * this field existed stays byte-identical. It exists for a SPLIT PART, where
+   * a whole bill's round-off is apportioned between the parts, and a part that
+   * silently swallowed its share would be a slip whose own lines do not sum to
+   * its own total.
+   */
+  roundOff?: number | null;
+  /**
+   * BILL ONLY: this slip is ONE PART OF A SPLIT BILL, not the whole thing.
+   *
+   * Two slips handed across the same table are the same document in every
+   * respect a guest can see — same restaurant, same bill number, same date, same
+   * table — so without this block they cannot be told apart, and "is this yours
+   * or mine" has no answer on the paper. It says which part this is, of how
+   * many, and which table they came from.
+   *
+   * Set ONLY when there is more than one part. A table whose whole bill is a
+   * single section is not a split: it is that table's ordinary bill and must
+   * print as one, byte for byte. See buildSplitReceiptsBase64, which owns that
+   * rule so no caller has to remember it.
+   */
+  splitPart?: { index: number; of: number; label?: string | null } | null;
   // When set (bill only), prints a "scan to rate" QR code linking to the
   // feedback form for the waiter who handled this table.
   feedbackUrl?: string | null;
@@ -494,6 +526,38 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
 
   // --- Meta block (left aligned) --------------------------------------------
   raw(ESC, 0x61, 0x00); // left
+  // WHICH SLIP THIS IS — BEFORE ANYTHING THAT LOOKS THE SAME ON BOTH OF THEM.
+  //
+  // The parts of a split bill are identical documents down to the bill number,
+  // so this block is the only thing that tells two of them apart, and it is read
+  // across a table, at arm's length, by someone deciding which one is theirs. It
+  // goes FIRST and in the biggest type the printer has, above the customer and
+  // date lines rather than among them: a part marker set in body text in a block
+  // of body text is a marker that gets missed, and the failure is two guests
+  // paying the same slip twice while the other one goes in a pocket.
+  //
+  // "** PART 1/3 **" is 14 characters, i.e. 28 of the 32 cells on 58mm paper, so
+  // it prints at full size on the narrow roll as well as the wide one; a
+  // two-digit split ("** PART 10/12 **") lands on exactly 32, and `big` degrades
+  // anything past that to normal width rather than letting the printer wrap the
+  // one line that had to be unmissable.
+  //
+  // THE TABLE IS REPEATED HERE even though the Dine In line below carries it:
+  // that line is a date stamp with a table on the end of it, and the fact that
+  // has to survive a glance at two slips is whose food this was.
+  const splitPart = !isKot && opts.splitPart ? opts.splitPart : null;
+  if (splitPart) {
+    const of = Math.max(1, Math.round(Number(splitPart.of) || 1));
+    const index = Math.min(of, Math.max(1, Math.round(Number(splitPart.index) || 1)));
+    big(`** PART ${index}/${of} **`, width);
+    // The section's own name, and the table, on one wrapped line. An unlabelled
+    // part still says which table it belongs to rather than printing a bare
+    // dash — same rule every header field in this file obeys.
+    const label = present(splitPart.label);
+    const where = `Table ${opts.table || "N/A"}`;
+    for (const l of wrapText(label ? `${label} - ${where}` : where, width)) {line(l);}
+    line(sep);
+  }
   if (!isKot) {
     line(`Customer Name: ${present(opts.customer) || "Guest"}`);
     line(sep);
@@ -855,6 +919,14 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   line(sep);
   const supplied = Number(opts.grandTotal);
   if (opts.grandTotal != null && Number.isFinite(supplied)) {
+    // The one thing that IS printed alongside a supplied total: a round-off the
+    // billing layer already computed, so the lines above add up to the total
+    // below. It is reported, not derived — see `roundOff`. Absent, null or zero
+    // prints nothing, which is every whole bill.
+    const disclosed = Number(opts.roundOff);
+    if (opts.roundOff != null && Number.isFinite(disclosed) && Math.round(disclosed * 100) !== 0) {
+      line(twoCol("Round off", (disclosed > 0 ? "+" : "") + disclosed.toFixed(2), width));
+    }
     raw(ESC, 0x45, 0x01); // bold
     line(twoCol("Grand Total:", money(supplied), width));
     raw(ESC, 0x45, 0x00);
@@ -942,4 +1014,141 @@ export function buildKotBase64(opts: ReceiptOptions, width = 48): { station: str
     station,
     escBase64: buildReceiptBase64({ ...opts, kind: "kot", station, items }, width),
   }));
+}
+
+/**
+ * ONE PART OF A SPLIT BILL, as the renderer reads it.
+ *
+ * STRUCTURAL ON PURPOSE, so this file keeps its zero imports (billing_math.ts
+ * has none either, and its header says why): `SectionSplitPart` — what
+ * computeSectionSplit returns and what SplitBillForTableBySection hands back —
+ * is assignable to this as it stands, field for field, with no adapter in
+ * between for a future change to drift through.
+ *
+ * EVERY NUMBER HERE IS THE BILLING LAYER'S. Nothing in this shape is derived and
+ * nothing in the renderer recomputes it.
+ */
+export interface SplitReceiptPart {
+  /** Stable identity of the part (the section key). Echoed back to the caller. */
+  key?: string;
+  /** What this part is called on the paper — "Starters", "Bar". */
+  label?: string | null;
+  /** GROSS, pre-discount — the Subtotal line, exactly as a whole bill prints it. */
+  subtotal: number;
+  discount?: number;
+  service_charge?: number;
+  taxes?: ReceiptTax[];
+  /** This part's share of a whole-bill round-off. Normally 0, and then unprinted. */
+  round_off?: number;
+  /** What this part is charged. PRINTED VERBATIM. */
+  grand_total: number;
+  items: ReceiptItem[];
+}
+
+/** One rendered part: the paper, plus the identity the caller needs to route it. */
+export interface SplitReceipt {
+  key: string;
+  label: string;
+  /** 1-based, and printed on the slip as "PART index/of". */
+  index: number;
+  of: number;
+  /** The part's grand total, for the caller's log/response. NOT re-derived here. */
+  grandTotal: number;
+  escBase64: string;
+}
+
+/**
+ * Render a split bill: ONE standalone, cut-terminated customer bill per part.
+ *
+ * The split ITSELF is not done here and must never be — computeSectionSplit
+ * apportions every rung of the ladder (net, discount, service charge, each named
+ * tax, unnamed tax, round-off) with a conserving allocator, and this function's
+ * whole job is to put those numbers on paper without touching them.
+ *
+ * NO PART EVER INVENTS ITS OWN ROUNDING, and that is the entire risk of this
+ * document. Each part's total goes in through `grandTotal`, which is the rule
+ * buildReceiptBase64 already has for a caller-supplied total: print it exactly
+ * as received and recompute nothing. Rendering a part the legacy way instead —
+ * re-adding its lines and whole-rupee-rounding the result — would give three
+ * parts of a 1,798.50 bill three totals summing to 1,799 or 1,797, and the
+ * difference is money the guest pays or the drawer is short. The allocator's
+ * guarantee is exact in paisa; this renderer's job is not to spend it.
+ *
+ * A ONE-PART SPLIT IS NOT A SPLIT. A table whose whole bill falls in one section
+ * gets no part banner, its round-off is zero, and every other field is the
+ * bill's own — so what comes off the roll is byte-for-byte the bill that table
+ * prints today. The rule lives here rather than in each caller, because a
+ * caller that forgot it would quietly start printing a different document for
+ * the commonest case there is.
+ *
+ * EACH SLIP CARRIES THE WHOLE BILL'S IDENTITY AND ONLY ITS OWN MONEY. The
+ * restaurant, legal name, GSTIN, bill number, date, cashier, token list and
+ * feedback QR all describe the BILL, and a part that dropped them would not be a
+ * tax document. Only the item list and the ladder are the part's.
+ */
+export function buildSplitReceiptsBase64(
+  opts: ReceiptOptions,
+  parts: readonly SplitReceiptPart[],
+  width = 48,
+): SplitReceipt[] {
+  const list = (Array.isArray(parts) ? parts : []).filter(Boolean);
+  // NO PARTS STILL PRINTS THE BILL. computeSectionSplit never returns an empty
+  // set — a bill with no classifiable lines comes back as one whole-bill bucket
+  // — so an empty list means a bug upstream, and answering a bug with NO PAPER
+  // is a table that never gets billed. Same fallback, for the same reason, as
+  // buildKotBase64's empty-ticket case.
+  if (list.length === 0) {
+    return [{
+      key: "whole",
+      label: "",
+      index: 1,
+      of: 1,
+      grandTotal: Number(opts.grandTotal ?? opts.total) || 0,
+      escBase64: buildReceiptBase64({ ...opts, kind: "bill", splitPart: null, roundOff: null }, width),
+    }];
+  }
+
+  const of = list.length;
+  // A split is a CUSTOMER document. The kitchen's split is a different one, cut
+  // per station by buildKotBase64, so `kind` is pinned rather than inherited: a
+  // caller that passed a KOT's options in here would otherwise get dockets with
+  // no prices and no totals under a part banner.
+  return list.map((part, i) => {
+    const index = i + 1;
+    const label = String(part.label ?? "").trim();
+    const service = Number(part.service_charge) || 0;
+    const discount = Number(part.discount) || 0;
+    const optedOut = opts.serviceCharge?.optedOut === true;
+    const grandTotal = Number(part.grand_total) || 0;
+    const escBase64 = buildReceiptBase64({
+      ...opts,
+      kind: "bill",
+      items: Array.isArray(part.items) ? part.items : [],
+      total: Number(part.subtotal) || 0,
+      // A part that was allocated nothing off a bill-wide discount prints no
+      // discount line at all, rather than "- 0.00": the line is a statement that
+      // money came off, and none did. The LABEL is the bill's, because the
+      // coupon was applied to the bill.
+      discount: discount > 0 ? { amount: discount, label: opts.discount?.label } : null,
+      // The PERCENTAGE is the bill's; the AMOUNT is this part's share of it. A
+      // waived charge stays waived on every part — `optedOut` prints the word
+      // instead of a figure, which is the whole point of a waiver being visible
+      // on the paper rather than inferred from a missing line.
+      serviceCharge: service > 0 || optedOut
+        ? { percent: Number(opts.serviceCharge?.percent) || 0, amount: service, ...(optedOut ? { optedOut: true } : {}) }
+        : null,
+      taxes: Array.isArray(part.taxes) ? part.taxes : [],
+      roundOff: Number(part.round_off) || 0,
+      grandTotal,
+      // THE DISCLAIMER IS A CLAIM ABOUT THE PIECE OF PAPER IT IS ON. "A
+      // voluntary service charge is included to support our staff" printed on a
+      // part that carries no such charge is a false statement on a tax document,
+      // and it invites a guest to ask for the removal of something they were
+      // never charged. A waived part keeps it: there the sentence is exactly
+      // what explains the "Opted-out" line above it.
+      serviceChargeNote: service > 0 || optedOut ? opts.serviceChargeNote : null,
+      splitPart: of > 1 ? { index, of, label } : null,
+    }, width);
+    return { key: String(part.key ?? "").trim() || String(index), label, index, of, grandTotal, escBase64 };
+  });
 }

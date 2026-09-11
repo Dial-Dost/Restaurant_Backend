@@ -7,6 +7,7 @@ import { z } from "zod";
 import { createSession, destroySession, getSession } from "../auth/sessions.js";
 import { AuthenticateRestaurantEmployee, GetRestaurantAccountStatus, GetRestaurantOutletsPublic, GetRestaurantPlan, getRestaurantIdFromUsername } from "../database_supabase.js";
 import { logger } from "../observability.js";
+import { sessionRoleScope } from "../role_scope.js";
 // Seeding a tenant is shared with the operator console's POST /platform/restaurants
 // — see provisioning.ts for why it is not duplicated in either route module.
 import { normalizeRestaurantSlug, provisionRestaurant, RestaurantExistsError } from "../provisioning.js";
@@ -181,6 +182,12 @@ app.post("/auth/employee-login", rateLimit("login", 15, 60_000), validate, async
 			emp_Lname: user.emp_Lname ?? null,
 			actions_set: Array.from(user.actions_set),
 			action_names: user.action_names,
+			// THE SERVER'S ANSWER, NOT THE CLIENT'S GUESS. See role_scope.ts: the
+			// clients used to derive this from the role strings and got it wrong on
+			// any tenant whose waiters carried a custom role (stored as a uuid) or
+			// the "employee" fallback — both of which silently removed every
+			// restriction, money included.
+			scope: sessionRoleScope({ role: user.role, role_all: user.role_all, actions: Array.from(user.actions_set) }),
 			features: plan.features,
 			limits: plan.limits,
 		});
@@ -231,6 +238,10 @@ app.get("/auth/me", async (req: Request, res: Response) => {
 		emp_Lname: session.emp_Lname,
 		actions_set: session.actions,
 		action_names: session.action_names,
+		// Recomputed on every /auth/me rather than stored on the session: a role
+		// change must take effect on the next launch, not on the next login. It is
+		// a pure function of fields already in hand, so it costs nothing.
+		scope: sessionRoleScope({ role: session.role, role_all: session.role_all, actions: session.actions }),
 		features: session.features ?? {},
 		limits: session.limits ?? {},
 	});

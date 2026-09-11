@@ -74,9 +74,9 @@ mw08 USE     *                                                      | <inline(re
 0052 GET     /metrics                                               | -                                              | d1569962
 0053 POST    /auth/register-restaurant                              | rateLimit("register", 5, 60000) -> validateBody(registerRestaurantSchema) -> validate | 19b740d4
 0054 GET     /auth/outlets                                          | rateLimit("auth-outlets", 30, 60000)           | b40af99c
-0055 POST    /auth/employee-login                                   | rateLimit("login", 15, 60000) -> validate      | 7e20c51c
+0055 POST    /auth/employee-login                                   | rateLimit("login", 15, 60000) -> validate      | c7ec3098
 0056 POST    /auth/logout                                           | -                                              | a5a9fa99
-0057 GET     /auth/me                                               | -                                              | 27e1b9b7
+0057 GET     /auth/me                                               | -                                              | 87a63736
 0058 GET     /reception/info                                        | -                                              | 0445092d
 0059 POST    /reception/check-availability                          | rateLimit("reception", 10, 60000)              | cbce5a24
 0060 POST    /reception/create-reservation                          | rateLimit("reception_create", 6, 60000)        | ab3737aa
@@ -260,7 +260,7 @@ mw08 USE     *                                                      | <inline(re
 0238 GET     /restaurant/profile                                    | validate                                       | 83660ec9
 0239 GET     /auth/restaurant-login                                 | validate                                       | eb6d239a
 0240 POST    /publish/bill                                          | validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9") | c9bc6a64
-0241 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | a91ced1c
+0241 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 05974160
 0242 POST    /print/ack                                             | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sPrintAck) | 07728a6e
 0243 POST    /print/kot/order/:id                                   | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 754ac87a
 0244 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428

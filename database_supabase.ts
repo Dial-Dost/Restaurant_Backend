@@ -51,6 +51,10 @@ import {
   orderLinePrice,
   orderLineQuantity,
   quoteServiceChargeWaiver,
+  // F2. The ONE pairing of "includeServiceCharge=false" with a tax config the
+  // charge has been lifted out of — see its header for why doing that pairing by
+  // hand at a call site is the bug rather than the fix.
+  resolveServiceChargeConfig,
   reconcileTenders,
   tenderAmountsTowardBill,
   allocateTenderAmounts,
@@ -62,6 +66,7 @@ import {
   type BillTaxLine,
   type BillDiscount,
   type ServiceChargeWaiverQuote,
+  type ServiceChargeConfigResolution,
   type TenderReconciliation,
   type SectionSplitLine,
   type SectionSplitResult,
@@ -75,10 +80,13 @@ import { compareTableSections, planSectionOrder, sectionOrderKey } from "./table
 export { round2, computeBillTaxes, computeBillCharges, computeCouponDiscount, computeBillSplit } from "./billing_math.js";
 export {
   chargeableSubtotal, nonChargeableValue, isNonChargeableLine,
-  quoteServiceChargeWaiver, reconcileTenders, tenderAmountsTowardBill, allocateTenderAmounts,
+  quoteServiceChargeWaiver, resolveServiceChargeConfig,
+  reconcileTenders, tenderAmountsTowardBill, allocateTenderAmounts,
   anyLineNamesVariation, resolveLinePriceFloor,
 } from "./billing_math.js";
-export type { ServiceChargeWaiverQuote, TenderReconciliation, VariationPriceRef } from "./billing_math.js";
+export type {
+  ServiceChargeWaiverQuote, ServiceChargeConfigResolution, TenderReconciliation, VariationPriceRef,
+} from "./billing_math.js";
 // Migration 039's EDITING and SHAPING rules (menu groups + item variations).
 // Re-exported here for the same reason billing_math and mis_capture are: routes
 // and tests import the pure rules from the data layer rather than reaching past
@@ -35105,21 +35113,42 @@ async function liveServiceChargeWaiver(
  * angry guest is holding two different totals. So all of them now resolve through
  * here and there is exactly one answer per table.
  *
- * The waiver's effect is taken from quoteServiceChargeWaiver, which computes it
- * by running computeBillCharges twice and differencing — so the waived config
- * this hands back is the same config the recorded saving was measured against.
+ * The removal itself is resolveServiceChargeConfig (billing_math.ts), which takes
+ * BOTH legs off — the "Service Charge" tax line (shape b) and the percent (shape
+ * a) — and is built from the same taxConfigWithoutServiceCharge the waiver's
+ * recorded saving was priced against. So the bill the guest pays and the number
+ * on the waiver record are the same subtraction.
+ *
+ * F2 — WHY IT NOW ALSO TAKES A REQUEST. A waiver is one of TWO ways a bill gets
+ * printed without the charge; the other is a till asking for it at print time
+ * (`no_service_charge` on /print/bill). That path used to build its own pair of
+ * arguments — `includeServiceCharge=false` against the RAW outlet config — and
+ * on a tax_line tenant that removed nothing at all, so the "without" bill
+ * equalled the "with" bill to the paisa. Both ways now arrive here and neither
+ * can answer differently from the other.
  */
-interface OpenBillChargeConfig {
+export interface OpenBillChargeConfig extends ServiceChargeConfigResolution {
   taxConfig: Record<string, number> | { name: string; percentage: number }[] | null;
-  scPct: number;
-  includeServiceCharge: boolean;
+  /** The live waiver, when the charge came off because of one. null otherwise. */
   waiver: ServiceChargeWaiverRecord | null;
+  /** True when THIS CALL asked for the charge off, rather than a stored waiver. */
+  requested_without_service_charge: boolean;
 }
 
-async function openBillChargeConfig(
+export interface OpenBillChargeConfigOptions {
+  /**
+   * Print/charge this bill WITHOUT the service charge, on this call only.
+   * Nothing is stored: a waiver is a control document with a reason and an
+   * authoriser (migration 036) and this is not one — it is a reprint.
+   */
+  withoutServiceCharge?: boolean;
+}
+
+export async function openBillChargeConfig(
   context: RestaurantContext,
   tableId: string | null,
   client?: PoolClient,
+  opts?: OpenBillChargeConfigOptions,
 ): Promise<OpenBillChargeConfig> {
   const taxRows = await runQuery<{ default_tax: unknown }>(
     `select default_tax from "Outlets" where id = $1 and res_id = $2 limit 1`,
@@ -35130,13 +35159,43 @@ async function openBillChargeConfig(
   const scPct = await getServiceChargePercent(context.res_id, client);
   const billId = tableId ? await existingOpenBillId(context, tableId, client) : null;
   const waiver = await liveServiceChargeWaiver(context, billId, client);
-  if (!waiver) {return { taxConfig, scPct, includeServiceCharge: true, waiver: null };}
-  // Waived: drop the "Service Charge" tax line (shape b) AND zero the percent
-  // (shape a). quoteServiceChargeWaiver already produced the filtered config it
-  // priced the saving against; reusing it is what guarantees the bill the guest
-  // pays and the number on the waiver record are the same subtraction.
-  const quote = quoteServiceChargeWaiver(0, taxConfig, scPct, null);
-  return { taxConfig: quote.tax_config_waived, scPct: 0, includeServiceCharge: false, waiver };
+  const requested = opts?.withoutServiceCharge === true;
+  // A live waiver and an explicit request are the same instruction arriving by
+  // two doors; either one is enough, and a request on an already-waived bill is
+  // a no-op rather than a double removal (there is only one charge to remove).
+  const resolved = resolveServiceChargeConfig(taxConfig, scPct, waiver !== null || requested);
+  return {
+    ...resolved,
+    taxConfig: resolved.taxConfig as OpenBillChargeConfig["taxConfig"],
+    waiver,
+    requested_without_service_charge: requested,
+  };
+}
+
+/**
+ * The same answer, addressed by restaurant + table name instead of a resolved
+ * context — the shape the ROUTE layer has in its hand.
+ *
+ * A thin resolver, NOT a second implementation: routes/bills.ts used to read
+ * `settings.taxes` and `settings.service_charge` and pair them with
+ * `includeServiceCharge` itself, which is how the printed bill drifted away from
+ * the bill on screen. It calls this now, so "what does this bill cost with the
+ * charge off" has exactly one answer no matter who is asking.
+ *
+ * AN UNKNOWN TABLE STILL RESOLVES, deliberately: the outlet's charge config does
+ * not depend on the table, only the WAIVER does. Returning the config with no
+ * waiver is right for a caller printing something not yet attached to a table,
+ * and it keeps a bad table name from turning a print into a 500.
+ */
+export async function GetBillChargeConfigForTable(
+  restaurantId: string,
+  tableName: string,
+  opts: OpenBillChargeConfigOptions = {},
+): Promise<OpenBillChargeConfig> {
+  const context = await requireRestaurantContext(restaurantId);
+  const name = String(tableName ?? "").trim();
+  const tableId = name ? await tableIdByName(context, name) : null;
+  return openBillChargeConfig(context, tableId, undefined, opts);
 }
 
 export interface WaiveServiceChargeInput {
