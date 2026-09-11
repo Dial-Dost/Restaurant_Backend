@@ -5,6 +5,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { createHmac, randomUUID } from "crypto";
+import { guestBillView } from "../guest_bill_view.js";
 import { AddBooking, AddNotification, AddOrder, AddWaitlistMember, AllocateBestTable, ApplyCouponToBill, CancelWaitlistByToken, CheckCoupon, ClaimWaitlistPreorder, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, DeletePushSubscription, FinalizeOnlinePayment, GetBillForTable, GetBookingSummaryById, GetMenuCategories, GetMenuItems, GetPublicBranding, GetQueueMenu, GetRestaurantProfile, GetVisiblePosters, GetRestaurantSettings, GetWaitlistEntryByToken, JoinWaitlist, ListMenuVariations, SavePushSubscription, SetWaitlistPreorder, SubmitCustomerPayment, UpdateBookingDeposit, VerifyTableOtp, getRestaurantIdFromUsername, parseWallClockInZone, publicVariationsByItem, repriceFromMenu, badgeCoveredAllergens, resolveBrandConfig, resolveBrandPalette, resolveMenuBadges, variationPayloadFor, withTenant, type MenuVariationRecord } from "../database_supabase.js";
 import { autoPrintOrderKot } from "../kot_print.js";
 import { logger } from "../observability.js";
@@ -479,7 +480,7 @@ app.get("/qr/:slug/bill", async (req: Request, res: Response) => {
 			{ res_id: resId, outlet_id: "", employeeId: "", role: "" },
 			() => GetBillForTable(slug, tableName),
 		);
-		res.json(bill ?? { total_amt: 0, covers: 0, apc: 0, order_ids: [], payment_status: null });
+		res.json(bill ? guestBillView(bill) : { total_amt: 0, covers: 0, apc: 0, order_ids: [], payment_status: null });
 	} catch (err: any) {
 		logger.error({ err }, "qr_bill_failed");
 		res.status(400).json({ error: safeClientError(err, "Unable to load bill") });

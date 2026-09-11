@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -14,6 +14,7 @@ import { runReportScheduleSweep } from "./report_schedules.js";
 import { warnAboutLegacyReleaseEnv } from "./app_release.js";
 import { runIdempotencyReaperSweep } from "./idempotency.js";
 import { runPrintJobReaperSweep } from "./print_jobs.js";
+import { runPrintOrphanSweep } from "./print_routing.js";
 import { extractBearerToken, isAllOutletsSentinel, normalizeRole, rawRequestedOutletId, sendDueBookingReminders } from "./routes/_shared.js";
 import { registerGuestOrderingRoutes, registerGuestWaitlistAndPaymentRoutes, registerGuestBrandingRoute } from "./routes/guest.js";
 import { registerWhatsAppWebhookRoutes } from "./routes/webhooks.js";
@@ -25,6 +26,7 @@ import { registerTableRoutes, registerTableListRoute } from "./routes/tables.js"
 import { registerBookingCreateRoute, registerBookingListRoute, registerBookingStatusRoute, registerBookingTableAndCancelRoutes, registerBookingRangeRoute } from "./routes/bookings.js";
 import { registerValetInfoRoute, registerValetRoutes } from "./routes/valet.js";
 import { registerBillRoutes, registerBillPaymentRoutes, registerBillPrintAndEditRoutes, registerBillOpsRoutes, registerTenderRoutes } from "./routes/bills.js";
+import { registerPrintRoutingRoutes } from "./routes/printing.js";
 import { registerRestaurantLogoRoutes, registerSettingsRoutes, registerRestaurantProfileReadRoute, registerRestaurantProfileWriteRoute } from "./routes/settings.js";
 import { registerAuditRoutes } from "./routes/audit.js";
 import { registerInventoryRoutes, registerInventoryMovementRoutes, registerInventoryDeleteRoute, registerInventoryCategoryRenameRoute } from "./routes/inventory.js";
@@ -420,6 +422,12 @@ registerLeaveRoutes(app);
 registerRestaurantProfileReadRoute(app);
 registerRestaurantLoginRoute(app);
 registerBillPrintAndEditRoutes(app);
+// IMMEDIATELY AFTER THE BILL PRINT ROUTES, so the whole /print family is
+// contiguous in the route manifest and only the tail after it renumbers. Nothing
+// here can shadow what is above: /print/bill, /print/ack and /print/kot/order/:id
+// are all literals, and this module's own order puts /print/devices/me and
+// /print/devices/me/targets in front of /print/devices/:id.
+registerPrintRoutingRoutes(app);
 registerDiscountRequestRoutes(app);
 registerCouponRoutes(app);
 registerLoyaltyRoutes(app);
@@ -521,7 +529,7 @@ export function ensureRealtime() {
     return realtimeServerPromise;
 }
 async function bootstrap() {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e;
     // Say once, at boot, if the old release variables are still set on this box.
     // They are inert now (app_release.ts owns the manifest), and discovering that
     // mid-incident — after editing .env and restarting and seeing no change — is
@@ -571,6 +579,44 @@ async function bootstrap() {
     }
     catch (error) {
         logger.warn({ err: error }, "Failed to ensure feature-permission actions");
+    }
+    // THE PRINT-ROUTING LATCH (migration 042). Asks Postgres once, at boot,
+    // whether "PrintJobs" actually has the nine assignment columns, and every
+    // statement that names one reads the answer.
+    //
+    // UNCONDITIONAL, AND HERE RATHER THAN ANYWHERE ELSE, for two reasons the
+    // deploy has already proved it needs:
+    //
+    //   * it cannot live behind a feature flag the way WarmReportingSchema does.
+    //     REPORT_SCHEDULER is unset in production, so a latch inside that block
+    //     would be latched OFF on the one box that has the migration.
+    //   * it cannot be lazy. isSchemaMissing does not catch 42703, so a container
+    //     running ahead of 042 — deploy Gate B has swapped containers with
+    //     migrations pending twice — would raise undefined_column inside
+    //     ClaimPrintJobsForAgent and reconnect replay would die SILENTLY for every
+    //     tenant. False here means every one of those statements issues exactly
+    //     what shipped in 027.
+    //
+    // It also runs the nine `add column if not exists` statements, which is the
+    // ONLY place that DDL may be issued from: ALTER TABLE wants ACCESS EXCLUSIVE on
+    // "PrintJobs" while concurrent settles hold row locks on it, and that convoy
+    // against a 15-slot session pooler is the 2026-08-24 standstill. At boot,
+    // before the listener, there is nothing to convoy with.
+    //
+    // Wrapped because NO BOOT STEP MAY TAKE THE SERVER DOWN. initPrintRoutingSchema
+    // swallows its own failures today; if that ever changes, the cost must still be
+    // routing off — which is broadcast, which is what the restaurant does now.
+    try {
+        const printRoutingReady = await initPrintRoutingSchema();
+        if (printRoutingReady) {
+            logger.info("✅ Print routing schema ready (migration 042)");
+        }
+        else {
+            logger.warn("Print routing OFF — \"PrintJobs\" has no assignment columns (migration 042 pending). Every docket broadcasts, exactly as before routing.");
+        }
+    }
+    catch (error) {
+        logger.warn({ err: error }, "print_routing_boot_probe_failed — routing stays off, printing is unchanged");
     }
     // Run the reporting path's lazy DDL ONCE here, outside any transaction, so the
     // scheduled-report sweep never triggers it inside withTenant's real one:
@@ -742,6 +788,59 @@ async function bootstrap() {
     else {
         logger.info("Print job reaper disabled (PRINT_JOB_REAPER=false)");
     }
+    // Print-assignment orphan sweep (migration 042): the 60-second backstop for a
+    // directed docket whose per-job deadline timer never fired — a GC stall, a
+    // clock jump, an unhandled path.
+    //
+    // READ THE REAPER'S NOTE ABOVE AND THE IDEMPOTENCY REAPER'S BELOW BEFORE
+    // TOUCHING THE INTERVAL. Every sweep in this file that opens one tenant
+    // connection per tenant is deliberately slow — 15 minutes, an hour — because a
+    // per-tenant sweep against a 15-slot session pooler is exactly what produced
+    // the 2026-08-24 standstill. A 60-second one would normally be indefensible
+    // here.
+    //
+    // IT IS DEFENSIBLE ONLY BECAUSE THIS SWEEP OPENS NO CONNECTION AT ALL IN THE
+    // ORDINARY CASE, and that is a property of runPrintOrphanSweep, not of this
+    // timer: it returns before touching the database when no routed outlet has an
+    // outstanding assignment on this replica, and again when every deadline it
+    // holds is still in the future. An outlet with no "PrintRoutes" rows never
+    // produces an assignment, and an outlet whose bound devices are all offline
+    // broadcasts immediately and produces none either — so the entire fleet on the
+    // day this ships pays zero connections per tick, forever. If somebody ever
+    // turns this into a database scan for orphans, this interval has to go back to
+    // minutes with it.
+    //
+    // Per-replica by nature: it drives THIS process's own registry, so two
+    // replicas cannot race each other on one job, and the in-process flag only
+    // stops one slow sweep stacking on the next tick.
+    //
+    // Gated on the same no-redeploy kill switch resolvePrintTarget reads, so
+    // PRINT_ROUTING=false is a total stop rather than a stop with a timer still
+    // ticking over an empty map.
+    if (process.env.PRINT_ROUTING !== "false") {
+        let printOrphanRunning = false;
+        const printOrphanSweep = async () => {
+            if (printOrphanRunning) {
+                return;
+            }
+            printOrphanRunning = true;
+            try {
+                await runPrintOrphanSweep();
+            }
+            catch (err) {
+                logger.warn({ err }, "print_orphan_sweep_failed");
+            }
+            finally {
+                printOrphanRunning = false;
+            }
+        };
+        const printOrphanTimer = setInterval(() => void printOrphanSweep(), Math.max(5, Number(process.env.PRINT_ORPHAN_SWEEP_SEC) || 60) * 1000);
+        (_d = printOrphanTimer.unref) === null || _d === void 0 ? void 0 : _d.call(printOrphanTimer);
+        logger.info("✅ Print orphan sweep armed");
+    }
+    else {
+        logger.info("Print routing disabled (PRINT_ROUTING=false) — orphan sweep not armed");
+    }
     // Idempotency-key reaper: delete keys past their 48h window.
     //
     // PURE HYGIENE, and more obviously so than the print reaper above: the claim
@@ -777,7 +876,7 @@ async function bootstrap() {
             }
         };
         const idemReaperTimer = setInterval(() => void idemReaperSweep(), Math.max(1, Number(process.env.IDEMPOTENCY_REAPER_INTERVAL_MIN) || 60) * 60000);
-        (_d = idemReaperTimer.unref) === null || _d === void 0 ? void 0 : _d.call(idemReaperTimer);
+        (_e = idemReaperTimer.unref) === null || _e === void 0 ? void 0 : _e.call(idemReaperTimer);
         logger.info("✅ Idempotency key reaper armed");
     }
     else {

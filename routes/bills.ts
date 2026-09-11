@@ -10,8 +10,9 @@ import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin,
 import { buildReceiptBase64 } from "../escpos.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
-import { ackPrintJob, enqueuePrintJob, printJobPayload } from "../print_jobs.js";
-import { emitOutlet, emitRestaurant } from "../realtime.js";
+import { ackPrintJob } from "../print_jobs.js";
+import { dispatchPrintJob } from "../print_routing.js";
+import { emitRestaurant } from "../realtime.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { ACCOUNTING_PERM, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, endOfDayBound, enforceAdmin, enforcePermission, enforceRoles, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
@@ -191,7 +192,25 @@ function readTenderList(raw: unknown): RouteTender[] | null {
 const sPrintAck = z.object({
 	jobId: z.string().uuid(),
 	result: z.enum(["printed", "failed"]),
+	// ADDITIVE (migration 042). Absent on every agent in the field today — the C#
+	// server, every Flutter build before device registration — and those must go
+	// on acking with {jobId, result} and nothing else, unchanged, because the
+	// Android app ships on its own release train and the fleet will be mixed for
+	// months. `.optional()`, not required, is what buys that.
+	//
+	// DELIBERATELY NOT `.uuid()` / `.int()`. A tightened shape here would turn a
+	// malformed field from a client we have not met into a 400 on a MONEY
+	// DOCUMENT'S ack — the one message whose loss makes a till retry a print. The
+	// handler below validates the shape itself and simply drops what it cannot
+	// use, which degrades that client to exactly today's unsigned ack.
+	deviceId: z.string().nullish(),
+	generation: z.number().nullish(),
 }).passthrough();
+
+// The shape of a "PrintDevices".id, checked in JS because the alternative is a
+// 22P02 from `$3::uuid` surfacing as a 500 on a print ack. Module scope so one
+// regex serves every ack rather than being rebuilt per request.
+const PRINT_DEVICE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /*
 	Upload a PAYMENT PROOF image and get back a URL to hand to settle.
@@ -780,18 +799,35 @@ app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9")
 			return;
 		}
 
-		// PERSIST, THEN EMIT. The row is the durable fact and the emit is the fast
-		// path — emitOutlet cannot report whether anything received it (an empty
-		// room is a successful no-op), so the row is the only thing that survives a
-		// till whose socket is down. A null jobId means durability is unavailable
-		// (migration 027 not applied); the emit still goes out, exactly as before.
-		const jobId = await enqueuePrintJob(restaurantId, {
+		// PERSIST, THEN EMIT — unchanged, and now through the router. The row is the
+		// durable fact and the emit is the fast path: an emit cannot report whether
+		// anything received it (an empty room is a successful no-op), so the row is
+		// the only thing that survives a till whose socket is down. A null jobId
+		// still means durability is unavailable (migration 027 not applied) and the
+		// emit still goes out, exactly as before.
+		//
+		// WHAT ROUTING CHANGES HERE, AND WHAT IT DOES NOT. With a `bill` rule
+		// configured for this outlet, the receipt goes to the machine bound to that
+		// destination instead of to every printer in the room — which is the whole
+		// of "desktop-preferred printing", deferred from 1.9.0 because bill:print
+		// was a broadcast and two configured devices both printed. With NO rule —
+		// every outlet in the fleet today — resolvePrintTarget returns a broadcast
+		// decision and this is the same emitOutlet with the same bytes it has been
+		// since 027.
+		const dispatched = await dispatchPrintJob(restaurantId, {
 			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
 		});
-		emitOutlet(restaurantId, outletId, 'bill:print', printJobPayload({
-			billId, escBase64, kind: "bill", jobId, publishedAt: new Date().toISOString(),
-		}));
-		res.json({ success: true, jobId });
+		// `jobId` keeps its exact meaning and position; `destination`/`device` are
+		// ADDITIVE and are null for every unrouted outlet, so a till written against
+		// this route before routing existed reads the same body it always did. They
+		// are here so the till can say "Sent to Front Till" rather than leaving the
+		// server's decision invisible to the person holding the tab.
+		res.json({
+			success: true,
+			jobId: dispatched.jobId,
+			destination: dispatched.decision.destinationName,
+			device: dispatched.assignedDeviceId,
+		});
 	} catch (err) {
 		logger.error({ err }, 'publish_bill_failed');
 		res.status(500).json({ error: 'Unable to publish bill' });
@@ -876,6 +912,12 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 				items: bill.items,
 				assignedTo: waiterName || null,
 				captain: waiterName && (waiterRole === 'captain' || waiterRole === 'manager') ? waiterName : null,
+				// EVERY order's whole-order instruction on this table, joined for the
+				// one banner the docket prints. A table-scoped docket covers several
+				// orders and each may carry its own note; " | " rather than a newline
+				// so the banner stays one wrapped paragraph instead of becoming a
+				// second list the eye has to parse under a pass light.
+				orderNote: bill.order_notes.join(' | ') || null,
 				billId,
 				restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
 				currency: settings.currency ?? "₹",
@@ -960,15 +1002,25 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		}, cols);
 		const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
 		// billId is STABLE ACROSS REPRINTS, so each reprint deliberately becomes its
-		// OWN job row. A waiter who asks for a second copy must get one.
-		const jobId = await enqueuePrintJob(restaurantId, {
+		// OWN job row. A waiter who asks for a second copy must get one — which is
+		// also why the router is asked again rather than the first decision being
+		// reused: the till that printed the original may be off by now.
+		//
+		// Same persist-then-emit as /publish/bill above, same fallback: no `bill`
+		// rule, or an unreadable routing table, or nothing online that serves the
+		// bill destination, and this is today's outlet-wide emit with today's bytes.
+		const dispatched = await dispatchPrintJob(restaurantId, {
 			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
 		});
-		emitOutlet(restaurantId, outletId, 'bill:print', printJobPayload({
-			billId, escBase64, kind: "bill", jobId, publishedAt: new Date().toISOString(),
-		}));
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${includeServiceCharge ? "" : " (no service charge)"}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: !includeServiceCharge }); } catch {/* ignore */}
-		res.json({ success: true, billId, jobId });
+		// Additive, exactly as on /publish/bill: null for every unrouted outlet.
+		res.json({
+			success: true,
+			billId,
+			jobId: dispatched.jobId,
+			destination: dispatched.decision.destinationName,
+			device: dispatched.assignedDeviceId,
+		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');
 		res.status(500).json({ error: String(err?.message ?? 'Unable to print') });
@@ -979,7 +1031,17 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 	The printer agent reports what it did with one job.
 
 	POST /print/ack  body { "jobId": "<uuid>", "result": "printed" | "failed" }
+	                       optional: { "deviceId": "<uuid>", "generation": <int> }
 	  -> 200 { "success": true, "duplicate": false }
+
+	THE TWO OPTIONAL FIELDS ARE ADDITIVE AND THE ROUTE DOES NOT DEPEND ON THEM.
+	Every agent in the field today sends the first pair and nothing else, and must
+	keep working exactly as it does — the Android app ships on its own release
+	train, so the fleet stays mixed for months. A routing-aware build that sends
+	both buys the kitchen one thing: a jammed printer's 'failed' can be tied to the
+	device that was holding the job, so the docket moves to the next printer in
+	about a second instead of waiting out the 75-second verdict deadline. See the
+	handler for why a wrong value can only ever be ignored.
 
 	AN HTTP ROUTE RATHER THAN A SOCKET.IO ACK CALLBACK, deliberately. A Socket.IO
 	ack is scoped to one emit on one connection: if the socket drops between
@@ -1004,8 +1066,35 @@ app.post('/print/ack', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), v
 	const body = (req.body ?? {}) as Record<string, unknown>;
 	const jobId = String(body.jobId ?? "").trim();
 	const result = body.result === "failed" ? "failed" : "printed";
+	// WHO IS ACKING, AS THE CLIENT REPORTS ITSELF — and every use of it makes a
+	// stale ack LESS powerful, never more. AckPrintJobRouted fences on it: an ack
+	// naming a device that is not the row's assignee is recorded and stops there,
+	// which is precisely what a revoked assignee's late 'failed' should do instead
+	// of tearing down the live assignee that is spooling at that moment. Without
+	// it the statement falls back to trusting an unsigned ack only in the one
+	// state where nobody else can have held the job (generation 0, no failures),
+	// so a jam at generation 1 waits out the 75-second verdict deadline rather
+	// than moving the docket in a second.
+	//
+	// IT IS NOT AN IDENTITY AND IS NEVER TREATED AS ONE. `printed_by_device` —
+	// receipt history, who produced a money document — is taken from the ROW
+	// inside AckPrintJobRouted and never from this body; see the SET list there.
+	// An HTTP ack has no server-held device identity to bind to (the socket beats
+	// do, via socket.data.print), so this stays a self-report, and the only thing
+	// a wrong one can buy is being ignored.
+	//
+	// PARSED, NOT TRUSTED TO BE WELL-FORMED (see PRINT_DEVICE_ID_RE): anything
+	// that is not a uuid is dropped here and the ack proceeds unsigned, i.e.
+	// exactly as it does today.
+	const claimedDevice = typeof body.deviceId === "string" ? body.deviceId.trim() : "";
+	const deviceId = PRINT_DEVICE_ID_RE.test(claimedDevice) ? claimedDevice : null;
+	// A generation is a fence, so a negative or fractional one is not a smaller
+	// fence — it is a value that can never equal assign_generation and would make
+	// every ack from that client unattributable. Dropped for the same reason.
+	const rawGeneration = Number(body.generation);
+	const generation = Number.isInteger(rawGeneration) && rawGeneration >= 0 ? rawGeneration : null;
 	try {
-		const outcome = await ackPrintJob(restaurantId, jobId, result);
+		const outcome = await ackPrintJob(restaurantId, jobId, result, { deviceId, generation });
 		res.json({ success: true, duplicate: outcome.duplicate });
 	} catch (err: any) {
 		logger.error({ err }, 'print_ack_failed');

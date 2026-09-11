@@ -31,6 +31,7 @@ import {
   OUTLET_ID,
   RESTAURANT_SLUG,
   counters,
+  printJobRows,
   resetStore,
   seedMenu,
   tickets,
@@ -43,8 +44,20 @@ interface EnqueuedJob {
   station: string | null;
   esc_base64: string;
 }
-const enqueued: EnqueuedJob[] = [];
+// The rows the queue was actually handed. THE SAME ARRAY the fixture appends to,
+// not a copy — see printJobRows, which explains why the old print_jobs mock stopped
+// seeing anything when the producers moved to dispatchPrintJob.
+const enqueued: EnqueuedJob[] = printJobRows;
+// SPREAD THE REAL MODULE, OVERRIDE TWO. A bare object here used to be enough,
+// because dispatchKot only ever reached for enqueuePrintJob and printJobPayload.
+// Since migration 042 it goes through print_routing.ts, which imports this
+// module's schema-degradation helpers (isSchemaMissing, warnSchemaMissing and
+// their routing supersets) — and a factory that omits them does not fail at
+// import time, it fails deep inside a dispatch with "is not a function", which
+// reads like a broken feature rather than a stale mock. Spreading the real
+// module means the next import this file grows is covered before anyone notices.
 jest.mock("../print_jobs.js", () => ({
+  ...(jest.requireActual("../print_jobs.js") as Record<string, unknown>),
   enqueuePrintJob: (_resId: string, job: EnqueuedJob): Promise<string> => {
     enqueued.push(job);
     return Promise.resolve(`job-${String(enqueued.length)}`);

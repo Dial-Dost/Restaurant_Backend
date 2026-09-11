@@ -3874,7 +3874,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; items: { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -3949,7 +3949,7 @@ export async function GetBillForTable(
   // Aggregate the placed line items (merged by name + price) for the bill view.
   // Per-item notes are carried through (distinct notes joined) so the kitchen/
   // waiter sees any special instructions on the bill.
-  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }>();
+  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }>();
   // HOW MANY OF EACH MERGED LINE ARE ON COURSE HOLD, tracked ALONGSIDE the merge
   // rather than inside its key.
   //
@@ -3965,6 +3965,19 @@ export async function GetBillForTable(
   const heldByKey = new Map<string, number>();
   let billCustomer = "";
   let ncTotal = 0;
+  // THE ORDER-LEVEL NOTES ON THIS TABLE, one per contributing order, in the
+  // order they were placed and de-duplicated.
+  //
+  // A table's bill is the sum of its orders and each of those carries its own
+  // whole-order instruction, so a table-scoped kitchen docket has to be able to
+  // carry all of them — "no onions" typed on the first round and "allergy:
+  // peanuts" on the second are two different facts and neither may swallow the
+  // other. Deduplicated because re-sending the same instruction with a second
+  // round is the common case and printing it twice reads as two requirements.
+  //
+  // For the BILL this list is inert: no bill renderer reads it, deliberately —
+  // see the note block in escpos.ts's bill item loop.
+  const orderNotes: string[] = [];
   for (const o of orderRows) {
     const f = parseJsonObject(o.food) ?? {};
     // Use the first non-empty, non-placeholder customer name for the bill header.
@@ -3972,6 +3985,8 @@ export async function GetBillForTable(
       const c = String((f).customer ?? "").trim();
       if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") {billCustomer = c;}
     }
+    const orderNote = String((f).note ?? "").trim();
+    if (orderNote && !orderNotes.includes(orderNote)) {orderNotes.push(orderNote);}
     const list = Array.isArray((f).items) ? (f as { items: unknown[] }).items : [];
     for (const raw of list) {
       const it = (raw ?? {}) as Record<string, unknown>;
@@ -4008,13 +4023,26 @@ export async function GetBillForTable(
       // prep timers all agree on which lines are still waiting: held means the
       // waiter marked it hold AND nobody has fired it since.
       if (it.course_hold === true && !it.fired_at) {heldByKey.set(key, (heldByKey.get(key) ?? 0) + quantity);}
+      const menuId = String(it.menu_id ?? "").trim();
       const existing = itemMap.get(key);
       if (existing) {
         existing.quantity += quantity;
         if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
+        if (menuId && !existing.menu_id) {existing.menu_id = menuId;}
       } else {
         itemMap.set(key, {
           name, price, quantity, note: note || undefined,
+          // THE MENU ROW THIS LINE WAS SOLD FROM — advisory, and deliberately
+          // NOT part of the merge key above. Adding it to the key would split a
+          // bill line a guest is handed today (two spellings of one dish, or a
+          // pre-039 line beside a post-039 one), on a tax document, for a reason
+          // the guest cannot see. First non-empty wins: every line merging under
+          // one key already shares name, price, NC status and variation, so they
+          // resolve to the same menu row anyway, and a line that carries none
+          // contributes nothing and falls back to name matching exactly as
+          // before. Consumed only by the KOT station lookup, so a dish RENAMED
+          // since it was ordered still reaches the right printer.
+          ...(menuId ? { menu_id: menuId } : {}),
           ...(nc ? { nc: true as const, nc_kind: String(it.nc_kind ?? "") || undefined } : {}),
           ...(variation ? { variation } : {}),
         });
@@ -4105,6 +4133,9 @@ export async function GetBillForTable(
     covers,
     apc: tableApc,
     order_ids: orderRows.map((row) => row.id),
+    // The whole-order instructions on this table. Consumed by the KITCHEN
+    // docket only; every bill renderer ignores it by construction.
+    order_notes: orderNotes,
     items,
     target_apc: targetApc,
     apc_status: apcStatusVal,
@@ -10073,7 +10104,14 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       price: parseNumeric(entry.price),
       orderedAt: String(entry.orderedAt ?? new Date().toISOString()),
       note: typeof entry.note === "string" && entry.note.trim().length > 0 ? entry.note.trim() : null,
-      station: stationById.get(String(entry.id ?? "")) ?? stationByName.get(name.trim().toLowerCase()) ?? null,
+      // `menu_id` FIRST, and it is the fix for a lookup that has been quietly
+      // missing. `stationById` is keyed on MENU ids while `entry.id` is the
+      // ORDER-LINE id, so this only ever hit on legacy rows that happened to
+      // store the menu id as the line id — every modern line fell through to
+      // name matching, which is what breaks for a dish renamed since it was
+      // ordered. `entry.id` is kept as the second key so those legacy rows
+      // keep resolving exactly as they do today.
+      station: stationById.get(String(entry.menu_id ?? "")) ?? stationById.get(String(entry.id ?? "")) ?? stationByName.get(name.trim().toLowerCase()) ?? null,
       course_hold: entry.course_hold === true,
       fired_at: typeof entry.fired_at === "string" && entry.fired_at ? entry.fired_at : null,
       ...(typeof entry.variation_id === "string" && entry.variation_id.trim() ? { variation_id: entry.variation_id.trim() } : {}),
@@ -10087,7 +10125,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
   // it also works on the raw items_split tuples (which aren't run through mapEntry).
   const stationFilter = String(station ?? "").trim().toLowerCase();
   const entryStation = (entry: any): string =>
-    String(stationById.get(String(entry?.id ?? "")) ?? stationByName.get(String(entry?.name ?? "").trim().toLowerCase()) ?? "").trim().toLowerCase();
+    String(stationById.get(String(entry?.menu_id ?? "")) ?? stationById.get(String(entry?.id ?? "")) ?? stationByName.get(String(entry?.name ?? "").trim().toLowerCase()) ?? "").trim().toLowerCase();
   const entryMatches = (entry: any): boolean => entryStation(entry) === stationFilter;
 
   const result = rows.map((row) => {
@@ -21616,7 +21654,18 @@ export async function GetOrderKotContext(
        * being told, so an order still awaiting approval must not produce one.
        */
       awaiting_approval: boolean;
-      items: { name: string; price: number; quantity: number; note?: string; variation?: string; held_qty?: number }[];
+      /**
+       * The ORDER-LEVEL note — "Orders".food.note, the box captioned "Note for
+       * the kitchen" in the owner app and "no onions, less spicy, allergies" on
+       * the guest QR menu.
+       *
+       * It has been written since ordering existed and READ BY NO PRINTER. The
+       * writer's own comment calls it "kitchen + bill"; it reached neither.
+       * Surfaced here so autoPrintOrderKot can put it on the docket, which is
+       * the one document its author was addressing.
+       */
+      order_note: string | null;
+      items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; variation?: string; held_qty?: number }[];
     }
   | null
 > {
@@ -21658,7 +21707,7 @@ export async function GetOrderKotContext(
 
   // Same merge key as GetBillForTable (name + price + nc + variation), so one
   // order's lines collapse on the docket exactly as they do on the bill.
-  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; variation?: string; held_qty?: number }>();
+  const itemMap = new Map<string, { name: string; price: number; quantity: number; note?: string; menu_id?: string; variation?: string; held_qty?: number }>();
   // Held units per merged line — see the identical note in GetBillForTable. This
   // read feeds only the KOT, but it keeps the same shape so kot_print.ts has one
   // rule to apply rather than two.
@@ -21674,12 +21723,16 @@ export async function GetOrderKotContext(
     const variation = String(it.variation_name ?? "").trim();
     const key = `${name.toLowerCase()}@@${price}@@${nc ? "nc" : ""}@@${variation.toLowerCase()}`;
     if (it.course_hold === true && !it.fired_at) {heldByKey.set(key, (heldByKey.get(key) ?? 0) + quantity);}
+    const menuId = String(it.menu_id ?? "").trim();
     const existing = itemMap.get(key);
     if (existing) {
       existing.quantity += quantity;
       if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
+      // Advisory, first non-empty wins — see the identical note in
+      // GetBillForTable. The merge key is untouched.
+      if (menuId && !existing.menu_id) {existing.menu_id = menuId;}
     } else {
-      itemMap.set(key, { name, price, quantity, note: note || undefined, ...(variation ? { variation } : {}) });
+      itemMap.set(key, { name, price, quantity, note: note || undefined, ...(menuId ? { menu_id: menuId } : {}), ...(variation ? { variation } : {}) });
     }
   }
 
@@ -21700,6 +21753,9 @@ export async function GetOrderKotContext(
     covers: Math.max(1, Number(row.num_covers ?? 1) || 1),
     is_virtual: row.is_virtual === true,
     order_type: orderType,
+    // Trimmed, and "" collapses to null so the renderer's one emptiness test
+    // covers "never typed" and "typed then cleared" alike.
+    order_note: String((food as Record<string, unknown>).note ?? "").trim() || null,
     items: [...itemMap.entries()].map(([key, item]) => {
       const heldQty = heldByKey.get(key) ?? 0;
       return heldQty > 0 ? { ...item, held_qty: Math.min(heldQty, item.quantity) } : item;
@@ -29122,6 +29178,40 @@ export interface PrintJobInput {
   esc_base64: string;
 }
 
+/**
+ * THE DURABLE LEASE, in minutes. Read here rather than imported from
+ * print_jobs.ts because print_jobs.ts imports THIS module — a static import back
+ * would be a cycle — and because the lease must be computed on THIS side of the
+ * call, where no caller can reach it. Same env var, same default, so one knob
+ * still moves both.
+ *
+ * IT IS NOT THE ASSIGNMENT DEADLINE, AND CONFLATING THE TWO DOUBLE-PRINTED
+ * BILLS. The first cut of routing wrote the router's four-second accept timeout
+ * into claimed_until as well as assign_expires_at, on the reasoning that the
+ * escalation rung waits on the lease. What that actually did was open
+ * ClaimPrintJobsForAgent's door at t=4s: D1 is handed a directed bill and starts
+ * spooling, the Wi-Fi blip that swallowed its `print:accepted` beat also
+ * reconnects D2, D2's replay claim matches a lapsed lease and prints the same
+ * bill while D1 is still inside its 5s connect + 10s write × 3 attempts (~61s
+ * worst case, §1.2 of the brief). Two charge slips for one guest, and unlike the
+ * escalation path no `print:revoke` was ever sent, so D1 never even got the
+ * chance to drop it.
+ *
+ * The two clocks answer different questions and now keep different answers:
+ *
+ *   assign_expires_at  "has THIS DEVICE said anything yet?"  — seconds. The
+ *                      ladder's rung, and the only thing ReassignPrintJob waits
+ *                      out. Supplied by the router.
+ *   claimed_until      "may ANOTHER AGENT take this job?"    — minutes. The 027
+ *                      at-most-once guard, and it must outlast the client's
+ *                      worst hold on one network job. Computed HERE, never
+ *                      passed in.
+ */
+const PRINT_JOB_LEASE_MIN = (): number => {
+  const n = Number(process.env.PRINT_JOB_LEASE_MIN);
+  return Number.isFinite(n) && n > 0 ? n : 2;
+};
+
 export interface PrintJobRow {
   id: string;
   /** Insertion order. Only ever a tiebreaker for created_at — see migration 027. */
@@ -29135,6 +29225,26 @@ export interface PrintJobRow {
 }
 
 /**
+ * An assignment minted by the router, written by the SAME insert as the job.
+ *
+ * THERE IS DELIBERATELY NO LEASE FIELD HERE. `assign_expires_at` is the
+ * ASSIGNMENT deadline and nothing else — "this device has N seconds to say it is
+ * trying". The durable at-most-once lease (claimed_until) is computed inside
+ * EnqueuePrintJob and ReassignPrintJob from PRINT_JOB_LEASE_MIN, so that no
+ * caller can hand a four-second accept timeout to the guard that decides whether
+ * a SECOND till may print the same bill. See PRINT_JOB_LEASE_MIN above for the
+ * two-charge-slip path that made this structural rather than a convention.
+ */
+export interface PrintJobAssignment {
+  assigned_device_id: string;
+  /** The address on THAT machine ('EPSON TM-T82 Receipt', 'tcp://…:9100'). */
+  assigned_target: string | null;
+  destination_id: string | null;
+  /** The ACCEPT/VERDICT deadline. Short (seconds). Never the lease. */
+  assign_expires_at: Date;
+}
+
+/**
  * Persist one print job. Returns its uuid — THE identity every other guard keys
  * on (see the migration header for why bill_id cannot be that key).
  *
@@ -29142,8 +29252,59 @@ export interface PrintJobRow {
  * is the fast path. An insert that landed after a successful emit would leave a
  * window in which the till has already printed and acked a job the backend does
  * not yet have a row for, and that ack would be discarded as unknown.
+ *
+ * `assign` is the router's decision (migration 042) and is written by THE SAME
+ * INSERT, never by a follow-up UPDATE: there must exist no observable state in
+ * which a job carries an assignment but no lease, because ClaimPrintJobsForAgent
+ * would hand that row to the first agent that reconnects while the assignee is
+ * already spooling it — two receipts for one bill.
+ *
+ * THE LEASE AND THE DEADLINE ARE TWO CLOCKS AND THIS INSERT WRITES BOTH.
+ * claimed_until comes from PRINT_JOB_LEASE_MIN and is computed in SQL (now() +
+ * interval), never from `assign`; assign_expires_at is the router's short accept
+ * deadline. The first cut of this made them one instant so that the four-second
+ * escalation rung would not be blocked by a two-minute lease — but the thing the
+ * lease blocks is not the rung, it is ANOTHER TILL'S REPLAY CLAIM, and opening
+ * that at t=4s printed the bill twice. The rung is unblocked instead by fencing
+ * ReassignPrintJob on assign_expires_at (see there), which is the clock that
+ * actually means "this device has not answered".
+ *
+ * Falls back to the unassigned insert when the routing columns are not there
+ * (see printRoutingSchemaReady). That is not a lost feature: the emit still
+ * goes out directed, the device still prints, and its 'printed' ack still lands
+ * — AckPrintJobRouted treats a null assigned_device_id as "mine".
  */
-export async function EnqueuePrintJob(resId: string, job: PrintJobInput): Promise<string> {
+export async function EnqueuePrintJob(
+  resId: string,
+  job: PrintJobInput,
+  assign?: PrintJobAssignment | null,
+): Promise<string> {
+  if (assign && printRoutingSchemaReady) {
+    const assigned = await runQuery<{ id: string }>(
+      `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64,
+                                status, attempts, claimed_by, claimed_until, delivered_at,
+                                assigned_device_id, assigned_target, destination_id, assign_expires_at)
+       values ($1,$2,$3,$4,$5,$6,
+               'delivered', 1, $7, now() + make_interval(mins => $12::int), now(),
+               $9::uuid, $10, $11::uuid, $8::timestamptz)
+       returning id`,
+      [
+        resId, job.outlet_id, job.bill_id, job.kind, job.station, job.esc_base64,
+        // Diagnostic only, and the same shape realtime.ts writes for a socket:
+        // claimed_until and assigned_device_id are the guards, not this string.
+        `device:${assign.assigned_device_id}`,
+        assign.assign_expires_at.toISOString(),
+        assign.assigned_device_id, assign.assigned_target, assign.destination_id,
+        // The lease, from the env knob and from Postgres' clock — NOT from the
+        // caller's deadline, and not from this process's clock either, so a
+        // replica whose time has drifted cannot shorten another till's guard.
+        Math.max(1, Math.round(PRINT_JOB_LEASE_MIN())),
+      ],
+    );
+    const assignedId = assigned[0]?.id;
+    if (!assignedId) { throw new Error("PrintJobs insert returned no id"); }
+    return assignedId;
+  }
   const rows = await runQuery<{ id: string }>(
     `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64)
      values ($1,$2,$3,$4,$5,$6)
@@ -29187,6 +29348,49 @@ export async function EnqueuePrintJob(resId: string, job: PrintJobInput): Promis
  * Returned rows are sorted by created_at because RETURNING has no defined order,
  * and order matters: the N station tickets of one KOT are one logical unit, and
  * dockets must reach the kitchen oldest-first.
+ *
+ * THE FOURTH PREDICATE (migration 042) IS CONDITIONAL, AND SO IS ITS ABSENCE.
+ * It is emitted only when printRoutingSchemaReady is true, because a backend
+ * running ahead of 042 would otherwise raise 42703 here — a code print_jobs.ts's
+ * isSchemaMissing does NOT catch — and reconnect replay would die silently for
+ * every tenant in exactly the window the guard exists to survive. Latch false =
+ * this function issues today's SQL, to the character.
+ *
+ * With the latch true, what an agent may claim depends on whether it has a
+ * device identity:
+ *
+ *   agentDeviceId null (the C# agent, any build that predates routing)
+ *     `assigned_device_id is null` — the ENTIRE unrouted set and nothing else.
+ *     A client that cannot report a route must never resume a DIRECTED job: it
+ *     would print a docket the router had already handed to a second device and
+ *     could not tell us it had. A directed job that nobody serves is the
+ *     ladder's problem, and the ladder's last rung is an outlet broadcast, which
+ *     reaches this agent anyway.
+ *
+ *   agentDeviceId set
+ *     also its OWN assignment (resuming across a WebSocket flap — a till
+ *     reconnects on every blip and must get its own docket back), and any
+ *     assignment whose deadline has lapsed. That last branch is the reconnect
+ *     door: it is what lets a device pick up an abandoned job with no sweep and
+ *     no leader, and it is backstop #1 for a dispatching replica that restarted
+ *     holding the only escalation timer.
+ *
+ *     MINUS anything already in that job's failed_devices. "Never ask the same
+ *     jammed printer twice" is enforced at the ack; without the same rule at the
+ *     claim door it is only enforced there. AckPrintJobRouted's retry arm leaves
+ *     the row status='pending' with a null assignee, which is branch 1 — i.e.
+ *     matchable by the very device that just reported the jam — and its second
+ *     'failed' is then a no-op (already_failed), so the row can never settle. It
+ *     is re-claimed on every flap until the read-time TTL collects it: a zombie
+ *     the health screen watches forever. Bounded, no paper at risk, still wrong.
+ *
+ * THE RECONNECT DOOR IS HELD SHUT BY THE LEASE, NOT BY THE DEADLINE. Branch 3
+ * is conjoined with the outer `claimed_until is null or claimed_until < now()`,
+ * which is now PRINT_JOB_LEASE_MIN (minutes) again rather than the router's
+ * four-second accept timeout. That ordering is the whole guard: assign_expires_at
+ * lapses in seconds by design, and if the lease lapsed with it, a till that
+ * reconnected four seconds into another till's 61-second spool would print the
+ * same bill. See PRINT_JOB_LEASE_MIN.
  */
 export async function ClaimPrintJobsForAgent(
   resId: string,
@@ -29195,7 +29399,31 @@ export async function ClaimPrintJobsForAgent(
   cutoffs: { kot: Date; bill: Date },
   leaseUntil: Date,
   limit: number,
+  agentDeviceId: string | null = null,
 ): Promise<PrintJobRow[]> {
+  const params: unknown[] = [
+    resId, outletId,
+    cutoffs.kot.toISOString(), cutoffs.bill.toISOString(),
+    agentId, leaseUntil.toISOString(), limit,
+  ];
+  // Built as text, not as a `case when $n then …`, so that the latch-false SQL is
+  // byte-identical to what shipped in 027 — a pinned test reads this statement.
+  let routingClause = "";
+  if (printRoutingSchemaReady) {
+    if (agentDeviceId) {
+      params.push(agentDeviceId);
+      const devParam = params.length;
+      params.push(JSON.stringify([agentDeviceId]));
+      const failedParam = params.length;
+      routingClause =
+        `\n          and (assigned_device_id is null` +
+        `\n            or assigned_device_id = $${devParam}::uuid` +
+        `\n            or assign_expires_at < now())` +
+        `\n          and not (failed_devices @> $${failedParam}::jsonb)`;
+    } else {
+      routingClause = "\n          and assigned_device_id is null";
+    }
+  }
   const rows = await runQuery<PrintJobRow>(
     `with due as (
        select id
@@ -29204,7 +29432,7 @@ export async function ClaimPrintJobsForAgent(
           and outlet_id = $2
           and status in ('pending','delivered')
           and (claimed_until is null or claimed_until < now())
-          and created_at > (case when kind = 'kot' then $3::timestamptz else $4::timestamptz end)
+          and created_at > (case when kind = 'kot' then $3::timestamptz else $4::timestamptz end)${routingClause}
         order by created_at asc, seq asc
         limit $7
         for update skip locked
@@ -29218,11 +29446,7 @@ export async function ClaimPrintJobsForAgent(
        from due
       where p.id = due.id
      returning p.id, p.seq, p.bill_id, p.kind, p.station, p.esc_base64, p.created_at, p.attempts`,
-    [
-      resId, outletId,
-      cutoffs.kot.toISOString(), cutoffs.bill.toISOString(),
-      agentId, leaseUntil.toISOString(), limit,
-    ],
+    params,
   );
   // Same key as the ORDER BY above, because RETURNING does not preserve it.
   return rows.sort((a, b) => {
@@ -29262,6 +29486,787 @@ export async function AckPrintJob(
         and status in ('pending','delivered')
       returning id`,
     [jobId, resId, result],
+  );
+  return rows.length > 0;
+}
+
+/** What one routed ack did, and everything the caller needs to re-offer the job
+ *  WITHOUT re-rendering it. Re-rendering is the trap: allocateKotNumber would
+ *  mint a second docket number, and a re-rendered bill would carry figures the
+ *  guest was never shown. The bytes come back from the row. */
+export interface RoutedPrintAck {
+  /** False when the row is unknown, already settled, or the ack was a no-op. */
+  ok: boolean;
+  /** THIS call performed the terminal transition ('acked' or, at the end of the
+   *  ladder, 'failed'). What the till is told, and the only field that means the
+   *  receipt is now recorded. */
+  settled: boolean;
+  /** The row exists. False means "unknown job" — the caller should log, not retry. */
+  found: boolean;
+  printed: boolean;
+  /** Released and waiting: re-dispatch IN PROCESS, excluding failed_devices. */
+  reassign: boolean;
+  /** A 'failed' from a generation that no longer owns the job: recorded only. */
+  superseded: boolean;
+  /** Nothing was touched, and nothing needs to be: this device's own ack retry,
+   *  or a row some other ack already settled. Both mean "stop retrying". */
+  duplicate: boolean;
+  /** Today's terminal 'failed' — the ladder is out of GENERATIONS. Not "out of
+   *  candidates": presence is not knowable from this table, and the rung after
+   *  the last candidate is an outlet broadcast, not silence. See the
+   *  candidatesRemain note on AckPrintJobRouted. */
+  terminal: boolean;
+  /** True when the routing columns are absent and AckPrintJob answered instead. */
+  degraded: boolean;
+  generation: number | null;
+  failed_devices: string[];
+  job: {
+    id: string; outlet_id: string; bill_id: string; kind: string;
+    station: string | null; esc_base64: string; destination_id: string | null;
+  } | null;
+}
+
+interface RoutedAckRow {
+  live: boolean; already_failed: boolean; current_gen: boolean;
+  do_printed: boolean; do_record: boolean; do_retry: boolean; do_fail: boolean;
+  upd_id: string | null; assign_generation: number | null; failed_devices: unknown;
+  outlet_id: string | null; bill_id: string | null; kind: string | null;
+  station: string | null; esc_base64: string | null; destination_id: string | null;
+}
+
+/**
+ * WHO IS ACKING, AS THE SERVER KNOWS IT — and an admission when it does not.
+ *
+ * This type exists because the previous shape let the caller pass nothing and
+ * had the row fill in the blanks, which is not a fence at all: print_jobs.ts
+ * substituted the row's own assigned_device_id and assign_generation whenever
+ * the caller supplied none (which is always — POST /print/ack carries only
+ * {jobId, result}), so the stale-assignee and stale-generation guards were
+ * comparing the row against itself and could never fail. The concrete cost: D1
+ * is revoked at t=4s, keeps the job because its bytes already went to the
+ * transport, and acks 'failed' at ~62s. By then the row reads {D2, gen 1}. Both
+ * fence values were synthesised to D2/1, so the ack passed as current and tore
+ * down D2's live assignment while D2 was spooling — D2 printed anyway, D3 was
+ * handed the same bytes, and D2 was written into failed_devices for good. Two
+ * charge slips and a working printer permanently excluded.
+ *
+ * BOTH FIELDS MAY BE NULL, AND NULL MEANS "NOT STATED", NEVER "THE ROW'S VALUE".
+ * An unstated device is handled by the attribution rule in the SQL below, which
+ * refuses to release a live assignment on an ack nobody signed.
+ *
+ * `deviceId` MUST come from the server's own session-held identity
+ * (socket.data.print.deviceId), never from a request body or header: it decides
+ * what goes into failed_devices, which decides who is asked next.
+ */
+export interface RoutedAckClaim {
+  /** The acking device, as the SERVER knows it. Null = the ack carried no
+   *  identity (today's HTTP /print/ack). */
+  deviceId: string | null;
+  /** The generation the device was told when it was handed the job. Null = it
+   *  did not say, which is treated as "no generation fence", not as "current". */
+  generation: number | null;
+}
+
+/**
+ * The routed ack. 'failed' stops being terminal for the JOB and becomes terminal
+ * for the DEVICE.
+ *
+ * AckPrintJob above cannot serve a routed job, and that is not a matter of
+ * taste: its CAS settles the row on 'failed', so the commonest kitchen fault —
+ * printer off, jammed, out of paper — would settle a docket that the second
+ * printer bound to the same destination could have produced. Under routing that
+ * is a lost ticket. AckPrintJob is untouched and still serves every unrouted job.
+ *
+ * ONE statement, because every rule below is a decision about the row's state
+ * RIGHT NOW and two replicas can be acking the same row. `for update` in the
+ * leading CTE takes the row lock — the ClaimPrintJobsForAgent pattern — and
+ * under READ COMMITTED the loser re-reads the winner's row, which is what makes
+ * the duplicate and stale rules fire instead of racing.
+ *
+ * THE FOUR RULES. Each exists because the obvious version broke:
+ *
+ *   'printed' from ANY generation is honoured, terminally.
+ *     It printed; paper is paper whoever was assigned by then. Rejecting a late
+ *     'printed' from a superseded assignee as stale would leave the row pending
+ *     and the ladder would print it again — on a bill, a second charge slip.
+ *
+ *   'failed' from a device already in failed_devices does NOTHING.
+ *     The client retries its ack up to three times. Without this, retry #2
+ *     arrives after the job was handed to D2 and would release D2's live lease
+ *     and clear an assignment that is at that moment spooling.
+ *
+ *   'failed' on a stale generation (or from a device that is not the assignee)
+ *     records the device and nothing else. Its assignment is already gone;
+ *     touching status here is how a slow 'failed' from D1 cancels D2.
+ *
+ *   'failed' on the current generation releases the row: status 'pending',
+ *     assignment cleared, deadline now — and the generation is left ALONE.
+ *     The design brief says bump it here; that is wrong, and it is wrong in the
+ *     silent direction. ReassignPrintJob is the ONE writer of assign_generation,
+ *     because the caller escalates with the generation it already holds: a bump
+ *     here would leave that CAS fenced one behind the row, it would match zero
+ *     rows, and every failed-ack reassignment would strand its docket while
+ *     logging that somebody else owned it. What the bump was meant to buy — a
+ *     revoked device's late ack being unactionable — is bought instead by
+ *     failed_devices (a second 'failed' from it is a no-op) and by 'printed'
+ *     being honoured from any generation anyway.
+ *
+ * THE ATTRIBUTION RULE — the fifth rule, and the one the first cut did not have.
+ * An ack that names no device cannot be fenced, and POST /print/ack names none.
+ * The old code filled the gap with the row's own assignee, which made every
+ * fence tautological (see RoutedAckClaim for the two-charge-slip trace). The
+ * honest reading is:
+ *
+ *   `by.deviceId` names the row's assignee            -> attributable
+ *   `by.deviceId` is null AND the row is at generation 0 with an empty
+ *   failed_devices                                    -> attributable, because
+ *     in that state no device other than the assignee can ever have been handed
+ *     this job: a routed emit goes to one dev: room and never enters the outlet
+ *     room, and nothing has been reassigned. This is the ordinary jammed-printer
+ *     case and it still moves in about a second.
+ *   anything else                                     -> NOT attributable
+ *
+ * A non-attributable 'failed' records and stops. It cannot release the live
+ * assignment, so a straggler from a revoked device is harmless, and the client's
+ * own ack retry is harmless for a second reason: the first retry's do_retry
+ * already NULLed assigned_device_id (or the reassignment already bumped the
+ * generation), so the retry no longer satisfies the unsigned leg and lands on
+ * do_record — a no-op that reports duplicate. That is the idempotency the client's
+ * three-attempt ack retry needs, and it holds whether or not the ack is signed.
+ *
+ * AND AN ATTRIBUTABLE 'failed' MUST NAME A DEVICE EVEN WHEN THE ACK DID NOT.
+ * failed_devices is not bookkeeping: it is the exclude set the next resolution
+ * uses, so an empty one means "ask everybody, including the printer that just
+ * jammed". Since every production ack is unsigned, the retry arm falls back to
+ * the ROW's assignee — see the SET list, which explains why that is a fact and
+ * not a guess. The record-only arm gets no such fallback, because its whole
+ * meaning is that the ack could not be tied to the assignee.
+ *
+ * `printed_by_device` IS TAKEN FROM THE ROW AND ONLY FROM THE ROW. It is receipt
+ * history: no client may name another till as the printer of a money document,
+ * which is exactly what `coalesce($deviceId, p.assigned_device_id)` allowed the
+ * moment /print/ack grew a device field. It is written only when the ack is
+ * attributable, so a late 'printed' from a superseded assignee still settles the
+ * row — paper is paper — while leaving the column null rather than crediting
+ * whichever device happens to hold the assignment now.
+ *
+ * `candidatesRemain` IS GONE, DELIBERATELY. It was the caller's declaration that
+ * some untried device remains, defaulted to true, and the caller never had it:
+ * presence lives in the socket adapter, the ack path would have to pay a
+ * cross-replica fetchSockets inside the request's pooled tenant connection to
+ * learn it, and the answer would be stale by the time the reassignment ran
+ * anyway. Defaulted to true it made the terminal arm unreachable for a
+ * one-printer outlet — the common first configuration — because such an outlet's
+ * generation never climbs. So termination now comes from the generation cap
+ * ALONE: assign_generation >= maxGenerations writes today's terminal 'failed';
+ * below it, the row is released and the caller re-dispatches. When there is no
+ * next device the re-dispatch does NOT fail the job — it falls to the ladder's
+ * last rung, an outlet-wide broadcast, which is what this design promises and is
+ * strictly better than a terminal 'failed' that prints nothing at all. The cost
+ * is named: after a broadcast rung the row sits 'pending' with broadcast_at
+ * stamped until some device acks it or the read-time TTL and the reaper collect
+ * it as 'expired'. That is the honest state — the whole outlet has the docket
+ * and one printer's jam is not the outlet's verdict.
+ */
+export async function AckPrintJobRouted(
+  resId: string,
+  jobId: string,
+  by: RoutedAckClaim,
+  result: "printed" | "failed",
+  opts: { maxGenerations?: number } = {},
+): Promise<RoutedPrintAck> {
+  const empty: RoutedPrintAck = {
+    ok: false, settled: false, found: false, printed: false, reassign: false,
+    superseded: false, duplicate: false, terminal: false, degraded: false,
+    generation: null, failed_devices: [], job: null,
+  };
+  // No columns, no ladder — but an ack must never be LOST just because a deploy
+  // is ahead of its migration. Today's CAS still settles the row, and the caller
+  // reads `degraded` rather than inferring anything from a silent failure.
+  if (!printRoutingSchemaReady) {
+    const ok = await AckPrintJob(resId, jobId, result);
+    return {
+      ...empty, ok, settled: ok, found: ok, degraded: true,
+      printed: ok && result === "printed",
+      terminal: ok && result === "failed",
+      // AckPrintJob's false means "already settled, or unknown" and the till must
+      // stop either way — the same thing `duplicate` means to every caller.
+      duplicate: !ok,
+    };
+  }
+  const deviceId = typeof by.deviceId === "string" && by.deviceId.trim().length > 0
+    ? by.deviceId.trim()
+    : null;
+  const generation = typeof by.generation === "number" && Number.isFinite(by.generation)
+    ? Math.trunc(by.generation)
+    : null;
+  const maxGenerations = Number.isFinite(opts.maxGenerations) ? Number(opts.maxGenerations) : 4;
+  // SQL NULL, not '[]'. `jsonb '[…]' @> '[]'` is TRUE for EVERY array, so binding
+  // an empty array here would make already_failed depend entirely on a sibling
+  // `$3 is not null` conjunct: delete that conjunct and every ack in the system
+  // silently becomes a duplicate no-op, no row ever settles, and every job
+  // replays on reconnect forever. NULL states the invariant in the SQL itself.
+  const failedJson = deviceId ? JSON.stringify([deviceId]) : null;
+  const rows = await runQuery<RoutedAckRow>(
+    `with cur as (
+       select id, status, assign_generation, assigned_device_id,
+              coalesce(failed_devices, '[]'::jsonb) as failed_devices
+         from "PrintJobs"
+        where id = $1 and res_id = $2
+        for update
+     ),
+     d as (
+       select c.id,
+              c.assign_generation,
+              c.failed_devices,
+              (c.status in ('pending','delivered'))                          as live,
+              ($5::text = 'printed')                                         as want_printed,
+              ($5::text = 'failed' and $6::jsonb is not null
+                 and c.failed_devices @> $6::jsonb)                          as already_failed,
+              -- THE ATTRIBUTION FENCE. An unstated generation is no fence at
+              -- all (a build old enough to omit it is too old to be given a
+              -- directed job); an unstated DEVICE is only trusted in the one
+              -- state where nobody else can have held this job.
+              -- coalesced to false because "$3::uuid = assigned_device_id" is
+              -- NULL, not false, when the ack is unsigned — and a NULL here
+              -- poisons every do_* below it, so the UPDATE's WHERE matches
+              -- nothing and the ack silently does nothing at all.
+              coalesce(
+                ($4::int is null or c.assign_generation = $4::int)
+                  and c.assigned_device_id is not null
+                  and ($3::uuid = c.assigned_device_id
+                       or ($3::uuid is null
+                           and c.assign_generation = 0
+                           and jsonb_array_length(c.failed_devices) = 0)),
+                false)                                                       as current_gen
+         from cur c
+     ),
+     f as (
+       select d.*,
+              (d.live and d.want_printed)                                    as do_printed,
+              (d.live and not d.want_printed and not d.already_failed
+                 and not d.current_gen)                                      as do_record,
+              (d.live and not d.want_printed and not d.already_failed and d.current_gen
+                 and d.assign_generation < $7::int)                          as do_retry,
+              (d.live and not d.want_printed and not d.already_failed and d.current_gen
+                 and d.assign_generation >= $7::int)                         as do_fail
+         from d
+     ),
+     upd as (
+       update "PrintJobs" p
+          set status = case when f.do_printed then 'acked'
+                            when f.do_fail    then 'failed'
+                            when f.do_retry   then 'pending'
+                            else p.status end,
+              ack_result = case when f.do_printed then 'printed'
+                                when f.do_fail    then 'failed'
+                                else p.ack_result end,
+              settled_at = case when f.do_printed or f.do_fail then now() else p.settled_at end,
+              -- THE ROW, NEVER THE CALLER. Receipt history: a till that could
+              -- put its own id here could write itself into another till's
+              -- history, and only an attributable ack tells us whose machine
+              -- this was — an unattributable 'printed' still settles the job and
+              -- leaves the column alone rather than crediting the wrong device.
+              printed_by_device = case when f.do_printed and f.current_gen
+                                       then p.assigned_device_id
+                                       else p.printed_by_device end,
+              -- WHO FAILED — and the retry arm may fall back to the ROW when the
+              -- ack did not say. Every production ack is unsigned (POST
+              -- /print/ack carries {jobId, result} and has since 027), so $6 is
+              -- NULL and this used to append NOTHING on the one arm that steers
+              -- what happens next. The row was released with failed_devices still
+              -- empty, the ladder re-resolved with an EMPTY exclude set, and it
+              -- re-offered the docket to the printer that had just reported the
+              -- jam — which answers a re-offer with a FALSE 'printed', because
+              -- the client writes _settled[jobId]='printed' before its first
+              -- send. The docket was then recorded as printed and no paper ever
+              -- came out. That is the lost-docket path, on the commonest kitchen
+              -- fault the feature exists for.
+              --
+              -- p.assigned_device_id is safe HERE and only here because do_retry
+              -- implies current_gen, whose unsigned leg already proved the row is
+              -- at generation 0 with an empty failed_devices and a non-null
+              -- assignee: in that state nobody but the assignee can ever have
+              -- been handed this job. So this is not a guess about who acked, it
+              -- is the server crediting the failure to whoever it believes was
+              -- holding the row — the only defensible answer when the client did
+              -- not say, and row-derived, which is the same rule printed_by_device
+              -- follows. A CALLER-SUPPLIED device still never reaches
+              -- printed_by_device; that rule is untouched.
+              --
+              -- do_record deliberately does NOT get this fallback. It is the
+              -- NON-attributable arm — the ack could not be tied to the row's
+              -- assignee at all — so charging the current assignee with somebody
+              -- else's failure would exclude a healthy printer from its own
+              -- destination for the life of the job.
+              failed_devices = case
+                                 when f.do_retry
+                                   then p.failed_devices || coalesce(
+                                          $6::jsonb,
+                                          case when p.assigned_device_id is not null
+                                               then jsonb_build_array(p.assigned_device_id::text)
+                                               else '[]'::jsonb end)
+                                 when f.do_record or f.do_fail
+                                   then p.failed_devices || coalesce($6::jsonb, '[]'::jsonb)
+                                 else p.failed_devices end,
+              claimed_until = case when f.do_printed or f.do_fail or f.do_retry
+                                   then null else p.claimed_until end,
+              assigned_device_id = case when f.do_retry then null else p.assigned_device_id end,
+              assigned_target    = case when f.do_retry then null else p.assigned_target end,
+              assign_expires_at  = case when f.do_retry then now() else p.assign_expires_at end,
+              assign_accepted_at = case when f.do_retry then null else p.assign_accepted_at end
+         from f
+        where p.id = f.id
+          and (f.do_printed or f.do_record or f.do_retry or f.do_fail)
+       returning p.id, p.assign_generation, p.failed_devices, p.outlet_id,
+                 p.bill_id, p.kind, p.station, p.esc_base64, p.destination_id
+     )
+     select f.live, f.already_failed, f.current_gen,
+            f.do_printed, f.do_record, f.do_retry, f.do_fail,
+            u.id as upd_id,
+            coalesce(u.assign_generation, f.assign_generation) as assign_generation,
+            coalesce(u.failed_devices, f.failed_devices)       as failed_devices,
+            u.outlet_id,
+            u.bill_id, u.kind, u.station, u.esc_base64, u.destination_id
+       from f left join upd u on u.id = f.id`,
+    [jobId, resId, deviceId, generation, result, failedJson, Math.trunc(maxGenerations)],
+  );
+  const r = rows[0];
+  if (!r) { return empty; }
+  const job = r.upd_id
+    ? {
+      id: r.upd_id,
+      outlet_id: String(r.outlet_id ?? ""),
+      bill_id: String(r.bill_id ?? ""),
+      kind: String(r.kind ?? ""),
+      station: r.station,
+      esc_base64: String(r.esc_base64 ?? ""),
+      destination_id: r.destination_id,
+    }
+    : null;
+  return {
+    ok: r.upd_id !== null,
+    settled: r.do_printed === true || r.do_fail === true,
+    found: true,
+    printed: r.do_printed === true,
+    reassign: r.do_retry === true,
+    superseded: r.do_record === true,
+    // A row that is no longer live was settled by an earlier ack; to the till
+    // that is indistinguishable from its own retry, and both mean "stop".
+    duplicate: (result === "failed" && r.already_failed === true) || r.live !== true,
+    terminal: r.do_fail === true,
+    degraded: false,
+    generation: r.assign_generation === null ? null : Math.trunc(Number(r.assign_generation)),
+    failed_devices: Array.isArray(r.failed_devices) ? (r.failed_devices as string[]) : [],
+    job,
+  };
+}
+
+/** The assignment half of a "PrintJobs" row: enough to tell a job the ROUTER
+ *  ever touched from one it never did, and to escalate the first kind. */
+export interface PrintJobAssignmentRow {
+  outlet_id: string;
+  assigned_device_id: string | null;
+  assign_generation: number | null;
+  /** Which destination the router picked. NEVER cleared once set — not by the
+   *  retry arm, not by the broadcast rung. This is the durable "was routed" bit. */
+  destination_id: string | null;
+  /** Stamped when the ladder gave up and handed the job to the whole outlet.
+   *  Diagnostic here; it does NOT make the job unrouted again. */
+  broadcast_at: Date | null;
+  /** Every device that has already reported this job failed. */
+  failed_devices: string[];
+  /**
+   * When the assignee said "I have this" — the accept beat, stamped by
+   * AcceptPrintAssignment. Null means it never did.
+   *
+   * PROJECTED FOR ONE CALLER AND ONE DECISION: an escalation that fires on a
+   * setTimeout is acting on IN-MEMORY state, and in-memory state is per-replica.
+   * When the device's socket lives on a different replica from the one that
+   * dispatched, the accept beat extends THE ROW and the dispatching replica
+   * never hears it — so its four-second timer revokes a device that is already
+   * spooling. The row is the only thing both replicas can see, so the timer must
+   * re-read it before it is allowed to revoke anybody.
+   */
+  assign_accepted_at: Date | null;
+  /** The assignment deadline as the ROW holds it — extended by an accept beat
+   *  wherever that beat landed. Paired with assign_accepted_at above. */
+  assign_expires_at: Date | null;
+}
+
+/**
+ * ROUTED OR BROADCAST — and it must NOT be decided by `assigned_device_id`.
+ *
+ * THE BUG THIS EXISTS TO KILL: the ack path forked on
+ * `assignment.assigned_device_id !== null`, and AckPrintJobRouted's own retry arm
+ * NULLS that column. So the client's second ack attempt — it retries up to three
+ * times, and one lost HTTP response on restaurant Wi-Fi is all it takes — read a
+ * null assignee, fell through to the BROADCAST branch, and AckPrintJob's CAS
+ * matched the 'pending' row the retry arm had just released for reassignment and
+ * wrote status='failed', TERMINAL. The docket was then unrecoverable and
+ * invisible: ExpirePrintJobs only touches non-terminal rows, so no
+ * print_jobs_expired_undelivered warn ever fired and no bell rang. The kitchen
+ * ticket simply never existed. And the duplicate-ack guard written expressly for
+ * that retry was never reached, because the retry never entered the routed
+ * function at all.
+ *
+ * So the question is asked of DURABLE facts only. Each of these is written once
+ * by the router and never taken back:
+ *
+ *   destination_id      the router chose a place. Set by the assigning INSERT,
+ *                       coalesced (never cleared) by ReassignPrintJob, untouched
+ *                       by the retry arm and by MarkPrintJobBroadcast.
+ *   assign_generation>0 the ladder has moved this job at least once.
+ *   failed_devices      at least one device has reported on this job.
+ *   assigned_device_id  a device holds it RIGHT NOW. Kept last and kept only as
+ *                       a belt: it is the one signal that goes away again.
+ *
+ * A job an unconfigured tenant produced answers false on all four, forever, and
+ * takes the pre-042 path to the character. A job the ladder has driven all the
+ * way to its broadcast rung answers TRUE — deliberately. Sending it to
+ * AckPrintJob there would let the original assignee's retried 'failed' terminally
+ * kill a docket the whole outlet is at that moment printing.
+ */
+export function isRoutedPrintJob(row: PrintJobAssignmentRow | null): boolean {
+  if (!row) { return false; }
+  return row.destination_id !== null
+    || (row.assign_generation ?? 0) > 0
+    || row.failed_devices.length > 0
+    || row.assigned_device_id !== null;
+}
+
+/**
+ * Was this job routed, to whom, and at which generation?
+ *
+ * One select per ack, and the ack path pays it deliberately rather than trusting
+ * the body: a routing-aware till that omitted its deviceId would otherwise take
+ * the unrouted path, where 'failed' is TERMINAL, and the docket would die where
+ * it should have moved to the next printer. The row already knows; the client is
+ * not asked.
+ *
+ * DEGRADES, IT DOES NOT THROW. This runs on POST /print/ack — the one route
+ * whose 500 makes a till retry an ack for paper that already came out. The latch
+ * short-circuits it before a statement is issued under a pending 042, and
+ * routingQuery catches 42P01/42501/42703 if a grant is pulled underneath a live
+ * process. Null means "treat as unrouted", which is this backend's pre-042
+ * behaviour and therefore always a safe answer; it is also what an unknown job
+ * returns. Callers keep their own catch as the belt to these braces.
+ */
+export async function GetPrintJobAssignment(
+  resId: string,
+  jobId: string,
+): Promise<PrintJobAssignmentRow | null> {
+  if (!printRoutingSchemaReady) { return null; }
+  const rows = await routingQuery("jobs.assignment", () => runQuery<{
+    outlet_id: string; assigned_device_id: string | null; assign_generation: number | null;
+    destination_id: string | null; broadcast_at: Date | null; failed_devices: unknown;
+    assign_accepted_at: Date | null; assign_expires_at: Date | null;
+  }>(
+    `select outlet_id, assigned_device_id, assign_generation,
+            destination_id, broadcast_at, coalesce(failed_devices, '[]'::jsonb) as failed_devices,
+            assign_accepted_at, assign_expires_at
+       from "PrintJobs"
+      where id = $1 and res_id = $2
+      limit 1`,
+    [jobId, resId],
+  ), []);
+  const row = rows[0];
+  if (!row) { return null; }
+  return {
+    outlet_id: row.outlet_id,
+    assigned_device_id: row.assigned_device_id,
+    assign_generation: row.assign_generation === null ? null : Math.trunc(Number(row.assign_generation)),
+    destination_id: row.destination_id ?? null,
+    broadcast_at: row.broadcast_at ?? null,
+    failed_devices: Array.isArray(row.failed_devices) ? row.failed_devices.map((d) => String(d)) : [],
+    assign_accepted_at: row.assign_accepted_at ?? null,
+    assign_expires_at: row.assign_expires_at ?? null,
+  };
+}
+
+/**
+ * Hand a job to the next device on the chain, generation-fenced.
+ *
+ * THE FENCE has one writer, and it is this function. Two replicas both read
+ * generation N, both attempt, exactly one UPDATE matches and the loser gets null
+ * and emits nothing — no leader lock, no advisory lock, no in-process flag, none
+ * of which survives a second replica anyway. AckPrintJobRouted deliberately does
+ * NOT touch assign_generation, so the number a caller is holding is still the
+ * row's by the time it gets here.
+ *
+ * TWO CLOCKS, AND THIS CAS NOW WAITS OUT BOTH. They answer different questions
+ * and dropping either one costs paper:
+ *
+ *   assign_expires_at  "has the assignee said anything?" — the ladder's own short
+ *                      deadline (4s before an accept beat, 75s after one).
+ *   claimed_until      "is somebody HOLDING this row right now?" — 027's durable
+ *                      at-most-once lease, two minutes, and the ONLY thing
+ *                      ClaimPrintJobsForAgent's reconnect door respects.
+ *
+ * THE DEADLINE IS NOT THE LEASE, and conflating them is what made the first cut
+ * print bills twice. The reasoning ran: "the rung has to fire at four seconds,
+ * and this CAS waits on claimed_until, so claimed_until must be four seconds."
+ * That shortened the 027 guard from two minutes to four seconds for every routed
+ * job, and the reconnect door opened on the same clock: a second till that
+ * reconnected while the first was still inside its ~61s spool claimed and printed
+ * the same bill, with no `print:revoke` sent on that path at all. The fix is two
+ * separate clocks (see PRINT_JOB_LEASE_MIN), not one predicate.
+ *
+ * THE SECOND CUT THEN DELETED THE LEASE PREDICATE ALTOGETHER, and that is the bug
+ * this comment exists to stop anybody repeating. With only the deadline leg, a
+ * row whose assign_expires_at had lapsed while an agent held a LIVE 027 lease —
+ * the ordinary shape of a device that accepted, is spooling, and whose accept
+ * beat landed on another replica; or of an agent that picked the job up through
+ * the reconnect door, which rewrites claimed_until and never touches
+ * assign_expires_at — was fair game. The ladder handed those bytes to a second
+ * device while the first was still pushing them at a printer. Two dockets, and on
+ * a bill two charge slips. `ExpirePrintJobs` states the same rule in its own
+ * words and for the same reason: a job must not be taken out from under an agent
+ * that is holding it.
+ *
+ * THE NAMED EXCEPTION, ON BOTH LEGS, IS `claimed_by = device:<fromDeviceId>` —
+ * and it is what keeps the fast path fast. The ~1s `print:reject` beat and the
+ * ~62s 'failed' ack both arrive INSIDE the lease and the deadline they were
+ * given; making the kitchen wait two minutes for paper that is never coming is
+ * the whole thing the beat exists to avoid. So this CAS may break exactly one
+ * lease: the one it handed out itself, to the device it is now moving off.
+ *
+ * READ THE TWO LEGS AS ONE RULE, because a future reader with half the context
+ * will otherwise delete whichever one looks redundant: "a row held by SOMEBODY
+ * ELSE is untouchable; a row held by the device I am moving off is mine to take
+ * back." Delete the claimed_until leg and the ladder yanks rows from live
+ * holders (two printers, same bytes). Delete the claimed_by leg and the fast
+ * rungs match zero rows, every reject waits out a two-minute lease, and the
+ * kitchen discovers a jammed printer at the reaper rather than in a second.
+ * A null on either column is nobody's and passes.
+ *
+ * The generation fence is what makes the claimed_by exception safe. A caller may
+ * only reassign the generation it is holding, so the revoked device's straggling
+ * ack (which never bumps the generation — see AckPrintJobRouted) cannot drive a
+ * second hop. And the exception is matched on claimed_by rather than on
+ * assigned_device_id on purpose: the reconnect door rewrites claimed_by and
+ * leaves assigned_device_id alone, so an assigned_device_id test would let this
+ * yank a job some OTHER agent has legitimately picked up and is spooling.
+ *
+ * `fromDeviceId` does two jobs deliberately: the device being moved off is
+ * exactly the device that must never be offered this job again, so it is also
+ * what gets appended to failed_devices.
+ *
+ * Writes status/claimed_by/claimed_until in the same shape EnqueuePrintJob's
+ * assigned arm does, so a reassigned job and a freshly assigned one are
+ * indistinguishable to every other statement in this file.
+ */
+export async function ReassignPrintJob(
+  resId: string,
+  jobId: string,
+  expectGeneration: number,
+  next: PrintJobAssignment,
+  fromDeviceId: string | null = null,
+): Promise<{ id: string; assign_generation: number } | null> {
+  if (!printRoutingSchemaReady) { return null; }
+  const rows = await runQuery<{ id: string; assign_generation: number }>(
+    `update "PrintJobs"
+        set assigned_device_id = $4::uuid,
+            assigned_target    = $5,
+            destination_id     = coalesce($6::uuid, destination_id),
+            assign_generation  = assign_generation + 1,
+            assign_expires_at  = $7::timestamptz,
+            assign_accepted_at = null,
+            failed_devices     = failed_devices || $8::jsonb,
+            attempts           = attempts + 1,
+            status             = 'delivered',
+            claimed_by         = $9,
+            claimed_until      = now() + make_interval(mins => $11::int)
+      where id = $1 and res_id = $2
+        and status in ('pending','delivered')
+        and assign_generation = $3::int
+        -- THE DEADLINE: has the assignee answered the ladder?
+        and (assign_expires_at is null or assign_expires_at <= now() or claimed_by = $10)
+        -- THE LEASE (027): is anybody HOLDING the row? Both legs carry the same
+        -- named exception — the one lease we are entitled to break is the one we
+        -- handed to the device we are moving off. See the two-clocks note above;
+        -- neither line is redundant and neither may be deleted alone.
+        and (claimed_until is null or claimed_until < now() or claimed_by = $10)
+        -- THE LAST RUNG IS FINAL. Once a job has been shouted into the outlet
+        -- room, EVERY capable device in it has the bytes — including the C# agent,
+        -- which prints unconditionally and cannot ack. Directing it at a device
+        -- afterwards does not move the ticket, it adds a second copy to whatever
+        -- the broadcast already produced. MarkPrintJobBroadcast writes this column
+        -- once and never takes it back, precisely so that it can be read here as
+        -- "this job is out of the ladder's hands now".
+        and broadcast_at is null
+      returning id, assign_generation`,
+    [
+      jobId, resId, Math.trunc(expectGeneration),
+      next.assigned_device_id, next.assigned_target, next.destination_id,
+      next.assign_expires_at.toISOString(),
+      JSON.stringify(fromDeviceId ? [fromDeviceId] : []),
+      `device:${next.assigned_device_id}`,
+      fromDeviceId ? `device:${fromDeviceId}` : null,
+      // The NEXT device's durable lease, from Postgres' clock. Same rule as
+      // EnqueuePrintJob: the caller's short deadline never reaches claimed_until.
+      Math.max(1, Math.round(PRINT_JOB_LEASE_MIN())),
+    ],
+  );
+  const row = rows[0];
+  return row ? { id: row.id, assign_generation: Math.trunc(Number(row.assign_generation)) } : null;
+}
+
+/**
+ * The accept beat: this device queued the job and resolved a printer for it.
+ *
+ * It buys the client the time it actually needs. The assignment deadline starts
+ * at PRINT_ACCEPT_TIMEOUT_MS — four seconds, short enough that a killed app or a
+ * zombie socket costs a docket four seconds — and only a device that has said
+ * "I am trying" gets extended to PRINT_VERDICT_TIMEOUT_SEC, which must exceed
+ * the client's own worst hold on one network job (~61s: connect 5s + write 10s,
+ * three attempts, plus its retry backoff). Extending on assignment instead would
+ * make every dead device cost 75 seconds.
+ *
+ * THE LEASE IS REFRESHED, NEVER SHORTENED. claimed_until takes whichever is
+ * later, the standard PRINT_JOB_LEASE_MIN or the verdict deadline this beat is
+ * buying — because the beat's job is to give the device MORE time and a plain
+ * assignment `claimed_until = $verdict` would have quietly cut the two-minute
+ * at-most-once guard down to 75 seconds on exactly the jobs a device is actively
+ * working on. The two clocks are separate (see PRINT_JOB_LEASE_MIN); this is the
+ * one statement where they meet, and `greatest` is what keeps the meeting
+ * monotonic.
+ *
+ * Fenced on device AND generation, so a beat that arrives after the job was
+ * handed on extends nobody's deadline.
+ */
+export async function AcceptPrintAssignment(
+  resId: string,
+  jobId: string,
+  deviceId: string,
+  generation: number,
+  until: Date,
+): Promise<boolean> {
+  if (!printRoutingSchemaReady) { return false; }
+  const rows = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set assign_accepted_at = coalesce(assign_accepted_at, now()),
+            assign_expires_at  = $5::timestamptz,
+            claimed_until      = greatest(
+                                   now() + make_interval(mins => $6::int),
+                                   $5::timestamptz)
+      where id = $1 and res_id = $2
+        and status in ('pending','delivered')
+        and assigned_device_id = $3::uuid
+        and assign_generation = $4::int
+      returning id`,
+    [
+      jobId, resId, deviceId, Math.trunc(generation), until.toISOString(),
+      Math.max(1, Math.round(PRINT_JOB_LEASE_MIN())),
+    ],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * The ladder's last rung, as a durable fact: nobody could be given this job, so
+ * the whole outlet gets it exactly as it would have before routing existed.
+ *
+ * Clearing the assignment is what puts the row back into the set an UNROUTED
+ * agent may claim — ClaimPrintJobsForAgent's `assigned_device_id is null` branch,
+ * i.e. the entire legacy set. Without it the C# agent and every old build could
+ * still not resume this job on reconnect, and "the last rung is today's
+ * behaviour" would be true of the emit and false of the replay.
+ *
+ * status goes back to 'pending' because that is now what it means: nobody holds
+ * it. broadcast_at is the only trace GET /print/health has to answer "why did the
+ * bar docket print at the pass?", whose three causes — the dish's station
+ * resolved to General, no route matched, the device's own local fallback won —
+ * are otherwise indistinguishable from outside.
+ *
+ * THE RETURN VALUE IS AN INTERLOCK, NOT A LOG LINE — broadcastRung emits the full
+ * ESC/POS payload into the outlet room if and only if this says true, so `true`
+ * means "you, and only you, now own the decision to shout". The first cut
+ * returned it unconditionally and the three fences below are each a way that went
+ * wrong:
+ *
+ *   broadcast_at is null — IDEMPOTENCE, and the reason the old shape could not
+ *     have it: the WHERE matched `status in ('pending','delivered')` while the SET
+ *     wrote status='pending', so the statement re-matched its own result and
+ *     answered true every time it was asked. Two replicas reaching this rung for
+ *     one job — the ordinary shape once an ack lands on a replica that did not
+ *     dispatch, so the adopting replica escalates while the dispatcher's own
+ *     deadline fires — both got true and both shouted. The C# agent prints
+ *     unconditionally, so that is two kitchen dockets, or on a bill two charge
+ *     slips. status is still 'pending' afterwards (the legacy replay set needs it
+ *     to be); broadcast_at, which is written once and never taken back, is what
+ *     carries the idempotence now.
+ *
+ *   assign_generation = $gen — THE STALE ESCALATION. The caller passes the
+ *     generation it is acting on, exactly as ReassignPrintJob's CAS does, and for
+ *     the same reason: a replica holding a registry entry one generation behind
+ *     (its device was reassigned elsewhere while its timer was still armed) must
+ *     not be able to announce "nobody could serve this" about a job that has
+ *     since been handed to a device now spooling it. ReassignPrintJob is the one
+ *     writer of the column, so the number the caller holds is still the row's
+ *     unless somebody moved the job — which is precisely the case to refuse.
+ *
+ *   the 027 lease, with the same named exception as ReassignPrintJob — a row some
+ *     OTHER agent is holding (it picked the job up through the reconnect door, or
+ *     its accept beat landed on another replica) is not ours to hand to the whole
+ *     outlet. `claimed_by = device:<failedDevice>` excuses the one lease this
+ *     ladder handed out itself, and that leg is load-bearing: without it the ~1s
+ *     `print:reject` with an empty onward chain would be refused for the two
+ *     minutes of its own lease and the kitchen would wait for a docket that had
+ *     already been declined.
+ *
+ * FALSE IS A REFUSAL, NEVER AN EXCEPTION. A fence that fails, a settled row, and
+ * a missing migration 042 all return false rather than throwing, because the
+ * caller's alternative to a clean boolean is a catch that cannot tell "somebody
+ * else owns this" from "the database is down" — and it emits on the latter,
+ * correctly. What false costs is named: this replica stops, and the job's deadline
+ * belongs to whoever the fence says still holds it (their timer, the reconnect
+ * door, the orphan sweep, or the 15-minute reaper). What false BUYS is that one
+ * docket never becomes two.
+ */
+export async function MarkPrintJobBroadcast(
+  resId: string,
+  jobId: string,
+  expectGeneration: number,
+  failedDevice: string | null = null,
+): Promise<boolean> {
+  if (!printRoutingSchemaReady) { return false; }
+  const rows = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set assigned_device_id = null,
+            assigned_target    = null,
+            assign_expires_at  = null,
+            assign_accepted_at = null,
+            claimed_by         = null,
+            claimed_until      = null,
+            -- Nobody holds it, which is what 'pending' means — and it is what
+            -- puts the row back in the legacy replay set. The generation is left
+            -- ALONE (ReassignPrintJob is its only writer) so a caller still
+            -- holding this number can recognise the row afterwards.
+            status             = 'pending',
+            -- Unconditional, not coalesced: the WHERE already proved it was null,
+            -- and that is the whole fence. A coalesce here would read as though
+            -- re-marking were expected, which is the misreading that let the old
+            -- shape answer true twice.
+            broadcast_at       = now(),
+            failed_devices     = failed_devices || $4::jsonb
+      where id = $1 and res_id = $2
+        and status in ('pending','delivered')
+        -- IDEMPOTENCE: the second replica to reach this rung gets false.
+        and broadcast_at is null
+        -- NOT A STALE ESCALATION: the caller is acting on the row's current
+        -- generation, not on a registry entry the ladder has moved past.
+        and assign_generation = $3::int
+        -- NOT SOMEBODY ELSE'S ROW: 027's lease, excusing only the lease this
+        -- ladder handed to the device it is giving up on. Same two-leg rule, same
+        -- reasons, as ReassignPrintJob — keep them in step.
+        and (claimed_until is null or claimed_until < now() or claimed_by = $5)
+      returning id`,
+    [
+      jobId, resId, Math.trunc(expectGeneration),
+      JSON.stringify(failedDevice ? [failedDevice] : []),
+      failedDevice ? `device:${failedDevice}` : null,
+    ],
   );
   return rows.length > 0;
 }
@@ -29344,6 +30349,955 @@ export async function OutletBelongsToRestaurant(resId: string, outletId: string)
     [outletId, resId],
   );
   return rows.length > 0;
+}
+
+// --- Server-decided print routing (migration 042) ----------------------------
+//
+// Four tables in three layers — PrintDestinations (a PLACE), PrintRoutes (the
+// RULE SET: "Bar + Cocktails + Juice on one printer" is three rows sharing a
+// destination_id, which is why there is no group table), PrintDevices (the
+// MACHINE registry) and PrintDeviceTargets (the ADDRESS, which only the device
+// that can reach it may write). Every statement that touches them lives here
+// behind a named export because runQuery is module-private. The DECISION — which
+// destination a docket belongs to, who is online to serve it, and what happens
+// when nobody is — lives in print_routing.ts.
+//
+// THE RULE THAT MAKES THIS SAFE TO SHIP AHEAD OF ITS MIGRATION: every READ here
+// returns EMPTY when the schema is not there. No destinations means no routes;
+// no routes means resolvePrintTarget broadcasts; a broadcast is today's code
+// path byte for byte. So "backend running ahead of 042" degrades to last week's
+// printing rather than to an error page — and that is not hypothetical, deploy
+// Gate B has twice swapped containers with migrations pending.
+//
+// WRITES DO THE OPPOSITE AND THROW. The first cut degraded them the same way,
+// and that is how a permission failure became indistinguishable from a
+// deliberate save: an EMPTY result is a legal instruction on this screen (no
+// routes = "turn routing off for this outlet"; no targets = "forget this
+// printer"), so returning empty on 42501 told an owner their save had succeeded
+// and configured nothing. See routingWrite.
+//
+// (The "PrintJobs" block above THROWS instead, and keeps doing so. Its callers
+// have a durability decision to make when a statement fails. Its ONE named
+// exception is GetPrintJobAssignment, which runs on POST /print/ack and returns
+// null — "treat as unrouted", the pre-042 answer — because a 500 on that route
+// makes a till retry an ack for paper that already came out.)
+//
+// Nothing here reads the ambient outlet, for the same reason the "PrintJobs"
+// block does not: resolveRestaurantContext's default branch picks the OLDEST
+// outlet when it cannot resolve one, which here would bind one branch's till to
+// another branch's printers.
+
+/**
+ * "Migration 042 has not run here yet", as a SQLSTATE test.
+ *
+ *   42P01 undefined_table         — the four tables come from 042 and only 042.
+ *   42501 insufficient_privilege  — tables exist, the app_runtime GRANT half did not.
+ *   42703 undefined_column        — 042's OTHER half adds nine columns to the
+ *                                   pre-existing "PrintJobs", so its unapplied
+ *                                   state is a missing column, not a missing
+ *                                   table. print_jobs.ts's isSchemaMissing does
+ *                                   not catch this one, which is exactly the gap
+ *                                   printRoutingSchemaReady below exists to close.
+ *
+ * Same three codes as isCaptureTableMissing, for the same reason, kept separate
+ * so the print half and the MIS half can never drift into catching different sets.
+ */
+function isPrintRoutingSchemaMissing(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === "42P01" || code === "42501" || code === "42703";
+}
+
+let printRoutingWarnedAt = 0;
+/** Loud, but not once per docket: an unmigrated deployment prints all day. */
+function warnPrintRoutingSchemaMissing(where: string, err: unknown): void {
+  const now = Date.now();
+  if (now - printRoutingWarnedAt < 10 * 60_000) { return; }
+  printRoutingWarnedAt = now;
+  logger.error(
+    { err, where },
+    'print routing is OFF — migration 042 is not applied here. Every docket ' +
+      "broadcasts to the whole outlet, which is exactly what it did before routing.",
+  );
+}
+
+/** Run a routing READ, degrading to `fallback` when 042 is unapplied. */
+async function routingQuery<T>(where: string, run: () => Promise<T>, fallback: T): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (!isPrintRoutingSchemaMissing(err)) { throw err; }
+    warnPrintRoutingSchemaMissing(where, err);
+    return fallback;
+  }
+}
+
+/**
+ * "This box has no routing schema", as a throwable the route layer can map to a
+ * 503 instead of guessing from a 500.
+ */
+export class PrintRoutingSchemaMissingError extends Error {
+  readonly code = "PRINT_ROUTING_SCHEMA_MISSING";
+  readonly where: string;
+  constructor(where: string, options?: { cause?: unknown }) {
+    super(
+      "Print routing is not installed on this server (migration 042). " +
+        "Nothing was saved.",
+      options,
+    );
+    this.name = "PrintRoutingSchemaMissingError";
+    this.where = where;
+  }
+}
+
+/** Does this error mean a routing WRITE was refused for want of migration 042? */
+export function isPrintRoutingSchemaMissingError(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === "PRINT_ROUTING_SCHEMA_MISSING";
+}
+
+/**
+ * Run a routing WRITE. It THROWS where a read degrades, and the asymmetry is the
+ * whole point.
+ *
+ * A read that degrades to empty is honest: no destinations means no routes means
+ * broadcast, which is last week's printing. A WRITE that degrades to empty is a
+ * LIE, because empty is also a legal and meaningful save here — SetPrintRoutes
+ * with no rows is exactly how an owner turns routing off for an outlet, and
+ * SetPrintDeviceTargets with no rows is what "forget this printer" means. So on a
+ * box where 042's tables landed but the app_runtime GRANT block did not (42501 —
+ * one of the three codes this file treats as "042 is not here", and deploy Gate B
+ * has twice swapped containers with migrations pending), an owner pressed Save on
+ * the routing screen, was handed a success describing zero routes, and reasonably
+ * concluded routing was configured off. Nothing anywhere said otherwise.
+ *
+ * Loud every time rather than throttled: a config save is an operator standing in
+ * front of the screen, not a docket on a hot path, so there is nothing to flood.
+ */
+async function routingWrite<T>(where: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (!isPrintRoutingSchemaMissing(err)) { throw err; }
+    logger.error(
+      { err, where },
+      "print_routing_write_refused — migration 042 is not applied here, so this " +
+        "save did nothing. It is reported as a failure rather than as an empty " +
+        "save, because an empty save is a legal instruction on this screen.",
+    );
+    throw new PrintRoutingSchemaMissingError(where, { cause: err });
+  }
+}
+
+/**
+ * The nine additive "PrintJobs" columns (migration 042), as a belt-and-braces
+ * boot step. COLUMNS ONLY — the four tables come from the migration and nothing
+ * else, because ensureLazyTable swallows 42501 and memoises SUCCESS having
+ * created nothing, and app_runtime has DML rights only: a lazy CREATE TABLE here
+ * is a guaranteed no-op followed by 42P01 on the next select. Migration 026's
+ * header records the outage that pattern caused.
+ *
+ * CALLABLE AT BOOT ONLY, and never from EnqueuePrintJob or anything else a
+ * request can reach. ALTER TABLE wants ACCESS EXCLUSIVE on "PrintJobs" while
+ * concurrent settles hold row locks on it; the resulting convoy — each waiter
+ * holding one of fifteen pooled sessions — IS the 2026-08-24 standstill. The
+ * ensureLazyTable wrapper bounds it to one run per process; running it off the
+ * hot path is what makes that one run harmless.
+ */
+export async function ensurePrintRoutingColumns(): Promise<void> {
+  await ensureLazyTable("PrintJobs.print_routing_cols", async () => {
+    // WHO the router picked, and WHERE on that machine. No foreign key on either:
+    // deleting a device must never cascade into settled receipt history (027/038's
+    // rule), so these stay plain uuids that may name a row that no longer exists.
+    await runQuery(`alter table "PrintJobs" add column if not exists assigned_device_id uuid`);
+    await runQuery(`alter table "PrintJobs" add column if not exists assigned_target text`);
+    await runQuery(`alter table "PrintJobs" add column if not exists destination_id uuid`);
+    // The assignment deadline AND the lease — see EnqueuePrintJob for why one
+    // clock rather than two.
+    await runQuery(`alter table "PrintJobs" add column if not exists assign_expires_at timestamptz`);
+    // The fence every reassignment compares against. Two replicas can both decide
+    // to escalate the same silent job; the generation is what makes exactly one
+    // of them win, with no leader lock.
+    await runQuery(`alter table "PrintJobs" add column if not exists assign_generation smallint not null default 0`);
+    // The accept beat's stamp: "a device is trying" is a different state from
+    // "a device was told", and only the first earns the long deadline.
+    await runQuery(`alter table "PrintJobs" add column if not exists assign_accepted_at timestamptz`);
+    // Every device that has already failed this job. This is what "never ask the
+    // same jammed printer twice" survives on once 'failed' stops being terminal
+    // for the job, and what makes the client's own ack retry a no-op.
+    await runQuery(`alter table "PrintJobs" add column if not exists failed_devices jsonb not null default '[]'::jsonb`);
+    // Receipt history: which machine actually produced the paper.
+    await runQuery(`alter table "PrintJobs" add column if not exists printed_by_device uuid`);
+    // The trace that answers "why did the bar docket print at the pass?". Without
+    // it the fallback rung is invisible and the feature quietly stops being one.
+    await runQuery(`alter table "PrintJobs" add column if not exists broadcast_at timestamptz`);
+  });
+}
+
+// THE LATCH. Read by ClaimPrintJobsForAgent, EnqueuePrintJob's assigned arm,
+// AckPrintJobRouted, ReassignPrintJob, AcceptPrintAssignment and
+// MarkPrintJobBroadcast — every statement that names a 042 column on a path a
+// request can reach.
+//
+// It is not decoration. isSchemaMissing does not catch 42703, so without this
+// latch a backend running ahead of 042 raises undefined_column inside the claim
+// and reconnect replay dies SILENTLY for every tenant — in precisely the Gate-B
+// window the guard exists to survive. False means every one of those functions
+// issues (or falls back to) exactly what shipped in 027.
+let printRoutingSchemaReady = false;
+
+/** The latch, for print_routing.ts and for tests. */
+export function isPrintRoutingSchemaReady(): boolean {
+  return printRoutingSchemaReady;
+}
+
+/**
+ * Set the latch at BOOT, by asking Postgres rather than by trusting a version
+ * file: `limit 0` plans the statement, resolves assigned_device_id, and returns
+ * no rows, so it costs one round trip and reads nothing.
+ *
+ * MUST be called from index.ts's startup, unconditionally. It cannot live inside
+ * WarmReportingSchema — that whole function is behind REPORT_SCHEDULER, which is
+ * unset in production, so routing would be latched off on the one box that has
+ * the migration.
+ *
+ * Never throws: a failure here means routing stays off, which means broadcast,
+ * which is today.
+ */
+export async function initPrintRoutingSchema(): Promise<boolean> {
+  try {
+    await ensurePrintRoutingColumns();
+  } catch (err) {
+    // app_runtime cannot ALTER. Expected in production — 042 brings the columns.
+    logger.warn({ err }, "print_routing_columns_not_ensured");
+  }
+  try {
+    await runQuery(`select assigned_device_id from "PrintJobs" limit 0`);
+    printRoutingSchemaReady = true;
+  } catch (err) {
+    printRoutingSchemaReady = false;
+    warnPrintRoutingSchemaMissing("boot_probe", err);
+  }
+  return printRoutingSchemaReady;
+}
+
+// Test seam (jest only). Mirrors __poolHygieneTestSeam: the latch's whole point
+// is the behaviour on the false side, and a test cannot reach that by luck.
+export const __printRoutingTestSeam = {
+  setSchemaReady(ready: boolean): void { printRoutingSchemaReady = ready; },
+  isSchemaReady(): boolean { return printRoutingSchemaReady; },
+};
+
+// --- Layer 1: destinations (a PLACE) -----------------------------------------
+
+export interface PrintDestinationRow {
+  id: string;
+  outlet_id: string;
+  name: string;
+  sort_order: number;
+  active: boolean;
+}
+
+const PRINT_DESTINATION_SELECT = `id, outlet_id, name, sort_order, active`;
+
+interface PrintDestinationSqlRow {
+  id: string; outlet_id: string; name: string; sort_order: unknown; active: unknown;
+}
+
+function mapPrintDestination(r: PrintDestinationSqlRow): PrintDestinationRow {
+  return {
+    id: r.id,
+    outlet_id: r.outlet_id,
+    name: r.name,
+    sort_order: Math.round(parseNumeric(r.sort_order)),
+    active: r.active !== false,
+  };
+}
+
+/** This outlet's destinations. Empty on a tenant that has never configured one —
+ *  which is every tenant until an owner opens the screen. */
+export async function ListPrintDestinations(
+  resId: string,
+  outletId: string,
+  opts: { includeInactive?: boolean } = {},
+): Promise<PrintDestinationRow[]> {
+  const rows = await routingQuery("destinations.list", () => runQuery<PrintDestinationSqlRow>(
+    `select ${PRINT_DESTINATION_SELECT} from "PrintDestinations"
+      where res_id = $1 and outlet_id = $2
+        and (${opts.includeInactive === true ? "true" : "active = true"})
+      order by sort_order asc, lower(name) asc`,
+    [resId, outletId],
+  ), [] as PrintDestinationSqlRow[]);
+  return rows.map(mapPrintDestination);
+}
+
+/**
+ * Create or rename a destination.
+ *
+ * Upserts on (res_id, outlet_id, lower(name)) — 042's unique index — so
+ * re-saving the screen updates rather than duplicating, and "Bar Printer" cannot
+ * become a second destination next to "bar printer" that nobody can tell apart
+ * on a routing screen. A supplied id that loses the conflict is DISCARDED: the
+ * surviving row keeps its own id, because PrintRoutes and PrintDeviceTargets
+ * reference it.
+ *
+ * AN OMITTED FIELD IS NOT A ZERO. sort_order and active are coalesced from the
+ * PARAMETER (null when the caller did not name it), not from `excluded`, because
+ * `excluded` carries the INSERT's defaults and would apply them on every update.
+ * The natural shape of a rename from the route editor is `{id, name}` — and that
+ * shape used to reset the destination's sort order to 0 and silently RE-ACTIVATE
+ * a destination the owner had deliberately deactivated, which is the one
+ * affordance DeletePrintDestination below tells people to use instead of
+ * deleting. Same coalesce idiom as RegisterPrintDevice's label.
+ */
+export async function UpsertPrintDestination(
+  resId: string,
+  outletId: string,
+  input: { id?: string | null; name: string; sort_order?: number; active?: boolean },
+): Promise<PrintDestinationRow | null> {
+  const name = String(input.name ?? "").trim().slice(0, 80);
+  if (!name) { throw new Error("A destination name is required"); }
+  const rows = await routingWrite("destinations.upsert", () => runQuery<PrintDestinationSqlRow>(
+    `insert into "PrintDestinations" (id, res_id, outlet_id, name, sort_order, active, updated_at)
+     values ($1,$2,$3,$4, coalesce($5::smallint, 0), coalesce($6::boolean, true), now())
+     on conflict (res_id, outlet_id, lower(name)) do update
+       set name = excluded.name,
+           sort_order = coalesce($5::smallint, "PrintDestinations".sort_order),
+           active = coalesce($6::boolean, "PrintDestinations".active),
+           updated_at = now()
+     returning ${PRINT_DESTINATION_SELECT}`,
+    [
+      isUuid(String(input.id ?? "")) ? input.id : randomUUID(),
+      resId, outletId, name,
+      // null, not 0 / true: "the caller did not say" is a third answer and the
+      // conflict arm above is the only place that can tell it from "the caller
+      // said 0 / said active".
+      input.sort_order === undefined || input.sort_order === null
+        ? null
+        : Math.max(-32768, Math.min(32767, Math.round(Number(input.sort_order) || 0))),
+      input.active === undefined || input.active === null ? null : input.active !== false,
+    ],
+  ));
+  const row = rows[0];
+  return row ? mapPrintDestination(row) : null;
+}
+
+/**
+ * Delete a destination. Its routes and its device bindings go with it, by 042's
+ * cascade.
+ *
+ * That is deliberate and it is the honest behaviour: a role whose destination is
+ * gone matches no route, and no route means broadcast — the whole outlet prints
+ * it, exactly as it did before routing. It will READ like a regression ("I
+ * deleted a printer and now everything prints everywhere"), which is why the
+ * screen offers deactivate first.
+ */
+export async function DeletePrintDestination(
+  resId: string,
+  outletId: string,
+  destinationId: string,
+): Promise<boolean> {
+  if (!isUuid(String(destinationId ?? ""))) { return false; }
+  const rows = await routingWrite("destinations.delete", () => runQuery<{ id: string }>(
+    `delete from "PrintDestinations"
+      where id = $1 and res_id = $2 and outlet_id = $3
+      returning id`,
+    [destinationId, resId, outletId],
+  ));
+  return rows.length > 0;
+}
+
+// --- Layer 2: routes (the RULE SET) ------------------------------------------
+
+export interface PrintRouteRow {
+  id: string;
+  role: string;
+  destination_id: string;
+  destination_name: string | null;
+  destination_active: boolean;
+}
+
+interface PrintRouteSqlRow {
+  id: string; role: string; destination_id: string;
+  destination_name: string | null; destination_active: unknown;
+}
+
+interface PrintRouteWriteRow { id: string; role: string; destination_id: string }
+
+/**
+ * Fold a role into the ONE vocabulary the wire already uses: 'bill', 'kot', or
+ * 'kot:<STATION UPPERCASED>'.
+ *
+ * The station half is upper-cased because PrintRole.kotStation on the client
+ * already upper-cases, and because "Bar" and "bar" are one kitchen section
+ * however the menu was typed — the whole point of grouping. Anything else
+ * returns null rather than being stored as a role nothing can ever match.
+ */
+export function canonicalPrintRole(raw: unknown): string | null {
+  const s = String(raw ?? "").trim();
+  if (!s) { return null; }
+  const lower = s.toLowerCase();
+  if (lower === "bill" || lower === "kot") { return lower; }
+  if (!lower.startsWith("kot:")) { return null; }
+  const station = s.slice(4).trim().toUpperCase().slice(0, 64);
+  return station ? `kot:${station}` : "kot";
+}
+
+/**
+ * This outlet's rules, joined to the destination each one names.
+ *
+ * An INNER join, not a left one: 042 cascades a deleted destination's routes
+ * away, so a route with no destination cannot exist — and if one ever did, the
+ * safe reading of it is "no rule", which is what dropping the row gives.
+ */
+export async function ListPrintRoutes(resId: string, outletId: string): Promise<PrintRouteRow[]> {
+  const rows = await routingQuery("routes.list", () => runQuery<PrintRouteSqlRow>(
+    `select r.id, r.role, r.destination_id, d.name as destination_name, d.active as destination_active
+       from "PrintRoutes" r
+       join "PrintDestinations" d
+         on d.id = r.destination_id and d.res_id = r.res_id
+      where r.res_id = $1 and r.outlet_id = $2
+      order by lower(r.role) asc`,
+    [resId, outletId],
+  ), [] as PrintRouteSqlRow[]);
+  return rows.map((r) => ({
+    id: r.id,
+    role: r.role,
+    destination_id: r.destination_id,
+    destination_name: r.destination_name,
+    destination_active: r.destination_active !== false,
+  }));
+}
+
+/**
+ * Replace this outlet's whole rule set, in ONE statement.
+ *
+ * One statement because a routing screen that saved half its rules would send
+ * dockets to two different printers depending on which half landed. There is no
+ * transaction to open: the delete and the upsert are sibling data-modifying CTEs
+ * against the same snapshot, and they touch disjoint rows by construction (the
+ * delete is scoped to roles NOT in the input), so neither can see or block the
+ * other's rows.
+ *
+ * `on conflict … do update` rather than delete-then-insert for the surviving
+ * roles: a delete and a re-insert of the SAME key inside one statement races the
+ * unique index, and the row's id is referenced by nothing but is still the id an
+ * audit line named.
+ *
+ * An EMPTY list is a legal and meaningful save — it is how an owner turns
+ * routing off for an outlet and goes back to broadcast without a redeploy.
+ */
+export async function SetPrintRoutes(
+  resId: string,
+  outletId: string,
+  routes: { role: string; destination_id: string }[],
+): Promise<PrintRouteRow[]> {
+  // Dedupe BEFORE the statement: two input rows with the same role would make
+  // ON CONFLICT DO UPDATE touch one row twice, which Postgres refuses outright
+  // (21000). Last one wins, which is what a screen's last dropdown change means.
+  //
+  // THE MAP KEY IS FOLDED, THE STORED VALUE IS NOT. The dedupe key has to match
+  // 042's unique index, which is on lower(role); the value written to the column
+  // has to be canonicalPrintRole's own output, 'kot:BAR'. Building the insert
+  // list from the KEYS stored 'kot:bar' — a spelling 042's header says is never
+  // the one that gets MATCHED, and the spelling ListPrintRoutes hands back
+  // verbatim to the health screen, the route trace and the routing card. Routing
+  // survived it only because print_routing.ts folds case on both sides; the first
+  // consumer that compares a stored role against `kot:${station.toUpperCase()}`
+  // would get a silent no-match and a broadcast, with nothing to see anywhere.
+  const byRole = new Map<string, { role: string; dest: string }>();
+  for (const r of routes ?? []) {
+    const role = canonicalPrintRole(r?.role);
+    const dest = String(r?.destination_id ?? "").trim();
+    if (!role || !isUuid(dest)) { continue; }
+    byRole.set(role.toLowerCase(), { role, dest });
+  }
+  const roleList = [...byRole.values()].map((v) => v.role);
+  const destList = [...byRole.values()].map((v) => v.dest);
+  const rows = await routingWrite("routes.set", () => runQuery<PrintRouteWriteRow>(
+    `with input as (
+       select * from unnest($3::text[], $4::uuid[]) as t(role, destination_id)
+     ),
+     gone as (
+       delete from "PrintRoutes"
+        where res_id = $1 and outlet_id = $2
+          and lower(role) not in (select lower(role) from input)
+       returning id
+     ),
+     kept as (
+       insert into "PrintRoutes" (id, res_id, outlet_id, role, destination_id)
+       select gen_random_uuid(), $1, $2, i.role, i.destination_id from input i
+       on conflict (res_id, outlet_id, lower(role)) do update
+         set destination_id = excluded.destination_id
+       returning id, role, destination_id
+     )
+     select id, role, destination_id from kept order by lower(role) asc`,
+    [resId, outletId, roleList, destList],
+  ));
+  // The destination names are not in the returning clause — a data-modifying CTE
+  // reads the pre-statement snapshot, so joining here would report the old name
+  // of a destination renamed in the same save. Callers that need names re-list.
+  return rows.map((r) => ({
+    id: r.id,
+    role: r.role,
+    destination_id: r.destination_id,
+    destination_name: null,
+    destination_active: true,
+  }));
+}
+
+// --- Layer 3a: devices (the MACHINE registry) --------------------------------
+
+export interface PrintDeviceRow {
+  id: string;
+  outlet_id: string;
+  device_key: string;
+  label: string | null;
+  platform: string | null;
+  agent_version: string | null;
+  /** The targets THIS machine reported it can reach. Advisory: the route refuses
+   *  to bind an address that is not in here, but a spooler can still vanish. */
+  capabilities: string[];
+  default_target: string | null;
+  last_seen_at: Date | null;
+  retired_at: Date | null;
+}
+
+const PRINT_DEVICE_SELECT =
+  `id, outlet_id, device_key, label, platform, agent_version, capabilities, ` +
+  `default_target, last_seen_at, retired_at`;
+
+interface PrintDeviceSqlRow {
+  id: string; outlet_id: string; device_key: string; label: string | null;
+  platform: string | null; agent_version: string | null; capabilities: unknown;
+  default_target: string | null; last_seen_at: Date | null; retired_at: Date | null;
+}
+
+function mapPrintDevice(r: PrintDeviceSqlRow): PrintDeviceRow {
+  return {
+    id: r.id,
+    outlet_id: r.outlet_id,
+    device_key: r.device_key,
+    label: r.label ?? null,
+    platform: r.platform ?? null,
+    agent_version: r.agent_version ?? null,
+    capabilities: Array.isArray(r.capabilities) ? r.capabilities.map((c: unknown) => String(c)) : [],
+    default_target: r.default_target ?? null,
+    last_seen_at: r.last_seen_at ?? null,
+    retired_at: r.retired_at ?? null,
+  };
+}
+
+/**
+ * Register (or re-register) one machine, keyed on ITS OWN client-minted key.
+ *
+ * res_id-unique, not outlet-unique: a machine is the same machine in every
+ * branch it signs into, and outlet_id is merely the branch it most recently
+ * registered under. That is also why this runs over HTTP at app start rather
+ * than off joinOutlet — a phone with no printer never creates the socket, and a
+ * phone with no printer is exactly the device an owner needs to SEE in the list
+ * so they can walk over, add an address, and bind it from the office PC.
+ *
+ * TWO THINGS THIS DELIBERATELY DOES NOT DO:
+ *
+ *   It does not overwrite an owner-edited label. The client sends a hostname;
+ *   the owner renames it "Front till"; every app start would otherwise undo that.
+ *
+ *   It does not clear retired_at. A retired machine that is still switched on
+ *   re-registers on every app start and would silently un-retire itself, which
+ *   would undo the one action that took its jobs away. Un-retiring is an
+ *   explicit owner action (RetirePrintDevice with retired=false).
+ */
+export async function RegisterPrintDevice(
+  resId: string,
+  outletId: string,
+  input: {
+    device_key: string;
+    label?: string | null;
+    platform?: string | null;
+    agent_version?: string | null;
+    capabilities?: string[] | null;
+    default_target?: string | null;
+  },
+): Promise<PrintDeviceRow | null> {
+  const key = String(input.device_key ?? "").trim().slice(0, 64);
+  if (!key) { throw new Error("A device key is required"); }
+  const caps = Array.isArray(input.capabilities)
+    ? input.capabilities.map((c) => String(c ?? "").trim()).filter(Boolean).slice(0, 64)
+    : [];
+  const rows = await routingWrite("devices.register", () => runQuery<PrintDeviceSqlRow>(
+    `insert into "PrintDevices"
+       (id, res_id, outlet_id, device_key, label, platform, agent_version,
+        capabilities, default_target, last_seen_at)
+     values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9, now())
+     on conflict (res_id, device_key) do update
+       set outlet_id = excluded.outlet_id,
+           label = coalesce("PrintDevices".label, excluded.label),
+           platform = excluded.platform,
+           agent_version = excluded.agent_version,
+           capabilities = excluded.capabilities,
+           default_target = excluded.default_target,
+           last_seen_at = now()
+     returning ${PRINT_DEVICE_SELECT}`,
+    [
+      randomUUID(), resId, outletId, key,
+      String(input.label ?? "").trim().slice(0, 60) || null,
+      String(input.platform ?? "").trim().slice(0, 20) || null,
+      String(input.agent_version ?? "").trim().slice(0, 40) || null,
+      JSON.stringify(caps),
+      String(input.default_target ?? "").trim().slice(0, 200) || null,
+    ],
+  ));
+  const row = rows[0];
+  return row ? mapPrintDevice(row) : null;
+}
+
+/**
+ * The machines an owner can bind. `outletId` null means the whole restaurant,
+ * because a device that registered under another branch this morning is still
+ * the same machine and the owner may be looking at it from the office.
+ */
+export async function ListPrintDevices(
+  resId: string,
+  outletId: string | null = null,
+  opts: { includeRetired?: boolean } = {},
+): Promise<PrintDeviceRow[]> {
+  const rows = await routingQuery("devices.list", () => runQuery<PrintDeviceSqlRow>(
+    `select ${PRINT_DEVICE_SELECT} from "PrintDevices"
+      where res_id = $1
+        and ($2::uuid is null or outlet_id = $2::uuid)
+        and (${opts.includeRetired === true ? "true" : "retired_at is null"})
+      order by retired_at asc nulls first, lower(coalesce(label, device_key)) asc`,
+    [resId, isUuid(String(outletId ?? "")) ? outletId : null],
+  ), [] as PrintDeviceSqlRow[]);
+  return rows.map(mapPrintDevice);
+}
+
+/**
+ * Retire a machine, or bring one back.
+ *
+ * Retire rather than delete, always: PrintDeviceTargets.device_id cascades, so a
+ * DELETE silently drops every binding that device served and each of those
+ * destinations falls back to broadcast. Retiring keeps the bindings and the
+ * receipt history, and leaves ReplacePrintDevice a row to move them off.
+ */
+export async function RetirePrintDevice(
+  resId: string,
+  deviceId: string,
+  retired: boolean = true,
+): Promise<boolean> {
+  if (!isUuid(String(deviceId ?? ""))) { return false; }
+  const rows = await routingWrite("devices.retire", () => runQuery<{ id: string }>(
+    `update "PrintDevices"
+        set retired_at = case when $3::boolean then coalesce(retired_at, now()) else null end
+      where id = $1 and res_id = $2
+      returning id`,
+    [deviceId, resId, retired],
+  ));
+  return rows.length > 0;
+}
+
+/**
+ * "This new till replaces that old one": move the bindings across and retire the
+ * old row, in ONE statement.
+ *
+ * A reinstall mints a fresh key and therefore a fresh device with zero bindings.
+ * It joins no destination room, is never a candidate and is never targeted —
+ * nothing waits on the operator, every destination the old machine served falls
+ * through its chain and, failing that, to broadcast. This is the audited way to
+ * put it back, and it is deliberately EXPLICIT: matching on hostname or platform
+ * is how a second till of the same model silently inherits the first's jobs.
+ *
+ * The ADDRESSES move with the bindings even though an address is a fact about
+ * the old machine, because the new one has usually inherited the same printer on
+ * the same LAN; where it has not, the device reports its own capabilities and
+ * the owner sees the mismatch on the health screen. Nothing is guessed.
+ *
+ * THE EXISTS GUARD IS ON ALL THREE CTEs, AND IT USED TO BE ON ONE. It sat on the
+ * `moved` insert's select alone, so a newDeviceId that was a typo, belonged to
+ * another tenant, or named a device deleted since the screen was rendered made
+ * the INSERT a no-op while the sibling DELETE still removed every binding the old
+ * machine held and the UPDATE still stamped retired_at — all three CTEs reading
+ * the same pre-statement snapshot. The function then returned 0, which the caller
+ * could not tell from the legitimate "that device had no bindings". Every
+ * destination the old till served fell to an empty chain and outlet-wide
+ * broadcast, and the only way back was re-entering every address from every
+ * machine. This is the exact class the destructive-write guardrails exist for,
+ * and the whole point of this function is retire-don't-delete.
+ *
+ * Returns NULL — not 0 — when either device is unknown to this tenant, so the
+ * route layer can answer 404 instead of reporting a successful move of nothing.
+ */
+export async function ReplacePrintDevice(
+  resId: string,
+  newDeviceId: string,
+  oldDeviceId: string,
+): Promise<{ moved: number } | null> {
+  const to = String(newDeviceId ?? "").trim();
+  const from = String(oldDeviceId ?? "").trim();
+  // Same row on both sides would make the insert and the delete fight over one
+  // primary key inside one statement, and means nothing anyway.
+  if (!isUuid(to) || !isUuid(from) || to === from) { return null; }
+  const rows = await routingWrite("devices.replace", () => runQuery<{
+    target_ok: unknown; source_ok: unknown; moved: unknown;
+  }>(
+    `with target as (
+       select 1 from "PrintDevices" where res_id = $1 and id = $3::uuid
+     ),
+     source as (
+       select 1 from "PrintDevices" where res_id = $1 and id = $2::uuid
+     ),
+     moved as (
+       insert into "PrintDeviceTargets"
+         (res_id, outlet_id, device_id, destination_id, target, priority, active, updated_at)
+       select t.res_id, t.outlet_id, $3::uuid, t.destination_id, t.target, t.priority, t.active, now()
+         from "PrintDeviceTargets" t
+        where t.res_id = $1 and t.device_id = $2::uuid
+          and exists (select 1 from target) and exists (select 1 from source)
+       on conflict (res_id, outlet_id, device_id, destination_id) do update
+         set target = excluded.target,
+             priority = excluded.priority,
+             active = excluded.active,
+             updated_at = now()
+       returning destination_id
+     ),
+     gone as (
+       delete from "PrintDeviceTargets"
+        where res_id = $1 and device_id = $2::uuid
+          and exists (select 1 from target) and exists (select 1 from source)
+       returning destination_id
+     ),
+     retired as (
+       update "PrintDevices"
+          set retired_at = coalesce(retired_at, now())
+        where res_id = $1 and id = $2::uuid
+          and exists (select 1 from target)
+       returning id
+     )
+     select (select count(*) from target) as target_ok,
+            (select count(*) from source) as source_ok,
+            (select count(*) from moved)  as moved`,
+    [resId, from, to],
+  ));
+  const row = rows[0];
+  // Both counts come from the SAME snapshot the three CTEs read, so this is the
+  // guard's own answer and not a second, racier look at the table.
+  if (!row || parseNumeric(row.target_ok) < 1 || parseNumeric(row.source_ok) < 1) { return null; }
+  return { moved: Math.round(parseNumeric(row.moved)) };
+}
+
+// --- Layer 3b: bindings (the ADDRESS) ----------------------------------------
+
+interface PrintBindingSqlRow {
+  outlet_id: string; device_id: string; device_key: string; device_label: string | null;
+  device_platform: string | null; device_retired_at: Date | null;
+  destination_id: string; destination_name: string | null; target: string;
+  priority: unknown; active: unknown;
+}
+
+export interface PrintDeviceBindingRow {
+  outlet_id: string;
+  device_id: string;
+  device_key: string;
+  /** THE DEVICE's label, joined in from "PrintDevices": a chain ordered by
+   *  (priority, label) needs the label on the same row as the priority, or the
+   *  ordering is not a total order and two replicas can order one chain
+   *  differently. Prefixed, like every device column here, because this row
+   *  carries two entities and a bare `label` beside `destination_name` is the
+   *  ambiguity somebody eventually reads the wrong way. */
+  device_label: string | null;
+  device_platform: string | null;
+  /** Non-null means retired. Joined in rather than filtered out — see below. */
+  device_retired_at: Date | null;
+  destination_id: string;
+  destination_name: string | null;
+  target: string;
+  priority: number;
+  active: boolean;
+}
+
+/**
+ * The chain, or one device's own view of it.
+ *
+ * Ordered by (priority, label) because priority IS the failover order and is
+ * what makes desktop-preferred bill printing a default rather than a special
+ * case: a Windows till binds at 10 and an Android tablet at 50, LOWER WINS, so
+ * two devices on one destination are a chain rather than a double print.
+ *
+ * Retired devices are joined in and FLAGGED rather than filtered out, because
+ * GET /print/health has to be able to say "this destination is bound to a machine
+ * you retired" instead of reporting no route at all. Dropping them from a chain
+ * is the resolver's job — a retired till still holds its bindings, which is the
+ * whole difference between retiring one and deleting one.
+ */
+export async function GetPrintDeviceTargets(
+  resId: string,
+  outletId: string,
+  deviceId: string | null = null,
+  opts: { destinationId?: string | null; includeInactive?: boolean } = {},
+): Promise<PrintDeviceBindingRow[]> {
+  const rows = await routingQuery("targets.get", () => runQuery<PrintBindingSqlRow>(
+    `select t.outlet_id, t.device_id, v.device_key, v.label as device_label,
+            v.platform as device_platform, v.retired_at as device_retired_at,
+            t.destination_id, d.name as destination_name,
+            t.target, t.priority, t.active
+       from "PrintDeviceTargets" t
+       join "PrintDevices" v on v.id = t.device_id and v.res_id = t.res_id
+       left join "PrintDestinations" d on d.id = t.destination_id and d.res_id = t.res_id
+      where t.res_id = $1 and t.outlet_id = $2
+        and ($3::uuid is null or t.device_id = $3::uuid)
+        and ($4::uuid is null or t.destination_id = $4::uuid)
+        and (${opts.includeInactive === true ? "true" : "t.active = true"})
+      order by t.priority asc, lower(coalesce(v.label, v.device_key)) asc`,
+    [
+      resId, outletId,
+      isUuid(String(deviceId ?? "")) ? deviceId : null,
+      isUuid(String(opts.destinationId ?? "")) ? opts.destinationId : null,
+    ],
+  ), [] as PrintBindingSqlRow[]);
+  return rows.map((r) => ({
+    outlet_id: r.outlet_id,
+    device_id: r.device_id,
+    device_key: r.device_key,
+    device_label: r.device_label ?? null,
+    device_platform: r.device_platform ?? null,
+    device_retired_at: r.device_retired_at ?? null,
+    destination_id: r.destination_id,
+    destination_name: r.destination_name ?? null,
+    target: r.target,
+    priority: Math.round(parseNumeric(r.priority)),
+    active: r.active !== false,
+  }));
+}
+
+/**
+ * Replace one device's bindings, in ONE statement, for the same reason
+ * SetPrintRoutes is one statement.
+ *
+ * ONLY THE DEVICE ITSELF WRITES THIS. The address lives in the bottom layer
+ * because only the machine that can reach a printer knows how to name it, and
+ * the route refuses a target that is not in that device's own reported
+ * capabilities — the check belongs there, where the request's identity is, not
+ * here where there is only SQL.
+ *
+ * An EMPTY list is the meaningful save that "forget this printer" makes: the
+ * device stops being a candidate for every destination at once. Without it the
+ * server keeps picking a machine that will fail three times and take ~62s to say
+ * so.
+ */
+export async function SetPrintDeviceTargets(
+  resId: string,
+  outletId: string,
+  deviceId: string,
+  targets: { destination_id: string; target: string; priority?: number; active?: boolean }[],
+): Promise<PrintDeviceBindingRow[]> {
+  if (!isUuid(String(deviceId ?? ""))) { return []; }
+  // One binding per destination — that is the primary key. Two rows for one
+  // destination would make ON CONFLICT DO UPDATE touch a row twice (21000).
+  const byDest = new Map<string, { target: string; priority: number; active: boolean }>();
+  for (const t of targets ?? []) {
+    const dest = String(t?.destination_id ?? "").trim();
+    const addr = String(t?.target ?? "").trim().slice(0, 200);
+    if (!isUuid(dest) || !addr) { continue; }
+    byDest.set(dest, {
+      target: addr,
+      priority: Math.min(32767, Math.max(0, Math.round(Number(t?.priority) || 50))),
+      active: t?.active === false ? false : true,
+    });
+  }
+  const dests = [...byDest.keys()];
+  const addrs = dests.map((d) => byDest.get(d)!.target);
+  const prios = dests.map((d) => byDest.get(d)!.priority);
+  const actives = dests.map((d) => byDest.get(d)!.active);
+  await routingWrite("targets.set", () => runQuery(
+    `with input as (
+       select * from unnest($4::uuid[], $5::text[], $6::int[], $7::boolean[])
+              as t(destination_id, target, priority, active)
+     ),
+     gone as (
+       delete from "PrintDeviceTargets"
+        where res_id = $1 and outlet_id = $2 and device_id = $3::uuid
+          and destination_id not in (select destination_id from input)
+       returning destination_id
+     ),
+     kept as (
+       insert into "PrintDeviceTargets"
+         (res_id, outlet_id, device_id, destination_id, target, priority, active, updated_at)
+       select $1, $2, $3::uuid, i.destination_id, i.target, i.priority, i.active, now()
+         from input i
+       on conflict (res_id, outlet_id, device_id, destination_id) do update
+         set target = excluded.target,
+             priority = excluded.priority,
+             active = excluded.active,
+             updated_at = now()
+       returning destination_id
+     )
+     select destination_id from kept`,
+    [resId, outletId, deviceId, dests, addrs, prios, actives],
+  ));
+  // Re-read rather than map the returning clause: the caller wants the device
+  // labels and destination names to render, and a data-modifying CTE cannot see
+  // its own writes.
+  return GetPrintDeviceTargets(resId, outletId, deviceId, { includeInactive: true });
+}
+
+/** One machine and everything it is bound to, which is the row GET /print/health
+ *  and the devices card both render. */
+export interface PrintDeviceWithBindingsRow extends PrintDeviceRow {
+  /** This OUTLET's bindings for this device, inactive ones included and flagged.
+   *  Empty is the normal state of a freshly registered phone — and is exactly
+   *  what the owner has to be shown so they can go and give it an address. */
+  bindings: PrintDeviceBindingRow[];
+}
+
+/**
+ * The health screen's list: every machine, with the destinations it serves.
+ *
+ * TWO READS JOINED IN MEMORY, NOT ONE JOIN, and deliberately. A left join would
+ * drop nothing but would return one row per binding, and the screen's hard case
+ * is the device with ZERO bindings — the printer-less phone that registered over
+ * HTTP precisely so the owner could see it and bind it. Assembling here keeps
+ * that device a first-class row instead of something the caller has to
+ * reconstruct from an absence, and it reuses two statements that already degrade
+ * to empty under a pending 042 rather than minting a third that would have to
+ * learn the same trick.
+ *
+ * PRESENCE IS NOT IN HERE, and must not be. Who is online RIGHT NOW lives in the
+ * socket adapter (outletDeviceSockets), never in last_seen_at: a device that
+ * registered this morning and was switched off at 16:00 has a recent last_seen_at
+ * and no socket, and a health screen that read this table for presence would show
+ * the bar printer green while the bar tablet slept. This function answers
+ * CONFIGURATION only — the route layer overlays live sockets on top.
+ *
+ * Bindings come back with inactive ones included, because "you deactivated this
+ * binding" and "this device was never bound here" are different answers to the
+ * same red light and each row carries its own `active` flag to tell them apart.
+ * Retired devices are included on request for the same reason GetPrintDeviceTargets
+ * joins them in rather than filtering them out.
+ */
+export async function ListPrintDevicesWithBindings(
+  resId: string,
+  outletId: string,
+  opts: { includeRetired?: boolean; restaurantWide?: boolean } = {},
+): Promise<PrintDeviceWithBindingsRow[]> {
+  // restaurantWide is the office case: a machine is the same machine in every
+  // branch it signs into, so a till that registered under another outlet this
+  // morning may still hold bindings here and must remain visible — see
+  // ListPrintDevices, which takes a null outlet to mean the whole restaurant.
+  const [devices, bindings] = await Promise.all([
+    ListPrintDevices(resId, opts.restaurantWide === true ? null : outletId, {
+      includeRetired: opts.includeRetired === true,
+    }),
+    GetPrintDeviceTargets(resId, outletId, null, { includeInactive: true }),
+  ]);
+  const byDevice = new Map<string, PrintDeviceBindingRow[]>();
+  for (const b of bindings) {
+    const list = byDevice.get(b.device_id);
+    if (list) { list.push(b); } else { byDevice.set(b.device_id, [b]); }
+  }
+  // The device list drives the result, not the binding list: a binding whose
+  // device row is filtered out here (retired, or another outlet's) would
+  // otherwise invent a device with no name, and the screen would offer the owner
+  // a machine it cannot describe.
+  return devices.map((d) => ({ ...d, bindings: byDevice.get(d.id) ?? [] }));
 }
 
 // --- Idempotency keys (migration 033) ----------------------------------------

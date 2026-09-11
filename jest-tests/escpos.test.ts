@@ -911,3 +911,86 @@ describe("buildReceiptBase64 — widths", () => {
     expect(buildReceiptBase64(baseBill, 32).length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// THE ORDER-LEVEL NOTE.
+//
+// Distinct from ReceiptItem.note, which hangs under one dish. This one is the
+// whole-order instruction — the box the owner app captions "Note for the
+// kitchen" and the guest QR menu fills with the placeholder "no onions, less
+// spicy, allergies" — and until this change it was written to
+// "Orders".food.note and then read by NO renderer on ANY path. A waiter typing
+// an allergy into a field captioned NOTE FOR THE KITCHEN was talking to nobody.
+//
+// Two properties are pinned here and they pull in opposite directions, which is
+// exactly why both are written down: the note MUST reach the kitchen, on every
+// station's docket, and it MUST NOT reach the guest's bill.
+describe("buildReceiptBase64 — the order-level note", () => {
+  const kotWithNote: ReceiptOptions = {
+    ...baseBill,
+    kind: "kot",
+    kotNo: 26,
+    printedAt: "25/08/26 15:23",
+    orderContext: "Running Table",
+    serviceMode: "Dine In",
+    table: "12",
+    covers: 2,
+    orderNote: "allergy: peanuts",
+  };
+
+  test("prints on the kitchen docket, under a banner", () => {
+    const out = printed(buildReceiptBase64(kotWithNote));
+    expect(out).toContain("** NOTE **");
+    expect(out).toContain("allergy: peanuts");
+  });
+
+  test("sits ABOVE the item table, because it qualifies every line below it", () => {
+    const out = printed(buildReceiptBase64(kotWithNote));
+    // "No." heads the numbered item column; the banner must precede it. Hung
+    // under a single dish, "no onions" would say the opposite of what it means.
+    expect(out.indexOf("allergy: peanuts")).toBeLessThan(out.indexOf("No."));
+  });
+
+  test("NEVER prints on the guest bill, even when the field is set", () => {
+    // The bill branch does not read the field at all, so this is not a matter
+    // of a caller remembering to omit it. Set it and the paper is unchanged.
+    const clean = buildReceiptBase64({ ...baseBill, orderNote: null });
+    const noted = buildReceiptBase64({ ...baseBill, orderNote: "allergy: peanuts" });
+    expect(noted).toBe(clean);
+    expect(printed(noted)).not.toContain("allergy");
+  });
+
+  test("a docket with no order note is byte-identical to one printed before the field existed", () => {
+    const withoutKey = buildReceiptBase64({ ...kotWithNote, orderNote: undefined });
+    const withNull = buildReceiptBase64({ ...kotWithNote, orderNote: null });
+    const withBlank = buildReceiptBase64({ ...kotWithNote, orderNote: "   " });
+    expect(withNull).toBe(withoutKey);
+    expect(withBlank).toBe(withoutKey);
+    expect(printed(withoutKey)).not.toContain("** NOTE **");
+  });
+
+  test("a long note wraps to the paper instead of running off it", () => {
+    const long = "no onions no garlic no coriander and the guest is allergic to shellfish please double check every dish";
+    for (const cols of [48, 32]) {
+      const b64 = buildReceiptBase64({ ...kotWithNote, orderNote: long }, cols);
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+      expect(printed(b64).replace(/\n/g, " ")).toContain("shellfish");
+    }
+  });
+
+  test("rides on EVERY station's docket, not just the first", () => {
+    // An allergy is not the hot kitchen's business alone. A bar docket that
+    // omits it is the one that pours the wrong thing.
+    const tickets = buildKotBase64({
+      ...kotWithNote,
+      items: [
+        { name: "Paneer Tikka", quantity: 1, price: 250, station: "TANDOOR" },
+        { name: "Mojito", quantity: 2, price: 180, station: "BAR" },
+      ],
+    });
+    expect(tickets).toHaveLength(2);
+    for (const t of tickets) {
+      expect(printed(t.escBase64)).toContain("allergy: peanuts");
+    }
+  });
+});

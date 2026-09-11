@@ -152,6 +152,10 @@ export async function printKotTableChange(opts: {
       items,
       assignedTo: waiterName || null,
       captain: waiterName && (waiterRole === "captain" || waiterRole === "manager") ? waiterName : null,
+      // The move docket replaces the one on the rail, so it must carry
+      // everything that one did - the allergy included. Dropping it here would
+      // make moving a table quietly downgrade the ticket.
+      orderNote: order.order_note,
       billId: `order-${order.order_id}`,
       restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
       currency: settings.currency ?? "₹",

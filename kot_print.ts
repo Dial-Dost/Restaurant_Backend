@@ -45,8 +45,7 @@
 import { buildKotBase64 } from "./escpos.js";
 import { allocateKotNumber, kotOrderContext, kotStamp, kotTicketKey, serviceModeLabel } from "./kot_numbers.js";
 import { logger } from "./observability.js";
-import { enqueuePrintJob, printJobPayload } from "./print_jobs.js";
-import { emitOutlet } from "./realtime.js";
+import { dispatchPrintJob } from "./print_routing.js";
 import {
   GetMenuItems,
   GetOrderKotContext,
@@ -63,6 +62,15 @@ export interface KotLine {
   price?: number;
   note?: string;
   variation?: string;
+  /**
+   * The menu row this line was sold from, stamped server-side on every order
+   * write by applyMenuPriceFloor. ADVISORY ONLY: it is never part of any merge
+   * key (adding it would split a bill line the guest is handed today), and a
+   * pre-039 line simply does not carry it and falls back to name matching, as
+   * every line did before. It exists so a dish RENAMED since it was ordered
+   * still reaches the right station.
+   */
+  menu_id?: string | null;
   /**
    * How many of this line's `quantity` are on COURSE HOLD (course_hold set and
    * not yet fired). Absent or 0 on every line of every restaurant that does not
@@ -101,6 +109,23 @@ export interface KotDispatchInput {
   items: KotLine[];
   assignedTo: string | null;
   captain: string | null;
+  /**
+   * The ORDER-LEVEL note ("Orders".food.note) — the whole-order instruction the
+   * waiter or the guest typed, as opposed to the per-dish `KotLine.note`.
+   *
+   * Optional so that every existing caller compiles and prints exactly the
+   * docket it printed before; absent and empty both mean "no banner". See
+   * ReceiptOptions.orderNote in escpos.ts for why it is on the KOT only, and
+   * why it goes on every station's ticket rather than one.
+   *
+   * DELIBERATELY NOT PART OF THE TICKET KEY (buildKotTicketKey). The key maps
+   * one FOOD CONTENT to one KOT number forever, which is what makes a reprint
+   * reuse its number instead of minting a second ticket for a dish the kitchen
+   * is already cooking. Folding the note into it would mean an edited note
+   * re-tickets an unchanged order — a new number, on paper, for food that has
+   * not changed. The note rides on the docket; the identity stays the food.
+   */
+  orderNote?: string | null;
   /**
    * The "PrintJobs".bill_id every station docket of this ticket is grouped
    * under. It is NOT the job identity — see the note in print_jobs.ts — it is
@@ -183,6 +208,17 @@ export interface KotDispatchResult {
   reprint: boolean;
   /** One per station docket; null where migration 027 is unapplied. */
   jobIds: (string | null)[];
+  /**
+   * One per station docket, PARALLEL TO jobIds: the device the router aimed that
+   * docket at, or null where it went to the whole outlet as it always has.
+   *
+   * It exists so logKotDispatched can answer "why did the bar docket print at the
+   * pass?" from the log line instead of from a database trace. A null here is the
+   * ordinary answer for every outlet that has not configured routing, and for a
+   * routed one it is the signal that the ladder fell back — the destination was
+   * offline, the tables were unreadable, or no rule matched this station.
+   */
+  devices: (string | null)[];
   /** True when skipIfTicketed suppressed this dispatch. Nothing was built,
    *  nothing was enqueued, and kotNo is the number already on paper. */
   skipped: boolean;
@@ -227,24 +263,106 @@ export function buildKotTicketKey(input: {
  * under the shared "General" bucket and the kitchen gets one ticket with
  * everything on it, which is what a single-station restaurant gets anyway.
  */
+/**
+ * ONE CANONICAL SPELLING PER STATION, for the length of one ticket.
+ *
+ * THE BUG THIS CLOSES. `groupKotItemsByStation` buckets on the trimmed station
+ * string with no case folding, so a menu carrying "Bar" on one dish and "bar"
+ * on another mints TWO dockets. The printer agent, meanwhile, upper-cases when
+ * it builds its rule key (`PrintRole.kotStation`), so both dockets resolve to
+ * the SAME printer — and the bar gets two half-tickets for one order, the
+ * second easy to miss under the first.
+ *
+ * That was cosmetic while every station had its own printer. It stops being
+ * cosmetic the moment sections are GROUPED onto one, because grouping is
+ * precisely the configuration that lands two spellings on one roll.
+ *
+ * A CLOSURE RATHER THAN A PURE FUNCTION, because collapsing case is not a
+ * property of one string — it is a property of the SET. Two unmanaged spellings
+ * have to agree on one of themselves, and the only way to do that without a
+ * vocabulary is to remember which was seen first.
+ *
+ * WHICH SPELLING WINS:
+ *   1. The restaurant's own. `Restaurant.kitchen_sections` is the vocabulary the
+ *      owner typed and the list the printer screen offers rules for, so a
+ *      station that appears there wins — a docket headed "Bar" rather than
+ *      whatever casing the first matching dish happened to carry.
+ *   2. Failing that, first seen on this ticket. Unmanaged stations are free
+ *      text; they still collapse to one bucket, just not to a spelling anybody
+ *      chose.
+ *
+ * FOLDED HERE, NOT IN escpos.ts, deliberately. The renderer stays a pure
+ * function of what it is handed, jest-tests/escpos.test.ts keeps describing the
+ * renderer rather than the menu, and because every KOT path in the system
+ * funnels through dispatchKot, one upstream fix covers all of them.
+ *
+ * The one deliberate byte change: a docket whose menu says "bar", in a
+ * restaurant whose vocabulary says "Bar", now prints the header "Bar". Pinned
+ * by a test, so it is a decision rather than a surprise.
+ */
+export function stationCanonicalizer(kitchenSections: string[]): (raw: string | null | undefined) => string | null {
+  const managed = new Map<string, string>();
+  for (const s of kitchenSections) {
+    const t = String(s ?? "").trim();
+    if (t) { managed.set(t.toLowerCase(), t); }
+  }
+  const seen = new Map<string, string>();
+  return (raw) => {
+    const trimmed = String(raw ?? "").trim();
+    if (!trimmed) {return null;}
+    const folded = trimmed.toLowerCase();
+    const fromVocabulary = managed.get(folded);
+    if (fromVocabulary) {return fromVocabulary;}
+    const first = seen.get(folded);
+    if (first) {return first;}
+    seen.set(folded, trimmed);
+    return trimmed;
+  };
+}
+
 async function withStations(restaurantId: string, items: KotLine[]): Promise<(KotLine & { price: number; station: string | null; held?: boolean })[]> {
   const stationByName = new Map<string, string>();
+  // THE ID MAP, AND WHY IT IS FIRST. A dish is matched to its station by NAME
+  // below, which silently fails for a line whose dish has since been renamed —
+  // it falls into "General", and under a grouped routing scheme "General" is
+  // almost certainly the hot kitchen. So a renamed cocktail prints at the pass
+  // and the bar never learns it was ordered. `menu_id` is stamped server-side on
+  // every order line by applyMenuPriceFloor (migration 039: "all STAMPED BY THE
+  // SERVER, never accepted from the client"), so where it survives to here it is
+  // authoritative and the name is only the fallback. GetOrders already resolves
+  // stations this way; this brings the PRINT path level with the KDS path.
+  const stationById = new Map<string, string>();
+  let kitchenSections: string[] = [];
   try {
     const menu = await GetMenuItems(restaurantId);
     for (const m of menu) {
-      if (m.station) { stationByName.set(m.name.trim().toLowerCase(), m.station); }
+      if (m.station) {
+        stationByName.set(m.name.trim().toLowerCase(), m.station);
+        if (m.id) { stationById.set(String(m.id), m.station); }
+      }
     }
   } catch {
     /* menu unavailable — everything falls under a single General ticket */
   }
+  try {
+    const settings = await GetRestaurantSettings(restaurantId);
+    kitchenSections = Array.isArray(settings.kitchen_sections) ? settings.kitchen_sections : [];
+  } catch {
+    /* no vocabulary — free-text stations keep their own spelling, still folded */
+  }
+  const canonical = stationCanonicalizer(kitchenSections);
   return items.flatMap((it) => {
+    const rawStation =
+      stationById.get(String(it.menu_id ?? "")) ??
+      stationByName.get(String(it.name).trim().toLowerCase()) ??
+      null;
     const base = {
       ...it,
       // ReceiptItem requires a price and a KOT never prints one, so an absent
       // price becomes 0 rather than making every caller invent a number for a
       // column the renderer does not lay out.
       price: it.price ?? 0,
-      station: stationByName.get(String(it.name).trim().toLowerCase()) ?? null,
+      station: canonical(rawStation),
     };
     // THE ONE PLACE A MERGED LINE BECOMES TWO DOCKET LINES. "Paneer Tikka x3, of
     // which 1 is held" is one line on the bill and two on the docket: two to
@@ -322,6 +440,7 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
       businessDay: kot.business_day,
       reprint: true,
       jobIds: [],
+      devices: [],
       skipped: true,
     };
   }
@@ -341,18 +460,33 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     section: input.section,
     assignedTo: input.assignedTo,
     captain: input.captain,
+    orderNote: input.orderNote ?? null,
   }, input.cols);
 
+  // PERSIST-THEN-EMIT, VIA THE ROUTER. dispatchPrintJob does exactly what the
+  // enqueue+emit pair here used to do — same order, same payload — and adds one
+  // thing: when this outlet has a rule for this station, the docket is emitted to
+  // the bound machine's own room instead of to every printer in the outlet. An
+  // outlet with zero "PrintRoutes" rows resolves to `mode:'broadcast'` and lands
+  // on the same emitOutlet with the same bytes, so the kitchen of every
+  // unconfigured restaurant sees no change at all.
+  //
+  // PRESENCE IS RESOLVED ONCE PER PRINT ACTION, NOT ONCE PER DOCKET, and that is
+  // why this loop can call the router N times without paying N cross-replica
+  // round trips: resolvePrintTarget reads the route table through a 10s cache and
+  // presence through a 2s one (PRINT_PRESENCE_CACHE_MS), both keyed by outlet, so
+  // a five-station order does ONE fetchSockets and four cache hits. The sharing
+  // lives in those caches rather than in a handle threaded through this function
+  // deliberately — see the PRESENCE_TTL_MS note in print_routing.ts — so every
+  // future producer gets it without having to know about it.
   const jobIds: (string | null)[] = [];
+  const devices: (string | null)[] = [];
   for (const t of tickets) {
-    const jobId = await enqueuePrintJob(input.restaurantId, {
+    const dispatched = await dispatchPrintJob(input.restaurantId, {
       outlet_id: input.outletId, bill_id: input.billId, kind: "kot", station: t.station, esc_base64: t.escBase64,
     });
-    jobIds.push(jobId);
-    emitOutlet(input.restaurantId, input.outletId, "bill:print", printJobPayload({
-      billId: input.billId, escBase64: t.escBase64, kind: "kot", station: t.station, jobId,
-      publishedAt: new Date().toISOString(),
-    }));
+    jobIds.push(dispatched.jobId);
+    devices.push(dispatched.assignedDeviceId);
   }
 
   return {
@@ -363,6 +497,7 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     businessDay: kot?.business_day ?? businessDay,
     reprint: kot?.reused ?? false,
     jobIds,
+    devices,
     skipped: false,
   };
 }
@@ -385,8 +520,18 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
  * to make the log line say which path produced the undeliverable job.
  */
 export function logKotDispatched(where: string, result: KotDispatchResult, ctx: Record<string, unknown>): void {
+  // `devices` is added ONLY when the router actually aimed a docket at a machine.
+  // Every outlet in the fleet is unrouted on the day this ships, and adding
+  // `devices: [null, null]` to each of their kot_dispatched lines would be pure
+  // volume in the one log a busy service produces most of — while its presence on
+  // a routed tenant's line is the whole point: it is what says WHICH docket went
+  // to WHICH till, and therefore which one fell back to the outlet broadcast.
+  const aimed = result.devices.some((d) => d !== null);
   logger.info(
-    { ...ctx, where, tickets: result.tickets, stations: result.stations, kot_no: result.kotNo, reprint: result.reprint },
+    {
+      ...ctx, where, tickets: result.tickets, stations: result.stations, kot_no: result.kotNo, reprint: result.reprint,
+      ...(aimed ? { devices: result.devices } : {}),
+    },
     "kot_dispatched",
   );
 }
@@ -500,6 +645,10 @@ export async function autoPrintOrderKot(opts: {
       items,
       assignedTo: waiterName || null,
       captain: waiterName && (waiterRole === "captain" || waiterRole === "manager") ? waiterName : null,
+      // The whole-order instruction, straight from the order this docket is
+      // for. A partial docket (opts.only) carries it too: the note qualifies
+      // the order, and a fired course is still part of that order.
+      orderNote: order.order_note,
       // The same shape POST /print/kot/order/:id uses, so a docket and its
       // later reprint group together in "PrintJobs".
       billId: `order-${order.order_id}`,

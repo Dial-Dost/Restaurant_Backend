@@ -29,6 +29,7 @@ import {
   OUTLET_ID,
   RESTAURANT_SLUG,
   counters,
+  printJobRows,
   resetStore,
   seedMenu,
   tickets,
@@ -51,8 +52,20 @@ interface EnqueuedJob {
   station: string | null;
   esc_base64: string;
 }
-const enqueued: EnqueuedJob[] = [];
+// The rows the queue was actually handed. THE SAME ARRAY the fixture appends to,
+// not a copy — see printJobRows, which explains why the old print_jobs mock stopped
+// seeing anything when the producers moved to dispatchPrintJob.
+const enqueued: EnqueuedJob[] = printJobRows;
+// SPREAD THE REAL MODULE, OVERRIDE TWO. A bare object here used to be enough,
+// because dispatchKot only ever reached for enqueuePrintJob and printJobPayload.
+// Since migration 042 it goes through print_routing.ts, which imports this
+// module's schema-degradation helpers (isSchemaMissing, warnSchemaMissing and
+// their routing supersets) — and a factory that omits them does not fail at
+// import time, it fails deep inside a dispatch with "is not a function", which
+// reads like a broken feature rather than a stale mock. Spreading the real
+// module means the next import this file grows is covered before anyone notices.
 jest.mock("../print_jobs.js", () => ({
+  ...(jest.requireActual("../print_jobs.js") as Record<string, unknown>),
   enqueuePrintJob: (_resId: string, job: EnqueuedJob): Promise<string> => {
     enqueued.push(job);
     return Promise.resolve(`job-${String(enqueued.length)}`);
@@ -643,5 +656,149 @@ describe("what the printer agent is given to route on", () => {
     const result = await kp.dispatchKot(dispatch({ skipIfTicketed: true }));
     expect([...result.stations].sort()).toEqual(["General", "TANDOOR"]);
     expect(enqueued.every((j) => typeof j.station === "string" && j.station.length > 0)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. THE ORDER-LEVEL NOTE reaching the paper.
+//
+//     escpos.test.ts pins that the RENDERER draws the banner and that the bill
+//     branch cannot. What is pinned HERE is the wiring between them — that
+//     dispatchKot actually hands the note to every station's docket — because
+//     that is the half that was missing for the entire life of the feature: the
+//     string was captured by both clients, stored in "Orders".food.note, and
+//     then passed to no renderer by any caller.
+//
+//     The ticket KEY deliberately excludes it (see KotDispatchInput.orderNote),
+//     so the last case here is the one that would catch someone "fixing" that:
+//     an edited note must not mint a second KOT number for food the kitchen is
+//     already cooking.
+// ---------------------------------------------------------------------------
+
+describe("the order-level note on the docket", () => {
+  test("reaches every station's docket, not just the first", async () => {
+    seedMenu([
+      { id: "m1", name: "Paneer Tikka", station: "TANDOOR" },
+      { id: "m3", name: "Fresh Lime Soda", station: "BAR" },
+    ]);
+
+    const result = await kp.dispatchKot(dispatch({
+      items: [{ name: "Paneer Tikka", quantity: 1 }, { name: "Fresh Lime Soda", quantity: 2 }],
+      orderNote: "allergy: peanuts",
+      skipIfTicketed: true,
+    }));
+
+    expect(result.tickets).toBe(2);
+    // The bar pours as well as the kitchen cooks. A docket that omits the
+    // allergy is the one that serves it.
+    for (const job of enqueued) {
+      expect(paper(job.esc_base64)).toContain("allergy: peanuts");
+    }
+  });
+
+  test("no note leaves the docket exactly as it was before the field existed", async () => {
+    seedMenu([{ id: "m1", name: "Paneer Tikka", station: "TANDOOR" }]);
+    const withoutNote = await kp.dispatchKot(dispatch({ skipIfTicketed: false }));
+    const bytesWithout = enqueued.map((j) => j.esc_base64);
+    expect(withoutNote.tickets).toBeGreaterThan(0);
+
+    enqueued.length = 0;
+    const withBlank = await kp.dispatchKot(dispatch({ orderNote: "   ", skipIfTicketed: false }));
+    expect(withBlank.tickets).toBe(withoutNote.tickets);
+    expect(enqueued.map((j) => j.esc_base64)).toEqual(bytesWithout);
+  });
+
+  test("editing the note does NOT mint a second KOT number for unchanged food", async () => {
+    // The memo maps one FOOD CONTENT to one number forever; that is what makes
+    // a reprint reuse its number rather than putting a second ticket for the
+    // same dishes on the pass. The note rides on the docket, so folding it into
+    // the key would re-ticket an order whose food has not moved.
+    seedMenu([{ id: "m1", name: "Paneer Tikka", station: "TANDOOR" }]);
+    const first = await kp.dispatchKot(dispatch({ orderNote: "no onions", skipIfTicketed: true }));
+    expect(first).toMatchObject({ kotNo: 1, reprint: false });
+
+    const second = await kp.dispatchKot(dispatch({ orderNote: "no onions, no garlic", skipIfTicketed: true }));
+    expect(second.kotNo).toBe(1);
+    expect(second.reprint).toBe(true);
+    expect(counters()[0]!.seq).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. STATION IDENTITY. Two bugs that were cosmetic while every station had its
+//     own printer, and stop being cosmetic the moment sections are GROUPED onto
+//     one — because grouping is exactly the configuration that lands them on the
+//     same roll.
+// ---------------------------------------------------------------------------
+
+describe("station identity", () => {
+  test("two casings of one station are ONE docket, not two half-tickets", async () => {
+    // The renderer buckets on the raw string and the printer agent upper-cases
+    // its rule key, so "Bar" and "bar" used to mint two dockets that both
+    // resolved to the same printer.
+    seedMenu([
+      { id: "m1", name: "Mojito", station: "Bar" },
+      { id: "m2", name: "Fresh Lime Soda", station: "bar" },
+    ]);
+
+    const result = await kp.dispatchKot(dispatch({
+      items: [{ name: "Mojito", quantity: 1 }, { name: "Fresh Lime Soda", quantity: 2 }],
+      skipIfTicketed: true,
+    }));
+
+    expect(result.tickets).toBe(1);
+    expect(result.stations).toHaveLength(1);
+    const only = paper(enqueued[0]!.esc_base64);
+    expect(only).toContain("Mojito");
+    expect(only).toContain("Fresh Lime Soda");
+  });
+
+  test("an unmanaged station still collapses, settling on the first spelling seen", async () => {
+    // No vocabulary to appeal to, so the two spellings agree on one of
+    // themselves rather than staying apart.
+    seedMenu([
+      { id: "m1", name: "Mojito", station: "poolside" },
+      { id: "m2", name: "Iced Tea", station: "POOLSIDE" },
+    ]);
+    const result = await kp.dispatchKot(dispatch({
+      items: [{ name: "Mojito", quantity: 1 }, { name: "Iced Tea", quantity: 1 }],
+      skipIfTicketed: true,
+    }));
+    expect(result.stations).toEqual(["poolside"]);
+  });
+
+  test("a dish RENAMED since it was ordered still reaches its own station", async () => {
+    // The name lookup cannot find it any more, so without the id it would fall
+    // into "General" — which under a grouped scheme is almost certainly the hot
+    // kitchen. A renamed cocktail would print at the pass and the bar would
+    // never learn it was ordered.
+    seedMenu([
+      { id: "m1", name: "Mojito Classico", station: "Bar" },   // renamed on the menu
+      { id: "m2", name: "Paneer Tikka", station: "TANDOOR" },
+    ]);
+
+    const result = await kp.dispatchKot(dispatch({
+      items: [
+        // The order line still says what it said when it was taken, but carries
+        // the server-stamped menu_id.
+        { name: "Mojito", quantity: 1, menu_id: "m1" },
+        { name: "Paneer Tikka", quantity: 1 },
+      ],
+      skipIfTicketed: true,
+    }));
+
+    expect([...result.stations].sort()).toEqual(["Bar", "TANDOOR"]);
+    const bar = paper(enqueued.find((j) => j.station === "Bar")!.esc_base64);
+    expect(bar).toContain("Mojito");
+    expect(bar).not.toContain("Paneer Tikka");
+  });
+
+  test("without a menu_id the name is still the key, exactly as before", async () => {
+    seedMenu([{ id: "m1", name: "Mojito", station: "Bar" }]);
+    const result = await kp.dispatchKot(dispatch({
+      items: [{ name: "Mojito", quantity: 1 }],
+      skipIfTicketed: true,
+    }));
+    expect(result.stations).toEqual(["Bar"]);
   });
 });

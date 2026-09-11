@@ -147,6 +147,29 @@ export interface ReceiptOptions {
   // employee's role actually is captain/manager, never as a duplicate label.
   assignedTo?: string | null;
   captain?: string | null;
+  /**
+   * KOT ONLY: the ORDER-LEVEL note — the whole-order instruction, as distinct
+   * from the per-dish `ReceiptItem.note` beside each line.
+   *
+   * THIS IS A BUG FIX AND THE BUG WAS THAT IT PRINTED NOWHERE. Both clients
+   * have offered this box since ordering existed, the owner app captions it
+   * "Note for the kitchen (e.g. no onions)" and the guest QR menu's placeholder
+   * reads "no onions, less spicy, allergies" — and the string went into
+   * "Orders".food.note, was described in the writer as "kitchen + bill", and
+   * was then read by no renderer on any path. A waiter typing an allergy into a
+   * field captioned NOTE FOR THE KITCHEN was talking to nobody.
+   *
+   * PRINTED ABOVE THE ITEMS, NOT BESIDE THEM, because it qualifies all of them:
+   * "no onions" on the order means every dish, and hanging it under one line
+   * would say the opposite. It goes on EVERY station's docket of the ticket for
+   * the same reason — an allergy is not the hot kitchen's business alone, and a
+   * bar docket that omits it is the one that pours the wrong thing.
+   *
+   * NOT ON THE BILL, under the same rule as the item note (see the block in the
+   * bill item loop): its reader is the chef. The bill branch never reads this
+   * field, so a guest's copy cannot grow one.
+   */
+  orderNote?: string | null;
   // The bill's grand total, AS THE BILLING LAYER COMPUTED IT.
   //
   // When present it is printed verbatim and NOTHING is recomputed or rounded
@@ -440,6 +463,24 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   }
   line(sep);
 
+  // --- The order-level instruction (KOT only) --------------------------------
+  //
+  // Above the item table, under its own banner, because it qualifies every line
+  // below it. The banner is what the eye catches across a pass; the wrapped
+  // text underneath is what removes the doubt — the same division the HOLD
+  // block uses, and for the same reason: a docket is read standing up, at a
+  // glance, and an instruction that has to be hunted for will be missed.
+  //
+  // A ticket with no order note prints EXACTLY what it printed before this
+  // existed, down to the byte — which is what keeps every dockets-are-unchanged
+  // assertion true for the restaurants that never type one.
+  const orderNote = isKot ? present(opts.orderNote) : "";
+  if (orderNote) {
+    big("** NOTE **", width);
+    for (const l of wrapText(orderNote, width)) {line(l);}
+    line(sep);
+  }
+
   // --- Items ----------------------------------------------------------------
   if (isKot) {
     // Kitchen ticket: a NUMBERED line per dish with the quantity right-aligned
@@ -675,6 +716,26 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
 // Group KOT items by their (upstream-enriched) kitchen station, preserving the
 // order in which stations first appear. Items with no station fall under a
 // shared "General" bucket so nothing is ever dropped from the kitchen.
+//
+// ONE DOCKET PER STATION, EVEN WHEN SEVERAL STATIONS SHARE A PRINTER — and that
+// is a decision, not a limitation of the split.
+//
+// Once sections can be GROUPED onto one printer, the obvious-looking economy is
+// to merge a group's lines onto a single ticket: one cut instead of three, less
+// paper, less to pick up. It is the wrong trade, because a docket is not only
+// paper — it is the unit the kitchen is measured in. Each station's ticket
+// carries its own KOT header and prints at its own moment, so each station's
+// prep clock starts when ITS ticket comes out. Merge them and Bar, Cocktails and
+// Juice share one timestamp, and the question "how long did the bar take" stops
+// having an answer.
+//
+// It would also make the ticket COUNT depend on the printer configuration:
+// changing where something prints would change how many documents exist, which
+// the per-station ticket identity and the KOT-number memo (migration 029) both
+// key on. Where a thing prints must not change what it is.
+//
+// So a group of three sections produces three cut-terminated dockets, back to
+// back on the same roll, in the order the stations first appear on the order.
 export function groupKotItemsByStation(items: ReceiptItem[]): { station: string; items: ReceiptItem[] }[] {
   const groups = new Map<string, ReceiptItem[]>();
   const order: string[] = [];

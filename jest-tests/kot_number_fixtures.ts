@@ -94,7 +94,25 @@ function freshStore(): Store {
   return { counters: new Map(), tickets: [], menu: [], tableMissing: false };
 }
 
+/**
+ * THE ROWS "PrintJobs" WAS HANDED, in dispatch order.
+ *
+ * A STABLE ARRAY, EMPTIED IN PLACE, because the suites that read it bind a
+ * reference once at module load. Reassigning it here would leave every test
+ * holding yesterday's array and asserting against an empty one.
+ *
+ * It exists because the enqueue moved. These suites used to intercept
+ * print_jobs.ts's `enqueuePrintJob` wrapper with a recorder; since migration 042
+ * the producers go through dispatchPrintJob, which calls the data layer's
+ * EnqueuePrintJob DIRECTLY so it can pass the assignment — so the wrapper is no
+ * longer on the path and a mock of it records nothing. Modelling the INSERT is
+ * the honest replacement: it records what the queue was actually told, one layer
+ * below where the old recorder sat, and it cannot drift out of the path again.
+ */
+export const printJobRows: { outlet_id: string; bill_id: string; kind: string; station: string | null; esc_base64: string }[] = [];
+
 export function resetStore(): void {
+  printJobRows.length = 0;
   store = freshStore();
   locks.clear();
   waiters.length = 0;
@@ -312,6 +330,28 @@ async function query(connId: number, sqlRaw: string, params: unknown[] = []): Pr
       const at = store.tickets.indexOf(row);
       if (at >= 0) {store.tickets.splice(at, 1);}
     });
+    return { rows: [] };
+  }
+
+  // --- PrintJobs -------------------------------------------------------------
+  // The durable print queue (migration 027), reached through dispatchPrintJob.
+  // Only the INSERT is modelled: what these suites assert is what the kitchen is
+  // handed, and the queue's own statements are driven for real by
+  // print_jobs.test.ts and print_routing.test.ts over their own fixtures.
+  if (s.startsWith('insert into "printjobs"')) {
+    printJobRows.push({
+      outlet_id: str(params[1]),
+      bill_id: str(params[2]),
+      kind: str(params[3]),
+      station: params[4] === null || params[4] === undefined ? null : str(params[4]),
+      esc_base64: str(params[5]),
+    });
+    return { rows: [{ id: `job-${String(printJobRows.length)}` }] };
+  }
+  if (s.includes('"printjobs"')) {
+    // Any other PrintJobs statement — a routed assignment read, an ack, the
+    // reaper. Not this fixture's subject; answer empty rather than throwing, so
+    // a routing path that degrades gracefully is not turned into a test failure.
     return { rows: [] };
   }
 
