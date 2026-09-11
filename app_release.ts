@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.9.0";
+const LATEST = "1.9.1";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,17 +118,14 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"Waiters now see only their own floor. Their app opens on Tables, shows their orders instead of " +
-		"seating, and carries their own average per cover, attendance and guest ratings — not the " +
-		"restaurant's takings. Settling, discounts, coupons, merging and reprinting are off the waiter's " +
-		"app entirely, so a busy shift cannot cost you a wrong bill. Kitchen tickets now print the moment " +
-		"the order is placed, held items included, and each printer can be pointed at the kind of order it " +
-		"should handle. Bills carry your legal name, address, phone and GSTIN, and can be split by menu " +
-		"section when a table wants drinks separate from food; item notes stay on the kitchen ticket and " +
-		"off the guest's copy. You can move a party to another table and the order and its kitchen ticket " +
-		"go with them. A table now turns occupied once an order is placed rather than the moment someone " +
-		"sits down. Table sections keep the order you made them in, and you can drag them into the order " +
-		"your floor actually runs in.",
+		"Every kitchen ticket now carries its number on screen as well as on paper, so the number a cook " +
+		"calls out is the one you can see on the board — and several rounds on one table read as the " +
+		"separate tickets they are instead of one long list. Your bill now lists every token that fed it. " +
+		"Cancel an order and the kitchen gets a slip saying CANCELLED, naming the ticket to pull off the " +
+		"rail, so food already being cooked actually stops. Dish names print bold, a held item says so " +
+		"beside its name, and a reprint is marked as one. You can now say which printer each part of the " +
+		"kitchen uses — group sections together and send them to one machine, with the bill on " +
+		"another. Waiters no longer see the floor summary, comping or the service-charge waiver.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
