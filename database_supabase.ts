@@ -31280,6 +31280,103 @@ export async function EnqueuePrintJob(
   return id;
 }
 
+/**
+ * C3, THE WEB DASHBOARD'S HALF — RECORD A BILL PRINT THAT THIS SERVER DID NOT
+ * PRODUCE, AND THAT NO TILL MUST EVER BE HANDED.
+ *
+ * ============================================================================
+ * THE HOLE THIS CLOSES
+ * ============================================================================
+ * POST /print/bill enforces "a waiter prints once" off this ledger, and the
+ * count is durable precisely because the row is. The WEB DASHBOARD never calls
+ * it: its Print Bill button renders an HTML page and calls `window.print()`, so
+ * the paper comes out of the browser's own printer and the backend hears
+ * nothing. A waiter on the dashboard therefore printed as many copies as they
+ * liked, and none of them existed as far as the floor tablets, the audit log or
+ * the next reprint check were concerned — the same "a rule that means something
+ * different on every device in the building" defect that C3 was written to end,
+ * surviving on the one client that was not looked at.
+ *
+ * POST /print/bill/claim is that client saying "I am about to produce this
+ * paper", and this is where it is written down.
+ *
+ * ============================================================================
+ * WHY IT CANNOT GO THROUGH EnqueuePrintJob / dispatchPrintJob
+ * ============================================================================
+ * Those write a job for an AGENT — status 'pending' (or 'delivered' with a
+ * lease), which is exactly the set ClaimPrintJobsForAgent replays. A dashboard
+ * print recorded that way would sit in the outlet's queue until the next till
+ * reconnected and then come out of the thermal printer, hours later, as a
+ * duplicate of a bill a guest already has. Two pieces of paper for one bill is
+ * the failure mode migration 027's lease notes spend a page on; producing one
+ * of them from a client that already printed its own would be a new way in.
+ *
+ * ============================================================================
+ * 'acked' — THE ONLY VALUE THAT IS BOTH TERMINAL AND COUNTED
+ * ============================================================================
+ * Read against migration 027's CHECK and against the two rules that consume it,
+ * rather than picked:
+ *
+ *   the CHECK allows      pending, delivered, acked, expired, failed
+ *   REPLAY takes          pending, delivered          (ClaimPrintJobsForAgent)
+ *   C3 COUNTS             pending, delivered, acked   (COUNTED_PRINT_JOB_STATUSES)
+ *
+ * The row must be OUTSIDE the replay set — that is the whole "emits nothing to
+ * the printer agent" requirement, made structural rather than left to the route
+ * remembering not to emit — and INSIDE the counted set, or the claim increments
+ * nothing and the second dashboard print is allowed. The intersection of
+ * "terminal" and "counted" has exactly one member and it is 'acked'.
+ *
+ * 'failed' and 'expired' are the other two terminal values and both are wrong
+ * here for the same reason: bill_print_state.ts calls them TERMINAL NON-EVENTS
+ * on purpose, so that a paper jam does not burn a waiter's single attempt. This
+ * print did not jam. It came out.
+ *
+ * `ack_result = 'printed'` for the same reason, and it is honest: an agent
+ * would have written it after the paper came out, and here the paper came out
+ * of the browser. `settled_at = now()` because retention is measured from there
+ * and a terminal row with a null settled_at is never collected by
+ * PurgeSettledPrintJobs — it would be an immortal row for every dashboard print
+ * the fleet ever makes.
+ *
+ * ============================================================================
+ * `esc_base64` IS EMPTY, AND THAT IS THE SECOND LOCK
+ * ============================================================================
+ * There are no ESC/POS bytes: nothing rendered any. The column is NOT NULL, so
+ * '' is what "there is no receipt in this row" spells. It also means that if
+ * some future replay path ever widened its status filter, the worst it could
+ * hand a till is an empty document — not a surprise thermal copy of a guest's
+ * bill. The status is the guarantee; this is the belt behind it.
+ *
+ * ============================================================================
+ * RETURNS THE ROW'S OWN created_at
+ * ============================================================================
+ * Not `new Date()`. summarizeBillPrints derives `printed_at` from created_at,
+ * so the timestamp the caller shows and the one the next /bill-for-table
+ * returns have to be the same instant — and it is Postgres' clock, which is the
+ * only clock every replica agrees on.
+ */
+export async function RecordClientRenderedBillPrint(
+  resId: string,
+  job: { outlet_id: string; bill_id: string; claimed_by: string },
+): Promise<{ id: string; created_at: string }> {
+  const rows = await runQuery<{ id: string; created_at: Date }>(
+    `insert into "PrintJobs" (res_id, outlet_id, bill_id, kind, station, esc_base64,
+                              status, attempts, claimed_by, settled_at, ack_result)
+     values ($1,$2,$3,'bill',null,'',
+             'acked', 1, $4, now(), 'printed')
+     returning id, created_at`,
+    // attempts = 1: one attempt was made and it succeeded. delivered_at stays
+    // NULL because that column means "handed to a named AGENT", and no agent was
+    // ever given this job — writing an instant there would put a delivery that
+    // never happened into the diagnostics.
+    [resId, job.outlet_id, job.bill_id, job.claimed_by],
+  );
+  const row = rows[0];
+  if (!row) { throw new Error("PrintJobs insert returned no id"); }
+  return { id: row.id, created_at: new Date(row.created_at).toISOString() };
+}
+
 // --- reading the numbers back -------------------------------------------------
 //
 // THE CONVENTION THESE REST ON, verified against the producers rather than

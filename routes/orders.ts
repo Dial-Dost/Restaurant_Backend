@@ -10,6 +10,7 @@ import { autoPrintOrderKot, dispatchCancellationKot, type KotLine } from "../kot
 import { idempotent } from "../idempotency.js";
 import { resolveServeIntent } from "../order_intent.js";
 import { logger } from "../observability.js";
+import { hidesPrices, redactOrderList } from "../price_scope.js";
 import { emitRestaurant } from "../realtime.js";
 import type { CreatedOrderInfo } from "./_shared.js";
 import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, validateAction } from "./_shared.js";
@@ -98,7 +99,19 @@ app.get("/orders", validateAction("b7f78d0f-323d-4622-8d05-aa2f82d54b2e"), async
 		// section server-side. Empty/absent => no filter (full set, as before).
 		const station = typeof req.query.station === "string" ? req.query.station : "";
 		const items = await GetOrders(restaurantId, station);
-		res.json(items);
+		// C4 — THE THIRD SURFACE, AND THE ONE THAT WOULD HAVE MADE THE OTHER TWO
+		// POINTLESS. A table's running bill IS the sum of its active orders, and
+		// this feed carries every one of them with `items[].price` on each line
+		// plus the ticket's own `subtotal` and `total` — so a waiter refused the
+		// prices on /bill-for-table could have read the same numbers, line for
+		// line, off the orders grid they already have open. The Flutter app
+		// gates all three behind the same `RoleScope.showsMoney`
+		// (modules.dart:2772, :3073, :3186); the server now does too.
+		//
+		// The KITCHEN half of this payload is untouched — station, prep timers,
+		// hold/fire, notes, variations, KOT numbers, who took it — because none
+		// of it is money and the KDS reads this same endpoint.
+		res.json(hidesPrices(req.auth) ? redactOrderList(items) : items);
 	} catch (error) {
 		logger.error({ err: error }, "get_orders_failed");
 		res.status(500).json({ error: "Unable to fetch orders" });

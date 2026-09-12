@@ -8,6 +8,7 @@ import { idempotent } from "../idempotency.js";
 import { printKotTableChange } from "../kot_move.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
+import { hidesPrices, redactBillForTable, redactTableList } from "../price_scope.js";
 import { mayReleaseTable } from "../release_authority.js";
 import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
 import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
@@ -1135,7 +1136,17 @@ app.get("/bill-for-table", validateAction("98b10bde-802d-4a5b-a726-53a826424f79"
 			res.status(404).json({ error: "No open bill found for this table" });
 			return;
 		}
-		res.json(result);
+		// C4 — THE PRIMARY SURFACE. This is the payload the order pad's "what is
+		// already on this table" strip and the bill sheet's line list are built
+		// from, which is the list the requirement names ("the list of ordered
+		// dishes displayed on the right side"). The REDACTION HAPPENS HERE AND
+		// NOT IN GetBillForTable: the same reader renders the guest's printed
+		// bill, the split, the KOT and every settle path, and taking prices off
+		// there would take them off a guest's receipt. See price_scope.ts.
+		//
+		// A manager, cashier, captain or admin takes the `result` branch and gets
+		// a byte-identical response to the one they got before this existed.
+		res.json(hidesPrices(req.auth) ? redactBillForTable(result as unknown as Record<string, unknown>) : result);
 	} catch (error: any) {
 		logger.error({ err: error }, "get_bill_for_table_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to get bill for table") });
@@ -1199,7 +1210,19 @@ app.get("/get-tables", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), a
 		} catch (err) {
 			logger.warn({ err }, 'log_audit get-tables failed');
 		}
-		res.send(tables ?? []);
+		// C4 — THE FLOOR GRID CARRIES THE SAME MONEY UNDER DIFFERENT NAMES.
+		// `table_total` / `table_apc` / `target_apc` are what the tile's
+		// "₹1,200 · bill · apc ₹300" line and its APC traffic-light are drawn
+		// from, and `RoleScope.showsMoney` already takes both off a waiter's grid
+		// (modules.dart:7929). Redacting /bill-for-table and leaving this one
+		// would have left the running total of every table on the floor one poll
+		// away — and this is the MOST-polled endpoint in the product, so it is
+		// the easiest of the three to read off the wire.
+		//
+		// `apc_status`, `payment_pending`, `occupied` and the three C3 print
+		// fields all survive: they are how a waiter still sees WHICH tables owe
+		// money and which have been billed, without being told how much.
+		res.send(hidesPrices(req.auth) ? redactTableList(tables ?? []) : (tables ?? []));
 	} catch (e) {
 		res.status(400).send({ error: "Oops something went wrong" });
 		return;
