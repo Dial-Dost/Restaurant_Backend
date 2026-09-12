@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.9.1";
+const LATEST = "1.9.4";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,14 +118,13 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"Every kitchen ticket now carries its number on screen as well as on paper, so the number a cook " +
-		"calls out is the one you can see on the board — and several rounds on one table read as the " +
-		"separate tickets they are instead of one long list. Your bill now lists every token that fed it. " +
-		"Cancel an order and the kitchen gets a slip saying CANCELLED, naming the ticket to pull off the " +
-		"rail, so food already being cooked actually stops. Dish names print bold, a held item says so " +
-		"beside its name, and a reprint is marked as one. You can now say which printer each part of the " +
-		"kitchen uses — group sections together and send them to one machine, with the bill on " +
-		"another. Waiters no longer see the floor summary, comping or the service-charge waiver.",
+		"Waiters no longer see money they were never meant to. Prices are gone from the order list, " +
+		"from the table cards and from the bill a waiter opens — including on a table whose service " +
+		"charge has been waived, where the amounts used to come back anyway. Managers and cashiers see " +
+		"everything they always did. The till now opens on the same figures the browser has had: today's " +
+		"net and gross takings, what came in online, what came in as cash, and the month so far, in one " +
+		"box at the top with each figure saying what it counts. On a phone, the bar along the bottom no " +
+		"longer covers the Send order button, and a table with guests on it no longer looks empty.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
