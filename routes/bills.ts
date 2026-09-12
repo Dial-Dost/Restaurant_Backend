@@ -6,12 +6,12 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type SplitReceiptPart } from "../escpos.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
-import { ackPrintJob } from "../print_jobs.js";
+import { ackPrintJob, isSchemaMissing, warnSchemaMissing } from "../print_jobs.js";
 import { dispatchPrintJob } from "../print_routing.js";
 import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
@@ -816,6 +816,98 @@ app.post('/bills/order/:orderId/close', validateAction("a953d044-31ba-4e31-b96f-
 }
 
 
+/*
+	C3 — "A WAITER MAY PRINT THE BILL ONCE; THE SECOND ONE IS SOMEBODY ELSE'S."
+	THE RULE ITSELF, FACTORED OUT SO THERE IS EXACTLY ONE OF IT.
+
+	============================================================================
+	THE HALF THAT WAS MISSING
+	============================================================================
+	The requirement is "Waiters can only execute Print Bill ONCE. Any subsequent
+	actions (reprinting, overrides) must be restricted." The clients implemented
+	it by hiding the button and remembering the press IN THE DEVICE. A device
+	memory survives a back-navigation and an app restart; it does not survive a
+	reinstall, a second tablet or a bare curl, and POST /print/bill was gated
+	only on "Add Orders" (4ad474d4…), which every waiter holds. So the rule meant
+	something different on every device in the building. A hidden control must be
+	UNREACHABLE, not merely undrawn — the button is the courtesy, this is the
+	control.
+
+	THE COUNT IS THE SERVER'S. `bill.print_count` comes from the durable
+	"PrintJobs" ledger (migration 027) scoped to this seating, counting only jobs
+	that printed or are still on their way — see billPrintHistoryForTable for why
+	a jammed printer does not burn the waiter's one attempt.
+
+	WHO IS NARROWED: waiter-only identities, decided by isWaiterOnly — the SAME
+	predicate role_scope.ts ships on every session payload, so the button the
+	client hides and the door the server shuts are one rule rather than two that
+	will drift. A manager, cashier, captain or admin reprints exactly as many
+	times as they always have; the requirement names "Super Admins" as who a
+	WAITER escalates to, not as a new ceiling on everyone who runs the floor.
+
+	============================================================================
+	WHY IT IS A FUNCTION AND NOT TWO COPIES
+	============================================================================
+	It has TWO callers now: POST /print/bill (the thermal print this server
+	renders and emits) and POST /print/bill/claim (the web dashboard, which
+	renders its own paper in the browser). They are different enough in every
+	other respect — one produces ESC/POS and dispatches it, the other produces
+	nothing and only writes the ledger — that the temptation is to restate the
+	four-line check in the second one.
+
+	A SECOND COPY OF AN AUTHORISATION RULE IS A RULE THAT WILL DIVERGE, and this
+	codebase has the receipts: the client-side `roles.every(r => r == 'waiter')`
+	that role_scope.ts exists to kill, the two print-count queries that
+	bill_print_state.ts merged, the release preflight and the bill math
+	disagreeing about status 6. The predicate, the count, the 403 status, the
+	sentence, `reprint_needs_senior`, `print_count`, `bill_printed_at`,
+	`printed_at` and `allowed_roles` are therefore produced HERE, once, so a
+	client cannot tell which route refused it and a change to the rule cannot
+	land on one door and not the other.
+
+	Returns TRUE when it has already answered 403 — the caller must return
+	immediately, the way requireSectionAdminForNewSection's callers do.
+
+	THE KOT IS NOT ITS BUSINESS. `kind === "kot"` is a kitchen docket, not a
+	bill: a waiter reprints a lost ticket all shift and always could. That test
+	stays at the /print/bill call site because /print/bill/claim has no kinds —
+	a browser never prints a kitchen docket.
+*/
+async function refuseWaiterBillReprint(
+	req: Request,
+	res: Response,
+	tableName: string,
+	bill: { print_count: number; bill_printed_at: string | null; printed_at: string | null },
+): Promise<boolean> {
+	if (!(bill.print_count > 0)) { return false; }
+	if (!isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions })) {
+		return false;
+	}
+	try {
+		await log_audit(
+			req, "4ad474d4-5230-449c-874f-6a238b833bca",
+			`REFUSED reprint of table ${tableName}'s bill — already printed ${String(bill.print_count)} time(s); reprints need a senior role`,
+			Audit_log_category.Bill,
+			{ table: tableName, kind: "bill", refused: true, print_count: bill.print_count, first_printed_at: bill.bill_printed_at },
+		);
+	} catch {/* a failed audit write must not turn a 403 into a 500 */}
+	// THE REFUSAL SAYS WHO CAN DO IT INSTEAD. A waiter handed a blank space
+	// where a control was will press it again on the next device they find;
+	// a waiter told "ask a manager" walks to the pass.
+	res.status(403).json({
+		error: "Forbidden",
+		details:
+			`This table's bill has already been printed. A reprint has to be made by a ${ROLES_OUTRANKING_WAITER.join(", ")} — ask one of them.`,
+		reprint_needs_senior: true,
+		print_count: bill.print_count,
+		bill_printed_at: bill.bill_printed_at,
+		printed_at: bill.printed_at,
+		allowed_roles: ROLES_OUTRANKING_WAITER,
+	});
+	return true;
+}
+
+
 export function registerBillPrintAndEditRoutes(app: Express): void {
 
 // Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
@@ -906,61 +998,18 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			res.status(400).json({ error: 'Nothing to print for this table' });
 			return;
 		}
-		// C3 — A WAITER MAY PRINT THE BILL ONCE; THE SECOND ONE IS SOMEBODY ELSE'S.
+		// C3 — THE ONE PRINT A WAITER GETS. The rule, the count, the audit line
+		// and the 403 body all live in refuseWaiterBillReprint above, because
+		// POST /print/bill/claim below has to refuse the identical thing in the
+		// identical words and a second copy would drift. Returning here is the
+		// whole enforcement: NOTHING is rendered and NOTHING is dispatched, so no
+		// paper comes out — a 403 body alone would prove only that a message was
+		// sent.
 		//
-		// THE HALF THAT WAS MISSING. The requirement is "Waiters can only execute
-		// Print Bill ONCE. Any subsequent actions (reprinting, overrides) must be
-		// restricted." The clients implemented it by hiding the button and
-		// remembering the press IN THE DEVICE. A device memory survives a
-		// back-navigation and an app restart; it does not survive a reinstall, a
-		// second tablet or a bare curl, and this route was gated only on "Add
-		// Orders" (4ad474d4…), which every waiter holds. So the rule meant
-		// something different on every device in the building. A hidden control
-		// must be UNREACHABLE, not merely undrawn — the button is the courtesy,
-		// this is the control.
-		//
-		// THE COUNT IS THE SERVER'S. bill.print_count comes from the durable
-		// "PrintJobs" ledger (migration 027) scoped to this seating, counting only
-		// jobs that printed or are still on their way — see
-		// billPrintHistoryForTable for why a jammed printer does not burn the
-		// waiter's one attempt.
-		//
-		// WHO IS NARROWED: waiter-only identities, decided by isWaiterOnly — the
-		// SAME predicate role_scope.ts ships on every session payload, so the
-		// button the client hides and the door the server shuts are one rule
-		// rather than two that will drift. A manager, cashier, captain or admin
-		// reprints exactly as many times as they always have; the requirement
-		// names "Super Admins" as who a WAITER escalates to, not as a new ceiling
-		// on everyone who runs the floor.
-		//
-		// KOT IS UNTOUCHED. `kind === "kot"` is a kitchen docket, not a bill: a
-		// waiter reprints a lost ticket all shift and always could.
-		if (kind === "bill" && bill.print_count > 0 && isWaiterOnly({
-			role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions,
-		})) {
-			try {
-				await log_audit(
-					req, "4ad474d4-5230-449c-874f-6a238b833bca",
-					`REFUSED reprint of table ${tableName}'s bill — already printed ${String(bill.print_count)} time(s); reprints need a senior role`,
-					Audit_log_category.Bill,
-					{ table: tableName, kind, refused: true, print_count: bill.print_count, first_printed_at: bill.bill_printed_at },
-				);
-			} catch {/* a failed audit write must not turn a 403 into a 500 */}
-			// THE REFUSAL SAYS WHO CAN DO IT INSTEAD. A waiter handed a blank space
-			// where a control was will press it again on the next device they find;
-			// a waiter told "ask a manager" walks to the pass.
-			res.status(403).json({
-				error: "Forbidden",
-				details:
-					`This table's bill has already been printed. A reprint has to be made by a ${ROLES_OUTRANKING_WAITER.join(", ")} — ask one of them.`,
-				reprint_needs_senior: true,
-				print_count: bill.print_count,
-				bill_printed_at: bill.bill_printed_at,
-				printed_at: bill.printed_at,
-				allowed_roles: ROLES_OUTRANKING_WAITER,
-			});
-			return;
-		}
+		// KOT IS UNTOUCHED, and the test is here rather than inside the helper:
+		// `kind === "kot"` is a kitchen docket, not a bill, and a waiter reprints
+		// a lost ticket all shift and always could.
+		if (kind === "bill" && await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
 		// THE CHARGE CONFIG COMES FROM THE RESOLVER, NOT FROM RAW SETTINGS (F2,
 		// root cause 1).
 		//
@@ -1242,6 +1291,164 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');
 		res.status(500).json({ error: String(err?.message ?? 'Unable to print') });
+	}
+});
+
+
+/*
+	C3, THE WEB DASHBOARD'S HALF — CLAIM A BILL PRINT THAT THIS SERVER DOES NOT
+	PRODUCE.
+
+	POST /print/bill/claim  body { "table_name": "T7" }
+	  -> 200 { success, billId, recorded, jobId, print_count, bill_printed_at, printed_at }
+	  -> 403 the IDENTICAL body POST /print/bill returns (reprint_needs_senior)
+	  -> 400 nothing on the table
+
+	============================================================================
+	WHY A SECOND ROUTE AT ALL
+	============================================================================
+	POST /print/bill does two things that are welded together: it RENDERS the
+	ESC/POS receipt and it DISPATCHES it to a till. The web dashboard needs
+	neither. Its Print Bill button builds an HTML page and calls
+	`window.print()`, so the paper comes out of whatever printer the browser is
+	pointed at — and the backend was never told, which is how a waiter on the
+	dashboard printed unlimited copies of a bill while the same waiter on a
+	tablet got exactly one. A rule enforced on one client and not another is the
+	same defect as a rule enforced on one device and not another; it is just
+	harder to see.
+
+	So the dashboard keeps producing its own paper, and this is the route that
+	makes the print a FACT on the server: the same permission, the same C3
+	refusal, a row in the same ledger, a line in the same audit log.
+
+	============================================================================
+	IT EMITS NOTHING. NOT A SOCKET EVENT, NOT A BYTE.
+	============================================================================
+	There is deliberately no dispatchPrintJob and no `bill:print` here. A
+	dashboard print that also reached the printer agent would put a SECOND,
+	thermal copy of the guest's bill on every till bound to this outlet —
+	"connected tills start double-printing" is not a hypothetical in this
+	codebase, it is what migration 027's lease notes and the router's
+	two-charge-slip path are both about.
+
+	And that is not left to this handler remembering to be careful. The ledger
+	row is written in a TERMINAL status ('acked'), which is outside the
+	`status in ('pending','delivered')` set ClaimPrintJobsForAgent replays — so
+	even a till that reconnects a second later cannot be handed it — and with an
+	EMPTY esc_base64, so there is nothing to hand over in the first place. See
+	RecordClientRenderedBillPrint for why 'acked' is the only value in the CHECK
+	constraint that is both terminal and counted by C3.
+
+	============================================================================
+	THE REFUSAL IS THE SAME OBJECT, NOT THE SAME SHAPE
+	============================================================================
+	refuseWaiterBillReprint produces it — one predicate, one sentence, one set of
+	fields — so a dashboard and a tablet answer a waiter's second print
+	identically, and a change to the rule cannot land on one and not the other.
+
+	============================================================================
+	NO `idempotent()`, AND THAT IS THE CORRECT ANSWER FOR A PRINT
+	============================================================================
+	Same reasoning routes/printing.ts states for POST /print/test: a request for
+	paper that is repeated is a request for a SECOND piece of paper, and pressing
+	Print twice must cost a waiter their one attempt exactly as pressing it twice
+	on a tablet does. Deduplicating it would hand back the first response and
+	silently let the second copy print unrecorded — the very hole this closes.
+
+	============================================================================
+	IF MIGRATION 027 IS NOT APPLIED, THE PRINT STILL HAPPENS
+	============================================================================
+	`recorded: false` and an unchanged `print_count`, plus the throttled warning
+	print_jobs.ts already emits for exactly this. The alternative is refusing to
+	let a restaurant print a guest's bill because its print ledger is one
+	migration behind, and this codebase has already decided that argument twice
+	(billPrintStateForSeatings' header, and every read in routes/printing.ts): a
+	floor that cannot bill a table is a far worse outage than a rule that is
+	temporarily as weak as it was last week.
+*/
+app.post('/print/bill/claim', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	const outletId = extractOutletId(req);
+	if (!restaurantId || !outletId) { res.status(400).json({ error: 'Missing restaurant/outlet' }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
+	if (!tableName) { res.status(400).json({ error: 'table_name is required' }); return; }
+	try {
+		// The SAME read POST /print/bill gates on, so the two routes can never
+		// disagree about how many times this seating's bill has been printed.
+		const bill = await GetBillForTable(restaurantId, tableName);
+		// An empty table is answered "nothing to print", not "forbidden" — the
+		// same 400 and the same sentence as /print/bill, because a client should
+		// not have to learn a second vocabulary to find out the table is empty.
+		if (!bill || !Array.isArray(bill.items) || bill.items.length === 0) {
+			res.status(400).json({ error: 'Nothing to print for this table' });
+			return;
+		}
+		if (await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
+
+		// The SAME bill_id shape /print/bill writes, including the
+		// `<table>-<epoch>` fallback for a table with no "Bills" row yet.
+		// bill_print_state.ts matches BOTH shapes and matches the fallback as a
+		// PREFIX on the exact table name, so a claim and a thermal print of the
+		// same seating land in the same count rather than in two.
+		const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
+		let recorded: { id: string; created_at: string } | null = null;
+		try {
+			recorded = await RecordClientRenderedBillPrint(restaurantId, {
+				outlet_id: outletId,
+				bill_id: billId,
+				// Diagnostic, and deliberately not a device or a lease holder:
+				// nothing holds a lease on a terminal row. It names the client
+				// class and the person, so a manager reading the ledger can tell a
+				// browser print from a till's.
+				claimed_by: `web-client:${extractEmployeeId(req) ?? "unknown"}`,
+			});
+		} catch (err) {
+			// 42P01 / 42501 only — migration 027 absent or ungranted. Anything else
+			// is a real failure and must not be swallowed into a success.
+			if (!isSchemaMissing(err)) { throw err; }
+			warnSchemaMissing("print_bill_claim", err);
+		}
+
+		// THE AUDIT LINE IS THE ONE /print/bill FILES, under the same Action id
+		// and the same category, worded so a manager scanning the log can see
+		// which piece of paper came out of what. `recorded:false` is in the
+		// metadata rather than left implicit: an unrecorded print is the one case
+		// where the log is the ONLY evidence the bill was printed at all.
+		try {
+			await log_audit(
+				req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				`Printed bill for table ${tableName} from the web dashboard (browser print — no thermal copy)`,
+				Audit_log_category.Bill,
+				{ table: tableName, kind: "bill", source: "web_dashboard", claim: true, recorded: recorded !== null, job_id: recorded?.id ?? null },
+			);
+		} catch {/* ignore */}
+
+		// ENOUGH FOR THE BUTTON TO GO GREY. `print_count` is what the dashboard
+		// tests to hide its own control on the next render, and `printed_at` is
+		// what it shows beside it — both taken from the row that was just
+		// written, so the client does not have to re-poll /bill-for-table to
+		// learn what it just did. They are the SAME THREE SPELLINGS
+		// /bill-for-table and /get-tables carry (bill_print_state.ts), so a
+		// client needs no second code path to read them.
+		//
+		// On the unrecorded path the counts are returned UNCHANGED rather than
+		// optimistically incremented: reporting a count the ledger does not hold
+		// is how a client ends up disabling a button the server would still allow.
+		res.json({
+			success: true,
+			billId,
+			recorded: recorded !== null,
+			jobId: recorded?.id ?? null,
+			print_count: recorded ? bill.print_count + 1 : bill.print_count,
+			// The FIRST print of this seating is the one that used up a waiter's
+			// single attempt, so it only moves when there was no earlier one.
+			bill_printed_at: bill.print_count === 0 ? (recorded?.created_at ?? bill.bill_printed_at) : bill.bill_printed_at,
+			printed_at: recorded?.created_at ?? bill.printed_at,
+		});
+	} catch (err: any) {
+		logger.error({ err }, 'print_bill_claim_failed');
+		res.status(500).json({ error: String(err?.message ?? 'Unable to record the print') });
 	}
 });
 
