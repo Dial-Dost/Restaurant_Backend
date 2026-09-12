@@ -190,6 +190,39 @@ export const REDACTED_BILL_MONEY_KEYS: readonly string[] = [
 	"apc", "target_apc",
 ];
 
+/**
+ * The money keys INSIDE `service_charge_waiver` (migration 036).
+ *
+ * THE LEAK THIS CLOSES, and it defeated the whole feature on exactly the tables
+ * somebody had already intervened on.
+ *
+ * `without()` is a FLAT copy — it deletes top-level keys and never descends.
+ * `redactBillForTable` knew that for `items` and `taxes` and handled both by
+ * hand, and `service_charge_waiver` is the third nested object on the same
+ * payload. It was handed back whole.
+ *
+ * That is not a partial leak. `basis_amount` is `round2(discounted_subtotal)`
+ * (billing_math.ts, quoteServiceChargeWaiver) — it IS the post-discount subtotal
+ * that the redaction two lines above had just removed. With `basis_percent`,
+ * `amount_waived`, `tax_on_waived` and `grand_total_reduction` beside it, the
+ * entire money ladder for the table is reconstructible from a payload that was
+ * supposed to carry none of it.
+ *
+ * WHY THE WAIVER SURVIVES AT ALL rather than being dropped whole: "this table's
+ * service charge was waived by Meena because a guest complained" is something a
+ * waiter standing at that table genuinely needs — it is the answer to the
+ * question the guest is about to ask. What they must not have is the four
+ * AMOUNTS. Same line as everywhere else in this module: rates and labels stay,
+ * money goes.
+ *
+ * `basis_percent` therefore stays, consistently with `service_charge_percent`
+ * above it, and it leaks nothing on its own: a percentage with no amount beside
+ * it cannot be turned back into a subtotal.
+ */
+export const REDACTED_WAIVER_MONEY_KEYS: readonly string[] = [
+	"basis_amount", "amount_waived", "tax_on_waived", "grand_total_reduction",
+];
+
 /** The money keys on a /get-tables row. `apc_status` is NOT one — see the header. */
 export const REDACTED_TABLE_ROW_MONEY_KEYS: readonly string[] = [
 	"table_total", "table_apc", "target_apc",
@@ -254,7 +287,24 @@ export function redactBillForTable(bill: Record<string, unknown>): Record<string
 	const out = without(bill, REDACTED_BILL_MONEY_KEYS);
 	if (Array.isArray(bill.items)) { out.items = bill.items.map(redactItem); }
 	if ("taxes" in bill) { out.taxes = redactTaxes(bill.taxes); }
+	// THE THIRD NESTED OBJECT ON THIS PAYLOAD. `without()` is flat; `items` and
+	// `taxes` were handled by hand above and this one was not, so a waived table
+	// handed back its own subtotal as `service_charge_waiver.basis_amount`.
+	// See REDACTED_WAIVER_MONEY_KEYS.
+	if ("service_charge_waiver" in bill) { out.service_charge_waiver = redactWaiver(bill.service_charge_waiver); }
 	return out;
+}
+
+/**
+ * One service-charge waiver with its amounts removed; who, when and why survive.
+ *
+ * `null` is the common case (no waiver on this table) and passes straight
+ * through, because the ABSENCE of a waiver is not a secret — `service_charge_waived`
+ * is a boolean on the same payload and stays either way.
+ */
+function redactWaiver(waiver: unknown): unknown {
+	if (waiver === null || typeof waiver !== "object" || Array.isArray(waiver)) { return waiver; }
+	return without(waiver as Record<string, unknown>, REDACTED_WAIVER_MONEY_KEYS);
 }
 
 /** One row of GET /get-tables, as a waiter-only session is told it. */
