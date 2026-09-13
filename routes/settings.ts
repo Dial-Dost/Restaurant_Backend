@@ -4,9 +4,10 @@
  */
 import type { Express, Request, Response } from "express";
 import { Audit_log_category, GetPublicBranding, GetRestaurantLogo, GetRestaurantProfile, GetRestaurantSettings, SetBranding, SetRestaurantSettings, UpdateRestaurantProfile } from "../database_supabase.js";
+import { billLogoDots } from "../bill_logo.js";
 import { logger } from "../observability.js";
 import { uploadMenuImage } from "../storage_bucket_supabase.js";
-import { PERM_BRANDING, PERM_SETTINGS, buildLogoEscPos, callerHasPermission, enforcePermission, extractEmployeeId, extractRestaurantId, log_audit, validate, validateAction } from "./_shared.js";
+import { PERM_BRANDING, PERM_SETTINGS, buildBillLogoRaster, buildLogoEscPos, callerHasPermission, enforcePermission, extractEmployeeId, extractRestaurantId, log_audit, validate, validateAction } from "./_shared.js";
 
 
 // Set the restaurant's customer-facing branding (logo + theme color). Accepts a
@@ -166,6 +167,30 @@ app.get('/restaurant/logo/escpos', validate, async (req: Request, res: Response)
 		return res.send(out);
 	} catch (err) {
 		logger.error({ err }, 'get restaurant escpos failed');
+		return res.status(500).json({ error: 'Internal' });
+	}
+});
+
+// 5.1 — THE LOGO THE BILL PRINTS, FOR THE SCREENS THAT PREVIEW THE BILL.
+//
+// GET /restaurant/logo is the BRANDING PNG. The roll prints something else: the
+// SVG bill logo when the tenant stored one, fitted to THIS tenant's roll and
+// thresholded to one bit (bill_logo.ts). A preview drawn off the branding PNG
+// showed no logo at all for an SVG-only tenant, and the colour original for
+// everyone else. This answers with a PNG of the raster the printer receives, so
+// the web print page and the app's bill preview show the paper's own logo.
+// 404 when there is none, exactly like /restaurant/logo, so a caller falls back
+// the same way for both.
+app.get('/restaurant/logo/bill', validate, async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
+	try {
+		const settings = await GetRestaurantSettings(restaurantId).catch(() => null);
+		const raster = await buildBillLogoRaster(restaurantId, billLogoDots(settings?.bill_paper_width));
+		if (!raster) {return res.status(404).json({ error: 'Logo not found' });}
+		return res.json({ logo_base64: raster.png.toString('base64'), width: raster.width, height: raster.height });
+	} catch (err) {
+		logger.error({ err }, 'get restaurant bill logo failed');
 		return res.status(500).json({ error: 'Internal' });
 	}
 });
