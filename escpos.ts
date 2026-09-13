@@ -108,6 +108,13 @@ export interface ReceiptOptions {
   currency: string;
   // Bill meta (bill view only) — printed in the header block like the web bill.
   customer?: string | null;
+  /**
+   * BILL ONLY (round 2 item 1): the corporate party's GSTIN, printed as
+   * "Customer GSTIN: <value>" directly under the "Customer Name:" slot that
+   * sits between the restaurant header and the date block. Pre-normalized by the caller (customer_gstin.ts).
+   * Absent prints NOTHING — the same rule `gstin` obeys for the restaurant's own.
+   */
+  customerGstin?: string | null;
   billNo?: string | null;
   cashier?: string | null;
   /**
@@ -602,7 +609,12 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     line(sep);
   }
   if (!isKot) {
-    line(`Customer Name: ${present(opts.customer) || "Guest"}`);
+    // WHO THE BILL IS MADE OUT TO — the "Name:" slot the client's own printed
+    // bill has, between the restaurant header and the date block. Round 2 item 1
+    // adds the corporate party's GSTIN directly under it, only when one is set.
+    for (const l of wrapText(`Customer Name: ${present(opts.customer) || "Guest"}`, width)) {line(l);}
+    const customerGstin = present(opts.customerGstin);
+    if (customerGstin) {line(`Customer GSTIN: ${customerGstin}`);}
     line(sep);
   }
   const now = new Date().toLocaleString();
