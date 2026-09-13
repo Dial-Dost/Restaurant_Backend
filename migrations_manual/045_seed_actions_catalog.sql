@@ -1,3 +1,17 @@
+-- NOT AN AUTOMATIC MIGRATION — lives in migrations_manual/ ON PURPOSE.
+--
+-- Shipped as migrations/045 on 2026-09-13, it stopped the production deploy:
+-- MIGRATION_APPLY_MODE=auto asks the VPS to `rd-deploy migrate`, the box does not
+-- have that verb yet (exit 64), and the pipeline refused to ship anything. The
+-- production catalogue already holds every row below (it was created by hand), so
+-- production loses nothing by not running it. Databases built from migrations —
+-- the local docker stack, a fresh box — should apply it once, by hand:
+--
+--     psql "$DATABASE_URL" -f migrations_manual/045_seed_actions_catalog.sql
+--
+-- It is insert-only and idempotent, so running it twice, or on production, is
+-- harmless. Move it back into migrations/ once the migrate verb is installed.
+--
 -- Migration 045: the permission catalogue a database built from migrations never had.
 --
 -- THE DEFECT. "Audit_logs".action_id has a foreign key to "Actions"(id)
