@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.9.5";
+const LATEST = "1.9.6";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,13 +118,10 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"Each KOT on a table now shows as its own block with its number and time, and a KOT can be " +
-		"cancelled right there with a reason. Add order and Print bill sit at the top of a table and are " +
-		"bigger; Send order sits under the search instead of at the bottom. Light mode is here in White, " +
-		"Beige or Soft grey. The floor plan is now only for arranging tables. The bill preview shows your " +
-		"logo, address and GSTIN clearly. You can change the guest's name on a bill, see the live total " +
-		"of every running table at the top of Tables, and grab the scrollbars more easily. Moving an order " +
-		"to another table works again, and the service-charge message now says what was actually printed.",
+		"You can now add the guest's name and a company GSTIN to a bill, from the top of a table or later " +
+		"from a past bill in Accounting, and both print on the bill. A bill printed a second time says " +
+		"REPRINT at the top, on the preview as well as on paper. On the kitchen ticket a held dish stays in " +
+		"its place with the hold written underneath it, like a note.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
