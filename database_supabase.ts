@@ -16697,6 +16697,9 @@ interface OpenBillRow {
   outlet_id: string | null;
   table_id: string | null;
   table_name: string | null;
+  // 6.4 — a takeaway/delivery bill sits on a hidden table; it is not a running
+  // TABLE, so the live-gross figures below leave it out.
+  table_is_virtual: boolean | null;
   total_amt: number | string | null;
   tax_breakdown: unknown;
   discount_type: string | null;
@@ -16721,6 +16724,10 @@ export async function ListOpenBills(
   offset: number;
   has_more: boolean;
   outstanding_total: number;
+  /** 6.4 — tables with an open bill OR still-owing orders. See the note at the end. */
+  running_tables: number;
+  /** 6.4 — what those tables owe right now, tax-inclusive. See the note at the end. */
+  running_total: number;
   timezone: string;
 }> {
   const context = await requireRestaurantContext(restaurantId);
@@ -16737,6 +16744,7 @@ export async function ListOpenBills(
   // guard against a corrupted tenant, not a real paging bound.
   const rows = await runQuery<OpenBillRow>(
     `select b.id, b.bill_no, b.status, b.outlet_id, b.table_id, t.table_name,
+            coalesce(t.is_virtual, false) as table_is_virtual,
             b.total_amt, b.tax_breakdown, b.discount_type, b.discount_value, b.coupon_code,
             b.payment_method, b.waiter_confirmed_at, b.admin_approved_at, b.created_at,
             extract(epoch from (now() - b.created_at)) as age_secs,
@@ -16853,6 +16861,65 @@ export async function ListOpenBills(
   });
 
   const outstanding_total = round2(priced.reduce((s, b) => s + b.grand_total, 0));
+
+  // 6.4 — "the gross sales specifically for currently running tables".
+  //
+  // THE DEFECT THIS CLOSES: the live-gross box read `total`/`outstanding_total`,
+  // and both are counted over "Bills" rows. A table does not get a bill row
+  // until somebody generates one, so a floor with three tables eating off sent
+  // KOTs and nobody billed yet read "₹0 · No tables are running" — the one thing
+  // the box must never say while guests are seated.
+  //
+  // So a RUNNING TABLE is a real (non-virtual) table that has either an open
+  // bill or at least one order that still owes (orderStatusStillOwes — not
+  // paid, cancelled or closed). Its figure is:
+  //   * the open bill's grand_total when there is one — the SAME priced number
+  //     the list above carries, so the box and the bill screen agree; newest
+  //     bill wins if a table somehow holds two, never both;
+  //   * otherwise its still-owing orders re-priced through activeOrderSubtotal
+  //     + computeBillCharges, exactly the live path above minus a discount
+  //     (discounts live on the bill row, and there is none yet).
+  // A table is counted once whichever path it takes. `total` and
+  // `outstanding_total` keep meaning "open BILLS" — accounting lists those.
+  const billedFloorTables = new Map<string, number>();
+  rows.forEach((row, i) => {
+    if (!row.table_id || row.table_is_virtual) {return;}
+    // rows are newest first, so the first bill seen for a table is the live one.
+    if (!billedFloorTables.has(row.table_id)) {billedFloorTables.set(row.table_id, priced[i].grand_total);}
+  });
+  const unbilledRows = await runQuery<{ table_id: string; outlet_id: string | null; food: unknown; status: unknown }>(
+    `select o.table_id, o.outlet_id, o.food, o.status
+       from "Orders" o
+       join "Tables" t on t.id = o.table_id and t.res_id = o.res_id
+      where o.res_id = $1 and (${og} or o.outlet_id = $2)
+        and coalesce(t.is_virtual, false) = false
+        and ${stillOwesStatusSql("o.status")}
+        and not (o.table_id = any($3::uuid[]))
+      order by o.created_at asc`,
+    [context.res_id, context.outlet_id, tableIds],
+  );
+  const unbilledByTable = new Map<string, { outlet_id: string | null; orders: { food: unknown; status: unknown }[] }>();
+  for (const o of unbilledRows) {
+    const entry = unbilledByTable.get(o.table_id);
+    if (entry) {entry.orders.push(o);} else {unbilledByTable.set(o.table_id, { outlet_id: o.outlet_id, orders: [o] });}
+  }
+  let unbilledTotal = 0;
+  let unbilledTables = 0;
+  for (const [tableId, entry] of unbilledByTable) {
+    if (billedFloorTables.has(tableId)) {continue;}
+    const { subtotal, order_count } = activeOrderSubtotal(entry.orders);
+    if (order_count === 0) {continue;}
+    unbilledTotal += computeBillCharges(
+      subtotal,
+      (taxByOutlet.get(entry.outlet_id ?? "") ?? null) as Record<string, number> | null,
+      scPct,
+      true,
+      null,
+    ).grand_total;
+    unbilledTables += 1;
+  }
+  const running_total = round2([...billedFloorTables.values()].reduce((s, v) => s + v, 0) + unbilledTotal);
+
   const bills = priced.slice(offset, offset + limit);
   return {
     bills,
@@ -16861,6 +16928,8 @@ export async function ListOpenBills(
     offset,
     has_more: offset + bills.length < priced.length,
     outstanding_total,
+    running_tables: billedFloorTables.size + unbilledTables,
+    running_total,
     timezone: context.timezone,
   };
 }

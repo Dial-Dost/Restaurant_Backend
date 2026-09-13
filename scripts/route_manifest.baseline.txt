@@ -106,7 +106,7 @@ mw08 USE     *                                                      | <inline(re
 0084 POST    /bills                                                 | validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f") | 39eddf8b
 0085 POST    /bills/replace                                         | validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047") | dc9dd3ee
 0086 GET     /bills/closed                                          | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 7b6c51af
-0087 GET     /bills/open                                            | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 26b9ac03
+0087 GET     /bills/open                                            | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 7fc3f4a6
 0088 GET     /bills/closed/:id                                      | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 27085ddb
 0089 GET     /bills/order/:orderId                                  | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 5293cc31
 0090 GET     /restaurant/logo                                       | validate                                       | ea5a4f85

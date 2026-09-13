@@ -11,6 +11,7 @@ import { buildReceiptBase64, buildSplitReceiptsBase64, type SplitReceiptPart } f
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
+import { hidesPrices, redactOpenBillPage } from "../price_scope.js";
 import { ackPrintJob, isSchemaMissing, warnSchemaMissing } from "../print_jobs.js";
 import { dispatchPrintJob } from "../print_routing.js";
 import { emitRestaurant } from "../realtime.js";
@@ -383,7 +384,10 @@ app.get('/bills/open', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), a
 		});
 		res.setHeader("X-Total-Count", String(page.total));
 		res.setHeader("X-Has-More", page.has_more ? "1" : "0");
-		return res.json(page);
+		// 6.4 / C4 — a waiter holds View Bill, so this route answered them with
+		// every open bill's grand total and the whole floor's live gross. The
+		// counts stay; the money goes. See price_scope.ts.
+		return res.json(hidesPrices(req.auth) ? redactOpenBillPage(page) : page);
 	} catch (err) {
 		logger.error({ err }, 'list_open_bills_failed');
 		return res.status(500).json({ error: 'Unable to fetch open bills' });
