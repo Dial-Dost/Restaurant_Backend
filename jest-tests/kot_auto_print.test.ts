@@ -393,11 +393,15 @@ describe("dispatchKot — what the kitchen actually gets", () => {
       items: [{ name: "Gulab Jamun", quantity: 3, held_qty: 1 }],
     }));
     const out = paper(enqueued[0]!.esc_base64);
-    const banner = out.indexOf("** HOLD **");
-    expect(banner).toBeGreaterThan(-1);
-    // Two to cook, one waiting — and the totals say so on their own.
-    expect(out.slice(0, banner)).toMatch(/Total Qty {2,}2/);
-    expect(out.slice(banner)).toMatch(/Hold Qty {2,}1/);
+    // Two to cook on line 1; one waiting on line 2, whose "[Hold]" tag hangs
+    // UNDER it the way a note does (item 2) — never a banner before it.
+    const hold = out.indexOf("[Hold]");
+    expect(hold).toBeGreaterThan(-1);
+    expect(out).not.toContain("** HOLD **");
+    expect(out.slice(0, hold).match(/Gulab Jamun/g)).toHaveLength(2);
+    // …and the totals say so on their own.
+    expect(out).toMatch(/Total Qty {2,}2/);
+    expect(out).toMatch(/Hold Qty {2,}1/);
   });
 
   test("a wholly held line never appears in the cook-now list", async () => {
@@ -405,10 +409,15 @@ describe("dispatchKot — what the kitchen actually gets", () => {
       items: [{ name: "Paneer Tikka", quantity: 2 }, { name: "Gulab Jamun", quantity: 3, held_qty: 3 }],
     }));
     const out = paper(enqueued[0]!.esc_base64);
-    const banner = out.indexOf("** HOLD **");
-    expect(out.slice(0, banner)).not.toContain("Gulab Jamun");
-    expect(out.slice(banner)).toContain("Gulab Jamun");
-    expect(out.slice(0, banner)).toMatch(/Total Qty {2,}2/);
+    // It is not counted as cook-now: Total Qty is the Paneer alone, and the
+    // dessert is marked "[Hold]" directly under its own line.
+    const dish = out.indexOf("Gulab Jamun");
+    const hold = out.indexOf("[Hold]");
+    expect(dish).toBeGreaterThan(-1);
+    expect(hold).toBeGreaterThan(dish);
+    expect(out.slice(dish, hold)).not.toMatch(/Paneer Tikka/);
+    expect(out).toMatch(/Total Qty {2,}2/);
+    expect(out).toMatch(/Hold Qty {2,}3/);
   });
 
   test("holding a course does NOT mint a new KOT number", async () => {
@@ -426,8 +435,8 @@ describe("dispatchKot — what the kitchen actually gets", () => {
     expect(fired).toMatchObject({ kotNo: 1, reprint: true });
     // Same number, and the paper is honestly different: the second docket has
     // released the course.
-    expect(paper(enqueued[0]!.esc_base64)).toContain("** HOLD **");
-    expect(paper(enqueued[1]!.esc_base64)).not.toContain("** HOLD **");
+    expect(paper(enqueued[0]!.esc_base64)).toContain("[Hold]");
+    expect(paper(enqueued[1]!.esc_base64)).not.toContain("[Hold]");
     expect(counters()[0]!.seq).toBe(1);
   });
 
@@ -436,8 +445,7 @@ describe("dispatchKot — what the kitchen actually gets", () => {
     // tenants are ever in, and it must not be able to produce a hold block.
     await kp.dispatchKot(dispatch());
     const out = paper(enqueued[0]!.esc_base64);
-    expect(out).not.toContain("HOLD");
-    expect(out).not.toContain("Hold Qty");
+    expect(out).not.toMatch(/hold/i);
     expect(out).toMatch(/Total Qty {2,}3/); // 2 Paneer + 1 Papad
   });
 

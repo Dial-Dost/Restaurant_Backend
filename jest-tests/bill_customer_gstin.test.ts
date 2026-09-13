@@ -19,7 +19,7 @@
 //     asserted equal to the original with only those two keys moved.
 //   * THE READS — the running bill, the settled detail and the settled list all
 //     carry `customer_gstin`, by the same read rule.
-//   * THE PAPER — "Customer:" and "Customer GSTIN:" under the bill header, each
+//   * THE PAPER — "Customer GSTIN:" directly under the "Customer Name:" slot, each
 //     only when there is something to say, and never on a KOT.
 //   * A DATABASE WITHOUT MIGRATION 046 — the build ships first. Reads degrade to
 //     the orders' copy without ever naming the column; a GSTIN write is refused
@@ -534,32 +534,32 @@ const bill: ReceiptOptions = {
 };
 
 describe("the thermal bill prints who the invoice is made out to", () => {
-  test("Customer and Customer GSTIN lines appear, under the bill no / date / table / token block", () => {
+  test("the GSTIN sits directly under the Customer Name slot, above the date block (the client's bill layout)", () => {
     const out = printed(buildReceiptBase64({ ...bill, customer: "Acme Pvt Ltd", customerGstin: GSTIN }));
     const lines = out.split("\n");
     const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
-    expect(at(/^Customer: Acme Pvt Ltd$/)).toBeGreaterThan(-1);
-    expect(at(/^Customer GSTIN: 29ABCDE1234F1Z5$/)).toBeGreaterThan(-1);
-    expect(at(/^Customer: /)).toBeGreaterThan(at(/Bill No\.: 5910/));
-    expect(at(/^Customer: /)).toBeGreaterThan(at(/Date: 06\/09\/26 21:06/));
-    expect(at(/^Customer: /)).toBeGreaterThan(at(/Dine In: 21/));
-    expect(at(/^Customer: /)).toBeGreaterThan(at(/^Token No\./));
-    expect(at(/^Customer GSTIN: /)).toBe(at(/^Customer: /) + 1);
-    // Still in the header, above the item table.
+    expect(at(/^Customer Name: Acme Pvt Ltd$/)).toBeGreaterThan(-1);
+    expect(at(/^Customer GSTIN: 29ABCDE1234F1Z5$/)).toBe(at(/^Customer Name: /) + 1);
+    // Above the date / bill-no block and the items, as on the client's paper.
+    expect(at(/^Customer GSTIN: /)).toBeLessThan(at(/Date: 06\/09\/26 21:06/));
+    expect(at(/^Customer GSTIN: /)).toBeLessThan(at(/Bill No\.: 5910/));
     expect(at(/^Customer GSTIN: /)).toBeLessThan(at(/Kronos/));
+    // The name is printed ONCE — no second customer line lower down.
+    expect(lines.filter((l) => /^Customer( Name)?: /.test(l))).toHaveLength(1);
     // The restaurant's own GSTIN label is untouched and distinct.
     expect(out).not.toMatch(/GSTN : 29ABCDE1234F1Z5/);
   });
 
-  test.each(["Guest", "QR Guest", "guest", "", "null", null, undefined])("name %p prints no Customer line", (name) => {
+  test.each(["Guest", "", null, undefined])("name %p keeps the slot reading Guest, with no GSTIN line", (name) => {
     const out = printed(buildReceiptBase64({ ...bill, customer: name as string | null | undefined }));
-    expect(out).not.toMatch(/^Customer: /m);
+    expect(out).toMatch(/^Customer Name: Guest$/m);
+    expect(out).not.toContain("Customer GSTIN");
   });
 
   test("no GSTIN prints no GSTIN line — not a bare label", () => {
     for (const g of [null, undefined, "", "null"]) {
       const out = printed(buildReceiptBase64({ ...bill, customer: "Acme", customerGstin: g }));
-      expect(out).toMatch(/^Customer: Acme$/m);
+      expect(out).toMatch(/^Customer Name: Acme$/m);
       expect(out).not.toContain("Customer GSTIN");
     }
   });
@@ -567,27 +567,24 @@ describe("the thermal bill prints who the invoice is made out to", () => {
   test("a GSTIN with a Guest name still prints the GSTIN", () => {
     const out = printed(buildReceiptBase64({ ...bill, customer: "Guest", customerGstin: GSTIN }));
     expect(out).toMatch(/^Customer GSTIN: 29ABCDE1234F1Z5$/m);
-    expect(out).not.toMatch(/^Customer: /m);
   });
 
   test("a long name wraps inside the 58mm roll instead of running off it", () => {
     const name = "Navkrish Hospitality Private Limited Corporate Account";
     const out = printed(buildReceiptBase64({ ...bill, customer: name, customerGstin: GSTIN }, 32));
-    // From the new Customer line down (the pre-existing "Customer Name:" line
-    // above the date is not this block's).
     const lines = out.split("\n");
-    const from = lines.findIndex((l) => l.startsWith("Customer: "));
+    const from = lines.findIndex((l) => l.startsWith("Customer Name: "));
+    const to = lines.findIndex((l) => l.startsWith("Customer GSTIN: "));
     expect(from).toBeGreaterThan(-1);
-    const block = lines.slice(from, lines.findIndex((l, i) => i > from && l.startsWith("Customer GSTIN: ")) + 1);
+    const block = lines.slice(from, to + 1);
     expect(block.join(" ")).toContain("Corporate Account");
     for (const l of block) { expect(l.length).toBeLessThanOrEqual(32); }
-    expect(out).toMatch(/^Customer GSTIN: 29ABCDE1234F1Z5$/m); // 31 chars: fits 58mm
   });
 
   test("the KOT never carries them", () => {
     const out = printed(buildReceiptBase64({ ...bill, kind: "kot", customer: "Acme", customerGstin: GSTIN }));
     expect(out).not.toContain("Customer GSTIN");
-    expect(out).not.toMatch(/^Customer: /m);
+    expect(out).not.toMatch(/^Customer( Name)?: /m);
   });
 
   test("every part of a split bill carries them (the bill's identity, not a part's)", () => {

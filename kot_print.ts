@@ -420,8 +420,8 @@ async function withStations(restaurantId: string, items: KotLine[]): Promise<(Ko
     };
     // THE ONE PLACE A MERGED LINE BECOMES TWO DOCKET LINES. "Paneer Tikka x3, of
     // which 1 is held" is one line on the bill and two on the docket: two to
-    // cook now, one waiting under the hold banner. A line that is wholly held
-    // produces exactly one line, in the hold block; a line with no hold produces
+    // cook now, one marked "[Hold]" under itself (escpos.ts). A line that is
+    // wholly held produces exactly one, held, line; a line with no hold produces
     // exactly one line and does not even carry the `held` key, so a restaurant
     // that never holds a course gets the object it always got.
     const quantity = Math.max(1, Math.round(Number(it.quantity) || 1));
