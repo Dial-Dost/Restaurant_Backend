@@ -6,9 +6,10 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type SplitReceiptPart } from "../escpos.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
+import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { logger } from "../observability.js";
 import { hidesPrices, redactOpenBillPage } from "../price_scope.js";
@@ -912,6 +913,32 @@ async function refuseWaiterBillReprint(
 }
 
 
+// Round 2 item 1 — `customer_gstin` as both bill-name routes read it off a body.
+// ABSENT is undefined (leave it unchanged), which is not the same as null (clear
+// it): an old client that never sends the key must not wipe a GSTIN. A value
+// that is present but not a GSTIN is INVALID_GSTIN, answered 400 before anything
+// is written.
+const INVALID_GSTIN = Symbol("invalid_gstin");
+function customerGstinFromBody(body: Record<string, unknown>): string | null | undefined | typeof INVALID_GSTIN {
+	if (!Object.prototype.hasOwnProperty.call(body, "customer_gstin") || body.customer_gstin === undefined) { return undefined; }
+	const r = normalizeCustomerGstin(body.customer_gstin);
+	return r.ok ? r.value : INVALID_GSTIN;
+}
+
+/** The two GSTIN refusals the data layer can raise, as their HTTP answers. True when it answered. */
+function sendCustomerGstinError(res: Response, err: unknown): boolean {
+	const name = (err as { name?: unknown } | null)?.name;
+	if (err instanceof CustomerGstinSchemaPendingError || name === "CustomerGstinSchemaPendingError") {
+		res.status(503).json({ error: (err as Error).message });
+		return true;
+	}
+	if (err instanceof CustomerGstinInvalidError || name === "CustomerGstinInvalidError") {
+		res.status(400).json({ error: CUSTOMER_GSTIN_ERROR });
+		return true;
+	}
+	return false;
+}
+
 export function registerBillPrintAndEditRoutes(app: Express): void {
 
 // Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
@@ -1217,6 +1244,7 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			items: bill.items,
 			total: charges.subtotal,
 			customer: bill.customer,
+			customerGstin: bill.customer_gstin ?? null,
 			billNo: bill.bill_no,
 			cashier: cashier || null,
 			discount: charges.discount > 0 ? { amount: charges.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
@@ -1580,6 +1608,7 @@ app.post('/print/bill/settled', validateAction(ACCOUNTING_PERM), async (req: Req
 			// The pre-discount line total, as the settled bill reconstructed it.
 			total: bill.items_subtotal,
 			customer: bill.customer,
+			customerGstin: bill.customer_gstin ?? null,
 			billNo: bill.bill_no,
 			cashier: bill.created_by ?? null,
 			discount: (bill.discount_amount ?? 0) > 0
@@ -1983,6 +2012,11 @@ app.post('/bills/apply-coupon', validateAction("4ad474d4-5230-449c-874f-6a238b83
 // order is placed, so requiring something stronger to CORRECT a typo would only
 // mean the wrong name stays on the paper. A settled bill is refused inside
 // SetBillCustomerName by the same assertBillEditable every other edit meets.
+//
+// Round 2 item 1 — `customer_gstin` rides along. OMITTED LEAVES IT UNCHANGED, so
+// a till built before the field existed renames a bill without wiping a GSTIN;
+// null or "" clears it. The response gains `customer_gstin` and nothing else
+// moves.
 app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -1990,20 +2024,75 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
 	const customer = typeof body.customer === "string" ? body.customer : "";
 	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
+	const gstin = customerGstinFromBody(body);
+	if (gstin === INVALID_GSTIN) { res.status(400).json({ error: CUSTOMER_GSTIN_ERROR }); return; }
 	try {
-		const result = await SetBillCustomerName(restaurantId, tableName, customer);
+		const result = await SetBillCustomerName(restaurantId, tableName, customer, gstin);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: tableName }); } catch {/* ignore */}
 		try {
+			const nameLine = result.customer
+				? `Set the bill name on table ${tableName} to "${result.customer}"`
+				: `Cleared the bill name on table ${tableName}`;
+			const gstinLine = gstin === undefined ? "" : (gstin ? ` (GSTIN ${gstin})` : " (GSTIN cleared)");
 			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
-				result.customer
-					? `Set the bill name on table ${tableName} to "${result.customer}"`
-					: `Cleared the bill name on table ${tableName}`,
-				Audit_log_category.Bill, { table: tableName, customer: result.customer });
+				`${nameLine}${gstinLine}`,
+				Audit_log_category.Bill,
+				{ table: tableName, customer: result.customer, ...(gstin === undefined ? {} : { customer_gstin: gstin }) });
 		} catch {/* ignore */}
 		res.json(result);
 	} catch (e: any) {
+		if (sendCustomerGstinError(res, e)) { return; }
 		logger.error({ err: e }, 'set_bill_customer_name_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to change the name on this bill') });
+	}
+});
+
+/*
+	Round 2 item 1 — THE NAME AND GSTIN ON A PAST (SETTLED) BILL, from Accounting.
+
+	POST /bills/:billId/customer-details  body { "customer": "...", "customer_gstin": "..." | null }
+	  -> 200 { success: true, bill_id, customer, customer_gstin }
+	  -> 400 { error: "GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5" }
+	  -> 404 { error: "Bill not found" }       not a settled bill of this tenant
+	  -> 503 { error: "This server has not finished updating — try again shortly" }
+	                                           a GSTIN write before migration 046
+
+	WHO MAY DO IT: ACCOUNTING_PERM — exactly what E5's /print/bill/settled
+	requires, because the button lives beside that reprint in the same past-bills
+	screen, and whoever may put a second copy of this invoice on paper is whoever
+	may correct who it is made out to. A waiter does not hold it and gets
+	validateAction's 403. /bills/customer-name stays the waiter's door for the
+	RUNNING bill, and still refuses a settled one.
+
+	WHAT IT CHANGES: the name and the GSTIN, nothing else — see
+	SetClosedBillCustomerDetails. `customer_gstin` omitted leaves it unchanged, the
+	same rule as the live route, so a name-only correction works before 046.
+*/
+app.post('/bills/:billId/customer-details', validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const billId = String(req.params.billId ?? "").trim();
+	if (!billId) { res.status(404).json({ error: "Bill not found" }); return; }
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const customer = typeof body.customer === "string" ? body.customer : "";
+	const gstin = customerGstinFromBody(body);
+	if (gstin === INVALID_GSTIN) { res.status(400).json({ error: CUSTOMER_GSTIN_ERROR }); return; }
+	try {
+		const result = await SetClosedBillCustomerDetails(restaurantId, billId, customer, gstin);
+		if (!result) { res.status(404).json({ error: "Bill not found" }); return; }
+		try {
+			const what = gstin === undefined ? "name" : "name/GSTIN";
+			await log_audit(req, ACCOUNTING_PERM,
+				`Changed the ${what} on bill #${result.bill_no ?? result.bill_id}${result.table_name ? ` (table ${result.table_name})` : ""} \u2014 ` +
+					`name "${result.customer ?? "Guest"}"${gstin === undefined ? "" : `, GSTIN ${result.customer_gstin ?? "cleared"}`}`,
+				Audit_log_category.Bill,
+				{ bill_id: result.bill_id, bill_no: result.bill_no, customer: result.customer, ...(gstin === undefined ? {} : { customer_gstin: result.customer_gstin }), settled_bill_edit: true });
+		} catch {/* a failed audit write must never fail the edit */}
+		res.json({ success: true, bill_id: result.bill_id, customer: result.customer, customer_gstin: result.customer_gstin });
+	} catch (e: any) {
+		if (sendCustomerGstinError(res, e)) { return; }
+		logger.error({ err: e }, 'set_closed_bill_customer_details_failed');
+		res.status(500).json({ error: 'Unable to change the details on this bill' });
 	}
 });
 
@@ -2236,6 +2325,7 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			items: bill.items,
 			total: bill.subtotal,
 			customer: bill.customer,
+			customerGstin: bill.customer_gstin ?? null,
 			billNo: bill.bill_no,
 			discount: bill.discount > 0 ? { amount: bill.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
 			// The bill's PERCENTAGE; each part carries its own share as the amount.

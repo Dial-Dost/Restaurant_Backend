@@ -101,6 +101,13 @@ export interface ReceiptOptions {
   currency: string;
   // Bill meta (bill view only) — printed in the header block like the web bill.
   customer?: string | null;
+  /**
+   * BILL ONLY (round 2 item 1): the corporate party's GSTIN, printed as
+   * "Customer GSTIN: <value>" under the bill number / token lines, beside a
+   * "Customer: <name>" line. Pre-normalized by the caller (customer_gstin.ts).
+   * Absent prints NOTHING — the same rule `gstin` obeys for the restaurant's own.
+   */
+  customerGstin?: string | null;
   billNo?: string | null;
   cashier?: string | null;
   /**
@@ -623,6 +630,18 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     if (tokens.length > 0) {
       for (const l of wrapText(`Token No.: ${tokens.join(", ")}`, width)) {line(l);}
     }
+    // ROUND 2 ITEM 1 — WHO THIS INVOICE IS MADE OUT TO, under the bill number,
+    // date and table. Each line only when there is something to say: "Guest" /
+    // "QR Guest" are the placeholders an order is written with when nobody typed
+    // a name, and printing them here would read as a named party. The name is
+    // wrapped (it is capped at 120 characters, not at the paper width); a GSTIN
+    // is always 15 and fits either roll.
+    const customerName = present(opts.customer);
+    if (customerName && !/^(qr )?guest$/i.test(customerName)) {
+      for (const l of wrapText(`Customer: ${customerName}`, width)) {line(l);}
+    }
+    const customerGstin = present(opts.customerGstin);
+    if (customerGstin) {line(`Customer GSTIN: ${customerGstin}`);}
   }
   line(sep);
 

@@ -28,6 +28,7 @@ import sharp from "sharp";
 import { downloadFile } from "./storage_bucket_supabase.js";
 import { signTable, encodeTableToken } from "./qr_signing.js";
 import { MOBILE_10_ERROR, normalizeMobile10 } from "./phone_validation.js";
+import { CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "./customer_gstin.js";
 // The renderer owns the QR-note default and its length cap, so the settings
 // layer serves the same two values every print path already obeys rather than
 // keeping a second copy that could drift.
@@ -4329,7 +4330,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -4419,6 +4420,10 @@ export async function GetBillForTable(
   // gets byte-identical items out of this function.
   const heldByKey = new Map<string, number>();
   let billCustomer = "";
+  // Round 2 item 1: the customer's GSTIN, first non-empty across the seating's
+  // orders — the carrier every GSTIN writer always writes (see the migration
+  // 046 block beside SetBillCustomerName).
+  let billCustomerGstin = "";
   let ncTotal = 0;
   // THE ORDER-LEVEL NOTES ON THIS TABLE, one per contributing order, in the
   // order they were placed and de-duplicated.
@@ -4440,6 +4445,7 @@ export async function GetBillForTable(
       const c = String((f).customer ?? "").trim();
       if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") {billCustomer = c;}
     }
+    if (!billCustomerGstin) {billCustomerGstin = foodCustomerGstin(f);}
     const orderNote = String((f).note ?? "").trim();
     if (orderNote && !orderNotes.includes(orderNote)) {orderNotes.push(orderNote);}
     const list = Array.isArray((f).items) ? (f as { items: unknown[] }).items : [];
@@ -4638,6 +4644,8 @@ export async function GetBillForTable(
     screenshot_url: bill?.payment_proof_screenshot_url ?? null,
     bill_no: bill?.bill_no ?? null,
     customer: billCustomer || null,
+    // NOT MONEY, so C4's waiter redaction leaves it on the payload.
+    customer_gstin: billCustomerGstin || null,
     coupon_code: bill?.coupon_code ?? null,
     // When each step of the OPEN bill happened. All UTC instants; the caller
     // renders them in the restaurant's timezone (GET /restaurant/settings).
@@ -14248,12 +14256,27 @@ export async function SetBillItemNote(
  *
  * Blank CLEARS rather than storing an empty string, so the bill falls back to
  * the header it had before anybody typed a name.
+ *
+ * ----------------------------------------------------------------------------
+ * ROUND 2 ITEM 1 — THE CUSTOMER'S GSTIN RIDES WITH THE NAME
+ * ----------------------------------------------------------------------------
+ * `rawGstin` UNDEFINED LEAVES THE GSTIN ALONE, so every client written before the
+ * field existed keeps renaming bills without wiping a GSTIN somebody else typed.
+ * null or "" clears it. See writeCustomerGstinToFood for where it lives and
+ * why, and billCustomerGstinColumnPresent for the 503 on an unmigrated database.
  */
 export async function SetBillCustomerName(
   restaurantId: string,
   tableName: string,
   rawName: string,
-): Promise<{ success: true; customer: string | null; orders_updated: number }> {
+  rawGstin?: string | null,
+): Promise<{ success: true; customer: string | null; customer_gstin: string | null; orders_updated: number }> {
+  const gstin = resolveCustomerGstinInput(rawGstin);
+  // Asked BEFORE the transaction opens, and of the catalogue rather than of the
+  // column: a refused GSTIN write must refuse without having renamed anything.
+  if (gstin !== undefined && !(await billCustomerGstinColumnPresent())) {
+    throw new CustomerGstinSchemaPendingError();
+  }
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const tableId = await tableIdByName(context, tableName, client);
@@ -14263,7 +14286,7 @@ export async function SetBillCustomerName(
     // 120 is the printed header's practical width at 32 columns with wrapping;
     // beyond that the name stops being a name and starts being a paragraph on a
     // thermal roll.
-    const name = String(rawName ?? "").trim().replace(/\s+/g, " ").slice(0, 120);
+    const name = normalizeBillCustomerName(rawName);
 
     const orders = await runQuery<{ id: string; food: unknown }>(
       `select id, food from "Orders"
@@ -14281,8 +14304,8 @@ export async function SetBillCustomerName(
       // "Guest" is what AddOrder writes when nobody typed a name, so CLEARING
       // restores that rather than leaving an empty header.
       const next = name || "Guest";
-      if (String(f.customer ?? "") === next) {continue;}
-      const newFood: Record<string, any> = { ...f, customer: next };
+      const newFood = writeCustomerGstinToFood({ ...f, customer: next }, gstin);
+      if (String(f.customer ?? "") === next && foodCustomerGstin(f) === foodCustomerGstin(newFood)) {continue;}
       await runQuery(
         `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
         [o.id, context.res_id, context.outlet_id, JSON.stringify(newFood)],
@@ -14290,7 +14313,262 @@ export async function SetBillCustomerName(
       );
       updated += 1;
     }
-    return { success: true, customer: name || null, orders_updated: updated };
+    // The table's OPEN "Bills" row, when one has been generated, carries the
+    // GSTIN too — so the number is already on the row when this bill settles.
+    // No open row is the common case (the row is minted by print/confirm), and
+    // the orders above are then the only carrier; every reader falls back to
+    // them. The column is known to exist: it was asked above.
+    if (gstin !== undefined) {
+      await runQuery(
+        `update "Bills" set customer_gstin = $4
+           where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null`,
+        [tableId, context.res_id, context.outlet_id, gstin],
+        client,
+      );
+    }
+    const current = gstin !== undefined
+      ? gstin
+      : (orders.map((o) => foodCustomerGstin(parseJsonObject(o.food) ?? {})).find((g) => g) || null);
+    return { success: true, customer: name || null, customer_gstin: current, orders_updated: updated };
+  });
+}
+
+// --- Round 2 item 1: the customer's GSTIN (migration 046) --------------------
+//
+// WHERE IT LIVES, AND WHY TWO PLACES.
+//
+//   "Orders".food.customer_gstin   beside food.customer, on every order of the
+//                                  seating — the SAME carrier the name uses, for
+//                                  the same reason (H6 above): a running table
+//                                  usually has NO "Bills" row yet, so there is
+//                                  nowhere else to put it.
+//   "Bills".customer_gstin (046)   the settled invoice's own record, written
+//                                  whenever there is a row to write it on — the
+//                                  column a GST (B2B) export will select.
+//
+// READ RULE: on a SETTLED bill, the row's column when it holds a value, else the
+// first order on the bill that carries one — the same "first non-empty wins" the
+// name obeys. Every writer below writes BOTH (the orders always, the row
+// whenever it exists), so the two can only disagree by the row being NULL, which
+// the fallback answers. Clearing strips both, so a cleared GSTIN cannot come
+// back from the other carrier. The RUNNING bill (GetBillForTable) reads the
+// orders alone: they are always written, and that reader is polled far too
+// often to hang a second statement off it for an answer it already has.
+//
+// A DATABASE WITHOUT 046. The build ships before the migration is applied, so
+// nothing here may assume the column:
+//   * reads ask billCustomerGstinColumnPresent first and fall back to the orders
+//     (which is null in practice: no GSTIN could have been written there without
+//     the column, see below), and still catch 42703 in case the answer is stale;
+//   * a GSTIN WRITE is refused with CustomerGstinSchemaPendingError (503) before
+//     anything is written, so a GSTIN can never be half-recorded;
+//   * a NAME-ONLY write never asks and never fails — the name has no column.
+
+/** The name rule H6 already enforced, shared by both bill-name writers. */
+function normalizeBillCustomerName(rawName: unknown): string {
+  return String(rawName ?? "").trim().replace(/\s+/g, " ").slice(0, 120);
+}
+
+/**
+ * undefined -> leave it alone; null -> clear; a string -> the normalized GSTIN.
+ * Throws CustomerGstinInvalidError for anything else. The routes validate first
+ * (so the 400 carries the exact sentence); this is the data layer refusing to
+ * trust that every future caller will.
+ */
+function resolveCustomerGstinInput(raw: unknown): string | null | undefined {
+  if (raw === undefined) {return undefined;}
+  const r = normalizeCustomerGstin(raw);
+  if (!r.ok) {throw new CustomerGstinInvalidError();}
+  return r.value;
+}
+
+/** The GSTIN an order's food blob carries, or "" — never "null"/"undefined". */
+function foodCustomerGstin(food: Record<string, unknown>): string {
+  const g = String(food.customer_gstin ?? "").trim();
+  return g.toLowerCase() === "null" || g.toLowerCase() === "undefined" ? "" : g;
+}
+
+/** A copy of `food` with the GSTIN set (string), removed (null) or untouched (undefined). */
+function writeCustomerGstinToFood(food: Record<string, any>, gstin: string | null | undefined): Record<string, any> {
+  if (gstin === undefined) {return food;}
+  const out = { ...food };
+  if (gstin) {out.customer_gstin = gstin;} else {delete out.customer_gstin;}
+  return out;
+}
+
+// THE LATCH. Asked of information_schema rather than by selecting the column,
+// because a 42703 inside an open transaction aborts the whole transaction (see
+// readSectionOrderByKey) and both writers ask from request paths. A missing
+// column is a missing ROW here, never an error.
+//
+// PRESENT IS REMEMBERED FOR GOOD; ABSENT IS RE-ASKED AFTER A MINUTE. 046 is
+// applied by hand on the VPS, possibly while this process is running, and a
+// latch that stayed false until the next restart would keep refusing GSTINs
+// the database can already hold.
+let billCustomerGstinColumn: { present: boolean; checkedAt: number } | null = null;
+const BILL_CUSTOMER_GSTIN_REPROBE_MS = 60_000;
+
+async function billCustomerGstinColumnPresent(): Promise<boolean> {
+  const now = Date.now();
+  const known = billCustomerGstinColumn;
+  if (known && (known.present || now - known.checkedAt < BILL_CUSTOMER_GSTIN_REPROBE_MS)) {return known.present;}
+  let present = false;
+  try {
+    const rows = await runQuery<{ column_name: string }>(
+      `select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'Bills' and column_name = 'customer_gstin'`,
+    );
+    present = rows.length > 0;
+  } catch (err) {
+    logger.warn({ err }, "bill_customer_gstin_probe_failed");
+  }
+  if (!present) {
+    logger.warn("Customer GSTIN is OFF — migration 046 is not applied here. Bills print without it and a GSTIN write answers 503.");
+  }
+  billCustomerGstinColumn = { present, checkedAt: now };
+  return present;
+}
+
+/** Test seam (jest only): forget what the latch learned. */
+export function resetBillCustomerGstinColumnCache(): void {
+  billCustomerGstinColumn = null;
+}
+
+/**
+ * "Bills".customer_gstin for each bill id that has one. Empty when 046 is not
+ * applied — including when the latch said it was and the column answered 42703
+ * anyway, which flips the latch rather than failing the read.
+ */
+async function readBillCustomerGstins(context: RestaurantContext, billIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = billIds.filter((id) => isUuid(id));
+  if (ids.length === 0) {return out;}
+  if (!(await billCustomerGstinColumnPresent())) {return out;}
+  try {
+    const rows = await runQuery<{ id: string; customer_gstin: string | null }>(
+      `select id, customer_gstin from "Bills"
+        where res_id = $1 and id = any($2::uuid[]) and customer_gstin is not null`,
+      [context.res_id, ids],
+    );
+    for (const r of rows) {
+      const g = String(r.customer_gstin ?? "").trim();
+      if (g) {out.set(String(r.id), g);}
+    }
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code !== "42703") {throw err;}
+    billCustomerGstinColumn = { present: false, checkedAt: Date.now() };
+    logger.warn({ err: (err as { message?: string }).message }, "bill_customer_gstin_read_failed");
+  }
+  return out;
+}
+
+/**
+ * Round 2 item 1 — CHANGE THE NAME AND/OR GSTIN ON A PAST (SETTLED) BILL, from
+ * Accounting.
+ *
+ * H6's SetBillCustomerName refuses a settled bill on purpose: its gate is the
+ * waiter's "Add Orders", and a settled bill is a tax document. This is the
+ * separate, ACCOUNTING-gated door the client asked for ("this option has to
+ * come in the past bills section in accounting") — a corporate guest who asks
+ * for their GSTIN on the invoice the next morning is the case it exists for.
+ *
+ * IT CHANGES NOTHING BUT THE TWO FIELDS. No money, no status, no bill
+ * timestamp: the statements below are one `food` rewrite per order (the name
+ * and GSTIN keys only, every other key carried through) and one
+ * `set customer_gstin` on the bill row. "Orders".updated_at still moves, because
+ * migration 021's trigger stamps every UPDATE on that table — it is a
+ * row-maintenance stamp, not a bill timestamp, and no report reads it.
+ *
+ * WHICH ORDERS. The bill's orders are not linked by id; GetClosedBill
+ * reconstructs them by time window, settled orders first and cancelled ones in
+ * the same window as a fallback. Both sets are renamed, so whichever set the
+ * reader picks, the first name it finds is the new one.
+ *
+ * `rawGstin` undefined leaves the GSTIN alone (a name-only edit works before 046).
+ * Returns null when there is no settled bill with this id for the tenant.
+ */
+export async function SetClosedBillCustomerDetails(
+  restaurantId: string,
+  billId: string,
+  rawName: string,
+  rawGstin?: string | null,
+): Promise<{ success: true; bill_id: string; bill_no: string | null; table_name: string | null; customer: string | null; customer_gstin: string | null; orders_updated: number } | null> {
+  const id = String(billId ?? "").trim();
+  // Not a uuid is not a bill — answered as "not found" rather than letting the
+  // uuid cast raise 22P02 as a 500.
+  if (!isUuid(id)) {return null;}
+  const gstin = resolveCustomerGstinInput(rawGstin);
+  if (gstin !== undefined && !(await billCustomerGstinColumnPresent())) {
+    throw new CustomerGstinSchemaPendingError();
+  }
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    await ensureBillWorkflowColumns(client);
+    const og = isAllOutlets() ? "true" : "false";
+    const rows = await runQuery<{ id: string; bill_no: string | null; table_id: string | null; table_name: string | null; closed_at: Date | null }>(
+      `select b.id, b.bill_no::text as bill_no, b.table_id, t.table_name, b.closed_at
+         from "Bills" b
+         left join "Tables" t on t.id = b.table_id and t.res_id = b.res_id and t.outlet_id = b.outlet_id
+        where b.id = $1 and b.res_id = $2 and (${og} or b.outlet_id = $3)
+          and (b.closed_at is not null or b.admin_approved_at is not null)
+        limit 1`,
+      [id, context.res_id, context.outlet_id],
+      client,
+    );
+    const row = rows[0];
+    if (!row) {return null;}
+
+    const name = normalizeBillCustomerName(rawName);
+    const next = name || "Guest";
+    // ordersForClosedBill reads only id / table_id / closed_at off the row.
+    const windowRow = row as unknown as ClosedBillRow;
+    const seen = new Set<string>();
+    const orders: { id: string; food: unknown }[] = [];
+    for (const o of await ordersForClosedBill(context, windowRow, [...SETTLED_ORDER_STATUS_CODES, "5"])) {
+      if (!seen.has(o.id)) { seen.add(o.id); orders.push(o); }
+    }
+
+    let updated = 0;
+    for (const o of orders) {
+      const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
+      const newFood = writeCustomerGstinToFood({ ...f, customer: next }, gstin);
+      if (String(f.customer ?? "") === next && foodCustomerGstin(f) === foodCustomerGstin(newFood)) {continue;}
+      await runQuery(
+        `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+        [o.id, context.res_id, context.outlet_id, JSON.stringify(newFood)],
+        client,
+      );
+      updated += 1;
+    }
+    if (gstin !== undefined) {
+      await runQuery(
+        `update "Bills" set customer_gstin = $3 where id = $1 and res_id = $2`,
+        [row.id, context.res_id, gstin],
+        client,
+      );
+    }
+    let current: string | null = gstin === undefined ? null : gstin;
+    if (gstin === undefined) {
+      // Unchanged: report what the bill carries, by the read rule.
+      if (await billCustomerGstinColumnPresent()) {
+        const stored = await runQuery<{ customer_gstin: string | null }>(
+          `select customer_gstin from "Bills" where id = $1 and res_id = $2`,
+          [row.id, context.res_id],
+          client,
+        );
+        current = String(stored[0]?.customer_gstin ?? "").trim() || null;
+      }
+      current = current ?? (orders.map((o) => foodCustomerGstin(parseJsonObject(o.food) ?? {})).find((g) => g) || null);
+    }
+    return {
+      success: true,
+      bill_id: row.id,
+      bill_no: row.bill_no == null ? null : String(row.bill_no),
+      table_name: row.table_name,
+      customer: name || null,
+      customer_gstin: current,
+      orders_updated: updated,
+    };
   });
 }
 
@@ -16022,6 +16300,10 @@ export interface ClosedBillSummary {
   // pre-discount subtotal); always a number in the detail read.
   discount_amount: number | null;
   coupon_code: string | null;
+  // Round 2 item 1 (migration 046): the corporate party's GSTIN, by the read
+  // rule in the block beside SetBillCustomerName — "Bills".customer_gstin, else
+  // the bill's orders. Null when neither carries one. Not money.
+  customer_gstin: string | null;
   refunded: boolean;
   refund_amount: number;
   apc: number | null;
@@ -16266,6 +16548,8 @@ function mapClosedBillSummary(row: ClosedBillRow, scPct = 0): ClosedBillSummary 
     discount_value: round2(parseNumeric(row.discount_value)),
     discount_amount: null, // detail read fills this in once the items are known
     coupon_code: row.coupon_code,
+    // Filled in by the list and detail readers, which know the orders.
+    customer_gstin: null,
     refunded: Boolean(row.refunded_at),
     refund_amount: round2(parseNumeric(row.refund_amount)),
     apc: covers && covers > 0 ? round2(apcBase / covers) : null,
@@ -16339,6 +16623,7 @@ interface ClosedBillItemAggregate {
   items: ClosedBillItem[];
   items_subtotal: number;
   customer: string | null;
+  customer_gstin: string | null;
   order_ids: string[];
   orders: ClosedBillDetail["orders"];
 }
@@ -16350,6 +16635,7 @@ function aggregateClosedBillOrders(
   const itemMap = new Map<string, ClosedBillItem>();
   const orders: ClosedBillDetail["orders"] = [];
   let customer = "";
+  let customerGstin = "";
   let items_subtotal = 0;
   for (const o of orderRows) {
     const food = parseJsonObject(o.food) ?? {};
@@ -16357,6 +16643,7 @@ function aggregateClosedBillOrders(
       const c = String(food.customer ?? "").trim();
       if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") {customer = c;}
     }
+    if (!customerGstin) {customerGstin = foodCustomerGstin(food);}
     const sub = parseNumeric(food.subtotal) > 0 ? parseNumeric(food.subtotal) : parseNumeric(food.total);
     items_subtotal += sub;
     const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
@@ -16393,6 +16680,7 @@ function aggregateClosedBillOrders(
     items: [...itemMap.values()],
     items_subtotal: round2(items_subtotal),
     customer: customer || null,
+    customer_gstin: customerGstin || null,
     order_ids: orderRows.map((o) => o.id),
     orders,
   };
@@ -16519,6 +16807,9 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
     taxes: charges.taxes,
     target_apc,
     customer: agg.customer,
+    // The bill row's own column first (what Accounting last wrote), else the
+    // orders this read just reconstructed.
+    customer_gstin: (await readBillCustomerGstins(context, [row.id])).get(row.id) ?? agg.customer_gstin,
     seated_at: iso(row.seated_at),
     left_at: iso(row.left_at),
     waiter_confirmed_at: iso(row.waiter_confirmed_at),
@@ -16556,6 +16847,52 @@ export interface ClosedBillListFilter {
   payment_method?: string;
   search?: string;
   include_open?: boolean;
+}
+
+/**
+ * Round 2 item 1 — the customer GSTIN for a PAGE of the closed-bill list, by the
+ * same read rule the detail read uses, in at most TWO statements per page.
+ *
+ * The list does not reconstruct orders (see below), but a GSTIN typed on the
+ * live table before the bill row existed lives only on the orders, so a
+ * column-only list would show null for a bill whose detail shows the number.
+ * The fallback walks each bill's order window in SQL instead — the identical
+ * window ordersForClosedBill uses (previous close on the table, exclusive, to
+ * this close, inclusive; the bill's own order_id for a row with no table or no
+ * close) — and touches no 046 column, so it runs on an unmigrated database too.
+ */
+async function readClosedBillListCustomerGstins(context: RestaurantContext, billIds: string[]): Promise<Map<string, string>> {
+  const out = await readBillCustomerGstins(context, billIds);
+  const missing = billIds.filter((id) => !out.has(id) && isUuid(id));
+  if (missing.length === 0) {return out;}
+  const rows = await runQuery<{ id: string; food_gstin: string | null }>(
+    `select b.id::text as id,
+            (select nullif(btrim(o.food::jsonb ->> 'customer_gstin'), '')
+               from "Orders" o
+              where o.res_id = b.res_id and o.outlet_id = b.outlet_id
+                and case
+                      when b.table_id is null or b.closed_at is null then o.id = b.order_id
+                      else o.table_id = b.table_id
+                       and coalesce(o.status::text, '1') = any($3::text[])
+                       and o.created_at <= b.closed_at
+                       and o.created_at > coalesce((
+                             select max(p.closed_at) from "Bills" p
+                              where p.table_id = b.table_id and p.res_id = b.res_id and p.outlet_id = b.outlet_id
+                                and p.id <> b.id and p.closed_at is not null and p.closed_at <= b.closed_at
+                           ), 'epoch'::timestamptz)
+                    end
+                and nullif(btrim(o.food::jsonb ->> 'customer_gstin'), '') is not null
+              order by o.created_at asc
+              limit 1) as food_gstin
+       from "Bills" b
+      where b.res_id = $1 and b.id = any($2::uuid[])`,
+    [context.res_id, missing, SETTLED_ORDER_STATUS_CODES],
+  );
+  for (const r of rows) {
+    const g = String(r.food_gstin ?? "").trim();
+    if (g && g.toLowerCase() !== "null") {out.set(String(r.id), g);}
+  }
+  return out;
 }
 
 /**
@@ -16619,7 +16956,8 @@ export async function ListClosedBills(
   // The service-charge percent is read ONCE for the page (not per row) so the
   // list's charge split matches the detail read's.
   const scPct = await getServiceChargePercent(context.res_id).catch(() => 0);
-  const bills = rows.map((row) => mapClosedBillSummary(row, scPct));
+  const gstins = await readClosedBillListCustomerGstins(context, rows.map((row) => row.id));
+  const bills = rows.map((row) => ({ ...mapClosedBillSummary(row, scPct), customer_gstin: gstins.get(row.id) ?? null }));
 
   return { bills, total, limit, offset, has_more: offset + bills.length < total };
 }
