@@ -43,7 +43,7 @@ const NOT_ACTIONS = new Set<string>([
 
 /** Directories that are not shipped server code. */
 const SKIP_DIRS = new Set([
-  "node_modules", "build", "jest-tests", "test", "scripts", "migrations", "docs",
+  "node_modules", "build", "jest-tests", "test", "scripts", "migrations", "migrations_manual", "docs",
   "C_Sharp_temp_printer_server", "Python_servers", "deploy",
 ]);
 
@@ -92,10 +92,16 @@ function actionInserts(sql: string): SeedRow[] {
 }
 
 const MIGRATIONS_DIR = join(ROOT, "migrations");
-const migrationFiles = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith(".sql")).sort();
+// 045 lives in migrations_manual/ until the VPS can apply migrations itself (see
+// that file's header). It still seeds the catalogue, so it still counts here.
+const MANUAL_DIR = join(ROOT, "migrations_manual");
+const migrationFiles = [MIGRATIONS_DIR, MANUAL_DIR]
+  .flatMap((dir) => readdirSync(dir).filter((f) => f.endsWith(".sql")).map((f) => join(dir, f)))
+  .sort((a, b) => a.split("/").pop()!.localeCompare(b.split("/").pop()!));
 const seeded = new Map<string, SeedRow & { file: string }>();
-for (const file of migrationFiles) {
-  for (const row of actionInserts(readFileSync(join(MIGRATIONS_DIR, file), "utf8"))) {
+for (const path of migrationFiles) {
+  const file = path.split("/").pop()!;
+  for (const row of actionInserts(readFileSync(path, "utf8"))) {
     if (!seeded.has(row.id)) { seeded.set(row.id, { ...row, file }); }
   }
 }
@@ -133,7 +139,7 @@ describe("the Actions catalogue a migrated database starts with", () => {
   });
 
   test("045 only INSERTs, and only ON CONFLICT DO NOTHING — a production row is never renamed", () => {
-    const sql = readFileSync(join(MIGRATIONS_DIR, "045_seed_actions_catalog.sql"), "utf8")
+    const sql = readFileSync(join(MANUAL_DIR, "045_seed_actions_catalog.sql"), "utf8")
       .split("\n").filter((l) => !l.trim().startsWith("--")).join("\n");
     // Statement keywords at the start of a line, not the words inside action names.
     expect(sql).not.toMatch(/^\s*(UPDATE|DELETE|ALTER|DROP)\b/m);
