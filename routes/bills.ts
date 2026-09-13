@@ -1445,6 +1445,40 @@ app.post('/print/bill/claim', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			// single attempt, so it only moves when there was no earlier one.
 			bill_printed_at: bill.print_count === 0 ? (recorded?.created_at ?? bill.bill_printed_at) : bill.bill_printed_at,
 			printed_at: recorded?.created_at ?? bill.printed_at,
+			// THE PRICED BILL, BECAUSE THIS IS THE GUEST'S RECEIPT.
+			//
+			// THE BUG THIS CLOSES, found in a live browser pass: on the web
+			// dashboard a waiter could not print a bill at all. The print page
+			// builds the receipt from the open bill, reading GET /bill-for-table AS
+			// THE SIGNED-IN USER — and for a waiter that read is redacted by C4, so
+			// `grand_total` arrives absent, the page's `Number.isFinite` gate fails,
+			// and it refuses with "No bill is available for this order yet". It
+			// refuses rather than printing zeros, which is right; it just meant no
+			// waiter on the web could ever produce paper. Worse, this claim had
+			// already spent their single attempt by then.
+			//
+			// WHY RETURNING AMOUNTS HERE DOES NOT UNDO C4. C4 is scoped to the
+			// ORDER-TAKING screen: "remove the prices from the list of ordered
+			// dishes displayed on the right side". A printed bill is a different
+			// artifact with a different reader — the guest — and a bill without
+			// amounts is not a bill. The waiter will see these figures on the paper
+			// they hand over; that was always true of every printed receipt.
+			//
+			// WHY HERE, AND NOT BY UN-REDACTING /bill-for-table. That route is read
+			// continuously by the order-taking screen, which is exactly where C4
+			// applies. This route is the one moment a waiter is AUTHORISED TO PRINT,
+			// it already enforced the once-only rule above, and a waiter-only
+			// session can only succeed at it once per seating. So the amounts
+			// reach a waiter exactly once, at the instant they are needed for
+			// paper, and never on the screen they take orders from.
+			//
+			// Sent on the UNRECORDED path too. That path means migration 027 is
+			// absent, so the print could not be written to the ledger — but the
+			// once-only gate above had already passed, and the gate is what
+			// authorises a print; the ledger is bookkeeping. Withholding the bill
+			// there would leave a waiter unable to produce paper on exactly the
+			// database where nothing else is stopping them.
+			printable_bill: bill,
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_claim_failed');

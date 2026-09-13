@@ -253,6 +253,63 @@ describe("the dashboard's print becomes a fact on the server", () => {
 });
 
 // ---------------------------------------------------------------------------
+// FOUND IN A LIVE BROWSER PASS: no waiter on the web could ever print a bill.
+//
+// The dashboard's print page builds the receipt from the open bill, reading
+// GET /bill-for-table AS THE SIGNED-IN USER. For a waiter C4 redacts that read,
+// so grand_total arrives absent, the page's Number.isFinite gate fails, and it
+// refuses with "No bill is available for this order yet" — after this very
+// claim had already spent the waiter's single attempt. Every unit test passed;
+// only clicking through as a waiter showed it.
+//
+// The claim is the one moment a waiter is AUTHORISED to print, so it hands back
+// the priced bill. C4 is scoped to the order-taking screen, not to the receipt
+// the guest takes home, and a bill without amounts is not a bill.
+describe("the claim hands back the PRICED bill, because paper needs amounts", () => {
+  test("a waiter's successful claim carries the full, unredacted bill", async () => {
+    GetBillForTable.mockResolvedValue(billWith(0));
+    const r = await claim(WAITER);
+    expect(r.status).toBe(200);
+    const printable = asMap(asMap(r.body).printable_bill);
+    // The figures the print page's gate requires — present, and not zeroed.
+    expect(printable.subtotal).toBe(4250);
+    expect(printable.total_amt).toBe(4250);
+    const items = printable.items as Array<Record<string, unknown>>;
+    expect(items).toHaveLength(1);
+    expect(items[0].price).toBe(425);
+  });
+
+  test("a senior's claim carries it too — one code path, not a waiter special case", async () => {
+    GetBillForTable.mockResolvedValue(billWith(0));
+    const r = await claim(identity("manager", ["manager"]));
+    expect(r.status).toBe(200);
+    expect(asMap(asMap(r.body).printable_bill).subtotal).toBe(4250);
+  });
+
+  test("a REFUSED claim hands over no amounts — the gate still decides who gets them", async () => {
+    // A waiter's second attempt. If the priced bill leaked on the 403 path, the
+    // once-only rule would stop the paper but not the prices, which would make
+    // this claim the easiest way for a waiter to read any table's total.
+    GetBillForTable.mockResolvedValue(billWith(1));
+    const r = await claim(WAITER);
+    expect(isReprintRefusal(r)).toBe(true);
+    expect(asMap(r.body).printable_bill).toBeUndefined();
+  });
+
+  test("migration 027 missing still hands over the bill — the gate authorised the print", async () => {
+    // recorded:false means the LEDGER could not be written, not that the print
+    // was unauthorised. Withholding the bill here would leave a waiter unable to
+    // produce paper on exactly the database where nothing else stops them.
+    GetBillForTable.mockResolvedValue(billWith(0));
+    RecordClientRenderedBillPrint.mockRejectedValue(Object.assign(new Error("relation does not exist"), { code: "42P01" }));
+    const r = await claim(WAITER);
+    expect(r.status).toBe(200);
+    expect(asMap(r.body).recorded).toBe(false);
+    expect(asMap(asMap(r.body).printable_bill).subtotal).toBe(4250);
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe("the SECOND dashboard print is somebody else's, exactly as on a tablet", () => {
   test("a waiter's second claim is refused and NOTHING IS RECORDED", async () => {
     GetBillForTable.mockResolvedValue(billWith(1));
