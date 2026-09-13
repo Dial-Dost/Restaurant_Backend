@@ -228,6 +228,41 @@ export const REDACTED_TABLE_ROW_MONEY_KEYS: readonly string[] = [
 	"table_total", "table_apc", "target_apc",
 ];
 
+/**
+ * The money keys on the GET /bills/open ENVELOPE — the floor-wide sums.
+ *
+ * 6.4's live-gross box reads `running_total`, and `outstanding_total` is the
+ * same kind of figure over billed tables only. Both are the restaurant's money
+ * across every table at once, which is strictly more than the one table's bill
+ * a waiter is already refused. The COUNTS (`total`, `running_tables`) stay: how
+ * many tables are running is floor work, the same line the Flutter Overview
+ * draws on its open-bills tile.
+ */
+export const REDACTED_OPEN_BILLS_MONEY_KEYS: readonly string[] = ["outstanding_total", "running_total"];
+
+/**
+ * The money keys on ONE row of GET /bills/open, beyond REDACTED_BILL_MONEY_KEYS.
+ * `taxable_base` is the post-discount subtotal under another name, and with it
+ * present the redaction of `subtotal` would hide nothing.
+ */
+export const REDACTED_OPEN_BILL_ROW_MONEY_KEYS: readonly string[] = [...REDACTED_BILL_MONEY_KEYS, "taxable_base"];
+
+/** GET /bills/open, as a waiter-only session is told it. Non-objects pass through. */
+export function redactOpenBillPage(page: unknown): unknown {
+	if (page === null || typeof page !== "object" || Array.isArray(page)) { return page; }
+	const src = page as Record<string, unknown>;
+	const out = without(src, REDACTED_OPEN_BILLS_MONEY_KEYS);
+	if (Array.isArray(src.bills)) {
+		out.bills = src.bills.map((b) => {
+			if (b === null || typeof b !== "object" || Array.isArray(b)) { return b; }
+			const row = without(b as Record<string, unknown>, REDACTED_OPEN_BILL_ROW_MONEY_KEYS);
+			if ("taxes" in (b as Record<string, unknown>)) { row.taxes = redactTaxes((b as Record<string, unknown>).taxes); }
+			return row;
+		});
+	}
+	return out;
+}
+
 /** The money keys on an OrderRecord (GET /orders). */
 export const REDACTED_ORDER_MONEY_KEYS: readonly string[] = ["subtotal", "total"];
 
