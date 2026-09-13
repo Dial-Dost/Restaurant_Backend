@@ -1239,6 +1239,14 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			// valet line inside the renderer, so an unconfigured tenant is unchanged.
 			qrNote: settings.bill_qr_note ?? null,
 			logo,
+			// 5.3 / item 4 — A SECOND COPY SAYS SO, AS ITS FIRST LINE. The banner
+			// already existed in the renderer and the accounting reprint set it, but
+			// THIS route never did: a manager's reprint of an open table's bill
+			// (C3 lets anyone senior to a waiter make one) came off the roll looking
+			// exactly like the original. `print_count` is the server's ledger count
+			// of this seating's bill prints BEFORE this one — the same number C3
+			// just refused a waiter on — so a first print (0) never carries it.
+			reprint: bill.print_count > 0,
 			// THE DISCLAIMER FOLLOWS THE CHARGE, NOT ONE LEG OF IT (G2; F2 root
 			// cause 3). This predicate was `charges.service_charge > 0` — the
 			// restaurant_percent leg alone — and so carried the same blind spot as
