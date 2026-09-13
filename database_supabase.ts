@@ -14480,9 +14480,11 @@ async function readBillCustomerGstins(context: RestaurantContext, billIds: strin
  * row-maintenance stamp, not a bill timestamp, and no report reads it.
  *
  * WHICH ORDERS. The bill's orders are not linked by id; GetClosedBill
- * reconstructs them by time window, settled orders first and cancelled ones in
- * the same window as a fallback. Both sets are renamed, so whichever set the
- * reader picks, the first name it finds is the new one.
+ * reconstructs them by time window. Every order in the IDENTITY window
+ * (CLOSED_BILL_IDENTITY_STATUS_CODES: settled and cancelled) is renamed, and
+ * every settled-bill reader resolves identity from that same window, so a write
+ * reads back on the detail, the list and the settled reprint — including a
+ * released bill whose only orders are cancelled.
  *
  * `rawGstin` undefined leaves the GSTIN alone (a name-only edit works before 046).
  * Returns null when there is no settled bill with this id for the tenant.
@@ -14524,7 +14526,7 @@ export async function SetClosedBillCustomerDetails(
     const windowRow = row as unknown as ClosedBillRow;
     const seen = new Set<string>();
     const orders: { id: string; food: unknown }[] = [];
-    for (const o of await ordersForClosedBill(context, windowRow, [...SETTLED_ORDER_STATUS_CODES, "5"])) {
+    for (const o of await ordersForClosedBill(context, windowRow, CLOSED_BILL_IDENTITY_STATUS_CODES)) {
       if (!seen.has(o.id)) { seen.add(o.id); orders.push(o); }
     }
 
@@ -16354,6 +16356,22 @@ export interface ClosedBillDetail extends ClosedBillSummary {
 const SETTLED_ORDER_STATUS_CODES = ["4", "6", "7"];
 
 /**
+ * Round 2 item 1 — THE ORDERS A SETTLED BILL'S IDENTITY (name, GSTIN) LIVES ON:
+ * the settled orders AND the ones cancelled inside the same window.
+ *
+ * GetClosedBill picks its MONEY set by reconciliation — settled orders, or the
+ * cancelled-inclusive set only when that one explains the total. Identity cannot
+ * follow that rule: a RELEASED bill (table cleared without payment) has a zero
+ * total and nothing but cancelled orders, so neither set reconciles, the picked
+ * set is empty, and a name written onto those orders read back as null while
+ * the GSTIN (from the column) read back fine. So the one writer
+ * (SetClosedBillCustomerDetails) writes every order in THIS set, and every
+ * settled-bill reader resolves identity from the picked set first and from THIS
+ * set second — see closedBillIdentity and readClosedBillListCustomerGstins.
+ */
+const CLOSED_BILL_IDENTITY_STATUS_CODES = [...SETTLED_ORDER_STATUS_CODES, "5"];
+
+/**
  * Index matching the closed-bill list's ORDER BY. The base schema already indexes
  * (res_id, outlet_id, closed_at), but the list sorts on the settlement moment —
  * coalesce(closed_at, admin_approved_at, created_at) — with an id tiebreak, so it
@@ -16773,13 +16791,28 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
   // a bill whose items do not match its total. Whichever set reconciles wins; if
   // neither does, the settled-only set is kept and `totals_reconciled` is false.
   let picked = evaluate(aggregateClosedBillOrders(await ordersForClosedBill(context, row)));
+  // The cancelled-inclusive aggregate, when it was built — identity reuses it.
+  let identityAgg: ClosedBillItemAggregate | null = null;
   if (!picked.reconciled) {
     const withCancelled = evaluate(
-      aggregateClosedBillOrders(await ordersForClosedBill(context, row, [...SETTLED_ORDER_STATUS_CODES, "5"])),
+      aggregateClosedBillOrders(await ordersForClosedBill(context, row, CLOSED_BILL_IDENTITY_STATUS_CODES)),
     );
+    identityAgg = withCancelled.agg;
     if (withCancelled.reconciled) {picked = withCancelled;}
   }
   const { agg, d, discounted_subtotal, service_charge, service_charge_percent, taxable_base, reconciled } = picked;
+
+  // WHO THE BILL IS MADE OUT TO, by the identity rule (CLOSED_BILL_IDENTITY_STATUS_CODES):
+  // the picked set first, then the whole identity window — which is exactly the
+  // set SetClosedBillCustomerDetails writes, so a write always reads back. The
+  // GSTIN prefers the bill row's own column over both.
+  let customer = agg.customer;
+  let customerGstin = (await readBillCustomerGstins(context, [row.id])).get(row.id) ?? agg.customer_gstin;
+  if (!customer || !customerGstin) {
+    identityAgg = identityAgg ?? aggregateClosedBillOrders(await ordersForClosedBill(context, row, CLOSED_BILL_IDENTITY_STATUS_CODES));
+    customer = customer ?? identityAgg.customer;
+    customerGstin = customerGstin ?? identityAgg.customer_gstin;
+  }
 
   const summary = mapClosedBillSummary(row, scPct);
   const target_apc = await getTargetApc(context).catch(() => 0);
@@ -16806,10 +16839,8 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
     // into `service_charge` above so a client never renders it twice.
     taxes: charges.taxes,
     target_apc,
-    customer: agg.customer,
-    // The bill row's own column first (what Accounting last wrote), else the
-    // orders this read just reconstructed.
-    customer_gstin: (await readBillCustomerGstins(context, [row.id])).get(row.id) ?? agg.customer_gstin,
+    customer,
+    customer_gstin: customerGstin,
     seated_at: iso(row.seated_at),
     left_at: iso(row.left_at),
     waiter_confirmed_at: iso(row.waiter_confirmed_at),
@@ -16859,7 +16890,8 @@ export interface ClosedBillListFilter {
  * The fallback walks each bill's order window in SQL instead — the identical
  * window ordersForClosedBill uses (previous close on the table, exclusive, to
  * this close, inclusive; the bill's own order_id for a row with no table or no
- * close) — and touches no 046 column, so it runs on an unmigrated database too.
+ * close), over the identity statuses (CLOSED_BILL_IDENTITY_STATUS_CODES) — and
+ * touches no 046 column, so it runs on an unmigrated database too.
  */
 async function readClosedBillListCustomerGstins(context: RestaurantContext, billIds: string[]): Promise<Map<string, string>> {
   const out = await readBillCustomerGstins(context, billIds);
@@ -16882,11 +16914,13 @@ async function readClosedBillListCustomerGstins(context: RestaurantContext, bill
                            ), 'epoch'::timestamptz)
                     end
                 and nullif(btrim(o.food::jsonb ->> 'customer_gstin'), '') is not null
-              order by o.created_at asc
+              -- Settled orders before cancelled ones, then oldest first: the
+              -- detail read's "picked set, then identity window" in one ORDER BY.
+              order by (coalesce(o.status::text, '1') = '5') asc, o.created_at asc
               limit 1) as food_gstin
        from "Bills" b
       where b.res_id = $1 and b.id = any($2::uuid[])`,
-    [context.res_id, missing, SETTLED_ORDER_STATUS_CODES],
+    [context.res_id, missing, CLOSED_BILL_IDENTITY_STATUS_CODES],
   );
   for (const r of rows) {
     const g = String(r.food_gstin ?? "").trim();
