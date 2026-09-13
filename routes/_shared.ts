@@ -17,6 +17,7 @@ import { destroyAllForEmployee } from "../auth/sessions.js";
 import { getStore } from "../auth/store.js";
 import type { CustomerDemographics } from "../database_supabase.js";
 import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
+import { rasterizeBillLogo, type BillLogoRaster } from "../bill_logo.js";
 import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import type { ReportWindowQuery } from "../report_window.js";
@@ -1218,52 +1219,32 @@ export async function linkOrderToCustomer(
 // SVG bill logo (rasterized via sharp) and falling back to the PNG logo. Returns
 // null when no logo is configured or sharp is unavailable. Reused by the
 // /restaurant/logo/escpos endpoint and embedded at the top of printed bills.
+//
+// 5.1 — the pixels themselves are made in bill_logo.ts, which also hands the
+// previews a PNG of the SAME raster (buildBillLogoRaster / GET
+// /restaurant/logo/bill), so what a preview shows is what the roll prints.
 export async function buildLogoEscPos(restaurantId: string, targetWidth = 576): Promise<Buffer | null> {
-	let raw: Buffer | null = null;
+	const raster = await buildBillLogoRaster(restaurantId, targetWidth);
+	return raster ? raster.escpos : null;
+}
+
+// The source bytes a tenant's bill logo is drawn from: the stored SVG bill logo
+// when there is one, the branding PNG otherwise, null when neither exists.
+async function billLogoSource(restaurantId: string): Promise<Buffer | null> {
 	try {
 		const settings = await GetRestaurantSettings(restaurantId);
 		const svg = settings.bill_logo_svg?.trim();
-		if (svg) {raw = Buffer.from(svg, 'utf8');}
+		if (svg) {return Buffer.from(svg, 'utf8');}
 	} catch {/* ignore — fall back to the PNG logo */}
-	if (!raw) {raw = await GetRestaurantLogoRaw(restaurantId).catch(() => null);}
+	return GetRestaurantLogoRaw(restaurantId).catch(() => null);
+}
+
+export async function buildBillLogoRaster(restaurantId: string, targetWidth = 576): Promise<BillLogoRaster | null> {
+	const raw = await billLogoSource(restaurantId);
 	if (!raw) {return null;}
-
-	let sharp: any;
-	try { sharp = (await import('sharp')).default ?? (await import('sharp')); } catch (err) {
-		logger.error({ err }, 'sharp not available');
-		return null;
-	}
-
-	// Fit within the paper width (576 dots for 80mm, 384 for 58mm) AND a sane max
-	// height so a tall logo can't overflow the printer's single-raster image buffer.
-	const img = sharp(raw).flatten({ background: '#ffffff' }).resize({ width: targetWidth, height: 240, fit: 'inside', withoutEnlargement: true }).threshold(128).raw();
-	const { data, info } = await img.toBuffer({ resolveWithObject: true });
-	const width = info.width;
-	const height = info.height;
-	const widthBytes = Math.ceil(width / 8);
-
-	const bytes: number[] = [];
-	for (let y = 0; y < height; y++) {
-		for (let xb = 0; xb < widthBytes; xb++) {
-			let byte = 0;
-			for (let bit = 0; bit < 8; bit++) {
-				const x = xb * 8 + bit;
-				const idx = y * width + x;
-				const pixel = x < width ? data[idx] : 255;
-				// in thresholded raw, 0=black, 255=white
-				if (pixel === 0) {byte |= (1 << (7 - bit));}
-			}
-			bytes.push(byte);
-		}
-	}
-
-	const xL = widthBytes & 0xff;
-	const xH = (widthBytes >> 8) & 0xff;
-	const yL = height & 0xff;
-	const yH = (height >> 8) & 0xff;
-	// GS v 0 m xL xH yL yH d
-	const header = Buffer.from([0x1d, 0x76, 0x30, 0x00, xL, xH, yL, yH]);
-	return Buffer.concat([header, Buffer.from(bytes)]);
+	const raster = await rasterizeBillLogo(raw, targetWidth);
+	if (!raster) {logger.error({ restaurantId }, 'bill logo could not be rasterized (sharp unavailable or unreadable image)');}
+	return raster;
 }
 
 // --- Vendors + stock movements (purchases / wastage) ------------------------
