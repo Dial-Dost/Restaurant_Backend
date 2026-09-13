@@ -249,9 +249,10 @@ describe("buildSplitReceiptsBase64 — telling two slips apart", () => {
 
   test("the part banner is the biggest type on the slip, above the meta block", () => {
     const first = buildSplitReceiptsBase64(WHOLE, SPLIT.parts)[0]!.escBase64;
-    // ESC E 1 (bold) + ESC ! 0x30 (double width AND height) — the same treatment
-    // the CANCELLED and HOLD banners get, and for the same reason.
-    expect(decode(first)).toContain("\x1bE\x01\x1b!0** PART 1/3 **\n\x1b!\x00\x1bE\x00");
+    // ESC E 1 (bold) + ESC ! 0x38 (double width AND height, with the bold bit
+    // so `ESC !` does not switch emphasis back off) — the same treatment the
+    // CANCELLED and REPRINT banners get, and for the same reason.
+    expect(decode(first)).toContain("\x1bE\x01\x1b!8** PART 1/3 **\n\x1b!\x00\x1bE\x00");
     const page = printed(first);
     expect(page.indexOf("** PART 1/3 **")).toBeLessThan(page.indexOf("Customer Name:"));
   });

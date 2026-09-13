@@ -8,6 +8,13 @@
 const ESC = 0x1b;
 const GS = 0x1d;
 
+// `ESC ! n` print-mode bits (Epson ESC/POS). One command sets ALL of them, so a
+// size change that leaves MODE_BOLD out also switches emphasis off — see `big`.
+// Bit 0 (Font B) is never set: every line here is Font A, the larger font.
+const MODE_BOLD = 0x08; // emphasized
+const MODE_TALL = 0x10; // double height
+const MODE_WIDE = 0x20; // double width
+
 export interface ReceiptItem {
   name: string;
   quantity: number;
@@ -32,9 +39,9 @@ export interface ReceiptItem {
    * Hold-and-fire has worked in the app since it shipped — a held line is dimmed
    * on the KDS and its prep timer does not start — but the paper said nothing,
    * so the kitchen cooked it anyway and the feature was defeated by its own
-   * docket. A held line is therefore not merely annotated here: it is lifted out
-   * of the cook-now list entirely and reprinted under its own banner (see the
-   * KOT item block below).
+   * docket. A held line therefore prints an indented "[Hold] ..." line directly
+   * UNDER the dish, in the slot a kitchen note uses, and is kept out of the
+   * cook-now Total Qty (see the KOT item block below).
    *
    * Absent/false on every line of every restaurant that never holds a course,
    * which is what keeps their dockets identical to the ones printed before this
@@ -422,10 +429,42 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     const t = asciiSafe(s);
     const fits = t.length * 2 <= cols;
     raw(ESC, 0x45, 0x01);                 // bold
-    if (fits) {raw(ESC, 0x21, 0x30);}     // double width + height
+    // THE BOLD BIT RIDES IN THE SIZE COMMAND TOO. `ESC ! n` sets every print
+    // mode at once, emphasis included, so on a printer that follows the Epson
+    // spec an `ESC ! 0x30` sent after `ESC E 1` quietly turned bold back OFF —
+    // the "large and bold" REPRINT banner came out large and thin. 0x38 is
+    // double width + height + emphasized, which holds either way.
+    if (fits) {raw(ESC, 0x21, MODE_WIDE | MODE_TALL | MODE_BOLD);}
     line(t);
     if (fits) {raw(ESC, 0x21, 0x00);}
     raw(ESC, 0x45, 0x00);
+  };
+
+  /**
+   * KOT body text, one step taller than it used to be (item 3: "the font of
+   * other items on the KOT should also be increased slightly").
+   *
+   * WHY DOUBLE HEIGHT, AND WHY NOTHING SMALLER. ESC/POS has no fractional type
+   * sizes: a line is Font A (12x24 dots) or Font B (9x17), times an integer
+   * width and height multiplier. This renderer already prints Font A — the
+   * larger font — so the smallest step up the printer has is ONE multiplier, and
+   * of the two, only height leaves the columns alone:
+   *
+   *   double height: 12x48 dots per cell, still 576/12 = 48 cells on 80mm and
+   *                  384/12 = 32 on 58mm. No. 4 + Item 36 + Qty 8 = 48, and
+   *                  No. 4 + Item 22 + Qty 6 = 32 — the qty column cannot move.
+   *   double width:  24x24, i.e. 24 cells on 80mm and 16 on 58mm. No. 4 + Qty 8
+   *                  would leave a 12-cell item column on 80mm and 6 on 58mm:
+   *                  "Paneer Tikka Masala" wraps on BOTH rolls.
+   *
+   * The cost is paper — each tall line is one 48-dot row instead of 24 — and it
+   * is the cost the client asked for. Rules (the dashed separators) stay at
+   * normal height: they carry no text, and a doubled rule is only a thicker gap.
+   */
+  const tall = (s = "") => {
+    raw(ESC, 0x21, MODE_TALL);
+    line(s);
+    raw(ESC, 0x21, 0x00);
   };
 
   raw(ESC, 0x40); // initialize
@@ -457,9 +496,13 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // in it. The two things a chef actually has to read off a docket at arm's
     // length are WHICH TICKET this is and WHICH TABLE it feeds, and both were
     // printed in body text. The name stays (a shared printer serves more than one
-    // outlet) but it prints bold at normal size, and the big type is spent below.
+    // outlet) but it prints bold at body size, and the big type is spent below.
+    // Body size on a docket is now double HEIGHT (item 3, see `tall`), with the
+    // bold bit carried inside the size command for the reason `big` gives.
     raw(ESC, 0x45, 0x01); // bold
+    raw(ESC, 0x21, MODE_TALL | MODE_BOLD);
     line(opts.restaurantName || "Receipt");
+    raw(ESC, 0x21, 0x00);
     raw(ESC, 0x45, 0x00);
   } else {
     raw(ESC, 0x21, 0x30); // double width + height
@@ -478,7 +521,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // on a 58mm roll.
     if (opts.cancelled === true) {
       big("** CANCELLED **", width);
-      line("DO NOT COOK — THIS TICKET IS OFF");
+      tall("DO NOT COOK — THIS TICKET IS OFF");
       line(sep);
     }
     // Context first, then the ticket's own identity — the order the reference
@@ -486,7 +529,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // of order this is, which ticket it is, when it was fired, and which station
     // it belongs to.
     const context = present(opts.orderContext);
-    if (context) {line(context);}
+    if (context) {tall(context);}
     // ONE IDENTITY LINE, IN THE BIGGEST TYPE ON THE DOCKET.
     //
     // This was two lines — a bold "KOT" and, under it, "KOT - 26" — which said
@@ -500,8 +543,8 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // Restaurant-zone stamp when the caller resolved one. The server-clock
     // fallback is what every ticket printed before kotStamp existed, kept so a
     // caller that has not been updated still prints a time rather than nothing.
-    line(present(opts.printedAt) || new Date().toLocaleString());
-    if (opts.station?.trim()) {line(`[ ${opts.station.trim().toUpperCase()} ]`);}
+    tall(present(opts.printedAt) || new Date().toLocaleString());
+    if (opts.station?.trim()) {tall(`[ ${opts.station.trim().toUpperCase()} ]`);}
   }
   if (!isKot) {
     // Legal entity, address, tax registration — EACH ONLY WHEN THE TENANT HAS
@@ -574,22 +617,22 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // configured the mode stands alone rather than repeating itself.
     const mode = present(opts.serviceMode) || "Dine In";
     const section = present(opts.section);
-    line(section ? `${mode}: ${section}` : mode);
+    tall(section ? `${mode}: ${section}` : mode);
     // Covers, counted ONCE PER TABLE ("Tables".num_covers) — the same number the
     // bill divides by for APC, so the kitchen and the till never disagree about
     // how many people are sitting there. Printed only when the table actually
     // records covers: defaulting an unknown count to 1 told the kitchen a
     // party size nobody had entered.
     const covers = Math.round(Number(opts.covers) || 0);
-    if (covers > 0) {line(`Persons - ${covers}`);}
+    if (covers > 0) {tall(`Persons - ${covers}`);}
     // WHO is looking after it. Each line only when that person is known; an
     // unassigned table prints neither, instead of two empty labels.
     const assignedTo = present(opts.assignedTo);
     const captain = present(opts.captain);
     if (assignedTo || captain) {
       line(sep);
-      if (assignedTo) {line(`Assign to: ${assignedTo}`);}
-      if (captain) {line(`Captain: ${captain}`);}
+      if (assignedTo) {tall(`Assign to: ${assignedTo}`);}
+      if (captain) {tall(`Captain: ${captain}`);}
     }
   } else {
     // The SAME restaurant-zone stamp the KOT uses. This used to be
@@ -630,9 +673,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   //
   // Above the item table, under its own banner, because it qualifies every line
   // below it. The banner is what the eye catches across a pass; the wrapped
-  // text underneath is what removes the doubt — the same division the HOLD
-  // block uses, and for the same reason: a docket is read standing up, at a
-  // glance, and an instruction that has to be hunted for will be missed.
+  // text underneath is what removes the doubt, because a docket is read
+  // standing up, at a glance, and an instruction that has to be hunted for will
+  // be missed. (A per-dish hold is the opposite case — it qualifies ONE line —
+  // so it hangs under that dish like a note; see the item block.)
   //
   // A ticket with no order note prints EXACTLY what it printed before this
   // existed, down to the byte — which is what keeps every dockets-are-unchanged
@@ -640,7 +684,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   const orderNote = isKot ? present(opts.orderNote) : "";
   if (orderNote) {
     big("** NOTE **", width);
-    for (const l of wrapText(orderNote, width)) {line(l);}
+    for (const l of wrapText(orderNote, width)) {tall(l);}
     line(sep);
   }
 
@@ -657,6 +701,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // hold "x120" at double width; at 32 six cells hold "x12", and anything
     // larger degrades to normal width inside the same column rather than
     // spilling into the dish name.
+    //
+    // The column arithmetic is UNCHANGED by item 3's taller type: double height
+    // does not widen a cell, so No. 4 + Item 36 + Qty 8 = 48 and No. 4 + Item 22
+    // + Qty 6 = 32 exactly as before (see `tall`).
     const COL_QTY = width >= 48 ? 8 : 6;
     const COL_ITEM = Math.max(8, width - COL_NO - COL_QTY);
     const pad = (s: string, n: number) => s.length >= n ? s : s + " ".repeat(n - s.length);
@@ -671,67 +719,60 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
      * AND height at the top of the ticket, reprint or not. Enlarging them again
      * is not a thing the printer can do. So only the dish name changes here.
      *
-     * Double WIDTH, never height, for the reason the quantity gives below:
-     * double height re-pitches every row and doubles the length of a
-     * fifteen-item docket. And the name is re-wrapped against HALF the item
-     * column, because a doubled character eats two cells — a 21-character name
-     * on 58mm paper is 42 cells of a 32-cell roll, i.e. the printer wrapping it
-     * mid-word, which is the failure every width guard in this file exists to
-     * stop.
+     * The name is re-wrapped against HALF the item column, because a doubled
+     * character eats two cells — a 21-character name on 58mm paper is 42 cells
+     * of a 32-cell roll, i.e. the printer wrapping it mid-word, which is the
+     * failure every width guard in this file exists to stop.
      */
     const wideName = opts.reprint === true;
 
     /**
-     * THE DISH NAME, BOLD (A4).
+     * THE DISH NAME, BOLD AND TALL (A4, item 3).
      *
-     * It was the only thing on the row set in ordinary type: the line number,
-     * the quantity and the two headings all carried weight, and the words the
-     * chef is actually cooking from did not. Bold costs no cells and no paper —
-     * a bold character is the same width — so the row keeps its exact layout and
-     * every column assertion in the tests still measures the same numbers.
+     * Bold costs no cells — a bold character is the same width — and double
+     * height costs none either, so the row keeps its exact column layout. The
+     * bold bit is set inside the `ESC !` size command as well as by `ESC E`,
+     * because `ESC !` rewrites emphasis along with size (see `big`): sending the
+     * size alone after `ESC E 1` would print the one word that had to be bold in
+     * ordinary weight.
      *
-     * The leaders are deliberately left OUTSIDE this run: a bold dot leader
-     * reads as part of the name rather than as the gap it is bridging.
+     * The run returns to plain TALL, not to normal, because the rest of the row
+     * (leaders, quantity) is still on the same tall line. The leaders are
+     * deliberately left OUTSIDE the bold run: a bold dot leader reads as part of
+     * the name rather than as the gap it is bridging.
      */
     const dishName = (s: string) => {
-      raw(ESC, 0x45, 0x01);                  // bold
-      if (wideName) {raw(ESC, 0x21, 0x20);}  // double width (reprints only)
+      raw(ESC, 0x45, 0x01); // bold
+      raw(ESC, 0x21, MODE_TALL | MODE_BOLD | (wideName ? MODE_WIDE : 0));
       text(s);
-      if (wideName) {raw(ESC, 0x21, 0x00);}
+      raw(ESC, 0x21, MODE_TALL);
       raw(ESC, 0x45, 0x00);
     };
 
     /**
      * One item row.
      *
-     * THE QUANTITY IS THE POINT OF THIS FUNCTION. It used to be a bare digit set
-     * in body text at the far right of a 48-column line — thirty blank columns
-     * away from the dish it belongs to, the same size and weight as everything
-     * else on the ticket, and indistinguishable at a glance from the line number
-     * at the other end of the row. Three changes, each fixing one way that fails
-     * in a hot kitchen:
+     * THE QUANTITY. It used to be a bare digit set in body text at the far right
+     * of a 48-column line — thirty blank columns away from the dish it belongs
+     * to, and indistinguishable at a glance from the line number at the other
+     * end of the row. So:
      *
      *   "x" prefix   — "x3" cannot be read as a line number, a table number or a
      *                  price; a lone "3" can be read as any of them.
      *   double width — twice the stroke width of every other character on the
-     *                  docket, so the eye finds it without reading the row. Width
-     *                  only, never height: double height would re-pitch every
-     *                  line and double the length of a fifteen-item docket.
+     *                  row, so the eye finds it without reading the row. It is
+     *                  double HEIGHT as well now, only because the whole row is.
      *   dot leaders  — the row is anchored end to end, so the number cannot be
      *                  read against the neighbouring dish. Leaders are dropped
      *                  when the name wraps, because a leader run that ends where
      *                  the name continues below reads as the end of the name.
+     *
+     * UNDER THE DISH, IN THIS ORDER: the rest of a wrapped name, then "[Hold]"
+     * when the line is held, then "[Note] ..." when it carries a note. See the
+     * list below for why the hold lives here.
      */
-    const itemRow = (no: string, it: ReceiptItem, qty: number, suffix = "") => {
-      // `suffix` is the word that must follow the dish name — today only "hold"
-      // (see the hold block below). It rides on the LAST line of the name, and
-      // the name is wrapped against a column shortened by its length, so the
-      // word sits immediately after the dish it qualifies even when the name
-      // wraps, and can never be pushed off the end of the row.
-      const tail = suffix ? ` ${suffix}` : "";
-      const nameW = Math.max(4, wideName
-        ? Math.floor((COL_ITEM - 1 - tail.length) / 2)
-        : COL_ITEM - 1 - tail.length);
+    const itemRow = (no: string, it: ReceiptItem, qty: number) => {
+      const nameW = Math.max(4, wideName ? Math.floor((COL_ITEM - 1) / 2) : COL_ITEM - 1);
       const nameLines = wrapText(itemLabel(it), nameW);
       const first = nameLines[0] ?? "";
       const q = `x${qty}`;
@@ -744,108 +785,100 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       // double width too, and a character count would run the row off the roll.
       const runway = COL_ITEM + COL_QTY - q.length * (double ? 2 : 1);
       const single = nameLines.length === 1;
-      const headCells = first.length * (wideName ? 2 : 1) + (single ? tail.length : 0);
-      const gap = runway - headCells;
+      const gap = runway - first.length * (wideName ? 2 : 1);
       const leaders = single && gap >= 4
         ? ` ${".".repeat(gap - 2)} `
         : " ".repeat(Math.max(0, gap));
+      raw(ESC, 0x21, MODE_TALL);
       text(pad(no, COL_NO));
       dishName(first);
-      if (single && tail) {text(tail);}
       text(leaders);
-      raw(ESC, 0x45, 0x01);               // bold
-      if (double) {raw(ESC, 0x21, 0x20);} // double width (NOT height)
+      raw(ESC, 0x45, 0x01); // bold
+      raw(ESC, 0x21, MODE_TALL | MODE_BOLD | (double ? MODE_WIDE : 0));
       text(q);
-      if (double) {raw(ESC, 0x21, 0x00);}
+      raw(ESC, 0x21, MODE_TALL);
       raw(ESC, 0x45, 0x00);
       line();
-      // Continuations and notes hang under the ITEM column, so the No. and Qty
-      // columns stay a clean vertical run down the docket.
+      raw(ESC, 0x21, 0x00);
+      // Continuations, the hold and the note hang under the ITEM column, so the
+      // No. and Qty columns stay a clean vertical run down the docket.
+      const indent = " ".repeat(COL_NO);
       for (let i = 1; i < nameLines.length; i++) {
-        text(" ".repeat(COL_NO));
+        raw(ESC, 0x21, MODE_TALL);
+        text(indent);
         dishName(nameLines[i] ?? "");
-        if (tail && i === nameLines.length - 1) {text(tail);}
         line();
+        raw(ESC, 0x21, 0x00);
       }
-      // The one thing on a KOT that is more important than the dish name. Left
-      // in body text on purpose: it is already set apart by its "*" and its
-      // indent, and a docket on which everything is emphasised emphasises
+      // THE HOLD, WHERE A NOTE GOES — directly under the dish it holds. The
+      // "[Hold]" tag is the same shape as the "[Note]" tag beneath it, and it
+      // carries its instruction in words, so the line can never be read as
+      // anything but "not this one yet".
+      if (it.held === true) {
+        for (const l of wrapText("[Hold] Do not cook until fired", COL_ITEM - 1)) {tall(indent + l);}
+      }
+      // Set apart by its "[Note]" tag and its indent and left out of the bold
+      // run on purpose: a docket on which everything is emphasised emphasises
       // nothing.
       const note = String(it.note ?? "").trim();
       if (note) {
-        for (const l of wrapText(`* ${note}`, COL_ITEM - 1)) {line(" ".repeat(COL_NO) + l);}
+        for (const l of wrapText(`[Note] ${note}`, COL_ITEM - 1)) {tall(indent + l);}
       }
     };
 
     /**
-     * HELD LINES ARE LIFTED OUT OF THE COOK-NOW LIST, NOT DECORATED INSIDE IT.
+     * A HELD LINE STAYS IN ITS PLACE IN THE LIST, AND SAYS "[Hold]" UNDER ITSELF.
      *
-     * The hold/fire feature exists so a course waits. It worked everywhere
-     * except on the paper the kitchen actually cooks from, where a held dish sat
-     * in the same numbered list as everything else — so it was cooked, and the
-     * feature was defeated by its own docket. A marker beside the name would not
-     * have been enough either: a docket is read standing up, at a glance, under
-     * a pass light, and a line that has to be READ to be excluded will be cooked
-     * by the third ticket of a busy service.
+     * Hold-and-fire exists so a course waits, and it used to be defeated by its
+     * own docket: a held dish sat in the numbered list like everything else and
+     * was cooked. The first fix lifted held lines out under a big "** HOLD **"
+     * banner — and the kitchen then read the banner BEFORE the dish it applied
+     * to, which the client reported as the hold printing in the wrong place.
      *
-     * So the list splits. Everything above "Total Qty" is cook it now, and that
-     * total counts only those lines. Everything below the banner is not yours
-     * yet. Held lines keep their own H-numbering so the pass can still call one
-     * out ("fire H2") without colliding with the cook-now numbers.
+     * Client, item 2: "Hold order should come after the name of the dish which is
+     * to be put on hold and not before. It should be in the same position like
+     * the way a note appears on the food order." (1.5 said the same thing
+     * earlier: dish name first, then hold.) So there is no banner and no second
+     * list: the held dish prints in its own place, and the line directly under
+     * it — the slot a "[Note]" uses on their reference docket — reads "[Hold] Do
+     * not cook until fired". One numbering, so the pass calls "fire 3".
      *
-     * AND EACH HELD LINE ALSO READS "Gulab Jamun hold" — DELIBERATELY BOTH.
+     * WHAT STILL KEEPS IT OUT OF THE POT: Total Qty counts only what may be
+     * cooked now, and the held quantity is totalled separately under it, so the
+     * count the kitchen plates to never includes a waiting course.
      *
-     * The client asked for exactly one thing: "when an item is placed on hold,
-     * the dish name must appear first, followed by the word hold". Read
-     * literally that is a marker beside the name, which is precisely the
-     * treatment this block exists because it is NOT enough — a line that has to
-     * be read to be excluded gets cooked. Read as a replacement it would undo
-     * the fix. So the word is printed where they asked for it, ON the line,
-     * after the dish, INSIDE the banner that keeps the line out of the cook-now
-     * list: the wording the client wants and the separation the kitchen needs,
-     * neither standing in for the other.
-     *
-     * Lower case and unemphasised, unlike the banner above it, because it is a
-     * confirmation of what the block already says rather than a second alarm.
+     * Absent/false on every line of every restaurant that never holds a course,
+     * so their dockets carry no "[Hold]" line and no Hold Qty line.
      */
-    const fire: ReceiptItem[] = [];
-    const held: ReceiptItem[] = [];
-    for (const it of opts.items) {(it.held ? held : fire).push(it);}
     const qtyOf = (it: ReceiptItem) => Math.max(1, Math.round(Number(it.quantity) || 1));
 
-    line(pad("No.", COL_NO) + pad("Item", COL_ITEM) + padL("Qty", COL_QTY));
+    tall(pad("No.", COL_NO) + pad("Item", COL_ITEM) + padL("Qty", COL_QTY));
     line(sep);
     let totalQty = 0;
-    for (const [idx, it] of fire.entries()) {
+    let heldQty = 0;
+    let heldLines = 0;
+    for (const [idx, it] of opts.items.entries()) {
       const qty = qtyOf(it);
-      totalQty += qty;
+      if (it.held === true) {
+        heldQty += qty;
+        heldLines += 1;
+      } else {
+        totalQty += qty;
+      }
       itemRow(String(idx + 1), it, qty);
     }
-    // A docket whose every line is held has nothing to total — printing
-    // "Total Qty 0" above a full hold block invites the reading that there is
-    // nothing on this ticket. The condition is written so that a docket with NO
-    // held lines (every docket of every restaurant that does not use the
-    // feature, including the deliberately empty one buildKotBase64 emits for an
-    // item-less ticket) always prints the line exactly as it always has.
-    if (fire.length > 0 || held.length === 0) {
-      line(sep);
-      line(twoCol("Total Qty", String(totalQty), width));
+    // A docket whose every line is held has nothing to total — printing "Total
+    // Qty 0" above the hold total invites the reading that there is nothing on
+    // this ticket. The condition is written so that a docket with NO held lines
+    // (every docket of every restaurant that does not use the feature, including
+    // the deliberately empty one buildKotBase64 emits for an item-less ticket)
+    // always prints the line exactly as it always has.
+    line(sep);
+    if (heldLines < opts.items.length || heldLines === 0) {
+      tall(twoCol("Total Qty", String(totalQty), width));
     }
-    if (held.length > 0) {
-      line(sep);
-      // Short enough to survive double width on 58mm paper (10 chars = 20 of 32
-      // cells), with the instruction spelled out underneath in body text — the
-      // banner is what the eye catches, the sentence is what removes the doubt.
-      big("** HOLD **", width);
-      line("DO NOT COOK UNTIL FIRED");
-      let heldQty = 0;
-      for (const [idx, it] of held.entries()) {
-        const qty = qtyOf(it);
-        heldQty += qty;
-        itemRow(`H${idx + 1}`, it, qty, "hold");
-      }
-      line(sep);
-      line(twoCol("Hold Qty", String(heldQty), width));
+    if (heldLines > 0) {
+      tall(twoCol("Hold Qty", String(heldQty), width));
     }
     line(sep);
   } else {
