@@ -219,7 +219,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   if (/from "Bills"/i.test(q)) {
     // ListClosedBills' count query.
     if (/count\(\*\)::text as total/i.test(q)) {
-      return [{ total: String(d.bills.filter(isSettled).length) }];
+      return [{ total: String(closedListBills(d, q, params).length) }];
     }
     // getSettledBills — the shared revenue basis of every report reader.
     if (/as settled_at/i.test(q)) {
@@ -229,11 +229,36 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     }
     // ListClosedBills' page query (the bill-detail classification path).
     if (/b\.bill_no/i.test(q)) {
-      return d.bills.filter(isSettled).map(closedBillRow);
+      return closedListBills(d, q, params).map(closedBillRow);
     }
   }
 
   throw new Error(`money fixture: unstubbed SQL — ${q.slice(0, 220)}`);
+}
+
+// ListClosedBills' date predicates, applied the way Postgres would. The bound
+// column is coalesce(closed_at, admin_approved_at, created_at), which is
+// settled_at for every fixture bill. Before this the fixture ignored from/to on
+// the list entirely, so no test could see WHICH DAY a bill is listed under —
+// the very thing the reports and the list must agree on. The ORDER BY uses the
+// same expression followed by `desc`, which this pattern deliberately skips.
+const CLOSED_LIST_BOUND = /coalesce\(b\.closed_at, b\.admin_approved_at, b\.created_at\) (>=|<=|<) \$(\d+)/;
+
+function closedListBills(d: FixtureDb, q: string, params: unknown[]): FixtureBill[] {
+  const bounds: { op: string; at: number }[] = [];
+  const re = new RegExp(CLOSED_LIST_BOUND.source, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(q)) !== null) {
+    const raw = params[Number(m[2]) - 1];
+    const at = new Date(String(raw)).getTime();
+    // A bound Postgres could not cast would be a 500 in production; fail loudly.
+    if (Number.isNaN(at)) {throw new Error(`money fixture: unparseable ListClosedBills bound ${String(raw)}`);}
+    bounds.push({ op: m[1], at });
+  }
+  return d.bills.filter(isSettled).filter((b) => {
+    const t = new Date(b.settled_at).getTime();
+    return bounds.every(({ op, at }) => (op === ">=" ? t >= at : op === "<" ? t < at : t <= at));
+  });
 }
 
 // Wired onto globalThis because a jest.mock factory is hoisted above imports and

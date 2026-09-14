@@ -232,6 +232,7 @@ import {
   addDaysToKey,
   countDays,
   dateKeyInZone,
+  isDateKey,
   resolveReportWindow,
   type ReportWindowQuery,
   type ResolvedReportWindow,
@@ -16874,7 +16875,9 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
 export interface ClosedBillListFilter {
   limit?: number;
   offset?: number;
+  /** YYYY-MM-DD = first day, INCLUSIVE, in the restaurant's zone; or an ISO instant (>=). */
   from?: string;
+  /** YYYY-MM-DD = last day, INCLUSIVE, in the restaurant's zone; or an ISO instant (<=). */
   to?: string;
   table?: string;
   payment_method?: string;
@@ -16956,8 +16959,24 @@ export async function ListClosedBills(
   if (!opts.include_open) {
     where.push(`b.closed_at is not null`);
   }
-  if (opts.from) { params.push(opts.from); where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) >= $${params.length}`); }
-  if (opts.to) { params.push(opts.to); where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) <= $${params.length}`); }
+  // Day bounds are cut in the RESTAURANT'S zone, the same half-open
+  // [from 00:00 local, to+1 00:00 local) that windowInstants hands every report.
+  // They used to be UTC midnights (the session zone casts a bare date as UTC),
+  // so for a Kolkata tenant "13 Sep" listed 05:30 on the 13th to 05:29 on the
+  // 14th, and a bill settled at 00:30 IST sat under the wrong day here while
+  // Sales/GST/P&L on the same screen counted it under the right one. A full ISO
+  // instant still means exactly that instant (>= / <=). A missing end is still
+  // "no bound": History and the tests list everything with {}, so none of
+  // resolveReportWindow's default span or caps belong here.
+  if (opts.from) {
+    params.push(isDateKey(opts.from) ? zoneMidnightUtc(opts.from, context.timezone).toISOString() : opts.from);
+    where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) >= $${params.length}`);
+  }
+  if (opts.to) {
+    const dayKey = isDateKey(opts.to);
+    params.push(dayKey ? zoneMidnightUtc(addDaysToKey(opts.to, 1), context.timezone).toISOString() : opts.to);
+    where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) ${dayKey ? "<" : "<="} $${params.length}`);
+  }
   if (opts.table?.trim()) { params.push(opts.table.trim()); where.push(`lower(t.table_name) = lower($${params.length})`); }
   if (opts.payment_method?.trim()) { params.push(opts.payment_method.trim()); where.push(`lower(coalesce(b.payment_method, '')) = lower($${params.length})`); }
   if (opts.search?.trim()) {
