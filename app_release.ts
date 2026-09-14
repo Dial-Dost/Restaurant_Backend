@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.9.6";
+const LATEST = "1.9.7";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,10 +118,11 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"You can now add the guest's name and a company GSTIN to a bill, from the top of a table or later " +
-		"from a past bill in Accounting, and both print on the bill. A bill printed a second time says " +
-		"REPRINT at the top, on the preview as well as on paper. On the kitchen ticket a held dish stays in " +
-		"its place with the hold written underneath it, like a note.",
+		"The printed bill now looks like a proper restaurant bill: your logo, solid lines, clear columns for " +
+		"quantity, price and amount, the totals lined up on the right and a bigger grand total. Your uploaded " +
+		"logo now prints on the bill, and the date and time are in your restaurant's time. The bill preview " +
+		"matches the paper. In Settings you can switch the QR code on the bill off or on, and the Bill " +
+		"details card now shows your saved business name, GSTIN and QR message instead of opening blank.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
