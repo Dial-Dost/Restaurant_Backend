@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import { describe, test, expect } from "@jest/globals";
 import {
   BILL_QR_NOTE_MAX,
   DEFAULT_BILL_QR_NOTE,
+  billColumns,
+  billMarginCols,
   buildReceiptBase64,
   buildKotBase64,
   groupKotItemsByStation,
@@ -12,27 +15,148 @@ const decode = (b64: string) => Buffer.from(b64, "base64").toString("latin1");
 const bytes = (b64: string) => Buffer.from(b64, "base64");
 
 /**
- * The receipt as the PAPER shows it: ESC/POS command sequences removed, so an
- * assertion can talk about lines and their widths without the invisible mode
- * bytes that sit inside them.
+ * The columns a CUSTOMER BILL's lines are laid out on, per roll.
  *
- * Needed because the command stream is interleaved with the text — `ESC ! 0x00`
- * (normal type) lands between the restaurant name's newline and the rule under
- * it, and `ESC E 0x01` (bold) prefixes the Grand Total line. Both make a naive
- * substring match miss and a naive `line.length` read three characters long.
- * Only the four fixed-length commands this renderer emits are stripped; the
- * logo and QR rasters are left alone.
+ * Not the roll width. The 80mm bill sets a two-column margin either side in the
+ * printer itself (GS L / GS W), so its print area is 44 of the 48 cells: a
+ * 46-character line fits the paper and still wraps, because it does not fit the
+ * area the printer was told to print in. The 58mm roll has no margin. KOTs have
+ * none either and are measured against the full roll.
+ */
+const BILL_COLS: Record<number, number> = { 48: 44, 32: 32 };
+
+/** Dots per Font A cell: 576 dots across the 80mm roll's 48 cells. */
+const CELL_DOTS = 12;
+
+/**
+ * One piece of the ESC/POS stream, in the order the printer reads it.
+ *
+ * THE STREAM IS PARSED, NOT PATTERN-MATCHED, because a customer bill carries
+ * binary images between its lines. Every separator on it is a GS v 0 raster (a
+ * solid rule, see billRule in escpos.ts), and a raster's header and body are
+ * arbitrary bytes: the height byte of a thin rule is 10, which is "\n", so a
+ * latin1 decode split on newlines breaks a "line" in the middle of a rule and
+ * leaves hundreds of bytes of ink printed on it. So every command is consumed
+ * by its own length — a raster by the width and height in its header, a QR
+ * function by its pL pH, GS L / GS W by their two parameter bytes — and nothing
+ * inside one can be read as text.
+ *
+ * A command this parser does not know THROWS rather than being counted as
+ * printed cells: an unrecognised parameter byte can be a newline, and a width
+ * assertion that silently measured it would pass or fail for the wrong reason.
+ * Text reaching the printer is already ASCII-folded (asciiSafe), so an ESC or
+ * GS byte is always a command.
+ */
+type Piece =
+  | { kind: "text"; text: string }
+  | { kind: "cmd"; op: "ESC @" | "ESC a" | "ESC !" | "ESC E" | "GS V" | "GS L" | "GS W"; n: number }
+  | {
+    kind: "raster";
+    mark: "<RULE>" | "<RULE:THICK>" | "<IMAGE>";
+    widthDots: number;
+    height: number;
+    inkRows: number;
+    /** One character per dot row, top to bottom: "." blank, "#" solid, "?" anything else. */
+    rows: string;
+    /** The eight header bytes, GS v 0 m xL xH yL yH. */
+    header: Buffer;
+  }
+  | { kind: "qr" };
+type Raster = Extract<Piece, { kind: "raster" }>;
+
+function pieces(b64: string): Piece[] {
+  const buf = bytes(b64);
+  const out: Piece[] = [];
+  let run = "";
+  const flush = () => { if (run) { out.push({ kind: "text", text: run }); run = ""; } };
+  const u16 = (at: number) => (buf[at] ?? 0) | ((buf[at + 1] ?? 0) << 8);
+  for (let i = 0; i < buf.length;) {
+    const b = buf[i]!;
+    const op = String.fromCharCode(buf[i + 1] ?? 0);
+    if (b === 0x1b) {
+      flush();
+      if (op === "@") { out.push({ kind: "cmd", op: "ESC @", n: 0 }); i += 2; continue; }
+      if (op === "a" || op === "!" || op === "E") { out.push({ kind: "cmd", op: `ESC ${op}`, n: buf[i + 2] ?? 0 }); i += 3; continue; }
+      throw new Error(`unparsed command ESC ${JSON.stringify(op)} at byte ${i}`);
+    }
+    if (b === 0x1d) {
+      flush();
+      if (op === "V") { out.push({ kind: "cmd", op: "GS V", n: buf[i + 2] ?? 0 }); i += 3; continue; }
+      if (op === "L" || op === "W") { out.push({ kind: "cmd", op: `GS ${op}`, n: u16(i + 2) }); i += 4; continue; }
+      if (op === "v" && buf[i + 2] === 0x30) {
+        // GS v 0 m xL xH yL yH d1...dk, k = widthBytes * height.
+        const widthBytes = u16(i + 4);
+        const height = u16(i + 6);
+        const start = i + 8;
+        const end = start + widthBytes * height;
+        if (end > buf.length) { throw new Error(`raster at byte ${i} runs past the end of the stream`); }
+        // A RULE IS RECOGNISED BY ITS SHAPE, not by asking the renderer's own
+        // billRule what one looks like: blank rows, then rows inked solid across
+        // the whole width (a partial last byte keeps only its leading bits), then
+        // blank rows. Two ink rows is the thin rule and four the thick one;
+        // anything else — the logo included — is an image.
+        const LEADING_BITS = [0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff];
+        let rows = "";
+        for (let y = 0; y < height; y++) {
+          const row = buf.subarray(start + y * widthBytes, start + (y + 1) * widthBytes);
+          const blank = row.every((v) => v === 0x00);
+          const solid = row.length > 0 && row.subarray(0, -1).every((v) => v === 0xff) && LEADING_BITS.includes(row[row.length - 1]!);
+          rows += blank ? "." : solid ? "#" : "?";
+        }
+        const m = /^\.+(#+)\.+$/.exec(rows);
+        const inkRows = m ? m[1]!.length : 0;
+        const mark = inkRows === 2 ? "<RULE>" : inkRows === 4 ? "<RULE:THICK>" : "<IMAGE>";
+        out.push({ kind: "raster", mark, widthDots: widthBytes * 8, height, inkRows, rows, header: buf.subarray(i, start) });
+        i = end;
+        continue;
+      }
+      if (op === "(" && buf[i + 2] === 0x6b) {
+        // GS ( k pL pH + (pL + 256 * pH) bytes. A QR is five of these back to
+        // back (model, size, error level, data, print): one symbol, one piece.
+        if (out[out.length - 1]?.kind !== "qr") { out.push({ kind: "qr" }); }
+        i += 5 + u16(i + 3);
+        continue;
+      }
+      throw new Error(`unparsed command GS ${JSON.stringify(op)} at byte ${i}`);
+    }
+    run += String.fromCharCode(b);
+    i += 1;
+  }
+  flush();
+  return out;
+}
+
+/** Every raster on the slip, in print order — the logo and each rule. */
+const rasters = (b64: string): Raster[] => pieces(b64).flatMap((p) => (p.kind === "raster" ? [p] : []));
+
+/**
+ * The receipt as the PAPER shows it: commands removed, so an assertion can talk
+ * about lines and their widths without the invisible mode bytes that sit inside
+ * them.
+ *
+ * Needed because the command stream is interleaved with the text — `ESC E 0x00`
+ * (bold off) lands between the restaurant name's newline and the rule under it,
+ * and `ESC E 0x01` + `ESC ! 0x18` prefix the Grand Total line. Both make a naive
+ * substring match miss and a naive `line.length` read too long.
+ *
+ * Each image prints as ONE MARKER LINE, because on paper it is a band of its
+ * own that the next text starts under: "<RULE>" for a thin solid rule,
+ * "<RULE:THICK>" for the heavy one around the item table, "<IMAGE>" for any
+ * other raster (the logo), and "<QR>" for a QR symbol.
  */
 function printed(b64: string): string {
-  return decode(b64)
-    .replace(/\x1b@/g, "")            // ESC @   initialize
-    .replace(/\x1b[a!E][\s\S]/g, "")  // ESC a/!/E n   align / mode / bold
-    .replace(/\x1dV[\s\S]/g, "");     // GS V n  cut
+  return pieces(b64).map((p) => {
+    if (p.kind === "text") { return p.text; }
+    if (p.kind === "raster") { return `${p.mark}\n`; }
+    if (p.kind === "qr") { return "<QR>\n"; }
+    return "";
+  }).join("");
 }
 const printedLines = (b64: string) => printed(b64).split("\n");
 
 /**
- * How wide each line actually comes out, IN PRINTER CELLS.
+ * How wide each line actually comes out, IN PRINTER CELLS — one entry per line
+ * of `printedLines`, so the two can be indexed together.
  *
  * `printed(...).length` counts characters, and characters are not cells: the KOT
  * sets `ESC ! 0x20` (double width) around a quantity and `ESC ! 0x30` around the
@@ -41,28 +165,49 @@ const printedLines = (b64: string) => printed(b64).split("\n");
  * a 58mm docket safe while the printer was wrapping it mid-word — the exact
  * failure the size guards in `big` and the quantity column exist to prevent.
  *
- * Only the four fixed-length commands this renderer emits are interpreted;
- * everything else is a printed cell.
+ * A raster's line is as wide as the raster, in cells of CELL_DOTS: a rule drawn
+ * wider than the print area runs into the margin exactly as an over-long line
+ * does. A QR's line counts nothing — it is sized in modules, and no text shares
+ * its line.
  */
 function cellWidths(b64: string): number[] {
-  const raw = decode(b64);
   const widths: number[] = [];
   let cur = 0;
   let scale = 1;
-  for (let i = 0; i < raw.length; i++) {
-    const c = raw[i];
-    if (c === "\x1b") {
-      const cmd = raw[i + 1];
-      if (cmd === "!") { scale = (raw.charCodeAt(i + 2) & 0x20) ? 2 : 1; i += 2; continue; }
-      if (cmd === "a" || cmd === "E") { i += 2; continue; }
-      if (cmd === "@") { scale = 1; i += 1; continue; }
+  for (const p of pieces(b64)) {
+    if (p.kind === "cmd") {
+      if (p.op === "ESC !") { scale = (p.n & 0x20) ? 2 : 1; }
+      if (p.op === "ESC @") { scale = 1; }
+      continue;
     }
-    if (c === "\x1d" && raw[i + 1] === "V") { i += 2; continue; } // GS V n — cut
-    if (c === "\n") { widths.push(cur); cur = 0; continue; }
-    cur += scale;
+    if (p.kind === "raster") { widths.push(cur + Math.ceil(p.widthDots / CELL_DOTS)); cur = 0; continue; }
+    if (p.kind === "qr") { widths.push(cur); cur = 0; continue; }
+    for (const c of p.text) {
+      if (c === "\n") { widths.push(cur); cur = 0; } else { cur += scale; }
+    }
   }
   if (cur > 0) { widths.push(cur); }
   return widths;
+}
+
+/**
+ * Every text run with the `ESC !` mode and the `ESC E` emphasis it was printed
+ * in. A run is the text between two commands (or images), so a line split by
+ * bold/size switches yields several. Built on `pieces`, so a bill's raster
+ * rules never leak their bytes into the run of text that follows them.
+ */
+function runs(b64: string): { mode: number; bold: boolean; text: string }[] {
+  const out: { mode: number; bold: boolean; text: string }[] = [];
+  let mode = 0;
+  let bold = false;
+  for (const p of pieces(b64)) {
+    if (p.kind === "text") { out.push({ mode, bold, text: p.text }); continue; }
+    if (p.kind !== "cmd") { continue; }
+    if (p.op === "ESC !") { mode = p.n; }
+    if (p.op === "ESC E") { bold = p.n === 1; }
+    if (p.op === "ESC @") { mode = 0; bold = false; }
+  }
+  return out;
 }
 
 const baseBill: ReceiptOptions = {
@@ -103,30 +248,36 @@ describe("buildReceiptBase64 — bill", () => {
   });
 
   test("renders the full header + meta block", () => {
-    const out = decode(buildReceiptBase64(baseBill));
-    expect(out).toContain("Customer Name: Alice");
+    // `printed`, not `decode`: the table on the Date row is emitted bold, so an
+    // `ESC E` pair sits inside that line.
+    const out = printed(buildReceiptBase64(baseBill));
+    // "Name:", the client's own wording for the slot — not "Customer Name:".
+    expect(out).toMatch(/^Name: Alice$/m);
+    expect(out).not.toContain("Customer Name");
     expect(out).toContain("Bill No.: INV-1");
     expect(out).toContain("Cashier: Bob");
     expect(out).toContain("Dine In: 5");
   });
 
   test("totals: subtotal, discount, service charge, tax, and rounded grand total", () => {
-    const out = decode(buildReceiptBase64(baseBill));
+    const out = printed(buildReceiptBase64(baseBill));
     // ₹ maps to the ASCII token "Rs"
     expect(out).toContain("Coupon SAVE20"); // discount label
-    expect(out).toContain("Service Charge (5%)");
-    expect(out).toContain("GST (5%)");
+    expect(out).toMatch(/Coupon SAVE20 +-20\.00$/m);
+    // The client's ladder wording: the rate follows the name bare, with no
+    // parentheses round it.
+    expect(out).toMatch(/Service Charge 5% +4\.00$/m);
+    expect(out).toMatch(/GST 5% +4\.20$/m);
     // LEGACY PATH ONLY (no grandTotal supplied): grand = 100 - 20 + 4 + 4.2
     // = 88.2 -> rounded 88, with the round-off line disclosing the -0.20.
-    expect(out).toContain("Grand Total:");
-    expect(out).toContain("Rs 88.00");
-    expect(out).toContain("Round off");
+    expect(out).toMatch(/Grand Total +Rs 88\.00$/m);
+    expect(out).not.toContain("Grand Total:");
+    expect(out).toMatch(/Round off +-0\.20$/m);
   });
 
   test("service charge waiver prints 'Opted-out'", () => {
-    const out = decode(buildReceiptBase64({ ...baseBill, serviceCharge: { percent: 10, amount: 0, optedOut: true } }));
-    expect(out).toContain("Service Charge (10%)");
-    expect(out).toContain("Opted-out");
+    const out = printed(buildReceiptBase64({ ...baseBill, serviceCharge: { percent: 10, amount: 0, optedOut: true } }));
+    expect(out).toMatch(/Service Charge 10% +Opted-out$/m);
   });
 
   // --- The item note is a KITCHEN instruction, and only the kitchen gets it ---
@@ -235,14 +386,16 @@ describe("buildReceiptBase64 — bill header", () => {
   });
 
   test("two stored numbers wrap instead of losing the second one", () => {
-    const out = printed(buildReceiptBase64({
-      ...fullHeader, phone: "080-4123 4567 / +91 98765 43210 / +91 91234 56789",
-    }, 32));
-    expect(out).toContain("Ph : 080-4123 4567");
-    expect(out).toContain("91234 56789");
-    for (const w of cellWidths(buildReceiptBase64({
-      ...fullHeader, phone: "080-4123 4567 / +91 98765 43210 / +91 91234 56789",
-    }, 32))) { expect(w).toBeLessThanOrEqual(32); }
+    const phone = "080-4123 4567 / +91 98765 43210 / +91 91234 56789";
+    for (const cols of [48, 32]) {
+      const b64 = buildReceiptBase64({ ...fullHeader, phone }, cols);
+      const out = printed(b64);
+      expect(out).toContain("Ph : 080-4123 4567");
+      expect(out).toContain("91234 56789");
+      // Against the bill's print area, not the roll: on 80mm that is 44 cells
+      // inside the margins, and 48 characters there would still wrap.
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(BILL_COLS[cols]!); }
+    }
   });
 
   // --- "null" is not a value ------------------------------------------------
@@ -267,8 +420,10 @@ describe("buildReceiptBase64 — bill header", () => {
     expect(out).not.toContain("Ph :");
     expect(out).not.toContain("Bill No.");
     expect(out).not.toContain("Cashier:");
-    // An unnamed guest is still a guest, not a blank.
-    expect(out).toContain("Customer Name: Guest");
+    // An unnamed guest gets the client's blank "Name:" slot — the label with
+    // nothing written after it, exactly as for a walk-in — never the word
+    // "null" and never a stand-in name.
+    expect(out).toMatch(/^Name:$/m);
   });
 
   test("a KOT's header fields obey the same rule", () => {
@@ -284,9 +439,10 @@ describe("buildReceiptBase64 — bill header", () => {
   });
 
   test("minimal tenant — no gstin, address or logo — prints a clean receipt", () => {
-    // `printed`, not `decode`: the renderer resets the type size (ESC ! 0x00)
-    // between the name's newline and the rule under it, so the adjacency below
-    // is only visible once the command bytes are out of the way.
+    // `printed`, not `decode`: the renderer turns bold off (ESC E 0) between the
+    // name's newline and the rule under it, and the rule itself is a raster, so
+    // the adjacency below is only visible once the command bytes are out of the
+    // way and the rule reads as its marker line.
     const out = printed(buildReceiptBase64({
       ...baseBill,
       legalName: null,
@@ -299,7 +455,7 @@ describe("buildReceiptBase64 — bill header", () => {
     expect(out).toContain("Cafe Nicoise");
     // The name is followed straight by the separator rule — no blank lines
     // standing in for the fields this tenant does not have.
-    expect(out).toContain(`Cafe Nicoise\n${"-".repeat(48)}`);
+    expect(out).toContain("Cafe Nicoise\n<RULE>\n");
   });
 
   test("blank-but-present fields are treated as absent, not as empty lines", () => {
@@ -310,7 +466,7 @@ describe("buildReceiptBase64 — bill header", () => {
       gstin: "  ",
     }));
     expect(out).not.toContain("GSTN");
-    expect(out).toContain(`Cafe Nicoise\n${"-".repeat(48)}`);
+    expect(out).toContain("Cafe Nicoise\n<RULE>\n");
   });
 
   test("a tenant with a GSTIN but no legal entity prints only the GSTIN", () => {
@@ -341,7 +497,7 @@ describe("buildReceiptBase64 — bill header", () => {
 // the renderer's only job is to print the lines it is handed.
 describe("buildReceiptBase64 — tax breakdown", () => {
   test("prints one line per configured tax, each with its own label and percentage", () => {
-    const out = decode(buildReceiptBase64({
+    const out = printed(buildReceiptBase64({
       ...baseBill,
       discount: null,
       serviceCharge: null,
@@ -352,26 +508,28 @@ describe("buildReceiptBase64 — tax breakdown", () => {
       ],
       grandTotal: 798,
     }));
-    expect(out).toContain("SGST (2.5%)");
-    expect(out).toContain("CGST (2.5%)");
-    expect(out).toContain("Sub");           // subtotal line still present
-    expect(out).toContain("760.00");
+    expect(out).toMatch(/SGST 2\.5% +19\.00$/m);
+    expect(out).toMatch(/CGST 2\.5% +19\.00$/m);
+    expect(out).toMatch(/Sub Total +760\.00$/m); // subtotal line still present
     expect(out).toContain("Rs 798.00");
   });
 
   test("does not invent a split the tenant has not configured", () => {
-    const out = decode(buildReceiptBase64({
+    const out = printed(buildReceiptBase64({
       ...baseBill,
       taxes: [{ name: "GST", percentage: 5, amount: 4.2 }],
     }));
-    expect(out).toContain("GST (5%)");
+    expect(out).toMatch(/GST 5% +4\.20$/m);
     expect(out).not.toContain("SGST");
     expect(out).not.toContain("CGST");
   });
 
   test("a tenant with no taxes configured prints no tax lines at all", () => {
-    const out = decode(buildReceiptBase64({ ...baseBill, taxes: [], discount: null, serviceCharge: null, grandTotal: 100 }));
-    expect(out).not.toContain("%)");
+    const out = printed(buildReceiptBase64({ ...baseBill, taxes: [], discount: null, serviceCharge: null, grandTotal: 100 }));
+    // No rate anywhere on the slip. (This used to look for "%)", which the
+    // ladder no longer prints for anything — a check that could not fail.)
+    expect(out).not.toContain("%");
+    expect(out).not.toContain("GST");
     expect(out).toContain("Rs 100.00");
   });
 });
@@ -436,36 +594,49 @@ describe("buildReceiptBase64 — money is printed verbatim", () => {
 describe("buildReceiptBase64 — custom QR message", () => {
   const withQr: ReceiptOptions = { ...baseBill, feedbackUrl: "https://example.test/feedback?rid=r1" };
 
+  /**
+   * The footer as one run of words. The note is wrapped to the bill's print
+   * area, and the built-in valet line (47 characters) is longer than the 44 the
+   * 80mm bill prints inside its margins, so it is two lines on BOTH rolls now; a
+   * whole-sentence substring check on the raw stream would miss it — and, worse,
+   * a NEGATIVE check for it would pass whether or not it printed.
+   */
+  const words = (b64: string) => printed(b64).replace(/\s+/g, " ");
+
   test("falls back to the built-in valet line when the tenant has set none", () => {
     for (const note of [undefined, null, "", "   "]) {
-      const out = decode(buildReceiptBase64({ ...withQr, qrNote: note as string | null | undefined }));
-      expect(out).toContain(DEFAULT_BILL_QR_NOTE);
+      const b64 = buildReceiptBase64({ ...withQr, qrNote: note as string | null | undefined });
+      expect(words(b64)).toContain(DEFAULT_BILL_QR_NOTE);
     }
   });
 
   test("prints the tenant's own sentence instead when one is set", () => {
-    const out = decode(buildReceiptBase64({ ...withQr, qrNote: "Scan to rate us and call your valet" }));
-    expect(out).toContain("Scan to rate us and call your valet");
-    expect(out).not.toContain(DEFAULT_BILL_QR_NOTE);
+    const b64 = buildReceiptBase64({ ...withQr, qrNote: "Scan to rate us and call your valet" });
+    expect(words(b64)).toContain("Scan to rate us and call your valet");
+    expect(words(b64)).not.toContain(DEFAULT_BILL_QR_NOTE);
   });
 
   test("is truncated to the documented cap rather than flooding the footer", () => {
     const long = "x".repeat(BILL_QR_NOTE_MAX + 50);
-    const out = decode(buildReceiptBase64({ ...withQr, qrNote: long }));
-    expect(out).not.toContain(long);
-    expect(out).toContain("x".repeat(Math.min(BILL_QR_NOTE_MAX, 48)));
+    const lines = printedLines(buildReceiptBase64({ ...withQr, qrNote: long }));
+    // One unbroken word, so wrapText hard-splits it at the print area. Rejoined,
+    // exactly the cap survives — not a character more, not a character less.
+    const xs = lines.filter((l) => /^x+$/.test(l));
+    expect(xs.join("")).toBe("x".repeat(BILL_QR_NOTE_MAX));
+    for (const l of xs) { expect(l.length).toBeLessThanOrEqual(BILL_COLS[48]!); }
   });
 
   test("wraps to the paper width on 58mm without overflowing the column", () => {
     const note = "Scan the code below to rate your meal and to call the valet to the porch";
-    // Everything up to the QR command block. The QR payload is the feedback URL
-    // carried verbatim inside `GS ( k`, which is longer than the paper is wide
-    // and contains no newline — measuring it as if it were a printed line would
-    // fail this test for a reason that has nothing to do with text wrapping.
-    // The note is emitted BEFORE the QR, so every wrapped note line is in here.
-    const out = printed(buildReceiptBase64({ ...withQr, qrNote: note }, 32)).split("\x1d(k")[0] ?? "";
-    for (const line of out.split("\n")) {
-      expect(line.length).toBeLessThanOrEqual(32);
+    const b64 = buildReceiptBase64({ ...withQr, qrNote: note }, 32);
+    // Everything up to the QR. The note is emitted BEFORE it, so every wrapped
+    // note line is in here.
+    const out = printed(b64).split("<QR>")[0] ?? "";
+    // Measured over the WHOLE slip: `cellWidths` steps over the QR's GS ( k
+    // payload by its own length, so the feedback URL inside it — longer than the
+    // paper is wide — is not mistaken for a printed line.
+    for (const w of cellWidths(b64)) {
+      expect(w).toBeLessThanOrEqual(32);
     }
     expect(out).toContain("Scan the code below to rate");
     // …and it really did wrap rather than being cut short at the column.
@@ -473,9 +644,10 @@ describe("buildReceiptBase64 — custom QR message", () => {
   });
 
   test("no QR, no note — the message never prints on a bill without a QR", () => {
-    const out = decode(buildReceiptBase64({ ...baseBill, feedbackUrl: null, qrNote: "Follow us online" }));
-    expect(out).not.toContain("Follow us online");
-    expect(out).not.toContain(DEFAULT_BILL_QR_NOTE);
+    const b64 = buildReceiptBase64({ ...baseBill, feedbackUrl: null, qrNote: "Follow us online" });
+    expect(words(b64)).not.toContain("Follow us online");
+    expect(words(b64)).not.toContain("For calling Valet");
+    expect(printed(b64)).not.toContain("<QR>");
   });
 });
 
@@ -636,6 +808,7 @@ describe("buildReceiptBase64 — KOT", () => {
     const out = decode(buildReceiptBase64(kotBase));
     expect(out).not.toContain("Grand Total");
     expect(out).not.toContain("Subtotal");
+    expect(out).not.toContain("Sub Total"); // the bill ladder's wording now
     expect(out).not.toContain("Rs ");
     expect(out).not.toContain("200.00");
     expect(out).not.toContain("Service Charge");
@@ -910,29 +1083,6 @@ describe("buildReceiptBase64 — KOT, type size", () => {
     ],
   };
 
-  /**
-   * Every text run with the `ESC !` mode it was printed in. A run is the text
-   * between two commands, so a line split by bold/size switches yields several.
-   */
-  const runs = (b64: string): { mode: number; bold: boolean; text: string }[] => {
-    const raw = decode(b64);
-    const out: { mode: number; bold: boolean; text: string }[] = [];
-    let mode = 0;
-    let bold = false;
-    let buf = "";
-    const flush = () => { if (buf) { out.push({ mode, bold, text: buf }); buf = ""; } };
-    for (let i = 0; i < raw.length; i++) {
-      const c = raw[i];
-      if (c === "\x1b" && raw[i + 1] === "!") { flush(); mode = raw.charCodeAt(i + 2); i += 2; continue; }
-      if (c === "\x1b" && raw[i + 1] === "E") { flush(); bold = raw.charCodeAt(i + 2) === 1; i += 2; continue; }
-      if (c === "\x1b" && raw[i + 1] === "a") { flush(); i += 2; continue; }
-      if (c === "\x1b" && raw[i + 1] === "@") { flush(); mode = 0; bold = false; i += 1; continue; }
-      if (c === "\x1d" && raw[i + 1] === "V") { flush(); i += 2; continue; }
-      buf += c;
-    }
-    flush();
-    return out;
-  };
   const runOf = (b64: string, needle: string) => {
     const r = runs(b64).find((x) => x.text.includes(needle));
     expect(r).toBeTruthy();
@@ -975,8 +1125,11 @@ describe("buildReceiptBase64 — KOT, type size", () => {
   });
 
   test("the GUEST's bill does not change size", () => {
+    // Item 3 is a kitchen change: a bill's lines and its ladder stay body size.
+    // (The one tall line a bill has is its Grand Total, which is the client's
+    // own layout and is pinned in "the client's reference bill layout".)
     const b64 = buildReceiptBase64(baseBill);
-    for (const needle of ["Tea - Earl Grey", "Subtotal", "Total Qty"]) {
+    for (const needle of ["Tea - Earl Grey", "Sub Total", "Total Qty", "Round off"]) {
       expect(runOf(b64, needle).mode).toBe(0);
     }
   });
@@ -1235,9 +1388,12 @@ describe("buildReceiptBase64 — KOT, bold dish names", () => {
   test("the GUEST's bill is untouched — this is a kitchen-legibility change", () => {
     const raw = decode(buildReceiptBase64(baseBill));
     expect(raw).not.toContain("\x1bE\x01Tea - Earl Grey");
-    // The only bold run on a bill is still the Grand Total.
+    // A bill spends bold where the client's own bill does — the restaurant
+    // name, the table on the Date row, the Grand Total — and never on a dish.
     expect(boldRuns(buildReceiptBase64(baseBill)).map((s) => s.trim())).toEqual([
-      expect.stringContaining("Grand Total:"),
+      "Cafe Nicoise",
+      "Dine In: 5",
+      expect.stringMatching(/^Grand Total +Rs 88\.00$/),
     ]);
   });
 });
@@ -1298,7 +1454,7 @@ describe("buildReceiptBase64 — reprints", () => {
       // 32 cells, so it survives `big`'s fit guard instead of degrading.
       // 0x38 = double width + height + the bold bit, so bold survives `ESC !`.
       expect(decode(b64)).toContain("\x1bE\x01\x1b!8** REPRINT **");
-      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(BILL_COLS[cols]!); }
     }
   });
 
@@ -1397,7 +1553,7 @@ describe("buildReceiptBase64 — Token No.", () => {
     return joined;
   };
 
-  test("lists every ticket, under the Bill No. / Cashier line and above the items", () => {
+  test("lists every ticket, under the Cashier / Bill No. line and above the items", () => {
     const b64 = buildReceiptBase64({ ...baseBill, kotNumbers: [214, 218, 236] });
     const lines = printedLines(b64);
     const at = lines.findIndex((l) => l.startsWith("Token No.:"));
@@ -1409,7 +1565,7 @@ describe("buildReceiptBase64 — Token No.", () => {
   test("nine tokens wrap to the roll, and a wrap never splits a number", () => {
     for (const cols of [48, 32]) {
       const b64 = buildReceiptBase64({ ...baseBill, kotNumbers: nine }, cols);
-      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
+      for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(BILL_COLS[cols]!); }
       // Rejoined on the single spaces wrapText broke at: exactly the list given.
       expect(tokenLine(b64)).toBe(`Token No.: ${nine.join(", ")}`);
     }
@@ -1517,6 +1673,565 @@ describe("buildReceiptBase64 — a cancelled docket", () => {
       for (const w of cellWidths(buildReceiptBase64(slip, cols))) {
         expect(w).toBeLessThanOrEqual(cols);
       }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE CLIENT'S REFERENCE BILL.
+//
+// The owner photographed a real "Gaia - Global Vegetarian" bill and said this is
+// how the bill should look — "see the margins and the lines and everything".
+// Every block above pins a BEHAVIOUR (no orphan labels, money printed verbatim,
+// notes kept off the guest's copy). This one pins the SHAPE, on a slip built
+// from that bill's own figures: fifteen lines including its two long dish names,
+// a total quantity of 19, a 4745.00 subtotal, SGST and CGST at 2.5% (118.63
+// each), a -0.26 round-off and 4982.00 to pay.
+//
+// What the reference looks like, top to bottom: the logo and a bold restaurant
+// name at body size over the address block; a thin rule; the "Name:" slot; a
+// thin rule; Date with the table in bold, then Cashier and Bill No., then the
+// token list; a THICK rule; "Item Qty. Price Amount"; a THICK rule; the lines; a
+// THICK rule; a right-hand ladder whose figures stand under the line amounts; a
+// thin rule; the round-off and a tall bold Grand Total; a thin rule; the bold
+// service-charge disclaimer; and inside margins on the wide roll throughout.
+// ---------------------------------------------------------------------------
+describe("the client's reference bill layout", () => {
+  const ROLLS = [48, 32];
+
+  /** Per roll: the print area W, the Amount column's width, and the heading row. */
+  const LAYOUT: Record<number, { W: number; AMT: number; heading: string }> = {
+    48: { W: 44, AMT: 10, heading: `Item${" ".repeat(17)}Qty.${" ".repeat(4)}Price${" ".repeat(4)}Amount` },
+    32: { W: 32, AMT: 9, heading: `Item${" ".repeat(7)}Qty.${" ".repeat(3)}Price${" ".repeat(3)}Amount` },
+  };
+
+  const items = [
+    { name: "Southern Enokii Tempura", quantity: 1, price: 425 },
+    { name: "Malabar Parotta - HSN:129", quantity: 3, price: 95 },
+    { name: "Burrata & Heirloom Tomato", quantity: 1, price: 495 },
+    { name: "Truffle Mushroom Dimsum", quantity: 1, price: 395 },
+    { name: "Paneer Tikka", quantity: 2, price: 325 },
+    { name: "Dal Makhani", quantity: 1, price: 345 },
+    { name: "Jeera Rice", quantity: 1, price: 195 },
+    { name: "Avocado Sushi Roll", quantity: 1, price: 425 },
+    { name: "Thai Green Curry", quantity: 1, price: 375 },
+    { name: "Butter Naan", quantity: 2, price: 75 },
+    { name: "Fresh Lime Soda", quantity: 1, price: 125 },
+    { name: "Masala Chaas", quantity: 1, price: 95 },
+    { name: "Gaia Rose Cookies", quantity: 1, price: 245 },
+    { name: "Ghewar Berry Mousse", quantity: 1, price: 295 },
+    { name: "Tiramisu", quantity: 1, price: 245 },
+  ];
+  const disclaimer = "Service charge is voluntary. Please ask your server to remove it if you do not wish to pay it.";
+  /**
+   * A logo the size bill_logo.ts produces for the 80mm roll (two thirds of 576
+   * dots = 384 across), ten rows tall on purpose: its height byte is 0x0a, the
+   * newline, so any helper that found lines by splitting the raw stream would
+   * break this image in half.
+   */
+  const logo = Buffer.concat([Buffer.from([0x1d, 0x76, 0x30, 0x00, 48, 0, 10, 0]), Buffer.alloc(48 * 10, 0x55)]);
+  const gaia: ReceiptOptions = {
+    restaurantName: "Gaia - Global Vegetarian",
+    legalName: "NAVKRISH HOSPITALITY LLP",
+    address: "12 Mantri Square, 2nd Floor, Sampige Road\nMalleshwaram, Bengaluru 560003",
+    phone: "080-4123 4567",
+    gstin: "29AAXFN2701Q1ZF",
+    logo,
+    table: "33",
+    covers: 4,
+    customer: "Guest",
+    billNo: "G-2345",
+    cashier: "Riya",
+    printedAt: "14/09/26 21:43",
+    kotNumbers: [214, 218, 236, 241, 242, 257, 272, 277, 298],
+    items,
+    total: 4745,
+    currency: "₹",
+    serviceCharge: { percent: 10, amount: 0, optedOut: true },
+    taxes: [
+      { name: "SGST", percentage: 2.5, amount: 118.63 },
+      { name: "CGST", percentage: 2.5, amount: 118.63 },
+    ],
+    roundOff: -0.26,
+    grandTotal: 4982,
+    serviceChargeNote: disclaimer,
+    feedbackUrl: "https://example.test/feedback?rid=r1&eid=e1",
+    kind: "bill",
+  };
+
+  /** For every rule on the slip: [the nearest printed line above, the rule, the nearest below]. */
+  const aroundRules = (lines: string[]) => lines.flatMap((l, i) => {
+    if (!l.startsWith("<RULE")) { return []; }
+    let above = i - 1;
+    while (above >= 0 && !lines[above]!.trim()) { above--; }
+    let below = i + 1;
+    while (below < lines.length && !lines[below]!.trim()) { below++; }
+    return [[lines[above] ?? "", l, lines[below] ?? ""]];
+  });
+
+  test("the fixture carries the reference bill's own arithmetic", () => {
+    // So a failure below is the renderer's, never a typo in the fixture.
+    expect(items).toHaveLength(15);
+    expect(items.reduce((s, it) => s + it.quantity, 0)).toBe(19);
+    expect(items.reduce((s, it) => s + it.quantity * it.price, 0)).toBe(4745);
+    const paise = (n: number) => Math.round(n * 100);
+    const taxes = (gaia.taxes ?? []).reduce((s, t) => s + paise(t.amount), 0);
+    expect(paise(gaia.total) + taxes + paise(gaia.roundOff ?? 0)).toBe(paise(gaia.grandTotal ?? 0));
+  });
+
+  test("the 80mm bill sets its margins in the printer; the 58mm bill sets none", () => {
+    const marginCmds = (b64: string) => pieces(b64)
+      .flatMap((p) => (p.kind === "cmd" && (p.op === "GS L" || p.op === "GS W") ? [`${p.op} ${p.n}`] : []));
+    // ESC @, then GS L 24 dots (two cells) and GS W 528 dots (44 cells), before
+    // anything prints — at the start of a line, where both are honoured.
+    const wide = buildReceiptBase64(gaia, 48);
+    expect([...bytes(wide).subarray(0, 10)]).toEqual([0x1b, 0x40, 0x1d, 0x4c, 24, 0, 0x1d, 0x57, 0x10, 0x02]);
+    expect(marginCmds(wide)).toEqual(["GS L 24", "GS W 528"]);
+    // The narrow roll has no column to spare: straight from ESC @ to centring.
+    const narrow = buildReceiptBase64(gaia, 32);
+    expect([...bytes(narrow).subarray(0, 5)]).toEqual([0x1b, 0x40, 0x1b, 0x61, 0x01]);
+    expect(marginCmds(narrow)).toEqual([]);
+    // The kitchen docket keeps the whole roll, bill fields or not.
+    expect(marginCmds(buildReceiptBase64({ ...gaia, kind: "kot" }, 48))).toEqual([]);
+    // The exported helpers say the same thing as the bytes.
+    expect(billMarginCols(48)).toBe(2);
+    expect(billMarginCols(32)).toBe(0);
+    expect(billColumns(44)).toEqual({ COL_ITEM: 20, COL_QTY: 5, COL_PRICE: 9, COL_TOTAL: 10 });
+    expect(billColumns(32)).toEqual({ COL_ITEM: 11, COL_QTY: 4, COL_PRICE: 8, COL_TOTAL: 9 });
+  });
+
+  test("every separator is a solid rule across the print area — never a row of hyphens", () => {
+    for (const cols of ROLLS) {
+      const { W } = LAYOUT[cols]!;
+      for (const opts of [gaia, baseBill, { ...gaia, splitPart: { index: 1, of: 2, label: "Bar" } }]) {
+        // Hyphens survive only where they are words: "Gaia - Global", "-0.26".
+        expect(printed(buildReceiptBase64(opts, cols))).not.toMatch(/-{3,}/);
+      }
+      const [first, ...rules] = rasters(buildReceiptBase64(gaia, cols));
+      // The logo passes through untouched, and is not mistaken for a rule.
+      expect(first).toMatchObject({ mark: "<IMAGE>", widthDots: 384, height: 10 });
+      expect(rules.map((r) => r.mark)).toEqual([
+        "<RULE>", "<RULE>", "<RULE:THICK>", "<RULE:THICK>", "<RULE:THICK>", "<RULE>", "<RULE>", "<RULE>",
+      ]);
+      for (const r of rules) {
+        // Exactly the print area across: W cells of 12 dots, so it lines up with
+        // the text above it and stops at the margin, not the paper edge...
+        expect(r.widthDots).toBe(W * CELL_DOTS);
+        // ...ink centred in four blank rows either side: two rows thin, four thick.
+        expect(r.rows).toBe(r.mark === "<RULE>" ? "....##...." : "....####....");
+        expect([...r.header]).toEqual([0x1d, 0x76, 0x30, 0x00, (W * CELL_DOTS) / 8, 0, r.rows.length, 0]);
+      }
+    }
+  });
+
+  test("the rules fall exactly where the client's bill draws them", () => {
+    for (const cols of ROLLS) {
+      const { heading } = LAYOUT[cols]!;
+      const lines = printedLines(buildReceiptBase64(gaia, cols));
+      // The logo first, then the name under it.
+      expect(lines.filter((l) => l.trim()).slice(0, 2)).toEqual(["<IMAGE>", "Gaia - Global Vegetarian"]);
+      expect(aroundRules(lines)).toEqual([
+        // thin: the header block closes
+        ["GSTN : 29AAXFN2701Q1ZF", "<RULE>", "Name:"],
+        // thin: the Name slot is boxed on its own
+        ["Name:", "<RULE>", expect.stringMatching(/^Date: /)],
+        // THICK: the meta block closes and the item table opens...
+        [expect.stringMatching(/277, 298$/), "<RULE:THICK>", heading],
+        // THICK: ...under its headings...
+        [heading, "<RULE:THICK>", expect.stringMatching(/^Southern /)],
+        // THICK: ...and closes under the last line
+        [expect.stringMatching(/^Tiramisu +1 +245\.00 +245\.00$/), "<RULE:THICK>", expect.stringMatching(/Total Qty: 19/)],
+        // thin: the ladder closes above the round-off
+        [expect.stringMatching(/CGST 2\.5% +118\.63$/), "<RULE>", expect.stringMatching(/Round off +-0\.26$/)],
+        // thin: the Grand Total is boxed off from the footer
+        [expect.stringMatching(/Grand Total +Rs 4982\.00$/), "<RULE>", expect.stringMatching(/^Service charge is voluntary/)],
+        // thin: the disclaimer and the QR invitation are two statements
+        [expect.stringMatching(/pay it\.$/), "<RULE>", expect.stringMatching(/^For calling Valet/)],
+      ]);
+
+      // A split part's banner is boxed between the header rule and the Name slot.
+      const part = printedLines(buildReceiptBase64({ ...gaia, splitPart: { index: 1, of: 2, label: "Bar" } }, cols));
+      expect(aroundRules(part).slice(0, 3)).toEqual([
+        ["GSTN : 29AAXFN2701Q1ZF", "<RULE>", "** PART 1/2 **"],
+        ["Bar - Table 33", "<RULE>", "Name:"],
+        ["Name:", "<RULE>", expect.stringMatching(/^Date: /)],
+      ]);
+
+      // No disclaimer, no rule under nothing: the QR note follows the Grand
+      // Total's rule directly.
+      const plain = aroundRules(printedLines(buildReceiptBase64({ ...gaia, serviceChargeNote: null }, cols)));
+      expect(plain).toHaveLength(7);
+      expect(plain[6]).toEqual([expect.stringMatching(/Grand Total/), "<RULE>", expect.stringMatching(/^For calling Valet/)]);
+    }
+  });
+
+  test("the item table carries the client's headings, each figure right-aligned under its own", () => {
+    for (const cols of ROLLS) {
+      const { W, AMT, heading } = LAYOUT[cols]!;
+      const { COL_ITEM } = billColumns(W);
+      const lines = printedLines(buildReceiptBase64(gaia, cols));
+      expect(heading).toHaveLength(W);
+      expect(lines).toContain(heading);
+      // Not the old "Item Qty Price Total".
+      expect(lines.join("\n")).not.toMatch(/^Item +Qty +Price +Total$/m);
+
+      // Fifteen rows with figures, each exactly the print area wide, their
+      // amounts in order.
+      const top = lines.indexOf(heading) + 2;
+      const bottom = lines.indexOf("<RULE:THICK>", top);
+      const rows = lines.slice(top, bottom).filter((l) => /\d\.\d\d$/.test(l));
+      expect(rows.map((r) => r.slice(-AMT).trim())).toEqual(items.map((it) => (it.price * it.quantity).toFixed(2)));
+      for (const r of rows) { expect(r).toHaveLength(W); }
+
+      // The quantity ends where "Qty." ends, the price where "Price" ends.
+      const endOf = (needle: string) => heading.indexOf(needle) + needle.length;
+      const malabar = rows.find((r) => r.startsWith("Malabar"))!;
+      expect(malabar.slice(0, endOf("Qty."))).toMatch(/ 3$/);
+      expect(malabar.slice(0, endOf("Price"))).toMatch(/ 95\.00$/);
+      expect(malabar).toMatch(/ 285\.00$/);
+
+      // The two long names wrap INSIDE the Item column and continue under it —
+      // whole, and without pushing a figure along.
+      for (const name of ["Southern Enokii Tempura", "Malabar Parotta - HSN:129"]) {
+        const at = lines.findIndex((l) => l.startsWith(name.split(" ")[0]!));
+        const parts = [lines[at]!.slice(0, COL_ITEM).trim()];
+        for (let i = at + 1; !/\d\.\d\d$/.test(lines[i]!) && !lines[i]!.startsWith("<"); i++) {
+          expect(lines[i]!.length).toBeLessThan(COL_ITEM);
+          parts.push(lines[i]!);
+        }
+        expect(parts.length).toBeGreaterThan(1);
+        expect(parts.join(" ")).toBe(name);
+      }
+    }
+  });
+
+  test("Date left with the table bold on the right; Cashier left with Bill No. right", () => {
+    for (const cols of ROLLS) {
+      const { W } = LAYOUT[cols]!;
+      const b64 = buildReceiptBase64(gaia, cols);
+      const lines = printedLines(b64);
+      const date = lines.findIndex((l) => l.startsWith("Date: "));
+      expect(lines[date]).toMatch(/^Date: 14\/09\/26 21:43 +Dine In: 33$/);
+      expect(lines[date]).toHaveLength(W);
+      // Bold is ESC E alone — no size change, so the row keeps its columns.
+      expect(decode(b64)).toContain("\x1bE\x01Dine In: 33\x1bE\x00");
+      // The client's order: who took the money on the left, the bill on the right.
+      expect(lines[date + 1]).toMatch(/^Cashier: Riya +Bill No\.: G-2345$/);
+      expect(lines[date + 1]).toHaveLength(W);
+    }
+    // Either one alone prints alone, with no bare label for the other.
+    const billOnly = printed(buildReceiptBase64({ ...gaia, cashier: null }));
+    expect(billOnly).toMatch(/^Bill No\.: G-2345$/m);
+    expect(billOnly).not.toContain("Cashier");
+    const cashierOnly = printed(buildReceiptBase64({ ...gaia, billNo: null }));
+    expect(cashierOnly).toMatch(/^Cashier: Riya$/m);
+    expect(cashierOnly).not.toContain("Bill No");
+  });
+
+  test("a walk-in's Name slot is left blank; a name the guest gave fills it", () => {
+    // "Guest" is the ordering flows' placeholder for nobody-gave-a-name. On the
+    // client's bill that slot is an empty "Name:", so it is here.
+    for (const customer of ["Guest", "QR Guest", "guest", "", "   ", null, undefined, "null"]) {
+      const lines = printedLines(buildReceiptBase64({ ...gaia, customer }));
+      const at = lines.findIndex((l) => l.startsWith("Name:"));
+      expect({ customer, slot: lines[at], next: lines[at + 1] }).toEqual({ customer, slot: "Name:", next: "<RULE>" });
+    }
+    // Only the placeholder is blanked: a party whose name merely starts with the
+    // word keeps it.
+    expect(printedLines(buildReceiptBase64({ ...gaia, customer: "Aarav Mehta" }))).toContain("Name: Aarav Mehta");
+    expect(printedLines(buildReceiptBase64({ ...gaia, customer: "Guest House Pvt Ltd" }))).toContain("Name: Guest House Pvt Ltd");
+    // A corporate party's GSTIN sits directly under the name, inside the same box.
+    const corporate = printedLines(buildReceiptBase64({ ...gaia, customer: "Acme Foods", customerGstin: "29ABCDE1234F1Z5" }));
+    const at = corporate.indexOf("Name: Acme Foods");
+    expect(corporate.slice(at, at + 3)).toEqual(["Name: Acme Foods", "Customer GSTIN: 29ABCDE1234F1Z5", "<RULE>"]);
+    expect(corporate.join("\n")).not.toContain("Customer Name");
+  });
+
+  test("the restaurant name is bold at body size — the logo above it already names the restaurant", () => {
+    for (const cols of ROLLS) {
+      const b64 = buildReceiptBase64(gaia, cols);
+      expect(decode(b64)).toContain("\x1bE\x01Gaia - Global Vegetarian\n\x1bE\x00");
+      expect(runs(b64).find((r) => r.text.includes("Gaia - Global Vegetarian"))).toEqual({
+        mode: 0, bold: true, text: "Gaia - Global Vegetarian\n",
+      });
+      // Nothing on an ordinary bill is double WIDTH: every `ESC !` is body size
+      // or the Grand Total's tall-and-bold 0x18.
+      const sizes = pieces(b64).flatMap((p) => (p.kind === "cmd" && p.op === "ESC !" ? [p.n] : []));
+      expect([...new Set(sizes)].sort((a, b) => a - b)).toEqual([0x00, 0x18]);
+
+      // A name too long for one line wraps to the print area, bold on every line.
+      const long = "Gaia - Global Vegetarian Kitchen, Rooftop Bar and Private Dining";
+      const wrapped = buildReceiptBase64({ ...gaia, restaurantName: long, logo: null }, cols);
+      const nameRuns: string[] = [];
+      for (const r of runs(wrapped)) { if (!r.bold) { break; } nameRuns.push(r.text); }
+      expect(nameRuns.length).toBeGreaterThan(1);
+      expect(nameRuns.join("").replace(/\n/g, " ").trim()).toBe(long);
+      for (const r of nameRuns) { expect(r.trimEnd().length).toBeLessThanOrEqual(LAYOUT[cols]!.W); }
+    }
+  });
+
+  test("the ladder: ONE label edge for every rung, figures ending under the item amounts", () => {
+    for (const cols of ROLLS) {
+      const { W, AMT } = LAYOUT[cols]!;
+      const lines = printedLines(buildReceiptBase64(gaia, cols));
+      // The amount column is sized ONCE, to the widest figure on the ladder
+      // (never narrower than the item table's Amount column), so every label
+      // ends on the same column. On this bill the widest is "Rs 4982.00".
+      const EDGE = W - Math.max(AMT, "Rs 4982.00".length + 1);
+      /** The rung carrying `label` and ending in `figure`: where its label ends, where its figure starts and ends. */
+      const rung = (label: string, figure: string) => {
+        const row = lines.find((l) => l.includes(label) && l.trimEnd().endsWith(figure));
+        expect({ label, figure, found: row !== undefined }).toEqual({ label, figure, found: true });
+        const r = row!.trimEnd();
+        return { labelEnd: r.indexOf(label) + label.length, figureStart: r.length - figure.length, figureEnd: r.length };
+      };
+      // The item amounts end at the print area's right edge (pinned above)...
+      for (const [label, figure] of [["Sub Total", "4745.00"], ["SGST 2.5%", "118.63"], ["CGST 2.5%", "118.63"], ["Round off", "-0.26"], ["Grand Total", "Rs 4982.00"]] as const) {
+        const r = rung(label, figure);
+        // ...so every figure of the ladder ends in that same column,
+        expect({ label, figureEnd: r.figureEnd }).toEqual({ label, figureEnd: W });
+        // ...right of the shared label edge, with a space between (a figure
+        // wider than the Amount column, like the grand total, widens it for
+        // every rung rather than touching its label),
+        expect(r.figureStart).toBeGreaterThanOrEqual(EDGE + 1);
+        // ...and its label ends on the ONE shared edge — Grand Total included,
+        // which sizing each row on its own figure used to push a column left.
+        expect({ label, labelEnd: r.labelEnd }).toEqual({ label, labelEnd: EDGE });
+      }
+      // A word wider than a figure ("Opted-out" is nine characters, the narrow
+      // roll's whole Amount column) still ends at the edge, and keeps a space
+      // before it rather than running into its label.
+      const sc = rung("Service Charge 10%", "Opted-out");
+      expect(sc.figureEnd).toBe(W);
+      expect(sc.figureStart - sc.labelEnd).toBeGreaterThanOrEqual(1);
+      // No parentheses round a rate any more.
+      expect(lines.join("\n")).not.toMatch(/\(\d/);
+    }
+  });
+
+  test("Total Qty shares the Sub Total row where it fits, and takes its own row where it does not", () => {
+    // 80mm: one row, as on the client's bill.
+    expect(printedLines(buildReceiptBase64(gaia, 48))).toContainEqual(
+      expect.stringMatching(/^ +Total Qty: 19 {3}Sub Total +4745\.00$/),
+    );
+    // 58mm: "Total Qty: 19   Sub Total" and a figure do not fit 32 columns, so
+    // the quantity takes the row above — right-aligned against the Amount
+    // column like every other label — instead of being wrapped by the printer.
+    const { W, AMT } = LAYOUT[32]!;
+    const narrow = printedLines(buildReceiptBase64(gaia, 32));
+    const q = narrow.findIndex((l) => l.trim() === "Total Qty: 19");
+    expect(q).toBeGreaterThanOrEqual(0);
+    // On the shared ladder edge (see the ladder test): the widest figure here
+    // is the grand total, "Rs 4982.00".
+    expect(narrow[q]!.trimEnd()).toHaveLength(W - Math.max(AMT, "Rs 4982.00".length + 1));
+    expect(narrow[q + 1]).toMatch(/^ +Sub Total +4745\.00$/);
+  });
+
+  test("a discount is a rung like the others, its minus sign against the figure", () => {
+    for (const cols of ROLLS) {
+      const { W } = LAYOUT[cols]!;
+      const out = printed(buildReceiptBase64({ ...gaia, discount: { amount: 500, label: "Loyalty 10%" } }, cols));
+      expect(out).toMatch(/^ +Loyalty 10% +-500\.00$/m);
+      expect(out).not.toContain("- 500.00");
+      const row = out.split("\n").find((l) => l.includes("Loyalty"))!;
+      expect(row).toHaveLength(W);
+      // Between the subtotal and the service charge, where it comes off.
+      expect(out.indexOf("Sub Total")).toBeGreaterThanOrEqual(0);
+      expect(out.indexOf("Loyalty")).toBeGreaterThan(out.indexOf("Sub Total"));
+      expect(out.indexOf("Service Charge")).toBeGreaterThan(out.indexOf("Loyalty"));
+    }
+  });
+
+  test("Grand Total: no colon, bold and double HEIGHT, its figure at the right edge", () => {
+    for (const cols of ROLLS) {
+      const { W } = LAYOUT[cols]!;
+      const b64 = buildReceiptBase64(gaia, cols);
+      const row = printedLines(b64).find((l) => l.includes("Grand Total"))!;
+      expect(row).toMatch(/^ +Grand Total +Rs 4982\.00$/);
+      expect(row).toHaveLength(W);
+      expect(printed(b64)).not.toContain("Grand Total:");
+      // ESC E 1, then ESC ! 0x18 — double height with the bold bit inside it,
+      // and never double width, which would halve the columns — then the row,
+      // and both reset straight after it.
+      expect(decode(b64)).toContain(`\x1bE\x01\x1b!\x18${row}\n\x1b!\x00\x1bE\x00`);
+      // It is the one tall line on the slip.
+      expect(runs(b64).filter((r) => r.mode !== 0).map((r) => r.text.trim())).toEqual([row.trim()]);
+    }
+  });
+
+  test("the footer: the disclaimer first and bold, then the QR note, then the QR — and no Thanks", () => {
+    for (const cols of ROLLS) {
+      const b64 = buildReceiptBase64(gaia, cols);
+      const flat = printed(b64).replace(/\s+/g, " ");
+      const at = (s: string) => {
+        const i = flat.indexOf(s);
+        // Present before ordered: -1 is less than every real index.
+        expect({ s, present: i >= 0 }).toEqual({ s, present: true });
+        return i;
+      };
+      expect(at("Rs 4982.00")).toBeLessThan(at(disclaimer));
+      expect(at(disclaimer)).toBeLessThan(at("For calling Valet kindly scan the below QR code"));
+      expect(at("For calling Valet kindly scan the below QR code")).toBeLessThan(at("<QR>"));
+      // The disclaimer is emphasised; the invitation under it is not.
+      const boldText = runs(b64).filter((r) => r.bold).map((r) => r.text).join("").replace(/\s+/g, " ");
+      expect(boldText).toContain(disclaimer);
+      expect(boldText).not.toContain("For calling Valet");
+      // The client's bill has no sign-off line.
+      expect(flat).not.toMatch(/thank/i);
+    }
+    // With no QR the disclaimer is the last thing printed, under the Grand
+    // Total's rule, with no rule dangling after it.
+    const noQr = printedLines(buildReceiptBase64({ ...gaia, feedbackUrl: null }));
+    const last = noQr.lastIndexOf("<RULE>");
+    expect(noQr[last - 1]).toMatch(/Grand Total/);
+    expect(noQr.slice(last + 1).join(" ").replace(/\s+/g, " ").trim()).toBe(disclaimer);
+    expect(noQr).not.toContain("<QR>");
+  });
+
+  test("every line of the reference bill fits the print area on both rolls", () => {
+    // The reference slip, and a harder one: a reprint of a two-digit split part
+    // for a long corporate name, with a discount and a custom QR note.
+    const heavy: ReceiptOptions = {
+      ...gaia,
+      reprint: true,
+      splitPart: { index: 10, of: 12, label: "Rooftop Bar" },
+      customer: "Aarav Mehta for Northwind Traders Private Limited",
+      customerGstin: "29ABCDE1234F1Z5",
+      discount: { amount: 500, label: "Corporate discount 10%" },
+      qrNote: "Scan to rate your meal and to call the valet to the porch",
+    };
+    for (const cols of ROLLS) {
+      const { W } = LAYOUT[cols]!;
+      for (const opts of [gaia, heavy]) {
+        const widths = cellWidths(buildReceiptBase64(opts, cols));
+        // In CELLS, so the double-size REPRINT and PART banners count double.
+        for (const w of widths) { expect(w).toBeLessThanOrEqual(W); }
+        // And laid out TO the print area rather than short of it: the rules and
+        // the item rows are exactly W.
+        expect(Math.max(...widths)).toBe(W);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE KITCHEN DOCKET DID NOT MOVE.
+//
+// The reference-bill change reworked the separators, the margins, the name's
+// size and half the labels — all behind `isKot` checks inside the one renderer
+// the docket shares, where a slip of a condition changes the kitchen's paper
+// too. A docket is matched against the rail by its shape, and a kitchen that has
+// learned where to look should not have to learn again because the guest's bill
+// was redesigned. So the docket is pinned to the BYTE.
+//
+// The digests below were produced by rendering these exact fixtures with the
+// escpos.ts committed before the bill change (067cb12), NOT with the renderer
+// under test — a golden taken from the code it guards only agrees with itself.
+// Each is "<byte length>:<sha256>". When the docket is changed ON PURPOSE,
+// compare the printed output of the old and new renderer for these fixtures,
+// and only then re-pin the digests from the new one.
+// ---------------------------------------------------------------------------
+describe("buildReceiptBase64 — the KOT is byte-identical to the docket before the bill layout changed", () => {
+  const docket: ReceiptOptions = {
+    ...baseBill,
+    kind: "kot",
+    kotNo: 26,
+    printedAt: "25/08/26 15:23",
+    orderContext: "Running Table",
+    serviceMode: "Dine In",
+    section: "FRONT",
+    table: "12",
+    covers: 2,
+    assignedTo: "yadob",
+    captain: "TIYASHA",
+    items: [
+      { name: "Paneer Tikka", quantity: 2, price: 200, variation: "Half" },
+      { name: "Slow Cooked Lamb Shank Rogan Josh With Saffron Pulao", quantity: 12, price: 500, note: "extra gravy on the side please" },
+      { name: "Gulab Jamun", quantity: 3, price: 90, held: true, note: "fire with dessert course" },
+      { name: "Roti", quantity: 120, price: 10 },
+    ],
+  };
+  /** Every bill-only field set, so a docket that started reading one would show. */
+  const billFields: Partial<ReceiptOptions> = {
+    legalName: "NAVKRISH HOSPITALITY LLP",
+    address: "12 Mantri Square\n2nd Floor, Sampige Road",
+    phone: "080-4123 4567",
+    gstin: "29AAXFN2701Q1ZF",
+    customer: "Guest",
+    customerGstin: "29ABCDE1234F1Z5",
+    kotNumbers: [214, 218, 236],
+    splitPart: { index: 1, of: 2, label: "Bar" },
+    grandTotal: 4982,
+    roundOff: -0.26,
+    feedbackUrl: "https://example.test/feedback?rid=r1",
+    qrNote: "Scan to rate us",
+    serviceChargeNote: "A voluntary service charge is included to support our staff",
+  };
+  const logo = Buffer.from([0x1d, 0x76, 0x30, 0x00, 0x01, 0x00, 0x01, 0x00, 0xff]);
+  const variants: [string, ReceiptOptions, number][] = [
+    ["the ordinary docket, 80mm", docket, 48],
+    ["the ordinary docket, 58mm", docket, 32],
+    ["a reprint with an order note, 80mm", { ...docket, reprint: true, orderNote: "allergy: peanuts, no onions in anything" }, 48],
+    ["a reprint with an order note, 58mm", { ...docket, reprint: true, orderNote: "allergy: peanuts, no onions in anything" }, 32],
+    ["a cancellation slip for a takeaway table", { ...docket, cancelled: true, table: "Swiggy-88214-Delivery", section: null, orderContext: "*** REASON: GUEST LEFT ***" }, 32],
+    ["an unnumbered, unassigned, empty ticket with a logo", { ...docket, kotNo: null, assignedTo: null, captain: null, section: null, items: [], logo }, 48],
+    ["a docket carrying every bill-only field", { ...docket, ...billFields }, 48],
+    ["a docket carrying every bill-only field, 58mm", { ...docket, ...billFields, reprint: true }, 32],
+  ];
+  const stations: ReceiptOptions = {
+    ...docket,
+    items: [
+      { name: "Paneer Tikka", quantity: 2, price: 200, station: "Tandoor" },
+      { name: "Mojito", quantity: 2, price: 180, station: "BAR" },
+      { name: "Gulab Jamun", quantity: 3, price: 90, station: "Sweets", held: true },
+    ],
+  };
+
+  const GOLDEN: Record<string, string> = {
+    "the ordinary docket, 80mm": "1157:17637d426f2b3cc1c2024e49034c98b119355593f7863a17418aa584a09ed7cd",
+    "the ordinary docket, 58mm": "1012:2884bcc98935a7fa3e7bc6a630824809423e68eb11161133d84703114088dc14",
+    "a reprint with an order note, 80mm": "1348:7b12d90862f7c1ea6f47a00a16f139bdd25ef1d6c70e1ea53b35155216e2bc2c",
+    "a reprint with an order note, 58mm": "1312:70cb3eb42ee058356b5ab565134fe463fd0ac8809d0c940e91f628bdc0b25c55",
+    "a cancellation slip for a takeaway table": "1131:0fcdad49884d4a6cca63a9ede91dc079ab2fe146e2eaa768dda2bc02ac80bdbf",
+    "an unnumbered, unassigned, empty ticket with a logo": "518:1255fb20bd25735d1d3d50b69d4cd87d3742a1836a414bf18ccf2e9f53fb15e4",
+    "a docket carrying every bill-only field": "1157:17637d426f2b3cc1c2024e49034c98b119355593f7863a17418aa584a09ed7cd",
+    "a docket carrying every bill-only field, 58mm": "1204:5f1061a226a7c9dd86abf461f2354f863319b291632aa7e095ccbef645e7b96b",
+    "per-station Tandoor, 48 columns": "710:5d0c567d42a6455ff9878d895ef2a767423c2ff45e5d8d68d521eed9cb5d9923",
+    "per-station BAR, 48 columns": "706:076170af2362911dd3c3dae8a6b9dbee47fa3386114ce670c93246b0bcb3a85d",
+    "per-station Sweets, 48 columns": "750:5ba29a23495fff9cac1c875cebdc424906c281ff28ac5b5b6834686198cf93ca",
+    "per-station Tandoor, 32 columns": "566:6f626540f1fafe62ba940907e45d6fca00bf3d2f171380c8a6333f3e8e3d5e0a",
+    "per-station BAR, 32 columns": "562:6d3413f4645b38dcc4334ea0ef3a5b60f1006494d77b848c206f12b877f5672e",
+    "per-station Sweets, 32 columns": "616:1127f6fc781d66130eb08c14f066dec303a2107c4bca640b091937cad7733436",
+  };
+
+  const digest = (b64: string) => {
+    const buf = bytes(b64);
+    return `${buf.length}:${createHash("sha256").update(buf).digest("hex")}`;
+  };
+
+  test("every docket variant matches the committed renderer's bytes", () => {
+    const actual: Record<string, string> = {};
+    for (const [name, opts, cols] of variants) { actual[name] = digest(buildReceiptBase64(opts, cols)); }
+    for (const cols of [48, 32]) {
+      for (const t of buildKotBase64(stations, cols)) { actual[`per-station ${t.station}, ${cols} columns`] = digest(t.escBase64); }
+    }
+    // One object, so a failure names every variant that moved at once.
+    expect(actual).toEqual(GOLDEN);
+  });
+
+  test("a docket reads no bill-only field, on either roll", () => {
+    for (const cols of [48, 32]) {
+      expect(buildReceiptBase64({ ...docket, ...billFields }, cols)).toBe(buildReceiptBase64(docket, cols));
+    }
+  });
+
+  test("a docket carries none of the bill's new printer furniture", () => {
+    for (const [name, opts, cols] of variants) {
+      const ps = pieces(buildReceiptBase64(opts, cols));
+      // No margins, no rules: its separators are still its dashed rows...
+      expect({ name, margins: ps.some((p) => p.kind === "cmd" && (p.op === "GS L" || p.op === "GS W")) }).toEqual({ name, margins: false });
+      expect({ name, rules: ps.some((p) => p.kind === "raster" && p.mark !== "<IMAGE>") }).toEqual({ name, rules: false });
+      expect(printed(buildReceiptBase64(opts, cols))).toMatch(new RegExp(`^-{${cols}}$`, "m"));
     }
   });
 });

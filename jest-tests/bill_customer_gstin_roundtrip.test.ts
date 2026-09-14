@@ -228,8 +228,40 @@ const listRow = async (billId: string) =>
     .bills.find((b) => b.id === billId)!;
 const reprint = (billId: string) =>
   harness.call("POST", "/print/bill/settled", { body: { bill_id: billId }, auth: ACCOUNTANT as never });
-const paper = (b64: string): string =>
-  Buffer.from(b64, "base64").toString("latin1").replace(/\x1b@/g, "").replace(/\x1b[a!E][\s\S]/g, "").replace(/\x1dV[\s\S]/g, "");
+/**
+ * The printed text of an ESC/POS stream, commands skipped BY THEIR OWN LENGTH.
+ *
+ * A regex strip is not enough since the bill gained solid raster rules: a
+ * GS v 0 header carries its height as a byte, and a 10-dot rule's height IS
+ * a newline, so a text split would cut a line in two inside a picture. Each image
+ * becomes one "<RASTER>" line; GS L / GS W (the bill's margins) print nothing.
+ */
+const stripEscPos = (raw: string): string => {
+  let out = "";
+  for (let i = 0; i < raw.length;) {
+    const c = raw.charCodeAt(i);
+    if (c === 0x1b) { i += raw.charCodeAt(i + 1) === 0x40 ? 2 : 3; continue; }
+    if (c === 0x1d) {
+      const n = raw.charCodeAt(i + 1);
+      if (n === 0x76) {
+        const wb = raw.charCodeAt(i + 4) | (raw.charCodeAt(i + 5) << 8);
+        const h = raw.charCodeAt(i + 6) | (raw.charCodeAt(i + 7) << 8);
+        out += "\n<RASTER>\n";
+        i += 8 + wb * h;
+        continue;
+      }
+      if (n === 0x4c || n === 0x57) { i += 4; continue; }
+      if (n === 0x28) { i += 5 + (raw.charCodeAt(i + 3) | (raw.charCodeAt(i + 4) << 8)); continue; }
+      i += 3; // GS V n
+      continue;
+    }
+    out += raw[i];
+    i++;
+  }
+  return out;
+};
+
+const paper = (b64: string): string => stripEscPos(Buffer.from(b64, "base64").toString("latin1"));
 
 describe("the live repro: a RELEASED bill whose only orders are cancelled", () => {
   test("write -> closed detail and list read back BOTH the name and the GSTIN", async () => {
@@ -292,7 +324,8 @@ describe("a normally PAID bill with a voided round in its window", () => {
     expect(r.status).toBe(200);
     expect(store.dispatched).toHaveLength(1);
     const out = paper(store.dispatched[0]);
-    expect(out).toMatch(new RegExp(`^Customer Name: ${NAME}$`, "m"));
+    // The client's bill calls the slot "Name:".
+    expect(out).toMatch(new RegExp(`^Name: ${NAME}$`, "m"));
     expect(out).toMatch(new RegExp(`^Customer GSTIN: ${GSTIN}$`, "m"));
     expect(out).toContain("REPRINT");
   });
@@ -312,7 +345,8 @@ describe("a normally PAID bill with a voided round in its window", () => {
     await edit(PAID_BILL, { customer: "Old Name", customer_gstin: GSTIN });
     await edit(PAID_BILL, { customer: NAME });
     const out = paper((await reprint(PAID_BILL), store.dispatched[store.dispatched.length - 1]));
-    expect(out).toMatch(new RegExp(`^Customer Name: ${NAME}$`, "m"));
+    // The client's bill calls the slot "Name:".
+    expect(out).toMatch(new RegExp(`^Name: ${NAME}$`, "m"));
     expect(out).toMatch(new RegExp(`^Customer GSTIN: ${GSTIN}$`, "m"));
     expect(out).not.toContain("Old Name");
   });

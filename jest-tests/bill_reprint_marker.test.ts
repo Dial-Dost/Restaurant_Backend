@@ -128,20 +128,51 @@ const sentBytes = (): string => {
   return Buffer.from(job.esc_base64, "base64").toString("latin1");
 };
 
-/** Printed lines with the fixed-length ESC/POS commands removed, blanks dropped. */
+/**
+ * The printed text of an ESC/POS stream, commands skipped BY THEIR OWN LENGTH.
+ *
+ * A regex strip is not enough since the bill gained solid raster rules: a
+ * GS v 0 header carries its height as a byte, and a 10-dot rule's height IS
+ * a newline, so a text split would cut a line in two inside a picture. Each image
+ * becomes one "<RASTER>" line; GS L / GS W (the bill's margins) print nothing.
+ */
+const stripEscPos = (raw: string): string => {
+  let out = "";
+  for (let i = 0; i < raw.length;) {
+    const c = raw.charCodeAt(i);
+    if (c === 0x1b) { i += raw.charCodeAt(i + 1) === 0x40 ? 2 : 3; continue; }
+    if (c === 0x1d) {
+      const n = raw.charCodeAt(i + 1);
+      if (n === 0x76) {
+        const wb = raw.charCodeAt(i + 4) | (raw.charCodeAt(i + 5) << 8);
+        const h = raw.charCodeAt(i + 6) | (raw.charCodeAt(i + 7) << 8);
+        out += "\n<RASTER>\n";
+        i += 8 + wb * h;
+        continue;
+      }
+      if (n === 0x4c || n === 0x57) { i += 4; continue; }
+      if (n === 0x28) { i += 5 + (raw.charCodeAt(i + 3) | (raw.charCodeAt(i + 4) << 8)); continue; }
+      i += 3; // GS V n
+      continue;
+    }
+    out += raw[i];
+    i++;
+  }
+  return out;
+};
+
+/** Printed lines with every ESC/POS command removed, blanks dropped. */
 const printedLines = (raw: string): string[] =>
-  raw
-    .replace(/\x1b@/g, "")
-    .replace(/\x1b[a!E][\s\S]/g, "")
-    .replace(/\x1dV[\s\S]/g, "")
+  stripEscPos(raw)
     .split("\n")
     .filter((l) => l.trim());
 
 /** Asserts REPRINT is the FIRST printed line, bold and double width+height. */
 const expectReprintOnTop = (raw: string) => {
   expect(printedLines(raw)[0]).toBe("** REPRINT **");
-  // Nothing printable precedes it: only init, alignment, then the bold+size run.
-  expect(raw.startsWith("\x1b@\x1ba\x01\x1bE\x01\x1b!\x38** REPRINT **\n")).toBe(true);
+  // Nothing printable precedes it: only init, the bill's margins (GS L 24 dots,
+  // GS W 528 dots on the 80mm roll), alignment, then the bold+size run.
+  expect(raw.startsWith("\x1b@\x1dL\x18\x00\x1dW\x10\x02\x1ba\x01\x1bE\x01\x1b!\x38** REPRINT **\n")).toBe(true);
 };
 
 describe("POST /print/bill — the open table's bill", () => {
