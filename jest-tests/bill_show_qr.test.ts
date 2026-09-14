@@ -233,4 +233,9 @@ describe("the switch is wired end to end", () => {
     expect(db).toContain('const billShowQr = typeof opts.bill_show_qr === "boolean" ? opts.bill_show_qr : null;');
     expect(db).toContain('add column if not exists bill_show_qr boolean default true');
   });
+
+  test("the migration that records the column defaults it to true, like the runtime DDL", () => {
+    const sql = read("migrations/047_bill_show_qr.sql");
+    expect(sql).toMatch(/add column if not exists bill_show_qr boolean default true/i);
+  });
 });
