@@ -4,7 +4,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { Audit_log_category, GetPublicBranding, GetRestaurantLogo, GetRestaurantProfile, GetRestaurantSettings, SetBranding, SetRestaurantSettings, UpdateRestaurantProfile } from "../database_supabase.js";
-import { billLogoDots } from "../bill_logo.js";
+import { BILL_LOGO_SVG_MAX_CHARS, billLogoDots, billLogoInkShare, cleanBillLogoSvg, rasterizeBillLogo } from "../bill_logo.js";
 import { logger } from "../observability.js";
 import { uploadMenuImage } from "../storage_bucket_supabase.js";
 import { PERM_BRANDING, PERM_SETTINGS, buildBillLogoRaster, buildLogoEscPos, callerHasPermission, enforcePermission, extractEmployeeId, extractRestaurantId, log_audit, validate, validateAction } from "./_shared.js";
@@ -277,6 +277,37 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	const body = (req.body ?? {}) as Record<string, unknown>;
+	// AN SVG BILL LOGO IS CHECKED HERE, AND REFUSED OUT LOUD.
+	//
+	// It used to be sanitized deep in the data layer to "" when it failed a check
+	// — stored as NULL, answered 200 — so the app said "Bill logo saved." over an
+	// empty card and no owner could tell why. Now the three ways an upload can be
+	// unusable each come back as a 400 with a sentence the app shows as-is:
+	// not an SVG, too large, or an SVG that prints as nothing (it cannot be drawn,
+	// or it is white/very light and thresholds to blank paper). Sending "" still
+	// clears the logo, exactly as before.
+	if (typeof body.bill_logo_svg === "string" && body.bill_logo_svg.trim()) {
+		const cleaned = cleanBillLogoSvg(body.bill_logo_svg);
+		if (!cleaned.ok) {
+			res.status(400).json({
+				error: "Invalid bill logo",
+				details: cleaned.reason === "too_large"
+					? `That SVG is too large (over ${Math.round(BILL_LOGO_SVG_MAX_CHARS / 1000)} KB). Export a simpler version of the logo and try again.`
+					: "That file is not an SVG logo. Export the logo as .svg from your design tool and choose that file.",
+			});
+			return;
+		}
+		const raster = await rasterizeBillLogo(Buffer.from(cleaned.svg, "utf8"), billLogoDots("80mm"));
+		if (!raster || billLogoInkShare(raster) === 0) {
+			res.status(400).json({
+				error: "Invalid bill logo",
+				details: !raster
+					? "That SVG could not be drawn for printing. Try exporting it again with text converted to outlines."
+					: "That logo prints as blank paper: it is white or very light. Bills print in black only, so choose a dark version of the logo.",
+			});
+			return;
+		}
+	}
 	// Reject an unknown zone instead of letting sanitizeTimezone quietly coerce it
 	// to Asia/Kolkata: the owner would see the save succeed and every timestamp
 	// keep rendering in the wrong zone with nothing to explain it. Only validated
