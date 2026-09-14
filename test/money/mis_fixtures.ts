@@ -867,6 +867,21 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       }
       return [...acc.entries()].map(([channel, v]) => ({ channel, bills: String(v.bills), total: v.total }));
     }
+    // GetOverviewHeadline — the ladder read without the seating lateral, plus
+    // the online flag. The reader's EXISTS looks for any online order on the
+    // bill's TABLE; the fixture has no table ids, so it reads the bill's own
+    // order, which is the same answer for every bill these suites build.
+    if (/as is_online/i.test(q)) {
+      const walkIn = new Set(["dine_in", "dinein", "dine-in", "takeaway", "take_away", "pickup"]);
+      return [...rows]
+        .sort((a, z) => new Date(a.settled_at).getTime() - new Date(z.settled_at).getTime())
+        .map((b) => ({
+          ...misBillRow(b),
+          session_id: null,
+          session_covers: null,
+          is_online: !walkIn.has(orderOf(b)?.order_type ?? "dine_in"),
+        }));
+    }
     // fetchMisBills — the shared ladder read.
     if (/s\.covers as session_covers/i.test(q)) {
       return [...rows]

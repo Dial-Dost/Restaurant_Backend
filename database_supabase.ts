@@ -259,11 +259,14 @@ import {
   perCover,
   previousWindow,
   serviceChargeBasisLabel,
+  settlementByMethod,
   sharePct,
   zeroLadder,
   type BillEditKind,
   type BillMoney,
   type LadderTotals,
+  type SettlementBill,
+  type SettlementMethodRow,
   type SettlementPart,
 } from "./mis_report_math.js";
 export {
@@ -36291,15 +36294,8 @@ export async function GetCoverSizeSummaryReport(restaurantId: string, q: MisRepo
 
 // --- 9. Settlement Summary ---------------------------------------------------
 
-export interface SettlementRow {
-  method: string;
-  /** Bills that touched this mode. A split bill counts under each mode it used. */
-  bills: number;
-  amount: number;
-  share_pct: number | null;
-  refund: number;
-  net_amount: number;
-}
+/** One mode's line. Defined beside settlementByMethod, which builds it. */
+export type SettlementRow = SettlementMethodRow;
 
 export interface SettlementSummaryReport {
   meta: MisReportMeta;
@@ -36352,41 +36348,16 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
   const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
 
-  const acc = new Map<string, { bills: number; amount: number; refund: number }>();
-  let splitBills = 0;
-  let unallocated = 0;
-  for (const b of bills) {
-    const parts = allocateSettlement(
-      b.money.grand_total,
-      b.row.payment_method,
-      parsePaymentSplits(b.row.payment_splits),
-    );
-    if (parts.length > 1) {splitBills += 1;}
-    for (const p of parts) {
-      if (p.method === UNALLOCATED_METHOD) {unallocated = round2(unallocated + p.amount);}
-      const e = acc.get(p.method) ?? { bills: 0, amount: 0, refund: 0 };
-      e.bills += 1;
-      e.amount = round2(e.amount + p.amount);
-      // A refund has no mode of its own, so it follows the money: each part
-      // carries its share of the bill's refund.
-      if (b.money.refund > 0 && b.money.grand_total > 0) {
-        e.refund = round2(e.refund + (b.money.refund * p.amount) / b.money.grand_total);
-      }
-      acc.set(p.method, e);
-    }
-  }
-
-  const totalAmount = round2([...acc.values()].reduce((s, v) => s + v.amount, 0));
-  const rows: SettlementRow[] = [...acc.entries()]
-    .map(([method, v]) => ({
-      method,
-      bills: v.bills,
-      amount: v.amount,
-      share_pct: sharePct(v.amount, totalAmount),
-      refund: round2(v.refund),
-      net_amount: round2(v.amount - v.refund),
-    }))
-    .sort((a, z) => z.amount - a.amount);
+  // The cut itself lives in mis_report_math.ts so the Overview headline's
+  // "today by payment method" block is this same computation, not a copy of it.
+  const {
+    rows, split_bills: splitBills, unallocated, total_amount: totalAmount,
+  } = settlementByMethod(bills.map((b) => ({
+    grand_total: b.money.grand_total,
+    refund: b.money.refund,
+    payment_method: b.row.payment_method,
+    splits: parsePaymentSplits(b.row.payment_splits),
+  })));
 
   const ladder = misLadder(bills);
   return {
@@ -36445,6 +36416,11 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
 //           this must never produce.
 //   MTD   = gross, from the 1st of the CURRENT MONTH in the restaurant's own zone
 //           up to and including today.
+//   BY METHOD = today's settlement cut by payment mode — settlementByMethod, the
+//           Settlement Summary's own computation, over today's bills only. CASH
+//           above is READ OFF these rows rather than summed beside them, so the
+//           Cash row and the Cash collection tile are the same number by
+//           construction, not by two loops that happen to agree.
 //
 // ----------------------------------------------------------------------------
 // ONE READ, NOT SIX
@@ -36480,6 +36456,24 @@ export interface OverviewHeadline {
   /** Bills behind the day's figures, so an empty day reads as empty, not as zero. */
   today_bills: number;
   month_bills: number;
+  /**
+   * Today's takings by payment mode — the Settlement Summary's rows for today.
+   * Σ amount === today_gross.value. A mode with no money and no refund (a
+   * released ₹0 table under Other) is left out; it moves no total.
+   */
+  today_by_method: SettlementRow[];
+  /** Today's bills settled with more than one mode. */
+  today_split_bills: number;
+  /** Today's money whose split parts did not add back to the bill. Should be 0. */
+  today_unallocated: number;
+  /** The block's own label and definition, server-authored like every figure. */
+  by_method: HeadlineSection;
+}
+
+/** A labelled group of rows on the headline card. */
+export interface HeadlineSection {
+  label: string;
+  hint: string;
 }
 
 interface HeadlineBillRow extends MisBillRow {
@@ -36542,8 +36536,9 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
 
   const composed = composeMisBills(rows, scPct, tz);
 
-  let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0, cash = 0;
+  let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0;
   let todayBills = 0;
+  const todaySettled: SettlementBill[] = [];
   for (let i = 0; i < composed.length; i += 1) {
     const b = composed[i];
     monthGross = round2(monthGross + b.money.grand_total);
@@ -36558,11 +36553,21 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     // THE SAME ALLOCATION THE SETTLEMENT SUMMARY MAKES. A split tender counts
     // under each mode it touched; reading payment_method alone would report a
     // part-cash bill as wholly cash or wholly card.
-    for (const part of allocateSettlement(
-      b.money.grand_total, rows[i].payment_method, parsePaymentSplits(rows[i].payment_splits),
-    )) {
-      if (String(part.method).trim().toLowerCase() === "cash") {cash = round2(cash + part.amount);}
-    }
+    todaySettled.push({
+      grand_total: b.money.grand_total,
+      refund: b.money.refund,
+      payment_method: rows[i].payment_method,
+      splits: parsePaymentSplits(rows[i].payment_splits),
+    });
+  }
+
+  const byMethod = settlementByMethod(todaySettled);
+  // CASH IS READ OFF THE ROWS. Case-insensitive, exactly as it always was, so a
+  // legacy 'cash' spelling still counts — and the only cash a split bill
+  // contributes is its cash part, because that is all its Cash row holds.
+  let cash = 0;
+  for (const row of byMethod.rows) {
+    if (row.method.trim().toLowerCase() === "cash") {cash = round2(cash + row.amount);}
   }
 
   const fig = (value: number, label: string, hint: string): HeadlineFigure => ({ value, label, hint });
@@ -36584,6 +36589,18 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
       "Cash taken today. A bill split across modes counts only its cash part."),
     month_to_date: fig(monthGross, "Month to date",
       `Gross sales from ${monthFrom} to today, tax inclusive.`),
+    // A released ₹0 table is a bill with no mode and no money. It stays in
+    // today_bills (as it always has) but a row reading "Other ₹0.00" is noise on
+    // the one screen a cashier reads at close. Filtering it moves no total.
+    today_by_method: byMethod.rows.filter((r) => r.amount !== 0 || r.refund !== 0),
+    today_split_bills: byMethod.split_bills,
+    today_unallocated: byMethod.unallocated,
+    by_method: {
+      label: "Collected by payment method",
+      hint: "Settled today, by how it was paid; adds up to Today's gross sale. A bill split across "
+        + "modes counts each part under its own mode, and a refund comes off the modes its bill was paid "
+        + "with, on the day the bill settled.",
+    },
   };
 }
 

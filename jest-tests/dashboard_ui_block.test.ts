@@ -284,9 +284,40 @@ describe("the headline figures define themselves", () => {
 
   test("cash uses the SAME allocation as the Settlement Summary", () => {
     // Two different answers to "how much cash is in the till" is the one thing
-    // this must never produce.
-    expect(fn()).toMatch(/allocateSettlement\(/);
+    // this must never produce. The allocation now arrives through
+    // settlementByMethod — the Settlement Summary's own cut — which calls
+    // allocateSettlement; a second hand-rolled loop here is what this forbids.
+    expect(fn()).toMatch(/settlementByMethod\(todaySettled\)/);
     expect(fn()).toMatch(/parsePaymentSplits\(/);
+    expect(fn()).not.toMatch(/allocateSettlement\(/);
+  });
+
+  test("the Settlement Summary reads the very same cut", () => {
+    const src = source();
+    const report = src.slice(
+      src.indexOf("export async function GetSettlementSummaryReport"),
+      src.indexOf("// H1 — THE OVERVIEW HEADLINE"),
+    );
+    expect(report).toMatch(/settlementByMethod\(/);
+    expect(report).not.toMatch(/allocateSettlement\(/);
+  });
+
+  test("Cash collection is READ OFF the by-method rows, so the Cash row and the tile cannot differ", () => {
+    const body = fn();
+    // Derived from the helper's rows, case-insensitively, as it always was…
+    expect(body).toMatch(/for \(const row of byMethod\.rows\) \{\s*if \(row\.method\.trim\(\)\.toLowerCase\(\) === "cash"\)/);
+    // …and the tile is that figure.
+    expect(body).toMatch(/cash_collection: fig\(cash,/);
+  });
+
+  test("today by payment method ships, with its counts and its own definition", () => {
+    const body = fn();
+    for (const key of ["today_by_method:", "today_split_bills:", "today_unallocated:", "by_method: {"]) {
+      expect(body).toContain(key);
+    }
+    // A released ₹0 table must not print as "Other ₹0.00" on the till's home
+    // screen, and the filter must be at the SURFACE — the report keeps the row.
+    expect(body).toMatch(/today_by_method: byMethod\.rows\.filter\(\(r\) => r\.amount !== 0 \|\| r\.refund !== 0\)/);
   });
 
   test("the money is composed by the MIS composer, not re-derived here", () => {
