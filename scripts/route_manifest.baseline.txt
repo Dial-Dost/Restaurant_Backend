@@ -397,7 +397,7 @@ mw08 USE     *                                                      | <inline(re
 0375 POST    /non-chargeables/:id/reverse                           | validateAction(PERM_NON_CHARGEABLE) -> validateBody(sReverse) | 6d25bcb2
 0376 GET     /orders/:id/non-chargeables                            | validateAction(PERM_NON_CHARGEABLE)            | cca11956
 0377 POST    /orders/:id/void                                       | validateAction(PERM_VOID_ORDER) -> validateBody(sVoidOrder) | ee42f764
-0378 POST    /bills/service-charge-waiver                           | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sWaiveServiceCharge) | fd20b59d
+0378 POST    /bills/service-charge-waiver                           | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sWaiveServiceCharge) | 9835ef42
 0379 POST    /bills/service-charge-waiver/:id/reverse               | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sReverse) | 38c3d7c2
 0380 GET     /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 215c021d
 0381 POST    /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sBillTenders) | 64ca2a01
