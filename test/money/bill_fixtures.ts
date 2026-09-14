@@ -35,6 +35,13 @@ export interface FixtureBill {
   total_amt: number;
   /** "Bills".tax_breakdown, verbatim. May contain a "Service Charge" line (shape b). */
   tax_breakdown: FixtureTaxLine[];
+  /**
+   * "Bills".round_off (migration 048). Absent = NULL, settled before rounding.
+   * Answered only to a query that SELECTS the column, as Postgres would — so a
+   * reader that loses it from its SELECT is caught, which the dispatch-by-marker
+   * limit noted above would otherwise let through.
+   */
+  round_off?: number | null;
   payment_method?: string | null;
   payment_splits?: { method: string; amount: number }[] | null;
   refund_amount?: number;
@@ -111,11 +118,12 @@ function inRange(iso: string, fromIso: unknown, toIso: unknown): boolean {
 }
 
 /** The row shape getSettledBills() selects. */
-function settledBillRow(b: FixtureBill) {
+function settledBillRow(b: FixtureBill, q = "") {
   return {
     settled_at: new Date(b.settled_at),
     total_amt: b.total_amt,
     tax_breakdown: b.tax_breakdown,
+    ...(/\bround_off\b/i.test(q) ? { round_off: b.round_off ?? 0 } : {}),
     payment_method: b.payment_method ?? null,
     payment_splits: b.payment_splits ?? null,
     refund_amount: b.refund_amount ?? 0,
@@ -123,7 +131,7 @@ function settledBillRow(b: FixtureBill) {
 }
 
 /** The row shape CLOSED_BILL_SELECT produces (the bill-detail / history path). */
-function closedBillRow(b: FixtureBill) {
+function closedBillRow(b: FixtureBill, q = "") {
   const closedAt = new Date(b.settled_at);
   return {
     id: b.id,
@@ -134,6 +142,7 @@ function closedBillRow(b: FixtureBill) {
     table_name: null,
     total_amt: b.total_amt,
     tax_breakdown: b.tax_breakdown,
+    ...(/\bb\.round_off\b/i.test(q) ? { round_off: b.round_off ?? null } : {}),
     payment_method: b.payment_method ?? null,
     payment_splits: b.payment_splits ?? null,
     payment_proof_screenshot_url: null,
@@ -232,11 +241,11 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     if (/as settled_at/i.test(q)) {
       return d.bills
         .filter((b) => isSettled(b) && inRange(b.settled_at, params[2], params[3]))
-        .map(settledBillRow);
+        .map((b) => settledBillRow(b, q));
     }
     // ListClosedBills' page query (the bill-detail classification path).
     if (/b\.bill_no/i.test(q)) {
-      return closedListBills(d, q, params).map(closedBillRow);
+      return closedListBills(d, q, params).map((b) => closedBillRow(b, q));
     }
   }
 

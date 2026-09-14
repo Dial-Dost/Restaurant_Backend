@@ -20,6 +20,7 @@
 import { describe, test, expect } from "@jest/globals";
 import {
   computeBillCharges,
+  computeBillSplit,
   computeSectionSplit,
   toPaisa,
   type SectionSplitLine,
@@ -194,6 +195,15 @@ const LINES: SectionSplitLine[] = [
 const SUBTOTAL = 1833;
 const CHARGES = computeBillCharges(SUBTOTAL, GST, 10, true, { type: "percent", value: 7 });
 const SPLIT = computeSectionSplit({ ...CHARGES }, LINES);
+/**
+ * The same bill as a ladder that was NEVER rounded to the rupee — a total built
+ * before migration 048, or by hand. Its parts are apportioned by weight and land
+ * on paise, which is what the "no part invents its own rounding" guards need:
+ * against whole-rupee parts, a renderer that whole-rupee-rounded on its own
+ * would pass them without ever being tested.
+ */
+const UNROUNDED = { ...CHARGES, grand_total: CHARGES.pre_round_total };
+const SPLIT_UNROUNDED = computeSectionSplit(UNROUNDED, LINES);
 
 /** The bill this table prints today, before anybody asks for a split. */
 const WHOLE: ReceiptOptions = {
@@ -214,6 +224,8 @@ const WHOLE: ReceiptOptions = {
   serviceCharge: { percent: CHARGES.service_charge_percent, amount: CHARGES.service_charge },
   taxes: CHARGES.taxes,
   grandTotal: CHARGES.grand_total,
+  // What /print/bill hands the renderer since migration 048.
+  roundOff: CHARGES.round_off,
   serviceChargeNote: "A Voluntary Service Charge is included to support our staff.",
 };
 
@@ -273,33 +285,59 @@ describe("buildSplitReceiptsBase64 — the printed money", () => {
   });
 
   test("no part invents its own rounding — it prints the allocator's number", () => {
-    const out = buildSplitReceiptsBase64(WHOLE, SPLIT.parts);
+    const unrounded = { ...WHOLE, grandTotal: UNROUNDED.grand_total, roundOff: null };
+    const out = buildSplitReceiptsBase64(unrounded, SPLIT_UNROUNDED.parts);
     out.forEach((receipt, i) => {
-      expect(printedGrandTotalPaisa(receipt.escBase64)).toBe(toPaisa(SPLIT.parts[i]!.grand_total));
+      expect(printedGrandTotalPaisa(receipt.escBase64)).toBe(toPaisa(SPLIT_UNROUNDED.parts[i]!.grand_total));
     });
     // The guard is only worth anything if a part's total is NOT a whole rupee:
     // the legacy branch of buildReceiptBase64 whole-rupee-rounds, and against a
     // fixture that happened to land on round numbers this suite would pass while
-    // the guest was being overcharged.
+    // the guest was being overcharged. Hence the unrounded ladder.
     expect(out.some((r) => printedGrandTotalPaisa(r.escBase64) % 100 !== 0)).toBe(true);
   });
 
   test("a part never prints a round-off it made up", () => {
-    // Every part of a ladder that reconciles has round_off 0, and the supplied-
-    // total rule leaves nothing to disclose. A "Round off" line on one of these
-    // slips would mean the renderer had gone back to deriving.
-    for (const part of SPLIT.parts) { expect(toPaisa(part.round_off)).toBe(0); }
-    for (const receipt of buildSplitReceiptsBase64(WHOLE, SPLIT.parts)) {
+    // Every part of a ladder that reconciles and was never rounded has
+    // round_off 0, and the supplied-total rule leaves nothing to disclose. A
+    // "Round off" line on one of these slips would mean the renderer had gone
+    // back to deriving.
+    for (const part of SPLIT_UNROUNDED.parts) { expect(toPaisa(part.round_off)).toBe(0); }
+    const unrounded = { ...WHOLE, grandTotal: UNROUNDED.grand_total, roundOff: null };
+    for (const receipt of buildSplitReceiptsBase64(unrounded, SPLIT_UNROUNDED.parts)) {
       expect(printed(receipt.escBase64)).not.toContain("Round off");
     }
   });
 
+  test("on a whole-rupee bill every slip is whole rupees, and discloses the round-off that made it so", () => {
+    // Migration 048: the bill is rupee-rounded, so its parts are too. Each slip
+    // prints its OWN round-off — the allocator's number, never the renderer's —
+    // and those lines add up to the bill's own "Round off".
+    const out = buildSplitReceiptsBase64(WHOLE, SPLIT.parts);
+    let disclosed = 0;
+    out.forEach((receipt, i) => {
+      const part = SPLIT.parts[i]!;
+      const page = printed(receipt.escBase64);
+      expect(printedGrandTotalPaisa(receipt.escBase64) % 100).toBe(0);
+      expect(printedGrandTotalPaisa(receipt.escBase64)).toBe(toPaisa(part.grand_total));
+      const m = rung("Round off", "([+-]?[0-9]+\\.[0-9]{2})").exec(page);
+      if (toPaisa(part.round_off) === 0) {
+        expect(m).toBeNull();
+      } else {
+        expect(m).not.toBeNull();
+        expect(toPaisa(Number(m![1]))).toBe(toPaisa(part.round_off));
+        disclosed += toPaisa(Number(m![1]));
+      }
+    });
+    expect(disclosed).toBe(toPaisa(CHARGES.round_off));
+  });
+
   test("a round-off the billing layer DID allocate is disclosed on the slip", () => {
     // A ladder handed in that does not add up (a grand total one rupee above its
-    // own rungs) is apportioned as a visible round_off rather than quietly lost
-    // — and a part that swallowed its share would be a slip whose printed lines
-    // do not reach its own printed total.
-    const skewed = computeSectionSplit({ ...CHARGES, grand_total: CHARGES.grand_total + 1 }, LINES);
+    // own rungs, and not whole rupees) is apportioned as a visible round_off
+    // rather than quietly lost — and a part that swallowed its share would be a
+    // slip whose printed lines do not reach its own printed total.
+    const skewed = computeSectionSplit({ ...UNROUNDED, grand_total: UNROUNDED.grand_total + 1 }, LINES);
     const out = buildSplitReceiptsBase64(WHOLE, skewed.parts);
     const disclosed = out
       .map((r) => rung("Round off", "([+-]?[0-9]+\\.[0-9]{2})").exec(printed(r.escBase64)))
@@ -308,7 +346,7 @@ describe("buildSplitReceiptsBase64 — the printed money", () => {
     expect(disclosed).toBe(100);
     // And the slips still sum to the (skewed) bill, which is the point.
     expect(out.map((r) => printedGrandTotalPaisa(r.escBase64)).reduce((s, x) => s + x, 0))
-      .toBe(toPaisa(CHARGES.grand_total + 1));
+      .toBe(toPaisa(UNROUNDED.grand_total + 1));
   });
 
   test("every rung a slip prints adds up to the total it prints", () => {
@@ -325,13 +363,48 @@ describe("buildSplitReceiptsBase64 — the printed money", () => {
       const service = read(rung("Service Charge 10%", FIGURE));
       const taxes = [...page.matchAll(new RegExp(`^ *[CS]GST 2\\.5% +${FIGURE}$`, "gm"))]
         .reduce((s, m) => s + toPaisa(Number(m[1])), 0);
+      // Signed, and absent on a part that needed none (migration 048).
+      const roundOff = read(rung("Round off", "([+-]?[0-9]+\\.[0-9]{2})"));
       // Every rung this fixture charges is on every slip — a rung the reader
       // silently failed to find would otherwise read as zero.
       expect(subtotal).toBeGreaterThan(0);
       expect(discount).toBeGreaterThan(0);
       expect(service).toBeGreaterThan(0);
       expect(taxes).toBeGreaterThan(0);
-      expect(subtotal - discount + service + taxes).toBe(printedGrandTotalPaisa(receipt.escBase64));
+      expect(subtotal - discount + service + taxes + roundOff).toBe(printedGrandTotalPaisa(receipt.escBase64));
+    }
+  });
+});
+
+describe("buildSplitReceiptsBase64 — the EVEN split, the one both clients print", () => {
+  /** Exactly the mapping /print/bill/split's even branch makes from computeBillSplit. */
+  const evenParts = (grand: number, n: number) => computeBillSplit(grand, "even", { parts: n }).parts
+    .map((pt) => ({ label: pt.label, subtotal: pt.subtotal, grand_total: pt.total, items: [] }));
+  // The client's receipt: 4745 + SGST 118.63 + CGST 118.63 = 4982.26, rounded to 4982.00.
+  const GAIA: ReceiptOptions = {
+    ...WHOLE, serviceCharge: null, discount: null, serviceChargeNote: null,
+    taxes: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+    total: 4745, grandTotal: 4982, roundOff: -0.26,
+  };
+
+  test("a whole-rupee bill three ways prints whole-rupee slips that sum to the bill", () => {
+    // Floored to the paisa these were 1660.66 / 1660.66 / 1660.68: a rounded bill
+    // handed back to its guests in paise.
+    const out = buildSplitReceiptsBase64(GAIA, evenParts(4982, 3));
+    const totals = out.map((r) => printedGrandTotalPaisa(r.escBase64));
+    expect(totals).toEqual([166100, 166100, 166000]);
+    expect(totals.reduce((s, x) => s + x, 0)).toBe(toPaisa(4982));
+  });
+
+  test("an even slip prints one figure twice and nothing between: no Round off, no tax, no charge", () => {
+    for (const r of buildSplitReceiptsBase64(GAIA, evenParts(4982, 3))) {
+      const page = printed(r.escBase64);
+      expect(page).not.toContain("Round off");
+      expect(page).not.toMatch(/[CS]GST [0-9]/);
+      expect(page).not.toContain("Service Charge");
+      const sub = /Sub Total +([0-9]+\.[0-9]{2})$/m.exec(page);
+      expect(sub).not.toBeNull();
+      expect(toPaisa(Number(sub![1]))).toBe(printedGrandTotalPaisa(r.escBase64));
     }
   });
 });
@@ -455,10 +528,12 @@ describe("buildSplitReceiptsBase64 — the one-part compat pin", () => {
   test("a bill printed without a split is untouched by any of this", () => {
     // The new fields are absent on every ordinary bill, and absent has to mean
     // "exactly what this renderer printed before they existed".
-    const clean = buildReceiptBase64(WHOLE);
-    expect(buildReceiptBase64({ ...WHOLE, splitPart: null, roundOff: null })).toBe(clean);
-    expect(buildReceiptBase64({ ...WHOLE, splitPart: undefined, roundOff: undefined })).toBe(clean);
-    expect(buildReceiptBase64({ ...WHOLE, roundOff: 0 })).toBe(clean);
+    const beforeRounding: ReceiptOptions = { ...WHOLE, grandTotal: UNROUNDED.grand_total };
+    delete beforeRounding.roundOff;
+    const clean = buildReceiptBase64(beforeRounding);
+    expect(buildReceiptBase64({ ...beforeRounding, splitPart: null, roundOff: null })).toBe(clean);
+    expect(buildReceiptBase64({ ...beforeRounding, splitPart: undefined, roundOff: undefined })).toBe(clean);
+    expect(buildReceiptBase64({ ...beforeRounding, roundOff: 0 })).toBe(clean);
   });
 });
 
@@ -515,21 +590,27 @@ describe("buildSplitReceiptsBase64 — a comped dish", () => {
 });
 
 describe("buildSplitReceiptsBase64 — the service charge on a part", () => {
-  test("a waived charge stays waived, and says so, on every part", () => {
+  test("a waived charge prints no service-charge line on any part, and the parts still sum to the bill", () => {
     const waived = computeBillCharges(SUBTOTAL, GST, 10, false, { type: "percent", value: 7 });
     const split = computeSectionSplit({ ...waived }, LINES);
     const out = buildSplitReceiptsBase64({
       ...WHOLE,
       total: waived.subtotal,
       discount: { amount: waived.discount, label: "Coupon SAVE7" },
-      // What routes/bills.ts hands the renderer for a waived bill: the tenant's
-      // configured percentage, nothing charged, and the word on the paper.
-      serviceCharge: { percent: 10, amount: 0, optedOut: true },
+      // Even handed the percentage with nothing charged, no part prints a line:
+      // a removed charge is not shown (the client's decision), on the whole bill
+      // or on any slip of it. routes/bills.ts hands the renderer null here.
+      serviceCharge: { percent: 10, amount: 0 },
       taxes: waived.taxes,
+      roundOff: waived.round_off,
       grandTotal: waived.grand_total,
     }, split.parts);
     for (const receipt of out) {
-      expect(printed(receipt.escBase64)).toMatch(rung("Service Charge 10%", "Opted-out"));
+      const page = printed(receipt.escBase64);
+      expect(page).not.toContain("Service Charge");
+      expect(page).not.toContain("Opted-out");
+      // Nor the disclaimer: nothing on the slip is a charge to contribute to.
+      expect(page.replace(/\s+/g, " ")).not.toContain("A Voluntary Service Charge");
     }
     expect(out.map((r) => printedGrandTotalPaisa(r.escBase64)).reduce((s, x) => s + x, 0))
       .toBe(toPaisa(waived.grand_total));

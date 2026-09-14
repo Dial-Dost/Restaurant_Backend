@@ -278,6 +278,75 @@ describe("the three headline numbers agree", () => {
 
 // --- 2. CANCELLED IS NOT SALES ----------------------------------------------
 
+// --- 048. THE ROUND-OFF RUNG, THROUGH THE REAL READERS ------------------------
+//
+// Every bill is rounded to the rupee at settle and the adjustment recorded in
+// "Bills".round_off. Everything above the total is recovered by SUBTRACTION, so
+// a reader that forgot to select the column would put the paise into `net` —
+// Gaia's 4982.00 would read back as 4744.74 of food against 4745.00 ordered.
+// The fixture only returns round_off when the SQL selects it, so a reader that
+// loses the column fails here rather than in the Accounting screen.
+
+describe("the round-off rung (migration 048)", () => {
+  function roundedDb(): FixtureDb {
+    return makeDb({
+      timezone: IST,
+      bills: [
+        // The client's receipt: 4745 + SGST 118.63 + CGST 118.63 = 4982.26 -> 4982.00.
+        {
+          id: "r1", bill_no: "3001", settled_at: "2026-06-03T10:00:00.000Z", total_amt: 4982, round_off: -0.26,
+          tax_breakdown: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+          payment_method: "Cash", table_name: "T3", session_id: "SR1", covers: 2, order_id: "or1",
+        },
+        // Rounded UP: 90 + 4.50 of GST = 94.50 -> 95.00.
+        {
+          id: "r2", bill_no: "3002", settled_at: "2026-06-04T10:00:00.000Z", total_amt: 95, round_off: 0.5,
+          tax_breakdown: [{ name: "GST", percentage: 5, amount: 4.5 }],
+          payment_method: "Card", table_name: "T4", session_id: "SR2", covers: 1, order_id: "or2",
+        },
+        // Settled BEFORE rounding existed: NULL round_off, fractional total, untouched.
+        {
+          id: "r3", bill_no: "3003", settled_at: "2026-06-05T10:00:00.000Z", total_amt: 1050.5, round_off: null,
+          tax_breakdown: [{ name: "GST", percentage: 5, amount: 50.5 }],
+          payment_method: "Cash", table_name: "T5", session_id: "SR3", covers: 3, order_id: "or3",
+        },
+      ],
+      orders: [
+        order({ id: "or1", created_at: "2026-06-03T09:00:00.000Z", status: 7, items: [{ name: "Thali", quantity: 1, price: 4745 }] }),
+        order({ id: "or2", created_at: "2026-06-04T09:00:00.000Z", status: 7, items: [{ name: "Chai", quantity: 3, price: 30 }] }),
+        order({ id: "or3", created_at: "2026-06-05T09:00:00.000Z", status: 7, items: [{ name: "Dal", quantity: 1, price: 1010 }] }),
+      ],
+    });
+  }
+
+  beforeEach(() => { useFixtureDb(roundedDb()); });
+
+  test("Sales Summary: net is the food, round off is its own rung, and the ladder closes", async () => {
+    const t = (await db.GetSalesSummaryReport(RID, W)).totals;
+    expect(t.net).toBe(r2(4745 + 90 + 1000));
+    expect(t.tax).toBe(r2(237.26 + 4.5 + 50.5));
+    expect(t.round_off).toBe(0.24);
+    expect(t.grand_total).toBe(r2(4982 + 95 + 1050.5));
+    expect(r2(t.net + t.service_charge + t.tax + t.round_off)).toBe(t.grand_total);
+  });
+
+  test("Order Summary: each row's net is its food — the paise never land in it", async () => {
+    const rows = (await db.GetOrderSummaryReport(RID, { ...W, limit: 500 })).rows;
+    const byNo = new Map(rows.map((r) => [r.bill_no, r]));
+    expect(byNo.get("3001")?.net).toBe(4745);
+    expect(byNo.get("3002")?.net).toBe(90);
+    expect(byNo.get("3003")?.net).toBe(1000);
+  });
+
+  test("the three headline numbers still agree with rounded bills in the window", async () => {
+    const sales = await db.GetSalesSummaryReport(RID, W);
+    const orders = await db.GetOrderSummaryReport(RID, { ...W, limit: 500 });
+    const settle = await db.GetSettlementSummaryReport(RID, W);
+    expect(sum(orders.rows.map((r) => r.grand_total))).toBe(sales.totals.grand_total);
+    expect(settle.totals.amount).toBe(sales.totals.grand_total);
+  });
+});
+
 describe("cancelled orders are not sales", () => {
   test("a voided order's food never reaches the Item Wise numbers", async () => {
     const item = await db.GetItemWiseReport(RID, { ...W, limit: 500 });

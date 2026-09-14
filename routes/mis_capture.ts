@@ -524,9 +524,17 @@ app.post("/orders/:id/void", validateAction(PERM_VOID_ORDER), validateBody(sVoid
 	"Service Charge" line inside "Outlets".default_tax — because the saving is
 	measured by running the real charge computation twice and differencing, never
 	by a second implementation of the arithmetic. In the first shape GST sits on
-	the charge, so the grand total falls by MORE than the charge itself; in the
-	second it does not. `grand_total_before/after` are the two totals that
-	difference, so the till can show the guest what actually changed.
+	the charge, so the bill falls by MORE than the charge itself; in the second it
+	does not.
+
+	TWO DIFFERENT NUMBERS, AND NEITHER IS THE OTHER (migration 048). The recorded
+	`grand_total_reduction` is the charge plus the tax on it, measured on the
+	totals BEFORE round-off, so amount_waived + tax_on_waived equals it exactly.
+	`grand_total_before/after` are what the guest is asked to pay either side of
+	the waiver, each rounded to the rupee — what the till shows the guest. Their
+	gap can differ from the recorded reduction by the two round-offs (under a
+	rupee), so nothing may label the reduction as "the difference of the totals",
+	the audit line included.
 
 	OPEN BILLS ONLY. A settled bill is final; a post-payment dispute is a refund,
 	which has its own path, its own columns and its own audit entry.
@@ -561,7 +569,7 @@ app.post("/bills/service-charge-waiver", validateAction(PERM_SERVICE_CHARGE_WAIV
 			await log_audit(
 				req,
 				PERM_SERVICE_CHARGE_WAIVER,
-				`Waived the service charge (₹${rec.amount_waived.toFixed(2)}, grand total −₹${rec.grand_total_reduction.toFixed(2)}) on bill ${rec.bill_id}${emitTable ? ` (table ${String(emitTable)})` : ""} — authorised by ${who.authorised_by_username}`,
+				`Waived the service charge (₹${rec.amount_waived.toFixed(2)}; ₹${rec.grand_total_reduction.toFixed(2)} with its tax, before round-off; grand total ₹${result.grand_total_before.toFixed(2)} → ₹${result.grand_total_after.toFixed(2)}) on bill ${rec.bill_id}${emitTable ? ` (table ${String(emitTable)})` : ""} — authorised by ${who.authorised_by_username}`,
 				Audit_log_category.Bill,
 				{
 					waiver_id: rec.id, bill_id: rec.bill_id, table: emitTable || null,

@@ -51,6 +51,12 @@ export interface GuestBillView {
 	service_charge_percent: number;
 	taxes: { name: string; percentage: number; amount: number }[];
 	tax_total: number;
+	/**
+	 * What rounded the bill to the rupee (migration 048). On the guest's copy
+	 * because it is on the guest's paper: without it the lines above do not add
+	 * up to the grand total the page asks them to pay.
+	 */
+	round_off: number;
 	grand_total: number;
 	covers: number;
 	bill_no: string | null;
@@ -75,6 +81,12 @@ export interface TillBillLike {
 	service_charge_percent: number;
 	taxes: { name: string; percentage: number; amount: number }[];
 	tax_total: number;
+	/**
+	 * What rounded the bill to the rupee (migration 048). On the guest's copy
+	 * because it is on the guest's paper: without it the lines above do not add
+	 * up to the grand total the page asks them to pay.
+	 */
+	round_off: number;
 	grand_total: number;
 	covers: number;
 	bill_no: string | null;
@@ -101,6 +113,7 @@ export function guestBillView(bill: TillBillLike): GuestBillView {
 		service_charge_percent: bill.service_charge_percent,
 		taxes: bill.taxes,
 		tax_total: bill.tax_total,
+		round_off: bill.round_off,
 		grand_total: bill.grand_total,
 		covers: bill.covers,
 		bill_no: bill.bill_no,
