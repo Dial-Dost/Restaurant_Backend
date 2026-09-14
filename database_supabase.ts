@@ -36459,12 +36459,17 @@ export interface OverviewHeadline {
   /**
    * Today's takings by payment mode — the Settlement Summary's rows for today.
    * Σ amount === today_gross.value. A mode with no money and no refund (a
-   * released ₹0 table under Other) is left out; it moves no total.
+   * released ₹0 table under Other) is left out; it moves no total. The
+   * Unallocated row never is: its `bills` is how many bills need looking at,
+   * even when their residuals net to ₹0.00.
    */
   today_by_method: SettlementRow[];
   /** Today's bills settled with more than one mode. */
   today_split_bills: number;
-  /** Today's money whose split parts did not add back to the bill. Should be 0. */
+  /**
+   * Today's money whose split parts did not add back to the bill, NETTED across
+   * bills. Should be 0 — but 0 does not prove it: read the Unallocated row.
+   */
   today_unallocated: number;
   /** The block's own label and definition, server-authored like every figure. */
   by_method: HeadlineSection;
@@ -36592,7 +36597,13 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     // A released ₹0 table is a bill with no mode and no money. It stays in
     // today_bills (as it always has) but a row reading "Other ₹0.00" is noise on
     // the one screen a cashier reads at close. Filtering it moves no total.
-    today_by_method: byMethod.rows.filter((r) => r.amount !== 0 || r.refund !== 0),
+    // UNALLOCATED IS NEVER FILTERED. Residuals net across bills — one split ₹50
+    // short and another ₹50 over is an Unallocated row of ₹0.00 over 2 bills,
+    // and today_unallocated of 0 — so its amount cannot say whether anything is
+    // wrong. Its bill count can, and the clients warn off the row being here.
+    today_by_method: byMethod.rows.filter(
+      (r) => r.method === UNALLOCATED_METHOD || r.amount !== 0 || r.refund !== 0,
+    ),
     today_split_bills: byMethod.split_bills,
     today_unallocated: byMethod.unallocated,
     by_method: {

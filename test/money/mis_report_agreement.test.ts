@@ -741,7 +741,9 @@ describe("the Overview's today-by-method block", () => {
     const settle = await db.GetSettlementSummaryReport(RID, { from: today, to: today });
 
     expect(head.today).toBe(today);
-    expect(head.today_by_method).toEqual(settle.rows.filter((r) => r.amount !== 0 || r.refund !== 0));
+    expect(head.today_by_method).toEqual(
+      settle.rows.filter((r) => r.method === "Unallocated" || r.amount !== 0 || r.refund !== 0),
+    );
     // The report keeps the Other row (its bills column always counted it)…
     expect(settle.rows.find((r) => r.method === "Other")).toMatchObject({ bills: 1, amount: 0 });
     // …the headline does not print it.
@@ -778,6 +780,35 @@ describe("the Overview's today-by-method block", () => {
     // t5 refunded ₹50, all card; t3's card part carried no refund.
     expect(card?.refund).toBe(50);
     expect(card?.net_amount).toBe(r2((card?.amount ?? 0) - 50));
+  });
+
+  test("residuals that cancel across bills still ship the Unallocated row, with its bill count", async () => {
+    // One split ₹50 short, one ₹50 over: the Unallocated bucket nets to ₹0.00
+    // and today_unallocated is 0, so neither can say anything is wrong. The row's
+    // bills column can, and it is what both clients warn off — so the ₹0 filter
+    // that drops a released table must not drop this.
+    const { db: fixture, today } = todayDb();
+    const at = fixture.bills.find((b) => b.id === "t1")!.settled_at;
+    const total = billOf(1000).total;
+    useFixtureDb({
+      ...fixture,
+      bills: [
+        bill({ id: "u1", bill_no: "4001", settled_at: at, food: 1000, order_id: "to1", payment_method: "Split",
+          payment_splits: [{ method: "Cash", amount: 600 }, { method: "Upi", amount: r2(total - 650) }] }),
+        bill({ id: "u2", bill_no: "4002", settled_at: at, food: 1000, order_id: "to3", payment_method: "Split",
+          payment_splits: [{ method: "Cash", amount: 650 }, { method: "Upi", amount: r2(total - 600) }] }),
+        { id: "u3", bill_no: "4003", settled_at: at, total_amt: 0, tax_breakdown: [], payment_method: null },
+      ],
+    });
+    const head = await db.GetOverviewHeadline(RID);
+    const settle = await db.GetSettlementSummaryReport(RID, { from: today, to: today });
+
+    expect(head.today_unallocated).toBe(0);
+    expect(settle.rows.find((r) => r.method === "Unallocated")).toMatchObject({ bills: 2, amount: 0 });
+    expect(head.today_by_method.find((r) => r.method === "Unallocated")).toMatchObject({ bills: 2, amount: 0 });
+    // The released ₹0 table is still left out, and the total still holds.
+    expect(head.today_by_method.some((r) => r.method === "Other")).toBe(false);
+    expect(sum(head.today_by_method.map((r) => r.amount))).toBe(head.today_gross.value);
   });
 
   test("nothing settled today is an empty list, not a row of zeroes", async () => {

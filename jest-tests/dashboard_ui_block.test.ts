@@ -317,7 +317,12 @@ describe("the headline figures define themselves", () => {
     }
     // A released ₹0 table must not print as "Other ₹0.00" on the till's home
     // screen, and the filter must be at the SURFACE — the report keeps the row.
-    expect(body).toMatch(/today_by_method: byMethod\.rows\.filter\(\(r\) => r\.amount !== 0 \|\| r\.refund !== 0\)/);
+    // Unallocated is exempt: residuals net across bills, so a ₹0.00 Unallocated
+    // row can still be two bills that need looking at, and dropping it would
+    // silence both clients' warning.
+    expect(body).toMatch(
+      /today_by_method: byMethod\.rows\.filter\(\s*\(r\) => r\.method === UNALLOCATED_METHOD \|\| r\.amount !== 0 \|\| r\.refund !== 0,?\s*\)/,
+    );
   });
 
   test("the money is composed by the MIS composer, not re-derived here", () => {

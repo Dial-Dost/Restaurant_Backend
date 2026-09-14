@@ -238,6 +238,20 @@ describe("settlementByMethod", () => {
     expect(total(out.rows)).toBe(948.4);
   });
 
+  test("residuals that cancel across bills net to ₹0 — the Unallocated row's bill count is what still says so", () => {
+    // ₹50 short on one split, ₹50 over on another. `unallocated` is a netted sum
+    // and reads 0; the row survives with both bills, which is why the headline
+    // never filters it and the clients warn off the row rather than the sum.
+    const out = settlementByMethod([
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 600 }, { method: "Upi", amount: 350 }] }),
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 650 }, { method: "Upi", amount: 400 }] }),
+      bill(0, null),
+    ]);
+    expect(out.unallocated).toBe(0);
+    expect(row(out, UNALLOCATED_METHOD)).toEqual({ method: UNALLOCATED_METHOD, bills: 2, amount: 0, share_pct: 0, refund: 0, net_amount: 0 });
+    expect(total(out.rows)).toBe(2000);
+  });
+
   test("a sub-tolerance crumb is folded into the largest part, never an Unallocated row", () => {
     const out = settlementByMethod([bill(1000, "Split", { splits: [{ method: "Cash", amount: 666.66 }, { method: "Card", amount: 333.33 }] })]);
     expect(row(out, "Cash")?.amount).toBe(666.67);
