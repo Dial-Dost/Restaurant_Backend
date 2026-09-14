@@ -345,6 +345,26 @@ describe("the round-off rung (migration 048)", () => {
     expect(sum(orders.rows.map((r) => r.grand_total))).toBe(sales.totals.grand_total);
     expect(settle.totals.amount).toBe(sales.totals.grand_total);
   });
+
+  // The Overview headline reads the same bills through its own query. Its fixture
+  // answer used to drop round_off, so no test could see a rounded bill there.
+  test("the Overview headline: today's net is the food on a rounded bill, not food minus the paise", async () => {
+    const today = db.dayKeyOf(new Date(), IST);
+    useFixtureDb(makeDb({
+      timezone: IST,
+      bills: [{
+        id: "h1", bill_no: "4001", settled_at: `${today}T06:30:00.000Z`, total_amt: 4982, round_off: -0.26,
+        tax_breakdown: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+        payment_method: "Cash", table_name: "T3", session_id: "SH1", covers: 2, order_id: "oh1",
+      }],
+      orders: [order({ id: "oh1", created_at: `${today}T06:00:00.000Z`, status: 7, items: [{ name: "Thali", quantity: 1, price: 4745 }] })],
+    }));
+    const head = await db.GetOverviewHeadline(RID);
+    const sales = await db.GetSalesSummaryReport(RID, { from: today, to: today });
+    expect(head.today_net.value).toBe(4745);
+    expect(head.today_net.value).toBe(sales.totals.net);
+    expect(head.today_gross.value).toBe(4982);
+  });
 });
 
 describe("cancelled orders are not sales", () => {

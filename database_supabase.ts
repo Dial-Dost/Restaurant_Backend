@@ -19707,6 +19707,19 @@ async function ensureBillRoundOffColumn(client?: PoolClient): Promise<void> {
 export async function InitBillRoundOffSchema(): Promise<boolean> {
   try {
     await ensureBillRoundOffColumn();
+    // ensureLazyTable treats a refused ALTER (42501, a least-privilege runtime)
+    // as "the migration owns this" and records success. 048 may not be applied
+    // yet, so CHECK rather than assume: a missing column makes every settle and
+    // every settled-bill reader fail, and must be loud at boot, not a quiet ✅.
+    const present = await runQuery<{ ok: boolean }>(
+      `select exists (select 1 from information_schema.columns
+                       where table_schema = 'public' and table_name = 'Bills' and column_name = 'round_off') as ok`,
+    );
+    if (present[0]?.ok !== true) {
+      ddlEnsured.delete("Bills.round_off");
+      logger.error("Bills.round_off is MISSING and could not be added by this role — apply migration 048 before bills are settled");
+      return false;
+    }
     return true;
   } catch (err) {
     logger.warn({ err }, "bill_round_off_boot_ensure_failed — the lazy ensure will retry on first use");

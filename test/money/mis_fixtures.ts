@@ -896,7 +896,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       return [...rows]
         .sort((a, z) => new Date(a.settled_at).getTime() - new Date(z.settled_at).getTime())
         .map((b) => ({
-          ...misBillRow(b),
+          ...misBillRow(b, q),
           session_id: null,
           session_covers: null,
           is_online: !walkIn.has(orderOf(b)?.order_type ?? "dine_in"),
