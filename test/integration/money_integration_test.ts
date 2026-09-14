@@ -86,7 +86,8 @@ async function main() {
     // T6 included: the release-without-payment section below occupies it, and a
     // missing table surfaces as "Table not found" from OccupyTable — which reads
     // like a product bug rather than a seed that is one row short.
-    tables: ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12"].map((n) => ({ name: n, capacity: 4 })),
+    // T13-T15: the payment-modes section at the end.
+    tables: ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12", "T13", "T14", "T15"].map((n) => ({ name: n, capacity: 4 })),
   });
   RES_ID = (await raw.query(`select id from "Restaurant" order by created_at desc limit 1`)).rows[0].id;
   console.log("seeded res_id:", RES_ID);
@@ -681,6 +682,97 @@ async function main() {
       where o.res_id=$1 and (it ? 'nc')`, [RES_ID],
   )).rows[0].n);
   check("no order line carries a stray nc flag after the reversal", noNcFlags === 0);
+
+  // ---- 13) PAYMENT MODES: an owner-added mode is real money, end to end ----
+  // "There has to be an option to add mode of payments." What a unit test cannot
+  // prove is the TRANSACTIONS: the save's merge against the stored row, the
+  // settle and the tender resolving against the tenant's own config inside
+  // their own transactions, and a switched-off mode being refused for NEW money
+  // while a bill already part-paid in it still closes.
+  console.log("\n[payment modes] an owner-added mode settles; a switched-off one takes no new money");
+  const { SetRestaurantSettings, GetRestaurantSettings, GetBillPaymentLedger, PaymentConfigError } = db;
+  await SetRestaurantSettings(RES_ID, {
+    payment_methods: [{ id: "Swiggy Dineout", label: "Swiggy Dineout", custom: true, requires_screenshot: false }],
+  });
+  const modesAfterAdd = (await GetRestaurantSettings(RES_ID)).payment_methods as any[];
+  check("the added mode is stored after the eight built-ins",
+    modesAfterAdd.length === 9 && modesAfterAdd[8].id === "Swiggy Dineout" && modesAfterAdd[8].custom === true);
+  // Exactly what a shipped app's Settings card posts: the built-ins it renders.
+  await SetRestaurantSettings(RES_ID, {
+    payment_methods: modesAfterAdd.filter((x) => !x.custom)
+      .map(({ id, label, enabled, requires_screenshot, online }) => ({ id, label, enabled, requires_screenshot, online: online === true })),
+  });
+  check("an older app's built-ins-only save does NOT erase it",
+    ((await GetRestaurantSettings(RES_ID)).payment_methods as any[]).some((x) => x.id === "Swiggy Dineout"));
+  let compRefused = false;
+  try { await SetRestaurantSettings(RES_ID, { payment_methods: [{ id: "Complimentary", custom: true }] }); }
+  catch (e: any) { compRefused = e instanceof PaymentConfigError && /non-chargeable/i.test(String(e?.message)); }
+  check("\"Complimentary\" is refused as a payment mode, pointing at non-chargeable", compRefused);
+
+  await OccupyTable(RES_ID, "T13", 2, null, null);
+  const pmOrder = await AddOrder(RES_ID, {
+    table: "T13", customer: "Aggregator", status: "Preparing",
+    items: [ITEM("pm1", "Thali", 500)], subtotal: 500, total: 500,
+  });
+  // The till's spelling differs; the STORED id is what lands on the bill.
+  await ConfirmBillPaymentByWaiter(RES_ID, pmOrder.id, "admin", "swiggy dineout");
+  await ApproveBillPaymentByAdmin(RES_ID, pmOrder.id, "admin");
+  const pmBill = (await raw.query(
+    `select payment_method, closed_at from "Bills" where res_id=$1 and table_id=$2 order by created_at desc limit 1`,
+    [RES_ID, await tableId("T13")],
+  )).rows[0];
+  check("a bill settles with the custom mode, stored under its id",
+    pmBill.closed_at != null && String(pmBill.payment_method) === "Swiggy Dineout");
+  const pmRow = ((await GetSalesReport(RES_ID)).by_method as any[]).find((x) => x.method === "Swiggy Dineout");
+  check("the sales report groups it under the id and carries its label",
+    !!pmRow && pmRow.label === "Swiggy Dineout" && pmRow.bills === 1);
+
+  // Part-paid in the mode, THEN the owner switches it off.
+  await OccupyTable(RES_ID, "T14", 2, null, null);
+  const offOrder = await AddOrder(RES_ID, {
+    table: "T14", customer: "Switched off", status: "Preparing",
+    items: [ITEM("pm2", "Biryani", 600)], subtotal: 600, total: 600,
+  });
+  await RecordBillTenders(RES_ID, {
+    table_name: "T14", settled_by_username: "cashier1",
+    tenders: [{ method: "Swiggy Dineout", amount: 200 }],
+  });
+  await SetRestaurantSettings(RES_ID, { payment_methods: [{ id: "Swiggy Dineout", custom: true, enabled: false }] });
+  check("switching it off keeps the entry (removal is never a delete)",
+    ((await GetRestaurantSettings(RES_ID)).payment_methods as any[]).some((x) => x.id === "Swiggy Dineout" && x.enabled === false));
+
+  await OccupyTable(RES_ID, "T15", 2, null, null);
+  const newOrder = await AddOrder(RES_ID, {
+    table: "T15", customer: "New money", status: "Preparing",
+    items: [ITEM("pm3", "Dosa", 300)], subtotal: 300, total: 300,
+  });
+  let newSettleRefused = false;
+  try { await ConfirmBillPaymentByWaiter(RES_ID, newOrder.id, "admin", "Swiggy Dineout"); }
+  catch (e: any) { newSettleRefused = /switched off/i.test(String(e?.message)); }
+  check("a NEW settle in a switched-off mode is refused", newSettleRefused);
+  let newTenderRefused = false;
+  try {
+    await RecordBillTenders(RES_ID, {
+      table_name: "T14", settled_by_username: "cashier1",
+      tenders: [{ method: "Swiggy Dineout", amount: 100 }],
+    });
+  } catch (e: any) { newTenderRefused = /switched off/i.test(String(e?.message)); }
+  check("a NEW tender in a switched-off mode is refused", newTenderRefused);
+
+  // The rest in cash, then the settle the route makes from the ledger's mirror.
+  const offOwed = (await GetBillTenderState(RES_ID, { table_name: "T14" })).outstanding;
+  await RecordBillTenders(RES_ID, {
+    table_name: "T14", settled_by_username: "cashier1", require_full: true,
+    tenders: [{ method: "Cash", amount: offOwed }],
+  });
+  const offLedger = await GetBillPaymentLedger(RES_ID, { order_id: offOrder.id });
+  let unflaggedRefused = false;
+  try { await ConfirmBillPaymentByWaiter(RES_ID, offOrder.id, "admin", "Split", null, offLedger.payment_splits); }
+  catch (e: any) { unflaggedRefused = /switched off/i.test(String(e?.message)); }
+  check("without the mirror flag the same parts are refused (the flag is what allows it)", unflaggedRefused);
+  await ConfirmBillPaymentByWaiter(RES_ID, offOrder.id, "admin", "Split", null, offLedger.payment_splits, { mirrorsLedger: true });
+  await ApproveBillPaymentByAdmin(RES_ID, offOrder.id, "admin");
+  check("a bill already part-paid in the mode still CLOSES from its ledger", await billClosed("T14"));
 
   console.log(`\n✓ ALL ${passed} integration assertions passed`);
 }

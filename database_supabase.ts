@@ -34,6 +34,24 @@ import { CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCu
 // layer serves the same two values every print path already obeys rather than
 // keeping a second copy that could drift.
 import { BILL_QR_NOTE_MAX, DEFAULT_BILL_QR_NOTE } from "./escpos.js";
+// Payment modes are CONFIGURED, not compiled in: the alias table, the screenshot
+// rule and the settings merge all live in payment_methods.ts, where jest proves
+// them, and every settle/tender/guest writer below asks it with the tenant's own
+// config (loadPaymentConfig).
+import {
+  DEFAULT_PAYMENT_METHODS,
+  PaymentConfigError,
+  displayPaymentMethod,
+  mergePaymentConfig,
+  methodRequiresProof,
+  paymentMethodLabel,
+  paymentMethodRefusal,
+  planPaymentConfigSave,
+  resolvePaymentMethod,
+  type PaymentMethodConfig,
+  type SettleMethod,
+} from "./payment_methods.js";
+export { DEFAULT_PAYMENT_METHODS, PaymentConfigError, type PaymentMethodConfig };
 import {
   round2,
   computeBillTaxes,
@@ -1149,16 +1167,8 @@ export interface OrderRecord {
   kot_nos?: number[];
 }
 
-export type PaymentMethod =
-  | "Upi"       // 1
-  | "Cash"      // 2
-  | "Card"      // 3
-  | "Dineout"   // 4 (screenshot)
-  | "Zomato"    // 5 (screenshot)
-  | "Eazydiner" // 6 (screenshot)
-  | "District"  // 7 (screenshot)
-  | "Razorpay"  // online (auto-verified)
-  | "Split";    // split tender — real modes live in Bills.payment_splits
+// A built-in id, 'Split', or a custom mode's own id (payment_methods.ts).
+export type PaymentMethod = SettleMethod;
 
 export interface TableAssignmentRecord {
   id: string;
@@ -1738,31 +1748,28 @@ function fromOrderStatusCode(status: unknown): OrderRecord["status"] {
   }
 }
 
-function normalizePaymentMethod(raw: unknown): PaymentMethod | null {
-  const n = String(raw ?? "").trim().toLowerCase();
-  if (!n) {return null;}
-  if (n === "upi") {return "Upi";}
-  if (n === "cash") {return "Cash";}
-  if (n === "card") {return "Card";}
-  if (n === "dineout" || n === "dine out") {return "Dineout";}
-  if (n === "zomato" || n === "zomato pay" || n === "zomatopay") {return "Zomato";}
-  if (n === "eazydiner" || n === "easydiner" || n === "easy diner") {return "Eazydiner";}
-  if (n === "district") {return "District";}
-  if (n === "razorpay") {return "Razorpay";}
-  if (n === "split") {return "Split";}
-  return null;
+/**
+ * The tenant's effective payment modes, read inside the caller's transaction.
+ * mergePaymentConfig turns a NULL column into exactly the built-in defaults, so
+ * a restaurant that has never opened the editor settles as it always has.
+ */
+async function loadPaymentConfig(context: RestaurantContext, client?: PoolClient): Promise<PaymentMethodConfig[]> {
+  const rows = await runQuery<{ payment_config: unknown }>(
+    `select payment_config from "Restaurant" where id = $1 limit 1`,
+    [context.res_id],
+    client,
+  );
+  return mergePaymentConfig(rows[0]?.payment_config);
 }
 
-// Alternate / third-party methods (4-7) that require a payment-proof screenshot.
-const PROOF_REQUIRED_METHODS: ReadonlySet<PaymentMethod> = new Set<PaymentMethod>([
-  "Dineout",
-  "Zomato",
-  "Eazydiner",
-  "District",
-]);
-
-function paymentRequiresProof(method: PaymentMethod | null): boolean {
-  return method !== null && PROOF_REQUIRED_METHODS.has(method);
+/**
+ * method -> label for a report. Display only: grouping and reconciliation saves
+ * keep keying on the stored id, so a failed read costs the label and nothing
+ * else — it must never take a money report down with it.
+ */
+async function paymentLabelsFor(context: RestaurantContext): Promise<(method: string) => string> {
+  const config = await loadPaymentConfig(context).catch(() => mergePaymentConfig(null));
+  return (method: string) => paymentMethodLabel(method, config) || method;
 }
 
 function encodeSlot(payload: SlotPayload): string {
@@ -7909,6 +7916,10 @@ async function undoSettings(restaurantId: string, cache: UndoStateCache): Promis
 const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; nullable: boolean; toDb(v: unknown): unknown }> = {
   auto_push_orders: { column: "auto_push_orders", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   currency: { column: "currency", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" ? v.slice(0, 8) : null) },
+  // Restores the PRIOR list whole. Undoing the save that added a custom mode
+  // therefore removes that mode: bills already settled with it keep their stored
+  // id (displayPaymentMethod passes it through) and reports still group them,
+  // but new settles in it are refused until it is added again.
   payment_methods: { column: "payment_config", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(mergePaymentConfig(v))) },
   razorpay_key_id: { column: "razorpay_key_id", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 80) : null) },
   service_charge: { column: "service_charge", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
@@ -10955,7 +10966,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       applyServiceCharge: Boolean(payload.applyServiceCharge),
       total: total > 0 ? total : subtotal,
       status: finalStatus,
-      payment_method: normalizePaymentMethod(row.payment_method),
+      payment_method: displayPaymentMethod(row.payment_method),
       payment_proof_screenshot_url:
         typeof row.payment_proof_screenshot_url === "string" ? row.payment_proof_screenshot_url : null,
       payment_waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
@@ -16562,7 +16573,7 @@ function mapClosedBillSummary(row: ClosedBillRow, scPct = 0): ClosedBillSummary 
     taxable_base,
     service_charge,
     service_charge_percent,
-    payment_method: normalizePaymentMethod(row.payment_method),
+    payment_method: displayPaymentMethod(row.payment_method),
     payment_splits: parsePaymentSplits(row.payment_splits),
     discount_type: parseNumeric(row.discount_value) > 0 ? (row.discount_type === "flat" ? "flat" : "percent") : null,
     discount_value: round2(parseNumeric(row.discount_value)),
@@ -17224,7 +17235,7 @@ export async function ListOpenBills(
       apc: covers && covers > 0 ? round2(charges.taxable_base / covers) : null,
       stage: row.admin_approved_at ? "approved" : row.waiter_confirmed_at ? "awaiting_approval" : "running",
       totals_snapshotted,
-      payment_method: normalizePaymentMethod(row.payment_method),
+      payment_method: displayPaymentMethod(row.payment_method),
       opened_by: name || takenBy || null,
       opened_at: iso(row.created_at) ?? "",
       opened_at_local: clock
@@ -17909,7 +17920,9 @@ export interface SalesReport {
   net_sales: number;
   bill_count: number;
   by_day: { date: string; sales: number; tax: number; service_charge: number; refund: number; bills: number }[];
-  by_method: { method: string; sales: number; bills: number }[];
+  // Grouped by the STORED id; `label` is the owner's name for it (Settings >
+  // Payments), so a renamed or custom mode reads right without splitting history.
+  by_method: { method: string; label?: string; sales: number; bills: number }[];
 }
 
 export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<SalesReport> {
@@ -17956,6 +17969,7 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     }
   }
 
+  const labelOf = await paymentLabelsFor(context);
   return {
     from: range.fromDate,
     to: range.toDate,
@@ -17967,7 +17981,7 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     net_sales: round2(totalSales - totalRefund),
     bill_count: bills.length,
     by_day: [...byDay.entries()].filter(([d]) => d).sort((a, b) => a[0].localeCompare(b[0])).map(([date, v]) => ({ date, ...v })),
-    by_method: [...byMethod.entries()].sort((a, b) => b[1].sales - a[1].sales).map(([method, v]) => ({ method, ...v })),
+    by_method: [...byMethod.entries()].sort((a, b) => b[1].sales - a[1].sales).map(([method, v]) => ({ method, label: labelOf(method), ...v })),
   };
 }
 
@@ -18360,6 +18374,8 @@ function methodTotalsOf(bills: SettledBill[]): Map<string, number> {
 
 export interface ReconciliationRow {
   method: string;
+  /** Display name from Settings > Payments. Saves still key on `method`. */
+  label?: string;
   expected: number;
   actual: number | null;
   status: "matched" | "variance" | null;
@@ -18408,10 +18424,12 @@ export async function GetReconciliation(
     savedByMethod.set(r.method, cur);
   }
   const methods = new Set<string>([...expected.keys(), ...savedByMethod.keys()]);
+  const labelOf = await paymentLabelsFor(context);
   const rows: ReconciliationRow[] = [...methods].map((method): ReconciliationRow => {
     const s = savedByMethod.get(method);
     return {
       method,
+      label: labelOf(method),
       expected: round2(expected.get(method) ?? 0),
       actual: s ? s.actual : null,
       status: s ? (s.matched ? "matched" : "variance") : null,
@@ -20534,15 +20552,26 @@ async function updateOrderWorkflowStatus(
 // Validate a split-tender payload: 2-6 rows of {method, amount} using REAL
 // methods (no nested 'Split'), positive amounts. Sum is checked against the
 // bill's grand total later (once it is known).
-function normalizePaymentSplits(raw: unknown): { method: PaymentMethod; amount: number }[] {
+//
+// Each part's method is resolved against the tenant's config, so a custom mode
+// is a valid part and a disabled one is refused — unless the parts are the
+// mirror of tenders already recorded on the bill (`mirrorsLedger`), which must
+// still settle after the owner switches a mode off. See paymentMethodRefusal.
+function normalizePaymentSplits(
+  raw: unknown,
+  config: readonly PaymentMethodConfig[],
+  opts: { mirrorsLedger?: boolean } = {},
+): { method: PaymentMethod; amount: number }[] {
   if (!Array.isArray(raw) || raw.length === 0) {return [];}
   if (raw.length < 2 || raw.length > 6) {throw new Error("A split payment needs between 2 and 6 parts");}
   return raw.map((s) => {
     const o = (s ?? {}) as Record<string, unknown>;
-    const method = normalizePaymentMethod(o.method);
+    const method = resolvePaymentMethod(o.method, config)?.id ?? null;
     if (!method || method === "Split" || method === "Razorpay") {
       throw new Error(`Invalid split payment method: ${String(o.method ?? "")}`);
     }
+    const refusal = paymentMethodRefusal(method, config, opts);
+    if (refusal) {throw new Error(refusal);}
     const amount = round2(Number(o.amount) || 0);
     if (amount <= 0) {throw new Error("Every split part needs an amount greater than zero");}
     return { method, amount };
@@ -20556,24 +20585,38 @@ export async function ConfirmBillPaymentByWaiter(
   paymentMethodRaw: string,
   paymentProofScreenshotUrlRaw?: string | null,
   splitsRaw?: unknown,
+  // TRUE ONLY WHEN the method/splits are the mirror of tenders already on the
+  // bill (routes/bills.ts sets it on its two ledger paths). A bill part-paid in
+  // a mode the owner has since switched off must still close; a NEW settle in
+  // that mode must not happen.
+  opts: { mirrorsLedger?: boolean } = {},
 ): Promise<{ success: true; payment_method: PaymentMethod; splits?: { method: PaymentMethod; amount: number }[] }> {
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
-    const splits = normalizePaymentSplits(splitsRaw);
-    const paymentMethod = splits.length > 0 ? ("Split" as PaymentMethod) : normalizePaymentMethod(paymentMethodRaw);
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const splits = normalizePaymentSplits(splitsRaw, paymentConfig, opts);
+    const paymentMethod = splits.length > 0
+      ? ("Split" as PaymentMethod)
+      : (resolvePaymentMethod(paymentMethodRaw, paymentConfig)?.id ?? null);
     if (!paymentMethod) {
       throw new Error("Invalid payment method");
     }
     if (paymentMethod === "Split" && splits.length === 0) {
       throw new Error("A split payment needs its parts ({method, amount} rows)");
     }
+    if (paymentMethod !== "Split") {
+      const refusal = paymentMethodRefusal(paymentMethod, paymentConfig, opts);
+      if (refusal) {throw new Error(refusal);}
+    }
 
-    const requiresProof = paymentRequiresProof(paymentMethod);
+    // The screenshot rule is the CONFIG's now (Settings > Payments), not a
+    // compiled-in list; a tenant with no config gets the old four exactly.
+    const requiresProof = methodRequiresProof(paymentMethod, paymentConfig);
     const paymentProofScreenshotUrl =
       typeof paymentProofScreenshotUrlRaw === "string" ? paymentProofScreenshotUrlRaw.trim() : "";
     if (requiresProof && !paymentProofScreenshotUrl) {
-      throw new Error("Payment proof screenshot is required for Dineout, Zomato, EasyDiner or District");
+      throw new Error(`Payment proof screenshot is required for ${paymentMethodLabel(paymentMethod, paymentConfig)}`);
     }
 
     const waiter = await resolveEmployeeByUsername(context, waiterEmployeeId, client);
@@ -20708,13 +20751,22 @@ export async function SubmitCustomerPayment(
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
-    const paymentMethod = normalizePaymentMethod(paymentMethodRaw);
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const resolved = resolvePaymentMethod(paymentMethodRaw, paymentConfig);
+    const paymentMethod = resolved?.id ?? null;
     // 'Split' is staff-only (needs the per-mode breakdown) — never a QR option.
     if (!paymentMethod || paymentMethod === "Split") {throw new Error("Invalid payment method");}
+    // A guest may only pay in a mode that is on AND offered on the QR page. The
+    // route checks this too; checking it here is what keeps a custom mode the
+    // owner added for the till (show_to_guests off by default) off the guest
+    // path whoever calls this.
+    if (!resolved?.entry || !resolved.entry.enabled || resolved.entry.show_to_guests === false) {
+      throw new Error("This payment method isn't accepted here.");
+    }
     const screenshotUrl = typeof screenshotUrlRaw === "string" ? screenshotUrlRaw.trim() : "";
     // Screenshot requirement is config-driven when an override is supplied,
-    // otherwise falls back to the built-in proof-method defaults.
-    const requiresProof = typeof requireScreenshotOverride === "boolean" ? requireScreenshotOverride : paymentRequiresProof(paymentMethod);
+    // otherwise the tenant's own config (which carries the built-in defaults).
+    const requiresProof = typeof requireScreenshotOverride === "boolean" ? requireScreenshotOverride : methodRequiresProof(paymentMethod, paymentConfig);
     if (requiresProof && !screenshotUrl) {
       throw new Error("A payment screenshot is required for this method.");
     }
@@ -20850,12 +20902,16 @@ export async function ApproveBillPaymentByAdmin(
       throw new Error("Bill not found");
     }
 
-    const billPaymentMethod = normalizePaymentMethod(bill.payment_method);
-    const requiresProof = paymentRequiresProof(billPaymentMethod);
+    // Approval never refuses a DISABLED mode: the money was taken when the
+    // waiter confirmed it, and switching a mode off afterwards must not strand
+    // the bill. It does still demand the screenshot the config asks for.
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const billPaymentMethod = displayPaymentMethod(bill.payment_method);
+    const requiresProof = methodRequiresProof(billPaymentMethod, paymentConfig);
     const hasProof =
       typeof bill.payment_proof_screenshot_url === "string" && bill.payment_proof_screenshot_url.trim().length > 0;
     if (requiresProof && !hasProof) {
-      throw new Error("Payment proof screenshot is required before approval for Dineout, Zomato, EasyDiner or District");
+      throw new Error(`Payment proof screenshot is required before approval for ${paymentMethodLabel(billPaymentMethod, paymentConfig)}`);
     }
 
     // Re-price at approval time. Any bill edit landing between waiter-confirm and
@@ -27231,33 +27287,8 @@ export async function MarkBookingReminderSent(
   return true;
 }
 
-export interface PaymentMethodConfig { id: string; label: string; enabled: boolean; requires_screenshot: boolean; online?: boolean }
-
-// Default payment methods. Razorpay (online) on by default; alternate methods
-// 4–7 require a screenshot by default. Restaurants override via settings.
-export const DEFAULT_PAYMENT_METHODS: PaymentMethodConfig[] = [
-  { id: "Razorpay", label: "Pay online (Razorpay)", enabled: true, requires_screenshot: false, online: true },
-  { id: "Upi", label: "UPI", enabled: true, requires_screenshot: false },
-  { id: "Cash", label: "Cash", enabled: true, requires_screenshot: false },
-  { id: "Card", label: "Card", enabled: true, requires_screenshot: false },
-  { id: "Dineout", label: "Dineout", enabled: true, requires_screenshot: true },
-  { id: "Zomato", label: "Zomato", enabled: true, requires_screenshot: true },
-  { id: "Eazydiner", label: "EasyDiner", enabled: true, requires_screenshot: true },
-  { id: "District", label: "District", enabled: true, requires_screenshot: true },
-];
-
-function mergePaymentConfig(stored: unknown): PaymentMethodConfig[] {
-  const byId = new Map<string, Record<string, unknown>>();
-  if (Array.isArray(stored)) {for (const m of stored) { const id = String((m)?.id ?? ""); if (id) {byId.set(id, m);} }}
-  return DEFAULT_PAYMENT_METHODS.map((def) => {
-    const ov = byId.get(def.id);
-    return {
-      ...def,
-      enabled: ov && typeof ov.enabled === "boolean" ? ov.enabled : def.enabled,
-      requires_screenshot: ov && typeof ov.requires_screenshot === "boolean" ? ov.requires_screenshot : def.requires_screenshot,
-    };
-  });
-}
+// PaymentMethodConfig, DEFAULT_PAYMENT_METHODS and mergePaymentConfig moved to
+// payment_methods.ts (imported and re-exported at the top of this file).
 
 // --- Customer feedback form configuration -----------------------------------
 export interface FeedbackCategoryConfig { key: string; label: string }
@@ -27646,7 +27677,37 @@ export async function SetRestaurantSettings(
   // bill_paper_width: only '58mm' or '80mm' accepted; null leaves it unchanged.
   const billPaperWidth = opts.bill_paper_width === "58mm" || opts.bill_paper_width === "80mm" ? opts.bill_paper_width : null;
   const currency = typeof opts.currency === "string" && opts.currency.trim() ? opts.currency.trim().slice(0, 8) : null;
-  const paymentConfig = Array.isArray(opts.payment_methods) ? JSON.stringify(mergePaymentConfig(opts.payment_methods)) : null;
+  // PAYMENT MODES ARE WRITTEN FIRST, in their own short transaction, and are
+  // then left alone by the big update below ($4 stays null).
+  //
+  // A save is a MERGE against what is stored (planPaymentConfigSave), which is
+  // what stops an older app — whose card round-trips only the eight built-ins —
+  // from erasing every mode the owner added on a newer screen. Merging needs the
+  // stored value, so the row is read `for update`: two editors saving at once
+  // take turns instead of each merging against the same stale copy and the
+  // second silently dropping the first one's new mode.
+  //
+  // Refused out loud: an invalid save throws PaymentConfigError before anything
+  // is written, and the route answers 400 with its sentences. The old merge
+  // dropped an unknown entry and answered 200, which is how "there is no option
+  // to add a payment mode" looked from the owner's side.
+  if (Array.isArray(opts.payment_methods)) {
+    const incoming = opts.payment_methods;
+    await withTransaction(async (client) => {
+      const current = await runQuery<{ payment_config: unknown }>(
+        `select payment_config from "Restaurant" where id = $1 limit 1 for update`,
+        [context.res_id],
+        client,
+      );
+      const plan = planPaymentConfigSave(incoming, current[0]?.payment_config ?? null);
+      if (!plan.ok) {throw new PaymentConfigError(plan.errors);}
+      await runQuery(
+        `update "Restaurant" set payment_config = $2::jsonb where id = $1`,
+        [context.res_id, JSON.stringify(plan.config)],
+        client,
+      );
+    });
+  }
   // key_id: set when a string is provided (empty string clears it).
   const razorpayKeyId = typeof opts.razorpay_key_id === "string" ? opts.razorpay_key_id.trim().slice(0, 80) : null;
   // key_secret: only overwrite when a non-empty value is sent (blank = keep current).
@@ -27773,7 +27834,7 @@ export async function SetRestaurantSettings(
       context.res_id,
       typeof opts.auto_push_orders === "boolean" ? opts.auto_push_orders : null,
       currency,
-      paymentConfig,
+      null, // payment_config: written above, in its own transaction
       razorpayKeyId,
       razorpayKeySecret,
       serviceCharge,
@@ -28023,8 +28084,10 @@ export async function GetPublicBranding(
     theme_primary: palette?.primary ?? null,
     theme_secondary: palette?.secondary ?? null,
     currency: (rows[0]?.currency && String(rows[0].currency).trim()) || "₹",
-    // Only enabled methods are exposed to customers; include the screenshot flag.
-    payment_methods: mergePaymentConfig(rows[0]?.payment_config).filter((m) => m.enabled),
+    // Only modes that are on AND offered to guests are exposed to customers;
+    // include the screenshot flag. A custom mode the owner added for the till
+    // defaults to show_to_guests: false, so adding one never surprises a guest.
+    payment_methods: mergePaymentConfig(rows[0]?.payment_config).filter((m) => m.enabled && m.show_to_guests !== false),
     restaurant_name: rows[0]?.res_name ?? context.restaurant_name ?? "",
     feedback_config: mergeFeedbackConfig(rows[0]?.feedback_config),
     // SVG bill logo for the customer-facing digital bill (crisp at any size).
@@ -29230,7 +29293,7 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
 
   return {
     ...row,
-    payment_method: normalizePaymentMethod(row.payment_method),
+    payment_method: displayPaymentMethod(row.payment_method),
     payment_proof_screenshot_url:
       typeof row.payment_proof_screenshot_url === "string" ? row.payment_proof_screenshot_url : null,
     waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
@@ -36293,6 +36356,8 @@ export async function GetCoverSizeSummaryReport(restaurantId: string, q: MisRepo
 
 export interface SettlementRow {
   method: string;
+  /** Display name from Settings > Payments; rows still group by `method`. */
+  label?: string;
   /** Bills that touched this mode. A split bill counts under each mode it used. */
   bills: number;
   amount: number;
@@ -36377,9 +36442,11 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
   }
 
   const totalAmount = round2([...acc.values()].reduce((s, v) => s + v.amount, 0));
+  const labelOf = await paymentLabelsFor(mc.context);
   const rows: SettlementRow[] = [...acc.entries()]
     .map(([method, v]) => ({
       method,
+      label: labelOf(method),
       bills: v.bills,
       amount: v.amount,
       share_pct: sharePct(v.amount, totalAmount),
@@ -38217,7 +38284,7 @@ async function readTenderState(
  * One tender  -> payment_method = that method, payment_splits = null.
  * N tenders   -> payment_method = 'Split', payment_splits = the parts.
  *
- * 'Split' with a capital S because normalizePaymentMethod maps the lowercase form
+ * 'Split' with a capital S because normalizeBuiltinPaymentMethod maps the lowercase form
  * to exactly that, and both GetSalesReport and allocateSettlement compare
  * `payment_method.toLowerCase() === 'split'` before they will read the parts —
  * so this is the one spelling that satisfies the type, the normaliser and both
@@ -38285,30 +38352,11 @@ export async function RecordBillTenders(
   if (raw.length > 50) {throw new Error("A bill cannot carry more than 50 tenders");}
 
   const parsed = raw.map((t, i) => {
-    // THE APPLICATION-SIDE BOUND migration 037's header names. The column is free
-    // text so a tenant can gain an aggregator mode without a migration, and the
-    // application is what keeps it honest. This is load-bearing, not cosmetic:
-    // mirrorTendersToBillColumns writes this exact string into
-    // "Bills".payment_method, and GetBillByOrder, the settle path's proof rule
-    // (paymentRequiresProof) and the cash-drawer cut (`lower(payment_method) in
-    // ('cash','split')`) all read it back through normalizePaymentMethod. A
-    // tender recorded as "Zomatoo" would mirror down as a method every one of
-    // those reads as NULL — the bill would display no payment method at all, and
-    // an aggregator bill would silently skip the screenshot the settle path is
-    // supposed to demand. Storing the normalised form (not the caller's spelling)
-    // is what keeps the ledger and the mirror byte-identical.
-    const method = normalizePaymentMethod(t?.method);
-    if (!method) {
-      throw new Error(
-        `Tender ${String(i + 1)}: "${String(t?.method ?? "")}" is not a payment method this system can settle a bill with`,
-      );
-    }
-    // "Split" is the MIRROR's word for "this bill has N tenders", not a way
-    // anybody pays. Accepting it would write a bill whose payment_method reads
-    // Split with one part, which every settlement cut treats as a split bill
-    // whose parts are missing.
-    if (method === "Split") {
-      throw new Error(`Tender ${String(i + 1)}: "Split" is not a payment method — record the individual tenders instead`);
+    // The method is only checked for PRESENCE here; which modes exist is the
+    // tenant's config, resolved inside the transaction below.
+    const methodRaw = String(t?.method ?? "").trim();
+    if (!methodRaw) {
+      throw new Error(`Tender ${String(i + 1)}: "" is not a payment method this system can settle a bill with`);
     }
     const amount = round2(Number(t?.amount));
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -38325,7 +38373,7 @@ export async function RecordBillTenders(
     }
     const tipToId = String(t?.tip_credited_to_employee_id ?? "").trim();
     return {
-      method,
+      method_raw: methodRaw,
       amount,
       txn_ref: String(t?.txn_ref ?? "").trim() || null,
       tip_amount: tip,
@@ -38337,6 +38385,41 @@ export async function RecordBillTenders(
 
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
+    // THE APPLICATION-SIDE BOUND migration 037's header names. The column is free
+    // text so a tenant can gain an aggregator mode without a migration, and the
+    // application is what keeps it honest. This is load-bearing, not cosmetic:
+    // mirrorTendersToBillColumns writes this exact string into
+    // "Bills".payment_method, and GetBillByOrder, the settle path's proof rule
+    // (methodRequiresProof) and the cash-drawer cut (`lower(payment_method) in
+    // ('cash','split')`) all read it back. A tender recorded as "Zomatoo" would
+    // mirror down as a mode no config knows — no label, no screenshot rule, a
+    // stray row on the cash-up sheet. So every tender resolves against the
+    // tenant's own config (built-in aliases first, then the modes the owner
+    // added) and the RESOLVED id is stored, never the caller's spelling — which
+    // is what keeps the ledger and the mirror byte-identical.
+    //
+    // A tender is always a NEW payment, so a mode switched off in Settings is
+    // refused here; the settle that later mirrors tenders recorded before the
+    // switch is not (ConfirmBillPaymentByWaiter's mirrorsLedger).
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const tenders = parsed.map((p, i) => {
+      const method = resolvePaymentMethod(p.method_raw, paymentConfig)?.id ?? null;
+      if (!method) {
+        throw new Error(
+          `Tender ${String(i + 1)}: "${p.method_raw}" is not a payment method this system can settle a bill with`,
+        );
+      }
+      // "Split" is the MIRROR's word for "this bill has N tenders", not a way
+      // anybody pays. Accepting it would write a bill whose payment_method reads
+      // Split with one part, which every settlement cut treats as a split bill
+      // whose parts are missing.
+      if (method === "Split") {
+        throw new Error(`Tender ${String(i + 1)}: "Split" is not a payment method — record the individual tenders instead`);
+      }
+      const refusal = paymentMethodRefusal(method, paymentConfig);
+      if (refusal) {throw new Error(`Tender ${String(i + 1)}: ${refusal}`);}
+      return { ...p, method };
+    });
     const bill = await resolveTenderBill(context, input, client, { create: true });
     if (!bill) {throw new Error("Could not open a bill for that table");}
     if (bill.closed_at) {
@@ -38345,7 +38428,7 @@ export async function RecordBillTenders(
 
     const before = await readTenderState(context, bill, client);
     const liveAmounts = before.tenders.filter((t) => t.voided_at === null).map((t) => t.amount);
-    const proposed = [...liveAmounts, ...parsed.map((p) => p.amount)];
+    const proposed = [...liveAmounts, ...tenders.map((p) => p.amount)];
     const rec = reconcileTenders(before.grand_total, proposed);
     if (rec.over) {
       throw new Error(
@@ -38359,8 +38442,8 @@ export async function RecordBillTenders(
     }
 
     const maxSeq = before.tenders.reduce((m, t) => Math.max(m, t.seq), 0);
-    for (let i = 0; i < parsed.length; i++) {
-      const p = parsed[i];
+    for (let i = 0; i < tenders.length; i++) {
+      const p = tenders[i];
       await runQuery(
         `insert into "BillTenders"
            (id, res_id, outlet_id, bill_id, table_id, seq, method, amount, txn_ref,
@@ -40554,8 +40637,8 @@ export interface CounterSummaryRow {
   tax: number;
   grand_total: number;
   refund: number;
-  /** The mode cut, machine-readable. Sums to grand_total exactly. */
-  by_method: { method: string; amount: number }[];
+  /** The mode cut, machine-readable. Sums to grand_total exactly. `label` is display only. */
+  by_method: { method: string; label?: string; amount: number }[];
   /** The same cut as one spreadsheet cell. */
   payment_modes: string;
   /** Cash sessions on this till that overlap the window (migration 038). */
@@ -40741,6 +40824,7 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
   });
 
   const seenSessions = new Set<string>();
+  const labelOf = await paymentLabelsFor(mc.context);
   const rows: CounterSummaryRow[] = orderedKeys.map((key) => {
     const bucket = buckets.get(key) ?? { bills: [], cashiers: new Set<string>(), methods: new Map<string, number>() };
     const l = ladderOf(bucket.bills, seenSessions);
@@ -40771,7 +40855,9 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
       tax: l.tax,
       grand_total: l.grand_total,
       refund: l.refund,
-      by_method: [...parts].sort((a, z) => z.amount - a.amount || a.method.localeCompare(z.method)),
+      by_method: [...parts]
+        .sort((a, z) => z.amount - a.amount || a.method.localeCompare(z.method))
+        .map((p) => ({ method: p.method, label: labelOf(p.method), amount: p.amount })),
       payment_modes: formatMethodSplit(parts),
       sessions: shift?.sessions ?? 0,
       opened_at: shift?.opened_at ?? null,

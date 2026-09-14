@@ -671,6 +671,11 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
 		// refused, which is correct and reads like a dead end without this sentence.
 		let result;
 		try {
+			// mirrorsLedger: on both ledger paths the method is the mirror of tenders
+			// ALREADY on the bill, so a mode switched off in Settings since they were
+			// taken must not strand the bill open. Passed only on those paths, so a
+			// plain settle's call is byte-for-byte the one it always was.
+			const mirrorsLedger = tenderState !== null || ledger.live_count > 0;
 			result = await ConfirmBillPaymentByWaiter(
 				auth.restaurantId,
 				orderId,
@@ -678,6 +683,7 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
 				settleMethod,
 				paymentProofScreenshotUrl || null,
 				settleSplits,
+				...(mirrorsLedger ? [{ mirrorsLedger: true }] : []),
 			);
 		} catch (err) {
 			if (!tenderState) { throw err; }

@@ -69,6 +69,8 @@ export interface FixtureDb {
   service_charge_percent: number;
   bills: FixtureBill[];
   expenses?: FixtureExpense[];
+  /** "Restaurant".payment_config — null/absent is the built-in defaults. */
+  payment_config?: unknown;
 }
 
 export const RES_ID = "11111111-1111-4111-8111-111111111111";
@@ -190,6 +192,11 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   // getServiceChargePercent — shape (a)'s percent.
   if (/select service_charge from "Restaurant"/i.test(q)) {
     return [{ service_charge: d.service_charge_percent }];
+  }
+
+  // loadPaymentConfig — the report readers' mode labels.
+  if (/select payment_config from "Restaurant" where id = \$1/i.test(q)) {
+    return params[0] === d.res_id ? [{ payment_config: d.payment_config ?? null }] : [];
   }
 
   if (/from "Outlets" where id = \$1/i.test(q)) {

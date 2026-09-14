@@ -9,6 +9,7 @@ import { guestBillView } from "../guest_bill_view.js";
 import { AddBooking, AddNotification, AddOrder, AddWaitlistMember, AllocateBestTable, ApplyCouponToBill, CancelWaitlistByToken, CheckCoupon, ClaimWaitlistPreorder, ConfirmWaitlistPreorder, DeclineWaitlistPreorder, DeletePushSubscription, FinalizeOnlinePayment, GetBillForTable, GetBookingSummaryById, GetMenuCategories, GetMenuItems, GetPublicBranding, GetQueueMenu, GetRestaurantProfile, GetVisiblePosters, GetRestaurantSettings, GetWaitlistEntryByToken, JoinWaitlist, ListMenuVariations, SavePushSubscription, SetWaitlistPreorder, SubmitCustomerPayment, UpdateBookingDeposit, VerifyTableOtp, getRestaurantIdFromUsername, parseWallClockInZone, publicVariationsByItem, repriceFromMenu, badgeCoveredAllergens, resolveBrandConfig, resolveBrandPalette, resolveMenuBadges, variationPayloadFor, withTenant, type MenuVariationRecord } from "../database_supabase.js";
 import { autoPrintOrderKot } from "../kot_print.js";
 import { logger } from "../observability.js";
+import { resolvePaymentMethod } from "../payment_methods.js";
 import { decodeTableToken, verifyTable } from "../qr_signing.js";
 import { emitRestaurant } from "../realtime.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
@@ -442,8 +443,11 @@ app.post("/qr/:slug/pay", rateLimit("qr_pay", 15, 60_000), async (req: Request, 
 		const result = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
 			// Enforce the restaurant's configured payment methods + screenshot rules.
 			const settings = await GetRestaurantSettings(slug).catch(() => null);
-			const cfg = settings?.payment_methods?.find((m) => m.id.toLowerCase() === method.toLowerCase());
-			if (settings && (!cfg?.enabled)) {
+			// Resolved the way every settle resolves a method (built-in aliases, then
+			// the owner's own modes), and refused unless it is on AND offered to
+			// guests — a mode added for the till is off the QR page by default.
+			const cfg = settings ? resolvePaymentMethod(method, settings.payment_methods ?? [])?.entry ?? null : null;
+			if (settings && (!cfg?.enabled || cfg.show_to_guests === false)) {
 				throw new Error("This payment method isn't accepted here.");
 			}
 			let screenshotUrl = typeof body.screenshot_url === "string" ? body.screenshot_url.trim() : "";
