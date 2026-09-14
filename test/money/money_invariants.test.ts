@@ -134,9 +134,27 @@ describe("rounding tolerance", () => {
   });
 
   test("a bill split conserves EXACTLY — zero tolerance, the last part absorbs the remainder", () => {
-    for (const [grand, parts] of [[100, 3], [10, 3], [1060, 7], [0.05, 4], [99999.99, 50]] as const) {
+    for (const [grand, parts] of [[100, 3], [10, 3], [1060, 7], [0.05, 4], [99999.99, 50], [4982, 3], [2, 3]] as const) {
       const r = computeBillSplit(grand, "even", { parts });
       expect(round2(r.parts.reduce((s, p) => s + p.total, 0))).toBe(round2(grand));
+    }
+  });
+
+  test("a whole-rupee bill splits evenly into whole-rupee shares no more than a rupee apart (migration 048)", () => {
+    // Every live bill is rupee-rounded now, and the even split is what both
+    // clients offer on screen and on the slips. Seeded, so a failure reproduces.
+    const rand = mulberry32(48);
+    for (let i = 0; i < 5000; i++) {
+      const parts = 2 + Math.floor(rand() * 49);
+      const grand = parts + Math.floor(rand() * 200000);
+      const r = computeBillSplit(grand, "even", { parts });
+      const paisa = r.parts.map((p) => toPaisa(p.total));
+      expect(r.parts).toHaveLength(parts);
+      expect(paisa.reduce((s, p) => s + p, 0)).toBe(toPaisa(grand));
+      expect(paisa.every((p) => p % 100 === 0 && p >= 100)).toBe(true);
+      expect(Math.max(...paisa) - Math.min(...paisa)).toBeLessThanOrEqual(100);
+      // The leftover rupees sit on the FIRST shares: never rising left to right.
+      expect(paisa.every((p, k) => k === 0 || p <= paisa[k - 1]!)).toBe(true);
     }
   });
 });
@@ -267,7 +285,10 @@ describe("section split — the parts recompose the bill, rung by rung", () => {
     // The section split is an ADDITIONAL mode. This is the same assertion as the
     // even-split test above, restated beside the new one so a change to the
     // shared allocator that broke the old mode could not pass unnoticed.
-    expect(computeBillSplit(100, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([33.33, 33.33, 33.34]);
+    // A total in paise keeps the shipped allocation; a whole-rupee one (every bill
+    // since migration 048) splits in whole rupees, pinned in its own test above.
+    expect(computeBillSplit(100.1, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([33.36, 33.36, 33.38]);
+    expect(computeBillSplit(100, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([34, 33, 33]);
     expect(computeBillSplit(100, "item", {
       groups: [
         { label: "A", items: [{ name: "x", price: 30, quantity: 1 }] },

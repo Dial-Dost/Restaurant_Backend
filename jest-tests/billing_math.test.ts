@@ -212,10 +212,28 @@ describe("computeCouponDiscount", () => {
 describe("computeBillSplit — conservation & allocation", () => {
   const sum = (r: { parts: { total: number }[] }) => round2(r.parts.reduce((s, p) => s + p.total, 0));
 
-  test("even split: parts sum back to the grand total exactly (remainder on last)", () => {
-    const r = computeBillSplit(100, "even", { parts: 3 });
-    expect(r.parts.map((p) => p.total)).toEqual([33.33, 33.33, 33.34]);
-    expect(sum(r)).toBe(100);
+  test("even split of a total in paise: floored to the paisa, remainder on last, sums back exactly", () => {
+    // A bill settled before rounding (migration 048), or a figure built by hand.
+    const r = computeBillSplit(100.1, "even", { parts: 3 });
+    expect(r.parts.map((p) => p.total)).toEqual([33.36, 33.36, 33.38]);
+    expect(sum(r)).toBe(100.1);
+  });
+
+  test("even split of a whole-rupee bill: whole-rupee shares, the leftover rupees one each to the first", () => {
+    expect(computeBillSplit(100, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([34, 33, 33]);
+    // The client's receipt, three ways. Floored to the paisa it was
+    // 1660.66 / 1660.66 / 1660.68 — paise again on every slip of a rounded bill.
+    const gaia = computeBillSplit(4982, "even", { parts: 3 });
+    expect(gaia.parts.map((p) => p.total)).toEqual([1661, 1661, 1660]);
+    // subtotal === total on an even part, so the slip has nothing unexplained on it.
+    expect(gaia.parts.map((p) => p.subtotal)).toEqual([1661, 1661, 1660]);
+    expect(sum(gaia)).toBe(4982);
+    expect(computeBillSplit(4982, "even", { parts: 2 }).parts.map((p) => p.total)).toEqual([2491, 2491]);
+  });
+
+  test("even split: under a rupee a share keeps the paisa allocation, so nobody is handed a zero slip", () => {
+    expect(computeBillSplit(2, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([0.66, 0.66, 0.68]);
+    expect(computeBillSplit(3, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([1, 1, 1]);
   });
 
   test("even split: clean division", () => {
@@ -232,7 +250,9 @@ describe("computeBillSplit — conservation & allocation", () => {
 
   test("even split: an awkward total still conserves", () => {
     const r = computeBillSplit(10, "even", { parts: 3 });
-    expect(sum(r)).toBe(10); // 3.33 + 3.33 + 3.34
+    expect(sum(r)).toBe(10); // 4 + 3 + 3
+    const paise = computeBillSplit(10.01, "even", { parts: 3 });
+    expect(sum(paise)).toBe(10.01); // 3.33 + 3.33 + 3.35
   });
 
   test("item split: allocates proportionally to group subtotals and conserves", () => {

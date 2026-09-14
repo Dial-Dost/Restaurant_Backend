@@ -20,6 +20,7 @@
 import { describe, test, expect } from "@jest/globals";
 import {
   computeBillCharges,
+  computeBillSplit,
   computeSectionSplit,
   toPaisa,
   type SectionSplitLine,
@@ -371,6 +372,39 @@ describe("buildSplitReceiptsBase64 — the printed money", () => {
       expect(service).toBeGreaterThan(0);
       expect(taxes).toBeGreaterThan(0);
       expect(subtotal - discount + service + taxes + roundOff).toBe(printedGrandTotalPaisa(receipt.escBase64));
+    }
+  });
+});
+
+describe("buildSplitReceiptsBase64 — the EVEN split, the one both clients print", () => {
+  /** Exactly the mapping /print/bill/split's even branch makes from computeBillSplit. */
+  const evenParts = (grand: number, n: number) => computeBillSplit(grand, "even", { parts: n }).parts
+    .map((pt) => ({ label: pt.label, subtotal: pt.subtotal, grand_total: pt.total, items: [] }));
+  // The client's receipt: 4745 + SGST 118.63 + CGST 118.63 = 4982.26, rounded to 4982.00.
+  const GAIA: ReceiptOptions = {
+    ...WHOLE, serviceCharge: null, discount: null, serviceChargeNote: null,
+    taxes: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+    total: 4745, grandTotal: 4982, roundOff: -0.26,
+  };
+
+  test("a whole-rupee bill three ways prints whole-rupee slips that sum to the bill", () => {
+    // Floored to the paisa these were 1660.66 / 1660.66 / 1660.68: a rounded bill
+    // handed back to its guests in paise.
+    const out = buildSplitReceiptsBase64(GAIA, evenParts(4982, 3));
+    const totals = out.map((r) => printedGrandTotalPaisa(r.escBase64));
+    expect(totals).toEqual([166100, 166100, 166000]);
+    expect(totals.reduce((s, x) => s + x, 0)).toBe(toPaisa(4982));
+  });
+
+  test("an even slip prints one figure twice and nothing between: no Round off, no tax, no charge", () => {
+    for (const r of buildSplitReceiptsBase64(GAIA, evenParts(4982, 3))) {
+      const page = printed(r.escBase64);
+      expect(page).not.toContain("Round off");
+      expect(page).not.toMatch(/[CS]GST [0-9]/);
+      expect(page).not.toContain("Service Charge");
+      const sub = /Sub Total +([0-9]+\.[0-9]{2})$/m.exec(page);
+      expect(sub).not.toBeNull();
+      expect(toPaisa(Number(sub![1]))).toBe(printedGrandTotalPaisa(r.escBase64));
     }
   });
 });

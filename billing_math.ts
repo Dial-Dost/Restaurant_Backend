@@ -165,7 +165,9 @@ export interface SplitPart { label: string; subtotal: number; total: number; ite
 // back to the grand total exactly (the last part absorbs any rounding remainder),
 // so a split can never lose or invent money.
 //   - "item": allocate the grand proportionally to each guest-group's item subtotal.
-//   - "even": split into N equal parts (N clamped to [2,50]).
+//   - "even": split into N equal parts (N clamped to [2,50]) — in whole rupees
+//     when the total is whole rupees, the leftover rupees one each to the first
+//     parts; otherwise to the paisa, remainder on the last.
 // A THIRD mode — by MENU SECTION (starters / mains / bar) — is computeSectionSplit
 // at the foot of this file. It is a separate function on purpose; its header says why.
 export function computeBillSplit(
@@ -198,8 +200,34 @@ export function computeBillSplit(
 
   // Even split.
   const n = Math.max(2, Math.min(50, Math.round(Number(opts.parts) || 2)));
-  const per = Math.floor((grand / n) * 100) / 100;
   const parts: SplitPart[] = [];
+
+  // A WHOLE-RUPEE BILL SPLITS INTO WHOLE-RUPEE SHARES (migration 048). The bill
+  // is rounded to the rupee now, and the even split is the one both clients
+  // actually offer — on screen and on the slips each guest is handed. Floored to
+  // the paisa, 4982 three ways came out 1660.66 / 1660.66 / 1660.68: a "final
+  // bill" in paise again, one slip at a time. So every share is floored to the
+  // RUPEE and the K rupees left over (K < n) go one each to the first K shares.
+  // Every share has the same claim to them, so position is the only fair tie
+  // break, and no share differs from another by more than a rupee. Conservation
+  // is exact by construction: n floors plus K rupees is the total.
+  //
+  // Not attempted when the total is not whole rupees (a bill settled before
+  // rounding, or a figure built by hand) or is under a rupee a share — ₹2 three
+  // ways would hand somebody a ₹0 slip. Those keep the paisa allocation below.
+  const grandP = toPaisa(grand);
+  if (grandP % 100 === 0 && grandP >= n * 100) {
+    const rupees = grandP / 100;
+    const perRupees = Math.floor(rupees / n);
+    const extra = rupees - perRupees * n;
+    for (let i = 0; i < n; i++) {
+      const total = perRupees + (i < extra ? 1 : 0);
+      parts.push({ label: `Guest ${i + 1}`, subtotal: total, total });
+    }
+    return { mode: "even", grand_total: grand, parts };
+  }
+
+  const per = Math.floor((grand / n) * 100) / 100;
   let allocated = 0;
   for (let i = 0; i < n; i++) {
     const isLast = i === n - 1;
