@@ -20,7 +20,7 @@ import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
-import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, endOfDayBound, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -342,6 +342,12 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 //   limit (1-200, default 50), offset, from, to (ISO or YYYY-MM-DD),
 //   table, payment_method, search, include_open=1
 // Also sets X-Total-Count / X-Has-More so a scroller can use headers alone.
+//
+// A bare YYYY-MM-DD `from`/`to` is a whole INCLUSIVE day in the RESTAURANT'S
+// zone, cut by ListClosedBills exactly as the reports cut it, so both go through
+// untouched. Widening `to` here to T23:59:59.999Z (endOfDayBound) made every day
+// a UTC day: a bill settled at 00:30 IST sat under the previous date in this list
+// while Sales/GST/P&L on the same screen counted it under the right one.
 app.get('/bills/closed', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
@@ -352,7 +358,7 @@ app.get('/bills/closed', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"),
 			limit: clampLimit(req.query.limit, 50, 200),
 			offset: Math.max(0, Math.min(Number(req.query.offset) || 0, 100000)),
 			from: str(req.query.from),
-			to: endOfDayBound(req.query.to),
+			to: str(req.query.to),
 			table: str(req.query.table),
 			payment_method: str(req.query.payment_method),
 			search: str(req.query.search),
