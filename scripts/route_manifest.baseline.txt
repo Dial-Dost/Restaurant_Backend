@@ -47,7 +47,7 @@ mw08 USE     *                                                      | <inline(re
 0025 POST    /qr/:slug/verify-otp                                   | rateLimit("qr_verify_otp", 10, 60000)          | 60b08a82
 0026 POST    /qr/:slug/check-coupon                                 | rateLimit("coupon", 20, 60000)                 | 9524e412
 0027 POST    /qr/:slug/coupon                                       | rateLimit("coupon", 20, 60000)                 | 6e50c94e
-0028 POST    /qr/:slug/pay                                          | rateLimit("qr_pay", 15, 60000)                 | 6825e6a9
+0028 POST    /qr/:slug/pay                                          | rateLimit("qr_pay", 15, 60000)                 | 3d73003b
 0029 GET     /qr/:slug/bill                                         | -                                              | 33a43b67
 0030 POST    /qr/:slug/reserve                                      | rateLimit("qr_reserve", 8, 60000)              | dd1b84e7
 0031 POST    /qr/:slug/reserve/verify-deposit                       | rateLimit("qr_reserve", 12, 60000)             | 7ab670fd
@@ -114,7 +114,7 @@ mw08 USE     *                                                      | <inline(re
 0092 GET     /restaurant/logo/bill                                  | validate                                       | ec5d9078
 0093 PATCH   /bills/order/:orderId/status                           | validateAction("07e364cc-f40d-46f3-b691-0f719dd38e0f") | d6ebd261
 0094 POST    /billing/upload-payment-proof                          | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 152073bc
-0095 POST    /bills/order/:orderId/waiter-confirm-payment           | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 40611584
+0095 POST    /bills/order/:orderId/waiter-confirm-payment           | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 23664ce5
 0096 POST    /bills/order/:orderId/admin-approve-payment            | validateAction("fc57d407-4bba-442c-97a2-9e6f3c57f288") | 0bd1650e
 0097 POST    /bills/order/:orderId/close                            | validateAction("a953d044-31ba-4e31-b96f-99304fe43dfa") | fb6e3fb7
 0098 PATCH   /booking/:id/table                                     | validateAction("c7699d46-0e2f-4448-b325-8ca490a5296b") | b62f3fba
@@ -156,7 +156,7 @@ mw08 USE     *                                                      | <inline(re
 0134 POST    /restaurant/branding                                   | validate                                       | 4c39a341
 0135 GET     /restaurant/timezones                                  | validate                                       | 0e348d83
 0136 GET     /restaurant/settings                                   | validate                                       | 6b4af499
-0137 POST    /restaurant/settings                                   | validate                                       | fc9ca024
+0137 POST    /restaurant/settings                                   | validate                                       | dcc68707
 0138 GET     /messages                                              | validate                                       | 3e965d1e
 0139 POST    /messages/run-reminders                                | validate                                       | 5e6cd93a
 0140 GET     /notifications                                         | validate                                       | be9fe12c

@@ -265,6 +265,8 @@ export interface FixtureDb {
   counters: FixtureCounter[];
   cash_sessions: FixtureCashSession[];
   order_voids: FixtureOrderVoid[];
+  /** "Restaurant".payment_config — null/absent is the built-in defaults. */
+  payment_config?: unknown;
 }
 
 export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
@@ -502,6 +504,11 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   }
   if (/select service_charge from "Restaurant"/i.test(q)) {
     return [{ service_charge: d.service_charge_percent }];
+  }
+  // loadPaymentConfig — the report readers' mode labels. Tenant-bound like
+  // everything else here.
+  if (/select payment_config from "Restaurant" where id = \$1/i.test(q)) {
+    return params[0] === d.res_id ? [{ payment_config: d.payment_config ?? null }] : [];
   }
 
   // --- "Outlets" ---

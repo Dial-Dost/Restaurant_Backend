@@ -6,6 +6,7 @@ import type { Express, Request, Response } from "express";
 import { Audit_log_category, GetPublicBranding, GetRestaurantLogo, GetRestaurantProfile, GetRestaurantSettings, SetBranding, SetRestaurantSettings, UpdateRestaurantProfile } from "../database_supabase.js";
 import { BILL_LOGO_SVG_MAX_CHARS, billLogoDots, billLogoInkShare, cleanBillLogoSvg, rasterizeBillLogo } from "../bill_logo.js";
 import { logger } from "../observability.js";
+import { PaymentConfigError } from "../payment_methods.js";
 import { uploadMenuImage } from "../storage_bucket_supabase.js";
 import { PERM_BRANDING, PERM_SETTINGS, buildBillLogoRaster, buildLogoEscPos, callerHasPermission, enforcePermission, extractEmployeeId, extractRestaurantId, log_audit, validate, validateAction } from "./_shared.js";
 
@@ -383,6 +384,13 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 		} catch (err) { logger.warn({ err }, "log_audit settings failed"); }
 		res.json(result);
 	} catch (err) {
+		// A payment-modes save the data layer refused (a reserved name, a clash, a
+		// bad id…) is the OWNER's to fix, so it is a 400 carrying every sentence,
+		// not a 500. Nothing was written: the refusal happens before the save.
+		if (err instanceof PaymentConfigError) {
+			res.status(400).json({ error: "Invalid payment modes", details: err.errors.join(" "), errors: err.errors });
+			return;
+		}
 		logger.error({ err }, "set_settings_failed");
 		res.status(500).json({ error: "Unable to save settings" });
 	}
