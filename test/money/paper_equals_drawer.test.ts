@@ -15,6 +15,10 @@
 //     subtotal 5499  ->  the guest is CHARGED   6323.84
 //                        the guest is HANDED    5773.94
 //
+// (Both figures are whole rupees since migration 048 — 6324.00 and 5774.00, with
+// round-offs of +0.16 and +0.06 — and the round-off is a second number the paper
+// and the drawer must agree on; see "the round-off is the drawer's".)
+//
 // It was already true for restaurant_percent tenants before F2; F2 extended it to
 // tax_line tenants, which is the seeded shape (migrations/000_base_schema.sql:266)
 // and therefore most of them. A guest holding a bill for less than the till took
@@ -238,7 +242,7 @@ async function call(method: string, path: string, body: unknown): Promise<Answer
  * THE PAPER. Drives the real /print/bill handler and returns the grand total it
  * handed the ESC/POS renderer — the number the guest reads.
  */
-async function printedBill(body: Record<string, unknown>): Promise<{ answer: Answer; grandTotal: number }> {
+async function printedBill(body: Record<string, unknown>): Promise<{ answer: Answer; grandTotal: number; roundOff: number; receipt: Record<string, unknown> }> {
   mockReceipts.length = 0;
   mockAudit.length = 0;
   const answer = await call("POST", "/print/bill", { table_name: TABLE_NAME, ...body });
@@ -247,7 +251,9 @@ async function printedBill(body: Record<string, unknown>): Promise<{ answer: Ans
   }
   const receipt = mockReceipts[0];
   if (!receipt) { throw new Error("/print/bill rendered no receipt"); }
-  return { answer, grandTotal: Number(receipt.grandTotal) };
+  // `roundOff` is what the renderer prints as "Round off" above the total
+  // (migration 048). Absent is treated as 0, which is also what it prints.
+  return { answer, grandTotal: Number(receipt.grandTotal), roundOff: Number(receipt.roundOff ?? 0), receipt };
 }
 
 /**
@@ -262,13 +268,16 @@ async function printedBill(body: Record<string, unknown>): Promise<{ answer: Ans
  * — which is exactly what those sites call. The source guard at the bottom of
  * this file is what keeps that true.
  */
-async function drawerGrandTotal(): Promise<number> {
+async function drawerCharges(): Promise<ReturnType<typeof import("../../billing_math").computeBillCharges>> {
   const db = await import("../../database_supabase");
   const cfg = await db.GetBillChargeConfigForTable(mockIds.res, TABLE_NAME);
   return db.computeBillCharges(
     mockDb.subtotal, cfg.taxConfig, cfg.scPct, cfg.includeServiceCharge,
     mockDb.discount ?? undefined,
-  ).grand_total;
+  );
+}
+async function drawerGrandTotal(): Promise<number> {
+  return (await drawerCharges()).grand_total;
 }
 
 // --- THE THREE CHARGE SHAPES -------------------------------------------------
@@ -335,7 +344,12 @@ describe("THE PAPER IS THE DRAWER — the printed grand total equals the settled
       test.each(SUBTOTALS)("subtotal %p, no waiver, no flag: paper == drawer", async (subtotal) => {
         mockDb.subtotal = subtotal;
         const paper = await printedBill({});
-        expect(paper.grandTotal).toBe(await drawerGrandTotal());
+        const drawer = await drawerCharges();
+        expect(paper.grandTotal).toBe(drawer.grand_total);
+        // The round-off is the drawer's too (migration 048): the line the paper
+        // prints above the total is the adjustment settle records, not one the
+        // route or the renderer worked out for itself.
+        expect(paper.roundOff).toBe(drawer.round_off);
       });
 
       test.each(SUBTOTALS)(
@@ -354,15 +368,20 @@ describe("THE PAPER IS THE DRAWER — the printed grand total equals the settled
         "subtotal %p, WAIVER RECORDED, no flag: paper == drawer, and both came down",
         async (subtotal) => {
           mockDb.subtotal = subtotal;
-          const charged = await drawerGrandTotal();       // with the charge
+          const charged = await drawerCharges();          // with the charge
           mockDb.waiver = liveWaiverRow();                // the authorised removal
           const paper = await printedBill({});
-          const drawer = await drawerGrandTotal();
-          expect(paper.grandTotal).toBe(drawer);
+          const drawer = await drawerCharges();
+          expect(paper.grandTotal).toBe(drawer.grand_total);
+          expect(paper.roundOff).toBe(drawer.round_off);
           // The reduction is REAL on both sides, not merely consistent: a fix
           // that made the paper agree by never removing anything would pass the
-          // equality above and fail here.
-          if (subtotal > 0) { expect(drawer).toBeLessThan(charged); }
+          // equality above and fail here. Compared BEFORE the rupee rounding: a
+          // one-rupee bill's ten-paise charge can round away on both totals.
+          if (subtotal > 0) {
+            expect(drawer.pre_round_total).toBeLessThan(charged.pre_round_total);
+            expect(drawer.grand_total).toBeLessThanOrEqual(charged.grand_total);
+          }
         },
       );
 
@@ -399,16 +418,89 @@ describe("THE PAPER IS THE DRAWER — the printed grand total equals the settled
     mockDb.scPct = 0;
     mockDb.subtotal = 5499;
 
-    expect(await drawerGrandTotal()).toBe(6323.84);
+    // 6323.84 before the rupee rounding of migration 048; 6324.00 payable.
+    expect(await drawerGrandTotal()).toBe(6324);
+    expect((await drawerCharges()).round_off).toBe(0.16);
     // WAS 5773.94 — a bill for ₹549.90 less than the till would take.
-    expect((await printedBill({ no_service_charge: true })).grandTotal).toBe(6323.84);
+    const unwaived = await printedBill({ no_service_charge: true });
+    expect(unwaived.grandTotal).toBe(6324);
+    expect(unwaived.roundOff).toBe(0.16);
 
     mockDb.waiver = liveWaiverRow();
-    // With the waiver recorded, 5773.94 is on the paper AND in the drawer.
-    expect(await drawerGrandTotal()).toBe(5773.94);
-    expect((await printedBill({ no_service_charge: true })).grandTotal).toBe(5773.94);
-    expect((await printedBill({})).grandTotal).toBe(5773.94);
+    // With the waiver recorded, 5773.94 -> 5774.00 is on the paper AND in the drawer.
+    expect(await drawerGrandTotal()).toBe(5774);
+    expect((await drawerCharges()).round_off).toBe(0.06);
+    expect((await printedBill({ no_service_charge: true })).grandTotal).toBe(5774);
+    const waived = await printedBill({});
+    expect(waived.grandTotal).toBe(5774);
+    expect(waived.roundOff).toBe(0.06);
   });
+
+  test("the round-off is the drawer's: Gaia's receipt, 4745 + SGST 118.63 + CGST 118.63 = 4982.00", async () => {
+    // The client's reference receipt, as literals a human can hold the paper
+    // against: "Round off -0.26", "Grand Total 4982.00".
+    mockDb.taxConfig = { SGST: 2.5, CGST: 2.5 };
+    mockDb.scPct = 0;
+    mockDb.subtotal = 4745;
+
+    const drawer = await drawerCharges();
+    expect(drawer.taxes.map((t) => t.amount)).toEqual([118.63, 118.63]);
+    expect(drawer.pre_round_total).toBe(4982.26);
+    expect(drawer.grand_total).toBe(4982);
+    expect(drawer.round_off).toBe(-0.26);
+
+    const paper = await printedBill({});
+    expect(paper.grandTotal).toBe(4982);
+    expect(paper.roundOff).toBe(-0.26);
+    // And the rungs the paper prints reach the total it prints, to the paisa.
+    const taxes = (paper.receipt.taxes as { amount: number }[]).reduce((s, t) => s + Math.round(t.amount * 100), 0);
+    expect(Math.round(Number(paper.receipt.total) * 100) + taxes + Math.round(paper.roundOff * 100))
+      .toBe(Math.round(paper.grandTotal * 100));
+  });
+});
+
+// ============================================================================
+// A REMOVED CHARGE IS NOT ON THE PAPER AT ALL
+// ============================================================================
+//
+// "In the overview, don't show service charge opted out when removed" — and,
+// of the bill, "this too". The route used to hand the renderer an Opted-out
+// rung for a waived bill (Gaia's 06:31:37 print decoded to "Service Charge (10%)
+// Opted-out"). Now a waived bill is rendered through the REAL renderer here and
+// its bytes read back: no service-charge line in either shape, no Opted-out, no
+// voluntary-charge sentence — and the total it prints is still the drawer's.
+
+describe("a waived bill prints no service-charge line, and its paper is still the drawer", () => {
+  const paperText = (receipt: Record<string, unknown>): string => {
+    const actual = jest.requireActual("../../escpos") as { buildReceiptBase64: (o: unknown, w?: number) => string };
+    return Buffer.from(actual.buildReceiptBase64(receipt, 48), "base64").toString("latin1");
+  };
+
+  for (const shape of SHAPES) {
+    test(`${shape.name}: waiver recorded -> no Service Charge, no Opted-out, no disclaimer; total == drawer`, async () => {
+      mockDb.taxConfig = shape.taxConfig;
+      mockDb.scPct = shape.scPct;
+      mockDb.subtotal = 5499;
+      // With the charge ON, the same bill DOES print its line — so the absence
+      // below is the waiver's doing, not a fixture that never had one.
+      const charged = paperText((await printedBill({})).receipt);
+      expect(charged).toMatch(/Service Charge 10% +[0-9]+\.[0-9]{2}\n/);
+
+      mockDb.waiver = liveWaiverRow();
+      const { receipt, grandTotal, roundOff } = await printedBill({});
+      const text = paperText(receipt);
+      expect(text).not.toContain("Service Charge");
+      expect(text).not.toContain("Opted-out");
+      expect(text).not.toMatch(/voluntary service charge/i);
+      expect(receipt.serviceCharge).toBeNull();
+
+      const drawer = await drawerCharges();
+      expect(grandTotal).toBe(drawer.grand_total);
+      expect(roundOff).toBe(drawer.round_off);
+      const printedTotal = /Grand Total +Rs ([0-9]+\.[0-9]{2})/.exec(text)?.[1];
+      expect(Number(printedTotal)).toBe(drawer.grand_total);
+    });
+  }
 });
 
 // ============================================================================

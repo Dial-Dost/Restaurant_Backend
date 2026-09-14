@@ -37,8 +37,18 @@ function assertConserves(bill: Parameters<typeof computeSectionSplit>[0], r: Sec
     expect(sumP(r.parts.map((x) => p(x.taxes[i]!.amount)))).toBe(p(t.amount));
     expect(r.parts.every((x) => x.taxes[i]!.name === t.name)).toBe(true);
   });
+  // The round-off is a column too (migration 048): the parts' round-offs are
+  // the bill's, whether the bill carries one or a hand-built ladder implies one.
+  const billRoundOffP = p(bill.grand_total) - (p(bill.subtotal) - p(bill.discount) + p(bill.service_charge) + p(bill.tax_total));
+  expect(sumP(r.parts.map((x) => p(x.round_off)))).toBe(billRoundOffP);
   // ROW — each part is a bill in miniature and adds up to its own total.
   for (const part of r.parts) {
+    // A whole-rupee bill (every bill since 048) splits into whole-rupee slips,
+    // and no slip is moved by a rupee or more to get there.
+    if (p(bill.grand_total) % 100 === 0 && Math.abs(billRoundOffP) <= 50) {
+      expect(p(part.grand_total) % 100).toBe(0);
+      expect(Math.abs(p(part.round_off))).toBeLessThan(100);
+    }
     expect(p(part.subtotal) - p(part.discount)).toBe(p(part.discounted_subtotal));
     expect(sumP(part.taxes.map((t) => p(t.amount)))).toBe(p(part.tax_total));
     expect(
@@ -149,10 +159,47 @@ describe("computeSectionSplit — the money rule", () => {
     expect(r.parts[1]!.service_charge).toBe(30);
     expect(r.parts[0]!.tax_total).toBe(38.5);
     expect(r.parts[1]!.tax_total).toBe(16.5);
-    expect(r.parts[0]!.grand_total).toBe(808.5);
-    expect(r.parts[1]!.grand_total).toBe(346.5);
+    // 808.50 and 346.50 before rounding. Each slip asks for whole rupees; the
+    // two fifty-paisa remainders tie, and the tie goes to the heavier section.
+    expect(r.parts[0]!.round_off).toBe(0.5);
+    expect(r.parts[0]!.grand_total).toBe(809);
+    expect(r.parts[1]!.round_off).toBe(-0.5);
+    expect(r.parts[1]!.grand_total).toBe(346);
     expect(round2(r.parts[0]!.grand_total + r.parts[1]!.grand_total)).toBe(bill.grand_total);
     assertConserves(bill, r);
+  });
+
+  test("THE CLIENT'S BILL, SPLIT: every slip is whole rupees, and the spare rupee goes to the largest remainder", () => {
+    // 4745 + CGST 118.63 + SGST 118.63 = 4982.26 -> 4982.00 (round off -0.26).
+    const bill = computeBillCharges(4745, GST, 0, true);
+    expect(bill.grand_total).toBe(4982);
+    const r = computeSectionSplit(bill, [line("Food", "a", 2999.5), line("Bar", "b", 1745.5)]);
+    // Before rounding: Food 3149.48, Bar 1832.78. Floors 3149 + 1832 = 4981, a
+    // rupee short of the bill — and it goes to Bar, whose 78 paisa out-claim
+    // Food's 48, not to whichever part happens to come last.
+    expect(r.parts.map((x) => [x.label, x.grand_total, x.round_off])).toEqual([
+      ["Food", 3149, -0.48],
+      ["Bar", 1833, 0.22],
+    ]);
+    expect(round2(r.parts[0]!.round_off + r.parts[1]!.round_off)).toBe(bill.round_off);
+    assertConserves(bill, r);
+  });
+
+  test("a one-part split carries the bill's own round-off, so it is the bill the table prints", () => {
+    const bill = computeBillCharges(4745, GST, 0, true);
+    const r = computeSectionSplit(bill, [line("Mains", "a", 4745)]);
+    expect(r.parts).toHaveLength(1);
+    expect(r.parts[0]!.round_off).toBe(bill.round_off);
+    expect(r.parts[0]!.grand_total).toBe(bill.grand_total);
+    assertConserves(bill, r);
+  });
+
+  test("a ladder whose total is not whole rupees keeps the by-weight round-off — nothing is rounded that was not", () => {
+    // A hand-built (or pre-048) ladder: 100.30 on rungs of 100.00.
+    const ladder = { subtotal: 100, discount: 0, service_charge: 0, taxes: [], tax_total: 0, grand_total: 100.3 };
+    const r = computeSectionSplit(ladder, [line("A", "x", 50), line("B", "y", 50)]);
+    expect(r.parts.map((x) => x.grand_total)).toEqual([50.15, 50.15]);
+    assertConserves(ladder, r);
   });
 
   test("A THREE-WAY SPLIT OF AN ODD AMOUNT — the case that drifts", () => {

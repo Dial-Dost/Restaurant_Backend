@@ -188,6 +188,9 @@ export const REDACTED_BILL_MONEY_KEYS: readonly string[] = [
 	"total_amt", "subtotal", "discount", "discount_value",
 	"service_charge", "tax_total", "grand_total", "nc_total",
 	"apc", "target_apc",
+	// Migration 048. Under half a rupee, but still an amount: with tax_total and
+	// the tax rates it narrows the grand total to a rupee, so it goes with them.
+	"round_off",
 ];
 
 /**

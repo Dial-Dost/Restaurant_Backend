@@ -224,12 +224,42 @@ describe("036 service-charge waiver: edges", () => {
       for (const [cfg, sc] of [[TAX_WITH_SC, 0], [TAX_ONLY, 10]] as const) {
         const q = quoteServiceChargeWaiver(subtotal, cfg, sc, null);
         const billed = computeBillCharges(subtotal, q.tax_config_waived, 0, false, null);
-        expect(round2(billed.discounted_subtotal + billed.service_charge + billed.tax_total)).toBe(billed.grand_total);
+        expect(toPaisa(billed.discounted_subtotal) + toPaisa(billed.service_charge) + toPaisa(billed.tax_total) + toPaisa(billed.round_off))
+          .toBe(toPaisa(billed.grand_total));
         expect(billed.grand_total).toBe(q.grand_total_without);
         expect(round2(q.amount_waived + q.tax_on_waived)).toBe(q.grand_total_reduction);
       }
     },
   );
+
+  // Migration 048. Both grand totals are rupee-rounded, each with its own
+  // round-off, so their DIFFERENCE is not what the waiver took off. 2400.40 on
+  // the seed shape: 2760.46 -> 2760 with the charge, 2520.42 -> 2520 without —
+  // a difference of 240.00 against a waived charge of 240.04, and a recorded
+  // waiver whose saving is smaller than its own charge.
+  test("the saving is the PRE-ROUND difference: the recorded arithmetic stays exact across the rounding", () => {
+    const q = quoteServiceChargeWaiver(2400.4, TAX_WITH_SC, 0, null);
+    expect(q.grand_total_with).toBe(2760);
+    expect(q.grand_total_without).toBe(2520);
+    expect(q.amount_waived).toBe(240.04);
+    expect(q.tax_on_waived).toBe(0);
+    expect(q.grand_total_reduction).toBe(240.04);
+    // Shape (a) as well, where the tax that rode on the charge falls away too.
+    const a = quoteServiceChargeWaiver(2400.4, TAX_ONLY, 10, null);
+    expect(round2(a.amount_waived + a.tax_on_waived)).toBe(a.grand_total_reduction);
+    expect(a.grand_total_reduction).toBeGreaterThanOrEqual(a.amount_waived);
+  });
+
+  test("across a sweep, saving === charge + its tax, never less than the charge, in both shapes", () => {
+    for (let paisa = 100; paisa < 500000; paisa += 1237) {
+      const subtotal = paisa / 100;
+      for (const [cfg, sc] of [[TAX_WITH_SC, 0], [TAX_ONLY, 10]] as const) {
+        const q = quoteServiceChargeWaiver(subtotal, cfg, sc, null);
+        expect(toPaisa(q.amount_waived) + toPaisa(q.tax_on_waived)).toBe(toPaisa(q.grand_total_reduction));
+        expect(toPaisa(q.grand_total_reduction)).toBeGreaterThanOrEqual(toPaisa(q.amount_waived));
+      }
+    }
+  });
 });
 
 // ============================================================================

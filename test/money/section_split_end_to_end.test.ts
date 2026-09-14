@@ -139,7 +139,7 @@ const FOOD_AND_DRINK: FixtureLine[] = [
 type SplitFn = (res: string, table: string, axis: "category" | "revenue_group" | "production_group") => Promise<{
   axis: string; grand_total: number; payable_parts: number; notes: string[];
   parts: { key: string; label: string; gap: boolean; subtotal: number; discount: number; service_charge: number;
-    taxes: { name: string; amount: number }[]; tax_total: number; grand_total: number; total: number;
+    taxes: { name: string; amount: number }[]; tax_total: number; round_off: number; grand_total: number; total: number;
     qty: number; nc_value: number; items: { name: string; price: number; quantity: number; nc?: true }[] }[];
 }>;
 let splitBySection: SplitFn;
@@ -171,8 +171,11 @@ describe("the category axis, end to end", () => {
     expect(starters.service_charge).toBe(70);
     expect(starters.tax_total).toBe(38.5);
     expect(starters.taxes.map((t) => [t.name, t.amount])).toEqual([["CGST", 19.25], ["SGST", 19.25]]);
-    expect(starters.grand_total).toBe(808.5);
-    expect(starters.total).toBe(808.5);
+    // 808.50 before rounding; every slip asks for whole rupees (migration 048),
+    // and the tied fifty paisa go to the heavier section.
+    expect(starters.round_off).toBe(0.5);
+    expect(starters.grand_total).toBe(809);
+    expect(starters.total).toBe(809);
     expect(starters.qty).toBe(2);
     expect(starters.items).toEqual([{ name: "Paneer Tikka", price: 350, quantity: 2 }]);
 
@@ -180,7 +183,8 @@ describe("the category axis, end to end", () => {
     expect(bar.subtotal).toBe(300);
     expect(bar.service_charge).toBe(30);
     expect(bar.tax_total).toBe(16.5);
-    expect(bar.grand_total).toBe(346.5);
+    expect(bar.round_off).toBe(-0.5);
+    expect(bar.grand_total).toBe(346);
 
     // And the whole point: they add back up to the bill.
     expect(starters.grand_total + bar.grand_total).toBe(1155);
@@ -221,19 +225,22 @@ describe("the category axis, end to end", () => {
     // Not counted as something anybody has to pay, and it does not distort the
     // sections that ARE being paid for.
     expect(r.payable_parts).toBe(2);
-    expect(r.parts.find((p) => p.label === "Starters")!.grand_total).toBe(808.5);
+    expect(r.parts.find((p) => p.label === "Starters")!.grand_total).toBe(809);
   });
 
   test("a bill-level discount is apportioned across the sections, not dropped on one", async () => {
     fixture.discount = { discount_type: "percent", discount_value: 10 };
 
     const r = await splitBySection(RES, "T1", "category");
-    // 1,000 less 10% = 900, +10% service = 990, +5% GST = 1,039.50.
-    expect(r.grand_total).toBe(1039.5);
+    // 1,000 less 10% = 900, +10% service = 990, +5% GST = 1,039.50 -> 1,040.
+    expect(r.grand_total).toBe(1040);
     expect(r.parts.map((p) => p.discount)).toEqual([70, 30]);
     expect(r.parts.map((p) => p.subtotal)).toEqual([700, 300]);
-    expect(r.parts.map((p) => p.grand_total)).toEqual([727.66, 311.84]);
-    expect(r.parts[0]!.grand_total + r.parts[1]!.grand_total).toBe(1039.5);
+    // 727.66 and 311.84 before rounding: the floors are two rupees short of the
+    // bill, so both parts round up.
+    expect(r.parts.map((p) => p.grand_total)).toEqual([728, 312]);
+    expect(r.parts.map((p) => p.round_off)).toEqual([0.34, 0.16]);
+    expect(r.parts[0]!.grand_total + r.parts[1]!.grand_total).toBe(1040);
   });
 
   test("A WEIGHED LINE IS WEIGHTED AT WHAT IT COSTS, not at the whole units the printed bill shows", async () => {
@@ -275,7 +282,7 @@ describe("the group axes, end to end", () => {
     expect(r.axis).toBe("revenue_group");
     expect(r.parts.map((p) => p.label)).toEqual(["Food", "Liquor"]);
     expect(r.parts.map((p) => p.key)).toEqual(["g-food", "g-liquor"]);
-    expect(r.parts.map((p) => p.grand_total)).toEqual([808.5, 346.5]);
+    expect(r.parts.map((p) => p.grand_total)).toEqual([809, 346]);
     expect(r.notes[0]).toContain("Group Summary");
   });
 

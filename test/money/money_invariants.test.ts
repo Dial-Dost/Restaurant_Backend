@@ -1,9 +1,11 @@
 // THE CORE MONEY INVARIANT, as pure arithmetic:
 //
-//     taxable_base + service_charge + tax_total === grand_total
+//     taxable_base + service_charge + tax_total + round_off === grand_total
 //
 // Every bill ever written must satisfy it, in both shapes a service charge
-// occurs in. These tests need no database and no fixture — they pin the shared
+// occurs in. round_off (migration 048) is what rounds the total to the rupee; it
+// is 0 on every bill settled before rounding existed, which is why the older
+// three-rung form of this identity was the same statement. These tests need no database and no fixture — they pin the shared
 // arithmetic in billing_math.ts that the write side (settle) uses to BUILD a
 // bill, so a bill can never be stored in a state the read side cannot decompose.
 // The read side's half of the contract is in report_agreement.test.ts.
@@ -59,8 +61,10 @@ describe("core invariant — shape (a): Restaurant.service_charge percent", () =
   test.each(cases)("subtotal %p", ({ subtotal, sc, discount }) => {
     const r = computeBillCharges(subtotal, DEFAULT_TAX_ONLY, sc, true, discount ?? null);
     // discounted_subtotal IS the taxable base: what was charged for food, after
-    // discount, before service charge and tax.
-    expect(round2(r.discounted_subtotal + r.service_charge + r.tax_total)).toBe(r.grand_total);
+    // discount, before service charge and tax. The round-off is the fourth rung.
+    expect(toPaisa(r.discounted_subtotal) + toPaisa(r.service_charge) + toPaisa(r.tax_total) + toPaisa(r.round_off))
+      .toBe(toPaisa(r.grand_total));
+    expect(toPaisa(r.grand_total) % 100).toBe(0);
     // No breakdown line may be a service charge in this shape — the charge is
     // folded into the amount the taxes were computed on instead.
     expect(r.taxes.some((t) => isServiceCharge(t.name))).toBe(false);
@@ -130,9 +134,27 @@ describe("rounding tolerance", () => {
   });
 
   test("a bill split conserves EXACTLY — zero tolerance, the last part absorbs the remainder", () => {
-    for (const [grand, parts] of [[100, 3], [10, 3], [1060, 7], [0.05, 4], [99999.99, 50]] as const) {
+    for (const [grand, parts] of [[100, 3], [10, 3], [1060, 7], [0.05, 4], [99999.99, 50], [4982, 3], [2, 3]] as const) {
       const r = computeBillSplit(grand, "even", { parts });
       expect(round2(r.parts.reduce((s, p) => s + p.total, 0))).toBe(round2(grand));
+    }
+  });
+
+  test("a whole-rupee bill splits evenly into whole-rupee shares no more than a rupee apart (migration 048)", () => {
+    // Every live bill is rupee-rounded now, and the even split is what both
+    // clients offer on screen and on the slips. Seeded, so a failure reproduces.
+    const rand = mulberry32(48);
+    for (let i = 0; i < 5000; i++) {
+      const parts = 2 + Math.floor(rand() * 49);
+      const grand = parts + Math.floor(rand() * 200000);
+      const r = computeBillSplit(grand, "even", { parts });
+      const paisa = r.parts.map((p) => toPaisa(p.total));
+      expect(r.parts).toHaveLength(parts);
+      expect(paisa.reduce((s, p) => s + p, 0)).toBe(toPaisa(grand));
+      expect(paisa.every((p) => p % 100 === 0 && p >= 100)).toBe(true);
+      expect(Math.max(...paisa) - Math.min(...paisa)).toBeLessThanOrEqual(100);
+      // The leftover rupees sit on the FIRST shares: never rising left to right.
+      expect(paisa.every((p, k) => k === 0 || p <= paisa[k - 1]!)).toBe(true);
     }
   });
 });
@@ -208,7 +230,12 @@ describe("section split — the parts recompose the bill, rung by rung", () => {
       expect(paisa(part.discounted_subtotal) + paisa(part.service_charge) + paisa(part.tax_total) + paisa(part.round_off))
         .toBe(paisa(part.grand_total));
       expect(part.grand_total).toBeGreaterThanOrEqual(0);
+      // A whole-rupee bill splits into whole-rupee parts, none moved a rupee.
+      expect(paisa(part.grand_total) % 100).toBe(0);
+      expect(Math.abs(paisa(part.round_off))).toBeLessThan(100);
     }
+    // And the round-off is a column like every other rung.
+    expect(sumPaisa(r.parts.map((p) => paisa(p.round_off)))).toBe(paisa(bill.round_off));
   });
 
   test("the service charge is apportioned in BOTH shapes it occurs in", () => {
@@ -258,7 +285,10 @@ describe("section split — the parts recompose the bill, rung by rung", () => {
     // The section split is an ADDITIONAL mode. This is the same assertion as the
     // even-split test above, restated beside the new one so a change to the
     // shared allocator that broke the old mode could not pass unnoticed.
-    expect(computeBillSplit(100, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([33.33, 33.33, 33.34]);
+    // A total in paise keeps the shipped allocation; a whole-rupee one (every bill
+    // since migration 048) splits in whole rupees, pinned in its own test above.
+    expect(computeBillSplit(100.1, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([33.36, 33.36, 33.38]);
+    expect(computeBillSplit(100, "even", { parts: 3 }).parts.map((p) => p.total)).toEqual([34, 33, 33]);
     expect(computeBillSplit(100, "item", {
       groups: [
         { label: "A", items: [{ name: "x", price: 30, quantity: 1 }] },

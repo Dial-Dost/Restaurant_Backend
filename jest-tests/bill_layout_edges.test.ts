@@ -75,12 +75,14 @@ const hard: ReceiptOptions = {
   printedAt: "14/09/26 13:11",
   gstin: "29ABCDE1234F1Z5 / 27ABCDE1234F1Z9 (MH)",
   discount: { amount: 500, label: "Coupon SUPERSAVER2026EXTRA" },
-  serviceCharge: { percent: 10, amount: 0, optedOut: true },
+  // A charged service charge (10% of the discounted 1162190.50): a removed one
+  // prints no line at all, and this fixture wants every rung on the paper.
+  serviceCharge: { percent: 10, amount: 116219.05 },
   taxes: [
     { name: "Compensation Cess on Aerated Beverages", percentage: 12, amount: 1234.5 },
     { name: "SGST", percentage: 2.5, amount: 118.63 },
   ],
-  grandTotal: 1163543.63,
+  grandTotal: 1279762.68,
   feedbackUrl: "https://example.test/f?rid=a",
   serviceChargeNote: "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed.",
 };

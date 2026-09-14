@@ -34,6 +34,26 @@ import { CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCu
 // layer serves the same two values every print path already obeys rather than
 // keeping a second copy that could drift.
 import { BILL_QR_NOTE_MAX, DEFAULT_BILL_QR_NOTE } from "./escpos.js";
+// Payment modes are CONFIGURED, not compiled in: the alias table, the screenshot
+// rule and the settings merge all live in payment_methods.ts, where jest proves
+// them, and every settle/tender/guest writer below asks it with the tenant's own
+// config (loadPaymentConfig).
+import {
+  DEFAULT_PAYMENT_METHODS,
+  PaymentConfigError,
+  displayPaymentMethod,
+  mergePaymentConfig,
+  methodRequiresProof,
+  paymentConfigForUndo,
+  paymentMethodLabel,
+  paymentMethodRefusal,
+  planPaymentConfigSave,
+  resolvePaymentMethod,
+  splitPartsNeedingProof,
+  type PaymentMethodConfig,
+  type SettleMethod,
+} from "./payment_methods.js";
+export { DEFAULT_PAYMENT_METHODS, PaymentConfigError, type PaymentMethodConfig };
 import {
   round2,
   computeBillTaxes,
@@ -232,6 +252,7 @@ import {
   addDaysToKey,
   countDays,
   dateKeyInZone,
+  isDateKey,
   resolveReportWindow,
   type ReportWindowQuery,
   type ResolvedReportWindow,
@@ -259,11 +280,14 @@ import {
   perCover,
   previousWindow,
   serviceChargeBasisLabel,
+  settlementByMethod,
   sharePct,
   zeroLadder,
   type BillEditKind,
   type BillMoney,
   type LadderTotals,
+  type SettlementBill,
+  type SettlementMethodRow,
   type SettlementPart,
 } from "./mis_report_math.js";
 export {
@@ -1149,16 +1173,8 @@ export interface OrderRecord {
   kot_nos?: number[];
 }
 
-export type PaymentMethod =
-  | "Upi"       // 1
-  | "Cash"      // 2
-  | "Card"      // 3
-  | "Dineout"   // 4 (screenshot)
-  | "Zomato"    // 5 (screenshot)
-  | "Eazydiner" // 6 (screenshot)
-  | "District"  // 7 (screenshot)
-  | "Razorpay"  // online (auto-verified)
-  | "Split";    // split tender — real modes live in Bills.payment_splits
+// A built-in id, 'Split', or a custom mode's own id (payment_methods.ts).
+export type PaymentMethod = SettleMethod;
 
 export interface TableAssignmentRecord {
   id: string;
@@ -1738,31 +1754,28 @@ function fromOrderStatusCode(status: unknown): OrderRecord["status"] {
   }
 }
 
-function normalizePaymentMethod(raw: unknown): PaymentMethod | null {
-  const n = String(raw ?? "").trim().toLowerCase();
-  if (!n) {return null;}
-  if (n === "upi") {return "Upi";}
-  if (n === "cash") {return "Cash";}
-  if (n === "card") {return "Card";}
-  if (n === "dineout" || n === "dine out") {return "Dineout";}
-  if (n === "zomato" || n === "zomato pay" || n === "zomatopay") {return "Zomato";}
-  if (n === "eazydiner" || n === "easydiner" || n === "easy diner") {return "Eazydiner";}
-  if (n === "district") {return "District";}
-  if (n === "razorpay") {return "Razorpay";}
-  if (n === "split") {return "Split";}
-  return null;
+/**
+ * The tenant's effective payment modes, read inside the caller's transaction.
+ * mergePaymentConfig turns a NULL column into exactly the built-in defaults, so
+ * a restaurant that has never opened the editor settles as it always has.
+ */
+async function loadPaymentConfig(context: RestaurantContext, client?: PoolClient): Promise<PaymentMethodConfig[]> {
+  const rows = await runQuery<{ payment_config: unknown }>(
+    `select payment_config from "Restaurant" where id = $1 limit 1`,
+    [context.res_id],
+    client,
+  );
+  return mergePaymentConfig(rows[0]?.payment_config);
 }
 
-// Alternate / third-party methods (4-7) that require a payment-proof screenshot.
-const PROOF_REQUIRED_METHODS: ReadonlySet<PaymentMethod> = new Set<PaymentMethod>([
-  "Dineout",
-  "Zomato",
-  "Eazydiner",
-  "District",
-]);
-
-function paymentRequiresProof(method: PaymentMethod | null): boolean {
-  return method !== null && PROOF_REQUIRED_METHODS.has(method);
+/**
+ * method -> label for a report. Display only: grouping and reconciliation saves
+ * keep keying on the stored id, so a failed read costs the label and nothing
+ * else — it must never take a money report down with it.
+ */
+async function paymentLabelsFor(context: RestaurantContext): Promise<(method: string) => string> {
+  const config = await loadPaymentConfig(context).catch(() => mergePaymentConfig(null));
+  return (method: string) => paymentMethodLabel(method, config) || method;
 }
 
 function encodeSlot(payload: SlotPayload): string {
@@ -4124,12 +4137,16 @@ export async function ReleaseTable(
   // An ADMIN-APPROVED bill keeps its total: that is money the guest really paid
   // (the guard above only refuses the not-yet-approved case), and wiping it would
   // be the very disappearing-revenue bug that guard exists to prevent.
+  // round_off (migration 048) goes with the total it belongs to: a zeroed bill
+  // that kept a waiter-confirm's -0.26 would read back as 0.26 of food sold.
+  await ensureBillRoundOffColumn();
   await runQuery(
     `update "Bills"
         set closed_at = now(),
             closed_by_username = 'released',
             total_amt = case when admin_approved_at is null then 0 else total_amt end,
-            tax_breakdown = case when admin_approved_at is null then '[]'::json else tax_breakdown end
+            tax_breakdown = case when admin_approved_at is null then '[]'::json else tax_breakdown end,
+            round_off = case when admin_approved_at is null then null else round_off end
       where res_id = $1 and outlet_id = $2 and table_id = $3 and closed_at is null`,
     [context.res_id, context.outlet_id, tableId],
   );
@@ -4331,7 +4348,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; round_off: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -4535,6 +4552,7 @@ export async function GetBillForTable(
     service_charge_percent,
     taxes,
     tax_total,
+    round_off,
     grand_total,
   } = computeBillCharges(total, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, discount);
   const bill = billRows[0];
@@ -4620,6 +4638,10 @@ export async function GetBillForTable(
     service_charge_waiver: chargeCfg.waiver,
     taxes,
     tax_total,
+    // Migration 048: what rounded `grand_total` to the rupee. Every screen and
+    // every piece of paper that shows the ladder shows this rung when it is not
+    // zero, so the lines a guest can add up reach the number they are asked for.
+    round_off,
     grand_total,
     // Migration 034: the menu value of everything comped on this table. NOT part
     // of `subtotal`/`grand_total` (that is the entire point of a non-chargeable),
@@ -6448,11 +6470,11 @@ export async function GetCustomerSegments(
     // literal placeholder "guest") are kept: their identity is resolved below
     // from the seating's booking, so table_id / created_at / seated_at ride
     // along for that.
-    runQuery<{ ident: string | null; table_id: string | null; bill_created_at: Date; seated_at: Date | null; settled_at: Date; total_amt: string; tax_breakdown: unknown }>(
-      `select i.ident, i.table_id::text as table_id, i.bill_created_at, i.seated_at, i.settled_at, i.total_amt::text, i.tax_breakdown
+    runQuery<{ ident: string | null; table_id: string | null; bill_created_at: Date; seated_at: Date | null; settled_at: Date; total_amt: string; tax_breakdown: unknown; round_off: string | null }>(
+      `select i.ident, i.table_id::text as table_id, i.bill_created_at, i.seated_at, i.settled_at, i.total_amt::text, i.tax_breakdown, i.round_off::text
          from (
            select coalesce(b.closed_at, b.admin_approved_at) as settled_at,
-                  b.total_amt, b.tax_breakdown, b.table_id, b.created_at as bill_created_at, s.seated_at,
+                  b.total_amt, b.tax_breakdown, b.round_off, b.table_id, b.created_at as bill_created_at, s.seated_at,
                   (select case when o.cust_id is not null then 'c:' || o.cust_id::text
                                else coalesce(nullif((o.food)::jsonb->>'customer_phone', ''),
                                              nullif((o.food)::jsonb->>'customer', '')) end
@@ -6532,7 +6554,7 @@ export async function GetCustomerSegments(
           bookingWindows,
         );
     if (ident === null) { continue; }
-    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct);
+    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct, parseNumeric(b.round_off));
     // Same identity keying as GetCustomerInsights: a direct cust_id link, else a
     // normalized phone when the ident has enough digits to be one, else a name.
     let key: string;
@@ -7909,6 +7931,10 @@ async function undoSettings(restaurantId: string, cache: UndoStateCache): Promis
 const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; nullable: boolean; toDb(v: unknown): unknown }> = {
   auto_push_orders: { column: "auto_push_orders", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   currency: { column: "currency", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" ? v.slice(0, 8) : null) },
+  // Restores the PRIOR list — but never by deleting a custom mode the undone save
+  // added: writeRestaurantSettingsForUndo swaps this toDb for
+  // paymentConfigUndoValue, which keeps such a mode switched off
+  // (paymentConfigForUndo). This toDb is what any other caller would get.
   payment_methods: { column: "payment_config", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(mergePaymentConfig(v))) },
   razorpay_key_id: { column: "razorpay_key_id", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 80) : null) },
   service_charge: { column: "service_charge", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
@@ -7964,6 +7990,27 @@ function undoSettingsKeyBlock(key: string, priorValue: unknown): UndoBlock | nul
   return null;
 }
 
+/**
+ * The payment_config an undo writes. The prior list, with any custom mode the
+ * undone save added kept and switched off (paymentConfigForUndo) — so undoing
+ * "added Swiggy Dineout" cannot strand a bill that already has a Swiggy Dineout
+ * tender on it. Read `for update` on the undo's own client, so a settings save
+ * landing mid-undo waits rather than being merged against a stale copy.
+ *
+ * A NULL prior (no config ever saved) still restores as NULL when there is no
+ * custom mode to keep — NULL and the defaults are the same config.
+ */
+async function paymentConfigUndoValue(context: RestaurantContext, prior: unknown, client?: PoolClient): Promise<string | null> {
+  const rows = await runQuery<{ payment_config: unknown }>(
+    `select payment_config from "Restaurant" where id = $1 limit 1 for update`,
+    [context.res_id],
+    client,
+  );
+  const restored = paymentConfigForUndo(prior, rows[0]?.payment_config ?? null);
+  if (prior == null && !restored.some((m) => m.custom === true)) {return null;}
+  return JSON.stringify(restored);
+}
+
 /** Restore settings columns EXPLICITLY (null restores as null). */
 async function writeRestaurantSettingsForUndo(
   restaurantId: string,
@@ -7978,7 +8025,7 @@ async function writeRestaurantSettingsForUndo(
     if (key === UNDO_TAXES_KEY) {continue;}
     const col = UNDO_SETTINGS_COLUMNS[key];
     if (!col) {throw new Error(`Setting "${key}" cannot be restored`);}
-    params.push(col.toDb(value));
+    params.push(key === "payment_methods" ? await paymentConfigUndoValue(context, value, client) : col.toDb(value));
     sets.push(`"${col.column}" = $${params.length}::${col.cast}`);
   }
   if (sets.length > 0) {
@@ -10955,7 +11002,7 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       applyServiceCharge: Boolean(payload.applyServiceCharge),
       total: total > 0 ? total : subtotal,
       status: finalStatus,
-      payment_method: normalizePaymentMethod(row.payment_method),
+      payment_method: displayPaymentMethod(row.payment_method),
       payment_proof_screenshot_url:
         typeof row.payment_proof_screenshot_url === "string" ? row.payment_proof_screenshot_url : null,
       payment_waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
@@ -13811,8 +13858,11 @@ export async function AddOrder(
     );
     if (openBill[0]) {
       const consolidated = await sumOrderTotalsForTable(context, table.id);
+      // An open bill's total_amt is the pre-tax running sum, which has no
+      // round-off; a stale one from a waiter-confirm is cleared with it (048).
+      await ensureBillRoundOffColumn();
       await runQuery(
-        `update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4`,
+        `update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4`,
         [consolidated, openBill[0].id, context.res_id, context.outlet_id],
       );
     }
@@ -14082,7 +14132,9 @@ async function removeItemFromTableOrders(
     [tableId, context.res_id, context.outlet_id], client);
   if (openBill[0]) {
     const consolidated = await sumOrderTotalsForTable(context, tableId, client);
-    await runQuery(`update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4`,
+    // Pre-tax running sum: no round-off belongs to it (migration 048).
+    await ensureBillRoundOffColumn(client);
+    await runQuery(`update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4`,
       [consolidated, openBill[0].id, context.res_id, context.outlet_id], client);
   }
   const value = round2(removedLines.reduce((sum, l) => sum + l.price * l.quantity, 0));
@@ -14643,7 +14695,9 @@ export async function MoveBillItem(
       [toId, context.res_id, context.outlet_id], client);
     if (toBill[0]) {
       const consolidated = await sumOrderTotalsForTable(context, toId, client);
-      await runQuery(`update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4`,
+      // Pre-tax running sum: no round-off belongs to it (migration 048).
+      await ensureBillRoundOffColumn(client);
+      await runQuery(`update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4`,
         [consolidated, toBill[0].id, context.res_id, context.outlet_id], client);
     }
     return { success: true, moved };
@@ -15415,7 +15469,9 @@ export async function MergeTableBills(
       client,
     );
     if (toBill[0]) {
-      await runQuery(`update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4`,
+      // Pre-tax running sum: no round-off belongs to it (migration 048).
+      await ensureBillRoundOffColumn(client);
+      await runQuery(`update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4`,
         [consolidated, toBill[0].id, context.res_id, context.outlet_id], client);
     } else {
       const billNo = await nextBillNo(context, client);
@@ -15432,8 +15488,11 @@ export async function MergeTableBills(
     // destination bill (which snapshots the tax-inclusive grand total at settle),
     // so zero this row — a merge-closed bill left holding the pre-tax running sum
     // would be double-counted (and tax-free) in the settled-bills revenue basis.
+    // round_off (migration 048) is cleared with the total, for the reason
+    // ReleaseTable gives: a closed zero bill must read back as zero food.
+    await ensureBillRoundOffColumn(client);
     await runQuery(
-      `update "Bills" set closed_at = now(), closed_by_username = 'merge', total_amt = 0, tax_breakdown = '[]'::jsonb
+      `update "Bills" set closed_at = now(), closed_by_username = 'merge', total_amt = 0, tax_breakdown = '[]'::jsonb, round_off = null
          where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null`,
       [fromId, context.res_id, context.outlet_id],
       client,
@@ -15941,8 +16000,10 @@ async function resyncOpenBillTotal(
     client,
   );
   if (open[0]) {
+    // Pre-tax running sum: no round-off belongs to it (migration 048).
+    await ensureBillRoundOffColumn(client);
     await runQuery(
-      `update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4`,
+      `update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4`,
       [total, open[0].id, context.res_id, context.outlet_id],
       client,
     );
@@ -16291,10 +16352,13 @@ export interface ClosedBillSummary {
   // out into service_charge (see closedBillCharges), so it is never counted twice.
   tax_total: number;
   // What the food actually cost, after discount and before service charge + tax.
-  // INVARIANT: taxable_base + service_charge + tax_total === grand_total.
+  // INVARIANT: taxable_base + service_charge + tax_total + round_off === grand_total.
   taxable_base: number;
   service_charge: number;
   service_charge_percent: number;
+  // Migration 048: what rounded the total to the rupee ("Bills".round_off). 0 on
+  // a bill settled before rounding existed, which is exactly what it was then.
+  round_off: number;
   payment_method: PaymentMethod | null;
   payment_splits: { method: string; amount: number }[];
   discount_type: "percent" | "flat" | null;
@@ -16401,6 +16465,8 @@ interface ClosedBillRow {
   table_name: string | null;
   total_amt: number | string | null;
   tax_breakdown: unknown;
+  /** Migration 048. NULL on a bill settled before rounding: reads as 0. */
+  round_off: number | string | null;
   payment_method: string | null;
   payment_splits: unknown;
   payment_proof_screenshot_url: string | null;
@@ -16445,7 +16511,7 @@ function parseStoredTaxLines(raw: unknown): BillTaxLine[] {
 /** Columns + joins shared by the list and the detail read. */
 const CLOSED_BILL_SELECT = `
   b.id, b.bill_no, b.status, b.reason, b.table_id, t.table_name,
-  b.total_amt, b.tax_breakdown, b.payment_method, b.payment_splits,
+  b.total_amt, b.tax_breakdown, b.round_off, b.payment_method, b.payment_splits,
   b.payment_proof_screenshot_url, b.discount_type, b.discount_value, b.discount_applied_at, b.coupon_code,
   b.waiter_confirmed_at, b.waiter_confirmed_by_username,
   b.admin_approved_at, b.admin_approved_by_username,
@@ -16502,22 +16568,36 @@ function splitServiceChargeLine(lines: BillTaxLine[]): { service: BillTaxLine | 
 
 /**
  * The money charged ABOVE the food base, split into its parts, for one stored
- * bill. Invariant in both shapes: taxable_base + service_charge + tax_total ===
- * grand_total, so a client can render a bill from these four numbers alone.
+ * bill. Invariant in both shapes: taxable_base + service_charge + tax_total +
+ * round_off === grand_total, so a client can render a bill from these numbers
+ * alone.
  *
  * `scPct` is Restaurant.service_charge, needed only for shape (a): there the
  * stored total already includes the charge, so it is unwound out of the base
  * rather than added to it.
+ *
+ * `roundOff` is "Bills".round_off (migration 048) — REQUIRED, with no default,
+ * so the compiler names every settled-bill reader that has not been taught to
+ * select it. Everything above the total is recovered by SUBTRACTION, so a
+ * rupee-rounded total read without its round-off pushes the paise into the food
+ * base: Gaia's 4982.00 would read back as base 4744.74 against 4745.00 of items,
+ * which moves net sales, APC and GST turnover by the round-off and, past the
+ * 0.05 tolerance, flags the bill as "no longer adds up". Pass
+ * `parseNumeric(row.round_off)` — NULL (a bill settled
+ * before rounding existed) is 0, which is exactly what it was.
  */
 function closedBillCharges(
   grand_total: number,
   rawLines: BillTaxLine[],
   scPct: number,
-): { taxes: BillTaxLine[]; tax_total: number; service_charge: number; service_charge_percent: number; taxable_base: number } {
+  roundOff: number,
+): { taxes: BillTaxLine[]; tax_total: number; service_charge: number; service_charge_percent: number; taxable_base: number; round_off: number } {
   const { service, taxes } = splitServiceChargeLine(rawLines);
   const tax_total = round2(taxes.reduce((s, t) => s + t.amount, 0));
+  const round_off = round2(Number(roundOff) || 0);
   // Everything the taxes were computed on = food base + any service charge.
-  const preTax = round2(grand_total - tax_total);
+  // The round-off comes off first: it was added to the total, never to a base.
+  const preTax = round2(grand_total - round_off - tax_total);
   if (service) {
     // Shape (b): the charge is a stored line — trust it verbatim.
     const service_charge = round2(service.amount);
@@ -16527,20 +16607,21 @@ function closedBillCharges(
       service_charge,
       service_charge_percent: round2(service.percentage),
       taxable_base: round2(preTax - service_charge),
+      round_off,
     };
   }
   if (scPct > 0) {
     // Shape (a): preTax = base * (1 + scPct/100); unwind to recover the base.
     const base = round2(preTax / (1 + scPct / 100));
-    return { taxes, tax_total, service_charge: round2(preTax - base), service_charge_percent: round2(scPct), taxable_base: base };
+    return { taxes, tax_total, service_charge: round2(preTax - base), service_charge_percent: round2(scPct), taxable_base: base, round_off };
   }
-  return { taxes, tax_total, service_charge: 0, service_charge_percent: 0, taxable_base: preTax };
+  return { taxes, tax_total, service_charge: 0, service_charge_percent: 0, taxable_base: preTax, round_off };
 }
 
 function mapClosedBillSummary(row: ClosedBillRow, scPct = 0): ClosedBillSummary {
   const grand_total = round2(parseNumeric(row.total_amt));
-  const charges = closedBillCharges(grand_total, parseStoredTaxLines(row.tax_breakdown), scPct);
-  const { tax_total, taxable_base, service_charge, service_charge_percent } = charges;
+  const charges = closedBillCharges(grand_total, parseStoredTaxLines(row.tax_breakdown), scPct, parseNumeric(row.round_off));
+  const { tax_total, taxable_base, service_charge, service_charge_percent, round_off } = charges;
   const covers = row.session_covers == null ? null : Math.max(1, Math.round(parseNumeric(row.session_covers)));
   // APC = pre-tax spend per guest, the same convention as the live floor grid.
   // The basis is the TAXABLE BASE (what was actually charged for food, before
@@ -16562,7 +16643,8 @@ function mapClosedBillSummary(row: ClosedBillRow, scPct = 0): ClosedBillSummary 
     taxable_base,
     service_charge,
     service_charge_percent,
-    payment_method: normalizePaymentMethod(row.payment_method),
+    round_off,
+    payment_method: displayPaymentMethod(row.payment_method),
     payment_splits: parsePaymentSplits(row.payment_splits),
     discount_type: parseNumeric(row.discount_value) > 0 ? (row.discount_type === "flat" ? "flat" : "percent") : null,
     discount_value: round2(parseNumeric(row.discount_value)),
@@ -16734,7 +16816,7 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
   const scPct = await getServiceChargePercent(context.res_id).catch(() => 0);
   const grandTotal = round2(parseNumeric(row.total_amt));
   const storedLines = parseStoredTaxLines(row.tax_breakdown);
-  const charges = closedBillCharges(grandTotal, storedLines, scPct);
+  const charges = closedBillCharges(grandTotal, storedLines, scPct, parseNumeric(row.round_off));
   // Everything charged before genuine tax = food base + service charge. This is
   // the one number that never depends on the reconstruction, so it is what the
   // reconstructed items (plus whatever service charge applied) are checked
@@ -16874,7 +16956,9 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
 export interface ClosedBillListFilter {
   limit?: number;
   offset?: number;
+  /** YYYY-MM-DD = first day, INCLUSIVE, in the restaurant's zone; or an ISO instant (>=). */
   from?: string;
+  /** YYYY-MM-DD = last day, INCLUSIVE, in the restaurant's zone; or an ISO instant (<=). */
   to?: string;
   table?: string;
   payment_method?: string;
@@ -16956,8 +17040,24 @@ export async function ListClosedBills(
   if (!opts.include_open) {
     where.push(`b.closed_at is not null`);
   }
-  if (opts.from) { params.push(opts.from); where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) >= $${params.length}`); }
-  if (opts.to) { params.push(opts.to); where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) <= $${params.length}`); }
+  // Day bounds are cut in the RESTAURANT'S zone, the same half-open
+  // [from 00:00 local, to+1 00:00 local) that windowInstants hands every report.
+  // They used to be UTC midnights (the session zone casts a bare date as UTC),
+  // so for a Kolkata tenant "13 Sep" listed 05:30 on the 13th to 05:29 on the
+  // 14th, and a bill settled at 00:30 IST sat under the wrong day here while
+  // Sales/GST/P&L on the same screen counted it under the right one. A full ISO
+  // instant still means exactly that instant (>= / <=). A missing end is still
+  // "no bound": History and the tests list everything with {}, so none of
+  // resolveReportWindow's default span or caps belong here.
+  if (opts.from) {
+    params.push(isDateKey(opts.from) ? zoneMidnightUtc(opts.from, context.timezone).toISOString() : opts.from);
+    where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) >= $${params.length}`);
+  }
+  if (opts.to) {
+    const dayKey = isDateKey(opts.to);
+    params.push(dayKey ? zoneMidnightUtc(addDaysToKey(opts.to, 1), context.timezone).toISOString() : opts.to);
+    where.push(`coalesce(b.closed_at, b.admin_approved_at, b.created_at) ${dayKey ? "<" : "<="} $${params.length}`);
+  }
   if (opts.table?.trim()) { params.push(opts.table.trim()); where.push(`lower(t.table_name) = lower($${params.length})`); }
   if (opts.payment_method?.trim()) { params.push(opts.payment_method.trim()); where.push(`lower(coalesce(b.payment_method, '')) = lower($${params.length})`); }
   if (opts.search?.trim()) {
@@ -17038,13 +17138,14 @@ export interface OpenBillSummary {
   covers: number | null;
   order_count: number;
   // INVARIANT, same as a settled bill: taxable_base + service_charge + tax_total
-  // === grand_total. grand_total is what the guest owes right now.
+  // + round_off === grand_total. grand_total is what the guest owes right now.
   grand_total: number;
   taxable_base: number;
   service_charge: number;
   service_charge_percent: number;
   taxes: BillTaxLine[];
   tax_total: number;
+  round_off: number;
   discount_type: "percent" | "flat" | null;
   discount_value: number;
   coupon_code: string | null;
@@ -17076,6 +17177,8 @@ interface OpenBillRow {
   table_is_virtual: boolean | null;
   total_amt: number | string | null;
   tax_breakdown: unknown;
+  /** Migration 048: written with the snapshot, so it belongs to `total_amt`. */
+  round_off: number | string | null;
   discount_type: string | null;
   discount_value: number | string | null;
   coupon_code: string | null;
@@ -17119,7 +17222,7 @@ export async function ListOpenBills(
   const rows = await runQuery<OpenBillRow>(
     `select b.id, b.bill_no, b.status, b.outlet_id, b.table_id, t.table_name,
             coalesce(t.is_virtual, false) as table_is_virtual,
-            b.total_amt, b.tax_breakdown, b.discount_type, b.discount_value, b.coupon_code,
+            b.total_amt, b.tax_breakdown, b.round_off, b.discount_type, b.discount_value, b.coupon_code,
             b.payment_method, b.waiter_confirmed_at, b.admin_approved_at, b.created_at,
             extract(epoch from (now() - b.created_at)) as age_secs,
             e."emp_Fname" as opened_by_fname, e."emp_Lname" as opened_by_lname
@@ -17190,7 +17293,9 @@ export async function ListOpenBills(
         );
     const grand_total = live ? live.grand_total : round2(parseNumeric(row.total_amt));
     const lines = live ? live.taxes : parseStoredTaxLines(row.tax_breakdown);
-    const charges = closedBillCharges(grand_total, lines, scPct);
+    // The round-off travels with whichever total was used: the live one's own,
+    // or the one the snapshot wrote beside total_amt.
+    const charges = closedBillCharges(grand_total, lines, scPct, live ? live.round_off : parseNumeric(row.round_off));
 
     const rawCovers = row.table_id ? coversByTable.get(row.table_id) : undefined;
     const covers = rawCovers == null ? null : Math.max(1, Math.round(parseNumeric(rawCovers)));
@@ -17216,6 +17321,7 @@ export async function ListOpenBills(
       service_charge_percent: charges.service_charge_percent,
       taxes: charges.taxes,
       tax_total: charges.tax_total,
+      round_off: charges.round_off,
       discount_type,
       discount_value: round2(dValue),
       coupon_code: row.coupon_code,
@@ -17224,7 +17330,7 @@ export async function ListOpenBills(
       apc: covers && covers > 0 ? round2(charges.taxable_base / covers) : null,
       stage: row.admin_approved_at ? "approved" : row.waiter_confirmed_at ? "awaiting_approval" : "running",
       totals_snapshotted,
-      payment_method: normalizePaymentMethod(row.payment_method),
+      payment_method: displayPaymentMethod(row.payment_method),
       opened_by: name || takenBy || null,
       opened_at: iso(row.created_at) ?? "",
       opened_at_local: clock
@@ -17521,6 +17627,8 @@ interface SettledBill {
   settled_at: Date | string;
   total_amt: number;
   tax_breakdown: unknown;
+  /** Migration 048. Inside total_amt, and never part of any taxable figure. */
+  round_off: number;
   payment_method: string | null;
   payment_splits: unknown;
   refund_amount: number;
@@ -17536,11 +17644,13 @@ async function getSettledBills(context: RestaurantContext, fromIso: string, toIs
     settled_at: Date | string;
     total_amt: number | string | null;
     tax_breakdown: unknown;
+    round_off: number | string | null;
     payment_method: string | null;
     payment_splits: unknown;
     refund_amount: number | string | null;
   }>(
-    `select coalesce(closed_at, admin_approved_at) as settled_at, total_amt, tax_breakdown, payment_method, payment_splits,
+    `select coalesce(closed_at, admin_approved_at) as settled_at, total_amt, tax_breakdown,
+            coalesce(round_off, 0) as round_off, payment_method, payment_splits,
             coalesce(refund_amount, 0) as refund_amount
        from "Bills"
        where res_id = $1 and (${og} or outlet_id = $2)
@@ -17554,6 +17664,7 @@ async function getSettledBills(context: RestaurantContext, fromIso: string, toIs
     settled_at: r.settled_at,
     total_amt: round2(parseNumeric(r.total_amt)),
     tax_breakdown: r.tax_breakdown,
+    round_off: round2(parseNumeric(r.round_off)),
     payment_method: r.payment_method,
     payment_splits: r.payment_splits,
     refund_amount: round2(parseNumeric(r.refund_amount)),
@@ -17570,7 +17681,7 @@ async function getSettledBills(context: RestaurantContext, fromIso: string, toIs
 // accounting screen contradict the bill it is showing. Routing every report
 // through the detail read's helper is what keeps the two from drifting apart.
 function reportBillCharges(bill: SettledBill, scPct: number) {
-  return closedBillCharges(bill.total_amt, parseTaxLines(bill.tax_breakdown), scPct);
+  return closedBillCharges(bill.total_amt, parseTaxLines(bill.tax_breakdown), scPct, bill.round_off);
 }
 
 // The tax reversed by a refund. Refunds are recorded on the bill row without
@@ -17909,7 +18020,9 @@ export interface SalesReport {
   net_sales: number;
   bill_count: number;
   by_day: { date: string; sales: number; tax: number; service_charge: number; refund: number; bills: number }[];
-  by_method: { method: string; sales: number; bills: number }[];
+  // Grouped by the STORED id; `label` is the owner's name for it (Settings >
+  // Payments), so a renamed or custom mode reads right without splitting history.
+  by_method: { method: string; label?: string; sales: number; bills: number }[];
 }
 
 export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<SalesReport> {
@@ -17956,6 +18069,7 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     }
   }
 
+  const labelOf = await paymentLabelsFor(context);
   return {
     from: range.fromDate,
     to: range.toDate,
@@ -17967,15 +18081,17 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     net_sales: round2(totalSales - totalRefund),
     bill_count: bills.length,
     by_day: [...byDay.entries()].filter(([d]) => d).sort((a, b) => a[0].localeCompare(b[0])).map(([date, v]) => ({ date, ...v })),
-    by_method: [...byMethod.entries()].sort((a, b) => b[1].sales - a[1].sales).map(([method, v]) => ({ method, ...v })),
+    by_method: [...byMethod.entries()].sort((a, b) => b[1].sales - a[1].sales).map(([method, v]) => ({ method, label: labelOf(method), ...v })),
   };
 }
 
 export interface GstReport {
   from: string;
   to: string;
-  // Turnover ex-tax: gross minus genuine tax. Service charge is part of turnover,
-  // so it stays inside this figure and is also reported on its own below.
+  // Turnover ex-tax: gross minus genuine tax minus round-off. Service charge is
+  // part of turnover, so it stays inside this figure and is also reported on its
+  // own below. The round-off (migration 048) is not: it is the paise the bill was
+  // rounded by, not a supply, and no tax was charged on it.
   total_taxable: number;
   total_tax: number;
   total_service_charge: number;
@@ -17991,7 +18107,8 @@ export async function GetGstReport(restaurantId: string, fromIso?: string, toIso
   let totalTax = 0, totalGross = 0, totalService = 0;
   const byRate = new Map<string, { name: string; percentage: number; taxable: number; tax: number }>();
   for (const b of bills) {
-    totalGross = round2(totalGross + b.total_amt);
+    // Ex round-off: see total_taxable. A bill settled before rounding carries 0.
+    totalGross = round2(totalGross + b.total_amt - b.round_off);
     const charges = reportBillCharges(b, scPct);
     totalService = round2(totalService + charges.service_charge);
     // `charges.taxes` has the service-charge line already lifted out, so this
@@ -18092,11 +18209,12 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
   const bills = await runQuery<{
     total_amt: number | string | null;
     tax_breakdown: unknown;
+    round_off: number | string | null;
     discount_type: string | null;
     discount_value: number | string | null;
     coupon_code: string | null;
   }>(
-    `select total_amt, tax_breakdown, discount_type, discount_value, coupon_code
+    `select total_amt, tax_breakdown, coalesce(round_off, 0) as round_off, discount_type, discount_value, coupon_code
        from "Bills"
        where res_id = $1 and (${og} or outlet_id = $2)
          and (admin_approved_at is not null or closed_at is not null)
@@ -18117,8 +18235,8 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
     if (b.discount_type === "percent") {
       // Percent rows store the RAW percentage; the money it removed was never
       // snapshotted. Reconstruct it from the settled total (see computeBillCharges):
-      //   total = discounted_subtotal·(1 + sc/100) + taxes
-      //   → discounted_subtotal = (total − tax) / (1 + sc/100)
+      //   total = discounted_subtotal·(1 + sc/100) + taxes + round_off
+      //   → discounted_subtotal = (total − round_off − tax) / (1 + sc/100)
       //   → discount = discounted_subtotal · p / (100 − p)
       // Uses the CURRENT service-charge %, so bills settled under a different SC
       // setting are slightly off, and a 100%-off bill (total 0) is unknowable.
@@ -18126,7 +18244,7 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
       const p = Math.min(value, 100);
       if (p < 100) {
         const tax = round2(parseTaxLines(b.tax_breakdown).reduce((s, l) => s + l.amount, 0));
-        const discountedSubtotal = Math.max(0, (total - tax) / (1 + scPct / 100));
+        const discountedSubtotal = Math.max(0, (total - parseNumeric(b.round_off) - tax) / (1 + scPct / 100));
         money = round2((discountedSubtotal * p) / (100 - p));
       }
     } else {
@@ -18360,6 +18478,8 @@ function methodTotalsOf(bills: SettledBill[]): Map<string, number> {
 
 export interface ReconciliationRow {
   method: string;
+  /** Display name from Settings > Payments. Saves still key on `method`. */
+  label?: string;
   expected: number;
   actual: number | null;
   status: "matched" | "variance" | null;
@@ -18408,10 +18528,12 @@ export async function GetReconciliation(
     savedByMethod.set(r.method, cur);
   }
   const methods = new Set<string>([...expected.keys(), ...savedByMethod.keys()]);
+  const labelOf = await paymentLabelsFor(context);
   const rows: ReconciliationRow[] = [...methods].map((method): ReconciliationRow => {
     const s = savedByMethod.get(method);
     return {
       method,
+      label: labelOf(method),
       expected: round2(expected.get(method) ?? 0),
       actual: s ? s.actual : null,
       status: s ? (s.matched ? "matched" : "variance") : null,
@@ -19489,7 +19611,9 @@ export async function AddBill(
             emp_id = $2,
             status = $3,
             reason = $4,
-            tax_breakdown = $5
+            tax_breakdown = $5,
+            -- A client-written total carries no recorded round-off (048).
+            round_off = null
         where id = $6 and res_id = $7 and outlet_id = $8
       `,
       [
@@ -19521,6 +19645,7 @@ export async function AddBill(
         reason = excluded.reason,
         total_amt = excluded.total_amt,
         tax_breakdown = excluded.tax_breakdown,
+        round_off = null,
         bill_no = "Bills".bill_no -- preserve original bill_no on updates
     `,
     [
@@ -19541,7 +19666,72 @@ export async function AddBill(
   return { id };
 }
 
+/**
+ * "Bills".round_off (migration 048) — what rounded the settled total to the
+ * rupee. Mirrors migrations/048_bill_round_off.sql, the idiom 040 documents.
+ *
+ * THIS CODE SHIPS BEFORE THE MIGRATION IS APPLIED. Applying one is a manual,
+ * root-only step on the VPS, and Gate B cannot see a migration that arrives in
+ * the same push — so for some window production runs readers that select
+ * b.round_off against a table that may not have it, and "column does not exist"
+ * on the settled-bill list is the Accounting screen, the MIS pack and the
+ * overview all failing at once. Three layers, so no single one has to be right:
+ *
+ *   1. index.ts's bootstrap runs this ONCE, before the listener, outside any
+ *      transaction. That is the one run that cannot be rolled back: DDL is
+ *      transactional in Postgres, and if the FIRST run in a process happened
+ *      inside a settle that later threw, the column would vanish with the
+ *      rollback while ensureLazyTable's memo went on believing it exists.
+ *   2. ensureBillWorkflowColumns awaits it, so every reader that already awaits
+ *      that (which every settled-bill reader does) gets it for free.
+ *   3. Every writer that resets round_off awaits THIS one directly rather than
+ *      the whole workflow group — those are hot order paths (AddOrder, item
+ *      moves, comps), and the group's seventeen ACCESS EXCLUSIVE ALTERs are not
+ *      something to trigger from the middle of a service. A memo hit costs a Set
+ *      lookup. jest-tests/bill_round_off_wiring.test.ts enumerates all of them.
+ *
+ * NUMERIC(12,2), NULLABLE, NO DEFAULT, NO BACKFILL. NULL means "settled before
+ * rounding existed", which every reader reads as 0 — true of every one of those
+ * bills, so none of their ladders, reports or reprints move by a paisa.
+ */
+async function ensureBillRoundOffColumn(client?: PoolClient): Promise<void> {
+  await ensureLazyTable("Bills.round_off", async () => {
+    await runQuery(`alter table "Bills" add column if not exists round_off numeric(12,2)`, [], client);
+  });
+}
+
+/**
+ * Boot-time half of ensureBillRoundOffColumn — see its header. Never throws: a
+ * boot step that fails leaves the key un-memoised, and the lazy calls retry.
+ */
+export async function InitBillRoundOffSchema(): Promise<boolean> {
+  try {
+    await ensureBillRoundOffColumn();
+    // ensureLazyTable treats a refused ALTER (42501, a least-privilege runtime)
+    // as "the migration owns this" and records success. 048 may not be applied
+    // yet, so CHECK rather than assume: a missing column makes every settle and
+    // every settled-bill reader fail, and must be loud at boot, not a quiet ✅.
+    const present = await runQuery<{ ok: boolean }>(
+      `select exists (select 1 from information_schema.columns
+                       where table_schema = 'public' and table_name = 'Bills' and column_name = 'round_off') as ok`,
+    );
+    if (present[0]?.ok !== true) {
+      ddlEnsured.delete("Bills.round_off");
+      logger.error("Bills.round_off is MISSING and could not be added by this role — apply migration 048 before bills are settled");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.warn({ err }, "bill_round_off_boot_ensure_failed — the lazy ensure will retry on first use");
+    return false;
+  }
+}
+
 async function ensureBillWorkflowColumns(client?: PoolClient): Promise<void> {
+  // Migration 048's column, under its OWN memo key rather than inside the group
+  // below, so the boot step and the hot writers can ensure that one ALTER
+  // without dragging the other seventeen along.
+  await ensureBillRoundOffColumn(client);
   // Run the 17 ALTERs at most ONCE per process (ACCESS EXCLUSIVE locks on the
   // hot Bills table) and tolerate a non-owner (app_runtime) 42501 post-cutover.
   await ensureLazyTable("Bills.workflow_cols", async () => {
@@ -20534,15 +20724,26 @@ async function updateOrderWorkflowStatus(
 // Validate a split-tender payload: 2-6 rows of {method, amount} using REAL
 // methods (no nested 'Split'), positive amounts. Sum is checked against the
 // bill's grand total later (once it is known).
-function normalizePaymentSplits(raw: unknown): { method: PaymentMethod; amount: number }[] {
+//
+// Each part's method is resolved against the tenant's config, so a custom mode
+// is a valid part and a disabled one is refused — unless the parts are the
+// mirror of tenders already recorded on the bill (`mirrorsLedger`), which must
+// still settle after the owner switches a mode off. See paymentMethodRefusal.
+function normalizePaymentSplits(
+  raw: unknown,
+  config: readonly PaymentMethodConfig[],
+  opts: { mirrorsLedger?: boolean } = {},
+): { method: PaymentMethod; amount: number }[] {
   if (!Array.isArray(raw) || raw.length === 0) {return [];}
   if (raw.length < 2 || raw.length > 6) {throw new Error("A split payment needs between 2 and 6 parts");}
   return raw.map((s) => {
     const o = (s ?? {}) as Record<string, unknown>;
-    const method = normalizePaymentMethod(o.method);
+    const method = resolvePaymentMethod(o.method, config)?.id ?? null;
     if (!method || method === "Split" || method === "Razorpay") {
       throw new Error(`Invalid split payment method: ${String(o.method ?? "")}`);
     }
+    const refusal = paymentMethodRefusal(method, config, opts);
+    if (refusal) {throw new Error(refusal);}
     const amount = round2(Number(o.amount) || 0);
     if (amount <= 0) {throw new Error("Every split part needs an amount greater than zero");}
     return { method, amount };
@@ -20556,24 +20757,48 @@ export async function ConfirmBillPaymentByWaiter(
   paymentMethodRaw: string,
   paymentProofScreenshotUrlRaw?: string | null,
   splitsRaw?: unknown,
+  // TRUE ONLY WHEN the method/splits are the mirror of tenders already on the
+  // bill (routes/bills.ts sets it on its two ledger paths). A bill part-paid in
+  // a mode the owner has since switched off must still close; a NEW settle in
+  // that mode must not happen.
+  opts: { mirrorsLedger?: boolean } = {},
 ): Promise<{ success: true; payment_method: PaymentMethod; splits?: { method: PaymentMethod; amount: number }[] }> {
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
-    const splits = normalizePaymentSplits(splitsRaw);
-    const paymentMethod = splits.length > 0 ? ("Split" as PaymentMethod) : normalizePaymentMethod(paymentMethodRaw);
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const splits = normalizePaymentSplits(splitsRaw, paymentConfig, opts);
+    const paymentMethod = splits.length > 0
+      ? ("Split" as PaymentMethod)
+      : (resolvePaymentMethod(paymentMethodRaw, paymentConfig)?.id ?? null);
     if (!paymentMethod) {
       throw new Error("Invalid payment method");
     }
     if (paymentMethod === "Split" && splits.length === 0) {
       throw new Error("A split payment needs its parts ({method, amount} rows)");
     }
+    if (paymentMethod !== "Split") {
+      const refusal = paymentMethodRefusal(paymentMethod, paymentConfig, opts);
+      if (refusal) {throw new Error(refusal);}
+    }
 
-    const requiresProof = paymentRequiresProof(paymentMethod);
+    // The screenshot rule is the CONFIG's now (Settings > Payments), not a
+    // compiled-in list; a tenant with no config gets the old four exactly.
+    //
+    // A SPLIT SENT AS PARTS answers to its parts' rules: 'Split' itself needs no
+    // screenshot, so without this a Zomato part rode through on Cash 1 + Zomato
+    // 999. NOT when the parts mirror the tender ledger — those are payments
+    // already recorded (POST /bills/tenders carries no screenshot; the app's
+    // settle sheet asks for one per part as it composes them), and refusing the
+    // settle here would strand money already taken on an open bill.
+    const proofParts = splits.length > 0 && opts.mirrorsLedger !== true
+      ? splitPartsNeedingProof(splits, paymentConfig)
+      : [];
+    const requiresProof = methodRequiresProof(paymentMethod, paymentConfig) || proofParts.length > 0;
     const paymentProofScreenshotUrl =
       typeof paymentProofScreenshotUrlRaw === "string" ? paymentProofScreenshotUrlRaw.trim() : "";
     if (requiresProof && !paymentProofScreenshotUrl) {
-      throw new Error("Payment proof screenshot is required for Dineout, Zomato, EasyDiner or District");
+      throw new Error(`Payment proof screenshot is required for ${proofParts.length > 0 ? proofParts.join(", ") : paymentMethodLabel(paymentMethod, paymentConfig)}`);
     }
 
     const waiter = await resolveEmployeeByUsername(context, waiterEmployeeId, client);
@@ -20663,6 +20888,8 @@ export async function ConfirmBillPaymentByWaiter(
             total_amt = $7,
             tax_breakdown = $8::jsonb,
             payment_splits = $9::jsonb,
+            -- Migration 048: the round-off that belongs to $7, written with it.
+            round_off = $10,
             status = 1
         where
           id = $4
@@ -20681,6 +20908,7 @@ export async function ConfirmBillPaymentByWaiter(
         charges.grand_total,
         taxJsonNow,
         splits.length > 0 ? JSON.stringify(splits) : null,
+        charges.round_off,
       ],
       client,
     );
@@ -20708,13 +20936,22 @@ export async function SubmitCustomerPayment(
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
-    const paymentMethod = normalizePaymentMethod(paymentMethodRaw);
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const resolved = resolvePaymentMethod(paymentMethodRaw, paymentConfig);
+    const paymentMethod = resolved?.id ?? null;
     // 'Split' is staff-only (needs the per-mode breakdown) — never a QR option.
     if (!paymentMethod || paymentMethod === "Split") {throw new Error("Invalid payment method");}
+    // A guest may only pay in a mode that is on AND offered on the QR page. The
+    // route checks this too; checking it here is what keeps a custom mode the
+    // owner added for the till (show_to_guests off by default) off the guest
+    // path whoever calls this.
+    if (!resolved?.entry || !resolved.entry.enabled || resolved.entry.show_to_guests === false) {
+      throw new Error("This payment method isn't accepted here.");
+    }
     const screenshotUrl = typeof screenshotUrlRaw === "string" ? screenshotUrlRaw.trim() : "";
     // Screenshot requirement is config-driven when an override is supplied,
-    // otherwise falls back to the built-in proof-method defaults.
-    const requiresProof = typeof requireScreenshotOverride === "boolean" ? requireScreenshotOverride : paymentRequiresProof(paymentMethod);
+    // otherwise the tenant's own config (which carries the built-in defaults).
+    const requiresProof = typeof requireScreenshotOverride === "boolean" ? requireScreenshotOverride : methodRequiresProof(paymentMethod, paymentConfig);
     if (requiresProof && !screenshotUrl) {
       throw new Error("A payment screenshot is required for this method.");
     }
@@ -20752,7 +20989,7 @@ export async function SubmitCustomerPayment(
     // waiver is honoured on this path exactly as it is on the bill view.
     const chargeCfg = await openBillChargeConfig(context, tableId, client);
     const billDiscount = await getOpenBillDiscount(context, tableId, client);
-    const { taxes, grand_total } = computeBillCharges(subtotal, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, billDiscount);
+    const { taxes, grand_total, round_off } = computeBillCharges(subtotal, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, billDiscount);
     const total = grand_total;
     const taxJson = JSON.stringify(taxes);
 
@@ -20779,9 +21016,10 @@ export async function SubmitCustomerPayment(
       `update "Bills" set
          total_amt = $1, tax_breakdown = $2::jsonb, payment_method = $3, payment_proof_screenshot_url = $4,
          waiter_confirmed_at = now(), waiter_confirmed_by_username = 'customer',
-         admin_approved_at = null, admin_approved_by_username = null, closed_at = null, status = 1
+         admin_approved_at = null, admin_approved_by_username = null, closed_at = null, status = 1,
+         round_off = $8
        where id = $5 and res_id = $6 and outlet_id = $7 and status <> 3`,
-      [total, taxJson, paymentMethod, screenshotUrl || null, billId, context.res_id, context.outlet_id],
+      [total, taxJson, paymentMethod, screenshotUrl || null, billId, context.res_id, context.outlet_id, round_off],
       client,
     );
 
@@ -20850,12 +21088,16 @@ export async function ApproveBillPaymentByAdmin(
       throw new Error("Bill not found");
     }
 
-    const billPaymentMethod = normalizePaymentMethod(bill.payment_method);
-    const requiresProof = paymentRequiresProof(billPaymentMethod);
+    // Approval never refuses a DISABLED mode: the money was taken when the
+    // waiter confirmed it, and switching a mode off afterwards must not strand
+    // the bill. It does still demand the screenshot the config asks for.
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const billPaymentMethod = displayPaymentMethod(bill.payment_method);
+    const requiresProof = methodRequiresProof(billPaymentMethod, paymentConfig);
     const hasProof =
       typeof bill.payment_proof_screenshot_url === "string" && bill.payment_proof_screenshot_url.trim().length > 0;
     if (requiresProof && !hasProof) {
-      throw new Error("Payment proof screenshot is required before approval for Dineout, Zomato, EasyDiner or District");
+      throw new Error(`Payment proof screenshot is required before approval for ${paymentMethodLabel(billPaymentMethod, paymentConfig)}`);
     }
 
     // Re-price at approval time. Any bill edit landing between waiter-confirm and
@@ -20914,7 +21156,9 @@ export async function ApproveBillPaymentByAdmin(
             admin_approved_by_username = $1,
             status = 2,
             total_amt = $5,
-            tax_breakdown = $6::json
+            tax_breakdown = $6::json,
+            -- Migration 048: re-priced with the total, so re-rounded with it.
+            round_off = $7
         where
           table_id = $2
           and res_id = $3
@@ -20927,7 +21171,7 @@ export async function ApproveBillPaymentByAdmin(
         returning id
       `,
       [admin.username, tableId, context.res_id, context.outlet_id,
-        chargesAtApproval.grand_total, JSON.stringify(chargesAtApproval.taxes)],
+        chargesAtApproval.grand_total, JSON.stringify(chargesAtApproval.taxes), chargesAtApproval.round_off],
       client,
     );
 
@@ -21349,7 +21593,7 @@ export async function FinalizeOnlinePayment(
     // waiver is honoured on this path exactly as it is on the bill view.
     const chargeCfg = await openBillChargeConfig(context, tableId, client);
     const billDiscount = await getOpenBillDiscount(context, tableId, client);
-    const { taxes, grand_total } = computeBillCharges(subtotal, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, billDiscount);
+    const { taxes, grand_total, round_off } = computeBillCharges(subtotal, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, billDiscount);
     const total = grand_total;
     const taxJson = JSON.stringify(taxes);
 
@@ -21385,9 +21629,10 @@ export async function FinalizeOnlinePayment(
          total_amt = $1, tax_breakdown = $2::jsonb, payment_method = 'Razorpay', payment_proof_screenshot_url = $3,
          waiter_confirmed_at = now(), waiter_confirmed_by_username = 'razorpay',
          admin_approved_at = now(), admin_approved_by_username = 'razorpay',
-         closed_at = now(), closed_by_username = 'razorpay', status = 2
+         closed_at = now(), closed_by_username = 'razorpay', status = 2,
+         round_off = $7
        where id = $4 and res_id = $5 and outlet_id = $6`,
-      [total, taxJson, paymentRef, billId, context.res_id, context.outlet_id],
+      [total, taxJson, paymentRef, billId, context.res_id, context.outlet_id, round_off],
       client,
     );
     // Loyalty earn on settle — best-effort, never fails the payment.
@@ -21736,9 +21981,11 @@ export async function ReplaceBill(
       // if empId not resolved, keep existing emp_id
       if (!empId) {empId = oldBillRow.emp_id ?? null;}
 
-      // update existing bill row in-place
+      // update existing bill row in-place. A client-written total carries no
+      // recorded round-off (migration 048), so any earlier one is cleared.
+      await ensureBillRoundOffColumn(client);
       await runQuery(
-        `update "Bills" set total_amt = $1, tax_breakdown = $2, emp_id = $3, reason = $4, table_id = $5 where id = $6 and res_id = $7 and outlet_id = $8`,
+        `update "Bills" set total_amt = $1, tax_breakdown = $2, emp_id = $3, reason = $4, table_id = $5, round_off = null where id = $6 and res_id = $7 and outlet_id = $8`,
         [
           payload.new_bill.total_amt ?? 0,
           payload.new_bill.tax_breakdown ? JSON.stringify(payload.new_bill.tax_breakdown) : null,
@@ -24731,8 +24978,8 @@ export async function GetStaffPerformance(restaurantId: string, days: AnalyticsW
     // "TableSessions", never on "Bills" — and outlet_id is NULLABLE there (unlike
     // Bills/Orders), so a strict equality guard would silently drop every session
     // written without one.
-    runQuery<{ emp_id: string | null; total_amt: string; tax_breakdown: unknown; session_id: string | null; covers: string | null }>(
-      `select b.emp_id, b.total_amt::text, b.tax_breakdown, s.session_id, s.covers::text
+    runQuery<{ emp_id: string | null; total_amt: string; tax_breakdown: unknown; round_off: string | null; session_id: string | null; covers: string | null }>(
+      `select b.emp_id, b.total_amt::text, b.tax_breakdown, b.round_off::text, s.session_id, s.covers::text
          from "Bills" b
          left join lateral (
            select ts.id as session_id, greatest(1, coalesce(ts.covers, 1)) as covers
@@ -24793,7 +25040,7 @@ export async function GetStaffPerformance(restaurantId: string, days: AnalyticsW
     if (sessionId) { acc.sessions.set(sessionId, covers); }
   };
   for (const b of billRows) {
-    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct);
+    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct, parseNumeric(b.round_off));
     const covers = Math.max(1, Math.round(parseNumeric(b.covers)));
     // A bill with no resolvable seating contributes to NEITHER side of the
     // division. Counting its money without its covers would inflate APC for
@@ -25781,8 +26028,8 @@ export async function GetSimulationRawStats(restaurantId: string): Promise<Simul
 
   // Settled bills in the window (same settle predicate as getSettledBills) with
   // the covers of the seating each bill closed.
-  const billRows = await runQuery<{ total_amt: number | string | null; tax_breakdown: unknown; covers: number }>(
-    `select b.total_amt, b.tax_breakdown, coalesce(s.covers, 1)::int as covers
+  const billRows = await runQuery<{ total_amt: number | string | null; tax_breakdown: unknown; round_off: number | string | null; covers: number }>(
+    `select b.total_amt, b.tax_breakdown, b.round_off, coalesce(s.covers, 1)::int as covers
        from "Bills" b
        left join lateral (
          select ts.covers
@@ -25801,7 +26048,7 @@ export async function GetSimulationRawStats(restaurantId: string): Promise<Simul
   );
   let pretaxTotal = 0, coversTotal = 0;
   for (const b of billRows) {
-    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct);
+    const charges = closedBillCharges(round2(parseNumeric(b.total_amt)), parseTaxLines(b.tax_breakdown), scPct, parseNumeric(b.round_off));
     pretaxTotal = round2(pretaxTotal + Math.max(0, charges.taxable_base));
     coversTotal += Math.max(1, Math.round(parseNumeric(b.covers)) || 1);
   }
@@ -27231,33 +27478,8 @@ export async function MarkBookingReminderSent(
   return true;
 }
 
-export interface PaymentMethodConfig { id: string; label: string; enabled: boolean; requires_screenshot: boolean; online?: boolean }
-
-// Default payment methods. Razorpay (online) on by default; alternate methods
-// 4–7 require a screenshot by default. Restaurants override via settings.
-export const DEFAULT_PAYMENT_METHODS: PaymentMethodConfig[] = [
-  { id: "Razorpay", label: "Pay online (Razorpay)", enabled: true, requires_screenshot: false, online: true },
-  { id: "Upi", label: "UPI", enabled: true, requires_screenshot: false },
-  { id: "Cash", label: "Cash", enabled: true, requires_screenshot: false },
-  { id: "Card", label: "Card", enabled: true, requires_screenshot: false },
-  { id: "Dineout", label: "Dineout", enabled: true, requires_screenshot: true },
-  { id: "Zomato", label: "Zomato", enabled: true, requires_screenshot: true },
-  { id: "Eazydiner", label: "EasyDiner", enabled: true, requires_screenshot: true },
-  { id: "District", label: "District", enabled: true, requires_screenshot: true },
-];
-
-function mergePaymentConfig(stored: unknown): PaymentMethodConfig[] {
-  const byId = new Map<string, Record<string, unknown>>();
-  if (Array.isArray(stored)) {for (const m of stored) { const id = String((m)?.id ?? ""); if (id) {byId.set(id, m);} }}
-  return DEFAULT_PAYMENT_METHODS.map((def) => {
-    const ov = byId.get(def.id);
-    return {
-      ...def,
-      enabled: ov && typeof ov.enabled === "boolean" ? ov.enabled : def.enabled,
-      requires_screenshot: ov && typeof ov.requires_screenshot === "boolean" ? ov.requires_screenshot : def.requires_screenshot,
-    };
-  });
-}
+// PaymentMethodConfig, DEFAULT_PAYMENT_METHODS and mergePaymentConfig moved to
+// payment_methods.ts (imported and re-exported at the top of this file).
 
 // --- Customer feedback form configuration -----------------------------------
 export interface FeedbackCategoryConfig { key: string; label: string }
@@ -27646,7 +27868,25 @@ export async function SetRestaurantSettings(
   // bill_paper_width: only '58mm' or '80mm' accepted; null leaves it unchanged.
   const billPaperWidth = opts.bill_paper_width === "58mm" || opts.bill_paper_width === "80mm" ? opts.bill_paper_width : null;
   const currency = typeof opts.currency === "string" && opts.currency.trim() ? opts.currency.trim().slice(0, 8) : null;
-  const paymentConfig = Array.isArray(opts.payment_methods) ? JSON.stringify(mergePaymentConfig(opts.payment_methods)) : null;
+  // PAYMENT MODES: a save is a MERGE against what is stored
+  // (planPaymentConfigSave), which is what stops a client that never heard of a
+  // mode from erasing it. Merging needs the stored value, so the row is read
+  // `for update`: two editors saving at once take turns instead of each merging
+  // against the same stale copy and the second silently dropping the first one's
+  // new mode.
+  //
+  // The read, the plan and the write run in ONE transaction WITH the settings
+  // update below ($4), not in a transaction of their own ahead of it. Written
+  // separately, a failure of the big update answered 500 "Unable to save
+  // settings" while the payment change was already live — and the route writes
+  // the audit entry and its undo only after this function resolves, so that
+  // change had neither.
+  //
+  // Refused out loud: an invalid save throws PaymentConfigError before anything
+  // is written, and the route answers 400 with its sentences. The old merge
+  // dropped an unknown entry and answered 200, which is how "there is no option
+  // to add a payment mode" looked from the owner's side.
+  const incomingPaymentMethods = Array.isArray(opts.payment_methods) ? opts.payment_methods : null;
   // key_id: set when a string is provided (empty string clears it).
   const razorpayKeyId = typeof opts.razorpay_key_id === "string" ? opts.razorpay_key_id.trim().slice(0, 80) : null;
   // key_secret: only overwrite when a non-empty value is sent (blank = keep current).
@@ -27732,7 +27972,7 @@ export async function SetRestaurantSettings(
   const billLegalName = opts.bill_legal_name !== undefined ? sanitizeBillHeaderField(opts.bill_legal_name) : null;
   const billGstin = opts.bill_gstin !== undefined ? sanitizeBillHeaderField(opts.bill_gstin) : null;
   const billQrNote = opts.bill_qr_note !== undefined ? sanitizeBillQrNote(opts.bill_qr_note) : null;
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; bill_show_qr: boolean | null; theme_color: string | null; brand_config: unknown }>(
+  const updateSettingsRow = (paymentConfig: string | null, client: PoolClient) => runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; bill_show_qr: boolean | null; theme_color: string | null; brand_config: unknown }>(
     `update "Restaurant" set
        auto_push_orders = coalesce($2, auto_push_orders),
        currency = coalesce($3, currency),
@@ -27773,7 +28013,7 @@ export async function SetRestaurantSettings(
       context.res_id,
       typeof opts.auto_push_orders === "boolean" ? opts.auto_push_orders : null,
       currency,
-      paymentConfig,
+      paymentConfig, // null = unchanged; see incomingPaymentMethods
       razorpayKeyId,
       razorpayKeySecret,
       serviceCharge,
@@ -27805,7 +28045,22 @@ export async function SetRestaurantSettings(
       kotAutoPrint,
       billShowQr,
     ],
+    client,
   );
+  const rows = await withTransaction(async (client) => {
+    let paymentConfig: string | null = null;
+    if (incomingPaymentMethods) {
+      const current = await runQuery<{ payment_config: unknown }>(
+        `select payment_config from "Restaurant" where id = $1 limit 1 for update`,
+        [context.res_id],
+        client,
+      );
+      const plan = planPaymentConfigSave(incomingPaymentMethods, current[0]?.payment_config ?? null);
+      if (!plan.ok) {throw new PaymentConfigError(plan.errors);}
+      paymentConfig = JSON.stringify(plan.config);
+    }
+    return updateSettingsRow(paymentConfig, client);
+  });
   // First messaging save: mint the webhook secret (Meta hub.verify_token +
   // X-Hub-Signature-256 app secret) so the owner has something to paste into
   // the Meta console without a separate "generate" step.
@@ -28023,8 +28278,10 @@ export async function GetPublicBranding(
     theme_primary: palette?.primary ?? null,
     theme_secondary: palette?.secondary ?? null,
     currency: (rows[0]?.currency && String(rows[0].currency).trim()) || "₹",
-    // Only enabled methods are exposed to customers; include the screenshot flag.
-    payment_methods: mergePaymentConfig(rows[0]?.payment_config).filter((m) => m.enabled),
+    // Only modes that are on AND offered to guests are exposed to customers;
+    // include the screenshot flag. A custom mode the owner added for the till
+    // defaults to show_to_guests: false, so adding one never surprises a guest.
+    payment_methods: mergePaymentConfig(rows[0]?.payment_config).filter((m) => m.enabled && m.show_to_guests !== false),
     restaurant_name: rows[0]?.res_name ?? context.restaurant_name ?? "",
     feedback_config: mergeFeedbackConfig(rows[0]?.feedback_config),
     // SVG bill logo for the customer-facing digital bill (crisp at any size).
@@ -29230,7 +29487,7 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
 
   return {
     ...row,
-    payment_method: normalizePaymentMethod(row.payment_method),
+    payment_method: displayPaymentMethod(row.payment_method),
     payment_proof_screenshot_url:
       typeof row.payment_proof_screenshot_url === "string" ? row.payment_proof_screenshot_url : null,
     waiter_confirmed_at: row.waiter_confirmed_at ? new Date(row.waiter_confirmed_at).toISOString() : null,
@@ -34450,7 +34707,7 @@ const NOTE_COVERS_ONCE =
 const NOTE_PER_COVER_PRETAX =
   "Per-cover figures are PRE-TAX (net of discount, before service charge and tax) — the house APC convention. Average bill value is the tax-inclusive grand total.";
 const NOTE_ROUND_OFF =
-  "Round off is always 0: no bill field records a rounding adjustment, so the ladder closes exactly.";
+  "Round off is what rounded each bill to the rupee (recorded at settle). It sits inside the grand total and outside net sales, service charge and tax; bills settled before rounding carry 0.";
 const NOTE_DISCOUNT_ESTIMATE =
   "A discount stored as a percentage did not have its money value snapshotted; it is reconstructed from the settled total. Those bills are counted in estimated_discount_bills.";
 
@@ -34706,6 +34963,8 @@ interface MisBillRow {
   settled_at: Date | string;
   total_amt: number | string | null;
   tax_breakdown: unknown;
+  /** Migration 048. The ladder's round_off rung. NULL (settled before rounding) is 0. */
+  round_off: number | string | null;
   payment_method: string | null;
   payment_splits: unknown;
   discount_type: string | null;
@@ -34755,7 +35014,7 @@ async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
   return runQuery<MisBillRow>(
     `select b.id, b.bill_no::text as bill_no, b.outlet_id,
             coalesce(b.closed_at, b.admin_approved_at) as settled_at,
-            b.total_amt, b.tax_breakdown, b.payment_method, b.payment_splits,
+            b.total_amt, b.tax_breakdown, b.round_off, b.payment_method, b.payment_splits,
             b.discount_type, b.discount_value, b.coupon_code,
             coalesce(b.refund_amount, 0) as refund_amount,
             s.session_id, s.covers as session_covers
@@ -34787,7 +35046,7 @@ interface MisBill {
 function composeMisBills(rows: MisBillRow[], scPct: number, tz: string): MisBill[] {
   return rows.map((row) => {
     const grand = round2(parseNumeric(row.total_amt));
-    const charges = closedBillCharges(grand, parseTaxLines(row.tax_breakdown), scPct);
+    const charges = closedBillCharges(grand, parseTaxLines(row.tax_breakdown), scPct, parseNumeric(row.round_off));
     const clock = zonedClockParts(row.settled_at, tz);
     return {
       row,
@@ -35233,7 +35492,7 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
   params.push(page.offset); const offIdx = `$${String(params.length)}`;
   const rows = await runQuery<{
     id: string; bill_no: string | null; settled_at: Date | string; table_name: string | null;
-    total_amt: number | string | null; tax_breakdown: unknown;
+    total_amt: number | string | null; tax_breakdown: unknown; round_off: number | string | null;
     discount_type: string | null; discount_value: number | string | null;
     coupon_code: string | null; reason: string | null;
     refund_amount: number | string | null;
@@ -35241,7 +35500,7 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
   }>(
     `select b.id, b.bill_no::text as bill_no,
             coalesce(b.closed_at, b.admin_approved_at) as settled_at,
-            t.table_name, b.total_amt, b.tax_breakdown,
+            t.table_name, b.total_amt, b.tax_breakdown, b.round_off,
             b.discount_type, b.discount_value, b.coupon_code, b.reason,
             coalesce(b.refund_amount, 0) as refund_amount,
             d.requested_by, d.decided_by
@@ -35264,7 +35523,7 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
 
   const out: DiscountReportRow[] = rows.map((r) => {
     const grand = round2(parseNumeric(r.total_amt));
-    const charges = closedBillCharges(grand, parseTaxLines(r.tax_breakdown), scPct);
+    const charges = closedBillCharges(grand, parseTaxLines(r.tax_breakdown), scPct, parseNumeric(r.round_off));
     const money = composeBillMoney({
       grand_total: grand,
       charges,
@@ -35901,6 +36160,7 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
   const rows = await runQuery<{
     id: string; bill_no: string | null; settled_at: Date | string; status: number | string | null;
     table_name: string | null; total_amt: number | string | null; tax_breakdown: unknown;
+    round_off: number | string | null;
     payment_method: string | null; discount_type: string | null; discount_value: number | string | null;
     refund_amount: number | string | null; session_covers: number | null;
     emp_fname: string | null; emp_lname: string | null;
@@ -35908,7 +36168,7 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
   }>(
     `select b.id, b.bill_no::text as bill_no,
             coalesce(b.closed_at, b.admin_approved_at) as settled_at,
-            b.status, t.table_name, b.total_amt, b.tax_breakdown, b.payment_method,
+            b.status, t.table_name, b.total_amt, b.tax_breakdown, b.round_off, b.payment_method,
             b.discount_type, b.discount_value, coalesce(b.refund_amount, 0) as refund_amount,
             s.covers as session_covers,
             e."emp_Fname" as emp_fname, e."emp_Lname" as emp_lname,
@@ -35927,7 +36187,7 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
 
   const out: OrderSummaryRow[] = rows.map((r) => {
     const grand = round2(parseNumeric(r.total_amt));
-    const charges = closedBillCharges(grand, parseTaxLines(r.tax_breakdown), scPct);
+    const charges = closedBillCharges(grand, parseTaxLines(r.tax_breakdown), scPct, parseNumeric(r.round_off));
     const money = composeBillMoney({
       grand_total: grand,
       charges,
@@ -36291,15 +36551,12 @@ export async function GetCoverSizeSummaryReport(restaurantId: string, q: MisRepo
 
 // --- 9. Settlement Summary ---------------------------------------------------
 
-export interface SettlementRow {
-  method: string;
-  /** Bills that touched this mode. A split bill counts under each mode it used. */
-  bills: number;
-  amount: number;
-  share_pct: number | null;
-  refund: number;
-  net_amount: number;
-}
+/**
+ * One mode's line. Built by settlementByMethod (mis_report_math.ts); `label` is
+ * the owner's display name from Settings > Payments, attached here — rows still
+ * group by `method`, the stored id.
+ */
+export type SettlementRow = SettlementMethodRow & { label?: string };
 
 export interface SettlementSummaryReport {
   meta: MisReportMeta;
@@ -36318,7 +36575,10 @@ export interface SettlementSummaryReport {
 }
 
 const SETTLEMENT_COLUMNS: MisColumn[] = [
-  { key: "method", label: "Payment mode", type: "text" },
+  // `label`, not `method`: the column a person reads (on screen and in the CSV)
+  // is the owner's name for the mode, the one the till shows. Rows still group,
+  // and carry `method`, by the stored id.
+  { key: "label", label: "Payment mode", type: "text" },
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "amount", label: "Collected", type: "money", total: true },
   { key: "share_pct", label: "% of takings", type: "percent" },
@@ -36352,41 +36612,27 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
   const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
 
-  const acc = new Map<string, { bills: number; amount: number; refund: number }>();
-  let splitBills = 0;
-  let unallocated = 0;
-  for (const b of bills) {
-    const parts = allocateSettlement(
-      b.money.grand_total,
-      b.row.payment_method,
-      parsePaymentSplits(b.row.payment_splits),
-    );
-    if (parts.length > 1) {splitBills += 1;}
-    for (const p of parts) {
-      if (p.method === UNALLOCATED_METHOD) {unallocated = round2(unallocated + p.amount);}
-      const e = acc.get(p.method) ?? { bills: 0, amount: 0, refund: 0 };
-      e.bills += 1;
-      e.amount = round2(e.amount + p.amount);
-      // A refund has no mode of its own, so it follows the money: each part
-      // carries its share of the bill's refund.
-      if (b.money.refund > 0 && b.money.grand_total > 0) {
-        e.refund = round2(e.refund + (b.money.refund * p.amount) / b.money.grand_total);
-      }
-      acc.set(p.method, e);
-    }
-  }
-
-  const totalAmount = round2([...acc.values()].reduce((s, v) => s + v.amount, 0));
-  const rows: SettlementRow[] = [...acc.entries()]
-    .map(([method, v]) => ({
-      method,
-      bills: v.bills,
-      amount: v.amount,
-      share_pct: sharePct(v.amount, totalAmount),
-      refund: round2(v.refund),
-      net_amount: round2(v.amount - v.refund),
-    }))
-    .sort((a, z) => z.amount - a.amount);
+  // The cut itself lives in mis_report_math.ts so the Overview headline's
+  // "today by payment method" block is this same computation, not a copy of it.
+  const {
+    rows: methodRows, split_bills: splitBills, unallocated, total_amount: totalAmount,
+  } = settlementByMethod(bills.map((b) => ({
+    grand_total: b.money.grand_total,
+    refund: b.money.refund,
+    payment_method: b.row.payment_method,
+    splits: parsePaymentSplits(b.row.payment_splits),
+  })));
+  // The owner's name for each mode rides beside the id it groups by.
+  const labelOf = await paymentLabelsFor(mc.context);
+  const rows: SettlementRow[] = methodRows.map((r) => ({
+    method: r.method,
+    label: labelOf(r.method),
+    bills: r.bills,
+    amount: r.amount,
+    share_pct: r.share_pct,
+    refund: r.refund,
+    net_amount: r.net_amount,
+  }));
 
   const ladder = misLadder(bills);
   return {
@@ -36445,6 +36691,11 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
 //           this must never produce.
 //   MTD   = gross, from the 1st of the CURRENT MONTH in the restaurant's own zone
 //           up to and including today.
+//   BY METHOD = today's settlement cut by payment mode — settlementByMethod, the
+//           Settlement Summary's own computation, over today's bills only. CASH
+//           above is READ OFF these rows rather than summed beside them, so the
+//           Cash row and the Cash collection tile are the same number by
+//           construction, not by two loops that happen to agree.
 //
 // ----------------------------------------------------------------------------
 // ONE READ, NOT SIX
@@ -36480,6 +36731,35 @@ export interface OverviewHeadline {
   /** Bills behind the day's figures, so an empty day reads as empty, not as zero. */
   today_bills: number;
   month_bills: number;
+  /**
+   * Today's takings by payment mode — the Settlement Summary's rows for today.
+   * Σ amount === today_gross.value. A mode with no money and no refund (a
+   * released ₹0 table under Other) is left out; it moves no total. The
+   * Unallocated row never is: its `bills` is how many bills need looking at,
+   * even when their residuals net to ₹0.00.
+   */
+  today_by_method: SettlementRow[];
+  /**
+   * Today's bills paid by more than one REAL mode — settlementByMethod's
+   * multi_method_bills, NOT the Settlement Summary's split_bills. Both clients
+   * print this as "paid across more than one method", and a 'Split' bill whose
+   * only other part is the Unallocated residual was paid one way: that bill is
+   * the Unallocated row's, and its warning, not this sentence.
+   */
+  today_split_bills: number;
+  /**
+   * Today's money whose split parts did not add back to the bill, NETTED across
+   * bills. Should be 0 — but 0 does not prove it: read the Unallocated row.
+   */
+  today_unallocated: number;
+  /** The block's own label and definition, server-authored like every figure. */
+  by_method: HeadlineSection;
+}
+
+/** A labelled group of rows on the headline card. */
+export interface HeadlineSection {
+  label: string;
+  hint: string;
 }
 
 interface HeadlineBillRow extends MisBillRow {
@@ -36522,7 +36802,7 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   const rows = await runQuery<HeadlineBillRow>(
     `select b.id, b.bill_no::text as bill_no, b.outlet_id,
             coalesce(b.closed_at, b.admin_approved_at) as settled_at,
-            b.total_amt, b.tax_breakdown, b.payment_method, b.payment_splits,
+            b.total_amt, b.tax_breakdown, b.round_off, b.payment_method, b.payment_splits,
             b.discount_type, b.discount_value, b.coupon_code,
             coalesce(b.refund_amount, 0) as refund_amount,
             null::uuid as session_id, null::int as session_covers,
@@ -36542,8 +36822,9 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
 
   const composed = composeMisBills(rows, scPct, tz);
 
-  let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0, cash = 0;
+  let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0;
   let todayBills = 0;
+  const todaySettled: SettlementBill[] = [];
   for (let i = 0; i < composed.length; i += 1) {
     const b = composed[i];
     monthGross = round2(monthGross + b.money.grand_total);
@@ -36558,14 +36839,29 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     // THE SAME ALLOCATION THE SETTLEMENT SUMMARY MAKES. A split tender counts
     // under each mode it touched; reading payment_method alone would report a
     // part-cash bill as wholly cash or wholly card.
-    for (const part of allocateSettlement(
-      b.money.grand_total, rows[i].payment_method, parsePaymentSplits(rows[i].payment_splits),
-    )) {
-      if (String(part.method).trim().toLowerCase() === "cash") {cash = round2(cash + part.amount);}
-    }
+    todaySettled.push({
+      grand_total: b.money.grand_total,
+      refund: b.money.refund,
+      payment_method: rows[i].payment_method,
+      splits: parsePaymentSplits(rows[i].payment_splits),
+    });
+  }
+
+  const byMethod = settlementByMethod(todaySettled);
+  // CASH IS READ OFF THE ROWS. Case-insensitive, exactly as it always was, so a
+  // legacy 'cash' spelling still counts — and the only cash a split bill
+  // contributes is its cash part, because that is all its Cash row holds.
+  let cash = 0;
+  for (const row of byMethod.rows) {
+    if (row.method.trim().toLowerCase() === "cash") {cash = round2(cash + row.amount);}
   }
 
   const fig = (value: number, label: string, hint: string): HeadlineFigure => ({ value, label, hint });
+  // Display names for today's modes: one small read of Settings > Payments,
+  // skipped on a day with nothing settled. Falls back to the stored ids.
+  const labelOf = byMethod.rows.length > 0
+    ? await paymentLabelsFor(context).catch(() => (m: string) => m)
+    : (m: string) => m;
   return {
     today,
     month_from: monthFrom,
@@ -36584,6 +36880,35 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
       "Cash taken today. A bill split across modes counts only its cash part."),
     month_to_date: fig(monthGross, "Month to date",
       `Gross sales from ${monthFrom} to today, tax inclusive.`),
+    // A released ₹0 table is a bill with no mode and no money. It stays in
+    // today_bills (as it always has) but a row reading "Other ₹0.00" is noise on
+    // the one screen a cashier reads at close. Filtering it moves no total.
+    // UNALLOCATED IS NEVER FILTERED. Residuals net across bills — one split ₹50
+    // short and another ₹50 over is an Unallocated row of ₹0.00 over 2 bills,
+    // and today_unallocated of 0 — so its amount cannot say whether anything is
+    // wrong. Its bill count can, and the clients warn off the row being here.
+    // Each row carries the owner's name for its mode (Settings > Payments), as
+    // the Settlement Summary's rows do, so "UPI" and a custom mode read the same
+    // on the Overview as on the report. Rows still group by the stored id.
+    today_by_method: byMethod.rows
+      .filter((r) => r.method === UNALLOCATED_METHOD || r.amount !== 0 || r.refund !== 0)
+      .map((r) => ({
+        method: r.method,
+        label: labelOf(r.method),
+        bills: r.bills,
+        amount: r.amount,
+        share_pct: r.share_pct,
+        refund: r.refund,
+        net_amount: r.net_amount,
+      })),
+    today_split_bills: byMethod.multi_method_bills,
+    today_unallocated: byMethod.unallocated,
+    by_method: {
+      label: "Collected by payment method",
+      hint: "Settled today, by how it was paid; adds up to Today's gross sale. A bill split across "
+        + "modes counts each part under its own mode, and a refund comes off the modes its bill was paid "
+        + "with, on the day the bill settled.",
+    },
   };
 }
 
@@ -37078,8 +37403,10 @@ export async function MarkOrderItemNonChargeable(
       tableSubtotal = await sumOrderTotalsForTable(context, tableId, client);
       const openBill = await existingOpenBillId(context, tableId, client);
       if (openBill) {
+        // Pre-tax running sum: no round-off belongs to it (migration 048).
+        await ensureBillRoundOffColumn(client);
         await runQuery(
-          `update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4 and closed_at is null`,
+          `update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4 and closed_at is null`,
           [tableSubtotal, openBill, context.res_id, context.outlet_id],
           client,
         );
@@ -37161,8 +37488,10 @@ export async function ReverseNonChargeable(
         const subtotal = await sumOrderTotalsForTable(context, tableId, client);
         const openBill = await existingOpenBillId(context, tableId, client);
         if (openBill) {
+          // Pre-tax running sum: no round-off belongs to it (migration 048).
+          await ensureBillRoundOffColumn(client);
           await runQuery(
-            `update "Bills" set total_amt = $1 where id = $2 and res_id = $3 and outlet_id = $4 and closed_at is null`,
+            `update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4 and closed_at is null`,
             [subtotal, openBill, context.res_id, context.outlet_id],
             client,
           );
@@ -38217,7 +38546,7 @@ async function readTenderState(
  * One tender  -> payment_method = that method, payment_splits = null.
  * N tenders   -> payment_method = 'Split', payment_splits = the parts.
  *
- * 'Split' with a capital S because normalizePaymentMethod maps the lowercase form
+ * 'Split' with a capital S because normalizeBuiltinPaymentMethod maps the lowercase form
  * to exactly that, and both GetSalesReport and allocateSettlement compare
  * `payment_method.toLowerCase() === 'split'` before they will read the parts —
  * so this is the one spelling that satisfies the type, the normaliser and both
@@ -38285,30 +38614,11 @@ export async function RecordBillTenders(
   if (raw.length > 50) {throw new Error("A bill cannot carry more than 50 tenders");}
 
   const parsed = raw.map((t, i) => {
-    // THE APPLICATION-SIDE BOUND migration 037's header names. The column is free
-    // text so a tenant can gain an aggregator mode without a migration, and the
-    // application is what keeps it honest. This is load-bearing, not cosmetic:
-    // mirrorTendersToBillColumns writes this exact string into
-    // "Bills".payment_method, and GetBillByOrder, the settle path's proof rule
-    // (paymentRequiresProof) and the cash-drawer cut (`lower(payment_method) in
-    // ('cash','split')`) all read it back through normalizePaymentMethod. A
-    // tender recorded as "Zomatoo" would mirror down as a method every one of
-    // those reads as NULL — the bill would display no payment method at all, and
-    // an aggregator bill would silently skip the screenshot the settle path is
-    // supposed to demand. Storing the normalised form (not the caller's spelling)
-    // is what keeps the ledger and the mirror byte-identical.
-    const method = normalizePaymentMethod(t?.method);
-    if (!method) {
-      throw new Error(
-        `Tender ${String(i + 1)}: "${String(t?.method ?? "")}" is not a payment method this system can settle a bill with`,
-      );
-    }
-    // "Split" is the MIRROR's word for "this bill has N tenders", not a way
-    // anybody pays. Accepting it would write a bill whose payment_method reads
-    // Split with one part, which every settlement cut treats as a split bill
-    // whose parts are missing.
-    if (method === "Split") {
-      throw new Error(`Tender ${String(i + 1)}: "Split" is not a payment method — record the individual tenders instead`);
+    // The method is only checked for PRESENCE here; which modes exist is the
+    // tenant's config, resolved inside the transaction below.
+    const methodRaw = String(t?.method ?? "").trim();
+    if (!methodRaw) {
+      throw new Error(`Tender ${String(i + 1)}: "" is not a payment method this system can settle a bill with`);
     }
     const amount = round2(Number(t?.amount));
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -38325,7 +38635,7 @@ export async function RecordBillTenders(
     }
     const tipToId = String(t?.tip_credited_to_employee_id ?? "").trim();
     return {
-      method,
+      method_raw: methodRaw,
       amount,
       txn_ref: String(t?.txn_ref ?? "").trim() || null,
       tip_amount: tip,
@@ -38337,6 +38647,41 @@ export async function RecordBillTenders(
 
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
+    // THE APPLICATION-SIDE BOUND migration 037's header names. The column is free
+    // text so a tenant can gain an aggregator mode without a migration, and the
+    // application is what keeps it honest. This is load-bearing, not cosmetic:
+    // mirrorTendersToBillColumns writes this exact string into
+    // "Bills".payment_method, and GetBillByOrder, the settle path's proof rule
+    // (methodRequiresProof) and the cash-drawer cut (`lower(payment_method) in
+    // ('cash','split')`) all read it back. A tender recorded as "Zomatoo" would
+    // mirror down as a mode no config knows — no label, no screenshot rule, a
+    // stray row on the cash-up sheet. So every tender resolves against the
+    // tenant's own config (built-in aliases first, then the modes the owner
+    // added) and the RESOLVED id is stored, never the caller's spelling — which
+    // is what keeps the ledger and the mirror byte-identical.
+    //
+    // A tender is always a NEW payment, so a mode switched off in Settings is
+    // refused here; the settle that later mirrors tenders recorded before the
+    // switch is not (ConfirmBillPaymentByWaiter's mirrorsLedger).
+    const paymentConfig = await loadPaymentConfig(context, client);
+    const tenders = parsed.map((p, i) => {
+      const method = resolvePaymentMethod(p.method_raw, paymentConfig)?.id ?? null;
+      if (!method) {
+        throw new Error(
+          `Tender ${String(i + 1)}: "${p.method_raw}" is not a payment method this system can settle a bill with`,
+        );
+      }
+      // "Split" is the MIRROR's word for "this bill has N tenders", not a way
+      // anybody pays. Accepting it would write a bill whose payment_method reads
+      // Split with one part, which every settlement cut treats as a split bill
+      // whose parts are missing.
+      if (method === "Split") {
+        throw new Error(`Tender ${String(i + 1)}: "Split" is not a payment method — record the individual tenders instead`);
+      }
+      const refusal = paymentMethodRefusal(method, paymentConfig);
+      if (refusal) {throw new Error(`Tender ${String(i + 1)}: ${refusal}`);}
+      return { ...p, method };
+    });
     const bill = await resolveTenderBill(context, input, client, { create: true });
     if (!bill) {throw new Error("Could not open a bill for that table");}
     if (bill.closed_at) {
@@ -38345,7 +38690,7 @@ export async function RecordBillTenders(
 
     const before = await readTenderState(context, bill, client);
     const liveAmounts = before.tenders.filter((t) => t.voided_at === null).map((t) => t.amount);
-    const proposed = [...liveAmounts, ...parsed.map((p) => p.amount)];
+    const proposed = [...liveAmounts, ...tenders.map((p) => p.amount)];
     const rec = reconcileTenders(before.grand_total, proposed);
     if (rec.over) {
       throw new Error(
@@ -38359,8 +38704,8 @@ export async function RecordBillTenders(
     }
 
     const maxSeq = before.tenders.reduce((m, t) => Math.max(m, t.seq), 0);
-    for (let i = 0; i < parsed.length; i++) {
-      const p = parsed[i];
+    for (let i = 0; i < tenders.length; i++) {
+      const p = tenders[i];
       await runQuery(
         `insert into "BillTenders"
            (id, res_id, outlet_id, bill_id, table_id, seq, method, amount, txn_ref,
@@ -40554,8 +40899,8 @@ export interface CounterSummaryRow {
   tax: number;
   grand_total: number;
   refund: number;
-  /** The mode cut, machine-readable. Sums to grand_total exactly. */
-  by_method: { method: string; amount: number }[];
+  /** The mode cut, machine-readable. Sums to grand_total exactly. `label` is display only. */
+  by_method: { method: string; label?: string; amount: number }[];
   /** The same cut as one spreadsheet cell. */
   payment_modes: string;
   /** Cash sessions on this till that overlap the window (migration 038). */
@@ -40741,6 +41086,7 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
   });
 
   const seenSessions = new Set<string>();
+  const labelOf = await paymentLabelsFor(mc.context);
   const rows: CounterSummaryRow[] = orderedKeys.map((key) => {
     const bucket = buckets.get(key) ?? { bills: [], cashiers: new Set<string>(), methods: new Map<string, number>() };
     const l = ladderOf(bucket.bills, seenSessions);
@@ -40771,8 +41117,12 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
       tax: l.tax,
       grand_total: l.grand_total,
       refund: l.refund,
-      by_method: [...parts].sort((a, z) => z.amount - a.amount || a.method.localeCompare(z.method)),
-      payment_modes: formatMethodSplit(parts),
+      by_method: [...parts]
+        .sort((a, z) => z.amount - a.amount || a.method.localeCompare(z.method))
+        .map((p) => ({ method: p.method, label: labelOf(p.method), amount: p.amount })),
+      // The spreadsheet cell reads the owner's labels, like the till; by_method
+      // above keeps the ids for anything that keys on them.
+      payment_modes: formatMethodSplit(parts.map((p) => ({ method: labelOf(p.method), amount: p.amount }))),
       sessions: shift?.sessions ?? 0,
       opened_at: shift?.opened_at ?? null,
       closed_at: shift?.closed_at ?? null,

@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.9.7";
+const LATEST = "1.9.9";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,11 +118,12 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"The printed bill now looks like a proper restaurant bill: your logo, solid lines, clear columns for " +
-		"quantity, price and amount, the totals lined up on the right and a bigger grand total. Your uploaded " +
-		"logo now prints on the bill, and the date and time are in your restaurant's time. The bill preview " +
-		"matches the paper. In Settings you can switch the QR code on the bill off or on, and the Bill " +
-		"details card now shows your saved business name, GSTIN and QR message instead of opening blank.",
+		"Today's money is now shown by payment method on the Overview, so you can see what came in as cash, "+
+		"UPI, card and every other mode at a glance. You can add your own payment modes in Settings, and they "+
+		"appear at the till and in reports. Every bill is now rounded to the rupee, with a Round off line, and "+
+		"a removed service charge no longer prints or shows as Opted-out. The printer keeps working after you "+
+		"sign out and back in, and the printer screen now says when it is not receiving jobs. The date pill "+
+		"beside Settled bills in Accounting now opens the calendar.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),

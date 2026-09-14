@@ -258,6 +258,54 @@ describe("both service-charge shapes separate identically", () => {
 
 // --- 4. refunds ---------------------------------------------------------------
 
+// --- migration 048: the round-off ------------------------------------------
+//
+// Every bill is rounded to the rupee at settle and the adjustment recorded
+// beside total_amt. It is money in the drawer (so it is in sales), it is not
+// food (so it is not in any base), and it is not a supply (so it is not GST
+// turnover). Gaia's receipt: 4745 + SGST 118.63 + CGST 118.63 = 4982.26 -> 4982.00.
+
+describe("the round-off (migration 048)", () => {
+  const GAIA: FixtureBill = {
+    id: "g1", bill_no: "11", settled_at: "2026-06-20T08:00:00Z", total_amt: 4982, round_off: -0.26,
+    tax_breakdown: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+    payment_method: "Cash", covers: 2,
+  };
+  // Settled before rounding existed: NULL round_off, and nothing about it moves.
+  const LEGACY: FixtureBill = {
+    id: "g2", bill_no: "12", settled_at: "2026-06-21T08:00:00Z", total_amt: 1050.5,
+    tax_breakdown: [{ name: "GST", percentage: 5, amount: 50.5 }], payment_method: "Card", covers: 1,
+  };
+  const rounded = (): FixtureDb => makeDb({ bills: [GAIA, LEGACY], service_charge_percent: 0 });
+
+  test("the bill-detail reader: base is the food, round off is its own rung", async () => {
+    useFixtureDb(rounded());
+    const page = await db.ListClosedBills(RID, { limit: 200 });
+    const gaia = page.bills.find((b) => b.bill_no === "11")!;
+    expect(gaia.taxable_base).toBe(4745);
+    expect(gaia.round_off).toBe(-0.26);
+    expect(r2(gaia.taxable_base + gaia.service_charge + gaia.tax_total + gaia.round_off)).toBe(gaia.grand_total);
+    const legacy = page.bills.find((b) => b.bill_no === "12")!;
+    expect(legacy.round_off).toBe(0);
+    expect(legacy.taxable_base).toBe(1000);
+  });
+
+  test("GetSalesReport: the round-off is in sales — it is money the drawer took", async () => {
+    useFixtureDb(rounded());
+    const sales = await db.GetSalesReport(RID, FROM, TO);
+    expect(sales.total_sales).toBe(r2(4982 + 1050.5));
+    expect(sales.total_tax).toBe(r2(237.26 + 50.5));
+  });
+
+  test("GetGstReport: taxable turnover EXCLUDES the round-off", async () => {
+    useFixtureDb(rounded());
+    const gst = await db.GetGstReport(RID, FROM, TO);
+    expect(gst.total_tax).toBe(r2(237.26 + 50.5));
+    // 4745 + 1000 of supplies. With the round-off left in, this is 5744.74.
+    expect(gst.total_taxable).toBe(5745);
+  });
+});
+
 describe("refunds", () => {
   const oneBill = (refund: number): FixtureDb =>
     makeDb({
@@ -367,6 +415,84 @@ describe("rounding", () => {
     // The parts must still reconstruct the whole within the same bound.
     const rebuilt = sum([sales.total_tax, sales.total_service_charge, sum(detail.bills.map((b) => b.taxable_base))]);
     expect(Math.abs(rebuilt - sales.total_sales)).toBeLessThanOrEqual(tolerance);
+  });
+});
+
+// --- 7. the settled-bills list cuts days where the reports cut them -----------
+
+describe("ListClosedBills day bounds (restaurant zone)", () => {
+  // Accounting shows the settled-bills list directly under Sales/GST/P&L for the
+  // SAME picked days. The list used to cut those days at UTC midnight, the
+  // reports at local midnight, so a bill settled just after midnight in Kolkata
+  // was listed under the previous date while the totals above counted it under
+  // the right one. Production had 11 of 78 such bills for one tenant in 90 days.
+  //
+  //   late   2026-08-01T19:00Z = 2 Aug 00:30 IST  (the UTC date is still the 1st)
+  //   noon   2026-08-02T06:30Z = 2 Aug 12:00 IST
+  //   edge   2026-08-02T18:30Z = 3 Aug 00:00 IST  (exactly the exclusive end)
+  const late: FixtureBill = {
+    id: "late", bill_no: "21", settled_at: "2026-08-01T19:00:00Z", total_amt: 1060,
+    tax_breakdown: [...gstLines(25), scLine(10)], payment_method: "Cash", covers: 2,
+  };
+  const noon: FixtureBill = {
+    id: "noon", bill_no: "22", settled_at: "2026-08-02T06:30:00Z", total_amt: 530,
+    tax_breakdown: [...gstLines(12.5), scLine(5)], payment_method: "UPI", covers: 2,
+  };
+  const edge: FixtureBill = {
+    id: "edge", bill_no: "23", settled_at: "2026-08-02T18:30:00Z", total_amt: 2544,
+    tax_breakdown: [...gstLines(60), scLine(24)], payment_method: "Card", covers: 4,
+  };
+  const fixture = (): FixtureDb => makeDb({ bills: [late, noon, edge], service_charge_percent: 0 });
+  const ids = (page: { bills: { id: string }[] }) => page.bills.map((b) => b.id).sort();
+
+  test("a 00:30 IST bill is listed under its IST day, exactly as GetSalesReport counts it", async () => {
+    useFixtureDb(fixture());
+    const list = await db.ListClosedBills(RID, { from: "2026-08-02", to: "2026-08-02", limit: 200 });
+    useFixtureDb(fixture());
+    const sales = await db.GetSalesReport(RID, "2026-08-02", "2026-08-02");
+
+    expect(ids(list)).toEqual(["late", "noon"]);
+    expect(list.total).toBe(2);
+    expect(list.total).toBe(sales.bill_count);
+    expect(sum(list.bills.map((b) => b.grand_total))).toBe(sales.total_sales);
+  });
+
+  test("the previous day no longer claims it", async () => {
+    useFixtureDb(fixture());
+    const list = await db.ListClosedBills(RID, { from: "2026-08-01", to: "2026-08-01", limit: 200 });
+    useFixtureDb(fixture());
+    const sales = await db.GetSalesReport(RID, "2026-08-01", "2026-08-01");
+
+    expect(ids(list)).toEqual([]);
+    expect(list.total).toBe(sales.bill_count);
+  });
+
+  test("the end is exclusive at the next local midnight, and `to` stays inclusive of its own day", async () => {
+    useFixtureDb(fixture());
+    const third = await db.ListClosedBills(RID, { from: "2026-08-03", to: "2026-08-03", limit: 200 });
+    useFixtureDb(fixture());
+    const both = await db.ListClosedBills(RID, { from: "2026-08-02", to: "2026-08-03", limit: 200 });
+
+    expect(ids(third)).toEqual(["edge"]);
+    expect(ids(both)).toEqual(["edge", "late", "noon"]);
+  });
+
+  test("one open end is still no bound on the other side", async () => {
+    useFixtureDb(fixture());
+    const since = await db.ListClosedBills(RID, { from: "2026-08-02", limit: 200 });
+    useFixtureDb(fixture());
+    const until = await db.ListClosedBills(RID, { to: "2026-08-01", limit: 200 });
+
+    expect(ids(since)).toEqual(["edge", "late", "noon"]);
+    expect(ids(until)).toEqual([]);
+  });
+
+  test("a full ISO instant keeps its literal meaning (no zone shift, inclusive `to`)", async () => {
+    useFixtureDb(fixture());
+    const list = await db.ListClosedBills(RID, {
+      from: "2026-08-01T19:00:00.000Z", to: "2026-08-02T18:30:00.000Z", limit: 200,
+    });
+    expect(ids(list)).toEqual(["edge", "late", "noon"]);
   });
 });
 

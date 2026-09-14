@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -625,6 +625,20 @@ async function bootstrap(): Promise<void> {
 		}
 	} catch (error) {
 		logger.warn({ err: error }, "print_routing_boot_probe_failed — routing stays off, printing is unchanged");
+	}
+
+	// "Bills".round_off (migration 048), ONCE, here, outside any transaction.
+	//
+	// Every settled-bill reader selects the column, and this code ships before the
+	// migration is applied by hand. The lazy ensure would add it on first use —
+	// but if that first use were inside a settle transaction that then rolled
+	// back, the ADD COLUMN would roll back with it while the in-process memo went
+	// on saying it exists, and the Accounting list, the MIS pack and the overview
+	// would all fail on "column does not exist" until the next restart. At boot
+	// there is no transaction to lose it in. One idempotent statement; a no-op
+	// once 048 is applied; never takes the server down (see its header).
+	if (await InitBillRoundOffSchema()) {
+		logger.info("✅ Bill round-off column ready (migration 048)");
 	}
 
 	// Run the reporting path's lazy DDL ONCE here, outside any transaction, so the

@@ -2,7 +2,7 @@ import type { Server as HttpServer } from "http";
 import { Server } from "socket.io";
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
-import { getSession } from "./auth/sessions.js";
+import { getSession, type SessionPayload } from "./auth/sessions.js";
 import { logger } from "./observability.js";
 import { resumeJitterMs, resumePrintJobsForAgent } from "./print_jobs.js";
 // STATIC, and safe to be static: print_jobs.js (imported above) already pulls
@@ -474,49 +474,122 @@ export async function initRealtime(httpServer: HttpServer) {
     );
   }
 
-  io.on("connection", async (socket) => {
+  // SYNCHRONOUS, AND THAT IS THE FIX. This handler used to be `async`: it awaited
+  // the session lookup and only THEN attached its listeners. Socket.IO has already
+  // sent CONNECT by the time 'connection' handlers run, and it dispatches incoming
+  // events with no buffering — so the printer agent, which emits joinOutlet the
+  // instant it sees CONNECT, raced a Redis round trip. Whenever the lookup lost
+  // (a cold store after every deploy, a busy event loop during a fleet-wide
+  // reconnect) the join went to a socket with no listener and vanished: no room,
+  // no replay, no answer, a till showing "Connected" that never printed again
+  // until somebody restarted the app. Every listener is now attached before this
+  // function returns and waits on the lookup itself.
+  io.on("connection", (socket) => {
     // Derive the tenant from the verified session token, never from a
     // client-supplied restaurantId — otherwise a client could subscribe to
     // another restaurant's realtime events.
     const auth = socket.handshake.auth as any || {};
     const token = typeof auth.token === "string" ? auth.token : null;
-    let session = null;
-    if (token) {
-      try {
-        session = await getSession(token);
-      } catch (err) {
-        logger.error({ err }, "socket_session_lookup_failed");
+
+    // THREE ANSWERS, NOT TWO. A session, `null` (the store answered: this token is
+    // not a session) and `undefined` (the store could not be asked). Only `null`
+    // may ever be reported to the client as a rejection — the app signs its user
+    // out on that word, and a Redis blip must not sign out every till at once.
+    const lookupSession = (t: string): Promise<SessionPayload | null | undefined> =>
+      getSession(t).catch((err: unknown) => {
+        logger.error({ err, socketId: socket.id }, "socket_session_lookup_failed");
+        return undefined;
+      });
+    let lookup: Promise<SessionPayload | null | undefined> = token ? lookupSession(token) : Promise.resolve(null);
+    // MEMOISED: one store read per connection, exactly as before, however many
+    // events wait on it. A lookup that FAILED is retried once by the next waiter
+    // — shared by every waiter already queued behind it, so a burst of events
+    // costs one retry, not one each — instead of leaving a live socket deaf for
+    // the rest of its life over a single store timeout. Waiters resume in the
+    // order they arrived, so join-then-leave is never applied as leave-then-join.
+    const resolveSession = async (): Promise<SessionPayload | null | undefined> => {
+      const seen = lookup;
+      const first = await seen;
+      if (first !== undefined || !token) { return first; }
+      if (lookup === seen) { lookup = lookupSession(token); }
+      return lookup;
+    };
+    // The restaurant room, joined ONCE, the first time the session is known — the
+    // same room on the same condition as before, for every socket (KDS, orders,
+    // dashboards and printers alike). Once, so a later event can never undo a
+    // client's own "leave".
+    let admitted = false;
+    const admit = (session: SessionPayload): void => {
+      if (admitted) { return; }
+      admitted = true;
+      socket.join(`restaurant:${session.res_id}`);
+    };
+    // The outlets this connection has a replay scheduled or running for. See the
+    // share in joinOutlet below.
+    const replayPending = new Set<string>();
+    // Every tenant-scoped listener goes through here. The connected check matters
+    // because the wait is now INSIDE the listener: a socket that disconnected
+    // while its lookup was in flight must not be put back into a room it has
+    // already been removed from, where it would sit as a dead member forever.
+    const onAuthed = (
+      event: string,
+      handler: (session: SessionPayload, payload: any) => void,
+      onRejected?: () => void,
+    ): void => {
+      socket.on(event, (payload: any) => {
+        resolveSession()
+          .then((session) => {
+            if (!socket.connected) { return; }
+            if (session) {
+              // A no-op on the normal path (the connection-level wait below got
+              // there first); the admission for a socket whose first lookup failed.
+              admit(session);
+              handler(session, payload);
+              return;
+            }
+            if (session === null && onRejected) { onRejected(); }
+          })
+          .catch((err: unknown) => { logger.error({ err, event, socketId: socket.id }, "socket_event_failed"); });
+      });
+    };
+
+    // Attached BEFORE any listener, so it resolves ahead of every queued event and
+    // a joinOutlet is never handled on a socket still outside its restaurant.
+    void resolveSession().then((session) => {
+      if (session) {
+        if (socket.connected) { admit(session); }
+        return;
       }
-    }
-
-    if (!session) {
-      // Connect but join no tenant rooms and ignore join requests, so an
-      // unauthenticated socket never receives any restaurant's events.
-      logger.warn({ socketId: socket.id }, "socket connected without a valid session; no rooms joined");
-      return;
-    }
-
-    // Captured as consts because the joinOutlet closure below outlives this
-    // scope's narrowing of `session` (a `let`, so TypeScript re-widens it inside a
-    // nested function).
-    const resId = session.res_id;
-    const employeeId = session.employeeId;
-    const role = session.role;
-    socket.join(`restaurant:${resId}`);
-
-    // All room operations are pinned to the caller's own restaurant.
-    socket.on("join", (rid: string) => {
-      if (rid === resId) {socket.join(`restaurant:${resId}`);}
+      if (session === null) {
+        // Connect but join no tenant rooms and ignore join requests, so an
+        // unauthenticated socket never receives any restaurant's events.
+        logger.warn({ socketId: socket.id }, "socket connected without a valid session; no rooms joined");
+      }
     });
 
-    socket.on("leave", (rid: string) => {
-      if (rid === resId) {socket.leave(`restaurant:${resId}`);}
+    // All room operations are pinned to the caller's own restaurant.
+    onAuthed("join", (session, rid: string) => {
+      if (rid === session.res_id) {socket.join(`restaurant:${session.res_id}`);}
+    });
+
+    onAuthed("leave", (session, rid: string) => {
+      if (rid === session.res_id) {socket.leave(`restaurant:${session.res_id}`);}
     });
 
     // THE RECONNECT HOOK. The printer agent re-emits joinOutlet on every connect
     // AND every reconnect, so this is already the exact moment a till comes back —
     // no new client-side trigger had to be invented for replay.
-    socket.on("joinOutlet", (payload: any) => {
+    //
+    // ANSWERED EITHER WAY. joinedOutlet on success has always been sent; a dead
+    // session used to get silence, which to the agent looked exactly like a slow
+    // server, so it waited forever. It now hears joinRejected and can send its
+    // user to sign in. The socket is deliberately NOT disconnected: the Dart
+    // client treats a server-side disconnect as final and never reconnects, which
+    // would turn a recoverable sign-in into a till that stays offline for good.
+    onAuthed("joinOutlet", (session, payload: any) => {
+      const resId = session.res_id;
+      const employeeId = session.employeeId;
+      const role = session.role;
       // safeRoomId, NOT a bare typeof — see its comment. This id is the PREFIX of
       // every print room name, so a colon in it lets a socket name a dev: room it
       // does not own and receive another device's guest bills. Every real outlet
@@ -567,6 +640,21 @@ export async function initRealtime(httpServer: HttpServer) {
           void claimDeviceRooms(socket, resId, o, employeeId, claimedDeviceId, platform, agentVersion)
             .catch((err: unknown) => { logger.error({ err }, "print_device_room_join_failed"); });
         }
+        // ONE REPLAY AT A TIME PER CONNECTION AND OUTLET. Every join above is
+        // still answered, but a join that arrives while this outlet's replay is
+        // scheduled or running shares it instead of adding a tenant transaction
+        // of its own. Queueing joins behind the session lookup is what stopped
+        // them being dropped, and it also means a store stall leaves each till
+        // with its connect join plus the watchdog's re-asks waiting — two or
+        // three per till, all released at once when the store recovers, against
+        // a fifteen-slot pooler. The pending replay reads the outstanding jobs
+        // when it runs, which is no earlier than any join it absorbed.
+        //
+        // Windowed catch-up is unaffected: the agent asks for the next window
+        // only after it has printed the last one, and the marker is cleared in
+        // the same turn the window is emitted, before any reply can be read.
+        if (replayPending.has(o)) { return; }
+        replayPending.add(o);
         // Deliberately NOT awaited and deliberately jittered. The room join must
         // be immediate (live printing depends on it) and a fleet-wide reconnect
         // must not turn into a fleet-wide simultaneous query. Errors are swallowed
@@ -598,13 +686,19 @@ export async function initRealtime(httpServer: HttpServer) {
             employeeId,
             role,
             deliver: (p) => { socket.emit('bill:print', p); },
-          }).catch((err: unknown) => { logger.error({ err }, "print_resume_dispatch_failed"); });
+          })
+            .catch((err: unknown) => { logger.error({ err }, "print_resume_dispatch_failed"); })
+            .finally(() => { replayPending.delete(o); });
         }, resumeJitterMs());
         timer.unref?.();
       }
+    }, () => {
+      logger.warn({ socketId: socket.id }, "joinOutlet from a socket without a valid session; rejected");
+      socket.emit('joinRejected', { reason: 'session_invalid' });
     });
 
-    socket.on("leaveOutlet", (payload: any) => {
+    onAuthed("leaveOutlet", (session, payload: any) => {
+      const resId = session.res_id;
       // Same validation as joinOutlet, for the same reason and so the two cannot
       // disagree about what an outlet id is: a room this handler can never build
       // is a room joinOutlet must never have built either.
@@ -634,14 +728,14 @@ export async function initRealtime(httpServer: HttpServer) {
      * tenant transaction downstream, so an unbounded stream of them is an
      * unbounded stream of checkouts against a fifteen-slot pooler. See JOB_ID_RE
      * and BEAT_MAX_PER_WINDOW.                                                   */
-    socket.on('print:accepted', (payload: any) => {
-      void handlePrintBeat("accepted", socket, resId, payload);
+    onAuthed('print:accepted', (session, payload: any) => {
+      void handlePrintBeat("accepted", socket, session.res_id, payload);
     });
-    socket.on('print:reject', (payload: any) => {
-      void handlePrintBeat("reject", socket, resId, payload);
+    onAuthed('print:reject', (session, payload: any) => {
+      void handlePrintBeat("reject", socket, session.res_id, payload);
     });
-    socket.on('print:revoked-ok', (payload: any) => {
-      void handlePrintBeat("revoked-ok", socket, resId, payload);
+    onAuthed('print:revoked-ok', (session, payload: any) => {
+      void handlePrintBeat("revoked-ok", socket, session.res_id, payload);
     });
 
     // Rooms are cleared before 'disconnect' fires, so the destination rooms this

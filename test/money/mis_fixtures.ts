@@ -64,6 +64,11 @@ export interface FixtureBill {
   /** "Bills".total_amt — the TAX-INCLUSIVE grand total. */
   total_amt: number;
   tax_breakdown: FixtureTaxLine[];
+  /**
+   * "Bills".round_off (migration 048) — what rounded total_amt to the rupee.
+   * Absent = NULL, a bill settled before rounding existed.
+   */
+  round_off?: number | null;
   payment_method?: string | null;
   payment_splits?: { method: string; amount: number }[] | null;
   discount_type?: "percent" | "flat" | null;
@@ -265,6 +270,8 @@ export interface FixtureDb {
   counters: FixtureCounter[];
   cash_sessions: FixtureCashSession[];
   order_voids: FixtureOrderVoid[];
+  /** "Restaurant".payment_config — null/absent is the built-in defaults. */
+  payment_config?: unknown;
 }
 
 export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
@@ -424,8 +431,15 @@ function captureRowsMatching<T extends { res_id?: string; outlet_id?: string }>(
 
 // --- row builders ------------------------------------------------------------
 
-/** The row shape fetchMisBills selects. */
-function misBillRow(b: FixtureBill) {
+/**
+ * The row shape fetchMisBills selects.
+ *
+ * `round_off` (migration 048) comes back ONLY when the query actually selects
+ * it — the way Postgres would answer. A fixture that returned it regardless
+ * would keep a reader green after its SELECT lost the column, and that reader
+ * would then book every rounded bill's paise as food.
+ */
+function misBillRow(b: FixtureBill, q = "") {
   return {
     id: b.id,
     bill_no: b.bill_no,
@@ -433,6 +447,7 @@ function misBillRow(b: FixtureBill) {
     settled_at: new Date(b.settled_at),
     total_amt: b.total_amt,
     tax_breakdown: b.tax_breakdown,
+    ...(/\bb\.round_off\b/i.test(q) ? { round_off: b.round_off ?? null } : {}),
     payment_method: b.payment_method ?? null,
     payment_splits: b.payment_splits ?? null,
     discount_type: b.discount_type ?? null,
@@ -449,10 +464,10 @@ function orderOf(b: FixtureBill): FixtureOrder | undefined {
 }
 
 /** The row shape GetOrderSummaryReport's page query selects. */
-function orderSummaryRow(b: FixtureBill) {
+function orderSummaryRow(b: FixtureBill, q = "") {
   const o = orderOf(b);
   return {
-    ...misBillRow(b),
+    ...misBillRow(b, q),
     status: b.status ?? 7,
     table_name: b.table_name ?? null,
     emp_fname: b.waiter_fname ?? null,
@@ -502,6 +517,11 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   }
   if (/select service_charge from "Restaurant"/i.test(q)) {
     return [{ service_charge: d.service_charge_percent }];
+  }
+  // loadPaymentConfig — the report readers' mode labels. Tenant-bound like
+  // everything else here.
+  if (/select payment_config from "Restaurant" where id = \$1/i.test(q)) {
+    return params[0] === d.res_id ? [{ payment_config: d.payment_config ?? null }] : [];
   }
 
   // --- "Outlets" ---
@@ -842,7 +862,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     // The Discount page: the only bill read that joins "DiscountRequests".
     if (/d\.requested_by, d\.decided_by/i.test(q)) {
       return paged(rows).map((b) => ({
-        ...misBillRow(b),
+        ...misBillRow(b, q),
         table_name: b.table_name ?? null,
         reason: b.reason ?? null,
         requested_by: b.requested_by ?? null,
@@ -850,7 +870,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       }));
     }
     // The Order Summary page: the only bill read that counts the order's items.
-    if (/jsonb_array_length\(/i.test(q)) {return paged(rows).map(orderSummaryRow);}
+    if (/jsonb_array_length\(/i.test(q)) {return paged(rows).map((b) => orderSummaryRow(b, q));}
     // The Sales Summary's order-type cut.
     if (/as channel/i.test(q)) {
       const acc = new Map<string, { bills: number; total: number }>();
@@ -867,11 +887,26 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       }
       return [...acc.entries()].map(([channel, v]) => ({ channel, bills: String(v.bills), total: v.total }));
     }
+    // GetOverviewHeadline — the ladder read without the seating lateral, plus
+    // the online flag. The reader's EXISTS looks for any online order on the
+    // bill's TABLE; the fixture has no table ids, so it reads the bill's own
+    // order, which is the same answer for every bill these suites build.
+    if (/as is_online/i.test(q)) {
+      const walkIn = new Set(["dine_in", "dinein", "dine-in", "takeaway", "take_away", "pickup"]);
+      return [...rows]
+        .sort((a, z) => new Date(a.settled_at).getTime() - new Date(z.settled_at).getTime())
+        .map((b) => ({
+          ...misBillRow(b, q),
+          session_id: null,
+          session_covers: null,
+          is_online: !walkIn.has(orderOf(b)?.order_type ?? "dine_in"),
+        }));
+    }
     // fetchMisBills — the shared ladder read.
     if (/s\.covers as session_covers/i.test(q)) {
       return [...rows]
         .sort((a, z) => new Date(a.settled_at).getTime() - new Date(z.settled_at).getTime())
-        .map(misBillRow);
+        .map((b) => misBillRow(b, q));
     }
     throw new Error(`mis fixture: unrecognised "Bills" read — ${q.slice(0, 260)}`);
   }

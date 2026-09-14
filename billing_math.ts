@@ -39,8 +39,51 @@ export function computeBillTaxes(
   return { taxes, tax_total, grand_total };
 }
 
+// ============================================================================
+// ROUNDING THE BILL TO THE RUPEE — migration 048
+// ============================================================================
+//
+// THE CLIENT'S RECEIPT, which is the specification: "Sub Total 4745.00, SGST
+// 2.5% 118.63, CGST 2.5% 118.63, Round off -0.26, Grand Total 4982.00". A guest
+// is asked for whole rupees, and the paise are disclosed on their own line.
+//
+// ROUNDED ONCE, HERE, AND NOWHERE ELSE. Every path that decides what a guest
+// owes — the bill view, the printed bill, the four settle writers, tender state,
+// split validation, the Razorpay order — already asks computeBillCharges, so
+// rounding its grand total is what makes all of them agree without any of them
+// knowing rounding exists. The renderers deliberately do NOT round (escpos.ts's
+// grandTotal note: a bill SETTLED at 797.55 once PRINTED as 798); they disclose
+// the `round_off` this function hands them, exactly as they always could.
+//
+// IN INTEGER PAISA, TO THE NEAREST RUPEE, HALF UP. 4982.26 -> 4982.00 (-0.26),
+// 4982.50 -> 4983.00 (+0.50), 4982.49 -> 4982.00 (-0.49): the CGST Act s.170
+// convention and the one on the client's own paper. Paisa because 4982.255 is
+// not a number a double holds, and a rounding rule that answers differently for
+// two spellings of one amount is not a rule. A bill total is never negative (the
+// discount is clamped to the subtotal), so Math.round's half-up is half-up here.
+//
+// ONLY THE TOTAL MOVES. Every rung above it — the subtotal, the discount, the
+// service charge, each tax line, tax_total — is exactly what it was, so no tax
+// is recomputed on a rounded base and the GST on the paper is the GST on the
+// food. The ladder identity simply gains one rung:
+//
+//     discounted_subtotal + service_charge + tax_total + round_off === grand_total
+//
+// `pre_round_total` is the old grand total, kept because two things need the
+// unrounded figure: the service-charge waiver quote (a difference of two
+// ROUNDED totals would leak up to a rupee of rounding into "tax on waived"),
+// and anything that has to prove the identity above.
+
+/** A bill's rupee-rounded total, and the adjustment that got it there. */
+export function roundBillTotal(preRoundTotal: number): { grand_total: number; round_off: number } {
+  const p = toPaisa(preRoundTotal);
+  const grandP = Math.round(p / 100) * 100;
+  return { grand_total: round2(grandP / 100), round_off: round2((grandP - p) / 100) };
+}
+
 // Full bill charges = optional service charge (on subtotal) + taxes (on subtotal
-// + service charge). `includeServiceCharge=false` reprints/charges without it.
+// + service charge), with the total rounded to the rupee (see above).
+// `includeServiceCharge=false` reprints/charges without the charge.
 export type BillDiscount = { type: "percent" | "flat"; value: number } | null | undefined;
 
 export function computeBillCharges(
@@ -59,6 +102,11 @@ export function computeBillCharges(
   service_charge_percent: number;
   taxes: BillTaxLine[];
   tax_total: number;
+  /** discounted_subtotal + service_charge + tax_total, before rounding to the rupee. */
+  pre_round_total: number;
+  /** grand_total - pre_round_total. In [-0.49, +0.50]; 0 when the bill is already whole. */
+  round_off: number;
+  /** What the guest pays: whole rupees. */
   grand_total: number;
 } {
   const base = round2(Number(subtotal) || 0);
@@ -78,7 +126,8 @@ export function computeBillCharges(
   const service_charge = round2((discountedBase * scPct) / 100);
   const taxBase = round2(discountedBase + service_charge);
   const { taxes, tax_total } = computeBillTaxes(taxBase, taxConfig);
-  const grand_total = round2(taxBase + tax_total);
+  const pre_round_total = round2(taxBase + tax_total);
+  const { grand_total, round_off } = roundBillTotal(pre_round_total);
   return {
     subtotal: base,
     discount: discountAmt,
@@ -89,6 +138,8 @@ export function computeBillCharges(
     service_charge_percent: scPct,
     taxes,
     tax_total,
+    pre_round_total,
+    round_off,
     grand_total,
   };
 }
@@ -114,7 +165,9 @@ export interface SplitPart { label: string; subtotal: number; total: number; ite
 // back to the grand total exactly (the last part absorbs any rounding remainder),
 // so a split can never lose or invent money.
 //   - "item": allocate the grand proportionally to each guest-group's item subtotal.
-//   - "even": split into N equal parts (N clamped to [2,50]).
+//   - "even": split into N equal parts (N clamped to [2,50]) — in whole rupees
+//     when the total is whole rupees, the leftover rupees one each to the first
+//     parts; otherwise to the paisa, remainder on the last.
 // A THIRD mode — by MENU SECTION (starters / mains / bar) — is computeSectionSplit
 // at the foot of this file. It is a separate function on purpose; its header says why.
 export function computeBillSplit(
@@ -147,8 +200,34 @@ export function computeBillSplit(
 
   // Even split.
   const n = Math.max(2, Math.min(50, Math.round(Number(opts.parts) || 2)));
-  const per = Math.floor((grand / n) * 100) / 100;
   const parts: SplitPart[] = [];
+
+  // A WHOLE-RUPEE BILL SPLITS INTO WHOLE-RUPEE SHARES (migration 048). The bill
+  // is rounded to the rupee now, and the even split is the one both clients
+  // actually offer — on screen and on the slips each guest is handed. Floored to
+  // the paisa, 4982 three ways came out 1660.66 / 1660.66 / 1660.68: a "final
+  // bill" in paise again, one slip at a time. So every share is floored to the
+  // RUPEE and the K rupees left over (K < n) go one each to the first K shares.
+  // Every share has the same claim to them, so position is the only fair tie
+  // break, and no share differs from another by more than a rupee. Conservation
+  // is exact by construction: n floors plus K rupees is the total.
+  //
+  // Not attempted when the total is not whole rupees (a bill settled before
+  // rounding, or a figure built by hand) or is under a rupee a share — ₹2 three
+  // ways would hand somebody a ₹0 slip. Those keep the paisa allocation below.
+  const grandP = toPaisa(grand);
+  if (grandP % 100 === 0 && grandP >= n * 100) {
+    const rupees = grandP / 100;
+    const perRupees = Math.floor(rupees / n);
+    const extra = rupees - perRupees * n;
+    for (let i = 0; i < n; i++) {
+      const total = perRupees + (i < extra ? 1 : 0);
+      parts.push({ label: `Guest ${i + 1}`, subtotal: total, total });
+    }
+    return { mode: "even", grand_total: grand, parts };
+  }
+
+  const per = Math.floor((grand / n) * 100) / 100;
   let allocated = 0;
   for (let i = 0; i < n; i++) {
     const isLast = i === n - 1;
@@ -482,11 +561,14 @@ export interface ServiceChargeWaiverQuote {
   amount_waived: number;
   /** The tax that fell away WITH it. Structurally 0 in the tax_line shape. */
   tax_on_waived: number;
-  /** What the guest stopped owing: amount_waived + tax_on_waived. */
+  /**
+   * What the waiver took off, before rounding: amount_waived + tax_on_waived,
+   * exactly. A difference of the two PRE-ROUND totals — see the function.
+   */
   grand_total_reduction: number;
-  /** The grand total the bill WOULD have had. */
+  /** The grand total the bill WOULD have had — rupee-rounded, as payable. */
   grand_total_with: number;
-  /** The grand total once waived. */
+  /** The grand total once waived — rupee-rounded, as payable. */
   grand_total_without: number;
   /** Feed these two back into computeBillCharges to bill the waived bill. */
   tax_config_waived: { name: string; percentage: number }[];
@@ -503,6 +585,16 @@ export interface ServiceChargeWaiverQuote {
  * results of the one function the whole system already bills with, which is what
  * makes the waived bill's own total exactly `grand_total_without` and the
  * reported saving exactly the difference — no residual, in either shape.
+ *
+ * THE SAVING IS A DIFFERENCE OF PRE-ROUND TOTALS (migration 048). Both grand
+ * totals are rupee-rounded, and each carries its own round-off of up to half a
+ * rupee, so subtracting them would book that rounding noise as "tax on the
+ * waived charge" — or, worse, report a reduction SMALLER than the charge itself
+ * (240.00 against 240.04), which is a control document contradicting its own
+ * arithmetic. The pre-round figures differ by exactly the charge and the tax
+ * that rode on it, so `amount_waived + tax_on_waived === grand_total_reduction`
+ * stays exact. `grand_total_with` / `grand_total_without` stay the rounded,
+ * payable figures, because those are what the till showed before and after.
  *
  * THE TWO SHAPES, and why one number would have been wrong for half the fleet:
  *
@@ -539,7 +631,7 @@ export function quoteServiceChargeWaiver(
     withCharge.taxes.filter((t) => SERVICE_CHARGE_NAME.test(t.name)).reduce((s, t) => s + t.amount, 0),
   );
   const amount_waived = round2(withCharge.service_charge + scLineAmount);
-  const reduction = round2(withCharge.grand_total - withoutCharge.grand_total);
+  const reduction = round2(withCharge.pre_round_total - withoutCharge.pre_round_total);
   // Never negative: a "waiver" that increased the bill would mean the two calls
   // disagreed about something other than the charge, and clamping is safer than
   // recording a negative saving on a control document. Unreachable with the
@@ -592,8 +684,8 @@ export function quoteServiceChargeWaiver(
 // caller asks this instead of assembling the pair itself.
 //
 // IT ALSO ANSWERS "WAS ANYTHING ACTUALLY REMOVED", because the printers need
-// that and were deriving it wrongly too: the Opted-out line and the
-// voluntary-charge disclaimer both keyed off `settings.service_charge > 0`,
+// that and were deriving it wrongly too: the (since retired) Opted-out line and
+// the voluntary-charge disclaimer both keyed off `settings.service_charge > 0`,
 // which is 0 on precisely the tax_line tenant being overcharged — so that bill
 // did not merely charge the guest, it declined to admit the charge existed.
 // `service_charge_removed` / `service_charge_applied` are that answer in both
@@ -653,7 +745,8 @@ export function resolveServiceChargeConfig(
   const basis: ServiceChargeBasis =
     service_line !== null ? "tax_line" : (scPct > 0 ? "restaurant_percent" : "none");
   // NOMINAL, not effective. In either single shape this IS the configured
-  // percentage, which is what the Opted-out line prints. A tenant carrying both
+  // percentage — a label for the audit line and the waiver card, never a
+  // printed rung (a removed charge prints no line). A tenant carrying both
   // is charging twice and the two legs sit on DIFFERENT bases (the percent leg
   // on the discounted subtotal, the tax line on subtotal + that leg), so their
   // sum is a label rather than an arithmetic claim; the money-truth for that
@@ -839,9 +932,13 @@ export function allocateTenderAmounts(grandTotal: number, parts: number): number
 // holds because each rung's own allocation conserves; the row holds by
 // construction. This works because the bill's own ladder satisfies the same
 // identity in paisa — computeBillCharges rounds every rung to 2dp, so
-// grand = discounted_subtotal + service_charge + tax_total exactly — and where a
-// caller hands in a ladder that does NOT, the difference is apportioned as a
-// visible `round_off` rather than quietly lost.
+// grand = discounted_subtotal + service_charge + tax_total + round_off exactly.
+// ROUND-OFF IS THE ONE RUNG THAT IS NOT APPORTIONED BY WEIGHT when the bill is
+// whole rupees (every bill since migration 048): each part is rounded to the
+// rupee instead, so every slip asks for rupees too — see
+// wholeRupeePartRoundOffs, which keeps both invariants. A ladder whose total is
+// NOT whole rupees, or not the rounding of its own rungs, has its difference
+// apportioned by weight as a visible `round_off` rather than quietly lost.
 //
 // WHY THE DISCOUNTED SUBTOTAL IS THE RUNG AND THE GROSS ONE IS DERIVED. If gross
 // and discount were allocated independently, a section whose share of the
@@ -918,7 +1015,11 @@ export interface SectionSplitPart {
   service_charge: number;
   taxes: BillTaxLine[];
   tax_total: number;
-  /** Normally 0. Non-zero only when the ladder handed in did not add up. */
+  /**
+   * What rounds this part to the rupee on a whole-rupee bill (always under a
+   * rupee either way), and sums across the parts to the bill's own round-off.
+   * On a ladder that is not whole rupees, the bill's difference apportioned.
+   */
   round_off: number;
   grand_total: number;
   /** Alias of grand_total, so a client written against `even`/`item` still renders. */
@@ -1008,6 +1109,58 @@ export function allocateInPaisa(totalPaisa: number, weights: readonly number[]):
 function sectionItemKey(line: SectionSplitLine): string {
   const variation = (line.variation ?? "").trim().toLowerCase();
   return `${line.name.trim().toLowerCase()}@@${String(orderLinePrice(line))}@@${line.nc === true ? "nc" : ""}@@${variation}`;
+}
+
+/**
+ * Each part's round-off, when the bill being split is a WHOLE-RUPEE bill — so
+ * every part is a whole-rupee slip too. Null when that cannot be done exactly,
+ * and the caller then apportions the bill's round-off by weight as before.
+ *
+ * WHY PARTS ARE ROUNDED AT ALL (migration 048). The whole bill is now paid in
+ * whole rupees. A part apportioned by weight alone would print "Food 3149.84"
+ * under a "Round off -0.16" line — a slip whose total is still in paise, next to
+ * a line announcing that the paise were rounded away. A guest paying their share
+ * is asked for rupees exactly as the table is.
+ *
+ * THE RULE, IN PAISA. Each part's pre-round total (its own net + service + tax,
+ * already apportioned and conserving) is floored to the rupee. The bill's grand
+ * total is then short of the sum of those floors by K whole rupees, and those K
+ * rupees go one each to the parts with the LARGEST dropped remainder — largest
+ * remainder again, for the reason allocateInPaisa gives: the extra rupee lands
+ * where the claim to it is biggest, never on whoever happens to be last. Ties
+ * break by position, which is weight order. A part's round-off is then its whole
+ * total minus its pre-round total.
+ *
+ * BOTH INVARIANTS SURVIVE. ROW: each part's rungs plus its round-off are its
+ * total, by construction. COLUMN: the parts' totals sum to the grand total (the
+ * floors plus exactly K rupees), and since their pre-round totals sum to the
+ * bill's, their round-offs sum to the bill's round-off. Every other rung is
+ * untouched. No part moves by a rupee or more, and no part goes negative (a floor
+ * of a non-negative amount is non-negative).
+ *
+ * WHEN IT IS NOT ATTEMPTED: the grand total is not whole rupees (a ladder built
+ * before rounding, or by hand), or K falls outside [0, parts with a remainder] —
+ * which only a ladder whose total is not the rounding of its own rungs can
+ * produce. Refusing is what keeps this exact rather than approximately right.
+ */
+function wholeRupeePartRoundOffs(partPreRoundP: readonly number[], grandP: number): number[] | null {
+  if (partPreRoundP.length === 0 || grandP % 100 !== 0) {return null;}
+  if (partPreRoundP.some((p) => !Number.isInteger(p) || p < 0)) {return null;}
+  const floors = partPreRoundP.map((p) => Math.floor(p / 100) * 100);
+  const shortP = grandP - floors.reduce((s, f) => s + f, 0);
+  if (shortP % 100 !== 0) {return null;}
+  const claims = partPreRoundP
+    .map((p, index) => ({ index, remainder: p - (floors[index] ?? 0) }))
+    .filter((c) => c.remainder > 0)
+    .sort((a, b) => (a.remainder === b.remainder ? a.index - b.index : b.remainder - a.remainder));
+  const rupees = shortP / 100;
+  if (rupees < 0 || rupees > claims.length) {return null;}
+  const totals = [...floors];
+  for (let k = 0; k < rupees; k++) {
+    const idx = claims[k].index;
+    totals[idx] = (totals[idx] ?? 0) + 100;
+  }
+  return totals.map((t, i) => t - (partPreRoundP[i] ?? 0));
 }
 
 /**
@@ -1113,7 +1266,11 @@ export function computeSectionSplit(
   // A tax total the named lines do not reconstruct is apportioned as well rather
   // than dropped: an unnamed rupee of tax is still a rupee of tax.
   const unnamedTax = allocateInPaisa(taxTotalP - namedTaxP.reduce((s, x) => s + x, 0), weights);
-  const roundOff = allocateInPaisa(grandP - (netP + serviceP + taxTotalP), weights);
+  const partTaxTotalsP = ordered.map((_, i) =>
+    taxes.reduce((s, line) => s + (line[i] ?? 0), 0) + (unnamedTax[i] ?? 0));
+  const partPreRoundP = ordered.map((_, i) => (net[i] ?? 0) + (service[i] ?? 0) + (partTaxTotalsP[i] ?? 0));
+  const roundOff = wholeRupeePartRoundOffs(partPreRoundP, grandP)
+    ?? allocateInPaisa(grandP - (netP + serviceP + taxTotalP), weights);
 
   const parts: SectionSplitPart[] = ordered.map((bucket, i) => {
     const partTaxes: BillTaxLine[] = taxLines.map((t, k) => ({
@@ -1121,8 +1278,8 @@ export function computeSectionSplit(
       percentage: t.percentage,
       amount: round2((taxes[k]?.[i] ?? 0) / 100),
     }));
-    const partTaxTotalP = taxes.reduce((s, line) => s + (line[i] ?? 0), 0) + (unnamedTax[i] ?? 0);
-    const partGrandP = (net[i] ?? 0) + (service[i] ?? 0) + partTaxTotalP + (roundOff[i] ?? 0);
+    const partTaxTotalP = partTaxTotalsP[i] ?? 0;
+    const partGrandP = (partPreRoundP[i] ?? 0) + (roundOff[i] ?? 0);
     const grand = round2(partGrandP / 100);
     return {
       key: bucket.key,

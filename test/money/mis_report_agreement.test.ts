@@ -278,6 +278,95 @@ describe("the three headline numbers agree", () => {
 
 // --- 2. CANCELLED IS NOT SALES ----------------------------------------------
 
+// --- 048. THE ROUND-OFF RUNG, THROUGH THE REAL READERS ------------------------
+//
+// Every bill is rounded to the rupee at settle and the adjustment recorded in
+// "Bills".round_off. Everything above the total is recovered by SUBTRACTION, so
+// a reader that forgot to select the column would put the paise into `net` —
+// Gaia's 4982.00 would read back as 4744.74 of food against 4745.00 ordered.
+// The fixture only returns round_off when the SQL selects it, so a reader that
+// loses the column fails here rather than in the Accounting screen.
+
+describe("the round-off rung (migration 048)", () => {
+  function roundedDb(): FixtureDb {
+    return makeDb({
+      timezone: IST,
+      bills: [
+        // The client's receipt: 4745 + SGST 118.63 + CGST 118.63 = 4982.26 -> 4982.00.
+        {
+          id: "r1", bill_no: "3001", settled_at: "2026-06-03T10:00:00.000Z", total_amt: 4982, round_off: -0.26,
+          tax_breakdown: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+          payment_method: "Cash", table_name: "T3", session_id: "SR1", covers: 2, order_id: "or1",
+        },
+        // Rounded UP: 90 + 4.50 of GST = 94.50 -> 95.00.
+        {
+          id: "r2", bill_no: "3002", settled_at: "2026-06-04T10:00:00.000Z", total_amt: 95, round_off: 0.5,
+          tax_breakdown: [{ name: "GST", percentage: 5, amount: 4.5 }],
+          payment_method: "Card", table_name: "T4", session_id: "SR2", covers: 1, order_id: "or2",
+        },
+        // Settled BEFORE rounding existed: NULL round_off, fractional total, untouched.
+        {
+          id: "r3", bill_no: "3003", settled_at: "2026-06-05T10:00:00.000Z", total_amt: 1050.5, round_off: null,
+          tax_breakdown: [{ name: "GST", percentage: 5, amount: 50.5 }],
+          payment_method: "Cash", table_name: "T5", session_id: "SR3", covers: 3, order_id: "or3",
+        },
+      ],
+      orders: [
+        order({ id: "or1", created_at: "2026-06-03T09:00:00.000Z", status: 7, items: [{ name: "Thali", quantity: 1, price: 4745 }] }),
+        order({ id: "or2", created_at: "2026-06-04T09:00:00.000Z", status: 7, items: [{ name: "Chai", quantity: 3, price: 30 }] }),
+        order({ id: "or3", created_at: "2026-06-05T09:00:00.000Z", status: 7, items: [{ name: "Dal", quantity: 1, price: 1010 }] }),
+      ],
+    });
+  }
+
+  beforeEach(() => { useFixtureDb(roundedDb()); });
+
+  test("Sales Summary: net is the food, round off is its own rung, and the ladder closes", async () => {
+    const t = (await db.GetSalesSummaryReport(RID, W)).totals;
+    expect(t.net).toBe(r2(4745 + 90 + 1000));
+    expect(t.tax).toBe(r2(237.26 + 4.5 + 50.5));
+    expect(t.round_off).toBe(0.24);
+    expect(t.grand_total).toBe(r2(4982 + 95 + 1050.5));
+    expect(r2(t.net + t.service_charge + t.tax + t.round_off)).toBe(t.grand_total);
+  });
+
+  test("Order Summary: each row's net is its food — the paise never land in it", async () => {
+    const rows = (await db.GetOrderSummaryReport(RID, { ...W, limit: 500 })).rows;
+    const byNo = new Map(rows.map((r) => [r.bill_no, r]));
+    expect(byNo.get("3001")?.net).toBe(4745);
+    expect(byNo.get("3002")?.net).toBe(90);
+    expect(byNo.get("3003")?.net).toBe(1000);
+  });
+
+  test("the three headline numbers still agree with rounded bills in the window", async () => {
+    const sales = await db.GetSalesSummaryReport(RID, W);
+    const orders = await db.GetOrderSummaryReport(RID, { ...W, limit: 500 });
+    const settle = await db.GetSettlementSummaryReport(RID, W);
+    expect(sum(orders.rows.map((r) => r.grand_total))).toBe(sales.totals.grand_total);
+    expect(settle.totals.amount).toBe(sales.totals.grand_total);
+  });
+
+  // The Overview headline reads the same bills through its own query. Its fixture
+  // answer used to drop round_off, so no test could see a rounded bill there.
+  test("the Overview headline: today's net is the food on a rounded bill, not food minus the paise", async () => {
+    const today = db.dayKeyOf(new Date(), IST);
+    useFixtureDb(makeDb({
+      timezone: IST,
+      bills: [{
+        id: "h1", bill_no: "4001", settled_at: `${today}T06:30:00.000Z`, total_amt: 4982, round_off: -0.26,
+        tax_breakdown: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+        payment_method: "Cash", table_name: "T3", session_id: "SH1", covers: 2, order_id: "oh1",
+      }],
+      orders: [order({ id: "oh1", created_at: `${today}T06:00:00.000Z`, status: 7, items: [{ name: "Thali", quantity: 1, price: 4745 }] })],
+    }));
+    const head = await db.GetOverviewHeadline(RID);
+    const sales = await db.GetSalesSummaryReport(RID, { from: today, to: today });
+    expect(head.today_net.value).toBe(4745);
+    expect(head.today_net.value).toBe(sales.totals.net);
+    expect(head.today_gross.value).toBe(4982);
+  });
+});
+
 describe("cancelled orders are not sales", () => {
   test("a voided order's food never reaches the Item Wise numbers", async () => {
     const item = await db.GetItemWiseReport(RID, { ...W, limit: 500 });
@@ -685,6 +774,144 @@ describe("Settlement Summary", () => {
     expect(cash?.refund).toBe(1060.5);
     expect(cash?.net_amount).toBe(r2((cash?.amount ?? 0) - 1060.5));
     expect(sum(settle.rows.map((r) => r.amount))).toBe(EXPECTED_GRAND);
+  });
+});
+
+// --- The Overview headline: today by payment method --------------------------
+//
+// "How much money from each payment method made in the day has to be shown."
+// The Overview's block is the Settlement Summary cut over TODAY, through the
+// same settlementByMethod — so this drives both readers over the same bills and
+// requires the same answer. The headline reads its own clock, so the fixture
+// settles its bills at noon of the restaurant's today.
+
+describe("the Overview's today-by-method block", () => {
+  function todayDb(): { db: FixtureDb; today: string } {
+    const today = db.dayKeyOf(new Date(), IST);
+    const noon = `${today}T06:30:00.000Z`; // 12:00 IST
+    const yesterday = new Date(new Date(noon).getTime() - 86_400_000).toISOString();
+    const at = (min: number): string => new Date(new Date(noon).getTime() + min * 60_000).toISOString();
+    return {
+      today,
+      db: makeDb({
+        timezone: IST,
+        bills: [
+          bill({ id: "t1", bill_no: "3001", settled_at: at(0), food: 1000, order_id: "to1", payment_method: "Cash" }),
+          bill({ id: "t2", bill_no: "3002", settled_at: at(5), food: 500, order_id: "to2", payment_method: "Upi" }),
+          // Split: cash part + card part that reconstruct the bill.
+          bill({ id: "t3", bill_no: "3003", settled_at: at(10), food: 800, order_id: "to3", payment_method: "Split",
+            payment_splits: [{ method: "Cash", amount: 500 }, { method: "Card", amount: 348.4 }] }),
+          // Split that falls short: the residual is Unallocated, never lost.
+          bill({ id: "t4", bill_no: "3004", settled_at: at(15), food: 300, order_id: "to4", payment_method: "Split",
+            payment_splits: [{ method: "Upi", amount: 100 }] }),
+          // Refunded card bill.
+          bill({ id: "t5", bill_no: "3005", settled_at: at(20), food: 100, order_id: "to5", payment_method: "Card", refund_amount: 50 }),
+          // A RELEASED table: no mode, no money. Counted in today_bills as it
+          // always was, but it must not print as "Other ₹0.00".
+          { id: "t6", bill_no: "3006", settled_at: at(25), total_amt: 0, tax_breakdown: [], payment_method: null },
+          // Yesterday's cash: month to date, never today's drawer.
+          bill({ id: "y1", bill_no: "2999", settled_at: yesterday, food: 700, payment_method: "Cash" }),
+        ],
+        orders: [
+          order({ id: "to1", created_at: at(-30), status: 7 }),
+          order({ id: "to2", created_at: at(-30), status: 7, order_type: "delivery" }),
+          order({ id: "to3", created_at: at(-30), status: 7 }),
+          order({ id: "to4", created_at: at(-30), status: 7 }),
+          order({ id: "to5", created_at: at(-30), status: 7 }),
+        ],
+      }),
+    };
+  }
+
+  test("its rows ARE the Settlement Summary's rows for today, less the ₹0 released table", async () => {
+    const { db: fixture, today } = todayDb();
+    useFixtureDb(fixture);
+    const head = await db.GetOverviewHeadline(RID);
+    const settle = await db.GetSettlementSummaryReport(RID, { from: today, to: today });
+
+    expect(head.today).toBe(today);
+    expect(head.today_by_method).toEqual(
+      settle.rows.filter((r) => r.method === "Unallocated" || r.amount !== 0 || r.refund !== 0),
+    );
+    // The report keeps the Other row (its bills column always counted it)…
+    expect(settle.rows.find((r) => r.method === "Other")).toMatchObject({ bills: 1, amount: 0 });
+    // …the headline does not print it.
+    expect(head.today_by_method.some((r) => r.method === "Other")).toBe(false);
+    // NOT the report's split_bills. The report counts t3 and t4 — two bills cut
+    // into parts — and keeps doing so. The headline's count is what both clients
+    // print as "paid across more than one method", and t4 was paid by UPI alone:
+    // its other part is the Unallocated residual. Only t3 (cash + card) was.
+    expect(settle.totals.split_bills).toBe(2);
+    expect(head.today_split_bills).toBe(1);
+    expect(head.today_unallocated).toBe(settle.totals.unallocated);
+    expect(head.today_unallocated).toBe(r2(billOf(300).total - 100));
+    expect(head.by_method.label).toBeTruthy();
+    expect(head.by_method.hint).toMatch(/gross/i);
+  });
+
+  test("THE INVARIANT: Σ today_by_method.amount === Today's gross sale", async () => {
+    useFixtureDb(todayDb().db);
+    const head = await db.GetOverviewHeadline(RID);
+    expect(sum(head.today_by_method.map((r) => r.amount))).toBe(head.today_gross.value);
+    expect(head.today_gross.value).toBe(sum([1000, 500, 800, 300, 100].map((f) => billOf(f).total)));
+  });
+
+  test("the Cash row IS the Cash collection tile — today's cash parts only", async () => {
+    useFixtureDb(todayDb().db);
+    const head = await db.GetOverviewHeadline(RID);
+    const cash = head.today_by_method.find((r) => r.method === "Cash");
+    expect(cash?.amount).toBe(head.cash_collection.value);
+    // t1 whole + t3's ₹500 cash part. Yesterday's ₹700-of-food bill is not in it.
+    expect(head.cash_collection.value).toBe(r2(billOf(1000).total + 500));
+    expect(cash?.bills).toBe(2);
+  });
+
+  test("a refund shows against the mode that took the money", async () => {
+    useFixtureDb(todayDb().db);
+    const head = await db.GetOverviewHeadline(RID);
+    const card = head.today_by_method.find((r) => r.method === "Card");
+    // t5 refunded ₹50, all card; t3's card part carried no refund.
+    expect(card?.refund).toBe(50);
+    expect(card?.net_amount).toBe(r2((card?.amount ?? 0) - 50));
+  });
+
+  test("residuals that cancel across bills still ship the Unallocated row, with its bill count", async () => {
+    // One split ₹50 short, one ₹50 over: the Unallocated bucket nets to ₹0.00
+    // and today_unallocated is 0, so neither can say anything is wrong. The row's
+    // bills column can, and it is what both clients warn off — so the ₹0 filter
+    // that drops a released table must not drop this.
+    const { db: fixture, today } = todayDb();
+    const at = fixture.bills.find((b) => b.id === "t1")!.settled_at;
+    const total = billOf(1000).total;
+    useFixtureDb({
+      ...fixture,
+      bills: [
+        bill({ id: "u1", bill_no: "4001", settled_at: at, food: 1000, order_id: "to1", payment_method: "Split",
+          payment_splits: [{ method: "Cash", amount: 600 }, { method: "Upi", amount: r2(total - 650) }] }),
+        bill({ id: "u2", bill_no: "4002", settled_at: at, food: 1000, order_id: "to3", payment_method: "Split",
+          payment_splits: [{ method: "Cash", amount: 650 }, { method: "Upi", amount: r2(total - 600) }] }),
+        { id: "u3", bill_no: "4003", settled_at: at, total_amt: 0, tax_breakdown: [], payment_method: null },
+      ],
+    });
+    const head = await db.GetOverviewHeadline(RID);
+    const settle = await db.GetSettlementSummaryReport(RID, { from: today, to: today });
+
+    expect(head.today_unallocated).toBe(0);
+    expect(settle.rows.find((r) => r.method === "Unallocated")).toMatchObject({ bills: 2, amount: 0 });
+    expect(head.today_by_method.find((r) => r.method === "Unallocated")).toMatchObject({ bills: 2, amount: 0 });
+    // The released ₹0 table is still left out, and the total still holds.
+    expect(head.today_by_method.some((r) => r.method === "Other")).toBe(false);
+    expect(sum(head.today_by_method.map((r) => r.amount))).toBe(head.today_gross.value);
+  });
+
+  test("nothing settled today is an empty list, not a row of zeroes", async () => {
+    const { db: fixture } = todayDb();
+    useFixtureDb({ ...fixture, bills: fixture.bills.filter((b) => b.id === "y1") });
+    const head = await db.GetOverviewHeadline(RID);
+    expect(head.today_bills).toBe(0);
+    expect(head.today_by_method).toEqual([]);
+    expect(head.today_split_bills).toBe(0);
+    expect(head.today_unallocated).toBe(0);
   });
 });
 

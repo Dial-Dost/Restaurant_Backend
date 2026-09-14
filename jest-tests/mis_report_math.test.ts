@@ -26,8 +26,10 @@ import {
   previousWindow,
   refundedTaxShare,
   serviceChargeBasisLabel,
+  settlementByMethod,
   sharePct,
   zeroLadder,
+  type SettlementBill,
 } from "../mis_report_math";
 import { UNCLASSIFIED_GROUP } from "../mis_capture";
 
@@ -37,16 +39,35 @@ const r2 = (n: number): number => Number(n.toFixed(2));
 
 describe("the money ladder", () => {
   // 1000 of food, 1% service charge, 5% tax on (food + charge):
-  //   net 1000 · sc 10 · tax 50.50 · grand 1060.50
-  const charges = { taxable_base: 1000, service_charge: 10, tax_total: 50.5 };
+  //   net 1000 · sc 10 · tax 50.50 · grand 1060.50 — a bill settled before
+  //   migration 048, so its round-off reads back as 0.
+  const charges = { taxable_base: 1000, service_charge: 10, tax_total: 50.5, round_off: 0 };
 
   test("net + service charge + tax + round off === grand total, exactly", () => {
     const m = composeBillMoney({ grand_total: 1060.5, charges });
     expect(r2(m.net + m.service_charge + m.tax + m.round_off)).toBe(m.grand_total);
   });
 
-  test("round off is a truthful zero — the schema records no rounding adjustment", () => {
+  test("a bill settled before rounding reports a truthful zero round off", () => {
     expect(composeBillMoney({ grand_total: 1060.5, charges }).round_off).toBe(0);
+  });
+
+  test("a rounded bill carries its RECORDED round off as a rung (migration 048)", () => {
+    // Gaia's receipt: 4745 + 237.26 of GST = 4982.26, settled at 4982.00.
+    const gaia = { taxable_base: 4745, service_charge: 0, tax_total: 237.26, round_off: -0.26 };
+    const m = composeBillMoney({ grand_total: 4982, charges: gaia });
+    expect(m.round_off).toBe(-0.26);
+    expect(m.net).toBe(4745);
+    expect(r2(m.net + m.service_charge + m.tax + m.round_off)).toBe(m.grand_total);
+  });
+
+  test("the ladder totals sum the round off like every other rung", () => {
+    const acc = zeroLadder();
+    addToLadder(acc, composeBillMoney({ grand_total: 4982, charges: { taxable_base: 4745, service_charge: 0, tax_total: 237.26, round_off: -0.26 } }));
+    addToLadder(acc, composeBillMoney({ grand_total: 1060.5, charges }));
+    addToLadder(acc, composeBillMoney({ grand_total: 95, charges: { taxable_base: 90, service_charge: 0, tax_total: 4.5, round_off: 0.5 } }));
+    expect(acc.round_off).toBe(0.24);
+    expect(r2(acc.net + acc.service_charge + acc.tax + acc.round_off)).toBe(acc.grand_total);
   });
 
   test("gross minus discount === net, so the top of the ladder is derived, not guessed", () => {
@@ -118,9 +139,9 @@ describe("refundedTaxShare", () => {
 describe("the ladder totals", () => {
   test("estimated discounts are counted separately from the discounted bills", () => {
     const acc = zeroLadder();
-    addToLadder(acc, composeBillMoney({ grand_total: 100, charges: { taxable_base: 100, service_charge: 0, tax_total: 0 }, discount_type: "flat", discount_value: 20 }));
-    addToLadder(acc, composeBillMoney({ grand_total: 90, charges: { taxable_base: 90, service_charge: 0, tax_total: 0 }, discount_type: "percent", discount_value: 10 }));
-    addToLadder(acc, composeBillMoney({ grand_total: 50, charges: { taxable_base: 50, service_charge: 0, tax_total: 0 } }));
+    addToLadder(acc, composeBillMoney({ grand_total: 100, charges: { taxable_base: 100, service_charge: 0, tax_total: 0, round_off: 0 }, discount_type: "flat", discount_value: 20 }));
+    addToLadder(acc, composeBillMoney({ grand_total: 90, charges: { taxable_base: 90, service_charge: 0, tax_total: 0, round_off: 0 }, discount_type: "percent", discount_value: 10 }));
+    addToLadder(acc, composeBillMoney({ grand_total: 50, charges: { taxable_base: 50, service_charge: 0, tax_total: 0, round_off: 0 } }));
     expect(acc.bills).toBe(3);
     expect(acc.discounted_bills).toBe(2);
     expect(acc.estimated_discount_bills).toBe(1);
@@ -189,6 +210,142 @@ describe("allocateSettlement", () => {
 
   test("a Split bill with no parsable parts falls back to the Split bucket whole", () => {
     expect(allocateSettlement(1000, "Split", [])).toEqual([{ method: "Split", amount: 1000 }]);
+  });
+});
+
+// --- The cash-up by mode -----------------------------------------------------
+//
+// settlementByMethod is the Settlement Summary's loop, lifted so the Overview's
+// "today by payment method" block is the same computation. These pin the rules
+// the owner reconciles a till against; test/money/mis_report_agreement.test.ts
+// proves the report and the headline both still read it.
+
+describe("settlementByMethod", () => {
+  const bill = (grand_total: number, payment_method: string | null, over: Partial<SettlementBill> = {}): SettlementBill =>
+    ({ grand_total, refund: 0, payment_method, splits: [], ...over });
+  const total = (rows: { amount: number }[]): number => r2(rows.reduce((s, r) => s + r.amount, 0));
+  const row = (out: ReturnType<typeof settlementByMethod>, method: string) => out.rows.find((r) => r.method === method);
+
+  test("single-mode bills group by mode, largest first, with bills and share", () => {
+    const out = settlementByMethod([bill(1060.5, "Cash"), bill(530.25, "Card"), bill(1890, "Upi"), bill(318.16, "Cash")]);
+    expect(out.rows.map((r) => r.method)).toEqual(["Upi", "Cash", "Card"]);
+    expect(row(out, "Cash")).toEqual({ method: "Cash", bills: 2, amount: 1378.66, share_pct: 36.29, refund: 0, net_amount: 1378.66 });
+    expect(out.total_amount).toBe(3798.91);
+    expect(out.split_bills).toBe(0);
+    expect(out.multi_method_bills).toBe(0);
+    expect(out.unallocated).toBe(0);
+  });
+
+  test("a Cash + UPI split counts under BOTH modes, each with its own part", () => {
+    // A ₹1,000 bill paid ₹600 cash and ₹400 UPI is ₹600 of cash, not ₹1,000.
+    const out = settlementByMethod([
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 600 }, { method: "Upi", amount: 400 }] }),
+      bill(200, "Cash"),
+    ]);
+    expect(row(out, "Cash")).toMatchObject({ bills: 2, amount: 800 });
+    expect(row(out, "Upi")).toMatchObject({ bills: 1, amount: 400 });
+    expect(out.split_bills).toBe(1);
+    expect(out.multi_method_bills).toBe(1);
+    // So the bills column adds to 3 over 2 bills — and split_bills says why.
+    expect(out.rows.reduce((s, r) => s + r.bills, 0)).toBe(3);
+    expect(out.total_amount).toBe(1200);
+  });
+
+  test("a split whose parts fall short sends the residual to Unallocated, and the total still holds", () => {
+    const out = settlementByMethod([bill(848.4, "Split", { splits: [{ method: "Cash", amount: 100 }] }), bill(100, "Upi")]);
+    expect(row(out, UNALLOCATED_METHOD)?.amount).toBe(748.4);
+    expect(out.unallocated).toBe(748.4);
+    expect(out.total_amount).toBe(948.4);
+    expect(total(out.rows)).toBe(948.4);
+  });
+
+  test("a residual is a PART but not a MODE: one real tender plus Unallocated is a split, not a multi-method bill", () => {
+    // ₹100 UPI on a ₹300 bill. Two parts, so the report's Split-tender column
+    // counts it (as it always has) — but it was paid ONE way, and a sentence
+    // saying "paid across more than one method" would be false beside the
+    // Unallocated warning that is true.
+    const out = settlementByMethod([bill(300, "Split", { splits: [{ method: "Upi", amount: 100 }] })]);
+    expect(out.rows.map((r) => r.method)).toEqual([UNALLOCATED_METHOD, "Upi"]);
+    expect(out.split_bills).toBe(1);
+    expect(out.multi_method_bills).toBe(0);
+  });
+
+  test("multi-method counts distinct real modes: a two-part split that is all cash is one mode", () => {
+    const out = settlementByMethod([
+      // Two cash parts: one mode, however many rows of the tender screen.
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 600 }, { method: "Cash", amount: 400 }] }),
+      // Cash + UPI, short by ₹100: two real modes, and a residual on top.
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 500 }, { method: "Upi", amount: 400 }] }),
+      // A ₹0 part names a mode that took no money.
+      bill(500, "Split", { splits: [{ method: "Card", amount: 500 }, { method: "Upi", amount: 0 }] }),
+    ]);
+    expect(out.split_bills).toBe(3);
+    expect(out.multi_method_bills).toBe(1);
+  });
+
+  test("residuals that cancel across bills net to ₹0 — the Unallocated row's bill count is what still says so", () => {
+    // ₹50 short on one split, ₹50 over on another. `unallocated` is a netted sum
+    // and reads 0; the row survives with both bills, which is why the headline
+    // never filters it and the clients warn off the row rather than the sum.
+    const out = settlementByMethod([
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 600 }, { method: "Upi", amount: 350 }] }),
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 650 }, { method: "Upi", amount: 400 }] }),
+      bill(0, null),
+    ]);
+    expect(out.unallocated).toBe(0);
+    expect(row(out, UNALLOCATED_METHOD)).toEqual({ method: UNALLOCATED_METHOD, bills: 2, amount: 0, share_pct: 0, refund: 0, net_amount: 0 });
+    expect(total(out.rows)).toBe(2000);
+  });
+
+  test("a sub-tolerance crumb is folded into the largest part, never an Unallocated row", () => {
+    const out = settlementByMethod([bill(1000, "Split", { splits: [{ method: "Cash", amount: 666.66 }, { method: "Card", amount: 333.33 }] })]);
+    expect(row(out, "Cash")?.amount).toBe(666.67);
+    expect(row(out, UNALLOCATED_METHOD)).toBeUndefined();
+    expect(out.unallocated).toBe(0);
+  });
+
+  test("a refund follows the bill's modes pro rata, and Collected stays what the till took", () => {
+    // ₹999.99 paid ⅓ cash, ⅔ card, ₹333.33 refunded: ₹111.11 comes off cash and
+    // ₹222.22 off card. The collected column does not move.
+    const out = settlementByMethod([
+      bill(999.99, "Split", { refund: 333.33, splits: [{ method: "Cash", amount: 333.33 }, { method: "Card", amount: 666.66 }] }),
+      bill(777.77, "Card", { refund: 77.7 }),
+    ]);
+    expect(row(out, "Cash")).toEqual({ method: "Cash", bills: 1, amount: 333.33, share_pct: 18.75, refund: 111.11, net_amount: 222.22 });
+    expect(row(out, "Card")).toMatchObject({ bills: 2, amount: 1444.43, refund: 299.92, net_amount: 1144.51 });
+    expect(out.total_amount).toBe(1777.76);
+  });
+
+  test("a released ₹0 table lands under Other with its bill count — the report never drops a row", () => {
+    // The report's bills column has always counted these. Filtering them is the
+    // headline's decision (GetOverviewHeadline), not this function's.
+    const out = settlementByMethod([bill(0, null), bill(0, null), bill(450, "Cash")]);
+    expect(row(out, "Other")).toEqual({ method: "Other", bills: 2, amount: 0, share_pct: 0, refund: 0, net_amount: 0 });
+    expect(out.total_amount).toBe(450);
+  });
+
+  test("a ₹0 bill carrying a refund cannot divide by zero", () => {
+    const out = settlementByMethod([bill(0, "Cash", { refund: 50 })]);
+    expect(row(out, "Cash")).toEqual({ method: "Cash", bills: 1, amount: 0, share_pct: null, refund: 0, net_amount: 0 });
+  });
+
+  test("nothing settled is an empty cut, not a row of zeroes", () => {
+    expect(settlementByMethod([])).toEqual({ rows: [], split_bills: 0, multi_method_bills: 0, unallocated: 0, total_amount: 0 });
+  });
+
+  test("THE INVARIANT: Σ rows.amount === Σ bill grand totals, whatever the splits say", () => {
+    const bills = [
+      bill(1060.5, "Cash"),
+      bill(848.4, "Split", { splits: [{ method: "Cash", amount: 500 }, { method: "Card", amount: 348.4 }] }),
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 800 }, { method: "Card", amount: 400 }] }),
+      bill(333.34, "Split", { splits: [{ method: "Upi", amount: 111.11 }] }),
+      bill(0, null),
+      bill(99.99, "  "),
+    ];
+    const out = settlementByMethod(bills);
+    const grand = r2(bills.reduce((s, b) => s + b.grand_total, 0));
+    expect(total(out.rows)).toBe(grand);
+    expect(out.total_amount).toBe(grand);
   });
 });
 

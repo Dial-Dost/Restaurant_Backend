@@ -142,10 +142,13 @@ export interface ReceiptOptions {
   kotNumbers?: number[];
   // Optional discount line (off the subtotal), shown before service charge.
   discount?: { amount: number; label?: string } | null;
-  // Optional service charge line (amount + percent), shown before taxes. When
-  // optedOut is true the line prints "Opted-out" instead of an amount (matches
-  // the web bill when the guest waives the voluntary charge).
-  serviceCharge?: { percent: number; amount: number; optedOut?: boolean } | null;
+  // Optional service charge line (amount + percent), shown before taxes, and
+  // ONLY when an amount above zero is charged. A charge that was removed (a
+  // recorded waiver, a zero-amount part) prints no line at all — the client's
+  // decision: "don't show service charge opted out when removed". The recorded
+  // waiver, its audit line and the MIS report still say it happened; the guest's
+  // bill reads like a bill with no charge, because it is one.
+  serviceCharge?: { percent: number; amount: number } | null;
   // Optional tax breakdown. When present, the receipt shows a Sub Total line,
   // each tax line, and a tax-inclusive TOTAL (= total + service charge + taxes).
   taxes?: ReceiptTax[];
@@ -259,13 +262,14 @@ export interface ReceiptOptions {
    * are asked to pay. The total itself is still printed verbatim and nothing
    * here is re-rounded: this line reports a difference, it does not make one.
    *
-   * A whole bill never carries one. computeBillCharges rounds every rung to 2dp,
-   * so discounted_subtotal + service_charge + tax_total IS the grand total and
-   * there is nothing to disclose — which is why every receipt printed before
-   * this field existed stays byte-identical. It exists for a SPLIT PART, where
-   * a whole bill's round-off is apportioned between the parts, and a part that
-   * silently swallowed its share would be a slip whose own lines do not sum to
-   * its own total.
+   * Since migration 048 a whole bill carries one: computeBillCharges rounds
+   * the grand total to the rupee and hands back the adjustment, and /print/bill
+   * and the settled reprint pass it straight through — "Round off -0.26" above
+   * "Grand Total 4982.00", as on the client's own receipt. A bill that was
+   * already whole (or was settled before rounding) passes 0 and prints exactly
+   * what it always did. A SPLIT PART carries its own share, and a part that
+   * silently swallowed it would be a slip whose own lines do not sum to its own
+   * total.
    */
   roundOff?: number | null;
   /**
@@ -1103,7 +1107,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   // --- Totals ---------------------------------------------------------------
   const totalQty = opts.items.reduce((s, it) => s + Math.max(1, Math.round(Number(it.quantity) || 1)), 0);
   const taxLines = (opts.taxes ?? []).filter((t) => Number(t.amount) > 0);
-  const sc = opts.serviceCharge && (Number(opts.serviceCharge.amount) > 0 || opts.serviceCharge.optedOut) ? opts.serviceCharge : null;
+  const sc = opts.serviceCharge && Number(opts.serviceCharge.amount) > 0 ? opts.serviceCharge : null;
   const discountAmt = opts.discount && Number(opts.discount.amount) > 0 ? Number(opts.discount.amount) : 0;
 
   // THE LADDER SITS IN THE RIGHT-HAND BLOCK, AS ON THE CLIENT'S BILL: every
@@ -1119,7 +1123,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   const AMT = billColumns(W).COL_TOTAL;
   const subtotalText = Number(opts.total).toFixed(2);
   const discountText = discountAmt > 0 ? `-${discountAmt.toFixed(2)}` : "";
-  const scText = sc ? (sc.optedOut ? "Opted-out" : Number(sc.amount).toFixed(2)) : "";
+  const scText = sc ? Number(sc.amount).toFixed(2) : "";
   const taxTexts = taxLines.map((t) => Number(t.amount).toFixed(2));
 
   // THE GRAND TOTAL IS NOT COMPUTED HERE WHEN THE CALLER SUPPLIES ONE.
@@ -1129,8 +1133,8 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   // against the bill. This renderer printing its own arithmetic on top of that —
   // in particular the whole-rupee Math.round below — is how a bill of 797.55
   // came to be SETTLED at 797.55 and PRINTED as 798. So when `grandTotal` is
-  // given it is printed exactly as received, with no round-off line, because
-  // there is no rounding left to disclose.
+  // given it is printed exactly as received, and the only round-off line beside
+  // it is the one the billing layer supplies in `roundOff` — never one made here.
   //
   // The legacy branch is kept for callers that pass no grandTotal, so nothing
   // that has not been migrated changes its figures.
@@ -1141,7 +1145,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // The one thing that IS printed alongside a supplied total: a round-off the
     // billing layer already computed, so the lines above add up to the total
     // below. It is reported, not derived — see `roundOff`. Absent, null or zero
-    // prints nothing, which is every whole bill.
+    // prints nothing, which is every bill that was already whole rupees.
     const disclosed = Number(opts.roundOff);
     if (opts.roundOff != null && Number.isFinite(disclosed) && Math.round(disclosed * 100) !== 0) {
       roundOffText = (disclosed > 0 ? "+" : "") + disclosed.toFixed(2);
@@ -1344,9 +1348,9 @@ export interface SplitReceipt {
  * guarantee is exact in paisa; this renderer's job is not to spend it.
  *
  * A ONE-PART SPLIT IS NOT A SPLIT. A table whose whole bill falls in one section
- * gets no part banner, its round-off is zero, and every other field is the
- * bill's own — so what comes off the roll is byte-for-byte the bill that table
- * prints today. The rule lives here rather than in each caller, because a
+ * gets no part banner, its round-off is the bill's own, and every other field is
+ * the bill's own — so what comes off the roll is byte-for-byte the bill that
+ * table prints today. The rule lives here rather than in each caller, because a
  * caller that forgot it would quietly start printing a different document for
  * the commonest case there is.
  *
@@ -1373,7 +1377,9 @@ export function buildSplitReceiptsBase64(
       index: 1,
       of: 1,
       grandTotal: Number(opts.grandTotal ?? opts.total) || 0,
-      escBase64: buildReceiptBase64({ ...opts, kind: "bill", splitPart: null, roundOff: null }, width),
+      // The bill's OWN round-off stays: since migration 048 a whole bill carries
+      // one, and this fallback is the whole bill.
+      escBase64: buildReceiptBase64({ ...opts, kind: "bill", splitPart: null }, width),
     }];
   }
 
@@ -1387,7 +1393,6 @@ export function buildSplitReceiptsBase64(
     const label = String(part.label ?? "").trim();
     const service = Number(part.service_charge) || 0;
     const discount = Number(part.discount) || 0;
-    const optedOut = opts.serviceCharge?.optedOut === true;
     const grandTotal = Number(part.grand_total) || 0;
     const escBase64 = buildReceiptBase64({
       ...opts,
@@ -1400,11 +1405,10 @@ export function buildSplitReceiptsBase64(
       // coupon was applied to the bill.
       discount: discount > 0 ? { amount: discount, label: opts.discount?.label } : null,
       // The PERCENTAGE is the bill's; the AMOUNT is this part's share of it. A
-      // waived charge stays waived on every part — `optedOut` prints the word
-      // instead of a figure, which is the whole point of a waiver being visible
-      // on the paper rather than inferred from a missing line.
-      serviceCharge: service > 0 || optedOut
-        ? { percent: Number(opts.serviceCharge?.percent) || 0, amount: service, ...(optedOut ? { optedOut: true } : {}) }
+      // part charged nothing — a waived bill, or a section allocated no share —
+      // prints no service-charge line, exactly as the whole bill does.
+      serviceCharge: service > 0
+        ? { percent: Number(opts.serviceCharge?.percent) || 0, amount: service }
         : null,
       taxes: Array.isArray(part.taxes) ? part.taxes : [],
       roundOff: Number(part.round_off) || 0,
@@ -1413,9 +1417,8 @@ export function buildSplitReceiptsBase64(
       // voluntary service charge is included to support our staff" printed on a
       // part that carries no such charge is a false statement on a tax document,
       // and it invites a guest to ask for the removal of something they were
-      // never charged. A waived part keeps it: there the sentence is exactly
-      // what explains the "Opted-out" line above it.
-      serviceChargeNote: service > 0 || optedOut ? opts.serviceChargeNote : null,
+      // never charged — and a waived bill's parts are charged none.
+      serviceChargeNote: service > 0 ? opts.serviceChargeNote : null,
       splitPart: of > 1 ? { index, of, label } : null,
     }, width);
     return { key: String(part.key ?? "").trim() || String(index), label, index, of, grandTotal, escBase64 };
