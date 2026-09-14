@@ -5,6 +5,8 @@ import {
   computeBillCharges,
   computeCouponDiscount,
   computeBillSplit,
+  roundBillTotal,
+  toPaisa,
 } from "../billing_math";
 
 describe("round2", () => {
@@ -53,7 +55,7 @@ describe("computeBillTaxes", () => {
 
 describe("computeBillCharges — ordering & totals", () => {
   test("discount → service charge → tax, in that order", () => {
-    // 100 - 20 = 80; +5% SC = 4 -> 84; +5% GST = 4.2 -> grand 88.2
+    // 100 - 20 = 80; +5% SC = 4 -> 84; +5% GST = 4.2 -> 88.20, rounded to 88
     const r = computeBillCharges(100, [{ name: "GST", percentage: 5 }], 5, true, {
       type: "flat",
       value: 20,
@@ -63,11 +65,13 @@ describe("computeBillCharges — ordering & totals", () => {
     expect(r.discounted_subtotal).toBe(80);
     expect(r.service_charge).toBe(4);
     expect(r.tax_total).toBe(4.2);
-    expect(r.grand_total).toBe(88.2);
+    expect(r.pre_round_total).toBe(88.2);
+    expect(r.round_off).toBe(-0.2);
+    expect(r.grand_total).toBe(88);
   });
 
   test("percent discount", () => {
-    // 10% off 100 = 90; no SC; 5% GST = 4.5 -> 94.5
+    // 10% off 100 = 90; no SC; 5% GST = 4.5 -> 94.50, and .50 rounds UP to 95
     const r = computeBillCharges(100, [{ name: "GST", percentage: 5 }], 0, true, {
       type: "percent",
       value: 10,
@@ -75,7 +79,9 @@ describe("computeBillCharges — ordering & totals", () => {
     expect(r.discount).toBe(10);
     expect(r.discounted_subtotal).toBe(90);
     expect(r.service_charge).toBe(0);
-    expect(r.grand_total).toBe(94.5);
+    expect(r.pre_round_total).toBe(94.5);
+    expect(r.round_off).toBe(0.5);
+    expect(r.grand_total).toBe(95);
   });
 
   test("includeServiceCharge=false suppresses SC even if a percent is configured", () => {
@@ -104,17 +110,79 @@ describe("computeBillCharges — ordering & totals", () => {
 
   test("no discount argument behaves like a zero discount", () => {
     const r = computeBillCharges(100, [{ name: "GST", percentage: 5 }], 10);
-    // 100 +10% SC = 110; +5% GST = 5.5 -> 115.5
+    // 100 +10% SC = 110; +5% GST = 5.5 -> 115.50 -> 116
     expect(r.discount).toBe(0);
     expect(r.discount_type).toBeNull();
     expect(r.service_charge).toBe(10);
-    expect(r.grand_total).toBe(115.5);
+    expect(r.grand_total).toBe(116);
   });
 
   test("a zero-value discount does not flip discount_type on", () => {
     const r = computeBillCharges(100, null, 0, true, { type: "percent", value: 0 });
     expect(r.discount).toBe(0);
     expect(r.discount_type).toBeNull();
+  });
+});
+
+// Migration 048 — the bill is rounded ONCE, in computeBillCharges, to the nearest
+// rupee, half up, in integer paisa. These pin the rule itself; the ladder
+// identity below pins that nothing else on the bill moved to make room for it.
+describe("roundBillTotal — nearest rupee, half up", () => {
+  test.each([
+    // [pre-round, grand, round_off]
+    [4982.26, 4982, -0.26], // the client's own receipt (4745 + 118.63 + 118.63)
+    [4982.25, 4982, -0.25],
+    [100.49, 100, -0.49],
+    [100.5, 101, 0.5], // .50 goes UP (CGST Act s.170)
+    [100.51, 101, 0.49],
+    [0.4, 0, -0.4],
+    [0.5, 1, 0.5],
+    [0, 0, 0],
+    [2501, 2501, 0], // already whole: nothing to disclose
+  ])("%p -> %p (round off %p)", (pre, grand, off) => {
+    const r = roundBillTotal(pre);
+    expect(r.grand_total).toBe(grand);
+    expect(r.round_off).toBe(off);
+  });
+
+  test("a float that is not quite its paisa (0.1 + 0.2) rounds by its paisa, not its noise", () => {
+    expect(roundBillTotal(0.1 + 0.2)).toEqual({ grand_total: 0, round_off: -0.3 });
+    expect(roundBillTotal(1.1 + 2.2 + 0.2)).toEqual({ grand_total: 4, round_off: 0.5 });
+  });
+
+  test("zero never comes back as negative zero", () => {
+    expect(Object.is(roundBillTotal(12).round_off, -0)).toBe(false);
+  });
+});
+
+describe("computeBillCharges — the rounded ladder closes, and no rung but the total moves", () => {
+  const TAX = [{ name: "SGST", percentage: 2.5 }, { name: "CGST", percentage: 2.5 }];
+
+  test("THE CLIENT'S RECEIPT: 4745 + SGST 118.63 + CGST 118.63 = 4982.00, round off -0.26", () => {
+    const r = computeBillCharges(4745, TAX, 0, true, null);
+    expect(r.taxes.map((t) => t.amount)).toEqual([118.63, 118.63]);
+    expect(r.tax_total).toBe(237.26);
+    expect(r.pre_round_total).toBe(4982.26);
+    expect(r.round_off).toBe(-0.26);
+    expect(r.grand_total).toBe(4982);
+  });
+
+  test("across 4,000 bills: whole rupees, |round off| <= 0.50, and the identity holds to the paisa", () => {
+    let seed = 20260914;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    for (let i = 0; i < 4000; i++) {
+      const subtotal = Math.round(rand() * 5_000_000) / 100;
+      const sc = [0, 5, 7.5, 10][i % 4] ?? 0;
+      const discount = i % 3 === 0 ? { type: "percent" as const, value: Math.round(rand() * 40) } : null;
+      const r = computeBillCharges(subtotal, TAX, sc, true, discount);
+      expect(toPaisa(r.grand_total) % 100).toBe(0);
+      expect(Math.abs(toPaisa(r.round_off))).toBeLessThanOrEqual(50);
+      expect(toPaisa(r.discounted_subtotal) + toPaisa(r.service_charge) + toPaisa(r.tax_total) + toPaisa(r.round_off))
+        .toBe(toPaisa(r.grand_total));
+      expect(toPaisa(r.pre_round_total) + toPaisa(r.round_off)).toBe(toPaisa(r.grand_total));
+      // The tax is on the food (+ service charge), never on a rounded base.
+      expect(r.tax_total).toBe(computeBillTaxes(round2(r.discounted_subtotal + r.service_charge), TAX).tax_total);
+    }
   });
 });
 

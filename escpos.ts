@@ -259,13 +259,14 @@ export interface ReceiptOptions {
    * are asked to pay. The total itself is still printed verbatim and nothing
    * here is re-rounded: this line reports a difference, it does not make one.
    *
-   * A whole bill never carries one. computeBillCharges rounds every rung to 2dp,
-   * so discounted_subtotal + service_charge + tax_total IS the grand total and
-   * there is nothing to disclose — which is why every receipt printed before
-   * this field existed stays byte-identical. It exists for a SPLIT PART, where
-   * a whole bill's round-off is apportioned between the parts, and a part that
-   * silently swallowed its share would be a slip whose own lines do not sum to
-   * its own total.
+   * Since migration 048 a whole bill carries one: computeBillCharges rounds
+   * the grand total to the rupee and hands back the adjustment, and /print/bill
+   * and the settled reprint pass it straight through — "Round off -0.26" above
+   * "Grand Total 4982.00", as on the client's own receipt. A bill that was
+   * already whole (or was settled before rounding) passes 0 and prints exactly
+   * what it always did. A SPLIT PART carries its own share, and a part that
+   * silently swallowed it would be a slip whose own lines do not sum to its own
+   * total.
    */
   roundOff?: number | null;
   /**
@@ -1129,8 +1130,8 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   // against the bill. This renderer printing its own arithmetic on top of that —
   // in particular the whole-rupee Math.round below — is how a bill of 797.55
   // came to be SETTLED at 797.55 and PRINTED as 798. So when `grandTotal` is
-  // given it is printed exactly as received, with no round-off line, because
-  // there is no rounding left to disclose.
+  // given it is printed exactly as received, and the only round-off line beside
+  // it is the one the billing layer supplies in `roundOff` — never one made here.
   //
   // The legacy branch is kept for callers that pass no grandTotal, so nothing
   // that has not been migrated changes its figures.
@@ -1141,7 +1142,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // The one thing that IS printed alongside a supplied total: a round-off the
     // billing layer already computed, so the lines above add up to the total
     // below. It is reported, not derived — see `roundOff`. Absent, null or zero
-    // prints nothing, which is every whole bill.
+    // prints nothing, which is every bill that was already whole rupees.
     const disclosed = Number(opts.roundOff);
     if (opts.roundOff != null && Number.isFinite(disclosed) && Math.round(disclosed * 100) !== 0) {
       roundOffText = (disclosed > 0 ? "+" : "") + disclosed.toFixed(2);
@@ -1344,9 +1345,9 @@ export interface SplitReceipt {
  * guarantee is exact in paisa; this renderer's job is not to spend it.
  *
  * A ONE-PART SPLIT IS NOT A SPLIT. A table whose whole bill falls in one section
- * gets no part banner, its round-off is zero, and every other field is the
- * bill's own — so what comes off the roll is byte-for-byte the bill that table
- * prints today. The rule lives here rather than in each caller, because a
+ * gets no part banner, its round-off is the bill's own, and every other field is
+ * the bill's own — so what comes off the roll is byte-for-byte the bill that
+ * table prints today. The rule lives here rather than in each caller, because a
  * caller that forgot it would quietly start printing a different document for
  * the commonest case there is.
  *
@@ -1373,7 +1374,9 @@ export function buildSplitReceiptsBase64(
       index: 1,
       of: 1,
       grandTotal: Number(opts.grandTotal ?? opts.total) || 0,
-      escBase64: buildReceiptBase64({ ...opts, kind: "bill", splitPart: null, roundOff: null }, width),
+      // The bill's OWN round-off stays: since migration 048 a whole bill carries
+      // one, and this fallback is the whole bill.
+      escBase64: buildReceiptBase64({ ...opts, kind: "bill", splitPart: null }, width),
     }];
   }
 

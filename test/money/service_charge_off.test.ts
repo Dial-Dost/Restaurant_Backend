@@ -99,8 +99,12 @@ describe("F2 — a bill printed WITHOUT the charge costs the guest less, in ever
           const withCharge = printedBill(shape, subtotal, false).charges;
           const without = printedBill(shape, subtotal, true).charges;
           // The one assertion this entire file exists for. On the shipped code
-          // this was an EQUALITY in the tax_line shape.
-          expect(without.grand_total).toBeLessThan(withCharge.grand_total);
+          // this was an EQUALITY in the tax_line shape. Asserted BEFORE the
+          // rupee rounding of migration 048: on a one-rupee bill the charge is
+          // ten paise, which both totals can round away — the charge still came
+          // off, and the payable total can never go UP for it.
+          expect(without.pre_round_total).toBeLessThan(withCharge.pre_round_total);
+          expect(without.grand_total).toBeLessThanOrEqual(withCharge.grand_total);
         },
       );
 
@@ -113,7 +117,8 @@ describe("F2 — a bill printed WITHOUT the charge costs the guest less, in ever
         // The two ladders and the quote are three readings of one subtraction;
         // if they ever disagree, the bill the guest pays and the saving the
         // waiver record claims have come apart.
-        expect(round2(withCharge.grand_total - without.grand_total)).toBe(quote.grand_total_reduction);
+        // Pre-round: the rounded totals each carry their own round-off (048).
+        expect(round2(withCharge.pre_round_total - without.pre_round_total)).toBe(quote.grand_total_reduction);
         expect(quote.grand_total_reduction).toBe(round2(quote.amount_waived + quote.tax_on_waived));
         expect(quote.grand_total_with).toBe(withCharge.grand_total);
         expect(quote.grand_total_without).toBe(without.grand_total);
@@ -167,12 +172,12 @@ describe("F2 — a bill printed WITHOUT the charge costs the guest less, in ever
 
       test.each(SUBTOTALS)("subtotal %p: the waived ladder still conserves, to the paisa", (subtotal) => {
         const { charges } = printedBill(shape, subtotal, true);
-        // subtotal - discount + service_charge + tax_total === grand_total.
+        // subtotal - discount + service_charge + tax_total + round_off === grand_total.
         // Compared in whole paisa for the reason billing_math.ts's TENDERS
         // header gives: 33.33 + 33.33 + 33.34 is not 100 in a double.
         const rungs =
           toPaisa(charges.subtotal) - toPaisa(charges.discount) +
-          toPaisa(charges.service_charge) + toPaisa(charges.tax_total);
+          toPaisa(charges.service_charge) + toPaisa(charges.tax_total) + toPaisa(charges.round_off);
         expect(rungs).toBe(toPaisa(charges.grand_total));
         expect(toPaisa(charges.discounted_subtotal)).toBe(toPaisa(charges.subtotal) - toPaisa(charges.discount));
       });
@@ -186,7 +191,7 @@ describe("F2 — a bill printed WITHOUT the charge costs the guest less, in ever
         expect(without.discount).toBe(withCharge.discount);
         expect(without.discounted_subtotal).toBe(withCharge.discounted_subtotal);
         const quote = quoteServiceChargeWaiver(2400, shape.taxConfig, shape.scPct, discount);
-        expect(round2(withCharge.grand_total - without.grand_total)).toBe(quote.grand_total_reduction);
+        expect(round2(withCharge.pre_round_total - without.pre_round_total)).toBe(quote.grand_total_reduction);
       });
     });
   }

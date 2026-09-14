@@ -1,9 +1,11 @@
 // THE CORE MONEY INVARIANT, as pure arithmetic:
 //
-//     taxable_base + service_charge + tax_total === grand_total
+//     taxable_base + service_charge + tax_total + round_off === grand_total
 //
 // Every bill ever written must satisfy it, in both shapes a service charge
-// occurs in. These tests need no database and no fixture — they pin the shared
+// occurs in. round_off (migration 048) is what rounds the total to the rupee; it
+// is 0 on every bill settled before rounding existed, which is why the older
+// three-rung form of this identity was the same statement. These tests need no database and no fixture — they pin the shared
 // arithmetic in billing_math.ts that the write side (settle) uses to BUILD a
 // bill, so a bill can never be stored in a state the read side cannot decompose.
 // The read side's half of the contract is in report_agreement.test.ts.
@@ -59,8 +61,10 @@ describe("core invariant — shape (a): Restaurant.service_charge percent", () =
   test.each(cases)("subtotal %p", ({ subtotal, sc, discount }) => {
     const r = computeBillCharges(subtotal, DEFAULT_TAX_ONLY, sc, true, discount ?? null);
     // discounted_subtotal IS the taxable base: what was charged for food, after
-    // discount, before service charge and tax.
-    expect(round2(r.discounted_subtotal + r.service_charge + r.tax_total)).toBe(r.grand_total);
+    // discount, before service charge and tax. The round-off is the fourth rung.
+    expect(toPaisa(r.discounted_subtotal) + toPaisa(r.service_charge) + toPaisa(r.tax_total) + toPaisa(r.round_off))
+      .toBe(toPaisa(r.grand_total));
+    expect(toPaisa(r.grand_total) % 100).toBe(0);
     // No breakdown line may be a service charge in this shape — the charge is
     // folded into the amount the taxes were computed on instead.
     expect(r.taxes.some((t) => isServiceCharge(t.name))).toBe(false);
@@ -208,7 +212,12 @@ describe("section split — the parts recompose the bill, rung by rung", () => {
       expect(paisa(part.discounted_subtotal) + paisa(part.service_charge) + paisa(part.tax_total) + paisa(part.round_off))
         .toBe(paisa(part.grand_total));
       expect(part.grand_total).toBeGreaterThanOrEqual(0);
+      // A whole-rupee bill splits into whole-rupee parts, none moved a rupee.
+      expect(paisa(part.grand_total) % 100).toBe(0);
+      expect(Math.abs(paisa(part.round_off))).toBeLessThan(100);
     }
+    // And the round-off is a column like every other rung.
+    expect(sumPaisa(r.parts.map((p) => paisa(p.round_off)))).toBe(paisa(bill.round_off));
   });
 
   test("the service charge is apportioned in BOTH shapes it occurs in", () => {

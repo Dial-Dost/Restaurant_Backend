@@ -28,24 +28,27 @@
  *     = net            closedBillCharges().taxable_base   ← THE ANCHOR
  *     + service_charge closedBillCharges().service_charge
  *     + tax            closedBillCharges().tax_total
- *     + round_off      ALWAYS 0 — the schema stores no rounding adjustment.
+ *     + round_off      closedBillCharges().round_off  ("Bills".round_off, 048)
  *     ────────────────────────────────────────────────────────────────────────
  *     = grand_total    Bills.total_amt   (TAX-INCLUSIVE, already net of discount)
  *
  * WHY `net` IS THE ANCHOR AND `gross` IS DERIVED UPWARD. The only stored money
  * fact on a settled bill is total_amt, the tax-inclusive grand total. Everything
  * above it is recovered by SUBTRACTION inside closedBillCharges, which is what
- * makes `net + service_charge + tax === grand_total` hold EXACTLY, per bill, in
+ * makes `net + service_charge + tax + round_off === grand_total` hold EXACTLY, per bill, in
  * both service-charge shapes. Building the ladder the other way round — summing
  * reconstructed item lines up to a total — would leave a residual on every bill
  * whose items cannot be rebuilt, and a control report with a residual is a
  * control report nobody signs.
  *
- * ROUND OFF is reported as 0 and said so out loud. No column, no bill field and
- * no settle path records a rounding adjustment, so the ladder closes exactly and
- * there is nothing to report. It is carried as an explicit zero rather than
- * omitted because "where is the round off?" is the first question an auditor asks
- * of an Indian bill, and a silent absence reads as a missing number.
+ * ROUND OFF is a real rung since migration 048. Every bill is rounded to the
+ * rupee inside computeBillCharges and the settle paths record the adjustment in
+ * "Bills".round_off beside total_amt, so it is READ, never derived: subtracting
+ * it before the charges are split is what keeps the paise out of `net` (and so
+ * out of APC and GST turnover). A bill settled before rounding existed has NULL
+ * there, which reads as 0 — exactly what it was. It is carried even when zero,
+ * because "where is the round off?" is the first question an auditor asks of an
+ * Indian bill, and a silent absence reads as a missing number.
  *
  * CANCELLED IS NOT SALES. "Orders".status = 5 never contributes to any revenue
  * figure anywhere (it appears only as the SUBJECT of the Void report).
@@ -112,9 +115,9 @@ export interface BillMoney {
   net: number;
   service_charge: number;
   tax: number;
-  /** Always 0 — the schema records no rounding adjustment. Carried, not hidden. */
+  /** "Bills".round_off (migration 048): what rounded the bill to the rupee. 0 before it. */
   round_off: number;
-  /** "Bills".total_amt. net + service_charge + tax, exactly. */
+  /** "Bills".total_amt. net + service_charge + tax + round_off, exactly. */
   grand_total: number;
   /** "Bills".refund_amount. Reverses a TAX-INCLUSIVE amount. */
   refund: number;
@@ -129,6 +132,7 @@ export interface BillCharges {
   taxable_base: number;
   service_charge: number;
   tax_total: number;
+  round_off: number;
 }
 
 /**
@@ -194,7 +198,7 @@ export function refundedTaxShare(grandTotal: number, refund: number, tax: number
  *
  * `charges` must come from closedBillCharges (the SAME classifier the bill
  * detail, the accounting reports and APC use), which guarantees
- * taxable_base + service_charge + tax_total === grand_total. This function does
+ * taxable_base + service_charge + tax_total + round_off === grand_total. This function does
  * not re-derive that split and must never be handed a hand-rolled one.
  */
 export function composeBillMoney(input: {
@@ -216,7 +220,7 @@ export function composeBillMoney(input: {
     net,
     service_charge,
     tax,
-    round_off: 0,
+    round_off: round2(input.charges.round_off),
     grand_total,
     refund,
     refunded_tax: refundedTaxShare(grand_total, refund, tax),
@@ -259,6 +263,7 @@ export function addToLadder(acc: LadderTotals, m: BillMoney): LadderTotals {
   acc.net = round2(acc.net + m.net);
   acc.service_charge = round2(acc.service_charge + m.service_charge);
   acc.tax = round2(acc.tax + m.tax);
+  acc.round_off = round2(acc.round_off + m.round_off);
   acc.grand_total = round2(acc.grand_total + m.grand_total);
   acc.refund = round2(acc.refund + m.refund);
   acc.refunded_tax = round2(acc.refunded_tax + m.refunded_tax);

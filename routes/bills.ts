@@ -1272,6 +1272,11 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			// records against the bill. Handing it over means the renderer has nothing
 			// left to round — see the grandTotal note in escpos.ts.
 			grandTotal: charges.grand_total,
+			// And the round-off it applied to get there (migration 048), which the
+			// renderer prints as "Round off" above the total only when it is not
+			// zero. Disclosed, not derived: the same charges object, so the paper's
+			// rungs reach the drawer's total exactly.
+			roundOff: charges.round_off,
 			currency: settings.currency ?? "₹",
 			kind,
 			feedbackUrl,
@@ -1648,6 +1653,10 @@ app.post('/print/bill/settled', validateAction(ACCOUNTING_PERM), async (req: Req
 					: null),
 			taxes: bill.taxes,
 			grandTotal: bill.grand_total,
+			// The round-off RECORDED at settle ("Bills".round_off, migration 048) —
+			// never recomputed from today's rule. 0 on a bill settled before
+			// rounding, which prints no line, exactly as the original did.
+			roundOff: bill.round_off,
 			currency: settings.currency ?? "\u20b9",
 			kind: "bill",
 			logo,
@@ -2366,6 +2375,9 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 					: null),
 			taxes: bill.taxes,
 			grandTotal: bill.grand_total,
+			// The whole bill's round-off (migration 048). Each part prints its OWN
+			// share from the split; this one is what the no-parts fallback prints.
+			roundOff: bill.round_off,
 			currency: settings.currency ?? "\u20b9",
 			kind: "bill",
 			logo,

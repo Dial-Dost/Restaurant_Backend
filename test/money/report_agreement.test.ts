@@ -258,6 +258,54 @@ describe("both service-charge shapes separate identically", () => {
 
 // --- 4. refunds ---------------------------------------------------------------
 
+// --- migration 048: the round-off ------------------------------------------
+//
+// Every bill is rounded to the rupee at settle and the adjustment recorded
+// beside total_amt. It is money in the drawer (so it is in sales), it is not
+// food (so it is not in any base), and it is not a supply (so it is not GST
+// turnover). Gaia's receipt: 4745 + SGST 118.63 + CGST 118.63 = 4982.26 -> 4982.00.
+
+describe("the round-off (migration 048)", () => {
+  const GAIA: FixtureBill = {
+    id: "g1", bill_no: "11", settled_at: "2026-06-20T08:00:00Z", total_amt: 4982, round_off: -0.26,
+    tax_breakdown: [{ name: "SGST", percentage: 2.5, amount: 118.63 }, { name: "CGST", percentage: 2.5, amount: 118.63 }],
+    payment_method: "Cash", covers: 2,
+  };
+  // Settled before rounding existed: NULL round_off, and nothing about it moves.
+  const LEGACY: FixtureBill = {
+    id: "g2", bill_no: "12", settled_at: "2026-06-21T08:00:00Z", total_amt: 1050.5,
+    tax_breakdown: [{ name: "GST", percentage: 5, amount: 50.5 }], payment_method: "Card", covers: 1,
+  };
+  const rounded = (): FixtureDb => makeDb({ bills: [GAIA, LEGACY], service_charge_percent: 0 });
+
+  test("the bill-detail reader: base is the food, round off is its own rung", async () => {
+    useFixtureDb(rounded());
+    const page = await db.ListClosedBills(RID, { limit: 200 });
+    const gaia = page.bills.find((b) => b.bill_no === "11")!;
+    expect(gaia.taxable_base).toBe(4745);
+    expect(gaia.round_off).toBe(-0.26);
+    expect(r2(gaia.taxable_base + gaia.service_charge + gaia.tax_total + gaia.round_off)).toBe(gaia.grand_total);
+    const legacy = page.bills.find((b) => b.bill_no === "12")!;
+    expect(legacy.round_off).toBe(0);
+    expect(legacy.taxable_base).toBe(1000);
+  });
+
+  test("GetSalesReport: the round-off is in sales — it is money the drawer took", async () => {
+    useFixtureDb(rounded());
+    const sales = await db.GetSalesReport(RID, FROM, TO);
+    expect(sales.total_sales).toBe(r2(4982 + 1050.5));
+    expect(sales.total_tax).toBe(r2(237.26 + 50.5));
+  });
+
+  test("GetGstReport: taxable turnover EXCLUDES the round-off", async () => {
+    useFixtureDb(rounded());
+    const gst = await db.GetGstReport(RID, FROM, TO);
+    expect(gst.total_tax).toBe(r2(237.26 + 50.5));
+    // 4745 + 1000 of supplies. With the round-off left in, this is 5744.74.
+    expect(gst.total_taxable).toBe(5745);
+  });
+});
+
 describe("refunds", () => {
   const oneBill = (refund: number): FixtureDb =>
     makeDb({

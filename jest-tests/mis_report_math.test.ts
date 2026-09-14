@@ -37,16 +37,35 @@ const r2 = (n: number): number => Number(n.toFixed(2));
 
 describe("the money ladder", () => {
   // 1000 of food, 1% service charge, 5% tax on (food + charge):
-  //   net 1000 · sc 10 · tax 50.50 · grand 1060.50
-  const charges = { taxable_base: 1000, service_charge: 10, tax_total: 50.5 };
+  //   net 1000 · sc 10 · tax 50.50 · grand 1060.50 — a bill settled before
+  //   migration 048, so its round-off reads back as 0.
+  const charges = { taxable_base: 1000, service_charge: 10, tax_total: 50.5, round_off: 0 };
 
   test("net + service charge + tax + round off === grand total, exactly", () => {
     const m = composeBillMoney({ grand_total: 1060.5, charges });
     expect(r2(m.net + m.service_charge + m.tax + m.round_off)).toBe(m.grand_total);
   });
 
-  test("round off is a truthful zero — the schema records no rounding adjustment", () => {
+  test("a bill settled before rounding reports a truthful zero round off", () => {
     expect(composeBillMoney({ grand_total: 1060.5, charges }).round_off).toBe(0);
+  });
+
+  test("a rounded bill carries its RECORDED round off as a rung (migration 048)", () => {
+    // Gaia's receipt: 4745 + 237.26 of GST = 4982.26, settled at 4982.00.
+    const gaia = { taxable_base: 4745, service_charge: 0, tax_total: 237.26, round_off: -0.26 };
+    const m = composeBillMoney({ grand_total: 4982, charges: gaia });
+    expect(m.round_off).toBe(-0.26);
+    expect(m.net).toBe(4745);
+    expect(r2(m.net + m.service_charge + m.tax + m.round_off)).toBe(m.grand_total);
+  });
+
+  test("the ladder totals sum the round off like every other rung", () => {
+    const acc = zeroLadder();
+    addToLadder(acc, composeBillMoney({ grand_total: 4982, charges: { taxable_base: 4745, service_charge: 0, tax_total: 237.26, round_off: -0.26 } }));
+    addToLadder(acc, composeBillMoney({ grand_total: 1060.5, charges }));
+    addToLadder(acc, composeBillMoney({ grand_total: 95, charges: { taxable_base: 90, service_charge: 0, tax_total: 4.5, round_off: 0.5 } }));
+    expect(acc.round_off).toBe(0.24);
+    expect(r2(acc.net + acc.service_charge + acc.tax + acc.round_off)).toBe(acc.grand_total);
   });
 
   test("gross minus discount === net, so the top of the ladder is derived, not guessed", () => {
@@ -118,9 +137,9 @@ describe("refundedTaxShare", () => {
 describe("the ladder totals", () => {
   test("estimated discounts are counted separately from the discounted bills", () => {
     const acc = zeroLadder();
-    addToLadder(acc, composeBillMoney({ grand_total: 100, charges: { taxable_base: 100, service_charge: 0, tax_total: 0 }, discount_type: "flat", discount_value: 20 }));
-    addToLadder(acc, composeBillMoney({ grand_total: 90, charges: { taxable_base: 90, service_charge: 0, tax_total: 0 }, discount_type: "percent", discount_value: 10 }));
-    addToLadder(acc, composeBillMoney({ grand_total: 50, charges: { taxable_base: 50, service_charge: 0, tax_total: 0 } }));
+    addToLadder(acc, composeBillMoney({ grand_total: 100, charges: { taxable_base: 100, service_charge: 0, tax_total: 0, round_off: 0 }, discount_type: "flat", discount_value: 20 }));
+    addToLadder(acc, composeBillMoney({ grand_total: 90, charges: { taxable_base: 90, service_charge: 0, tax_total: 0, round_off: 0 }, discount_type: "percent", discount_value: 10 }));
+    addToLadder(acc, composeBillMoney({ grand_total: 50, charges: { taxable_base: 50, service_charge: 0, tax_total: 0, round_off: 0 } }));
     expect(acc.bills).toBe(3);
     expect(acc.discounted_bills).toBe(2);
     expect(acc.estimated_discount_bills).toBe(1);

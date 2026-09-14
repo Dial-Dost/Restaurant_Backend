@@ -22,7 +22,7 @@ const tillBill = {
   discount: 0, discount_type: null, discount_value: 0,
   service_charge: 50, service_charge_percent: 5, service_charge_waived: false,
   service_charge_waiver: null, taxes: [{ name: "GST", percentage: 5, amount: 50 }],
-  tax_total: 50, grand_total: 1180, nc_total: 250, covers: 4, apc: 250,
+  tax_total: 50, round_off: -0.4, grand_total: 1180, nc_total: 250, covers: 4, apc: 250,
   order_ids: ["o-1", "o-2"], order_notes: ["allergy: peanuts"],
   items: [
     { name: "Paneer Tikka", price: 250, quantity: 2, note: "allergy: peanuts", variation: "Half" },
@@ -40,9 +40,15 @@ describe("guestBillView", () => {
   test("returns ONLY the allowlisted keys — a new till-side field must not leak", () => {
     expect(Object.keys(guestBillView(tillBill)).sort()).toEqual([
       "bill_no", "coupon_code", "covers", "discount", "grand_total", "items",
-      "payment_method", "payment_status", "service_charge", "service_charge_percent",
+      "payment_method", "payment_status", "round_off", "service_charge", "service_charge_percent",
       "subtotal", "tax_total", "taxes", "total_amt",
     ]);
+  });
+
+  test("the round-off reaches the guest (migration 048) — it is on their paper, so it is on their page", () => {
+    // Without it the guest's ladder (subtotal + charges + taxes) does not reach
+    // the grand total the page asks them to pay.
+    expect(guestBillView(tillBill).round_off).toBe(-0.4);
   });
 
   test("the kitchen note never reaches the guest, on any line", () => {

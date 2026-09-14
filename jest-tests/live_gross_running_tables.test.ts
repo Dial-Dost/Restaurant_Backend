@@ -121,8 +121,9 @@ describe("6.4 — running tables are tables with orders, not tables with bills",
     // …and the floor is no longer reported empty.
     expect(page.running_tables).toBe(3);
     expect(page.running_total).toBe(Number((gross(1500) + gross(800) + gross(300)).toFixed(2)));
-    // Money rules, spelled out once: 1500 → SC 150 → tax 5% of 1650 = 82.50.
-    expect(gross(1500)).toBe(1732.5);
+    // Money rules, spelled out once: 1500 → SC 150 → tax 5% of 1650 = 82.50 →
+    // 1732.50, which rounds half up to the rupee (migration 048).
+    expect(gross(1500)).toBe(1733);
   });
 
   test("a table WITH an open bill keeps the bill's figure — discount included — and is counted once", async () => {
