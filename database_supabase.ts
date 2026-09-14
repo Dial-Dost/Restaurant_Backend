@@ -18,6 +18,7 @@
 //   6. payment pending approval
 //   7. closed
 
+import { cleanBillLogoSvg } from "./bill_logo.js";
 import { randomUUID, randomInt } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import net from "node:net";
@@ -27465,22 +27466,13 @@ export interface RestaurantSettings {
 }
 
 
-// Basic sanitization for an uploaded SVG logo: cap the size and strip the
-// script/event-handler vectors so a stored logo can't run code where it's
-// rendered. Returns "" for anything that isn't a plausible <svg> document.
+// The stored form of an uploaded SVG bill logo, or "" for anything unusable.
+// The rules live in bill_logo.ts (cleanBillLogoSvg), where they can be tested;
+// POST /restaurant/settings refuses an unusable one with a sentence BEFORE it
+// reaches here, so "" only ever means "cleared".
 export function sanitizeBillLogoSvg(input: unknown): string {
-  if (typeof input !== "string") {return "";}
-  let svg = input.trim();
-  if (!svg) {return "";}
-  if (svg.length > 100_000) {svg = svg.slice(0, 100_000);}
-  if (!/^<svg[\s>]/i.test(svg) || !/<\/svg>/i.test(svg)) {return "";}
-  // Drop <script> blocks, on*= handlers, and javascript: URLs.
-  svg = svg
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
-    .replace(/\son\w+\s*=\s*'[^']*'/gi, "")
-    .replace(/javascript:/gi, "");
-  return svg;
+  const cleaned = cleanBillLogoSvg(input);
+  return cleaned.ok ? cleaned.svg : "";
 }
 
 // Coerce a stored msg_provider value into the supported set.

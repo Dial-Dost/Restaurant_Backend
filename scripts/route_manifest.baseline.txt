@@ -156,7 +156,7 @@ mw08 USE     *                                                      | <inline(re
 0134 POST    /restaurant/branding                                   | validate                                       | 4c39a341
 0135 GET     /restaurant/timezones                                  | validate                                       | 0e348d83
 0136 GET     /restaurant/settings                                   | validate                                       | 6b4af499
-0137 POST    /restaurant/settings                                   | validate                                       | f7121462
+0137 POST    /restaurant/settings                                   | validate                                       | fc9ca024
 0138 GET     /messages                                              | validate                                       | 3e965d1e
 0139 POST    /messages/run-reminders                                | validate                                       | 5e6cd93a
 0140 GET     /notifications                                         | validate                                       | be9fe12c

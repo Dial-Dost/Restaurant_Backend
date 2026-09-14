@@ -56,7 +56,70 @@ export interface BillLogoRaster {
   height: number;
 }
 
-type SharpFactory = (input: Buffer) => any;
+type SharpFactory = (input: Buffer, options?: Record<string, unknown>) => any;
+
+/**
+ * The largest SVG bill logo accepted, in characters.
+ *
+ * The old cap was 100,000 and it TRUNCATED rather than refused: a traced logo
+ * over the cap lost its closing </svg>, the "is this an SVG" check then failed,
+ * and the logo was silently stored as nothing. Refusing with a sentence is the
+ * behaviour an owner can act on. Half a megabyte holds any real wordmark; the
+ * value travels in the settings document, so it is not unbounded either.
+ */
+export const BILL_LOGO_SVG_MAX_CHARS = 500_000;
+
+/** A usable SVG bill logo, or why it is not one. */
+export type BillLogoSvgResult =
+  | { ok: true; svg: string }
+  | { ok: false; reason: "not_svg" | "too_large" };
+
+/**
+ * THE SVG AN OWNER UPLOADS, MADE STORABLE — or refused, never silently emptied.
+ *
+ * THE BUG THIS REPLACES. The old check demanded the text START with "<svg".
+ * Almost every design tool writes something first: Illustrator, Inkscape and
+ * CorelDRAW all begin with an XML declaration ("<?xml version=…?>"), usually a
+ * generator comment, often a DOCTYPE. So the logo an owner actually has was
+ * judged "not an SVG", sanitized to "", stored as NULL — and the settings save
+ * still answered 200, so the app said "Bill logo saved." and then showed an
+ * empty card. Not one tenant in production has ever managed to store one.
+ *
+ * WHAT IT DOES NOW. Keeps exactly the <svg>…</svg> element — first opening tag
+ * to last closing tag, so nested <svg> survive — and drops everything around
+ * it. That removes the XML declaration, comments and DOCTYPE, which is also
+ * the safe thing to do with a DOCTYPE: it is where entity declarations live.
+ * Then the same script/handler/javascript: stripping as before, plus unquoted
+ * handlers (onload=alert(1)), which the quoted-only patterns missed.
+ */
+export function cleanBillLogoSvg(input: unknown): BillLogoSvgResult {
+  if (typeof input !== "string") { return { ok: false, reason: "not_svg" }; }
+  const text = input.replace(/^\uFEFF/, "").trim();
+  if (text.length > BILL_LOGO_SVG_MAX_CHARS) { return { ok: false, reason: "too_large" }; }
+  const open = text.search(/<svg[\s>]/i);
+  // The LAST closing tag, found on the text itself (a lower-cased copy can be a
+  // different length, and its indexes would not be this string's).
+  let close = -1;
+  let closeLen = 0;
+  for (const m of text.matchAll(/<\/svg\s*>/gi)) { close = m.index ?? -1; closeLen = m[0].length; }
+  if (open < 0 || close < open) { return { ok: false, reason: "not_svg" }; }
+  const svg = text
+    .slice(open, close + closeLen)
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, "")
+    .replace(/\son\w+\s*=\s*[^\s>"']+/gi, "")
+    .replace(/javascript:/gi, "");
+  return { ok: true, svg };
+}
+
+/** How much of a raster is ink, 0..1. A logo that thresholds to nothing prints nothing. */
+export function billLogoInkShare(raster: BillLogoRaster): number {
+  const bits = raster.escpos.subarray(8);
+  let ink = 0;
+  for (const byte of bits) { let b = byte; while (b) { ink += b & 1; b >>= 1; } }
+  return raster.width * raster.height > 0 ? ink / (raster.width * raster.height) : 0;
+}
 
 async function loadSharp(): Promise<SharpFactory | null> {
   try {
@@ -85,11 +148,25 @@ export async function rasterizeBillLogo(
   // type, so that failure cannot come back through a different caller.
   if (!sharp || !Buffer.isBuffer(raw) || raw.length === 0) { return null; }
   try {
+    // A VECTOR IS DRAWN AT THE SIZE IT WILL PRINT. sharp rasterizes an SVG at
+    // 72 dpi from its own width/height, and `withoutEnlargement` below (right
+    // for a PNG — never blow a small bitmap up into a blurry one) then kept that
+    // size: an SVG saved as width="120" printed as a 120-dot smudge. So an SVG
+    // is rendered at the density that makes it as wide as the space it gets.
+    const maxWidth = Math.round(targetWidth * BILL_LOGO_WIDTH_SHARE);
+    let density: number | undefined;
+    try {
+      const meta = await sharp(raw).metadata();
+      if (meta?.format === "svg" && meta.width && meta.height) {
+        const scale = Math.min(maxWidth / meta.width, BILL_LOGO_MAX_HEIGHT / meta.height);
+        if (scale > 1) { density = Math.min(2400, Math.ceil(72 * scale)); }
+      }
+    } catch {/* not readable here either; the render below returns null */}
     // Flatten first: a transparent PNG would otherwise threshold its empty
     // background to black and print a solid slab.
-    const { data, info } = await sharp(raw)
+    const { data, info } = await (density ? sharp(raw, { density }) : sharp(raw))
       .flatten({ background: "#ffffff" })
-      .resize({ width: Math.round(targetWidth * BILL_LOGO_WIDTH_SHARE), height: BILL_LOGO_MAX_HEIGHT, fit: "inside", withoutEnlargement: true })
+      .resize({ width: maxWidth, height: BILL_LOGO_MAX_HEIGHT, fit: "inside", withoutEnlargement: true })
       .threshold(128)
       .raw()
       .toBuffer({ resolveWithObject: true });
