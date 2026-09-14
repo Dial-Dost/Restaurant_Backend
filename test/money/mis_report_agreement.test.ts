@@ -748,8 +748,12 @@ describe("the Overview's today-by-method block", () => {
     expect(settle.rows.find((r) => r.method === "Other")).toMatchObject({ bills: 1, amount: 0 });
     // …the headline does not print it.
     expect(head.today_by_method.some((r) => r.method === "Other")).toBe(false);
-    expect(head.today_split_bills).toBe(settle.totals.split_bills);
-    expect(head.today_split_bills).toBe(2);
+    // NOT the report's split_bills. The report counts t3 and t4 — two bills cut
+    // into parts — and keeps doing so. The headline's count is what both clients
+    // print as "paid across more than one method", and t4 was paid by UPI alone:
+    // its other part is the Unallocated residual. Only t3 (cash + card) was.
+    expect(settle.totals.split_bills).toBe(2);
+    expect(head.today_split_bills).toBe(1);
     expect(head.today_unallocated).toBe(settle.totals.unallocated);
     expect(head.today_unallocated).toBe(r2(billOf(300).total - 100));
     expect(head.by_method.label).toBeTruthy();

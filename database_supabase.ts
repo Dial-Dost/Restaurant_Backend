@@ -36464,7 +36464,13 @@ export interface OverviewHeadline {
    * even when their residuals net to ₹0.00.
    */
   today_by_method: SettlementRow[];
-  /** Today's bills settled with more than one mode. */
+  /**
+   * Today's bills paid by more than one REAL mode — settlementByMethod's
+   * multi_method_bills, NOT the Settlement Summary's split_bills. Both clients
+   * print this as "paid across more than one method", and a 'Split' bill whose
+   * only other part is the Unallocated residual was paid one way: that bill is
+   * the Unallocated row's, and its warning, not this sentence.
+   */
   today_split_bills: number;
   /**
    * Today's money whose split parts did not add back to the bill, NETTED across
@@ -36604,7 +36610,7 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     today_by_method: byMethod.rows.filter(
       (r) => r.method === UNALLOCATED_METHOD || r.amount !== 0 || r.refund !== 0,
     ),
-    today_split_bills: byMethod.split_bills,
+    today_split_bills: byMethod.multi_method_bills,
     today_unallocated: byMethod.unallocated,
     by_method: {
       label: "Collected by payment method",

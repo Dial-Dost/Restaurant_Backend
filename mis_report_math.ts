@@ -359,8 +359,21 @@ export interface SettlementMethodRow {
 export interface SettlementByMethod {
   /** Largest amount first. Includes the Other and Unallocated buckets when used. */
   rows: SettlementMethodRow[];
-  /** Bills settled with more than one mode. */
+  /**
+   * Bills cut into more than one PART — the Settlement Summary's own count,
+   * unchanged. An Unallocated residual is a part, so a 'Split' bill whose only
+   * tender is ₹100 UPI on a ₹300 bill counts here.
+   */
   split_bills: number;
+  /**
+   * Bills whose money came in by MORE THAN ONE REAL MODE: distinct modes with
+   * money on them, the Unallocated residual not among them. The bill above —
+   * ₹100 UPI and ₹200 nobody can place — was paid one way and is missing money;
+   * a sentence saying it was "paid across more than one method" would be false,
+   * and would sit right beside the warning that is true. Use this for any copy
+   * that makes that claim.
+   */
+  multi_method_bills: number;
   /** Money that split parts failed to account for. Should always be 0. */
   unallocated: number;
   /** Σ rows.amount — equal to the bills' grand totals, by allocateSettlement. */
@@ -398,10 +411,18 @@ export interface SettlementByMethod {
 export function settlementByMethod(bills: readonly SettlementBill[]): SettlementByMethod {
   const acc = new Map<string, { bills: number; amount: number; refund: number }>();
   let splitBills = 0;
+  let multiMethodBills = 0;
   let unallocated = 0;
   for (const b of bills) {
     const parts = allocateSettlement(b.grand_total, b.payment_method, b.splits);
     if (parts.length > 1) {splitBills += 1;}
+    // Counted apart from split_bills rather than instead of it: the report's
+    // "Split-tender bills" column has always been parts.length > 1, and changing
+    // it would move a number on a report owners already reconcile against.
+    const realModes = new Set(
+      parts.filter((p) => p.method !== UNALLOCATED_METHOD && p.amount !== 0).map((p) => p.method),
+    );
+    if (realModes.size > 1) {multiMethodBills += 1;}
     for (const p of parts) {
       if (p.method === UNALLOCATED_METHOD) {unallocated = round2(unallocated + p.amount);}
       const e = acc.get(p.method) ?? { bills: 0, amount: 0, refund: 0 };
@@ -428,7 +449,9 @@ export function settlementByMethod(bills: readonly SettlementBill[]): Settlement
     }))
     .sort((a, z) => z.amount - a.amount);
 
-  return { rows, split_bills: splitBills, unallocated, total_amount: totalAmount };
+  return {
+    rows, split_bills: splitBills, multi_method_bills: multiMethodBills, unallocated, total_amount: totalAmount,
+  };
 }
 
 // --- Period-on-period comparison (Executive Summary) -------------------------

@@ -315,6 +315,11 @@ describe("the headline figures define themselves", () => {
     for (const key of ["today_by_method:", "today_split_bills:", "today_unallocated:", "by_method: {"]) {
       expect(body).toContain(key);
     }
+    // The split sentence both clients print claims MORE THAN ONE METHOD. The
+    // report's split_bills also counts a one-tender bill whose other part is the
+    // Unallocated residual, so it is the wrong count to hand them.
+    expect(body).toMatch(/today_split_bills: byMethod\.multi_method_bills,/);
+    expect(body).not.toMatch(/today_split_bills: byMethod\.split_bills/);
     // A released ₹0 table must not print as "Other ₹0.00" on the till's home
     // screen, and the filter must be at the SURFACE — the report keeps the row.
     // Unallocated is exempt: residuals net across bills, so a ₹0.00 Unallocated

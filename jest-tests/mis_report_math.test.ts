@@ -213,6 +213,7 @@ describe("settlementByMethod", () => {
     expect(row(out, "Cash")).toEqual({ method: "Cash", bills: 2, amount: 1378.66, share_pct: 36.29, refund: 0, net_amount: 1378.66 });
     expect(out.total_amount).toBe(3798.91);
     expect(out.split_bills).toBe(0);
+    expect(out.multi_method_bills).toBe(0);
     expect(out.unallocated).toBe(0);
   });
 
@@ -225,6 +226,7 @@ describe("settlementByMethod", () => {
     expect(row(out, "Cash")).toMatchObject({ bills: 2, amount: 800 });
     expect(row(out, "Upi")).toMatchObject({ bills: 1, amount: 400 });
     expect(out.split_bills).toBe(1);
+    expect(out.multi_method_bills).toBe(1);
     // So the bills column adds to 3 over 2 bills — and split_bills says why.
     expect(out.rows.reduce((s, r) => s + r.bills, 0)).toBe(3);
     expect(out.total_amount).toBe(1200);
@@ -236,6 +238,30 @@ describe("settlementByMethod", () => {
     expect(out.unallocated).toBe(748.4);
     expect(out.total_amount).toBe(948.4);
     expect(total(out.rows)).toBe(948.4);
+  });
+
+  test("a residual is a PART but not a MODE: one real tender plus Unallocated is a split, not a multi-method bill", () => {
+    // ₹100 UPI on a ₹300 bill. Two parts, so the report's Split-tender column
+    // counts it (as it always has) — but it was paid ONE way, and a sentence
+    // saying "paid across more than one method" would be false beside the
+    // Unallocated warning that is true.
+    const out = settlementByMethod([bill(300, "Split", { splits: [{ method: "Upi", amount: 100 }] })]);
+    expect(out.rows.map((r) => r.method)).toEqual([UNALLOCATED_METHOD, "Upi"]);
+    expect(out.split_bills).toBe(1);
+    expect(out.multi_method_bills).toBe(0);
+  });
+
+  test("multi-method counts distinct real modes: a two-part split that is all cash is one mode", () => {
+    const out = settlementByMethod([
+      // Two cash parts: one mode, however many rows of the tender screen.
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 600 }, { method: "Cash", amount: 400 }] }),
+      // Cash + UPI, short by ₹100: two real modes, and a residual on top.
+      bill(1000, "Split", { splits: [{ method: "Cash", amount: 500 }, { method: "Upi", amount: 400 }] }),
+      // A ₹0 part names a mode that took no money.
+      bill(500, "Split", { splits: [{ method: "Card", amount: 500 }, { method: "Upi", amount: 0 }] }),
+    ]);
+    expect(out.split_bills).toBe(3);
+    expect(out.multi_method_bills).toBe(1);
   });
 
   test("residuals that cancel across bills net to ₹0 — the Unallocated row's bill count is what still says so", () => {
@@ -285,7 +311,7 @@ describe("settlementByMethod", () => {
   });
 
   test("nothing settled is an empty cut, not a row of zeroes", () => {
-    expect(settlementByMethod([])).toEqual({ rows: [], split_bills: 0, unallocated: 0, total_amount: 0 });
+    expect(settlementByMethod([])).toEqual({ rows: [], split_bills: 0, multi_method_bills: 0, unallocated: 0, total_amount: 0 });
   });
 
   test("THE INVARIANT: Σ rows.amount === Σ bill grand totals, whatever the splits say", () => {
