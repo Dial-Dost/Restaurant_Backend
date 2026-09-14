@@ -106,6 +106,10 @@ describe("Settlement and Counter Summary: the cash-up sheet names the mode", () 
     const settle = await db.GetSettlementSummaryReport("zztest-mis", W);
     const row = settle.rows.find((r) => r.method === "Swiggy Dineout");
     expect(row?.label).toBe("Swiggy (Dineout)");
+    // The "Payment mode" column both clients' report tables (and the CSV) render
+    // is the label, and every row has one — a row without it would be a blank cell.
+    expect(settle.columns.find((c) => c.label === "Payment mode")?.key).toBe("label");
+    expect(settle.rows.every((r) => typeof r.label === "string" && r.label.length > 0)).toBe(true);
     expect(row?.amount).toBe(1200);
     expect(settle.rows.find((r) => r.method === "Upi")?.label).toBe("UPI");
     expect(settle.rows.reduce((s, r) => s + r.amount, 0)).toBe(1800);
@@ -113,5 +117,10 @@ describe("Settlement and Counter Summary: the cash-up sheet names the mode", () 
     const counter = await db.GetCounterSummaryReport("zztest-mis", W);
     const methods = counter.rows.flatMap((r) => r.by_method);
     expect(methods.find((m) => m.method === "Swiggy Dineout")).toEqual({ method: "Swiggy Dineout", label: "Swiggy (Dineout)", amount: 1200 });
+    // The one-cell spreadsheet cut reads the labels too, and still carries every rupee.
+    const cell = counter.rows.map((r) => r.payment_modes).join(" | ");
+    expect(cell).toContain("Swiggy (Dineout) 1200.00");
+    expect(cell).toContain("UPI 500.00");
+    expect(cell).not.toContain("Swiggy Dineout");
   });
 });

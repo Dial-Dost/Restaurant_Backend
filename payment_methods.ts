@@ -181,9 +181,9 @@ export function paymentNameKey(raw: unknown): string {
 }
 
 /** Names that would book free food as revenue. The editors point at NC instead. */
-const NOT_MONEY_COMP = ["complimentary", "comp", "nc", "non chargeable", "non-chargeable", "staff meal"];
+const NOT_MONEY_COMP = ["complimentary", "comp", "comps", "nc", "foc", "non chargeable", "nonchargeable", "staff meal", "staff meals"];
 /** Names that would close a bill as collected while no money has arrived. */
-const NOT_MONEY_CREDIT = ["credit", "on account", "due", "pay later"];
+const NOT_MONEY_CREDIT = ["credit", "on account", "due", "pay later", "paylater"];
 /** The cash-up sheet's own rows. */
 const REPORT_BUCKETS = ["split", "other", "unallocated"];
 
@@ -194,16 +194,64 @@ const BUILTIN_KEYS = new Map<string, BuiltinPaymentMethod>(
   Object.entries(BUILTIN_ALIASES).map(([alias, id]) => [paymentNameKey(alias), id]),
 );
 
+/** A name's words, lower-cased: "Staff-Meals (FOC)" is staff, meals, foc. */
+function paymentNameWords(raw: unknown): string[] {
+  return String(raw ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/** Whether `phrase` (one or more words) sits anywhere in `words` as whole words. */
+function hasPhraseAt(words: readonly string[], phrase: readonly string[], i: number): boolean {
+  return phrase.every((w, j) => words[i + j] === w);
+}
+
+/**
+ * Whether a name says it is NOT MONEY COLLECTED — "comp" (free food booked as
+ * sales and tax) or "credit" (a bill closed as paid with nothing received) — or
+ * null.
+ *
+ * WHOLE WORDS, ANYWHERE IN THE NAME. Matching the whole name only let "Staff
+ * Meals", "Complimentary Meal", "FOC", "On Credit", "Due Payment", "Credit/Due"
+ * and "Non Chargeable Bill" through, and every one of them books the same free
+ * or unpaid bill as takings. Whole words rather than substrings, so "Company
+ * Card" is not a comp and "Duet Pay" is not a due. The whole-name key is still
+ * checked too, which is what catches "N/C" and "Non-Chargeable".
+ *
+ * ONE REAL PAYMENT NAME CARRIES A RESERVED WORD: a credit CARD is money the
+ * acquirer pays out, so "credit" with "card" after it ("Credit Card", "HDFC
+ * Credit/Debit Card") is not the on-account meaning.
+ *
+ * Mirrored word for word in the dashboard's src/lib/payment-methods.ts and the
+ * app's lib/models/payment_modes.dart, so the editors refuse what the save will.
+ */
+export function notMoneyKind(name: string): "comp" | "credit" | null {
+  const key = paymentNameKey(name);
+  if (COMP_KEYS.has(key)) {return "comp";}
+  if (CREDIT_KEYS.has(key)) {return "credit";}
+  const words = paymentNameWords(name);
+  for (let i = 0; i < words.length; i++) {
+    if (NOT_MONEY_COMP.some((p) => hasPhraseAt(words, paymentNameWords(p), i))) {return "comp";}
+  }
+  for (let i = 0; i < words.length; i++) {
+    for (const p of NOT_MONEY_CREDIT) {
+      if (!hasPhraseAt(words, paymentNameWords(p), i)) {continue;}
+      if (p === "credit" && words.slice(i + 1).some((w) => w === "card" || w === "cards")) {continue;}
+      return "credit";
+    }
+  }
+  return null;
+}
+
 /**
  * Why a name cannot be a custom payment mode's id, or null when it can. The
  * sentence is shown to the owner verbatim, so it says what to do instead.
  */
 export function reservedReason(name: string): string | null {
   const key = paymentNameKey(name);
-  if (COMP_KEYS.has(key)) {
+  const notMoney = notMoneyKind(name);
+  if (notMoney === "comp") {
     return `"${name}" can't be a payment mode: a free meal is not money collected, and settling it as paid books it as sales and tax. Use "Mark as non-chargeable" on the bill instead.`;
   }
-  if (CREDIT_KEYS.has(key)) {
+  if (notMoney === "credit") {
     return `"${name}" can't be a payment mode: it would close the bill as paid while no money has arrived.`;
   }
   if (BUCKET_KEYS.has(key)) {
@@ -234,7 +282,7 @@ function cleanLabel(raw: unknown): string | null {
   const s = tidyPaymentName(raw);
   if (!s || s.length > PAYMENT_MODE_LABEL_MAX) {return null;}
   // eslint-disable-next-line no-control-regex
-  if (/[ -]/.test(s)) {return null;}
+  if (/[\u0000-\u001f\u007f]/.test(s)) {return null;}
   return s;
 }
 
@@ -325,13 +373,15 @@ export type PaymentConfigPlan =
  * restaurant already has.
  *   * A built-in keeps, field by field: what this save sent, else what was
  *     stored, else the default.
- *   * A stored custom mode that this save OMITS IS KEPT, unchanged. An older
- *     app's Settings card round-trips only the eight built-ins; without this, its
- *     first "Save payments & currency" would erase every mode the owner added on
- *     a newer screen. Removal is explicit: `enabled: false`.
- *   * A custom entry whose name collides (by paymentNameKey) with a stored custom
- *     is an UPDATE of that mode — the stored id is kept, because the id is
- *     immutable — and a genuinely new name is appended.
+ *   * A stored custom mode that this save OMITS IS KEPT, unchanged. A client
+ *     written before custom modes existed may send only the eight built-ins;
+ *     without this, its first "Save payments & currency" would erase every mode
+ *     the owner added on a newer screen. Removal is explicit: `enabled: false`.
+ *   * An entry whose name matches (by paymentNameKey) a stored custom mode is an
+ *     UPDATE of that mode — with or without `custom: true`, because an older
+ *     card round-trips the rows it was given without that flag — and the stored
+ *     id is kept, because the id is immutable. Only a genuinely new name needs
+ *     `custom: true`, and it is appended.
  *
  * REFUSED, each with a sentence the editors show verbatim: an entry with no id;
  * an unknown id sent without `custom: true` (a typo of a built-in must not
@@ -403,16 +453,19 @@ export function planPaymentConfigSave(incoming: unknown, stored: unknown): Payme
       return;
     }
 
-    if (entry.custom !== true) {
-      errors.push(`"${rawId}" is not a payment mode this restaurant has. To add a new one, send it with custom: true.`);
-      return;
-    }
     if (entry.online === true) {
       errors.push(`"${rawId}" can't be an online payment mode: only the built-in gateway settles online.`);
       return;
     }
     if (existing) {
       // An update of a mode the restaurant already has. Id immutable.
+      //
+      // Decided BEFORE the `custom: true` rule, and whatever `custom` says. The
+      // installed 1.9.7 app's Settings card maps every row it is given to
+      // {id, label, enabled, requires_screenshot, online: false} — `custom`
+      // dropped — and posts the whole list back with the currency. Refusing that
+      // as "not a mode this restaurant has" locked a 1.9.7 owner out of Settings >
+      // Payments, currency included, the day a newer screen added a mode.
       byKey.set(key, {
         ...existing,
         label: label ?? (typeof entry.label === "string" && entry.label.trim() === "" ? existing.id : existing.label),
@@ -420,6 +473,10 @@ export function planPaymentConfigSave(incoming: unknown, stored: unknown): Payme
         requires_screenshot: boolOr(entry.requires_screenshot, existing.requires_screenshot),
         show_to_guests: boolOr(entry.show_to_guests, existing.show_to_guests ?? false),
       });
+      return;
+    }
+    if (entry.custom !== true) {
+      errors.push(`"${rawId}" is not a payment mode this restaurant has. To add a new one, send it with custom: true.`);
       return;
     }
     const reserved = reservedReason(rawId);
@@ -458,9 +515,9 @@ export function planPaymentConfigSave(incoming: unknown, stored: unknown): Payme
   const labelOwner = new Map<string, string>();
   for (const m of config) {
     const lk = paymentNameKey(m.label);
-    const reason = COMP_KEYS.has(lk) || CREDIT_KEYS.has(lk) || BUCKET_KEYS.has(lk);
-    if (reason) {
-      errors.push(`"${m.label}" can't be used as a label: ${COMP_KEYS.has(lk) ? "a free meal is not money collected — use \"Mark as non-chargeable\" on the bill instead" : CREDIT_KEYS.has(lk) ? "it would close the bill as paid while no money has arrived" : "reports already use that name for their own rows"}.`);
+    const notMoney = notMoneyKind(m.label);
+    if (notMoney || BUCKET_KEYS.has(lk)) {
+      errors.push(`"${m.label}" can't be used as a label: ${notMoney === "comp" ? "a free meal is not money collected — use \"Mark as non-chargeable\" on the bill instead" : notMoney === "credit" ? "it would close the bill as paid while no money has arrived" : "reports already use that name for their own rows"}.`);
       continue;
     }
     const aliasOf = BUILTIN_KEYS.get(lk);
@@ -481,6 +538,31 @@ export function planPaymentConfigSave(incoming: unknown, stored: unknown): Payme
   }
 
   return errors.length > 0 ? { ok: false, errors } : { ok: true, config };
+}
+
+/**
+ * What UNDOING a payment-modes save writes back: the list as it was before the
+ * save, EXCEPT that a custom mode the undone save added — stored now, absent
+ * before — stays, switched off.
+ *
+ * Restoring the prior list whole deleted that mode outright, which is the one
+ * thing Settings may never do (removal is `enabled: false`), and it did real
+ * damage: a bill with a tender already recorded in the mode could no longer
+ * settle, because the settle that mirrors its ledger resolves the method against
+ * the config and a mode that no longer exists resolves to nothing. Switched off,
+ * the mode takes no new money (paymentMethodRefusal) while that bill still closes
+ * (mirrorsLedger), and every bill settled with it keeps its label.
+ */
+export function paymentConfigForUndo(prior: unknown, current: unknown): PaymentMethodConfig[] {
+  const restored = mergePaymentConfig(prior);
+  const have = new Set(restored.map((m) => paymentNameKey(m.id)));
+  for (const m of mergePaymentConfig(current)) {
+    const key = paymentNameKey(m.id);
+    if (m.custom !== true || have.has(key)) {continue;}
+    restored.push({ ...m, enabled: false });
+    have.add(key);
+  }
+  return restored;
 }
 
 /** Just the refusals of planPaymentConfigSave — empty when the save is valid. */
@@ -550,6 +632,29 @@ export function methodRequiresProof(method: string | null | undefined, config: r
   if (!resolved) {return false;}
   if (resolved.entry) {return resolved.entry.requires_screenshot === true;}
   return DEFAULT_PROOF_METHODS.has(resolved.id);
+}
+
+/**
+ * The labels of the parts of a split that need a payment screenshot, each once,
+ * in the order they were sent — empty when none does.
+ *
+ * A split is stored as the method 'Split', which is no mode and needs no
+ * screenshot of its own; the rule lives on its parts. Asking only about 'Split'
+ * let a bill take Zomato money with no proof just by being split (Cash 1 +
+ * Zomato 999), which is exactly the owner's "Require payment screenshot" switch
+ * skipped.
+ */
+export function splitPartsNeedingProof(
+  parts: readonly { method: string }[],
+  config: readonly PaymentMethodConfig[],
+): string[] {
+  const labels: string[] = [];
+  for (const p of parts) {
+    if (!methodRequiresProof(p.method, config)) {continue;}
+    const label = paymentMethodLabel(p.method, config);
+    if (!labels.includes(label)) {labels.push(label);}
+  }
+  return labels;
 }
 
 /**

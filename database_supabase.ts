@@ -44,10 +44,12 @@ import {
   displayPaymentMethod,
   mergePaymentConfig,
   methodRequiresProof,
+  paymentConfigForUndo,
   paymentMethodLabel,
   paymentMethodRefusal,
   planPaymentConfigSave,
   resolvePaymentMethod,
+  splitPartsNeedingProof,
   type PaymentMethodConfig,
   type SettleMethod,
 } from "./payment_methods.js";
@@ -7916,10 +7918,10 @@ async function undoSettings(restaurantId: string, cache: UndoStateCache): Promis
 const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; nullable: boolean; toDb(v: unknown): unknown }> = {
   auto_push_orders: { column: "auto_push_orders", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   currency: { column: "currency", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" ? v.slice(0, 8) : null) },
-  // Restores the PRIOR list whole. Undoing the save that added a custom mode
-  // therefore removes that mode: bills already settled with it keep their stored
-  // id (displayPaymentMethod passes it through) and reports still group them,
-  // but new settles in it are refused until it is added again.
+  // Restores the PRIOR list — but never by deleting a custom mode the undone save
+  // added: writeRestaurantSettingsForUndo swaps this toDb for
+  // paymentConfigUndoValue, which keeps such a mode switched off
+  // (paymentConfigForUndo). This toDb is what any other caller would get.
   payment_methods: { column: "payment_config", cast: "jsonb", nullable: true, toDb: (v) => (v == null ? null : JSON.stringify(mergePaymentConfig(v))) },
   razorpay_key_id: { column: "razorpay_key_id", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 80) : null) },
   service_charge: { column: "service_charge", cast: "numeric", nullable: true, toDb: (v) => (v == null ? null : round2(num(v))) },
@@ -7975,6 +7977,27 @@ function undoSettingsKeyBlock(key: string, priorValue: unknown): UndoBlock | nul
   return null;
 }
 
+/**
+ * The payment_config an undo writes. The prior list, with any custom mode the
+ * undone save added kept and switched off (paymentConfigForUndo) — so undoing
+ * "added Swiggy Dineout" cannot strand a bill that already has a Swiggy Dineout
+ * tender on it. Read `for update` on the undo's own client, so a settings save
+ * landing mid-undo waits rather than being merged against a stale copy.
+ *
+ * A NULL prior (no config ever saved) still restores as NULL when there is no
+ * custom mode to keep — NULL and the defaults are the same config.
+ */
+async function paymentConfigUndoValue(context: RestaurantContext, prior: unknown, client?: PoolClient): Promise<string | null> {
+  const rows = await runQuery<{ payment_config: unknown }>(
+    `select payment_config from "Restaurant" where id = $1 limit 1 for update`,
+    [context.res_id],
+    client,
+  );
+  const restored = paymentConfigForUndo(prior, rows[0]?.payment_config ?? null);
+  if (prior == null && !restored.some((m) => m.custom === true)) {return null;}
+  return JSON.stringify(restored);
+}
+
 /** Restore settings columns EXPLICITLY (null restores as null). */
 async function writeRestaurantSettingsForUndo(
   restaurantId: string,
@@ -7989,7 +8012,7 @@ async function writeRestaurantSettingsForUndo(
     if (key === UNDO_TAXES_KEY) {continue;}
     const col = UNDO_SETTINGS_COLUMNS[key];
     if (!col) {throw new Error(`Setting "${key}" cannot be restored`);}
-    params.push(col.toDb(value));
+    params.push(key === "payment_methods" ? await paymentConfigUndoValue(context, value, client) : col.toDb(value));
     sets.push(`"${col.column}" = $${params.length}::${col.cast}`);
   }
   if (sets.length > 0) {
@@ -20612,11 +20635,21 @@ export async function ConfirmBillPaymentByWaiter(
 
     // The screenshot rule is the CONFIG's now (Settings > Payments), not a
     // compiled-in list; a tenant with no config gets the old four exactly.
-    const requiresProof = methodRequiresProof(paymentMethod, paymentConfig);
+    //
+    // A SPLIT SENT AS PARTS answers to its parts' rules: 'Split' itself needs no
+    // screenshot, so without this a Zomato part rode through on Cash 1 + Zomato
+    // 999. NOT when the parts mirror the tender ledger — those are payments
+    // already recorded (POST /bills/tenders carries no screenshot; the app's
+    // settle sheet asks for one per part as it composes them), and refusing the
+    // settle here would strand money already taken on an open bill.
+    const proofParts = splits.length > 0 && opts.mirrorsLedger !== true
+      ? splitPartsNeedingProof(splits, paymentConfig)
+      : [];
+    const requiresProof = methodRequiresProof(paymentMethod, paymentConfig) || proofParts.length > 0;
     const paymentProofScreenshotUrl =
       typeof paymentProofScreenshotUrlRaw === "string" ? paymentProofScreenshotUrlRaw.trim() : "";
     if (requiresProof && !paymentProofScreenshotUrl) {
-      throw new Error(`Payment proof screenshot is required for ${paymentMethodLabel(paymentMethod, paymentConfig)}`);
+      throw new Error(`Payment proof screenshot is required for ${proofParts.length > 0 ? proofParts.join(", ") : paymentMethodLabel(paymentMethod, paymentConfig)}`);
     }
 
     const waiter = await resolveEmployeeByUsername(context, waiterEmployeeId, client);
@@ -27677,37 +27710,25 @@ export async function SetRestaurantSettings(
   // bill_paper_width: only '58mm' or '80mm' accepted; null leaves it unchanged.
   const billPaperWidth = opts.bill_paper_width === "58mm" || opts.bill_paper_width === "80mm" ? opts.bill_paper_width : null;
   const currency = typeof opts.currency === "string" && opts.currency.trim() ? opts.currency.trim().slice(0, 8) : null;
-  // PAYMENT MODES ARE WRITTEN FIRST, in their own short transaction, and are
-  // then left alone by the big update below ($4 stays null).
+  // PAYMENT MODES: a save is a MERGE against what is stored
+  // (planPaymentConfigSave), which is what stops a client that never heard of a
+  // mode from erasing it. Merging needs the stored value, so the row is read
+  // `for update`: two editors saving at once take turns instead of each merging
+  // against the same stale copy and the second silently dropping the first one's
+  // new mode.
   //
-  // A save is a MERGE against what is stored (planPaymentConfigSave), which is
-  // what stops an older app — whose card round-trips only the eight built-ins —
-  // from erasing every mode the owner added on a newer screen. Merging needs the
-  // stored value, so the row is read `for update`: two editors saving at once
-  // take turns instead of each merging against the same stale copy and the
-  // second silently dropping the first one's new mode.
+  // The read, the plan and the write run in ONE transaction WITH the settings
+  // update below ($4), not in a transaction of their own ahead of it. Written
+  // separately, a failure of the big update answered 500 "Unable to save
+  // settings" while the payment change was already live — and the route writes
+  // the audit entry and its undo only after this function resolves, so that
+  // change had neither.
   //
   // Refused out loud: an invalid save throws PaymentConfigError before anything
   // is written, and the route answers 400 with its sentences. The old merge
   // dropped an unknown entry and answered 200, which is how "there is no option
   // to add a payment mode" looked from the owner's side.
-  if (Array.isArray(opts.payment_methods)) {
-    const incoming = opts.payment_methods;
-    await withTransaction(async (client) => {
-      const current = await runQuery<{ payment_config: unknown }>(
-        `select payment_config from "Restaurant" where id = $1 limit 1 for update`,
-        [context.res_id],
-        client,
-      );
-      const plan = planPaymentConfigSave(incoming, current[0]?.payment_config ?? null);
-      if (!plan.ok) {throw new PaymentConfigError(plan.errors);}
-      await runQuery(
-        `update "Restaurant" set payment_config = $2::jsonb where id = $1`,
-        [context.res_id, JSON.stringify(plan.config)],
-        client,
-      );
-    });
-  }
+  const incomingPaymentMethods = Array.isArray(opts.payment_methods) ? opts.payment_methods : null;
   // key_id: set when a string is provided (empty string clears it).
   const razorpayKeyId = typeof opts.razorpay_key_id === "string" ? opts.razorpay_key_id.trim().slice(0, 80) : null;
   // key_secret: only overwrite when a non-empty value is sent (blank = keep current).
@@ -27793,7 +27814,7 @@ export async function SetRestaurantSettings(
   const billLegalName = opts.bill_legal_name !== undefined ? sanitizeBillHeaderField(opts.bill_legal_name) : null;
   const billGstin = opts.bill_gstin !== undefined ? sanitizeBillHeaderField(opts.bill_gstin) : null;
   const billQrNote = opts.bill_qr_note !== undefined ? sanitizeBillQrNote(opts.bill_qr_note) : null;
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; bill_show_qr: boolean | null; theme_color: string | null; brand_config: unknown }>(
+  const updateSettingsRow = (paymentConfig: string | null, client: PoolClient) => runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; bill_show_qr: boolean | null; theme_color: string | null; brand_config: unknown }>(
     `update "Restaurant" set
        auto_push_orders = coalesce($2, auto_push_orders),
        currency = coalesce($3, currency),
@@ -27834,7 +27855,7 @@ export async function SetRestaurantSettings(
       context.res_id,
       typeof opts.auto_push_orders === "boolean" ? opts.auto_push_orders : null,
       currency,
-      null, // payment_config: written above, in its own transaction
+      paymentConfig, // null = unchanged; see incomingPaymentMethods
       razorpayKeyId,
       razorpayKeySecret,
       serviceCharge,
@@ -27866,7 +27887,22 @@ export async function SetRestaurantSettings(
       kotAutoPrint,
       billShowQr,
     ],
+    client,
   );
+  const rows = await withTransaction(async (client) => {
+    let paymentConfig: string | null = null;
+    if (incomingPaymentMethods) {
+      const current = await runQuery<{ payment_config: unknown }>(
+        `select payment_config from "Restaurant" where id = $1 limit 1 for update`,
+        [context.res_id],
+        client,
+      );
+      const plan = planPaymentConfigSave(incomingPaymentMethods, current[0]?.payment_config ?? null);
+      if (!plan.ok) {throw new PaymentConfigError(plan.errors);}
+      paymentConfig = JSON.stringify(plan.config);
+    }
+    return updateSettingsRow(paymentConfig, client);
+  });
   // First messaging save: mint the webhook secret (Meta hub.verify_token +
   // X-Hub-Signature-256 app secret) so the owner has something to paste into
   // the Meta console without a separate "generate" step.
@@ -36383,7 +36419,10 @@ export interface SettlementSummaryReport {
 }
 
 const SETTLEMENT_COLUMNS: MisColumn[] = [
-  { key: "method", label: "Payment mode", type: "text" },
+  // `label`, not `method`: the column a person reads (on screen and in the CSV)
+  // is the owner's name for the mode, the one the till shows. Rows still group,
+  // and carry `method`, by the stored id.
+  { key: "label", label: "Payment mode", type: "text" },
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "amount", label: "Collected", type: "money", total: true },
   { key: "share_pct", label: "% of takings", type: "percent" },
@@ -40858,7 +40897,9 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
       by_method: [...parts]
         .sort((a, z) => z.amount - a.amount || a.method.localeCompare(z.method))
         .map((p) => ({ method: p.method, label: labelOf(p.method), amount: p.amount })),
-      payment_modes: formatMethodSplit(parts),
+      // The spreadsheet cell reads the owner's labels, like the till; by_method
+      // above keeps the ids for anything that keys on them.
+      payment_modes: formatMethodSplit(parts.map((p) => ({ method: labelOf(p.method), amount: p.amount }))),
       sessions: shift?.sessions ?? 0,
       opened_at: shift?.opened_at ?? null,
       closed_at: shift?.closed_at ?? null,

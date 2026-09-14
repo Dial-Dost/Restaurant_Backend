@@ -214,9 +214,35 @@ describe("BUILT AND CALLED: every writer resolves against the tenant's config", 
     ["export async function RecordBillTenders(", ["loadPaymentConfig(context, client)", "resolvePaymentMethod(", "paymentMethodRefusal("]],
     ["function normalizePaymentSplits(", ["resolvePaymentMethod(", "paymentMethodRefusal("]],
     ["export async function SetRestaurantSettings(", ["planPaymentConfigSave(", "PaymentConfigError", "for update"]],
+    ["async function writeRestaurantSettingsForUndo(", ["paymentConfigUndoValue(context, value, client)"]],
+    ["async function paymentConfigUndoValue(", ["paymentConfigForUndo(", "for update"]],
   ])("%s", (signature, needles) => {
     const body = bodyOf(db, signature);
     for (const needle of needles) {expect(body).toContain(needle);}
+  });
+
+  test("a settings save writes payment modes in the SAME transaction as every other setting", () => {
+    const body = bodyOf(db, "export async function SetRestaurantSettings(");
+    // No write of its own ahead of the settings update: that one committed
+    // before the big update ran, so a failure there left an unaudited change live.
+    expect(body).not.toMatch(/set payment_config = \$2/);
+    expect(body).toContain("payment_config = coalesce($4::jsonb, payment_config)");
+    const txn = body.slice(body.indexOf("const rows = await withTransaction(async (client) => {"));
+    expect(txn.indexOf("planPaymentConfigSave(")).toBeGreaterThan(0);
+    expect(txn).toContain("return updateSettingsRow(paymentConfig, client);");
+    expect(body).toMatch(/paymentConfig, \/\/ null = unchanged/);
+  });
+
+  test("a split sent as parts answers to its parts' screenshot rules — but not the ledger mirror", () => {
+    const body = bodyOf(db, "export async function ConfirmBillPaymentByWaiter(");
+    expect(body).toContain("splitPartsNeedingProof(splits, paymentConfig)");
+    expect(body).toContain("splits.length > 0 && opts.mirrorsLedger !== true");
+    expect(body).toMatch(/requiresProof = methodRequiresProof\(paymentMethod, paymentConfig\) \|\| proofParts\.length > 0/);
+  });
+
+  test("the cash-up sheets show the owner's label where a person reads the mode", () => {
+    expect(db).toMatch(/const SETTLEMENT_COLUMNS: MisColumn\[\] = \[[^\]]*\{ key: "label", label: "Payment mode", type: "text" \}/);
+    expect(bodyOf(db, "export async function GetCounterSummaryReport(")).toContain("formatMethodSplit(parts.map((p) => ({ method: labelOf(p.method), amount: p.amount })))");
   });
 
   test("approval never refuses a disabled mode (it would strand a paid bill)", () => {
