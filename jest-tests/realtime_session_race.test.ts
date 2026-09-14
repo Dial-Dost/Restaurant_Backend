@@ -26,7 +26,9 @@
 //   * the restaurant room — what every KDS, order screen and dashboard socket
 //     depends on — is joined on exactly the condition it always was;
 //   * events queued behind the lookup are applied in the order they arrived;
-//   * one store read per connection, however many events wait on it.
+//   * one store read per connection, however many events wait on it;
+//   * joins repeated on one connection share one replay transaction per outlet,
+//     while every one of them is still answered.
 
 import { describe, test, expect, beforeAll, beforeEach, afterEach, jest } from "@jest/globals";
 
@@ -253,6 +255,100 @@ describe("a join that arrives before the session lookup resolves", () => {
     expect(socket.rooms.size).toBe(0);
     expect(socket.emitted).toHaveLength(0);
     expect(resume).not.toHaveBeenCalled();
+  });
+});
+
+// ONE REPLAY PER BURST, NOT ONE PER JOIN. Queueing joins behind the lookup is
+// what stopped them being dropped, but every queued join used to schedule its own
+// resumePrintJobsForAgent — a tenant transaction each. The agent's watchdog
+// re-asks at 5s and again 10s later while unanswered, so a session-store stall
+// left each till with two or three joins waiting, and at recovery they all ran
+// replay transactions together against the fifteen-slot pooler: extra load in
+// exactly the failure the standstill incident was about. Every join is still
+// answered and still joins the room; only the replay is shared.
+describe("repeated joins share one replay", () => {
+  const OTHER_OUTLET = "5d2c7e1a-3b9f-4c6d-8e0a-7f1b2c3d4e5f";
+
+  test("joins queued behind one lookup are all answered, and replay once", async () => {
+    const lookup = deferred<typeof SESSION | null>();
+    getSession.mockReturnValueOnce(lookup.promise);
+    const socket = connect();
+    // The connect join, the watchdog's 5s re-ask, and a window regaining focus.
+    socket.fire("joinOutlet", JOIN);
+    socket.fire("joinOutlet", JOIN);
+    socket.fire("joinOutlet", JOIN);
+    lookup.resolve(SESSION);
+    await flush();
+
+    expect(socket.emitsOf("joinedOutlet")).toHaveLength(3);
+    expect(socket.rooms.has(OUTLET_ROOM)).toBe(true);
+    jest.runOnlyPendingTimers();
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  test("a join that lands while the replay is running adds none; the next window after it is served", async () => {
+    getSession.mockResolvedValueOnce(SESSION);
+    const running = deferred<number>();
+    resume.mockImplementationOnce(() => running.promise);
+    const socket = connect();
+    socket.fire("joinOutlet", JOIN);
+    await flush();
+    jest.runOnlyPendingTimers();
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    // A re-ask that was already on the wire arrives mid-transaction.
+    socket.fire("joinOutlet", JOIN);
+    await flush();
+    jest.runOnlyPendingTimers();
+    expect(socket.emitsOf("joinedOutlet")).toHaveLength(2);
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    // The window is delivered; the agent drains it and asks for the next one.
+    running.resolve(20);
+    await flush();
+    socket.fire("joinOutlet", JOIN);
+    await flush();
+    jest.runOnlyPendingTimers();
+    expect(resume).toHaveBeenCalledTimes(2);
+  });
+
+  test("a replay that fails does not hold back the next join's", async () => {
+    getSession.mockResolvedValueOnce(SESSION);
+    resume.mockImplementationOnce(() => Promise.reject(new Error("pool exhausted")));
+    const socket = connect();
+    socket.fire("joinOutlet", JOIN);
+    await flush();
+    jest.runOnlyPendingTimers();
+    await flush();
+    socket.fire("joinOutlet", JOIN);
+    await flush();
+    jest.runOnlyPendingTimers();
+    expect(resume).toHaveBeenCalledTimes(2);
+  });
+
+  test("the share is per outlet and per connection, never wider", async () => {
+    getSession.mockResolvedValueOnce(SESSION).mockResolvedValueOnce(SESSION);
+    const running = deferred<number>();
+    resume.mockImplementation(() => running.promise);
+    try {
+      const socket = connect();
+      socket.fire("joinOutlet", JOIN);
+      socket.fire("joinOutlet", { ...JOIN, outletId: OTHER_OUTLET });
+      await flush();
+      jest.runOnlyPendingTimers();
+      expect(resume.mock.calls.map((c) => c[0].outletId)).toEqual([OUTLET_ID, OTHER_OUTLET]);
+
+      // A reconnect is a new socket, and its replay must not wait on the dead one's.
+      const reconnected = connect();
+      reconnected.fire("joinOutlet", JOIN);
+      await flush();
+      jest.runOnlyPendingTimers();
+      expect(resume).toHaveBeenCalledTimes(3);
+      expect(resume.mock.calls[2][0].agentId).toBe(reconnected.id);
+    } finally {
+      running.resolve(0);
+      resume.mockImplementation(() => Promise.resolve(0));
+    }
   });
 });
 

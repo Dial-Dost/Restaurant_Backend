@@ -524,6 +524,9 @@ export async function initRealtime(httpServer: HttpServer) {
       admitted = true;
       socket.join(`restaurant:${session.res_id}`);
     };
+    // The outlets this connection has a replay scheduled or running for. See the
+    // share in joinOutlet below.
+    const replayPending = new Set<string>();
     // Every tenant-scoped listener goes through here. The connected check matters
     // because the wait is now INSIDE the listener: a socket that disconnected
     // while its lookup was in flight must not be put back into a room it has
@@ -637,6 +640,21 @@ export async function initRealtime(httpServer: HttpServer) {
           void claimDeviceRooms(socket, resId, o, employeeId, claimedDeviceId, platform, agentVersion)
             .catch((err: unknown) => { logger.error({ err }, "print_device_room_join_failed"); });
         }
+        // ONE REPLAY AT A TIME PER CONNECTION AND OUTLET. Every join above is
+        // still answered, but a join that arrives while this outlet's replay is
+        // scheduled or running shares it instead of adding a tenant transaction
+        // of its own. Queueing joins behind the session lookup is what stopped
+        // them being dropped, and it also means a store stall leaves each till
+        // with its connect join plus the watchdog's re-asks waiting — two or
+        // three per till, all released at once when the store recovers, against
+        // a fifteen-slot pooler. The pending replay reads the outstanding jobs
+        // when it runs, which is no earlier than any join it absorbed.
+        //
+        // Windowed catch-up is unaffected: the agent asks for the next window
+        // only after it has printed the last one, and the marker is cleared in
+        // the same turn the window is emitted, before any reply can be read.
+        if (replayPending.has(o)) { return; }
+        replayPending.add(o);
         // Deliberately NOT awaited and deliberately jittered. The room join must
         // be immediate (live printing depends on it) and a fleet-wide reconnect
         // must not turn into a fleet-wide simultaneous query. Errors are swallowed
@@ -668,7 +686,9 @@ export async function initRealtime(httpServer: HttpServer) {
             employeeId,
             role,
             deliver: (p) => { socket.emit('bill:print', p); },
-          }).catch((err: unknown) => { logger.error({ err }, "print_resume_dispatch_failed"); });
+          })
+            .catch((err: unknown) => { logger.error({ err }, "print_resume_dispatch_failed"); })
+            .finally(() => { replayPending.delete(o); });
         }, resumeJitterMs());
         timer.unref?.();
       }
