@@ -11,7 +11,7 @@
 
 import { describe, test, expect } from "@jest/globals";
 import sharp from "sharp";
-import { BILL_LOGO_DOTS, BILL_LOGO_MAX_HEIGHT, billLogoDots, rasterizeBillLogo } from "../bill_logo";
+import { BILL_LOGO_DOTS, BILL_LOGO_MAX_HEIGHT, BILL_LOGO_WIDTH_SHARE, billLogoDots, rasterizeBillLogo } from "../bill_logo";
 
 function readSource(relative: string): string {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -50,6 +50,20 @@ describe("the raster fits the roll it is printed on", () => {
     expect(billLogoDots("58mm")).toBe(384);
     expect(billLogoDots("80mm")).toBe(576);
     expect(billLogoDots(undefined)).toBe(576);
+  });
+
+  test("the logo prints at no more than two thirds of the roll, as on the client's bill", async () => {
+    const wide = await rasterizeBillLogo(await wordmark(), BILL_LOGO_DOTS["80mm"]);
+    expect(wide!.width).toBeLessThanOrEqual(Math.round(576 * BILL_LOGO_WIDTH_SHARE));
+    expect(wide!.width).toBeGreaterThan(576 / 2);
+    const narrow = await rasterizeBillLogo(await wordmark(), BILL_LOGO_DOTS["58mm"]);
+    expect(narrow!.width).toBeLessThanOrEqual(Math.round(384 * BILL_LOGO_WIDTH_SHARE));
+  });
+
+  test("a stored logo REFERENCE is not image bytes — a string is refused, never read as a file path", async () => {
+    // The original bug: "Restaurant".logo holds "logos/Gaia_logo.png", and that
+    // string reached sharp, which reads a string as a path on the API host.
+    await expect(rasterizeBillLogo("logos/Gaia_logo.png" as unknown as Buffer, 576)).resolves.toBeNull();
   });
 
   test("a small logo is not blown up into a blurry one", async () => {
@@ -100,6 +114,31 @@ describe("the printer bytes and the preview PNG are the same pixels", () => {
   test("bytes that are not an image cost the logo, never throw into the bill", async () => {
     await expect(rasterizeBillLogo(Buffer.from("not an image"), 576)).resolves.toBeNull();
     await expect(rasterizeBillLogo(Buffer.alloc(0), 576)).resolves.toBeNull();
+  });
+});
+
+describe("the branding logo is resolved from its stored reference", () => {
+  const db = readSource("database_supabase.ts");
+  const at = db.indexOf("export async function GetRestaurantLogoRaw");
+  const body = db.slice(at, db.indexOf("\n}", at));
+
+  test("GetRestaurantLogoRaw downloads the referenced image instead of returning the column", () => {
+    expect(at).toBeGreaterThan(-1);
+    expect(body).toContain("logoToBuffer(ref)");
+    expect(body).not.toMatch(/return row\.logo;/);
+  });
+
+  test("the lookup has a deadline and a failure is remembered briefly", () => {
+    expect(body).toMatch(/Promise\.race\(\[logoToBuffer\(ref\)/);
+    expect(body).toContain("LOGO_MISS_TTL_MS");
+    expect(body).toContain("LOGO_CACHE_MAX");
+  });
+
+  test("the logo fetch is bounded in time and in size on every path", () => {
+    const f = db.indexOf("async function logoToBuffer");
+    const fn = db.slice(f, db.indexOf("\n}", f));
+    expect(fn).toContain("AbortSignal.timeout(LOGO_FETCH_TIMEOUT_MS)");
+    expect(fn.match(/LOGO_MAX_BYTES/g)?.length).toBeGreaterThanOrEqual(3);
   });
 });
 

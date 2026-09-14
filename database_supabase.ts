@@ -7939,6 +7939,7 @@ const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; null
   timezone: { column: "timezone", cast: "text", nullable: true, toDb: (v) => (typeof v === "string" && v.trim() ? sanitizeTimezone(v) : null) },
   require_table_otp: { column: "require_table_otp", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   kot_auto_print: { column: "kot_auto_print", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
+  bill_show_qr: { column: "bill_show_qr", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   queue_show_menu: { column: "queue_show_menu", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
 };
 
@@ -26979,6 +26980,12 @@ async function ensureBrandingColumns(): Promise<void> {
   // opens the setting gets the auto-print. Turning it off restores the
   // press-the-button-yourself behaviour this column replaced.
   await runQuery(`alter table "Restaurant" add column if not exists kot_auto_print boolean default true`);
+  // Whether the customer bill carries the feedback/valet QR. DEFAULT TRUE, and
+  // NULL reads as true: every bill printed before this switch existed carried
+  // the QR, so a tenant who never opens the setting keeps it. Created here, at
+  // runtime, like every settings column in this list; the migration file that
+  // records it follows separately.
+  await runQuery(`alter table "Restaurant" add column if not exists bill_show_qr boolean default true`);
   // Rich customer-page branding: a sanitized JSON customization object (font +
   // colors + header/button style — see sanitizeBrandConfigInput / BrandConfig).
   // Null means "never customized" — the read layer applies sane defaults and
@@ -27426,6 +27433,8 @@ export interface RestaurantSettings {
   require_table_otp: boolean;
   /** Barking an order also prints its kitchen docket. Default (and NULL) = true. */
   kot_auto_print: boolean;
+  /** The customer bill prints the feedback/valet QR. Default (and NULL) = true. */
+  bill_show_qr: boolean;
   // Rich customer-page branding (resolved with defaults — see resolveBrandConfig)
   // so the admin UI can prefill the editor.
   brand_config: BrandConfig;
@@ -27531,8 +27540,8 @@ export async function GetRestaurantSettings(
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; theme_color: string | null; brand_config: unknown }>(
-    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, bill_legal_name, bill_gstin, bill_qr_note, queue_show_menu, kitchen_sections, inventory_categories, timezone, require_table_otp, kot_auto_print, theme_color, brand_config from "Restaurant" where id = $1 limit 1`,
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; queue_show_menu: boolean | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; bill_show_qr: boolean | null; theme_color: string | null; brand_config: unknown }>(
+    `select auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, bill_legal_name, bill_gstin, bill_qr_note, queue_show_menu, kitchen_sections, inventory_categories, timezone, require_table_otp, kot_auto_print, bill_show_qr, theme_color, brand_config from "Restaurant" where id = $1 limit 1`,
     [context.res_id],
   );
   const taxRows = await runQuery<{ default_tax: unknown }>(
@@ -27581,6 +27590,9 @@ export async function GetRestaurantSettings(
     // NULL reads as ON. A tenant whose row predates migration 040 has never
     // made a choice, and the shipped default for that choice is "print it".
     kot_auto_print: rows[0]?.kot_auto_print !== false,
+    // NULL reads as ON, for the same reason: every bill before this column
+    // carried the QR, and a tenant who has made no choice keeps what they had.
+    bill_show_qr: rows[0]?.bill_show_qr !== false,
     // Admin editor prefill: the stored customization resolved with defaults
     // (color_primary falls back to theme_color here — the logo-extracted palette
     // is only resolved on the public branding path to keep this admin read cheap)
@@ -27597,7 +27609,7 @@ export async function GetRestaurantSettings(
 
 export async function SetRestaurantSettings(
   restaurantId: string,
-  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; bill_legal_name?: unknown; bill_gstin?: unknown; bill_qr_note?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean; kot_auto_print?: boolean },
+  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; bill_legal_name?: unknown; bill_gstin?: unknown; bill_qr_note?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean; kot_auto_print?: boolean; bill_show_qr?: boolean },
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
@@ -27683,6 +27695,9 @@ export async function SetRestaurantSettings(
   // null = "not in this request", which the coalesce below leaves untouched —
   // the same shape every other optional boolean here uses.
   const kotAutoPrint = typeof opts.kot_auto_print === "boolean" ? opts.kot_auto_print : null;
+  // Same shape: only an explicit boolean writes, so a client that has never
+  // heard of the switch cannot turn the QR off by leaving it out.
+  const billShowQr = typeof opts.bill_show_qr === "boolean" ? opts.bill_show_qr : null;
   // Printed-bill header identity + the custom QR sentence. All three follow the
   // bill_logo_svg idiom exactly: only written when the key is PRESENT, and an
   // empty string CLEARS the column (nullif below) rather than storing a blank
@@ -27690,7 +27705,7 @@ export async function SetRestaurantSettings(
   const billLegalName = opts.bill_legal_name !== undefined ? sanitizeBillHeaderField(opts.bill_legal_name) : null;
   const billGstin = opts.bill_gstin !== undefined ? sanitizeBillHeaderField(opts.bill_gstin) : null;
   const billQrNote = opts.bill_qr_note !== undefined ? sanitizeBillQrNote(opts.bill_qr_note) : null;
-  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; theme_color: string | null; brand_config: unknown }>(
+  const rows = await runQuery<{ auto_push_orders: boolean | null; currency: string | null; payment_config: unknown; razorpay_key_id: string | null; razorpay_key_secret: string | null; service_charge: number | string | null; discount_approval_threshold: number | string | null; bill_reopen_window_min: number | string | null; alert_discount_pct: number | string | null; alert_void_count: number | string | null; loyalty_earn_per_100: number | string | null; loyalty_point_value: number | string | null; booking_deposit_amount: number | string | null; booking_deposit_min_party: number | string | null; booking_cancel_window_hours: number | string | null; booking_min_spend: number | string | null; msg_provider: string | null; msg_sender: string | null; msg_key_id: string | null; msg_key_secret: string | null; msg_reminder_hours: number | string | null; msg_webhook_secret: string | null; feedback_config: unknown; bill_logo_svg: string | null; bill_paper_width: string | null; bill_legal_name: string | null; bill_gstin: string | null; bill_qr_note: string | null; kitchen_sections: unknown; inventory_categories: unknown; timezone: string | null; require_table_otp: boolean | null; kot_auto_print: boolean | null; bill_show_qr: boolean | null; theme_color: string | null; brand_config: unknown }>(
     `update "Restaurant" set
        auto_push_orders = coalesce($2, auto_push_orders),
        currency = coalesce($3, currency),
@@ -27723,9 +27738,10 @@ export async function SetRestaurantSettings(
        bill_legal_name = case when $30::text is null then bill_legal_name else nullif($30, '') end,
        bill_gstin = case when $31::text is null then bill_gstin else nullif($31, '') end,
        bill_qr_note = case when $32::text is null then bill_qr_note else nullif($32, '') end,
-       kot_auto_print = coalesce($33, kot_auto_print)
+       kot_auto_print = coalesce($33, kot_auto_print),
+       bill_show_qr = coalesce($34, bill_show_qr)
      where id = $1
-     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone, require_table_otp, kot_auto_print, bill_legal_name, bill_gstin, bill_qr_note, theme_color, brand_config`,
+     returning auto_push_orders, currency, payment_config, razorpay_key_id, razorpay_key_secret, service_charge, discount_approval_threshold, bill_reopen_window_min, alert_discount_pct, alert_void_count, loyalty_earn_per_100, loyalty_point_value, booking_deposit_amount, booking_deposit_min_party, booking_cancel_window_hours, booking_min_spend, msg_provider, msg_sender, msg_key_id, msg_key_secret, msg_reminder_hours, msg_webhook_secret, feedback_config, bill_logo_svg, bill_paper_width, kitchen_sections, inventory_categories, timezone, require_table_otp, kot_auto_print, bill_show_qr, bill_legal_name, bill_gstin, bill_qr_note, theme_color, brand_config`,
     [
       context.res_id,
       typeof opts.auto_push_orders === "boolean" ? opts.auto_push_orders : null,
@@ -27760,6 +27776,7 @@ export async function SetRestaurantSettings(
       billGstin,
       billQrNote,
       kotAutoPrint,
+      billShowQr,
     ],
   );
   // First messaging save: mint the webhook secret (Meta hub.verify_token +
@@ -27821,6 +27838,9 @@ export async function SetRestaurantSettings(
     // NULL reads as ON. A tenant whose row predates migration 040 has never
     // made a choice, and the shipped default for that choice is "print it".
     kot_auto_print: rows[0]?.kot_auto_print !== false,
+    // NULL reads as ON, for the same reason: every bill before this column
+    // carried the QR, and a tenant who has made no choice keeps what they had.
+    bill_show_qr: rows[0]?.bill_show_qr !== false,
     // brand_config isn't written here (branding is set via SetBranding), but the
     // type requires it — echo the current stored value resolved with defaults.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),
@@ -27871,28 +27891,45 @@ async function assertPublicHttpUrl(urlStr: string): Promise<URL | null> {
 }
 
 // --- Logo-derived theming (server-side, via sharp) --------------------------
+/** The largest logo image read into memory, whichever way it is stored. */
+const LOGO_MAX_BYTES = 5_000_000;
+/** How long a logo fetch may take. A bill print waits on it. */
+const LOGO_FETCH_TIMEOUT_MS = 4_000;
 // Decode the stored logo to raw bytes (storage path/URL, http URL, or data URL).
 async function logoToBuffer(logoRef: string): Promise<Buffer | null> {
   if (logoRef.startsWith("data:")) {
     const b64 = logoRef.split(",")[1] ?? "";
     return b64 ? Buffer.from(b64, "base64") : null;
   }
-  try {
-    const blob = await downloadFile(logoRef);
-    if (blob) {return Buffer.from(await blob.arrayBuffer());}
-  } catch {/* fall through to direct fetch */}
-  if (/^https?:\/\//.test(logoRef)) {
-    const safe = await assertPublicHttpUrl(logoRef);
-    if (!safe) {return null;} // SSRF guard: refuse internal/metadata targets
+  const isHttp = /^https?:\/\//.test(logoRef);
+  // A URL is not a "bucket/path": downloadFile would split "https:" off as the
+  // bucket name, fail, and log a storage error on every call before the fetch
+  // below did the real work.
+  if (!isHttp) {
     try {
-      // redirect:"manual" so a 3xx can't bounce us to an internal host post-check.
-      const r = await fetch(safe, { redirect: "manual" });
-      if (r.ok) {
-        const buf = Buffer.from(await r.arrayBuffer());
-        return buf.length <= 5_000_000 ? buf : null; // cap size
+      const blob = await downloadFile(logoRef);
+      if (blob) {
+        const buf = Buffer.from(await blob.arrayBuffer());
+        return buf.length <= LOGO_MAX_BYTES ? buf : null; // same cap as the fetch
       }
-    } catch {/* ignore */}
+    } catch {/* fall through */}
+    return null;
   }
+  const safe = await assertPublicHttpUrl(logoRef);
+  if (!safe) {return null;} // SSRF guard: refuse internal/metadata targets
+  try {
+    // redirect:"manual" so a 3xx can't bounce us to an internal host post-check.
+    // A deadline, because a bill print waits on this.
+    const r = await fetch(safe, { redirect: "manual", signal: AbortSignal.timeout(LOGO_FETCH_TIMEOUT_MS) });
+    if (r.ok) {
+      // Refuse an over-cap body BEFORE reading it when the host says how big it
+      // is: a 9 MB branding PNG was being downloaded in full and then discarded.
+      const declared = Number(r.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > LOGO_MAX_BYTES) {return null;}
+      const buf = Buffer.from(await r.arrayBuffer());
+      return buf.length <= LOGO_MAX_BYTES ? buf : null; // cap size
+    }
+  } catch {/* ignore */}
   return null;
 }
 
@@ -29176,10 +29213,41 @@ export async function GetBillByOrder(restaurantId: string, orderId: string) {
   };
 }
 
+/**
+ * THE LOGO'S IMAGE BYTES — not the column.
+ *
+ * `"Restaurant".logo` is a TEXT column holding a REFERENCE: a storage path
+ * ("logos/Gaia_logo.png") or a public URL (what /restaurant/branding writes).
+ * This used to return that column as if it were the image, and the bill printer
+ * handed the string to sharp — which reads a string as a FILE PATH on the API
+ * host, found nothing, and returned null. So the branding-PNG fallback printed
+ * no logo on any bill for any tenant, silently; only an SVG bill logo ever
+ * reached the paper. Resolved through logoToBuffer, the same resolver the
+ * logo-derived theme already uses successfully for the same column.
+ *
+ * Cached per reference for a few minutes: every bill print asks for it, and a
+ * storage round-trip per bill is latency at the till for bytes that change
+ * only when an owner uploads a new logo — and an upload writes a NEW reference
+ * (timestamped object name), which misses the cache on its own.
+ *
+ * A FAILURE IS CACHED TOO, BRIEFLY. A logo that can never load (a 9 MB PNG
+ * over the cap, a dead host) would otherwise be fetched again on every bill,
+ * each one waiting on it. A minute is short enough that a storage blip costs
+ * a minute of bills their logo, and long enough that a permanent failure costs
+ * one fetch a minute instead of one per bill.
+ *
+ * BOUNDED, and the whole lookup has a DEADLINE: a slow logo costs the bill its
+ * logo, never its print.
+ */
+const LOGO_BYTES_TTL_MS = 10 * 60 * 1000;
+const LOGO_MISS_TTL_MS = 60 * 1000;
+const LOGO_CACHE_MAX = 256;
+const logoBytesCache = new Map<string, { at: number; bytes: Buffer | null }>();
+
 export async function GetRestaurantLogoRaw(restaurantId: string): Promise<Buffer | null> {
   const context = await requireRestaurantContext(restaurantId);
   const rows = await runQuery<{
-    logo: Buffer | null;
+    logo: string | null;
   }>(
     `
       select r.logo
@@ -29189,9 +29257,24 @@ export async function GetRestaurantLogoRaw(restaurantId: string): Promise<Buffer
     `,
     [context.res_id],
   );
-  const row = rows[0];
-  if (!row?.logo) {return null;}
-  return row.logo;
+  const ref = String(rows[0]?.logo ?? "").trim();
+  if (!ref) {return null;}
+  const cached = logoBytesCache.get(ref);
+  if (cached && Date.now() - cached.at < (cached.bytes ? LOGO_BYTES_TTL_MS : LOGO_MISS_TTL_MS)) {return cached.bytes;}
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => { timer = setTimeout(() => { resolve(null); }, LOGO_FETCH_TIMEOUT_MS + 500); });
+  const fetched = await Promise.race([logoToBuffer(ref).catch(() => null), deadline]);
+  if (timer) {clearTimeout(timer);}
+  const bytes = fetched && fetched.length > 0 ? fetched : null;
+  // Re-inserted so Map order is recency; the oldest entry goes when full.
+  logoBytesCache.delete(ref);
+  logoBytesCache.set(ref, { at: Date.now(), bytes });
+  while (logoBytesCache.size > LOGO_CACHE_MAX) {
+    const oldest = logoBytesCache.keys().next().value;
+    if (oldest === undefined) {break;}
+    logoBytesCache.delete(oldest);
+  }
+  return bytes;
 }
 
 export async function UpdateOutletDefaultTax(restaurantId: string, defaultTax: Record<string, number> | null): Promise<void> {

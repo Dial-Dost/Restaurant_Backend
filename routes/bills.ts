@@ -11,6 +11,7 @@ import { buildReceiptBase64, buildSplitReceiptsBase64, type SplitReceiptPart } f
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
+import { kotStamp } from "../kot_numbers.js";
 import { logger } from "../observability.js";
 import { hidesPrices, redactOpenBillPage } from "../price_scope.js";
 import { ackPrintJob, isSchemaMissing, warnSchemaMissing } from "../print_jobs.js";
@@ -1192,7 +1193,12 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		// The kitchen ticket returned above; everything below is the customer bill,
 		// which alone carries the logo, cashier line and feedback QR.
 		const isBill = true;
-		const feedbackUrl = isBill ? await feedbackUrlForTable(restaurantId, tableName) : null;
+		// THE OWNER'S SWITCH (the bill_show_qr column). Off means no QR and no QR sentence:
+		// the renderer prints that whole block only when it has a URL, so leaving
+		// the URL out is the entire mechanism, and the table's feedback context is
+		// not even looked up. `!== false` because a settings shape without the key
+		// is a tenant who never turned it off.
+		const feedbackUrl = isBill && settings.bill_show_qr !== false ? await feedbackUrlForTable(restaurantId, tableName) : null;
 		const logo = isBill ? await buildLogoEscPos(restaurantId, is58 ? 384 : 576).catch(() => null) : null;
 		let cashier = "";
 		if (isBill) {
@@ -1247,6 +1253,12 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			customerGstin: bill.customer_gstin ?? null,
 			billNo: bill.bill_no,
 			cashier: cashier || null,
+			// THE DATE LINE, IN THE RESTAURANT'S ZONE ("13/09/26 23:19"). Unset, the
+			// renderer fell back to the SERVER's clock and locale, which on the UTC
+			// host printed a US-format, UTC time on a GST document, and the wrong
+			// calendar date for every bill between midnight and 05:30 IST. The same
+			// stamp the KOT has carried since kotStamp existed.
+			printedAt: kotStamp(new Date(), settings.timezone || "Asia/Kolkata"),
 			discount: charges.discount > 0 ? { amount: charges.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
 			serviceCharge,
 			// The breakdown the billing layer produced for THIS bill — one line per
@@ -1619,6 +1631,11 @@ app.post('/print/bill/settled', validateAction(ACCOUNTING_PERM), async (req: Req
 			customerGstin: bill.customer_gstin ?? null,
 			billNo: bill.bill_no,
 			cashier: bill.created_by ?? null,
+			// The date the bill was RAISED, not today: a reprint is a second copy of
+			// that document, and the REPRINT banner already says it is a copy.
+			// An unreadable created_at would make Intl throw, and a date line is not
+			// worth the reprint: it falls back to now.
+			printedAt: kotStamp(Number.isFinite(Date.parse(String(bill.created_at ?? ""))) ? new Date(bill.created_at) : new Date(), settings.timezone || "Asia/Kolkata"),
 			discount: (bill.discount_amount ?? 0) > 0
 				? { amount: bill.discount_amount ?? 0, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" }
 				: null,
@@ -2335,6 +2352,8 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			customer: bill.customer,
 			customerGstin: bill.customer_gstin ?? null,
 			billNo: bill.bill_no,
+			// Restaurant-zone stamp, as on the whole bill (see /print/bill).
+			printedAt: kotStamp(new Date(), settings.timezone || "Asia/Kolkata"),
 			discount: bill.discount > 0 ? { amount: bill.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
 			// The bill's PERCENTAGE; each part carries its own share as the amount.
 			// A waived charge stays waived on every part — the renderer prints the

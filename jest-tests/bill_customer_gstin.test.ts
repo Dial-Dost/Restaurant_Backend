@@ -19,8 +19,9 @@
 //     asserted equal to the original with only those two keys moved.
 //   * THE READS — the running bill, the settled detail and the settled list all
 //     carry `customer_gstin`, by the same read rule.
-//   * THE PAPER — "Customer GSTIN:" directly under the "Customer Name:" slot, each
-//     only when there is something to say, and never on a KOT.
+//   * THE PAPER — "Customer GSTIN:" directly under the "Name:" slot, only when
+//     there is one to print; a walk-in's slot left blank rather than reading
+//     "Guest"; both inside the roll's text area, and never on a KOT.
 //   * A DATABASE WITHOUT MIGRATION 046 — the build ships first. Reads degrade to
 //     the orders' copy without ever naming the column; a GSTIN write is refused
 //     (503) before anything at all is written; a name-only edit still works; and
@@ -520,11 +521,47 @@ describe("migration 046 not applied yet (42703 tolerance)", () => {
 // ===========================================================================
 // THE PAPER
 // ===========================================================================
-const printed = (b64: string): string =>
-  Buffer.from(b64, "base64").toString("latin1")
-    .replace(/\x1b@/g, "")
-    .replace(/\x1b[a!E][\s\S]/g, "")
-    .replace(/\x1dV[\s\S]/g, "");
+/**
+ * The receipt as the paper reads it: the ESC/POS commands walked out of the
+ * stream, each GS v 0 raster replaced by one marker line.
+ *
+ * Walked, not pattern-stripped, because the bill's rules are rasters now and a
+ * thin rule's header carries a height byte of 0x0a — the "\n" a line split
+ * looks for. A raster is skipped by the length its own header states (8 +
+ * widthBytes x height); a rule (blank rows around 2 or 4 solid ones) reads as
+ * "<RULE>" / "<RULE:THICK>", anything else (the logo) as "<IMAGE>".
+ */
+const printed = (b64: string): string => {
+  const buf = Buffer.from(b64, "base64");
+  const u16 = (at: number) => buf[at]! | (buf[at + 1]! << 8);
+  let out = "";
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i]!;
+    const cmd = buf[i + 1];
+    if (b === 0x1b && cmd === 0x40) { i += 1; continue; }                                    // ESC @
+    if (b === 0x1b && (cmd === 0x61 || cmd === 0x21 || cmd === 0x45)) { i += 2; continue; }  // ESC a/!/E n
+    if (b === 0x1d && cmd === 0x56) { i += 2; continue; }                                    // GS V n  cut
+    if (b === 0x1d && (cmd === 0x4c || cmd === 0x57)) { i += 3; continue; }                  // GS L / GS W  margins
+    if (b === 0x1d && cmd === 0x76 && buf[i + 2] === 0x30) {                                 // GS v 0 raster
+      const widthBytes = u16(i + 4);
+      const height = u16(i + 6);
+      const rows = Array.from({ length: height }, (_, y) =>
+        buf.subarray(i + 8 + y * widthBytes, i + 8 + (y + 1) * widthBytes));
+      const inked = rows.map((r) => r.some((x) => x !== 0x00));
+      // Every inked row full edge to edge (a last byte may keep only its leading
+      // bits), and the inked rows one unbroken band.
+      const solid = rows.every((r, y) => !inked[y] || r.subarray(0, widthBytes - 1).every((x) => x === 0xff));
+      const ink = inked.filter(Boolean).length;
+      const band = inked.lastIndexOf(true) - inked.indexOf(true) + 1 === ink;
+      const marker = !solid || !band ? "<IMAGE>" : ink === 2 ? "<RULE>" : ink === 4 ? "<RULE:THICK>" : "<IMAGE>";
+      out += `${out === "" || out.endsWith("\n") ? "" : "\n"}${marker}\n`;
+      i += 7 + widthBytes * height;
+      continue;
+    }
+    out += String.fromCharCode(b);
+  }
+  return out;
+};
 
 const bill: ReceiptOptions = {
   restaurantName: "Gaia", table: "21", covers: 2,
@@ -533,58 +570,81 @@ const bill: ReceiptOptions = {
   billNo: "5910", cashier: "JIM", printedAt: "06/09/26 21:06", kotNumbers: [214, 218],
 };
 
+/** Any line that is a customer-name slot, in the wording of this bill or an older one. */
+const NAME_SLOT = /^(Customer( Name)?|Name):/;
+
 describe("the thermal bill prints who the invoice is made out to", () => {
-  test("the GSTIN sits directly under the Customer Name slot, above the date block (the client's bill layout)", () => {
+  test("the GSTIN sits directly under the Name slot, above the date block (the client's bill layout)", () => {
     const out = printed(buildReceiptBase64({ ...bill, customer: "Acme Pvt Ltd", customerGstin: GSTIN }));
     const lines = out.split("\n");
     const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
-    expect(at(/^Customer Name: Acme Pvt Ltd$/)).toBeGreaterThan(-1);
-    expect(at(/^Customer GSTIN: 29ABCDE1234F1Z5$/)).toBe(at(/^Customer Name: /) + 1);
+    expect(at(/^Name: Acme Pvt Ltd$/)).toBeGreaterThan(-1);
+    expect(at(/^Customer GSTIN: 29ABCDE1234F1Z5$/)).toBe(at(/^Name: /) + 1);
     // Above the date / bill-no block and the items, as on the client's paper.
     expect(at(/^Customer GSTIN: /)).toBeLessThan(at(/Date: 06\/09\/26 21:06/));
     expect(at(/^Customer GSTIN: /)).toBeLessThan(at(/Bill No\.: 5910/));
     expect(at(/^Customer GSTIN: /)).toBeLessThan(at(/Kronos/));
     // The name is printed ONCE — no second customer line lower down.
-    expect(lines.filter((l) => /^Customer( Name)?: /.test(l))).toHaveLength(1);
+    expect(lines.filter((l) => NAME_SLOT.test(l))).toHaveLength(1);
     // The restaurant's own GSTIN label is untouched and distinct.
     expect(out).not.toMatch(/GSTN : 29ABCDE1234F1Z5/);
   });
 
-  test.each(["Guest", "", null, undefined])("name %p keeps the slot reading Guest, with no GSTIN line", (name) => {
+  test.each(["Guest", "QR Guest", "", "null", null, undefined])("a walk-in (name %p) leaves the Name slot blank, with no GSTIN line", (name) => {
+    // The client's bill: a bare "Name:" for a guest who gave none. The ordering
+    // flows' "Guest" placeholder is not a name and must not print as one.
     const out = printed(buildReceiptBase64({ ...bill, customer: name as string | null | undefined }));
-    expect(out).toMatch(/^Customer Name: Guest$/m);
+    const lines = out.split("\n");
+    const slot = lines.findIndex((l) => NAME_SLOT.test(l));
+    expect(lines[slot]).toBe("Name:");
+    expect(lines.filter((l) => NAME_SLOT.test(l))).toHaveLength(1);
+    // Nothing stray fills the blank: the rule closing the block comes next.
+    expect(lines[slot + 1]).toBe("<RULE>");
+    expect(out).not.toMatch(/guest|null|undefined/i);
     expect(out).not.toContain("Customer GSTIN");
   });
 
   test("no GSTIN prints no GSTIN line — not a bare label", () => {
     for (const g of [null, undefined, "", "null"]) {
       const out = printed(buildReceiptBase64({ ...bill, customer: "Acme", customerGstin: g }));
-      expect(out).toMatch(/^Customer Name: Acme$/m);
+      const lines = out.split("\n");
+      const slot = lines.indexOf("Name: Acme");
+      expect(slot).toBeGreaterThan(-1);
+      expect(lines[slot + 1]).toBe("<RULE>");
       expect(out).not.toContain("Customer GSTIN");
     }
   });
 
-  test("a GSTIN with a Guest name still prints the GSTIN", () => {
+  test("a GSTIN with a Guest name still prints the GSTIN, directly under the blank slot", () => {
     const out = printed(buildReceiptBase64({ ...bill, customer: "Guest", customerGstin: GSTIN }));
-    expect(out).toMatch(/^Customer GSTIN: 29ABCDE1234F1Z5$/m);
+    const lines = out.split("\n");
+    expect(lines.indexOf("Customer GSTIN: 29ABCDE1234F1Z5")).toBe(lines.indexOf("Name:") + 1);
+    expect(lines.indexOf("Name:")).toBeGreaterThan(-1);
   });
 
-  test("a long name wraps inside the 58mm roll instead of running off it", () => {
+  test.each([
+    // The roll, and the cells a line may use on it: 80mm keeps a two-cell margin
+    // either side (48 - 4 = 44), 58mm keeps none.
+    [48, 44],
+    [32, 32],
+  ])("a long name wraps inside the %p-column roll's %p-cell text area instead of running off it", (roll, area) => {
     const name = "Navkrish Hospitality Private Limited Corporate Account";
-    const out = printed(buildReceiptBase64({ ...bill, customer: name, customerGstin: GSTIN }, 32));
+    const out = printed(buildReceiptBase64({ ...bill, customer: name, customerGstin: GSTIN }, roll));
     const lines = out.split("\n");
-    const from = lines.findIndex((l) => l.startsWith("Customer Name: "));
+    const from = lines.findIndex((l) => l.startsWith("Name: "));
     const to = lines.findIndex((l) => l.startsWith("Customer GSTIN: "));
     expect(from).toBeGreaterThan(-1);
+    expect(to).toBeGreaterThan(from);
     const block = lines.slice(from, to + 1);
-    expect(block.join(" ")).toContain("Corporate Account");
-    for (const l of block) { expect(l.length).toBeLessThanOrEqual(32); }
+    expect(block.slice(0, -1).join(" ")).toBe(`Name: ${name}`);
+    for (const l of block) { expect(l.length).toBeLessThanOrEqual(area); }
   });
 
   test("the KOT never carries them", () => {
     const out = printed(buildReceiptBase64({ ...bill, kind: "kot", customer: "Acme", customerGstin: GSTIN }));
     expect(out).not.toContain("Customer GSTIN");
-    expect(out).not.toMatch(/^Customer( Name)?: /m);
+    expect(out).not.toMatch(new RegExp(NAME_SLOT.source, "m"));
+    expect(out).not.toContain("Acme");
   });
 
   test("every part of a split bill carries them (the bill's identity, not a part's)", () => {

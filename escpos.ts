@@ -75,11 +75,11 @@ export const DEFAULT_BILL_QR_NOTE = "For calling Valet kindly scan the below QR 
  * Cap on a tenant's custom QR note.
  *
  * Chosen against the NARROW paper, not the wide one: 120 characters wraps to at
- * most 4 lines on 58mm/32-col and 3 on 80mm/48-col. That is long enough for a
- * real two-sentence instruction ("Scan to rate us and call your valet — your
- * feedback goes straight to the owner.") and short enough that it cannot push
- * the QR itself off a short tail of paper or bury the service-charge
- * disclaimer that follows it.
+ * most 4 lines on 58mm/32-col and 3 inside the 44-column text area of the 80mm
+ * bill. That is long enough for a real two-sentence instruction ("Scan to rate
+ * us and call your valet — your feedback goes straight to the owner.") and
+ * short enough that it cannot push the QR itself off a short tail of paper
+ * below the service-charge disclaimer that precedes it.
  */
 export const BILL_QR_NOTE_MAX = 120;
 
@@ -110,7 +110,7 @@ export interface ReceiptOptions {
   customer?: string | null;
   /**
    * BILL ONLY (round 2 item 1): the corporate party's GSTIN, printed as
-   * "Customer GSTIN: <value>" directly under the "Customer Name:" slot that
+   * "Customer GSTIN: <value>" directly under the "Name:" slot that
    * sits between the restaurant header and the date block. Pre-normalized by the caller (customer_gstin.ts).
    * Absent prints NOTHING — the same rule `gstin` obeys for the restaurant's own.
    */
@@ -119,7 +119,7 @@ export interface ReceiptOptions {
   cashier?: string | null;
   /**
    * BILL ONLY: every KOT number that fed this bill, in allocation order —
-   * printed as "Token No.: 214, 218, 236, ..." under the Bill No./Cashier line,
+   * printed as "Token No.: 214, 218, 236, ..." under the Cashier/Bill No. line,
    * where the reference GAIA receipt carries it.
    *
    * A table's bill is the sum of SEVERAL orders, each fired on its own ticket,
@@ -146,7 +146,7 @@ export interface ReceiptOptions {
   // optedOut is true the line prints "Opted-out" instead of an amount (matches
   // the web bill when the guest waives the voluntary charge).
   serviceCharge?: { percent: number; amount: number; optedOut?: boolean } | null;
-  // Optional tax breakdown. When present, the receipt shows a Subtotal line,
+  // Optional tax breakdown. When present, the receipt shows a Sub Total line,
   // each tax line, and a tax-inclusive TOTAL (= total + service charge + taxes).
   taxes?: ReceiptTax[];
   /**
@@ -409,6 +409,80 @@ function present(v: string | null | undefined): string {
   return s.toLowerCase() === "null" || s.toLowerCase() === "undefined" ? "" : s;
 }
 
+/** Printer dots per Font A column — 576 dots / 48 columns on the 80mm roll. */
+export const DOTS_PER_COL = 12;
+
+/**
+ * Text columns of white kept either side of a CUSTOMER BILL, per roll.
+ *
+ * The client's printed bill sits inside visible margins — the rules and the
+ * right-hand money column stop well short of the paper edge. Edge-to-edge text
+ * on an 80mm roll reads as cramped and loses its last character to a printer
+ * whose head is a dot or two narrower than nominal. The 58mm roll gets none:
+ * at 32 columns every one is already spoken for by the item table.
+ *
+ * KOTs are untouched. A docket is read at arm's length on a rail, and its
+ * layout was tuned column by column for that — see the KOT item block.
+ */
+export function billMarginCols(width: number): number {
+  return width >= 48 ? 2 : 0;
+}
+
+/**
+ * The bill's item-table columns for a text area of `textWidth` — Item, Qty.,
+ * Price, Amount — summing exactly to it. The totals ladder right-aligns on the
+ * same Amount column, so the figures of the ladder sit under the line amounts.
+ */
+export function billColumns(textWidth: number): { COL_ITEM: number; COL_QTY: number; COL_PRICE: number; COL_TOTAL: number } {
+  const wide = textWidth >= 40;
+  const COL_QTY = wide ? 5 : 4;
+  const COL_PRICE = wide ? 9 : 8;
+  const COL_TOTAL = wide ? 10 : 9;
+  const COL_ITEM = Math.max(8, textWidth - COL_QTY - COL_PRICE - COL_TOTAL);
+  return { COL_ITEM, COL_QTY, COL_PRICE, COL_TOTAL };
+}
+
+/**
+ * A SOLID RULE, as a raster — the lines on the client's bill are continuous
+ * strokes, not a row of hyphens.
+ *
+ * Why a raster and not a box-drawing character: 0xC4 is a line only in code
+ * page 437, and a printer left on WPC1252 prints a row of "Ä" instead. A GS v 0
+ * image prints the same on every printer that prints the logo.
+ *
+ * IT IS A NEW REQUIREMENT FOR A TENANT WITH NO LOGO, stated plainly: the logo
+ * is optional, so a bill without one used to send no raster at all, and every
+ * bill now sends these. A printer that cannot take GS v 0 would print the rule
+ * bytes as garbage where the dashes used to be. Every ESC/POS printer this
+ * product has been deployed on takes GS v 0 (the logo path has relied on it
+ * for as long as bills have carried one), which is why this is a raster and not
+ * a per-tenant choice — but it is a choice made, not a free one.
+ *
+ * `dots` is the width of the text area it underlines; the stroke is centred in
+ * a little white above and below so it separates blocks the way the reference
+ * does instead of touching the text.
+ */
+export function billRule(dots: number, thick = false): Buffer {
+  const widthBytes = Math.ceil(dots / 8);
+  const PAD = 4;
+  const INK = thick ? 4 : 2;
+  const height = PAD + INK + PAD;
+  const header = Buffer.from([
+    0x1d, 0x76, 0x30, 0x00,
+    widthBytes & 0xff, (widthBytes >> 8) & 0xff,
+    height & 0xff, (height >> 8) & 0xff,
+  ]);
+  const body = Buffer.alloc(widthBytes * height, 0x00);
+  const tail = dots % 8;
+  for (let y = PAD; y < PAD + INK; y++) {
+    body.fill(0xff, y * widthBytes, (y + 1) * widthBytes);
+    // Never ink past the requested width: a partial last byte keeps only its
+    // leading bits.
+    if (tail) { body[(y + 1) * widthBytes - 1] = (0xff << (8 - tail)) & 0xff; }
+  }
+  return Buffer.concat([header, body]);
+}
+
 // width defaults to 48 columns (80mm paper), matching the web printable bill.
 // Pass 32 for 58mm printers.
 export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
@@ -420,6 +494,22 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   const line = (s = "") => text(s + "\n");
   const sep = "-".repeat(width);
   const isKot = opts.kind === "kot";
+  // THE BILL'S TEXT AREA: the roll less its margins. Every bill line is laid
+  // out against W; the margins themselves are the printer's (GS L / GS W,
+  // below), so the text stream carries no padding a copy-paste would inherit.
+  const marginCols = isKot ? 0 : billMarginCols(width);
+  const W = width - 2 * marginCols;
+  /**
+   * The separator between blocks. A KOT keeps its dashed row, byte for byte; a
+   * bill draws the solid stroke its reference carries, thicker around the item
+   * table exactly where the client's bill thickens it.
+   */
+  const rule = (thick = false) => {
+    if (isKot) { line(sep); return; }
+    parts.push(billRule(W * DOTS_PER_COL, thick));
+  };
+  /** Bold, without touching size — `ESC E` alone, so a line keeps its columns. */
+  const bold = (s: string) => { raw(ESC, 0x45, 0x01); text(s); raw(ESC, 0x45, 0x00); };
 
   /**
    * One line in the largest type the printer has: bold, double width AND height.
@@ -475,6 +565,16 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   };
 
   raw(ESC, 0x40); // initialize
+  if (marginCols > 0) {
+    // GS L (left margin) then GS W (print area), both in dots. Set straight
+    // after ESC @, at the start of a line, where both are honoured. A printer
+    // that ignores GS W still fits every line: W columns from the left margin
+    // end inside the roll. The next job's ESC @ clears both.
+    const left = marginCols * DOTS_PER_COL;
+    const area = W * DOTS_PER_COL;
+    raw(GS, 0x4c, left & 0xff, (left >> 8) & 0xff);
+    raw(GS, 0x57, area & 0xff, (area >> 8) & 0xff);
+  }
 
   // --- Header (centered): logo, restaurant name, address ---------------------
   raw(ESC, 0x61, 0x01); // center
@@ -489,7 +589,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   // It goes on the kitchen docket too, for the harder version of the same
   // failure: an unmarked second copy of a ticket is cooked twice.
   if (opts.reprint) {
-    big("** REPRINT **", width);
+    big("** REPRINT **", isKot ? width : W);
   }
   if (opts.logo && opts.logo.length > 0) {
     parts.push(opts.logo);
@@ -512,9 +612,15 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     raw(ESC, 0x21, 0x00);
     raw(ESC, 0x45, 0x00);
   } else {
-    raw(ESC, 0x21, 0x30); // double width + height
-    line(opts.restaurantName || "Receipt");
-    raw(ESC, 0x21, 0x00); // normal
+    // BOLD, AT THE SIZE OF THE ADDRESS UNDER IT — the client's bill. The name
+    // used to print double width AND height, which on the 80mm roll is 22
+    // characters before it wraps: "Gaia - Global Vegetarian" broke in two and
+    // shouted over the logo that already names the restaurant.
+    for (const l of wrapText(asciiSafe(opts.restaurantName || "Receipt"), W)) {
+      raw(ESC, 0x45, 0x01);
+      line(l);
+      raw(ESC, 0x45, 0x00);
+    }
   }
   if (isKot) {
     // THE CANCELLATION BANNER GOES FIRST, ABOVE EVERYTHING ELSE ON THE TICKET.
@@ -559,20 +665,25 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // "GSTN :" label with nothing after it, and no blank line where a field
     // would have been.
     const legalName = present(opts.legalName);
+    // FOLDED TO ASCII BEFORE IT IS MEASURED. `line` folds anyway, and the
+    // fold can LENGTHEN text ("…" is three characters, "½" is "1?2"), so a
+    // wrap measured on the original can print past the text area.
     if (legalName) {
-      for (const l of wrapText(legalName, width)) {line(l);}
+      for (const l of wrapText(asciiSafe(legalName), W)) {line(l);}
     }
-    for (const l of addressLines(present(opts.address), width)) {line(l);}
+    for (const l of addressLines(asciiSafe(present(opts.address)), W)) {line(l);}
     // The outlet's own number, in the place an Indian tax invoice carries it:
     // under the address, above the GST registration. It is wrapped like the
     // address rather than assumed short — a tenant who stores "080-4123 4567 /
     // +91 98765 43210" gets both numbers, not a truncated first one.
     const phone = present(opts.phone);
-    if (phone) {for (const l of wrapText(`Ph : ${phone}`, width)) {line(l);}}
+    if (phone) {for (const l of wrapText(asciiSafe(`Ph : ${phone}`), W)) {line(l);}}
+    // Wrapped like the phone. A GSTIN is 15 characters, but the field is free
+    // text, and a tenant registered in two states stores both.
     const gstin = present(opts.gstin);
-    if (gstin) {line(`GSTN : ${gstin}`);}
+    if (gstin) {for (const l of wrapText(asciiSafe(`GSTN : ${gstin}`), W)) {line(l);}}
   }
-  line(sep);
+  rule();
 
   // --- Meta block (left aligned) --------------------------------------------
   raw(ESC, 0x61, 0x00); // left
@@ -599,23 +710,30 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   if (splitPart) {
     const of = Math.max(1, Math.round(Number(splitPart.of) || 1));
     const index = Math.min(of, Math.max(1, Math.round(Number(splitPart.index) || 1)));
-    big(`** PART ${index}/${of} **`, width);
+    big(`** PART ${index}/${of} **`, W);
     // The section's own name, and the table, on one wrapped line. An unlabelled
     // part still says which table it belongs to rather than printing a bare
     // dash — same rule every header field in this file obeys.
     const label = present(splitPart.label);
     const where = `Table ${opts.table || "N/A"}`;
-    for (const l of wrapText(label ? `${label} - ${where}` : where, width)) {line(l);}
-    line(sep);
+    for (const l of wrapText(asciiSafe(label ? `${label} - ${where}` : where), W)) {line(l);}
+    rule();
   }
   if (!isKot) {
     // WHO THE BILL IS MADE OUT TO — the "Name:" slot the client's own printed
-    // bill has, between the restaurant header and the date block. Round 2 item 1
-    // adds the corporate party's GSTIN directly under it, only when one is set.
-    for (const l of wrapText(`Customer Name: ${present(opts.customer) || "Guest"}`, width)) {line(l);}
+    // bill has, between the restaurant header and the date block, worded as it
+    // is there. Round 2 item 1 adds the corporate party's GSTIN directly under
+    // it, only when one is set.
+    //
+    // A WALK-IN LEAVES THE SLOT BLANK, as the client's bill does. "Guest" is the
+    // placeholder the ordering flows store for "nobody gave a name"; printed, it
+    // reads as a name somebody wrote down.
+    const customer = present(opts.customer);
+    const named = /^(qr )?guest$/i.test(customer) ? "" : customer;
+    for (const l of wrapText(asciiSafe(named ? `Name: ${named}` : "Name:"), W)) {line(l);}
     const customerGstin = present(opts.customerGstin);
-    if (customerGstin) {line(`Customer GSTIN: ${customerGstin}`);}
-    line(sep);
+    if (customerGstin) {for (const l of wrapText(asciiSafe(`Customer GSTIN: ${customerGstin}`), W)) {line(l);}}
+    rule();
   }
   const now = new Date().toLocaleString();
   if (isKot) {
@@ -651,18 +769,44 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // `new Date().toLocaleString()` — the SERVER's zone and locale, which on a
     // UTC host prints a US-format timestamp and, between 00:00 and 05:30 IST,
     // the WRONG CALENDAR DATE on a receipt that carries the tenant's GSTIN.
-    line(twoCol(`Date: ${present(opts.printedAt) || now}`, `Dine In: ${opts.table || "N/A"}`, width));
+    // The table is BOLD on the client's bill: it is what a server matches the
+    // slip to. Bold changes no cell widths, so the row is laid out as plain text
+    // and only the right-hand run is emphasised.
+    //
+    // NEVER CUT A VALUE TO MAKE A ROW FIT. `twoCol` slices the left text when
+    // both halves do not fit, and on this row the left text is the DATE: a table
+    // named "ZOMATO-5123456789" printed "Date: 14/09/26 13 Dine In: ..." — the
+    // minutes gone from a GST invoice, silently. When the two do not fit side by
+    // side they print on two lines instead, each wrapped whole.
+    {
+      const dateText = asciiSafe(`Date: ${present(opts.printedAt) || now}`);
+      const dineIn = asciiSafe(`Dine In: ${opts.table || "N/A"}`);
+      if (dateText.length + 1 + dineIn.length <= W) {
+        text(dateText + " ".repeat(W - dateText.length - dineIn.length));
+        bold(dineIn);
+        line();
+      } else {
+        for (const l of wrapText(dateText, W)) {line(l);}
+        for (const l of wrapText(dineIn, W)) {bold(l); line();}
+      }
+    }
     // Each label only when its value is known — same rule the header block
     // obeys. A tenant with no bill series and no named cashier printed two
     // bare labels ("Bill No.:" / "Cashier:") with nothing after them.
+    //
+    // Cashier on the left, bill number on the right — the client's order.
+    //
+    // Same rule as the date: side by side when both fit whole, otherwise one
+    // under the other. A long cashier name used to lose its tail to `twoCol`.
     const billNo = present(opts.billNo);
     const cashier = present(opts.cashier);
-    if (billNo && cashier) {
-      line(twoCol(`Bill No.: ${billNo}`, `Cashier: ${cashier}`, width));
-    } else if (billNo) {
-      line(`Bill No.: ${billNo}`);
-    } else if (cashier) {
-      line(`Cashier: ${cashier}`);
+    const cashierText = cashier ? asciiSafe(`Cashier: ${cashier}`) : "";
+    const billNoText = billNo ? asciiSafe(`Bill No.: ${billNo}`) : "";
+    if (cashierText && billNoText && cashierText.length + 1 + billNoText.length <= W) {
+      line(cashierText + " ".repeat(W - cashierText.length - billNoText.length) + billNoText);
+    } else {
+      for (const l of cashierText ? wrapText(cashierText, W) : []) {line(l);}
+      for (const l of billNoText ? wrapText(billNoText, W) : []) {line(l);}
     }
     // EVERY KOT NUMBER THAT FED THIS BILL — see `kotNumbers` for why the guest's
     // copy carries them and why the renderer neither derives nor dedupes them.
@@ -676,10 +820,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       .map((n) => Math.round(Number(n)))
       .filter((n) => Number.isFinite(n) && n > 0);
     if (tokens.length > 0) {
-      for (const l of wrapText(`Token No.: ${tokens.join(", ")}`, width)) {line(l);}
+      for (const l of wrapText(`Token No.: ${tokens.join(", ")}`, W)) {line(l);}
     }
   }
-  line(sep);
+  rule(true);
 
   // --- The order-level instruction (KOT only) --------------------------------
   //
@@ -894,28 +1038,47 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     }
     line(sep);
   } else {
-    // Column layout: Item | Qty | Price | Total (sums to `width`). At 80mm/48-col
-    // these match the web bill exactly (Item 20, Qty 6, Price 10, Total 12);
-    // narrower for 58mm/32-col.
-    const COL_QTY = width >= 48 ? 6 : 4;
-    const COL_PRICE = width >= 48 ? 10 : 8;
-    const COL_TOTAL = width >= 48 ? 12 : 9;
-    const COL_ITEM = Math.max(8, width - COL_QTY - COL_PRICE - COL_TOTAL);
+    // Column layout: Item | Qty. | Price | Amount, summing to the text area W —
+    // the client's headings. 80mm (44 inside its margins): Item 20, Qty. 5,
+    // Price 9, Amount 10. 58mm (32, no margins): Item 11, Qty. 4, Price 8,
+    // Amount 9.
+    const { COL_ITEM, COL_QTY, COL_PRICE, COL_TOTAL } = billColumns(W);
     const pad = (s: string, n: number) => s.length >= n ? s : s + " ".repeat(n - s.length);
     const padL = (s: string, n: number) => s.length >= n ? s : " ".repeat(n - s.length) + s;
-    line(pad("Item", COL_ITEM) + padL("Qty", COL_QTY) + padL("Price", COL_PRICE) + padL("Total", COL_TOTAL));
-    line(sep);
+    line(pad("Item", COL_ITEM) + padL("Qty.", COL_QTY) + padL("Price", COL_PRICE) + padL("Amount", COL_TOTAL));
+    rule(true);
     for (const it of opts.items) {
       const qty = Math.max(1, Math.round(Number(it.quantity) || 1));
       const price = Number(it.price) || 0;
-      const nameLines = wrapText(itemLabel(it), COL_ITEM - 1);
-      line(
-        pad(nameLines[0] ?? "", COL_ITEM) +
-        padL(String(qty), COL_QTY) +
-        padL(price.toFixed(2), COL_PRICE) +
-        padL((price * qty).toFixed(2), COL_TOTAL),
-      );
-      for (let i = 1; i < nameLines.length; i++) {line(nameLines[i] ?? "");}
+      const qtyText = String(qty);
+      const priceText = price.toFixed(2);
+      const amountText = (price * qty).toFixed(2);
+      // EVERY FIGURE KEEPS A SPACE IN FRONT OF IT. `padL` neither separates nor
+      // trims, so a figure as wide as its column used to butt against the one
+      // before it: qty 1 at 1,50,000.00 printed "1150000.00", which reads as a
+      // different price. When any figure fills its column the numbers move to
+      // their own right-aligned line under the dish, with a space between each.
+      const fits = qtyText.length < COL_QTY && priceText.length < COL_PRICE && amountText.length < COL_TOTAL;
+      const label = asciiSafe(itemLabel(it));
+      if (fits) {
+        const nameLines = wrapText(label, COL_ITEM - 1);
+        line(
+          pad(nameLines[0] ?? "", COL_ITEM) +
+          padL(qtyText, COL_QTY) +
+          padL(priceText, COL_PRICE) +
+          padL(amountText, COL_TOTAL),
+        );
+        for (let i = 1; i < nameLines.length; i++) {line(nameLines[i] ?? "");}
+      } else {
+        for (const l of wrapText(label, W)) {line(l);}
+        const figures = `${qtyText} x ${priceText}  ${amountText}`;
+        if (figures.length <= W) {
+          line(padL(figures, W));
+        } else {
+          line(padL(`${qtyText} x ${priceText}`, W));
+          line(padL(amountText, W));
+        }
+      }
       // THE ITEM NOTE IS DELIBERATELY NOT PRINTED HERE. It used to be, under the
       // line it belonged to, and it did not belong on this document at all.
       //
@@ -928,7 +1091,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       // depends on it: it carries no price, moves no total, and its absence
       // changes not one figure the guest is charged.
     }
-    line(sep);
+    rule(true);
   }
 
   if (isKot) {
@@ -943,11 +1106,21 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   const sc = opts.serviceCharge && (Number(opts.serviceCharge.amount) > 0 || opts.serviceCharge.optedOut) ? opts.serviceCharge : null;
   const discountAmt = opts.discount && Number(opts.discount.amount) > 0 ? Number(opts.discount.amount) : 0;
 
-  line(twoCol("Subtotal", Number(opts.total).toFixed(2), width));
-  line(twoCol("Total Qty", String(totalQty), width));
-  if (discountAmt > 0) {line(twoCol(opts.discount?.label || "Discount", `- ${discountAmt.toFixed(2)}`, width));}
-  if (sc) {line(twoCol(`Service Charge (${sc.percent}%)`, sc.optedOut ? "Opted-out" : Number(sc.amount).toFixed(2), width));}
-  for (const t of taxLines) {line(twoCol(`${t.name} (${t.percentage}%)`, Number(t.amount).toFixed(2), width));}
+  // THE LADDER SITS IN THE RIGHT-HAND BLOCK, AS ON THE CLIENT'S BILL: every
+  // label right-aligned against the Amount column, every figure in that column
+  // under the item amounts it sums. "Total Qty: 19   Sub Total   4745.00" is
+  // one row there, and is one row here whenever it fits the roll.
+  //
+  // ONE LABEL EDGE FOR THE WHOLE LADDER. Every figure is known before the first
+  // row prints, so the amount column is sized once, to the widest of them
+  // (never narrower than the item table's Amount column), and every label ends
+  // on the same column. Sizing each row on its own value put "Grand Total" a
+  // column left of the rows above it on every bill of Rs 1000 or more.
+  const AMT = billColumns(W).COL_TOTAL;
+  const subtotalText = Number(opts.total).toFixed(2);
+  const discountText = discountAmt > 0 ? `-${discountAmt.toFixed(2)}` : "";
+  const scText = sc ? (sc.optedOut ? "Opted-out" : Number(sc.amount).toFixed(2)) : "";
+  const taxTexts = taxLines.map((t) => Number(t.amount).toFixed(2));
 
   // THE GRAND TOTAL IS NOT COMPUTED HERE WHEN THE CALLER SUPPLIES ONE.
   //
@@ -959,10 +1132,11 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   // given it is printed exactly as received, with no round-off line, because
   // there is no rounding left to disclose.
   //
-  // The legacy branch is kept verbatim for callers that pass no grandTotal, so
-  // nothing that has not been migrated changes behaviour.
-  line(sep);
+  // The legacy branch is kept for callers that pass no grandTotal, so nothing
+  // that has not been migrated changes its figures.
   const supplied = Number(opts.grandTotal);
+  let roundOffText = "";
+  let grandText: string;
   if (opts.grandTotal != null && Number.isFinite(supplied)) {
     // The one thing that IS printed alongside a supplied total: a round-off the
     // billing layer already computed, so the lines above add up to the total
@@ -970,37 +1144,87 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // prints nothing, which is every whole bill.
     const disclosed = Number(opts.roundOff);
     if (opts.roundOff != null && Number.isFinite(disclosed) && Math.round(disclosed * 100) !== 0) {
-      line(twoCol("Round off", (disclosed > 0 ? "+" : "") + disclosed.toFixed(2), width));
+      roundOffText = (disclosed > 0 ? "+" : "") + disclosed.toFixed(2);
     }
-    raw(ESC, 0x45, 0x01); // bold
-    line(twoCol("Grand Total:", money(supplied), width));
-    raw(ESC, 0x45, 0x00);
+    grandText = money(supplied);
   } else {
     const preRound = Number(opts.total) - discountAmt + (sc ? Number(sc.amount) : 0) + taxLines.reduce((s, t) => s + Number(t.amount || 0), 0);
     const grand = Math.round(preRound);
-    const roundOff = grand - preRound;
-    line(twoCol("Round off", (roundOff > 0 ? "+" : "") + roundOff.toFixed(2), width));
-    raw(ESC, 0x45, 0x01); // bold
-    line(twoCol("Grand Total:", money(grand), width));
+    roundOffText = ((grand - preRound) > 0 ? "+" : "") + (grand - preRound).toFixed(2);
+    grandText = money(grand);
+  }
+
+  const amtW = Math.max(AMT, ...[subtotalText, discountText, scText, ...taxTexts, roundOffText, grandText]
+    .filter((v) => v.length > 0)
+    .map((v) => v.length + 1));
+  const labelW = Math.max(1, W - amtW);
+  /**
+   * One rung: the label right-aligned against the shared edge, the figure in
+   * the amount column. A label too long for its side WRAPS, right-aligned, with
+   * the figure on its last line — cutting it would drop the rate off a tax line
+   * ("Compensation Cess on Aerated Beverag 1234.50") on a tax document.
+   */
+  const ladder = (label: string, value: string) => {
+    // Only a label that does not fit is wrapped: wrapText rejoins words with
+    // single spaces, and "Total Qty: 19   Sub Total" keeps its wider gap.
+    const folded = asciiSafe(label);
+    const parts = folded.length <= labelW ? [folded] : wrapText(folded, labelW);
+    parts.forEach((part, i) => {
+      const lead = " ".repeat(Math.max(0, labelW - part.length)) + part;
+      line(i === parts.length - 1 && value ? lead + " ".repeat(amtW - value.length) + value : lead);
+    });
+  };
+  const qtyAndSub = `Total Qty: ${totalQty}   Sub Total`;
+  if (qtyAndSub.length <= labelW) {
+    ladder(qtyAndSub, subtotalText);
+  } else {
+    // The 58mm roll: two rows rather than a row the printer wraps mid-word.
+    ladder(`Total Qty: ${totalQty}`, "");
+    ladder("Sub Total", subtotalText);
+  }
+  if (discountText) {ladder(opts.discount?.label || "Discount", discountText);}
+  if (sc) {ladder(`Service Charge ${sc.percent}%`, scText);}
+  taxLines.forEach((t, i) => { ladder(`${t.name} ${t.percentage}%`, taxTexts[i] ?? ""); });
+
+  /**
+   * The grand total: bold and DOUBLE HEIGHT, the one figure on the slip that is
+   * bigger than the rest, as it is on the client's bill. Double height costs no
+   * columns, so the row is laid out exactly as a ladder row is.
+   */
+  const grandRow = (amount: string) => {
+    raw(ESC, 0x45, 0x01);
+    raw(ESC, 0x21, MODE_TALL | MODE_BOLD);
+    ladder("Grand Total", amount);
+    raw(ESC, 0x21, 0x00);
+    raw(ESC, 0x45, 0x00);
+  };
+
+  rule();
+  if (roundOffText) {ladder("Round off", roundOffText);}
+  grandRow(grandText);
+  rule();
+
+  // --- Footer (centered): disclaimer, then the valet/feedback QR ------------
+  //
+  // The disclaimer comes straight under the total, bold, as on the client's
+  // bill: it is a statement about the charge in the figure just above it, and
+  // a guest reads it before deciding what to pay. The QR is an invitation, so
+  // it follows. The old "Thanks" line is gone — the client's bill has none.
+  raw(ESC, 0x61, 0x01); // center
+  if (opts.serviceChargeNote) {
+    raw(ESC, 0x45, 0x01);
+    for (const l of wrapText(asciiSafe(opts.serviceChargeNote), W)) {line(l);}
     raw(ESC, 0x45, 0x00);
   }
-  line(sep);
-
-  // --- Footer (centered): thanks, valet/feedback QR, disclaimer -------------
-  raw(ESC, 0x61, 0x01); // center
-  line("Thanks");
   if (opts.feedbackUrl) {
-    line(sep);
+    if (opts.serviceChargeNote) {rule();}
     // The tenant's own sentence when they have set one, otherwise the valet
     // line this receipt has always carried.
     const note = present(opts.qrNote).slice(0, BILL_QR_NOTE_MAX) || DEFAULT_BILL_QR_NOTE;
-    for (const l of wrapText(note, width)) {line(l);}
+    for (const l of wrapText(asciiSafe(note), W)) {line(l);}
     text("\n");
     parts.push(escposQr(opts.feedbackUrl, 6));
     text("\n");
-  }
-  if (opts.serviceChargeNote) {
-    for (const l of wrapText(opts.serviceChargeNote, width)) {line(l);}
   }
   text("\n\n\n");
   raw(GS, 0x56, 0x00); // full cut
@@ -1078,7 +1302,7 @@ export interface SplitReceiptPart {
   key?: string;
   /** What this part is called on the paper — "Starters", "Bar". */
   label?: string | null;
-  /** GROSS, pre-discount — the Subtotal line, exactly as a whole bill prints it. */
+  /** GROSS, pre-discount — the Sub Total line, exactly as a whole bill prints it. */
   subtotal: number;
   discount?: number;
   service_charge?: number;
@@ -1171,7 +1395,7 @@ export function buildSplitReceiptsBase64(
       items: Array.isArray(part.items) ? part.items : [],
       total: Number(part.subtotal) || 0,
       // A part that was allocated nothing off a bill-wide discount prints no
-      // discount line at all, rather than "- 0.00": the line is a statement that
+      // discount line at all, rather than "-0.00": the line is a statement that
       // money came off, and none did. The LABEL is the bill's, because the
       // coupon was applied to the bill.
       discount: discount > 0 ? { amount: discount, label: opts.discount?.label } : null,

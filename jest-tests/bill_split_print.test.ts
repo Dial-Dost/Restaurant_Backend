@@ -32,49 +32,137 @@ import {
 
 const decode = (b64: string) => Buffer.from(b64, "base64").toString("latin1");
 
+/** Printer dots per Font A cell: 576 dots / 48 cells on the 80mm roll. */
+const DOTS_PER_CELL = 12;
+
 /**
- * The receipt as the PAPER shows it — the same helper escpos.test.ts uses, and
- * for the same reason: the ESC/POS mode bytes are interleaved with the text, so
- * a naive substring match misses "Grand Total:" (which is prefixed by ESC E 1)
- * and a naive length read comes out three characters long.
+ * A GS v 0 raster, named by what it draws. The bill's rules are a raster whose
+ * every row is either blank or inked edge to edge — two inked rows for a thin
+ * rule, four for the thick one around the item table. Anything else (the logo)
+ * is just an image.
  */
-function printed(b64: string): string {
-  return decode(b64)
-    .replace(/\x1b@/g, "")            // ESC @   initialize
-    .replace(/\x1b[a!E][\s\S]/g, "")  // ESC a/!/E n   align / mode / bold
-    .replace(/\x1dV[\s\S]/g, "");     // GS V n  cut
+function rasterMarker(body: Buffer, widthBytes: number, height: number): string {
+  let ink = 0;
+  let inkEnded = false;
+  for (let y = 0; y < height; y++) {
+    const row = body.subarray(y * widthBytes, (y + 1) * widthBytes);
+    if (row.every((b) => b === 0x00)) { if (ink > 0) { inkEnded = true; } continue; }
+    // A solid row: every byte full, bar a last byte that keeps only its leading
+    // bits when the stroke's width is not a whole number of bytes.
+    const solid = row.subarray(0, widthBytes - 1).every((b) => b === 0xff) && row[widthBytes - 1] !== 0x00;
+    if (!solid || inkEnded) { return "<IMAGE>"; }
+    ink++;
+  }
+  return ink === 2 ? "<RULE>" : ink === 4 ? "<RULE:THICK>" : "<IMAGE>";
 }
 
-/** Printed width in CELLS, not characters — a doubled banner eats two each. */
-function cellWidths(b64: string): number[] {
-  const raw = decode(b64);
-  const widths: number[] = [];
+interface Paper {
+  /** The slip as the paper reads: text, with each raster standing as one marker line. */
+  text: string;
+  /** Each printed line's width in CELLS — a double-width run eats two each, a raster its dot width. */
+  cells: number[];
+  /** GS L — the left margin the slip set, in dots; 0 when it set none. */
+  leftDots: number;
+  /** GS W — the print area the slip set, in dots; null when it set none. */
+  areaDots: number | null;
+}
+
+/**
+ * The receipt as the PAPER shows it, walked command by command.
+ *
+ * The ESC/POS mode bytes are interleaved with the text, so a naive substring
+ * match misses "Grand Total" (which is prefixed by ESC E 1 and ESC ! 0x18) and
+ * a naive length read comes out several characters long. And the bill's rules
+ * are GS v 0 rasters now, whose header carries a height byte of 0x0a — the same
+ * byte as "\n" — so a latin1 decode split on newlines breaks a line inside every
+ * thin rule. A raster is therefore skipped by the length its own header states
+ * (8 + widthBytes x height), never by pattern, and replaced by a marker line.
+ */
+function paper(b64: string): Paper {
+  const buf = Buffer.from(b64, "base64");
+  let text = "";
+  const cells: number[] = [];
   let cur = 0;
   let scale = 1;
-  for (let i = 0; i < raw.length; i++) {
-    const c = raw[i];
-    if (c === "\x1b") {
-      const cmd = raw[i + 1];
-      if (cmd === "!") { scale = (raw.charCodeAt(i + 2) & 0x20) ? 2 : 1; i += 2; continue; }
-      if (cmd === "a" || cmd === "E") { i += 2; continue; }
-      if (cmd === "@") { scale = 1; i += 1; continue; }
+  let leftDots = 0;
+  let areaDots: number | null = null;
+  const u16 = (at: number) => buf[at]! | (buf[at + 1]! << 8);
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i]!;
+    const cmd = buf[i + 1];
+    if (b === 0x1b) {
+      if (cmd === 0x40) { scale = 1; i += 1; continue; }                              // ESC @    initialize
+      if (cmd === 0x21) { scale = (buf[i + 2]! & 0x20) ? 2 : 1; i += 2; continue; }   // ESC ! n  mode
+      if (cmd === 0x61 || cmd === 0x45) { i += 2; continue; }                         // ESC a/E n  align / bold
     }
-    if (c === "\x1d" && raw[i + 1] === "V") { i += 2; continue; } // GS V n — cut
-    if (c === "\n") { widths.push(cur); cur = 0; continue; }
+    if (b === 0x1d) {
+      if (cmd === 0x56) { i += 2; continue; }                                         // GS V n   cut
+      if (cmd === 0x4c) { leftDots = u16(i + 2); i += 3; continue; }                  // GS L nL nH  left margin
+      if (cmd === 0x57) { areaDots = u16(i + 2); i += 3; continue; }                  // GS W nL nH  print area
+      if (cmd === 0x76 && buf[i + 2] === 0x30) {                                      // GS v 0 m xL xH yL yH d...
+        const widthBytes = u16(i + 4);
+        const height = u16(i + 6);
+        const body = buf.subarray(i + 8, i + 8 + widthBytes * height);
+        if (cur > 0) { text += "\n"; cells.push(cur); cur = 0; }
+        text += `${rasterMarker(body, widthBytes, height)}\n`;
+        cells.push(Math.ceil((widthBytes * 8) / DOTS_PER_CELL));
+        i += 7 + widthBytes * height;
+        continue;
+      }
+    }
+    if (b === 0x0a) { text += "\n"; cells.push(cur); cur = 0; continue; }
+    text += String.fromCharCode(b);
     cur += scale;
   }
-  if (cur > 0) { widths.push(cur); }
-  return widths;
+  if (cur > 0) { cells.push(cur); }
+  return { text, cells, leftDots, areaDots };
 }
+
+const printed = (b64: string): string => paper(b64).text;
+
+/** Printed width in CELLS, not characters — a doubled banner eats two each. */
+const cellWidths = (b64: string): number[] => paper(b64).cells;
+
+/**
+ * WHERE ON THE ROLL THE SLIP PUTS ITS TEXT, in cells, read off the commands the
+ * slip itself sent: the left margin (GS L) and the columns a line may occupy
+ * there — the print area (GS W) where one is set, and never more than the roll
+ * has left to the right of the margin.
+ */
+function textArea(b64: string, rollCols: number): { left: number; cols: number } {
+  const { leftDots, areaDots } = paper(b64);
+  const rollDots = rollCols * DOTS_PER_CELL;
+  const area = Math.min(areaDots ?? rollDots, rollDots - leftDots);
+  return { left: leftDots / DOTS_PER_CELL, cols: Math.floor(area / DOTS_PER_CELL) };
+}
+
+/**
+ * The text area each roll's bill is laid out in: 80mm keeps two cells of white
+ * either side (48 - 2 - 2 = 44), 58mm keeps none — every one of its 32 cells is
+ * already spoken for by the item table.
+ */
+const BILL_AREA: Record<number, { left: number; cols: number }> = {
+  48: { left: 2, cols: 44 },
+  32: { left: 0, cols: 32 },
+};
+
+/** A totals-ladder row: label and figure right-aligned into the Amount column. */
+const rung = (label: string, figure: string) => new RegExp(`^ *${label} +${figure}$`, "m");
 
 /**
  * THE NUMBER OFF THE PAPER, IN PAISA. Read back out of the printed characters
  * rather than off the part object — that round trip is the whole point of this
  * file, because the paper is the only place a second rounding could hide.
+ *
+ * Exactly one line of the slip may mention the grand total, and it must be the
+ * whole "Grand Total  Rs 1234.56" row: a second total, or a figure with anything
+ * stuck to it, is a slip a guest could pay the wrong number off.
  */
 function printedGrandTotalPaisa(b64: string): number {
-  const match = /^Grand Total: +Rs ([0-9]+\.[0-9]{2})$/m.exec(printed(b64));
-  if (!match) { throw new Error(`no Grand Total line on this receipt:\n${printed(b64)}`); }
+  const page = printed(b64);
+  const rows = page.split("\n").filter((l) => l.includes("Grand Total"));
+  const match = rows.length === 1 ? /^ *Grand Total +Rs ([0-9]+\.[0-9]{2})$/.exec(rows[0]!) : null;
+  if (!match) { throw new Error(`expected exactly one whole Grand Total line on this receipt:\n${page}`); }
   return toPaisa(Number(match[1]));
 }
 
@@ -141,7 +229,7 @@ describe("buildSplitReceiptsBase64 — one document per part", () => {
     // paper are handed across the table as a single bill.
     for (const receipt of buildSplitReceiptsBase64(WHOLE, SPLIT.parts)) {
       expect(cuts(receipt.escBase64)).toBe(1);
-      expect(printed(receipt.escBase64)).toContain("Grand Total:");
+      expect(printed(receipt.escBase64)).toMatch(rung("Grand Total", "Rs [0-9]+\\.[0-9]{2}"));
     }
   });
 
@@ -150,10 +238,12 @@ describe("buildSplitReceiptsBase64 — one document per part", () => {
     out.forEach((receipt, i) => {
       const part = SPLIT.parts[i]!;
       const page = printed(receipt.escBase64);
-      expect(page).toMatch(new RegExp(`^Subtotal +${part.subtotal.toFixed(2)}$`, "m"));
-      expect(page).toMatch(new RegExp(`^Service Charge \\(10%\\) +${part.service_charge.toFixed(2)}$`, "m"));
+      // The client's first rung: the part's own unit count and its own subtotal,
+      // on one row.
+      expect(page).toMatch(rung(`Total Qty: ${part.qty} +Sub Total`, part.subtotal.toFixed(2)));
+      expect(page).toMatch(rung("Service Charge 10%", part.service_charge.toFixed(2)));
       for (const tax of part.taxes) {
-        expect(page).toMatch(new RegExp(`^${tax.name} \\(2.5%\\) +${tax.amount.toFixed(2)}$`, "m"));
+        expect(page).toMatch(rung(`${tax.name} 2\\.5%`, tax.amount.toFixed(2)));
       }
     });
   });
@@ -212,7 +302,7 @@ describe("buildSplitReceiptsBase64 — the printed money", () => {
     const skewed = computeSectionSplit({ ...CHARGES, grand_total: CHARGES.grand_total + 1 }, LINES);
     const out = buildSplitReceiptsBase64(WHOLE, skewed.parts);
     const disclosed = out
-      .map((r) => /^Round off +([+-]?[0-9]+\.[0-9]{2})$/m.exec(printed(r.escBase64)))
+      .map((r) => rung("Round off", "([+-]?[0-9]+\\.[0-9]{2})").exec(printed(r.escBase64)))
       .filter((m): m is RegExpExecArray => m !== null)
       .reduce((s, m) => s + toPaisa(Number(m[1])), 0);
     expect(disclosed).toBe(100);
@@ -226,12 +316,21 @@ describe("buildSplitReceiptsBase64 — the printed money", () => {
     // the guest handed one can check it with the calculator on their phone.
     for (const receipt of buildSplitReceiptsBase64(WHOLE, SPLIT.parts)) {
       const page = printed(receipt.escBase64);
+      const FIGURE = "([0-9]+\\.[0-9]{2})";
       const read = (re: RegExp) => { const m = re.exec(page); return m ? toPaisa(Number(m[1])) : 0; };
-      const subtotal = read(/^Subtotal +([0-9]+\.[0-9]{2})$/m);
-      const discount = read(/^Coupon SAVE7 +- ([0-9]+\.[0-9]{2})$/m);
-      const service = read(/^Service Charge \(10%\) +([0-9]+\.[0-9]{2})$/m);
-      const taxes = [...page.matchAll(/^[CS]GST \(2\.5%\) +([0-9]+\.[0-9]{2})$/gm)]
+      // The subtotal shares its row with the unit count; on a roll too narrow
+      // for both it stands on its own row under it.
+      const subtotal = read(rung("(?:Total Qty: [0-9]+ +)?Sub Total", FIGURE));
+      const discount = read(rung("Coupon SAVE7", `-${FIGURE}`));
+      const service = read(rung("Service Charge 10%", FIGURE));
+      const taxes = [...page.matchAll(new RegExp(`^ *[CS]GST 2\\.5% +${FIGURE}$`, "gm"))]
         .reduce((s, m) => s + toPaisa(Number(m[1])), 0);
+      // Every rung this fixture charges is on every slip — a rung the reader
+      // silently failed to find would otherwise read as zero.
+      expect(subtotal).toBeGreaterThan(0);
+      expect(discount).toBeGreaterThan(0);
+      expect(service).toBeGreaterThan(0);
+      expect(taxes).toBeGreaterThan(0);
       expect(subtotal - discount + service + taxes).toBe(printedGrandTotalPaisa(receipt.escBase64));
     }
   });
@@ -254,7 +353,9 @@ describe("buildSplitReceiptsBase64 — telling two slips apart", () => {
     // CANCELLED and REPRINT banners get, and for the same reason.
     expect(decode(first)).toContain("\x1bE\x01\x1b!8** PART 1/3 **\n\x1b!\x00\x1bE\x00");
     const page = printed(first);
-    expect(page.indexOf("** PART 1/3 **")).toBeLessThan(page.indexOf("Customer Name:"));
+    const nameSlot = page.search(/^Name: Alice$/m);
+    expect(nameSlot).toBeGreaterThan(-1);
+    expect(page.indexOf("** PART 1/3 **")).toBeLessThan(nameSlot);
   });
 
   test("two slips of one bill differ in the banner and the money, nowhere else", () => {
@@ -286,16 +387,28 @@ describe("buildSplitReceiptsBase64 — telling two slips apart", () => {
     }));
     for (const cols of [32, 48]) {
       for (const receipt of buildSplitReceiptsBase64(WHOLE, many, cols)) {
-        for (const w of cellWidths(receipt.escBase64)) { expect(w).toBeLessThanOrEqual(cols); }
+        // Measured against the text area the slip actually has — inside its
+        // margins on 80mm — not against the bare roll.
+        const area = textArea(receipt.escBase64, cols);
+        expect(area).toEqual(BILL_AREA[cols]);
+        for (const w of cellWidths(receipt.escBase64)) { expect(w).toBeLessThanOrEqual(area.cols); }
       }
     }
     expect(printed(buildSplitReceiptsBase64(WHOLE, many, 32)[9]!.escBase64)).toContain("** PART 10/12 **");
   });
 
   test("every line of every slip fits the roll it is printed on", () => {
+    // On 80mm a line must fit the 44 cells between the margins, not the 48 of
+    // the roll: the printer starts it two cells in, and a 48-cell line from there
+    // wraps its last four characters — the right-hand end of every money row.
+    // The margins are checked to be symmetric so the area cannot quietly slide
+    // off the right edge of the paper either.
     for (const cols of [32, 48]) {
       for (const receipt of buildSplitReceiptsBase64(WHOLE, SPLIT.parts, cols)) {
-        for (const w of cellWidths(receipt.escBase64)) { expect(w).toBeLessThanOrEqual(cols); }
+        const area = textArea(receipt.escBase64, cols);
+        expect(area).toEqual(BILL_AREA[cols]);
+        expect(area.left * 2 + area.cols).toBe(cols);
+        for (const w of cellWidths(receipt.escBase64)) { expect(w).toBeLessThanOrEqual(area.cols); }
       }
     }
   });
@@ -416,7 +529,7 @@ describe("buildSplitReceiptsBase64 — the service charge on a part", () => {
       grandTotal: waived.grand_total,
     }, split.parts);
     for (const receipt of out) {
-      expect(printed(receipt.escBase64)).toMatch(/^Service Charge \(10%\) +Opted-out$/m);
+      expect(printed(receipt.escBase64)).toMatch(rung("Service Charge 10%", "Opted-out"));
     }
     expect(out.map((r) => printedGrandTotalPaisa(r.escBase64)).reduce((s, x) => s + x, 0))
       .toBe(toPaisa(waived.grand_total));
@@ -429,12 +542,16 @@ describe("buildSplitReceiptsBase64 — the service charge on a part", () => {
     const noCharge = { label: "Bar", subtotal: 100, grand_total: 100, items: [{ name: "Soda", price: 100, quantity: 1 }] };
     const charged = { label: "Mains", subtotal: 100, service_charge: 10, grand_total: 110, items: [{ name: "Dal", price: 100, quantity: 1 }] };
     const out = buildSplitReceiptsBase64(WHOLE, [charged, noCharge]);
-    expect(printed(out[0]!.escBase64)).toContain("A Voluntary Service Charge is included");
-    expect(printed(out[1]!.escBase64)).not.toContain("A Voluntary Service Charge is included");
+    // The disclaimer wraps to the text area, so the sentence is read with its
+    // line breaks folded back into spaces: wherever the wrap happens to fall, the
+    // negative check cannot pass merely because the words landed on two lines.
+    const flowed = (b64: string) => printed(b64).replace(/\s+/g, " ");
+    expect(flowed(out[0]!.escBase64)).toContain(WHOLE.serviceChargeNote);
+    expect(flowed(out[1]!.escBase64)).not.toContain("A Voluntary Service Charge");
   });
 
   test("a part allocated none of a bill-wide discount prints no discount line", () => {
-    // "- 0.00" is a statement that money came off, and none did.
+    // "-0.00" is a statement that money came off, and none did.
     const out = buildSplitReceiptsBase64(WHOLE, [
       { label: "Bar", subtotal: 100, discount: 0, grand_total: 100, items: [{ name: "Soda", price: 100, quantity: 1 }] },
     ]);

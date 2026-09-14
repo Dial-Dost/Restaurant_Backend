@@ -338,6 +338,9 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 			// boolean writes, so a client that has never heard of this setting
 			// cannot silently turn it off by omitting it.
 			kot_auto_print: typeof body.kot_auto_print === "boolean" ? body.kot_auto_print : undefined,
+			// Whether the customer bill prints the feedback/valet QR (bill_show_qr).
+			// Same rule: only an explicit boolean writes.
+			bill_show_qr: typeof body.bill_show_qr === "boolean" ? body.bill_show_qr : undefined,
 		});
 		const settingsUndo = buildSettingsUndo(priorSettings, result);
 		try {

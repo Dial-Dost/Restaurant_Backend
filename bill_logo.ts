@@ -31,6 +31,16 @@ export const BILL_LOGO_DOTS = { "58mm": 384, "80mm": 576 } as const;
  */
 export const BILL_LOGO_MAX_HEIGHT = 240;
 
+/**
+ * The widest a logo prints, as a share of the roll.
+ *
+ * The client's own bill carries its wordmark at a little over half the paper,
+ * with white either side — a logo fitted edge to edge reads as a banner and
+ * pushes the restaurant name a long way down the slip. Two thirds keeps a
+ * wordmark comfortably legible on the 58mm roll too (256 dots).
+ */
+export const BILL_LOGO_WIDTH_SHARE = 2 / 3;
+
 /** Dots across for a stored paper width; anything unrecognised is the 80mm roll. */
 export function billLogoDots(paperWidth: unknown): number {
   return paperWidth === "58mm" ? BILL_LOGO_DOTS["58mm"] : BILL_LOGO_DOTS["80mm"];
@@ -69,13 +79,17 @@ export async function rasterizeBillLogo(
   sharpImpl?: SharpFactory,
 ): Promise<BillLogoRaster | null> {
   const sharp = sharpImpl ?? (await loadSharp());
-  if (!sharp || raw.length === 0) { return null; }
+  // A STRING IS NOT IMAGE BYTES. sharp reads a string as a file path on this
+  // host, which is how a stored logo REFERENCE ("logos/x.png") once reached here
+  // in place of the image and every bill silently lost its logo. Refused by
+  // type, so that failure cannot come back through a different caller.
+  if (!sharp || !Buffer.isBuffer(raw) || raw.length === 0) { return null; }
   try {
     // Flatten first: a transparent PNG would otherwise threshold its empty
     // background to black and print a solid slab.
     const { data, info } = await sharp(raw)
       .flatten({ background: "#ffffff" })
-      .resize({ width: targetWidth, height: BILL_LOGO_MAX_HEIGHT, fit: "inside", withoutEnlargement: true })
+      .resize({ width: Math.round(targetWidth * BILL_LOGO_WIDTH_SHARE), height: BILL_LOGO_MAX_HEIGHT, fit: "inside", withoutEnlargement: true })
       .threshold(128)
       .raw()
       .toBuffer({ resolveWithObject: true });
