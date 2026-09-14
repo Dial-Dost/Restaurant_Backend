@@ -335,6 +335,125 @@ export function allocateSettlement(
   return parts;
 }
 
+/** One settled bill, as the by-mode cut needs it. */
+export interface SettlementBill {
+  /** The bill's composed grand total — BillMoney.grand_total. */
+  grand_total: number;
+  /** BillMoney.refund. A refund has no mode of its own; see settlementByMethod. */
+  refund: number;
+  payment_method: string | null | undefined;
+  splits: SettlementPart[];
+}
+
+/** One payment mode's line on a cash-up. */
+export interface SettlementMethodRow {
+  method: string;
+  /** Bills that touched this mode. A split bill counts under each mode it used. */
+  bills: number;
+  amount: number;
+  share_pct: number | null;
+  refund: number;
+  net_amount: number;
+}
+
+export interface SettlementByMethod {
+  /** Largest amount first. Includes the Other and Unallocated buckets when used. */
+  rows: SettlementMethodRow[];
+  /**
+   * Bills cut into more than one PART — the Settlement Summary's own count,
+   * unchanged. An Unallocated residual is a part, so a 'Split' bill whose only
+   * tender is ₹100 UPI on a ₹300 bill counts here.
+   */
+  split_bills: number;
+  /**
+   * Bills whose money came in by MORE THAN ONE REAL MODE: distinct modes with
+   * money on them, the Unallocated residual not among them. The bill above —
+   * ₹100 UPI and ₹200 nobody can place — was paid one way and is missing money;
+   * a sentence saying it was "paid across more than one method" would be false,
+   * and would sit right beside the warning that is true. Use this for any copy
+   * that makes that claim.
+   */
+  multi_method_bills: number;
+  /** Money that split parts failed to account for. Should always be 0. */
+  unallocated: number;
+  /** Σ rows.amount — equal to the bills' grand totals, by allocateSettlement. */
+  total_amount: number;
+}
+
+/**
+ * THE CASH-UP BY PAYMENT MODE, for any set of settled bills.
+ *
+ * Lifted verbatim out of GetSettlementSummaryReport so the Overview's "today by
+ * payment method" block and the Settlement Summary are ONE computation rather
+ * than two that agree today. Three different by-mode sums already exist in the
+ * data layer (this one, GetSalesReport.by_method, cashTotalsSince); they only
+ * agree while nobody has split a tender with a residual or refunded a bill. A
+ * screen that put a Cash row from one of them beside a Cash tile from another
+ * would eventually show an owner two answers to "how much cash came in", so
+ * every new surface reads this.
+ *
+ * Every rule is allocateSettlement's plus two of its own:
+ *
+ *   * A BILL COUNTS ONCE UNDER EACH MODE IT TOUCHED, so the bills column can add
+ *     up to more than the bill count. `split_bills` says by how much.
+ *   * A REFUND FOLLOWS THE MONEY. "Bills" records a refund without a mode, so
+ *     each part carries its share of the bill's refund, pro rata. `amount` stays
+ *     what the till took; `net_amount` is what survived.
+ *
+ * Nothing is filtered. A released ₹0 table lands under Other with a bill count
+ * and ₹0, because the Settlement Summary's bills column has always counted it;
+ * a surface that does not want that row filters it at the surface.
+ *
+ * Order-sensitive only in the ways the report always was: accumulation is in
+ * the order given (callers pass settle order), each step round2'd, and the rows
+ * are sorted by amount descending with the insertion order breaking ties.
+ */
+export function settlementByMethod(bills: readonly SettlementBill[]): SettlementByMethod {
+  const acc = new Map<string, { bills: number; amount: number; refund: number }>();
+  let splitBills = 0;
+  let multiMethodBills = 0;
+  let unallocated = 0;
+  for (const b of bills) {
+    const parts = allocateSettlement(b.grand_total, b.payment_method, b.splits);
+    if (parts.length > 1) {splitBills += 1;}
+    // Counted apart from split_bills rather than instead of it: the report's
+    // "Split-tender bills" column has always been parts.length > 1, and changing
+    // it would move a number on a report owners already reconcile against.
+    const realModes = new Set(
+      parts.filter((p) => p.method !== UNALLOCATED_METHOD && p.amount !== 0).map((p) => p.method),
+    );
+    if (realModes.size > 1) {multiMethodBills += 1;}
+    for (const p of parts) {
+      if (p.method === UNALLOCATED_METHOD) {unallocated = round2(unallocated + p.amount);}
+      const e = acc.get(p.method) ?? { bills: 0, amount: 0, refund: 0 };
+      e.bills += 1;
+      e.amount = round2(e.amount + p.amount);
+      // A refund has no mode of its own, so it follows the money: each part
+      // carries its share of the bill's refund.
+      if (b.refund > 0 && b.grand_total > 0) {
+        e.refund = round2(e.refund + (b.refund * p.amount) / b.grand_total);
+      }
+      acc.set(p.method, e);
+    }
+  }
+
+  const totalAmount = round2([...acc.values()].reduce((s, v) => s + v.amount, 0));
+  const rows: SettlementMethodRow[] = [...acc.entries()]
+    .map(([method, v]) => ({
+      method,
+      bills: v.bills,
+      amount: v.amount,
+      share_pct: sharePct(v.amount, totalAmount),
+      refund: round2(v.refund),
+      net_amount: round2(v.amount - v.refund),
+    }))
+    .sort((a, z) => z.amount - a.amount);
+
+  return {
+    rows, split_bills: splitBills, multi_method_bills: multiMethodBills, unallocated, total_amount: totalAmount,
+  };
+}
+
 // --- Period-on-period comparison (Executive Summary) -------------------------
 
 const DATE_KEY = /^(\d{4})-(\d{2})-(\d{2})$/;
