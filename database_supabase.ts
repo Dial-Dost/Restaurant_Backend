@@ -27313,6 +27313,38 @@ function mergeFeedbackConfig(stored: unknown): FeedbackConfig {
   };
 }
 
+/**
+ * THE KEYS OF A FEEDBACK-FORM SAVE THAT THE CALLER ACTUALLY SENT, validated.
+ *
+ * WHY A SAVE IS A PATCH. `feedback_config` used to be REPLACED on every save
+ * with mergeFeedbackConfig(body) — i.e. the body with a default filled in for
+ * every key it left out. The owner app's feedback card always sends the whole
+ * form, so that never showed. A single switch cannot: the valet toggle on the
+ * web dashboard sends `{valet_enabled: false}`, and a replace would have reset
+ * the owner's form title, welcome text, review link and rating categories to
+ * the defaults in the same click.
+ *
+ * So only the keys PRESENT in the body, and of the right type, are written; the
+ * SQL concatenates them onto the stored object (see SetRestaurantSettings), and
+ * the read path (mergeFeedbackConfig) still supplies defaults for anything never
+ * set. Each value is normalized exactly as the read path would normalize it, so
+ * what is stored is what is served. A whole-form save is a patch of every key,
+ * which is today's behaviour, unchanged.
+ */
+export function feedbackConfigPatch(input: unknown): Partial<FeedbackConfig> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {return {};}
+  const body = input as Record<string, unknown>;
+  const normalized = mergeFeedbackConfig(body);
+  const patch: Partial<FeedbackConfig> = {};
+  if (typeof body.title === "string") {patch.title = normalized.title;}
+  if (typeof body.subtitle === "string") {patch.subtitle = normalized.subtitle;}
+  if (typeof body.valet_enabled === "boolean") {patch.valet_enabled = body.valet_enabled;}
+  if (typeof body.require_image === "boolean") {patch.require_image = body.require_image;}
+  if (typeof body.review_url === "string") {patch.review_url = normalized.review_url;}
+  if (Array.isArray(body.categories)) {patch.categories = normalized.categories;}
+  return patch;
+}
+
 // Normalize an arbitrary tax payload (array of {name,percentage} or a
 // name->percentage record) into an ordered, validated array.
 function normalizeTaxes(raw: unknown): { name: string; percentage: number }[] {
@@ -27605,7 +27637,10 @@ export async function SetRestaurantSettings(
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
-  const feedbackConfig = opts.feedback_config !== undefined ? JSON.stringify(mergeFeedbackConfig(opts.feedback_config)) : null;
+  // A PATCH, not a replace — see feedbackConfigPatch. A body with no usable key
+  // writes nothing rather than an empty object.
+  const feedbackPatch = opts.feedback_config !== undefined ? feedbackConfigPatch(opts.feedback_config) : {};
+  const feedbackConfig = Object.keys(feedbackPatch).length > 0 ? JSON.stringify(feedbackPatch) : null;
   // bill_logo_svg: only written when the field is present. Empty string clears it.
   const billLogoSvg = opts.bill_logo_svg !== undefined ? sanitizeBillLogoSvg(opts.bill_logo_svg) : null;
   // bill_paper_width: only '58mm' or '80mm' accepted; null leaves it unchanged.
@@ -27705,7 +27740,7 @@ export async function SetRestaurantSettings(
        razorpay_key_id = case when $5::text is null then razorpay_key_id else nullif($5, '') end,
        razorpay_key_secret = coalesce($6, razorpay_key_secret),
        service_charge = coalesce($7, service_charge),
-       feedback_config = coalesce($8::jsonb, feedback_config),
+       feedback_config = case when $8::jsonb is null then feedback_config else coalesce(feedback_config, '{}'::jsonb) || $8::jsonb end,
        bill_logo_svg = case when $9::text is null then bill_logo_svg else nullif($9, '') end,
        bill_paper_width = coalesce($10, bill_paper_width),
        discount_approval_threshold = coalesce($11, discount_approval_threshold),
