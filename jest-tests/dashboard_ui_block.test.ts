@@ -326,7 +326,7 @@ describe("the headline figures define themselves", () => {
     // row can still be two bills that need looking at, and dropping it would
     // silence both clients' warning.
     expect(body).toMatch(
-      /today_by_method: byMethod\.rows\.filter\(\s*\(r\) => r\.method === UNALLOCATED_METHOD \|\| r\.amount !== 0 \|\| r\.refund !== 0,?\s*\)/,
+      /today_by_method: byMethod\.rows\s*\.filter\(\s*\(r\) => r\.method === UNALLOCATED_METHOD \|\| r\.amount !== 0 \|\| r\.refund !== 0,?\s*\)/,
     );
   });
 

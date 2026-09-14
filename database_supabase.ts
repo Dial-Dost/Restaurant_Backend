@@ -36844,6 +36844,11 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   }
 
   const fig = (value: number, label: string, hint: string): HeadlineFigure => ({ value, label, hint });
+  // Display names for today's modes: one small read of Settings > Payments,
+  // skipped on a day with nothing settled. Falls back to the stored ids.
+  const labelOf = byMethod.rows.length > 0
+    ? await paymentLabelsFor(context).catch(() => (m: string) => m)
+    : (m: string) => m;
   return {
     today,
     month_from: monthFrom,
@@ -36869,9 +36874,20 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     // short and another ₹50 over is an Unallocated row of ₹0.00 over 2 bills,
     // and today_unallocated of 0 — so its amount cannot say whether anything is
     // wrong. Its bill count can, and the clients warn off the row being here.
-    today_by_method: byMethod.rows.filter(
-      (r) => r.method === UNALLOCATED_METHOD || r.amount !== 0 || r.refund !== 0,
-    ),
+    // Each row carries the owner's name for its mode (Settings > Payments), as
+    // the Settlement Summary's rows do, so "UPI" and a custom mode read the same
+    // on the Overview as on the report. Rows still group by the stored id.
+    today_by_method: byMethod.rows
+      .filter((r) => r.method === UNALLOCATED_METHOD || r.amount !== 0 || r.refund !== 0)
+      .map((r) => ({
+        method: r.method,
+        label: labelOf(r.method),
+        bills: r.bills,
+        amount: r.amount,
+        share_pct: r.share_pct,
+        refund: r.refund,
+        net_amount: r.net_amount,
+      })),
     today_split_bills: byMethod.multi_method_bills,
     today_unallocated: byMethod.unallocated,
     by_method: {
