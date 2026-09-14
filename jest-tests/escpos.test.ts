@@ -275,9 +275,15 @@ describe("buildReceiptBase64 — bill", () => {
     expect(out).toMatch(/Round off +-0\.20$/m);
   });
 
-  test("service charge waiver prints 'Opted-out'", () => {
-    const out = printed(buildReceiptBase64({ ...baseBill, serviceCharge: { percent: 10, amount: 0, optedOut: true } }));
-    expect(out).toMatch(/Service Charge 10% +Opted-out$/m);
+  test("a waived service charge prints NO service-charge line — not a zero, not 'Opted-out'", () => {
+    // The client: "don't show service charge opted out when removed ... this too
+    // in the bill". A charge handed in at zero is a charge that was removed, and
+    // the paper reads exactly as a bill that never carried one.
+    for (const serviceCharge of [{ percent: 10, amount: 0 }, null]) {
+      const out = printed(buildReceiptBase64({ ...baseBill, serviceCharge }));
+      expect(out).not.toContain("Service Charge");
+      expect(out).not.toContain("Opted-out");
+    }
   });
 
   // --- The item note is a KITCHEN instruction, and only the kitchen gets it ---
@@ -1747,7 +1753,8 @@ describe("the client's reference bill layout", () => {
     items,
     total: 4745,
     currency: "₹",
-    serviceCharge: { percent: 10, amount: 0, optedOut: true },
+    // The client's receipt carries no service charge: 4745 + 237.26 = 4982.26.
+    serviceCharge: null,
     taxes: [
       { name: "SGST", percentage: 2.5, amount: 118.63 },
       { name: "CGST", percentage: 2.5, amount: 118.63 },
@@ -1998,12 +2005,6 @@ describe("the client's reference bill layout", () => {
         // which sizing each row on its own figure used to push a column left.
         expect({ label, labelEnd: r.labelEnd }).toEqual({ label, labelEnd: EDGE });
       }
-      // A word wider than a figure ("Opted-out" is nine characters, the narrow
-      // roll's whole Amount column) still ends at the edge, and keeps a space
-      // before it rather than running into its label.
-      const sc = rung("Service Charge 10%", "Opted-out");
-      expect(sc.figureEnd).toBe(W);
-      expect(sc.figureStart - sc.labelEnd).toBeGreaterThanOrEqual(1);
       // No parentheses round a rate any more.
       expect(lines.join("\n")).not.toMatch(/\(\d/);
     }
@@ -2030,7 +2031,8 @@ describe("the client's reference bill layout", () => {
   test("a discount is a rung like the others, its minus sign against the figure", () => {
     for (const cols of ROLLS) {
       const { W } = LAYOUT[cols]!;
-      const out = printed(buildReceiptBase64({ ...gaia, discount: { amount: 500, label: "Loyalty 10%" } }, cols));
+      // A charged service charge, so there is a rung after the discount to order against.
+      const out = printed(buildReceiptBase64({ ...gaia, discount: { amount: 500, label: "Loyalty 10%" }, serviceCharge: { percent: 10, amount: 424.5 } }, cols));
       expect(out).toMatch(/^ +Loyalty 10% +-500\.00$/m);
       expect(out).not.toContain("- 500.00");
       const row = out.split("\n").find((l) => l.includes("Loyalty"))!;

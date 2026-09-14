@@ -460,6 +460,50 @@ describe("THE PAPER IS THE DRAWER — the printed grand total equals the settled
 });
 
 // ============================================================================
+// A REMOVED CHARGE IS NOT ON THE PAPER AT ALL
+// ============================================================================
+//
+// "In the overview, don't show service charge opted out when removed" — and,
+// of the bill, "this too". The route used to hand the renderer an Opted-out
+// rung for a waived bill (Gaia's 06:31:37 print decoded to "Service Charge (10%)
+// Opted-out"). Now a waived bill is rendered through the REAL renderer here and
+// its bytes read back: no service-charge line in either shape, no Opted-out, no
+// voluntary-charge sentence — and the total it prints is still the drawer's.
+
+describe("a waived bill prints no service-charge line, and its paper is still the drawer", () => {
+  const paperText = (receipt: Record<string, unknown>): string => {
+    const actual = jest.requireActual("../../escpos") as { buildReceiptBase64: (o: unknown, w?: number) => string };
+    return Buffer.from(actual.buildReceiptBase64(receipt, 48), "base64").toString("latin1");
+  };
+
+  for (const shape of SHAPES) {
+    test(`${shape.name}: waiver recorded -> no Service Charge, no Opted-out, no disclaimer; total == drawer`, async () => {
+      mockDb.taxConfig = shape.taxConfig;
+      mockDb.scPct = shape.scPct;
+      mockDb.subtotal = 5499;
+      // With the charge ON, the same bill DOES print its line — so the absence
+      // below is the waiver's doing, not a fixture that never had one.
+      const charged = paperText((await printedBill({})).receipt);
+      expect(charged).toMatch(/Service Charge 10% +[0-9]+\.[0-9]{2}\n/);
+
+      mockDb.waiver = liveWaiverRow();
+      const { receipt, grandTotal, roundOff } = await printedBill({});
+      const text = paperText(receipt);
+      expect(text).not.toContain("Service Charge");
+      expect(text).not.toContain("Opted-out");
+      expect(text).not.toMatch(/voluntary service charge/i);
+      expect(receipt.serviceCharge).toBeNull();
+
+      const drawer = await drawerCharges();
+      expect(grandTotal).toBe(drawer.grand_total);
+      expect(roundOff).toBe(drawer.round_off);
+      const printedTotal = /Grand Total +Rs ([0-9]+\.[0-9]{2})/.exec(text)?.[1];
+      expect(Number(printedTotal)).toBe(drawer.grand_total);
+    });
+  }
+});
+
+// ============================================================================
 // A REDUCTION NOBODY AUTHORISED IS VISIBLE TO A MANAGER
 // ============================================================================
 //

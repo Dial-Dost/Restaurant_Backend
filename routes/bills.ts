@@ -1207,29 +1207,22 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 				cashier = `${emp?.emp_Fname ?? ""} ${emp?.emp_Lname ?? ""}`.trim();
 			} catch {/* cashier optional */}
 		}
-		// THE OPTED-OUT LINE KEYS OFF A CHARGE HAVING ACTUALLY BEEN REMOVED — not
-		// off a percent that is structurally zero on the broken tenant (F2, root
-		// cause 2).
+		// A SERVICE-CHARGE LINE ONLY WHEN ONE IS CHARGED. The restaurant_percent
+		// leg prints here when its amount is above zero; a tax-line charge prints
+		// among `taxes` below, exactly as it always has.
 		//
-		// It used to read `charges.service_charge_percent || settings.service_charge`,
-		// and `settings.service_charge` is 0 on a tenant carrying the charge as a
-		// tax line. So on exactly the tenant whose opt-out was already silently
-		// failing, the bill did not even admit the line existed: no charge line, no
-		// Opted-out line, and a total identical to the one with the charge.
-		// `service_charge_removed` is the resolver's answer in BOTH shapes and
-		// `service_charge_percent` is the configured percentage whichever shape
-		// carries it, so the line now prints on a tax-line tenant too, at the
-		// percentage the guest would otherwise have been charged.
-		//
-		// IT ALSO NOW PRINTS ON A LIVE WAIVER, not just on a `no_service_charge`
-		// reprint: the resolver removes the charge for both, and a waived table
-		// whose bill simply omitted the line left the guest no way to see that the
-		// charge had been dropped rather than never applied.
+		// A REMOVED CHARGE PRINTS NOTHING. This route used to print "Service Charge
+		// 10%  Opted-out" on a waived bill so the guest could see the charge had
+		// been dropped; the client asked for the opposite ("don't show service
+		// charge opted out when removed ... this too in the bill"). The money was
+		// never in question — the resolver takes the charge off the ladder and the
+		// till alike — and the removal is still recorded where a manager looks for
+		// it: the waiver row, the audit line below, and the Service Charge Deny
+		// report. The disclaimer already followed service_charge_applied, so a
+		// waived bill says nothing about a charge anywhere.
 		const serviceCharge = charges.service_charge > 0
 			? { percent: charges.service_charge_percent, amount: charges.service_charge }
-			: (chargeCfg.service_charge_removed
-				? { percent: chargeCfg.service_charge_percent, amount: 0, optedOut: true }
-				: null);
+			: null;
 		const escBase64 = buildReceiptBase64({
 			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
 			// Legal entity + GSTIN are tenant settings, not profile fields: they are
@@ -1294,11 +1287,10 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			reprint: bill.print_count > 0,
 			// THE DISCLAIMER FOLLOWS THE CHARGE, NOT ONE LEG OF IT (G2; F2 root
 			// cause 3). This predicate was `charges.service_charge > 0` — the
-			// restaurant_percent leg alone — and so carried the same blind spot as
-			// the Opted-out line above it: a tenant charging through a tax line
-			// never printed the sentence the requirement makes mandatory, and would
-			// have gone on printing it on opted-out bills once the opt-out started
-			// working. `service_charge_applied` is the resolver's "does this
+			// restaurant_percent leg alone — so a tenant charging through a tax
+			// line never printed the sentence the requirement makes mandatory, and
+			// would have gone on printing it on waived bills once the waiver
+			// started working. `service_charge_applied` is the resolver's "does this
 			// configuration still charge for service", in both shapes, so the
 			// sentence appears when and only when the guest is actually being
 			// charged for one.
@@ -1644,13 +1636,11 @@ app.post('/print/bill/settled', validateAction(ACCOUNTING_PERM), async (req: Req
 			discount: (bill.discount_amount ?? 0) > 0
 				? { amount: bill.discount_amount ?? 0, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" }
 				: null,
-			// Zero is not the same as absent: a bill settled with the charge waived
-			// prints the Opted-out line, exactly as the original did.
+			// Only a charge that was actually taken prints — the same rule as the
+			// original bill, so a waived bill's reprint has no service-charge line.
 			serviceCharge: bill.service_charge > 0
 				? { percent: bill.service_charge_percent, amount: bill.service_charge }
-				: (bill.service_charge_percent > 0
-					? { percent: bill.service_charge_percent, amount: 0, optedOut: true }
-					: null),
+				: null,
 			taxes: bill.taxes,
 			grandTotal: bill.grand_total,
 			// The round-off RECORDED at settle ("Bills".round_off, migration 048) —
@@ -2365,14 +2355,11 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			printedAt: kotStamp(new Date(), settings.timezone || "Asia/Kolkata"),
 			discount: bill.discount > 0 ? { amount: bill.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
 			// The bill's PERCENTAGE; each part carries its own share as the amount.
-			// A waived charge stays waived on every part — the renderer prints the
-			// word rather than a figure, which is the point of a waiver being
-			// visible on paper instead of inferred from a missing line.
+			// A waived bill is charged none, so neither it nor any part of it
+			// prints a service-charge line (see /print/bill).
 			serviceCharge: bill.service_charge > 0
 				? { percent: bill.service_charge_percent, amount: bill.service_charge }
-				: (bill.service_charge_waived
-					? { percent: bill.service_charge_percent, amount: 0, optedOut: true }
-					: null),
+				: null,
 			taxes: bill.taxes,
 			grandTotal: bill.grand_total,
 			// The whole bill's round-off (migration 048). Each part prints its OWN

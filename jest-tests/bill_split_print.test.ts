@@ -556,21 +556,27 @@ describe("buildSplitReceiptsBase64 — a comped dish", () => {
 });
 
 describe("buildSplitReceiptsBase64 — the service charge on a part", () => {
-  test("a waived charge stays waived, and says so, on every part", () => {
+  test("a waived charge prints no service-charge line on any part, and the parts still sum to the bill", () => {
     const waived = computeBillCharges(SUBTOTAL, GST, 10, false, { type: "percent", value: 7 });
     const split = computeSectionSplit({ ...waived }, LINES);
     const out = buildSplitReceiptsBase64({
       ...WHOLE,
       total: waived.subtotal,
       discount: { amount: waived.discount, label: "Coupon SAVE7" },
-      // What routes/bills.ts hands the renderer for a waived bill: the tenant's
-      // configured percentage, nothing charged, and the word on the paper.
-      serviceCharge: { percent: 10, amount: 0, optedOut: true },
+      // Even handed the percentage with nothing charged, no part prints a line:
+      // a removed charge is not shown (the client's decision), on the whole bill
+      // or on any slip of it. routes/bills.ts hands the renderer null here.
+      serviceCharge: { percent: 10, amount: 0 },
       taxes: waived.taxes,
+      roundOff: waived.round_off,
       grandTotal: waived.grand_total,
     }, split.parts);
     for (const receipt of out) {
-      expect(printed(receipt.escBase64)).toMatch(rung("Service Charge 10%", "Opted-out"));
+      const page = printed(receipt.escBase64);
+      expect(page).not.toContain("Service Charge");
+      expect(page).not.toContain("Opted-out");
+      // Nor the disclaimer: nothing on the slip is a charge to contribute to.
+      expect(page.replace(/\s+/g, " ")).not.toContain("A Voluntary Service Charge");
     }
     expect(out.map((r) => printedGrandTotalPaisa(r.escBase64)).reduce((s, x) => s + x, 0))
       .toBe(toPaisa(waived.grand_total));

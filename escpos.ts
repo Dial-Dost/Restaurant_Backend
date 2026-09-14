@@ -142,10 +142,13 @@ export interface ReceiptOptions {
   kotNumbers?: number[];
   // Optional discount line (off the subtotal), shown before service charge.
   discount?: { amount: number; label?: string } | null;
-  // Optional service charge line (amount + percent), shown before taxes. When
-  // optedOut is true the line prints "Opted-out" instead of an amount (matches
-  // the web bill when the guest waives the voluntary charge).
-  serviceCharge?: { percent: number; amount: number; optedOut?: boolean } | null;
+  // Optional service charge line (amount + percent), shown before taxes, and
+  // ONLY when an amount above zero is charged. A charge that was removed (a
+  // recorded waiver, a zero-amount part) prints no line at all — the client's
+  // decision: "don't show service charge opted out when removed". The recorded
+  // waiver, its audit line and the MIS report still say it happened; the guest's
+  // bill reads like a bill with no charge, because it is one.
+  serviceCharge?: { percent: number; amount: number } | null;
   // Optional tax breakdown. When present, the receipt shows a Sub Total line,
   // each tax line, and a tax-inclusive TOTAL (= total + service charge + taxes).
   taxes?: ReceiptTax[];
@@ -1104,7 +1107,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   // --- Totals ---------------------------------------------------------------
   const totalQty = opts.items.reduce((s, it) => s + Math.max(1, Math.round(Number(it.quantity) || 1)), 0);
   const taxLines = (opts.taxes ?? []).filter((t) => Number(t.amount) > 0);
-  const sc = opts.serviceCharge && (Number(opts.serviceCharge.amount) > 0 || opts.serviceCharge.optedOut) ? opts.serviceCharge : null;
+  const sc = opts.serviceCharge && Number(opts.serviceCharge.amount) > 0 ? opts.serviceCharge : null;
   const discountAmt = opts.discount && Number(opts.discount.amount) > 0 ? Number(opts.discount.amount) : 0;
 
   // THE LADDER SITS IN THE RIGHT-HAND BLOCK, AS ON THE CLIENT'S BILL: every
@@ -1120,7 +1123,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   const AMT = billColumns(W).COL_TOTAL;
   const subtotalText = Number(opts.total).toFixed(2);
   const discountText = discountAmt > 0 ? `-${discountAmt.toFixed(2)}` : "";
-  const scText = sc ? (sc.optedOut ? "Opted-out" : Number(sc.amount).toFixed(2)) : "";
+  const scText = sc ? Number(sc.amount).toFixed(2) : "";
   const taxTexts = taxLines.map((t) => Number(t.amount).toFixed(2));
 
   // THE GRAND TOTAL IS NOT COMPUTED HERE WHEN THE CALLER SUPPLIES ONE.
@@ -1390,7 +1393,6 @@ export function buildSplitReceiptsBase64(
     const label = String(part.label ?? "").trim();
     const service = Number(part.service_charge) || 0;
     const discount = Number(part.discount) || 0;
-    const optedOut = opts.serviceCharge?.optedOut === true;
     const grandTotal = Number(part.grand_total) || 0;
     const escBase64 = buildReceiptBase64({
       ...opts,
@@ -1403,11 +1405,10 @@ export function buildSplitReceiptsBase64(
       // coupon was applied to the bill.
       discount: discount > 0 ? { amount: discount, label: opts.discount?.label } : null,
       // The PERCENTAGE is the bill's; the AMOUNT is this part's share of it. A
-      // waived charge stays waived on every part — `optedOut` prints the word
-      // instead of a figure, which is the whole point of a waiver being visible
-      // on the paper rather than inferred from a missing line.
-      serviceCharge: service > 0 || optedOut
-        ? { percent: Number(opts.serviceCharge?.percent) || 0, amount: service, ...(optedOut ? { optedOut: true } : {}) }
+      // part charged nothing — a waived bill, or a section allocated no share —
+      // prints no service-charge line, exactly as the whole bill does.
+      serviceCharge: service > 0
+        ? { percent: Number(opts.serviceCharge?.percent) || 0, amount: service }
         : null,
       taxes: Array.isArray(part.taxes) ? part.taxes : [],
       roundOff: Number(part.round_off) || 0,
@@ -1416,9 +1417,8 @@ export function buildSplitReceiptsBase64(
       // voluntary service charge is included to support our staff" printed on a
       // part that carries no such charge is a false statement on a tax document,
       // and it invites a guest to ask for the removal of something they were
-      // never charged. A waived part keeps it: there the sentence is exactly
-      // what explains the "Opted-out" line above it.
-      serviceChargeNote: service > 0 || optedOut ? opts.serviceChargeNote : null,
+      // never charged — and a waived bill's parts are charged none.
+      serviceChargeNote: service > 0 ? opts.serviceChargeNote : null,
       splitPart: of > 1 ? { index, of, label } : null,
     }, width);
     return { key: String(part.key ?? "").trim() || String(index), label, index, of, grandTotal, escBase64 };

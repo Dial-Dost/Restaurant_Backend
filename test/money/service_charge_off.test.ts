@@ -138,10 +138,12 @@ describe("F2 — a bill printed WITHOUT the charge costs the guest less, in ever
       });
 
       test("the bill tells the truth about WHETHER a charge was removed", () => {
-        // The Opted-out line and the voluntary-charge disclaimer used to key off
-        // `settings.service_charge > 0`, which is 0 on a tax_line tenant — so the
-        // one tenant being overcharged was also the one whose bill declined to
-        // mention the charge at all. These three fields are the replacement.
+        // The (since retired) Opted-out line and the voluntary-charge disclaimer
+        // used to key off `settings.service_charge > 0`, which is 0 on a tax_line
+        // tenant — so the one tenant being overcharged was also the one whose bill
+        // declined to mention the charge at all. These three fields are the
+        // replacement; today they gate the disclaimer, the audit line and the
+        // waiver card, and no printed line.
         const on = printedBill(shape, 1000, false).cfg;
         const offCfg = printedBill(shape, 1000, true).cfg;
 
@@ -210,7 +212,7 @@ describe("a tenant with NO service charge configured prints identically either w
     expect(JSON.stringify(off.charges)).toBe(JSON.stringify(on.charges));
   });
 
-  test("and the bill does not grow an Opted-out line it has no business printing", () => {
+  test("and nothing reports a removal on a tenant that has no charge to remove", () => {
     const off = printedBill({ name: "none", taxConfig: NO_CHARGE_TAX, scPct: 0, taxRidesOnTheCharge: false }, 1000, true).cfg;
     expect(off.basis).toBe("none");
     expect(off.service_charge_removed).toBe(false);

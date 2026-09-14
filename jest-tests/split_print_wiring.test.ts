@@ -162,10 +162,12 @@ describe("what the paper does and does not carry", () => {
     expect(route()).toMatch(/feedbackUrl: null/);
   });
 
-  test("a waived service charge stays visible on every part", () => {
-    // A waived bill that simply omits the line leaves the guest no way to see
-    // the charge was dropped rather than never applied.
-    expect(route()).toMatch(/optedOut: true/);
+  test("a waived service charge prints no line on any part", () => {
+    // The client asked for a removed charge to vanish from the bill, and a split
+    // part is a bill. The route hands the renderer a charge only when one is
+    // charged, and the renderer's own type no longer has a way to say Opted-out.
+    expect(route()).not.toMatch(/optedOut/);
+    expect(route()).toMatch(/serviceCharge: bill\.service_charge > 0\s*\?\s*\{ percent: bill\.service_charge_percent, amount: bill\.service_charge \}\s*:\s*null,/);
   });
 
   test("each part is its own print job, so one failure does not reprint the rest", () => {

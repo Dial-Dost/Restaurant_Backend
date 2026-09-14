@@ -656,8 +656,8 @@ export function quoteServiceChargeWaiver(
 // caller asks this instead of assembling the pair itself.
 //
 // IT ALSO ANSWERS "WAS ANYTHING ACTUALLY REMOVED", because the printers need
-// that and were deriving it wrongly too: the Opted-out line and the
-// voluntary-charge disclaimer both keyed off `settings.service_charge > 0`,
+// that and were deriving it wrongly too: the (since retired) Opted-out line and
+// the voluntary-charge disclaimer both keyed off `settings.service_charge > 0`,
 // which is 0 on precisely the tax_line tenant being overcharged — so that bill
 // did not merely charge the guest, it declined to admit the charge existed.
 // `service_charge_removed` / `service_charge_applied` are that answer in both
@@ -717,7 +717,8 @@ export function resolveServiceChargeConfig(
   const basis: ServiceChargeBasis =
     service_line !== null ? "tax_line" : (scPct > 0 ? "restaurant_percent" : "none");
   // NOMINAL, not effective. In either single shape this IS the configured
-  // percentage, which is what the Opted-out line prints. A tenant carrying both
+  // percentage — a label for the audit line and the waiver card, never a
+  // printed rung (a removed charge prints no line). A tenant carrying both
   // is charging twice and the two legs sit on DIFFERENT bases (the percent leg
   // on the discounted subtotal, the tax line on subtotal + that leg), so their
   // sum is a label rather than an arithmetic claim; the money-truth for that
