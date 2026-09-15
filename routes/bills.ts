@@ -4,7 +4,7 @@
  * split, merge, refund, reopen).
  */
 import type { Express, Request, Response } from "express";
-import type { BillSectionAxis, BillTenderState } from "../database_supabase.js";
+import type { BillSectionAxis, BillTenderState, OpenBillChargeConfig } from "../database_supabase.js";
 import { z } from "zod";
 import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type SplitReceiptPart } from "../escpos.js";
@@ -873,6 +873,11 @@ app.post('/bills/order/:orderId/close', validateAction("a953d044-31ba-4e31-b96f-
 	nothing and only writes the ledger — that the temptation is to restate the
 	four-line check in the second one.
 
+	A THIRD DOOR asks it too: POST /bills/service-charge-waiver/print
+	(routes/mis_capture.ts), and it asks BEFORE its waiver is written, so a
+	waiter who may not print this bill again can never record a waiver they
+	could not then hand the guest.
+
 	A SECOND COPY OF AN AUTHORISATION RULE IS A RULE THAT WILL DIVERGE, and this
 	codebase has the receipts: the client-side `roles.every(r => r == 'waiter')`
 	that role_scope.ts exists to kill, the two print-count queries that
@@ -891,7 +896,7 @@ app.post('/bills/order/:orderId/close', validateAction("a953d044-31ba-4e31-b96f-
 	stays at the /print/bill call site because /print/bill/claim has no kinds —
 	a browser never prints a kitchen docket.
 */
-async function refuseWaiterBillReprint(
+export async function refuseWaiterBillReprint(
 	req: Request,
 	res: Response,
 	tableName: string,
@@ -950,6 +955,410 @@ function sendCustomerGstinError(res: Response, err: unknown): boolean {
 		return true;
 	}
 	return false;
+}
+
+/** The open bill GetBillForTable reads, once a caller has answered the empty table. */
+type OpenTableBill = NonNullable<Awaited<ReturnType<typeof GetBillForTable>>>;
+
+/**
+ * THE LADDER AN OPEN TABLE'S BILL IS PRINTED FROM — the charge configuration
+ * and the charges, resolved with the same arguments every settle path uses.
+ *
+ * Lifted out of POST /print/bill when POST /bills/service-charge-waiver/print
+ * (routes/mis_capture.ts) became a second door to an open table's paper. The
+ * essay below is why there is ONE copy of it: a second print route that built
+ * its own ladder is the paper-disagrees-with-the-drawer bug with a new caller.
+ *
+ * IT TAKES NO CHARGE CONFIG FROM ITS CALLER, deliberately. It reads one every
+ * time, so a route that has just committed a waiver cannot hand in the answer
+ * it read before the commit — the waiver comes off this paper because it is in
+ * the database, and for no other reason.
+ */
+async function openTableBillCharges(
+	restaurantId: string,
+	tableName: string,
+	bill: OpenTableBill,
+	askedWithoutServiceCharge: boolean,
+): Promise<{ chargeCfg: OpenBillChargeConfig; waiverRequired: boolean; charges: ReturnType<typeof computeBillCharges> }> {
+	// THE CHARGE CONFIG COMES FROM THE RESOLVER, NOT FROM RAW SETTINGS (F2,
+	// root cause 1).
+	//
+	// THE FAILURE THIS CLOSES. This route used to call computeBillCharges
+	// itself with `settings.taxes` and `settings.service_charge` — the RAW
+	// outlet config — and suppress the charge by passing
+	// includeServiceCharge=false. That flag zeroes ONE leg: the
+	// "Restaurant".service_charge percent. A tenant carrying its service
+	// charge as a LINE IN Outlets.default_tax — the tax_line shape, which is
+	// the shipped seed and therefore the tenant that reported this — sailed
+	// straight through computeBillTaxes untouched, so the bill printed WITHOUT
+	// the charge came out to the same paisa as the bill printed WITH it.
+	//
+	// Pairing "off" with a tax config the charge has been lifted out of is now
+	// one function's job (resolveServiceChargeConfig, reached through
+	// GetBillChargeConfigForTable) rather than four call sites' — see its
+	// header for why doing that pairing by hand at a call site IS the bug.
+	//
+	// Reading the raw config had a second consequence: it ignored a LIVE
+	// WAIVER (migration 036), which openBillChargeConfig had already applied to
+	// the bill on screen. A waived table was shown one total and handed
+	// another on paper — precisely the divergence that resolver was
+	// consolidated to make impossible. The stored waiver now reaches this route
+	// through the same resolver the bill view and every settle path use, so the
+	// printed bill and the till's bill are built from one answer.
+	//
+	// `no_service_charge` NO LONGER MOVES THE TOTAL — THE PAPER IS THE DRAWER.
+	//
+	// THE FAILURE MODE, NAMED: THE PAPER DISAGREEING WITH THE DRAWER. This
+	// route used to hand the flag down as `withoutServiceCharge`, so the charge
+	// came off the PRINTED ladder. No settle path has ever heard of the flag —
+	// ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin and the two
+	// customer-payment paths all resolve through
+	// `openBillChargeConfig(context, tableId, client)` with no options, and a
+	// print-time request is not stored anywhere they could read it. On the
+	// seeded tax shape at 10%, subtotal 5499: the guest was CHARGED 6323.84 and
+	// HANDED a bill for 5773.94. That is worse than the F2 bug it came in with
+	// — F2 printed a number that was too high, this printed one the till would
+	// not honour — and it is on a tax document.
+	//
+	// A PRINT MUST NOT BE THE THING THAT DECIDES WHAT A GUEST PAYS, so the fix
+	// is not to teach settle about the flag; it is to stop the flag from being
+	// a way to reduce a total. The ONE way the charge comes off a bill is the
+	// RECORDED WAIVER (migration 036): quoteServiceChargeWaiver prices it,
+	// "ServiceChargeWaivers" records who asked and who authorised and why, the
+	// waiver report and the audit log show it, and openBillChargeConfig honours
+	// it on every read — so a waived bill prints less AND charges less AND
+	// names the person who allowed it. `no_service_charge` keeps its name and
+	// becomes what the name says on a bill that already carries a waiver; on an
+	// un-waived bill the paper shows what the guest owes.
+	//
+	// THE ARGUMENTS BELOW ARE DELIBERATELY IDENTICAL TO THE SETTLE PATHS'. If a
+	// reprint ever needs a "what would this cost without the charge" preview,
+	// it must not be built here: whatever this route renders is what a guest is
+	// handed, and the only honest way to lower it is to record the waiver first.
+	const chargeCfg = await GetBillChargeConfigForTable(restaurantId, tableName);
+	// The flag was asked for, there IS a charge, and nobody authorised taking it
+	// off. The bill below therefore prints WITH the charge and the till takes
+	// the same number — so the ask itself is reported to the caller and written
+	// to the audit log, because a waiter who asked for less and handed over
+	// more has to be able to find out why, and a manager has to be able to see
+	// that it was asked for at all.
+	const waiverRequired = askedWithoutServiceCharge
+		&& !chargeCfg.service_charge_removed
+		&& chargeCfg.basis !== "none";
+	const charges = computeBillCharges(
+		bill.subtotal ?? bill.total_amt ?? 0,
+		chargeCfg.taxConfig,
+		chargeCfg.scPct,
+		chargeCfg.includeServiceCharge,
+		// The discount exactly as GetBillForTable read it, so the printed ladder
+		// is built on the same base as the one the till is showing.
+		bill.discount_value > 0 ? { type: bill.discount_type ?? "percent", value: bill.discount_value } : undefined,
+	);
+	return { chargeCfg, waiverRequired, charges };
+}
+
+/** What printOpenTableBill put on a printer, in the words its callers answer with. */
+export interface OpenTableBillPrint {
+	billId: string;
+	jobId: string | null;
+	destination: string | null;
+	device: string | null;
+	service_charge_removed: boolean;
+	service_charge_waiver_required: boolean;
+	/** The grand total on the paper — the drawer's, because the ladder is the settle paths'. */
+	grand_total: number;
+}
+
+/**
+ * PRINT ONE OPEN TABLE'S BILL ON THE THERMAL PATH — render, dispatch, audit.
+ *
+ * The customer-bill half of POST /print/bill, moved here without a change to a
+ * byte of its paper so that POST /bills/service-charge-waiver/print prints the
+ * same bill through the same code instead of through a copy. /print/bill still
+ * owns its door — the permission, the empty-table 400, C3's refusal and the
+ * KOT branch; this owns what comes out of the printer and the audit line filed
+ * for it.
+ *
+ * The caller hands in the bill, settings and profile it read AFTER anything it
+ * changed: the composite route re-reads all three once its waiver has
+ * committed, so a bill number the waiver minted is on the paper. The charge
+ * configuration is NOT handed in — see openTableBillCharges.
+ *
+ * THROWS on a failed render or dispatch, and the caller decides what that
+ * means. For /print/bill it is the 500 it always was. For the composite route
+ * it is a 200 that says the waiver landed and the paper did not, because a 5xx
+ * there would hide a committed change to what the guest owes.
+ */
+export async function printOpenTableBill(
+	req: Request,
+	target: {
+		restaurantId: string;
+		outletId: string;
+		tableName: string;
+		bill: OpenTableBill;
+		settings: Awaited<ReturnType<typeof GetRestaurantSettings>>;
+		profile: Awaited<ReturnType<typeof GetRestaurantProfile>> | null;
+		/** `no_service_charge` as the till sent it. Changes the audit line and the reply, never the ladder. */
+		askedWithoutServiceCharge: boolean;
+	},
+): Promise<OpenTableBillPrint> {
+	const { restaurantId, outletId, tableName, bill, settings, profile, askedWithoutServiceCharge } = target;
+	const kind = "bill" as const;
+	const { chargeCfg, waiverRequired, charges } = await openTableBillCharges(restaurantId, tableName, bill, askedWithoutServiceCharge);
+	// Column layout + logo raster width follow the configured paper size
+	// (58mm = 32 cols / 384 dots, 80mm = 48 cols / 576 dots).
+	const is58 = settings.bill_paper_width === "58mm";
+	const cols = is58 ? 32 : 48;
+	// Everything below is the customer bill, which alone carries the logo,
+	// cashier line and feedback QR.
+	const isBill = true;
+	// THE OWNER'S SWITCH (the bill_show_qr column). Off means no QR and no QR sentence:
+	// the renderer prints that whole block only when it has a URL, so leaving
+	// the URL out is the entire mechanism, and the table's feedback context is
+	// not even looked up. `!== false` because a settings shape without the key
+	// is a tenant who never turned it off.
+	const feedbackUrl = isBill && settings.bill_show_qr !== false ? await feedbackUrlForTable(restaurantId, tableName) : null;
+	const logo = isBill ? await buildLogoEscPos(restaurantId, is58 ? 384 : 576).catch(() => null) : null;
+	let cashier = "";
+	if (isBill) {
+		try {
+			const emp = await GetEmployeeDetailsFromEmpID(extractEmployeeId(req) ?? "");
+			cashier = `${emp?.emp_Fname ?? ""} ${emp?.emp_Lname ?? ""}`.trim();
+		} catch {/* cashier optional */}
+	}
+	// A SERVICE-CHARGE LINE ONLY WHEN ONE IS CHARGED. The restaurant_percent
+	// leg prints here when its amount is above zero; a tax-line charge prints
+	// among `taxes` below, exactly as it always has.
+	//
+	// A REMOVED CHARGE PRINTS NOTHING. This route used to print "Service Charge
+	// 10%  Opted-out" on a waived bill so the guest could see the charge had
+	// been dropped; the client asked for the opposite ("don't show service
+	// charge opted out when removed ... this too in the bill"). The money was
+	// never in question — the resolver takes the charge off the ladder and the
+	// till alike — and the removal is still recorded where a manager looks for
+	// it: the waiver row, the audit line below, and the Service Charge Deny
+	// report. The disclaimer already followed service_charge_applied, so a
+	// waived bill says nothing about a charge anywhere.
+	const serviceCharge = charges.service_charge > 0
+		? { percent: charges.service_charge_percent, amount: charges.service_charge }
+		: null;
+	const escBase64 = buildReceiptBase64({
+		restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+		// Legal entity + GSTIN are tenant settings, not profile fields: they are
+		// statutory identifiers for the business, not per-outlet contact details.
+		// Both are "" when unset and the renderer prints nothing for "", so a
+		// tenant that has configured neither gets exactly today's header.
+		legalName: settings.bill_legal_name ?? null,
+		address: profile?.outlet_add ?? null,
+		// The outlet's own contact number ("Outlets".outlet_main_ph, surfaced by
+		// GetRestaurantProfile). Address and GSTIN were already on the paper;
+		// the phone was the one statutory-header field a guest could not read
+		// off their own bill. Unset resolves to "" and the renderer prints no
+		// line for "", so an outlet that never filled it in is unchanged.
+		phone: profile?.outlet_phone ?? null,
+		gstin: settings.bill_gstin ?? null,
+		table: tableName,
+		covers: bill.covers ?? 1,
+		items: bill.items,
+		total: charges.subtotal,
+		customer: bill.customer,
+		customerGstin: bill.customer_gstin ?? null,
+		billNo: bill.bill_no,
+		cashier: cashier || null,
+		// THE DATE LINE, IN THE RESTAURANT'S ZONE ("13/09/26 23:19"). Unset, the
+		// renderer fell back to the SERVER's clock and locale, which on the UTC
+		// host printed a US-format, UTC time on a GST document, and the wrong
+		// calendar date for every bill between midnight and 05:30 IST. The same
+		// stamp the KOT has carried since kotStamp existed.
+		printedAt: kotStamp(new Date(), settings.timezone || "Asia/Kolkata"),
+		discount: charges.discount > 0 ? { amount: charges.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
+		serviceCharge,
+		// The breakdown the billing layer produced for THIS bill — one line per
+		// tax the outlet actually has configured in Outlets.default_tax, each
+		// with its own label and percentage (so a tenant on SGST 2.5% + CGST 2.5%
+		// prints two lines, and a tenant on a single GST line prints one). The
+		// renderer prints them; it does not invent, merge or split them.
+		taxes: charges.taxes,
+		// PRINT WHAT THE BILLING LAYER COMPUTED. computeBillCharges is the single
+		// authority on the tax-inclusive total, and it is the same number settle
+		// records against the bill. Handing it over means the renderer has nothing
+		// left to round — see the grandTotal note in escpos.ts.
+		grandTotal: charges.grand_total,
+		// And the round-off it applied to get there (migration 048), which the
+		// renderer prints as "Round off" above the total only when it is not
+		// zero. Disclosed, not derived: the same charges object, so the paper's
+		// rungs reach the drawer's total exactly.
+		roundOff: charges.round_off,
+		currency: settings.currency ?? "₹",
+		kind,
+		feedbackUrl,
+		// The tenant's own sentence above the QR; "" falls back to the built-in
+		// valet line inside the renderer, so an unconfigured tenant is unchanged.
+		qrNote: settings.bill_qr_note ?? null,
+		logo,
+		// 5.3 / item 4 — A SECOND COPY SAYS SO, AS ITS FIRST LINE. The banner
+		// already existed in the renderer and the accounting reprint set it, but
+		// THIS route never did: a manager's reprint of an open table's bill
+		// (C3 lets anyone senior to a waiter make one) came off the roll looking
+		// exactly like the original. `print_count` is the server's ledger count
+		// of this seating's bill prints BEFORE this one — the same number C3
+		// just refused a waiter on — so a first print (0) never carries it.
+		reprint: bill.print_count > 0,
+		// THE DISCLAIMER FOLLOWS THE CHARGE, NOT ONE LEG OF IT (G2; F2 root
+		// cause 3). This predicate was `charges.service_charge > 0` — the
+		// restaurant_percent leg alone — so a tenant charging through a tax
+		// line never printed the sentence the requirement makes mandatory, and
+		// would have gone on printing it on waived bills once the waiver
+		// started working. `service_charge_applied` is the resolver's "does this
+		// configuration still charge for service", in both shapes, so the
+		// sentence appears when and only when the guest is actually being
+		// charged for one.
+		serviceChargeNote: isBill && chargeCfg.service_charge_applied
+			? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."
+			: null,
+	}, cols);
+	const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
+	// billId is STABLE ACROSS REPRINTS, so each reprint deliberately becomes its
+	// OWN job row. A waiter who asks for a second copy must get one — which is
+	// also why the router is asked again rather than the first decision being
+	// reused: the till that printed the original may be off by now.
+	//
+	// Same persist-then-emit as /publish/bill above, same fallback: no `bill`
+	// rule, or an unreadable routing table, or nothing online that serves the
+	// bill destination, and this is today's outlet-wide emit with today's bytes.
+	const dispatched = await dispatchPrintJob(restaurantId, {
+		outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
+	});
+	// THE AUDIT LINE SAYS WHAT THE PAPER ACTUALLY SAYS. It used to read "(no
+	// service charge)" off the REQUEST, which is how a print that reduced a
+	// total nobody authorised left a trail claiming it was fine. It now
+	// describes the bill that came out: removed (and by whose waiver), or asked
+	// for and refused — which is the line a manager scans for.
+	const scNote = chargeCfg.service_charge_removed
+		? ` (no service charge — waiver by ${chargeCfg.waiver?.authorised_by_username ?? "unknown"})`
+		: waiverRequired
+			? " (asked WITHOUT the service charge; no waiver is recorded, so the charge is ON this bill)"
+			: "";
+	try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null }); } catch {/* ignore */}
+	return {
+		billId,
+		jobId: dispatched.jobId,
+		destination: dispatched.decision.destinationName,
+		device: dispatched.assignedDeviceId,
+		service_charge_removed: chargeCfg.service_charge_removed,
+		service_charge_waiver_required: waiverRequired,
+		grand_total: charges.grand_total,
+	};
+}
+
+/**
+ * RECORD A BILL PRINT THE BROWSER RENDERS — the ledger row, the audit line and
+ * the priced bill, as POST /print/bill/claim has always answered them.
+ *
+ * Lifted out of that route so POST /bills/service-charge-waiver/print can make
+ * the SAME claim for the web dashboard after its waiver commits: one ledger
+ * row, one audit line, one `printable_bill`, whichever door the print came
+ * through. The caller has already answered the empty table and C3's refusal,
+ * and hands in the bill it read after anything it changed.
+ */
+export async function claimClientRenderedBillPrint(
+	req: Request,
+	target: { restaurantId: string; outletId: string; tableName: string; bill: OpenTableBill },
+) {
+	const { restaurantId, outletId, tableName, bill } = target;
+	// The SAME bill_id shape /print/bill writes, including the
+	// `<table>-<epoch>` fallback for a table with no "Bills" row yet.
+	// bill_print_state.ts matches BOTH shapes and matches the fallback as a
+	// PREFIX on the exact table name, so a claim and a thermal print of the
+	// same seating land in the same count rather than in two.
+	const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
+	let recorded: { id: string; created_at: string } | null = null;
+	try {
+		recorded = await RecordClientRenderedBillPrint(restaurantId, {
+			outlet_id: outletId,
+			bill_id: billId,
+			// Diagnostic, and deliberately not a device or a lease holder:
+			// nothing holds a lease on a terminal row. It names the client
+			// class and the person, so a manager reading the ledger can tell a
+			// browser print from a till's.
+			claimed_by: `web-client:${extractEmployeeId(req) ?? "unknown"}`,
+		});
+	} catch (err) {
+		// 42P01 / 42501 only — migration 027 absent or ungranted. Anything else
+		// is a real failure and must not be swallowed into a success.
+		if (!isSchemaMissing(err)) { throw err; }
+		warnSchemaMissing("print_bill_claim", err);
+	}
+
+	// THE AUDIT LINE IS THE ONE /print/bill FILES, under the same Action id
+	// and the same category, worded so a manager scanning the log can see
+	// which piece of paper came out of what. `recorded:false` is in the
+	// metadata rather than left implicit: an unrecorded print is the one case
+	// where the log is the ONLY evidence the bill was printed at all.
+	try {
+		await log_audit(
+			req, "4ad474d4-5230-449c-874f-6a238b833bca",
+			`Printed bill for table ${tableName} from the web dashboard (browser print — no thermal copy)`,
+			Audit_log_category.Bill,
+			{ table: tableName, kind: "bill", source: "web_dashboard", claim: true, recorded: recorded !== null, job_id: recorded?.id ?? null },
+		);
+	} catch {/* ignore */}
+
+	// ENOUGH FOR THE BUTTON TO GO GREY. `print_count` is what the dashboard
+	// tests to hide its own control on the next render, and `printed_at` is
+	// what it shows beside it — both taken from the row that was just
+	// written, so the client does not have to re-poll /bill-for-table to
+	// learn what it just did. They are the SAME THREE SPELLINGS
+	// /bill-for-table and /get-tables carry (bill_print_state.ts), so a
+	// client needs no second code path to read them.
+	//
+	// On the unrecorded path the counts are returned UNCHANGED rather than
+	// optimistically incremented: reporting a count the ledger does not hold
+	// is how a client ends up disabling a button the server would still allow.
+	return {
+		billId,
+		recorded: recorded !== null,
+		jobId: recorded?.id ?? null,
+		print_count: recorded ? bill.print_count + 1 : bill.print_count,
+		// The FIRST print of this seating is the one that used up a waiter's
+		// single attempt, so it only moves when there was no earlier one.
+		bill_printed_at: bill.print_count === 0 ? (recorded?.created_at ?? bill.bill_printed_at) : bill.bill_printed_at,
+		printed_at: recorded?.created_at ?? bill.printed_at,
+		// THE PRICED BILL, BECAUSE THIS IS THE GUEST'S RECEIPT.
+		//
+		// THE BUG THIS CLOSES, found in a live browser pass: on the web
+		// dashboard a waiter could not print a bill at all. The print page
+		// builds the receipt from the open bill, reading GET /bill-for-table AS
+		// THE SIGNED-IN USER — and for a waiter that read is redacted by C4, so
+		// `grand_total` arrives absent, the page's `Number.isFinite` gate fails,
+		// and it refuses with "No bill is available for this order yet". It
+		// refuses rather than printing zeros, which is right; it just meant no
+		// waiter on the web could ever produce paper. Worse, this claim had
+		// already spent their single attempt by then.
+		//
+		// WHY RETURNING AMOUNTS HERE DOES NOT UNDO C4. C4 is scoped to the
+		// ORDER-TAKING screen: "remove the prices from the list of ordered
+		// dishes displayed on the right side". A printed bill is a different
+		// artifact with a different reader — the guest — and a bill without
+		// amounts is not a bill. The waiter will see these figures on the paper
+		// they hand over; that was always true of every printed receipt.
+		//
+		// WHY HERE, AND NOT BY UN-REDACTING /bill-for-table. That route is read
+		// continuously by the order-taking screen, which is exactly where C4
+		// applies. A print claim is the one moment a waiter is AUTHORISED TO PRINT,
+		// its caller has already enforced the once-only rule, and a waiter-only
+		// session can only succeed at it once per seating. So the amounts
+		// reach a waiter exactly once, at the instant they are needed for
+		// paper, and never on the screen they take orders from.
+		//
+		// Sent on the UNRECORDED path too. That path means migration 027 is
+		// absent, so the print could not be written to the ledger — but the
+		// once-only gate above had already passed, and the gate is what
+		// authorises a print; the ledger is bookkeeping. Withholding the bill
+		// there would leave a waiter unable to produce paper on exactly the
+		// database where nothing else is stopping them.
+		printable_bill: bill,
+	};
 }
 
 export function registerBillPrintAndEditRoutes(app: Express): void {
@@ -1054,81 +1463,6 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		// `kind === "kot"` is a kitchen docket, not a bill, and a waiter reprints
 		// a lost ticket all shift and always could.
 		if (kind === "bill" && await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
-		// THE CHARGE CONFIG COMES FROM THE RESOLVER, NOT FROM RAW SETTINGS (F2,
-		// root cause 1).
-		//
-		// THE FAILURE THIS CLOSES. This route used to call computeBillCharges
-		// itself with `settings.taxes` and `settings.service_charge` — the RAW
-		// outlet config — and suppress the charge by passing
-		// includeServiceCharge=false. That flag zeroes ONE leg: the
-		// "Restaurant".service_charge percent. A tenant carrying its service
-		// charge as a LINE IN Outlets.default_tax — the tax_line shape, which is
-		// the shipped seed and therefore the tenant that reported this — sailed
-		// straight through computeBillTaxes untouched, so the bill printed WITHOUT
-		// the charge came out to the same paisa as the bill printed WITH it.
-		//
-		// Pairing "off" with a tax config the charge has been lifted out of is now
-		// one function's job (resolveServiceChargeConfig, reached through
-		// GetBillChargeConfigForTable) rather than four call sites' — see its
-		// header for why doing that pairing by hand at a call site IS the bug.
-		//
-		// Reading the raw config had a second consequence: it ignored a LIVE
-		// WAIVER (migration 036), which openBillChargeConfig had already applied to
-		// the bill on screen. A waived table was shown one total and handed
-		// another on paper — precisely the divergence that resolver was
-		// consolidated to make impossible. The stored waiver now reaches this route
-		// through the same resolver the bill view and every settle path use, so the
-		// printed bill and the till's bill are built from one answer.
-		//
-		// `no_service_charge` NO LONGER MOVES THE TOTAL — THE PAPER IS THE DRAWER.
-		//
-		// THE FAILURE MODE, NAMED: THE PAPER DISAGREEING WITH THE DRAWER. This
-		// route used to hand the flag down as `withoutServiceCharge`, so the charge
-		// came off the PRINTED ladder. No settle path has ever heard of the flag —
-		// ConfirmBillPaymentByWaiter, ApproveBillPaymentByAdmin and the two
-		// customer-payment paths all resolve through
-		// `openBillChargeConfig(context, tableId, client)` with no options, and a
-		// print-time request is not stored anywhere they could read it. On the
-		// seeded tax shape at 10%, subtotal 5499: the guest was CHARGED 6323.84 and
-		// HANDED a bill for 5773.94. That is worse than the F2 bug it came in with
-		// — F2 printed a number that was too high, this printed one the till would
-		// not honour — and it is on a tax document.
-		//
-		// A PRINT MUST NOT BE THE THING THAT DECIDES WHAT A GUEST PAYS, so the fix
-		// is not to teach settle about the flag; it is to stop the flag from being
-		// a way to reduce a total. The ONE way the charge comes off a bill is the
-		// RECORDED WAIVER (migration 036): quoteServiceChargeWaiver prices it,
-		// "ServiceChargeWaivers" records who asked and who authorised and why, the
-		// waiver report and the audit log show it, and openBillChargeConfig honours
-		// it on every read — so a waived bill prints less AND charges less AND
-		// names the person who allowed it. `no_service_charge` keeps its name and
-		// becomes what the name says on a bill that already carries a waiver; on an
-		// un-waived bill the paper shows what the guest owes.
-		//
-		// THE ARGUMENTS BELOW ARE DELIBERATELY IDENTICAL TO THE SETTLE PATHS'. If a
-		// reprint ever needs a "what would this cost without the charge" preview,
-		// it must not be built here: whatever this route renders is what a guest is
-		// handed, and the only honest way to lower it is to record the waiver first.
-		const askedWithoutServiceCharge = body.no_service_charge === true;
-		const chargeCfg = await GetBillChargeConfigForTable(restaurantId, tableName);
-		// The flag was asked for, there IS a charge, and nobody authorised taking it
-		// off. The bill below therefore prints WITH the charge and the till takes
-		// the same number — so the ask itself is reported to the caller and written
-		// to the audit log, because a waiter who asked for less and handed over
-		// more has to be able to find out why, and a manager has to be able to see
-		// that it was asked for at all.
-		const waiverRequired = askedWithoutServiceCharge
-			&& !chargeCfg.service_charge_removed
-			&& chargeCfg.basis !== "none";
-		const charges = computeBillCharges(
-			bill.subtotal ?? bill.total_amt ?? 0,
-			chargeCfg.taxConfig,
-			chargeCfg.scPct,
-			chargeCfg.includeServiceCharge,
-			// The discount exactly as GetBillForTable read it, so the printed ladder
-			// is built on the same base as the one the till is showing.
-			bill.discount_value > 0 ? { type: bill.discount_type ?? "percent", value: bill.discount_value } : undefined,
-		);
 		// Column layout + logo raster width follow the configured paper size
 		// (58mm = 32 cols / 384 dots, 80mm = 48 cols / 576 dots).
 		const is58 = settings.bill_paper_width === "58mm";
@@ -1139,6 +1473,9 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		// agent that maps station -> printer can route it; a single-printer agent
 		// prints all N tickets on one roll (same paper, just split + labelled).
 		if (kind === "kot") {
+			// The docket prints the pre-tax subtotal off the same ladder the bill
+			// uses; `no_service_charge` moves nothing on it, as before.
+			const { charges } = await openTableBillCharges(restaurantId, tableName, bill, body.no_service_charge === true);
 			// THE KOT HEADER, resolved here and printed verbatim by the renderer.
 			//
 			// The zone is the tenant's own ("Restaurant".timezone). Everything
@@ -1203,136 +1540,12 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			return;
 		}
 		// The kitchen ticket returned above; everything below is the customer bill,
-		// which alone carries the logo, cashier line and feedback QR.
-		const isBill = true;
-		// THE OWNER'S SWITCH (the bill_show_qr column). Off means no QR and no QR sentence:
-		// the renderer prints that whole block only when it has a URL, so leaving
-		// the URL out is the entire mechanism, and the table's feedback context is
-		// not even looked up. `!== false` because a settings shape without the key
-		// is a tenant who never turned it off.
-		const feedbackUrl = isBill && settings.bill_show_qr !== false ? await feedbackUrlForTable(restaurantId, tableName) : null;
-		const logo = isBill ? await buildLogoEscPos(restaurantId, is58 ? 384 : 576).catch(() => null) : null;
-		let cashier = "";
-		if (isBill) {
-			try {
-				const emp = await GetEmployeeDetailsFromEmpID(extractEmployeeId(req) ?? "");
-				cashier = `${emp?.emp_Fname ?? ""} ${emp?.emp_Lname ?? ""}`.trim();
-			} catch {/* cashier optional */}
-		}
-		// A SERVICE-CHARGE LINE ONLY WHEN ONE IS CHARGED. The restaurant_percent
-		// leg prints here when its amount is above zero; a tax-line charge prints
-		// among `taxes` below, exactly as it always has.
-		//
-		// A REMOVED CHARGE PRINTS NOTHING. This route used to print "Service Charge
-		// 10%  Opted-out" on a waived bill so the guest could see the charge had
-		// been dropped; the client asked for the opposite ("don't show service
-		// charge opted out when removed ... this too in the bill"). The money was
-		// never in question — the resolver takes the charge off the ladder and the
-		// till alike — and the removal is still recorded where a manager looks for
-		// it: the waiver row, the audit line below, and the Service Charge Deny
-		// report. The disclaimer already followed service_charge_applied, so a
-		// waived bill says nothing about a charge anywhere.
-		const serviceCharge = charges.service_charge > 0
-			? { percent: charges.service_charge_percent, amount: charges.service_charge }
-			: null;
-		const escBase64 = buildReceiptBase64({
-			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
-			// Legal entity + GSTIN are tenant settings, not profile fields: they are
-			// statutory identifiers for the business, not per-outlet contact details.
-			// Both are "" when unset and the renderer prints nothing for "", so a
-			// tenant that has configured neither gets exactly today's header.
-			legalName: settings.bill_legal_name ?? null,
-			address: profile?.outlet_add ?? null,
-			// The outlet's own contact number ("Outlets".outlet_main_ph, surfaced by
-			// GetRestaurantProfile). Address and GSTIN were already on the paper;
-			// the phone was the one statutory-header field a guest could not read
-			// off their own bill. Unset resolves to "" and the renderer prints no
-			// line for "", so an outlet that never filled it in is unchanged.
-			phone: profile?.outlet_phone ?? null,
-			gstin: settings.bill_gstin ?? null,
-			table: tableName,
-			covers: bill.covers ?? 1,
-			items: bill.items,
-			total: charges.subtotal,
-			customer: bill.customer,
-			customerGstin: bill.customer_gstin ?? null,
-			billNo: bill.bill_no,
-			cashier: cashier || null,
-			// THE DATE LINE, IN THE RESTAURANT'S ZONE ("13/09/26 23:19"). Unset, the
-			// renderer fell back to the SERVER's clock and locale, which on the UTC
-			// host printed a US-format, UTC time on a GST document, and the wrong
-			// calendar date for every bill between midnight and 05:30 IST. The same
-			// stamp the KOT has carried since kotStamp existed.
-			printedAt: kotStamp(new Date(), settings.timezone || "Asia/Kolkata"),
-			discount: charges.discount > 0 ? { amount: charges.discount, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" } : null,
-			serviceCharge,
-			// The breakdown the billing layer produced for THIS bill — one line per
-			// tax the outlet actually has configured in Outlets.default_tax, each
-			// with its own label and percentage (so a tenant on SGST 2.5% + CGST 2.5%
-			// prints two lines, and a tenant on a single GST line prints one). The
-			// renderer prints them; it does not invent, merge or split them.
-			taxes: charges.taxes,
-			// PRINT WHAT THE BILLING LAYER COMPUTED. computeBillCharges is the single
-			// authority on the tax-inclusive total, and it is the same number settle
-			// records against the bill. Handing it over means the renderer has nothing
-			// left to round — see the grandTotal note in escpos.ts.
-			grandTotal: charges.grand_total,
-			// And the round-off it applied to get there (migration 048), which the
-			// renderer prints as "Round off" above the total only when it is not
-			// zero. Disclosed, not derived: the same charges object, so the paper's
-			// rungs reach the drawer's total exactly.
-			roundOff: charges.round_off,
-			currency: settings.currency ?? "₹",
-			kind,
-			feedbackUrl,
-			// The tenant's own sentence above the QR; "" falls back to the built-in
-			// valet line inside the renderer, so an unconfigured tenant is unchanged.
-			qrNote: settings.bill_qr_note ?? null,
-			logo,
-			// 5.3 / item 4 — A SECOND COPY SAYS SO, AS ITS FIRST LINE. The banner
-			// already existed in the renderer and the accounting reprint set it, but
-			// THIS route never did: a manager's reprint of an open table's bill
-			// (C3 lets anyone senior to a waiter make one) came off the roll looking
-			// exactly like the original. `print_count` is the server's ledger count
-			// of this seating's bill prints BEFORE this one — the same number C3
-			// just refused a waiter on — so a first print (0) never carries it.
-			reprint: bill.print_count > 0,
-			// THE DISCLAIMER FOLLOWS THE CHARGE, NOT ONE LEG OF IT (G2; F2 root
-			// cause 3). This predicate was `charges.service_charge > 0` — the
-			// restaurant_percent leg alone — so a tenant charging through a tax
-			// line never printed the sentence the requirement makes mandatory, and
-			// would have gone on printing it on waived bills once the waiver
-			// started working. `service_charge_applied` is the resolver's "does this
-			// configuration still charge for service", in both shapes, so the
-			// sentence appears when and only when the guest is actually being
-			// charged for one.
-			serviceChargeNote: isBill && chargeCfg.service_charge_applied
-				? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."
-				: null,
-		}, cols);
-		const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
-		// billId is STABLE ACROSS REPRINTS, so each reprint deliberately becomes its
-		// OWN job row. A waiter who asks for a second copy must get one — which is
-		// also why the router is asked again rather than the first decision being
-		// reused: the till that printed the original may be off by now.
-		//
-		// Same persist-then-emit as /publish/bill above, same fallback: no `bill`
-		// rule, or an unreadable routing table, or nothing online that serves the
-		// bill destination, and this is today's outlet-wide emit with today's bytes.
-		const dispatched = await dispatchPrintJob(restaurantId, {
-			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
+		// and it is printOpenTableBill's — the same render, dispatch and audit line
+		// POST /bills/service-charge-waiver/print uses once its waiver has committed.
+		const printed = await printOpenTableBill(req, {
+			restaurantId, outletId, tableName, bill, settings, profile,
+			askedWithoutServiceCharge: body.no_service_charge === true,
 		});
-		// THE AUDIT LINE SAYS WHAT THE PAPER ACTUALLY SAYS. It used to read "(no
-		// service charge)" off the REQUEST, which is how a print that reduced a
-		// total nobody authorised left a trail claiming it was fine. It now
-		// describes the bill that came out: removed (and by whose waiver), or asked
-		// for and refused — which is the line a manager scans for.
-		const scNote = chargeCfg.service_charge_removed
-			? ` (no service charge — waiver by ${chargeCfg.waiver?.authorised_by_username ?? "unknown"})`
-			: waiverRequired
-				? " (asked WITHOUT the service charge; no waiver is recorded, so the charge is ON this bill)"
-				: "";
-		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null }); } catch {/* ignore */}
 		// Additive, exactly as on /publish/bill: null for every unrouted outlet.
 		//
 		// The two service-charge fields are additive too, and a shipped till that
@@ -1342,12 +1555,12 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		// is a total that silently did not move.
 		res.json({
 			success: true,
-			billId,
-			jobId: dispatched.jobId,
-			destination: dispatched.decision.destinationName,
-			device: dispatched.assignedDeviceId,
-			service_charge_removed: chargeCfg.service_charge_removed,
-			service_charge_waiver_required: waiverRequired,
+			billId: printed.billId,
+			jobId: printed.jobId,
+			destination: printed.destination,
+			device: printed.device,
+			service_charge_removed: printed.service_charge_removed,
+			service_charge_waiver_required: printed.service_charge_waiver_required,
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');
@@ -1447,100 +1660,10 @@ app.post('/print/bill/claim', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 		}
 		if (await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
 
-		// The SAME bill_id shape /print/bill writes, including the
-		// `<table>-<epoch>` fallback for a table with no "Bills" row yet.
-		// bill_print_state.ts matches BOTH shapes and matches the fallback as a
-		// PREFIX on the exact table name, so a claim and a thermal print of the
-		// same seating land in the same count rather than in two.
-		const billId = bill.bill_id ?? `${tableName}-${Date.now()}`;
-		let recorded: { id: string; created_at: string } | null = null;
-		try {
-			recorded = await RecordClientRenderedBillPrint(restaurantId, {
-				outlet_id: outletId,
-				bill_id: billId,
-				// Diagnostic, and deliberately not a device or a lease holder:
-				// nothing holds a lease on a terminal row. It names the client
-				// class and the person, so a manager reading the ledger can tell a
-				// browser print from a till's.
-				claimed_by: `web-client:${extractEmployeeId(req) ?? "unknown"}`,
-			});
-		} catch (err) {
-			// 42P01 / 42501 only — migration 027 absent or ungranted. Anything else
-			// is a real failure and must not be swallowed into a success.
-			if (!isSchemaMissing(err)) { throw err; }
-			warnSchemaMissing("print_bill_claim", err);
-		}
-
-		// THE AUDIT LINE IS THE ONE /print/bill FILES, under the same Action id
-		// and the same category, worded so a manager scanning the log can see
-		// which piece of paper came out of what. `recorded:false` is in the
-		// metadata rather than left implicit: an unrecorded print is the one case
-		// where the log is the ONLY evidence the bill was printed at all.
-		try {
-			await log_audit(
-				req, "4ad474d4-5230-449c-874f-6a238b833bca",
-				`Printed bill for table ${tableName} from the web dashboard (browser print — no thermal copy)`,
-				Audit_log_category.Bill,
-				{ table: tableName, kind: "bill", source: "web_dashboard", claim: true, recorded: recorded !== null, job_id: recorded?.id ?? null },
-			);
-		} catch {/* ignore */}
-
-		// ENOUGH FOR THE BUTTON TO GO GREY. `print_count` is what the dashboard
-		// tests to hide its own control on the next render, and `printed_at` is
-		// what it shows beside it — both taken from the row that was just
-		// written, so the client does not have to re-poll /bill-for-table to
-		// learn what it just did. They are the SAME THREE SPELLINGS
-		// /bill-for-table and /get-tables carry (bill_print_state.ts), so a
-		// client needs no second code path to read them.
-		//
-		// On the unrecorded path the counts are returned UNCHANGED rather than
-		// optimistically incremented: reporting a count the ledger does not hold
-		// is how a client ends up disabling a button the server would still allow.
-		res.json({
-			success: true,
-			billId,
-			recorded: recorded !== null,
-			jobId: recorded?.id ?? null,
-			print_count: recorded ? bill.print_count + 1 : bill.print_count,
-			// The FIRST print of this seating is the one that used up a waiter's
-			// single attempt, so it only moves when there was no earlier one.
-			bill_printed_at: bill.print_count === 0 ? (recorded?.created_at ?? bill.bill_printed_at) : bill.bill_printed_at,
-			printed_at: recorded?.created_at ?? bill.printed_at,
-			// THE PRICED BILL, BECAUSE THIS IS THE GUEST'S RECEIPT.
-			//
-			// THE BUG THIS CLOSES, found in a live browser pass: on the web
-			// dashboard a waiter could not print a bill at all. The print page
-			// builds the receipt from the open bill, reading GET /bill-for-table AS
-			// THE SIGNED-IN USER — and for a waiter that read is redacted by C4, so
-			// `grand_total` arrives absent, the page's `Number.isFinite` gate fails,
-			// and it refuses with "No bill is available for this order yet". It
-			// refuses rather than printing zeros, which is right; it just meant no
-			// waiter on the web could ever produce paper. Worse, this claim had
-			// already spent their single attempt by then.
-			//
-			// WHY RETURNING AMOUNTS HERE DOES NOT UNDO C4. C4 is scoped to the
-			// ORDER-TAKING screen: "remove the prices from the list of ordered
-			// dishes displayed on the right side". A printed bill is a different
-			// artifact with a different reader — the guest — and a bill without
-			// amounts is not a bill. The waiter will see these figures on the paper
-			// they hand over; that was always true of every printed receipt.
-			//
-			// WHY HERE, AND NOT BY UN-REDACTING /bill-for-table. That route is read
-			// continuously by the order-taking screen, which is exactly where C4
-			// applies. This route is the one moment a waiter is AUTHORISED TO PRINT,
-			// it already enforced the once-only rule above, and a waiter-only
-			// session can only succeed at it once per seating. So the amounts
-			// reach a waiter exactly once, at the instant they are needed for
-			// paper, and never on the screen they take orders from.
-			//
-			// Sent on the UNRECORDED path too. That path means migration 027 is
-			// absent, so the print could not be written to the ledger — but the
-			// once-only gate above had already passed, and the gate is what
-			// authorises a print; the ledger is bookkeeping. Withholding the bill
-			// there would leave a waiter unable to produce paper on exactly the
-			// database where nothing else is stopping them.
-			printable_bill: bill,
-		});
+		// The ledger row, the audit line and the priced bill are
+		// claimClientRenderedBillPrint's, which the composite waiver-and-print
+		// route also calls — so a browser print is one fact whichever door it used.
+		res.json({ success: true, ...await claimClientRenderedBillPrint(req, { restaurantId, outletId, tableName, bill }) });
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_claim_failed');
 		res.status(500).json({ error: String(err?.message ?? 'Unable to record the print') });

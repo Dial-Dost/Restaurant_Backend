@@ -111,7 +111,11 @@ import type { Express, Request, Response } from "express";
 import { z } from "zod";
 import {
 	Audit_log_category,
+	GetBillChargeConfigForTable,
+	GetBillForTable,
 	GetNonChargeablesForOrders,
+	GetRestaurantProfile,
+	GetRestaurantSettings,
 	GetTableNameById,
 	MarkOrderItemNonChargeable,
 	ResolveAuthoriser,
@@ -124,12 +128,15 @@ import { dispatchCancellationKot } from "../kot_print.js";
 import { NON_CHARGEABLE_KINDS, SERVICE_CHARGE_WAIVER_KINDS, VOID_KINDS } from "../mis_capture.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
+import { claimClientRenderedBillPrint, printOpenTableBill, refuseWaiterBillReprint } from "./bills.js";
 import {
 	PERM_NON_CHARGEABLE,
 	PERM_SERVICE_CHARGE_WAIVER,
 	PERM_VOID_ORDER,
+	callerHasPermission,
 	extractEmployeeId,
 	extractEmployeeUsername,
+	extractOutletId,
 	extractRestaurantId,
 	log_audit,
 	validateAction,
@@ -174,6 +181,23 @@ const sWaiveServiceCharge = z.object({
 		|| (typeof b.bill_id === "string" && b.bill_id.trim().length > 0),
 	{ message: "table_name or bill_id is required" },
 );
+
+// The one-step "Remove service charge & print". Everything about the WAIVER is
+// optional here because a bill that already carries one is simply reprinted and
+// needs no second reason — the handler, not the schema, decides whether this
+// call has to write a waiver and refuses the missing fields then. When they ARE
+// sent they are held to exactly the vocabulary and lengths the waiver route
+// holds them to, from the same consts. `table_name` only: WaiveServiceCharge
+// can mint the table's bill, and a print is addressed by table everywhere else.
+const sRemoveServiceChargeAndPrint = z.object({
+	table_name: z.string(),
+	waiver_kind: z.enum(SERVICE_CHARGE_WAIVER_KINDS).optional(),
+	reason: sReason.optional(),
+	authorised_by: sAuthorisedBy.optional(),
+	// "client" is the web dashboard, which renders its own paper in the browser
+	// and only needs the print CLAIMED (POST /print/bill/claim's half).
+	render: z.enum(["thermal", "client"]).optional(),
+}).passthrough();
 
 
 // --- Shared handler plumbing -------------------------------------------------
@@ -260,6 +284,44 @@ function failCapture(res: Response, err: unknown, log: string, conflict: string)
 	}
 	logger.error({ err }, log);
 	res.status(400).json({ error: String((err as { message?: unknown })?.message ?? "Unable to complete that change") });
+}
+
+/**
+ * THE AUDIT LINE A SERVICE-CHARGE WAIVER FILES, written in one place because two
+ * routes now record a waiver: POST /bills/service-charge-waiver and the one-step
+ * POST /bills/service-charge-waiver/print.
+ *
+ * The Bill Edit report classifies waivers off the PERM_SERVICE_CHARGE_WAIVER
+ * action id on this line, and a manager reads its sentence beside the Service
+ * Charge Deny report's row. A waiver recorded by the composite route that filed
+ * a subtly different line would be the same fact told two ways in one control
+ * ledger, so both routes hand this function what WaiveServiceCharge returned and
+ * it writes the bytes. Never throws: the waiver it describes has committed.
+ */
+async function auditServiceChargeWaiver(
+	req: Request,
+	who: { authorised_by_username: string },
+	result: Awaited<ReturnType<typeof WaiveServiceCharge>>,
+	emitTable: string | null,
+): Promise<void> {
+	const rec = result.record;
+	try {
+		await log_audit(
+			req,
+			PERM_SERVICE_CHARGE_WAIVER,
+			`Waived the service charge (₹${rec.amount_waived.toFixed(2)}; ₹${rec.grand_total_reduction.toFixed(2)} with its tax, before round-off; grand total ₹${result.grand_total_before.toFixed(2)} → ₹${result.grand_total_after.toFixed(2)}) on bill ${rec.bill_id}${emitTable ? ` (table ${String(emitTable)})` : ""} — authorised by ${who.authorised_by_username}`,
+			Audit_log_category.Bill,
+			{
+				waiver_id: rec.id, bill_id: rec.bill_id, table: emitTable || null,
+				waiver_kind: rec.waiver_kind, reason: rec.reason,
+				basis: rec.basis, basis_percent: rec.basis_percent, basis_amount: rec.basis_amount,
+				amount_waived: rec.amount_waived, tax_on_waived: rec.tax_on_waived,
+				grand_total_reduction: rec.grand_total_reduction,
+				grand_total_before: result.grand_total_before, grand_total_after: result.grand_total_after,
+				authorised_by: who.authorised_by_username,
+			},
+		);
+	} catch (err) { logger.warn({ err }, "log_audit service_charge_waiver failed"); }
 }
 
 /** Best-effort floor refresh. Never fails a write that already committed. */
@@ -565,23 +627,7 @@ app.post("/bills/service-charge-waiver", validateAction(PERM_SERVICE_CHARGE_WAIV
 		const rec = result.record;
 		const emitTable = tableName || await GetTableNameById(restaurantId, rec.table_id).catch(() => null);
 		announceBill(restaurantId, emitTable || null, null);
-		try {
-			await log_audit(
-				req,
-				PERM_SERVICE_CHARGE_WAIVER,
-				`Waived the service charge (₹${rec.amount_waived.toFixed(2)}; ₹${rec.grand_total_reduction.toFixed(2)} with its tax, before round-off; grand total ₹${result.grand_total_before.toFixed(2)} → ₹${result.grand_total_after.toFixed(2)}) on bill ${rec.bill_id}${emitTable ? ` (table ${String(emitTable)})` : ""} — authorised by ${who.authorised_by_username}`,
-				Audit_log_category.Bill,
-				{
-					waiver_id: rec.id, bill_id: rec.bill_id, table: emitTable || null,
-					waiver_kind: rec.waiver_kind, reason: rec.reason,
-					basis: rec.basis, basis_percent: rec.basis_percent, basis_amount: rec.basis_amount,
-					amount_waived: rec.amount_waived, tax_on_waived: rec.tax_on_waived,
-					grand_total_reduction: rec.grand_total_reduction,
-					grand_total_before: result.grand_total_before, grand_total_after: result.grand_total_after,
-					authorised_by: who.authorised_by_username,
-				},
-			);
-		} catch (err) { logger.warn({ err }, "log_audit service_charge_waiver failed"); }
+		await auditServiceChargeWaiver(req, who, result, emitTable || null);
 		res.status(201).json({
 			waiver: rec,
 			grand_total_before: result.grand_total_before,
@@ -634,5 +680,231 @@ app.post("/bills/service-charge-waiver/:id/reverse", validateAction(PERM_SERVICE
 	} catch (err) {
 		failCapture(res, err, "reverse_service_charge_waiver_failed", "That waiver has already been reversed.");
 	}
+});
+
+/*
+	REMOVE THE SERVICE CHARGE AND PRINT THE BILL — ONE ACT, ONE REQUEST.
+
+	POST /bills/service-charge-waiver/print
+	  body { table_name, waiver_kind?, reason?, authorised_by?, render?: "thermal" | "client" }
+	  -> 200 { success, waiver, waiver_created, grand_total_before, grand_total_after,
+	           service_charge_removed, printed, print_error?, render, ...the print's own fields }
+	  -> 400 nothing on the table / no service charge on it (nothing_to_remove) /
+	         a missing kind, reason or authoriser / anything WaiveServiceCharge refuses
+	  -> 403 C3's reprint refusal (reprint_needs_senior) / no waive permission (waiver_required)
+
+	============================================================================
+	WHY IT EXISTS
+	============================================================================
+	The client: "reprint without service charge and waive service charge should
+	be merged as one option instead of being 2 separate steps." Since the paper
+	was made to equal the drawer, the RECORDED WAIVER is the only thing that takes
+	the charge off a bill, so the old "Reprint (no service charge)" could not do
+	its job alone — its own dialog sent the user to "Waive service charge", and a
+	press in the wrong order spent a full-charge copy (and a waiter's one print)
+	for nothing. Production showed the result: a refused print, a waiver, a
+	reprint, 3 to 30 seconds apart, on table after table.
+
+	============================================================================
+	THE ORDER IS THE CONTROL
+	============================================================================
+	Nothing that moves money is written until every refusal has been answered:
+
+	  1. an empty table — the same 400 and sentence as /print/bill;
+	  2. C3 — refuseWaiterBillReprint, the SAME function /print/bill and
+	     /print/bill/claim call. Asked before the waiver, so a waiter who may not
+	     print this bill again can never record a waiver they cannot then hand
+	     over (the drawer would drop and the guest would hold the old paper);
+	  3. a bill that ALREADY carries a live waiver is a plain reprint of it: no
+	     permission beyond printing, no second reason, no second row, no second
+	     audit line. That is also what a lost response on a flaky line recovers
+	     to, instead of a dead-end "already waived";
+	  4. no charge to remove — 400 `nothing_to_remove`, and nothing prints: the
+	     user asked for a removal, and an ordinary print would answer a different
+	     question;
+	  5. the waive permission, checked HERE rather than in the guard chain,
+	     because step 3 needs none. The guard is "Add Orders", the print's own —
+	     the manifest shows one gate, and this is the second;
+	  6. the kind, the reason and the authoriser, then resolveActors — the same
+	     400/403 answers the waiver route gives.
+
+	Then the waiver is WaiveServiceCharge, unchanged, and its audit line is
+	auditServiceChargeWaiver's — so the Service Charge Deny report and the Bill
+	Edit report see the same row and the same line whichever route wrote it. A
+	23505 means another device waived between step 3 and the insert; the charge
+	is off, which is what was asked, so this carries on as a reprint of THAT
+	waiver.
+
+	============================================================================
+	THE PAPER IS READ AFTER THE COMMIT, THROUGH THE SAME CODE
+	============================================================================
+	The print re-reads the bill (the waiver may have minted its number) and goes
+	through printOpenTableBill — /print/bill's own render, dispatch and audit —
+	which reads the charge configuration itself, so the charge comes off the
+	paper because the waiver is in the database. `render: "client"` is the web
+	dashboard, which draws its own paper: claimClientRenderedBillPrint records
+	the print exactly as /print/bill/claim does and hands back `printable_bill`.
+
+	It is not atomic with the paper and cannot be: a printer does not join a
+	transaction. It does not need to be. The invariant is "no paper without the
+	charge unless a waiver has committed", and the order above guarantees it. A
+	print that fails AFTER the commit is answered 200 with `printed: false` and
+	`print_error` — never a 5xx, which would hide a committed change to what the
+	guest owes from the person who has to tell them.
+
+	No idempotent(), for the reasons in this file's header: it can mint a bill,
+	and a repeated request for paper is a request for a second piece of paper.
+
+	============================================================================
+	A PRINT DOOR THAT IS NOT UNDER /print/
+	============================================================================
+	The thermal path ends in /print/bill's 'bill:print' emit. The serverless
+	topology (deploy/template.yaml, parked) serves /print/* and /publish/* from
+	the always-on task that owns the printer sockets, because an emit made on
+	Lambda can be frozen in the container. This path matches neither, so the
+	template names it as its own behaviour. Move or rename the route and that
+	behaviour must follow, or a committed waiver answers printed:true with no
+	paper — jest-tests/bill_print_doors_always_on.test.ts fails if it does not.
+*/
+app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), validateBody(sRemoveServiceChargeAndPrint), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	const outletId = extractOutletId(req);
+	if (!restaurantId || !outletId) { res.status(400).json({ error: "Missing restaurant/outlet" }); return; }
+	const body = req.body as { table_name: string; waiver_kind?: string; reason?: string; authorised_by?: string; render?: string };
+	const tableName = String(body.table_name ?? "").trim();
+	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
+	const render = body.render === "client" ? "client" : "thermal";
+
+	// --- 1-4: the reads every refusal is decided on. Nothing is written. -------
+	let waiver: Awaited<ReturnType<typeof GetBillChargeConfigForTable>>["waiver"] = null;
+	let basis: Awaited<ReturnType<typeof GetBillChargeConfigForTable>>["basis"] = "none";
+	try {
+		const bill = await GetBillForTable(restaurantId, tableName);
+		if (!bill || !Array.isArray(bill.items) || bill.items.length === 0) {
+			res.status(400).json({ error: "Nothing to print for this table" });
+			return;
+		}
+		if (await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
+		const cfg = await GetBillChargeConfigForTable(restaurantId, tableName);
+		waiver = cfg.waiver;
+		basis = cfg.basis;
+	} catch (err) {
+		logger.error({ err }, "remove_service_charge_print_read_failed");
+		res.status(500).json({ error: String((err as { message?: unknown })?.message ?? "Unable to read this table's bill") });
+		return;
+	}
+
+	let created: { before: number; after: number } | null = null;
+	if (!waiver) {
+		if (basis === "none") {
+			res.status(400).json({ error: "This bill carries no service charge, so there is nothing to remove.", nothing_to_remove: true });
+			return;
+		}
+		// --- 5: the second gate. Named, in the shape validateAction refuses in. --
+		if (!callerHasPermission(req, PERM_SERVICE_CHARGE_WAIVER)) {
+			res.status(403).json({
+				error: "Forbidden",
+				details: "Removing the service charge needs the 'Waive Service Charge' permission. Ask a manager to do it, or an admin to grant it to your role.",
+				requiredPermission: PERM_SERVICE_CHARGE_WAIVER,
+				waiver_required: true,
+			});
+			return;
+		}
+		// --- 6: the control document's fields. ----------------------------------
+		const kind = String(body.waiver_kind ?? "").trim();
+		const reason = String(body.reason ?? "").trim();
+		if (!kind || !reason) {
+			res.status(400).json({ error: "Say why the service charge is coming off — waiver_kind and reason are required." });
+			return;
+		}
+		const who = await resolveActors(req, res, restaurantId, PERM_SERVICE_CHARGE_WAIVER, "a service-charge waiver");
+		if (!who) {return;}
+
+		try {
+			const result = await WaiveServiceCharge(restaurantId, {
+				table_name: tableName,
+				waiver_kind: kind,
+				reason,
+				actor: {
+					employee_id: who.employee_id,
+					username: who.username,
+					authorised_by_employee_id: who.authorised_by_employee_id,
+					authorised_by_username: who.authorised_by_username,
+				},
+			});
+			waiver = result.record;
+			created = { before: result.grand_total_before, after: result.grand_total_after };
+			announceBill(restaurantId, tableName, null);
+			await auditServiceChargeWaiver(req, who, result, tableName);
+		} catch (err) {
+			if (!isUniqueViolation(err)) {
+				failCapture(res, err, "remove_service_charge_print_failed", "This bill's service charge has already been waived.");
+				return;
+			}
+			// Another device waived it between the read and the insert. Reprint
+			// THAT waiver rather than refusing what has, in fact, happened.
+			logger.warn({ err }, "remove_service_charge_print_raced");
+			waiver = await GetBillChargeConfigForTable(restaurantId, tableName).then((c) => c.waiver).catch(() => null);
+			if (!waiver) {
+				res.status(409).json({ error: "This bill's service charge has already been waived." });
+				return;
+			}
+		}
+	}
+
+	// --- the paper, from the state AFTER the commit --------------------------------
+	let printed = false;
+	let printError: string | null = null;
+	let serviceChargeRemoved = true;
+	let grandTotalAfter: number | null = created?.after ?? null;
+	let paper: Record<string, unknown> = {};
+	try {
+		if (render === "client") {
+			const fresh = await GetBillForTable(restaurantId, tableName);
+			if (!fresh || !Array.isArray(fresh.items) || fresh.items.length === 0) { throw new Error("Nothing to print for this table"); }
+			paper = await claimClientRenderedBillPrint(req, { restaurantId, outletId, tableName, bill: fresh });
+			serviceChargeRemoved = fresh.service_charge_waived === true;
+			grandTotalAfter = fresh.grand_total;
+		} else {
+			// The same three reads, with the same fallbacks, /print/bill makes.
+			const [fresh, settings, profile] = await Promise.all([
+				GetBillForTable(restaurantId, tableName),
+				GetRestaurantSettings(restaurantId).catch(() => ({ currency: "₹" } as any)),
+				GetRestaurantProfile(restaurantId).catch(() => null),
+			]);
+			if (!fresh || !Array.isArray(fresh.items) || fresh.items.length === 0) { throw new Error("Nothing to print for this table"); }
+			const out = await printOpenTableBill(req, {
+				restaurantId, outletId, tableName, bill: fresh, settings, profile,
+				// It WAS asked for without the charge. If the waiver were somehow
+				// reversed between the commit and this read, the paper would carry
+				// the charge and the audit line would say so — which is the truth.
+				askedWithoutServiceCharge: true,
+			});
+			paper = { billId: out.billId, jobId: out.jobId, destination: out.destination, device: out.device };
+			serviceChargeRemoved = out.service_charge_removed;
+			grandTotalAfter = out.grand_total;
+		}
+		printed = true;
+	} catch (err) {
+		logger.error({ err }, "remove_service_charge_print_paper_failed");
+		printError = String((err as { message?: unknown })?.message ?? "Unable to print");
+	}
+
+	res.json({
+		success: true,
+		waiver,
+		waiver_created: created !== null,
+		// What the guest was asked for before this waiver — null on a reprint of
+		// an existing one, whose "before" belongs to whoever recorded it.
+		grand_total_before: created?.before ?? null,
+		// What is on the paper when there is paper; the waiver's own figure when
+		// the print failed. Both are the drawer's.
+		grand_total_after: grandTotalAfter,
+		service_charge_removed: serviceChargeRemoved,
+		printed,
+		...(printError !== null ? { print_error: printError } : {}),
+		render,
+		...paper,
+	});
 });
 }
