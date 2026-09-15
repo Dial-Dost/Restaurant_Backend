@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "1.9.9";
+const LATEST = "2.0.0";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,12 +118,13 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"Today's money is now shown by payment method on the Overview, so you can see what came in as cash, "+
-		"UPI, card and every other mode at a glance. You can add your own payment modes in Settings, and they "+
-		"appear at the till and in reports. Every bill is now rounded to the rupee, with a Round off line, and "+
-		"a removed service charge no longer prints or shows as Opted-out. The printer keeps working after you "+
-		"sign out and back in, and the printer screen now says when it is not receiving jobs. The date pill "+
-		"beside Settled bills in Accounting now opens the calendar.",
+		"Reports now say Gross for the full bill value, including service charge, tax and round off, and Net "+
+		"for the menu value after discounts; the old pre-discount figure is called Item total. Every report "+
+		"can be cut to a session: Lunch (12pm-5pm), Dinner (6pm-12am) or your own times, and Sales Summary "+
+		"can show sales by hour of the day or by session. The Void KOT export now lists the dishes that were "+
+		"voided, and exported dates read in your restaurant's time. When taking an order, View order lets "+
+		"you read it back to the guest before sending it to the kitchen. Removing the service charge and "+
+		"printing the bill is now one step: Remove service charge & print.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
