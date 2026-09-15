@@ -18304,7 +18304,7 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
   const giftTotal = round2(byCoupon.filter((c) => c.kind === "gift").reduce((s, c) => s + c.amount, 0));
 
   const notes = [
-    "Bill totals are stored net of discount, so the sales, GST and P&L figures already reflect these discounts — don't subtract them again.",
+    "Bill totals are stored after discount, so the sales, GST and P&L figures already reflect these discounts — don't subtract them again.",
     "Discounts come off the item total before service charge and taxes. Settled totals are stored after the discount, so the pre-discount item total is reconstructed per bill; the MIS Discount report shows each discounted bill's Item total, Net and Gross side by side.",
   ];
   if (estimatedBills > 0) {
@@ -35606,7 +35606,9 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
       "Discounts in this system are BILL-level: there is no per-item discount to report.",
       NOTE_DISCOUNT_ESTIMATE,
       "Requested by / Approved by are populated only for discounts that went through the approval threshold. A discount applied directly records no actor, and both columns stay blank rather than being inferred.",
-      "Bill totals are already NET of these discounts — this report is context, never a figure to subtract from revenue a second time.",
+      // Not "net of these discounts": Net is a defined word (NOTE_GROSS_NET, the
+      // very next note) and the bill totals are Gross.
+      "Bill totals (Gross) are already after these discounts — this report is context, never a figure to subtract from revenue a second time.",
       NOTE_GROSS_NET,
       "Item total, Net and Gross in the totals row cover the discounted bills only. The discount percentage is taken against the WHOLE window's item total — every settled bill — so it is the share of everything sold that was given away.",
     ]),
@@ -36165,7 +36167,13 @@ const ORDER_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
+  // EVERY rung between Net and Gross is ON by default — service charge, tax and
+  // round off alike. Net + SC + Tax + Round off IS Gross, and a default layout
+  // that hides one of them leaves a row whose visible figures stop short of its
+  // own Gross: a 1% service charge hidden is ₹10 no reader can find. The Sales
+  // Summary has always shown all four; jest sums each row's default-visible
+  // rungs against its Gross.
+  { key: "service_charge", label: "Service charge", type: "money", total: true },
   { key: "tax", label: "Tax", type: "money", total: true },
   // The rung that was missing: without it no row's Net + SC + Tax reached its
   // own Gross, and the gap was the paise the bill was rounded by.
@@ -41002,8 +41010,11 @@ const COUNTER_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
-  { key: "tax", label: "Tax", type: "money", total: true, default_on: false },
+  // All three rungs between Net and Gross ON by default, for the reason given at
+  // ORDER_SUMMARY_COLUMNS: a till whose visible rungs stop short of its Gross by
+  // the tax it collected reads as a till that is short by that much.
+  { key: "service_charge", label: "Service charge", type: "money", total: true },
+  { key: "tax", label: "Tax", type: "money", total: true },
   // The rung the Order Summary was also missing — see ORDER_SUMMARY_COLUMNS.
   { key: "round_off", label: "Round off", type: "money", total: true },
   { key: "grand_total", label: "Gross", type: "money", total: true },

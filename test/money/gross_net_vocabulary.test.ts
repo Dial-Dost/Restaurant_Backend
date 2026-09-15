@@ -209,6 +209,16 @@ describe("one word, one key, on all fifteen", () => {
     expect(defines((await db.GetExecutiveSummaryReport(RID, W)).meta.notes)).toBe(true);
     expect(defines((await db.GetCoverSizeSummaryReport(RID, W)).meta.notes)).toBe(true);
   });
+
+  // The Discount report printed "Bill totals are already NET of these discounts"
+  // one line above the note that defines Net as the item total less discounts —
+  // while those bill totals are its Gross column (1060 on g2, Net 1000). Every
+  // CSV/XLSX/PDF preamble carried both.
+  test("the Discount report never calls the bill totals net of its discounts — they are Gross", async () => {
+    const notes = (await db.GetDiscountReport(RID, { ...W, limit: 500 })).meta.notes;
+    for (const n of notes) {expect(n).not.toMatch(/\bnet of\b/i);}
+    expect(notes.some((n) => /^Bill totals \(Gross\) are already after these discounts/.test(n))).toBe(true);
+  });
 });
 
 // --- 2. THE NUMBERS BEHIND THE WORDS ------------------------------------------
@@ -254,6 +264,42 @@ describe("Gross, Net and Item total over one window", () => {
       expect(at("net")).toBeLessThan(at("round_off"));
       expect(at("round_off")).toBeLessThan(at("grand_total"));
     }
+  });
+
+  // The round off being ON is not the property; the property is that a reader
+  // who never touches the column picker can add up what is in front of them. The
+  // test above passed with Service charge (Order, Counter) and Tax (Counter)
+  // still hidden by default — bill 5002 read Net 1000 + Tax 50.50 + Round off
+  // −0.50 = 1050 beside a Gross of 1060. So this one ADDS the default-visible
+  // rungs, row by row, exactly as the grid, CSV, XLSX and PDF would lay them out.
+  test("every row's default-visible Net and rungs add up to the Gross beside them — no rung hidden by default", async () => {
+    const sales = await db.GetSalesSummaryReport(RID, W);
+    const orders = await db.GetOrderSummaryReport(RID, { ...W, limit: 500 });
+    const counter = await db.GetCounterSummaryReport(RID, W);
+    const layouts: { report: string; columns: MisColumn[]; rows: Record<string, unknown>[] }[] = [
+      { report: "sales_summary", columns: sales.columns, rows: [...sales.series, sales.totals] as unknown as Record<string, unknown>[] },
+      { report: "order_summary", columns: orders.columns, rows: [...orders.rows, orders.totals] as unknown as Record<string, unknown>[] },
+      { report: "counter_summary", columns: counter.columns, rows: [...counter.rows, counter.totals] as unknown as Record<string, unknown>[] },
+    ];
+    for (const { report, columns, rows } of layouts) {
+      const at = (k: string): number => columns.findIndex((c) => c.key === k);
+      // The ladder as declared: Net, then everything up to (not including) Gross.
+      const ladder = columns.slice(at("net"), at("grand_total"));
+      expect(ladder.map((c) => c.key)).toEqual(["net", "service_charge", "tax", "round_off"]);
+      for (const c of [...ladder, columns[at("grand_total")]]) {
+        expect(`${report}:${c?.key ?? "?"}:${String(c?.default_on)}`).not.toBe(`${report}:${c?.key ?? "?"}:false`);
+      }
+      const shown = ladder.filter((c) => c.default_on !== false);
+      expect(rows.length).toBeGreaterThan(1);
+      for (const row of rows) {
+        const visible = sum(shown.map((c) => Number(row[c.key])));
+        expect(`${report}:${visible}`).toBe(`${report}:${Number(row.grand_total)}`);
+      }
+    }
+    // The bill the old default layout could not add up.
+    const g2 = orders.rows.find((r) => r.bill_no === "5002");
+    expect(g2?.service_charge).toBe(SERVICE_CHARGE);
+    expect(g2?.grand_total).toBe(1060);
   });
 
   test("THE ROUND-OFF PARTITION: Σ Order rows === Σ Counter rows === the Sales Summary's round off", async () => {
