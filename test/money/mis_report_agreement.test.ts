@@ -1818,3 +1818,185 @@ describe("the six export like the nine", () => {
     }
   });
 });
+
+// --- Void KOT names what was voided ------------------------------------------
+//
+// THE CLIENT'S COMPLAINT: "item names should show up properly in the void KOT
+// reports in the Excel". Four defects sat behind it, one per group below:
+//   1. No column carried a dish name. The rows had an `items` array, every export
+//      is column-driven, and an array is not a cell.
+//   2. Remove item that emptied a ticket threw its lines away, so the row named
+//      nothing and its value left the totals. Move item that emptied a ticket was
+//      listed as a void, although the food was billed at the other table.
+//   3. An empty ticket added a phantom line and qty to the totals.
+//   4. Voided / Voided by matched only the status route's OLD sentence.
+// The writers are driven for real here (RemoveBillItem, MoveBillItem) and what
+// they wrote is read back through the real report, so no link in the chain is a
+// hand-built stand-in.
+
+const sumOf = (rows: readonly { value: number }[]): number => r2(rows.reduce((s, r) => s + r.value, 0));
+
+function expectRowsAddUp(voids: Awaited<ReturnType<Readers["GetVoidKotReport"]>>): void {
+  expect(voids.page.total).toBe(voids.rows.length);
+  expect(voids.totals.voids).toBe(voids.rows.length);
+  expect(sumOf(voids.rows)).toBe(voids.totals.value);
+  expect(voids.rows.reduce((s, r) => s + r.qty, 0)).toBe(voids.totals.qty);
+  expect(voids.rows.reduce((s, r) => s + r.item_count, 0)).toBe(voids.totals.item_count);
+}
+
+describe("Void KOT: the Items column", () => {
+  test("every row names its dishes in ONE text cell, placed right after Table", async () => {
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    expect(voids.rows[0]?.items_text).toBe("Biryani x3");
+    const keys = voids.columns.map((c) => c.key);
+    expect(keys.indexOf("items_text")).toBe(keys.indexOf("table_name") + 1);
+    expect(voids.columns.find((c) => c.key === "items_text")).toEqual({ key: "items_text", label: "Items", type: "text" });
+  });
+
+  test("a variation is part of the dish's name, the way the docket prints it", async () => {
+    useFixtureDb(standardDb({
+      orders: [
+        order({
+          id: VOID_ID, created_at: "2026-06-06T10:00:00.000Z", status: 5, table_name: "T9",
+          items: [
+            { name: "Biryani", variation_name: "Half", quantity: 1, price: 600 },
+            { name: "Raita", quantity: 2, price: 50 },
+          ],
+        }),
+      ],
+    }));
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    expect(voids.rows[0]?.items_text).toBe("Biryani (Half) x1; Raita x2");
+    expect(voids.rows[0]?.items.map((i) => i.variation)).toEqual(["Half", null]);
+    // One entry per line: the cell and the Lines column count the same thing.
+    expect(voids.rows[0]?.item_count).toBe(2);
+    expectRowsAddUp(voids);
+  });
+
+  test("the sheet carries the names, never [object Object] and never a blank", async () => {
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    const lines = renderMisCsv(voids.columns, voids.rows, voids.totals).split("\n");
+    const header = (lines[0] ?? "").split(",");
+    const at = header.indexOf("Items");
+    expect(at).toBe(header.indexOf("Table") + 1);
+    expect((lines[1] ?? "").split(",")[at]).toBe("Biryani x3");
+    expect(lines.join("\n")).not.toContain("[object Object]");
+    // A text column is never totalled.
+    expect((lines[lines.length - 1] ?? "").split(",")[at]).toBe("");
+  });
+});
+
+describe("Void KOT: a ticket emptied from the bill", () => {
+  const REMOVED_ID = "33333333-cccc-4ccc-8ccc-333333333333";
+  const MOVED_ID = "44444444-dddd-4ddd-8ddd-444444444444";
+  const MIXED_ID = "55555555-eeee-4eee-8eee-555555555555";
+
+  const floorDb = (): FixtureDb => standardDb({
+    orders: [
+      ...standardDb().orders,
+      order({ id: REMOVED_ID, created_at: "2026-06-10T12:00:00.000Z", status: 1, table_name: "T12",
+        items: [{ name: "Helios", quantity: 1, price: 450 }, { name: "Ares", quantity: 2, price: 300 }] }),
+      order({ id: MOVED_ID, created_at: "2026-06-10T12:30:00.000Z", status: 1, table_name: "31A",
+        items: [{ name: "Puchka", quantity: 1, price: 200 }] }),
+      order({ id: MIXED_ID, created_at: "2026-06-10T13:00:00.000Z", status: 1, table_name: "T14",
+        items: [{ name: "Dal", quantity: 1, price: 400 }, { name: "Chai", quantity: 2, price: 50 }] }),
+    ],
+    tables: ["31"],
+  });
+
+  test("Remove item keeps the dishes and their value on the void row", async () => {
+    useFixtureDb(floorDb());
+    await db.RemoveBillItem(RID, "T12", "Helios", 450);
+    await db.RemoveBillItem(RID, "T12", "Ares", 0);
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    const row = voids.rows.find((r) => r.order_id === REMOVED_ID);
+    // Before the fix this row read Lines 0, Qty 0, Value 0 and named nothing.
+    expect(row).toMatchObject({ item_count: 2, qty: 3, value: 1050, items_text: "Helios x1; Ares x2" });
+    expect(voids.totals.value).toBe(3000 + 1050);
+    expectRowsAddUp(voids);
+    // And the ticket behind the row opens with the same lines and the same value.
+    const detail = await db.GetMisOrderDetail(RID, REMOVED_ID);
+    expect(detail?.status).toBe("Cancelled");
+    expect(detail?.value).toBe(1050);
+    expect(detail?.items.map((i) => i.name)).toEqual(["Helios", "Ares"]);
+  });
+
+  test("Move item is not a void: the emptied ticket leaves the count, the totals and the page", async () => {
+    useFixtureDb(floorDb());
+    await db.MoveBillItem(RID, "31A", "31", "Puchka", 200);
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    expect(voids.rows.map((r) => r.order_id)).not.toContain(MOVED_ID);
+    expect(voids.totals.voids).toBe(1);
+    expect(voids.totals.value).toBe(3000);
+    expectRowsAddUp(voids);
+  });
+
+  test("a ticket that lost one dish to Remove and its last to Move still reports the removed dish", async () => {
+    useFixtureDb(floorDb());
+    await db.RemoveBillItem(RID, "T14", "Dal", 400);
+    await db.MoveBillItem(RID, "T14", "31", "Chai", 50);
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    const row = voids.rows.find((r) => r.order_id === MIXED_ID);
+    // The moved Chai is billed at table 31. The removed Dal is the void.
+    expect(row).toMatchObject({ item_count: 1, qty: 1, value: 400, items_text: "Dal x1" });
+    expectRowsAddUp(voids);
+  });
+
+  test("a ticket emptied before lines were recorded is a void with nothing on it, and adds no phantom line", async () => {
+    // The shape of the two production rows from 14 Sep: status 5, no lines, no
+    // evidence. Never back-filled. The totals must still not count the empty
+    // ticket as one line and one qty, which the old aggregate did.
+    useFixtureDb(standardDb({
+      orders: [
+        ...standardDb().orders,
+        order({ id: REMOVED_ID, created_at: "2026-06-10T12:00:00.000Z", status: 5, table_name: "12", items: [] }),
+      ],
+    }));
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    const row = voids.rows.find((r) => r.order_id === REMOVED_ID);
+    expect(row).toMatchObject({ item_count: 0, qty: 0, value: 0, items_text: null });
+    expect(voids.totals).toMatchObject({ voids: 2, qty: 3, item_count: 1, value: 3000 });
+    expectRowsAddUp(voids);
+  });
+});
+
+describe("Void KOT: who voided it", () => {
+  const REASONED_ID = "66666666-ffff-4fff-8fff-666666666666";
+  const VOIDED_ID = "77777777-aaaa-4aaa-8aaa-777777777777";
+  const UNDONE_ID = "88888888-bbbb-4bbb-8bbb-888888888888";
+
+  test("both current cancel sentences fill Voided and Voided by, and an undo never does", async () => {
+    useFixtureDb(standardDb({
+      orders: [
+        ...standardDb().orders,
+        order({ id: REASONED_ID, created_at: "2026-06-11T09:00:00.000Z", status: 5, items: [{ name: "Dal", quantity: 1, price: 400 }] }),
+        order({ id: VOIDED_ID, created_at: "2026-06-11T09:30:00.000Z", status: 5, items: [{ name: "Chai", quantity: 1, price: 50 }] }),
+        order({ id: UNDONE_ID, created_at: "2026-06-11T10:00:00.000Z", status: 5, items: [{ name: "Chai", quantity: 1, price: 50 }] }),
+      ],
+      audits: [
+        ...standardDb().audits,
+        // PATCH /orders/:id/status, as it has written since the reason was captured.
+        { id: "c1", created_at: "2026-06-11T09:05:00.000Z", action_id: CATCH_ALL, action_name: "Add Orders",
+          reason: `Order ${REASONED_ID} -> Cancelled — reason: Other`,
+          details: { order_id: REASONED_ID, status: "Cancelled", reason: "Other" }, fname: "Ravi", lname: "Kumar" },
+        // POST /orders/:id/void.
+        { id: "c2", created_at: "2026-06-11T09:35:00.000Z", action_id: CATCH_ALL, action_name: "Void Order",
+          reason: `Voided order ${VOIDED_ID} (wrong_entry, ₹50.00, before_print) — authorised by admin`,
+          details: { void_id: "v2", order_id: VOIDED_ID }, fname: "Meera", lname: "Iyer" },
+        // Sentences that name the order but are NOT its cancellation, and are newer.
+        { id: "c3", created_at: "2026-06-11T10:05:00.000Z", action_id: CATCH_ALL, action_name: "Add Orders",
+          reason: `Undid: Order ${UNDONE_ID} -> Cancelled`, details: { order_id: UNDONE_ID }, fname: "Not", lname: "This" },
+        { id: "c4", created_at: "2026-06-11T10:06:00.000Z", action_id: CATCH_ALL, action_name: "Add Orders",
+          reason: `Removed 1x Chai (50.00) from order ${UNDONE_ID} on table T1`,
+          details: { order_id: UNDONE_ID, void_id: "v4" }, fname: "Nor", lname: "This" },
+      ],
+    }));
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    const by = (id: string) => voids.rows.find((r) => r.order_id === id);
+    expect(by(REASONED_ID)).toMatchObject({ voided_by: "Ravi Kumar", voided_at: "2026-06-11T09:05:00.000Z" });
+    expect(by(VOIDED_ID)).toMatchObject({ voided_by: "Meera Iyer", voided_at: "2026-06-11T09:35:00.000Z" });
+    expect(by(UNDONE_ID)).toMatchObject({ voided_by: null, voided_at: null });
+    // The original wording still reads, as it always did.
+    expect(by(VOID_ID)?.voided_by).toBe("Asha Rao");
+  });
+});

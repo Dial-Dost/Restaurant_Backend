@@ -956,3 +956,128 @@ export function formatMethodSplit(parts: readonly SettlementPart[]): string {
     .map((p) => `${p.method} ${round2(p.amount).toFixed(2)}`)
     .join(" | ");
 }
+
+// --- Void KOT: the lines a cancelled ticket is reported WITH -----------------
+
+/**
+ * WHERE A DISH GOES WHEN IT IS TAKEN OFF A BILL BY NAME.
+ *
+ * POST /bills/remove-item and POST /bills/move-item both run
+ * removeItemFromTableOrders, which filters the matching lines out of
+ * "Orders".food.items and, when nothing is left on an order, cancels it
+ * (status 5). The lines used to vanish with the filter. The Void KOT row for that
+ * ticket then read Lines 0, Qty 0, Value 0 and named no dish: a void the report
+ * counted but could not describe, holding money the report could not see. A
+ * ticket emptied by a MOVE was listed the same way, although its food was served
+ * at the other table.
+ *
+ * So the writer records two facts on the order, in the SAME update that filters
+ * the lines and flips the status:
+ *   * REMOVED_LINES_KEY holds every line a REMOVAL took off, exactly as it stood,
+ *     plus the moment. A move records none, because a moved dish is still on a
+ *     bill, at the destination table.
+ *   * EMPTIED_BY_KEY names which of the two emptied the order.
+ *
+ * WHY ON THE ORDER AND NOT AS "OrderVoids" ROWS. The void ledger is the other
+ * obvious home. It was not chosen, for three reasons:
+ *   1. The ledger insert would be a second statement inside the removal's
+ *      transaction. It would need a savepoint, or a missing table or a
+ *      constraint would roll the removal back. The JSON rides in the one update
+ *      that already has to succeed, so it cannot fail independently.
+ *   2. The ledger allows one row per (order, item_id). Lines written by old
+ *      clients have no id, so removing the same dish twice would keep only the
+ *      first row and understate the money.
+ *   3. The report's totals come from one aggregate over the same statement as
+ *      its rows. A line list on the order feeds that aggregate and the row mapper
+ *      the same input, so the rows add up to the total by construction.
+ *      Ledger money would need a second degrading read that has to agree with
+ *      the first.
+ * Nothing is back-filled: an order emptied before this shipped has neither key,
+ * and it still reports as it did (no lines, no value), because an audit
+ * sentence keyed by table and time cannot say which ORDER a dish came off.
+ */
+export const REMOVED_LINES_KEY = "removed_items";
+export const EMPTIED_BY_KEY = "emptied_by";
+
+/** Which bill-item writer took the lines off. */
+export type LineRemovalMode = "remove" | "move";
+
+/**
+ * The order's food after lines were taken off it: the evidence above, stamped.
+ *
+ * `food` is the blob with the matching lines ALREADY filtered out; `removed` are
+ * those lines as they stood. Pure, and it never drops a key the blob already
+ * carries, so an earlier removal's lines survive a later one.
+ */
+export function stampLineRemoval(
+  food: Readonly<Record<string, unknown>>,
+  removed: readonly unknown[],
+  mode: LineRemovalMode,
+  emptied: boolean,
+  at: string,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...food };
+  if (mode === "remove" && removed.length > 0) {
+    const prior = food[REMOVED_LINES_KEY];
+    out[REMOVED_LINES_KEY] = [
+      ...(Array.isArray(prior) ? prior : []),
+      ...removed.map((line) => (line !== null && typeof line === "object" ? { ...line, removed_at: at } : line)),
+    ];
+  }
+  if (emptied) {out[EMPTIED_BY_KEY] = mode;}
+  return out;
+}
+
+/**
+ * The lines the Void KOT report reads off a CANCELLED order.
+ *
+ * The lines still on the ticket when it has any (a cancel through the status
+ * route or the void route leaves them in place). Otherwise, the lines Remove
+ * item took off it. The SQL twin is VOID_KOT_LINES_JSON in database_supabase.ts,
+ * which the totals aggregate expands. The two have to choose the same list, or
+ * the rows stop adding up to the total.
+ */
+export function voidKotLines(food: Readonly<Record<string, unknown>>): unknown[] {
+  const items = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+  if (items.length > 0) {return items;}
+  const removed = food[REMOVED_LINES_KEY];
+  return Array.isArray(removed) ? (removed as unknown[]) : [];
+}
+
+/** One cancelled line as the Void KOT row carries it. */
+export interface VoidKotLine {
+  name: string;
+  variation: string | null;
+  quantity: number;
+  price: number;
+}
+
+/** The dish and, when there is one, the size, as a stored line spells them. */
+export function voidLineIdentity(raw: unknown): { name: string; variation: string | null } {
+  const it = (raw !== null && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const name = (typeof it.name === "string" ? it.name.trim() : "") || "Item";
+  const variation = typeof it.variation_name === "string" ? it.variation_name.trim() : "";
+  return { name, variation: variation || null };
+}
+
+/**
+ * A voided ticket's dishes as ONE spreadsheet cell: `Biryani (Half) x2; Raita x1`.
+ *
+ * WHY A TEXT CELL. The row already carries `items` as an array, and every export
+ * on both clients is column-driven. A spreadsheet cannot hold an array, so the
+ * dish names never reached any file: the Excel showed a 36-character order id
+ * and a line count. Same answer as formatMethodSplit, for the same reason.
+ *
+ * `Name (Variation)` is the label the docket and the bill print (escpos.ts
+ * itemLabel), so the sheet names a dish the way the paper did. ` x` is ASCII
+ * because the app's PDF font has no multiplication sign. `; ` separates lines
+ * because a comma inside a dish name is ordinary. Every line stays its own entry,
+ * so the cell and the Lines column count the same thing. No lines is null (a
+ * blank cell), never an empty string pretending to be a list.
+ */
+export function voidItemsText(lines: readonly Pick<VoidKotLine, "name" | "variation" | "quantity">[]): string | null {
+  if (lines.length === 0) {return null;}
+  return lines
+    .map((l) => `${l.variation ? `${l.name} (${l.variation})` : l.name} x${String(l.quantity)}`)
+    .join("; ");
+}

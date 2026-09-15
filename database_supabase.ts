@@ -264,6 +264,8 @@ import {
 // nine readers at the bottom of this file are the only consumers.
 import {
   BILL_EDIT_ACTION_IDS,
+  EMPTIED_BY_KEY,
+  REMOVED_LINES_KEY,
   UNALLOCATED_METHOD,
   UNATTRIBUTED_GROUP,
   addToLadder,
@@ -282,10 +284,15 @@ import {
   serviceChargeBasisLabel,
   settlementByMethod,
   sharePct,
+  stampLineRemoval,
+  voidItemsText,
+  voidKotLines,
+  voidLineIdentity,
   zeroLadder,
   type BillEditKind,
   type BillMoney,
   type LadderTotals,
+  type LineRemovalMode,
   type SettlementBill,
   type SettlementMethodRow,
   type SettlementPart,
@@ -14064,6 +14071,14 @@ export interface RemovedBillLine {
  * So every removed line is returned as it stood. The `{ name, price, quantity }`
  * summary is kept for the callers and the audit line that already read it, and
  * `value` is the one number a move must preserve.
+ *
+ * `mode` SAYS WHICH OF THE TWO THIS IS, because the order it empties means
+ * different things. A removal is a void: the order keeps the lines it lost, so
+ * its Void KOT row still names the dishes and their value. A move is not a void,
+ * because the food lives on at the destination: the order is only marked as
+ * emptied by a move, and the Void KOT report leaves it out. See stampLineRemoval
+ * (mis_report_math.ts) for why this is recorded on the order rather than in the
+ * void ledger.
  */
 async function removeItemFromTableOrders(
   context: RestaurantContext,
@@ -14071,6 +14086,7 @@ async function removeItemFromTableOrders(
   itemName: string,
   itemPrice: number,
   client: PoolClient,
+  mode: LineRemovalMode,
 ): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number } | null> {
   const orders = await runQuery<{ id: string; food: unknown }>(
     `select id, food from "Orders"
@@ -14114,7 +14130,13 @@ async function removeItemFromTableOrders(
       split = split.map((t: any) => Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter((it: any) => !matches(it))] : t);
     }
     const subtotal = round2(keep.reduce((s, it) => s + (Number(it?.price) || 0) * Math.max(1, Math.round(Number(it?.quantity) || 1)), 0));
-    const newFood: Record<string, any> = { ...f, items: keep, subtotal, total: subtotal };
+    const newFood: Record<string, any> = stampLineRemoval(
+      { ...f, items: keep, subtotal, total: subtotal },
+      items.filter((it) => matches(it)),
+      mode,
+      keep.length === 0,
+      new Date().toISOString(),
+    );
     if (split !== undefined) {newFood.items_split = split;}
     if (keep.length === 0) {
       await runQuery(`update "Orders" set food = $4::json, status = 5 where id = $1 and res_id = $2 and outlet_id = $3`,
@@ -14215,7 +14237,7 @@ export async function RemoveBillItem(
     const tableId = await tableIdByName(context, tableName, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
-    const removed = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client);
+    const removed = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove");
     if (!removed) {throw new Error("Item not found on this table's bill");}
     return { success: true, removed };
   });
@@ -14650,7 +14672,7 @@ export async function MoveBillItem(
     await assertBillEditable(context, fromId, client);
     await assertBillEditable(context, toId, client);
 
-    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client);
+    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client, "move");
     if (!moved) {throw new Error("Item not found on the source table");}
 
     // Ensure the destination table is occupied so the order/bill attaches.
@@ -35597,7 +35619,13 @@ export interface VoidKotRow {
   qty: number;
   /** Σ price × quantity — the menu-price value that did NOT become revenue. */
   value: number;
-  items: { name: string; quantity: number; price: number }[];
+  items: { name: string; variation: string | null; quantity: number; price: number }[];
+  /**
+   * The same lines as ONE text cell (`Biryani (Half) x2; Raita x1`) — the only
+   * way a dish name reaches a spreadsheet. See voidItemsText. Null when the
+   * ticket has no lines to name.
+   */
+  items_text: string | null;
   /**
    * A2 — WHY IT WAS VOIDED, from the "OrderVoids" ledger (migration 035).
    *
@@ -35627,6 +35655,7 @@ const VOID_KOT_COLUMNS: MisColumn[] = [
   { key: "voided_at", label: "Voided", type: "datetime" },
   { key: "order_id", label: "KOT / Order", type: "text" },
   { key: "table_name", label: "Table", type: "text" },
+  { key: "items_text", label: "Items", type: "text" },
   { key: "order_type", label: "Type", type: "text" },
   { key: "item_count", label: "Lines", type: "int", total: true },
   { key: "qty", label: "Qty", type: "int", total: true },
@@ -35635,6 +35664,36 @@ const VOID_KOT_COLUMNS: MisColumn[] = [
   { key: "reason", label: "Reason", type: "text" },
   { key: "stage", label: "Stage", type: "text" },
 ];
+
+/**
+ * THE LINES A CANCELLED ORDER IS REPORTED WITH: voidKotLines (mis_report_math.ts)
+ * written in SQL. The lines still on the ticket, or, when Remove item emptied
+ * it, the lines it took off. The totals aggregate expands this and the row
+ * mapper calls the TypeScript twin. They have to choose the same list, or the
+ * page rows stop adding up to the total.
+ */
+const VOID_KOT_LINES_JSON = `case when jsonb_typeof((o.food)::jsonb->'items') = 'array'
+                                  and jsonb_array_length((o.food)::jsonb->'items') > 0
+                                 then (o.food)::jsonb->'items'
+                                 when jsonb_typeof((o.food)::jsonb->'${REMOVED_LINES_KEY}') = 'array'
+                                 then (o.food)::jsonb->'${REMOVED_LINES_KEY}'
+                                 else '[]'::jsonb end`;
+
+/**
+ * THE AUDIT SENTENCES THAT MEAN "THIS ORDER WAS CANCELLED".
+ *
+ * The join used to read `reason ilike '%Cancelled'`, which matched only the
+ * status route's ORIGINAL wording, `Order <id> -> Cancelled`. Two current writers
+ * say more than that, so Voided and Voided by were blank on every production row
+ * after they shipped:
+ *   * PATCH /orders/:id/status appends the reason: `Order <id> -> Cancelled — reason: Other`.
+ *   * POST /orders/:id/void writes `Voided order <id> (wrong_entry, ₹699.00, before_print) — authorised by …`.
+ * Both are anchored at the START, so the undo registry's `Undid: Order <id> -> Cancelled`
+ * (which reverses a cancel) can never be read as one. `Cancel%` also takes the
+ * route's accepted spelling "canceled". A line removal on the same order carries
+ * the order id too, but no removal says either sentence.
+ */
+const VOID_KOT_CANCEL_AUDIT_SQL = `(l.reason ilike 'Order % -> Cancel%' or l.reason ilike 'Voided order %')`;
 
 /**
  * VOID KOT — the orders that were cancelled, what was on them and who did it.
@@ -35665,6 +35724,13 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
     `o.res_id = $1`,
     `(${mc.og} or o.outlet_id = $2)`,
     `coalesce(o.status::text, '1') = '5'`,
+    // A TICKET EMPTIED BY MOVING ITS DISHES IS NOT A VOID. The food was served
+    // and billed at the other table. Listing it made a move look like a
+    // cancellation with nothing on it. Excluded only when a move emptied it AND
+    // no removal left lines on it: a ticket that lost one dish to Remove item
+    // and its last dish to Move item still reports the removed dish. In the
+    // where-list, so the count, the totals and the page all agree.
+    `not (coalesce((o.food)::jsonb->>'${EMPTIED_BY_KEY}', '') = 'move' and jsonb_array_length(${VOID_KOT_LINES_JSON}) = 0)`,
     `o.created_at >= $3`,
     `o.created_at < $4`,
   ];
@@ -35687,20 +35753,27 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
 
   // Window totals come from their own aggregate rather than the page, for the
   // same reason every other report's do.
+  //
+  // A TICKET WITH NO LINES ADDS A VOID AND NOTHING ELSE. The left join still
+  // gives such an order one row, with a NULL `item`, so it is counted in
+  // `voids`. That row's qty used to coalesce to 1 and was counted as a line, so
+  // every empty ticket added a phantom line and a phantom qty to the total while
+  // its own row read 0 and 0. Counting `item` rather than the row keeps the
+  // total equal to the sum of the rows.
   const totalRows = await runQuery<{ voids: string; qty: number; value: number; lines: string }>(
     `with it as (
-       select o.id,
+       select o.id, item,
               coalesce((item->>'quantity')::numeric, 1) as qty,
               coalesce((item->>'price')::numeric, 0) as price
          from "Orders" o
          left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
-         left join lateral jsonb_array_elements(${MIS_ITEMS_JSON}) item on true
+         left join lateral jsonb_array_elements(${VOID_KOT_LINES_JSON}) item on true
         where ${whereSql}
      )
      select count(distinct id)::text as voids,
-            coalesce(sum(qty), 0)::float as qty,
-            coalesce(sum(price * qty), 0)::float as value,
-            count(*) filter (where qty is not null)::text as lines
+            coalesce(sum(qty) filter (where item is not null), 0)::float as qty,
+            coalesce(sum(price * qty) filter (where item is not null), 0)::float as value,
+            count(item)::text as lines
        from it`,
     params,
   );
@@ -35715,9 +35788,10 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
             v.created_at as voided_at, v.fname as voided_fname, v.lname as voided_lname, v.emp_username as voided_username
        from "Orders" o
        left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
-       -- WHO CANCELLED IT. The status route writes one audit entry per real
-       -- transition into Cancelled (an idempotent re-cancel writes none), keyed
-       -- by order id inside additional_details. Deliberately NOT matched on
+       -- WHO CANCELLED IT. The status route and the void route each write one
+       -- audit entry per real cancellation (an idempotent re-cancel writes none),
+       -- keyed by order id inside additional_details. Which sentences count is
+       -- VOID_KOT_CANCEL_AUDIT_SQL. Deliberately NOT matched on
        -- outlet: an admin acting on another branch files the entry against that
        -- branch, and res_id + order id already identify it uniquely.
        left join lateral (
@@ -35727,7 +35801,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
            left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
           where l.res_id = o.res_id
             and l.additional_details ->> 'order_id' = o.id::text
-            and l.reason ilike '%Cancelled'
+            and ${VOID_KOT_CANCEL_AUDIT_SQL}
           order by l.created_at desc
           limit 1
        ) v on true
@@ -35764,7 +35838,8 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
 
   const out: VoidKotRow[] = rows.map((r) => {
     const food = parseJsonObject(r.food) ?? {};
-    const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+    // The SAME list the totals aggregate expands (VOID_KOT_LINES_JSON).
+    const list = voidKotLines(food);
     let qty = 0, value = 0;
     const items = list.map((raw) => {
       const it = (raw ?? {}) as Record<string, unknown>;
@@ -35772,7 +35847,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
       const price = round2(parseNumeric(it.price));
       qty += quantity;
       value = round2(value + price * quantity);
-      return { name: String(it.name ?? "Item"), quantity, price };
+      return { ...voidLineIdentity(it), quantity, price };
     });
     const name = [r.voided_fname, r.voided_lname].filter((x) => (x ?? "").trim()).join(" ").trim();
     return {
@@ -35787,6 +35862,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
       qty,
       value,
       items,
+      items_text: voidItemsText(items),
       reason: voidReasons.get(String(r.id))?.reason ?? null,
       void_kind: voidReasons.get(String(r.id))?.void_kind ?? null,
       stage: voidReasons.get(String(r.id))?.stage ?? null,
@@ -35802,6 +35878,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
       "Voided by / voided at come from the audit trail entry the cancel path writes. An order cancelled before that entry existed, or by a path that wrote none, shows blank.",
       "KOT numbers are keyed by a fingerprint of the ticket's CONTENT, not by order id, so a printed KOT number cannot be tied back to an order with certainty. The order id is the ticket identity here.",
       "Value is the menu-price value of the cancelled lines (price × quantity). It never appeared in revenue.",
+      "Items lists the cancelled lines as they stood on the ticket, one entry per line, as \"Name (Variation) xQty\" separated by semicolons. A ticket emptied with Remove item keeps the dishes it lost, so its row names them and counts their value. A ticket emptied by moving its dishes to another table is not a void and is not listed. A ticket emptied before removed lines were recorded shows no items and no value; it is never back-filled.",
     ]),
     columns: VOID_KOT_COLUMNS,
     rows: out,
@@ -36968,7 +37045,12 @@ export async function GetMisOrderDetail(restaurantId: string, orderId: string): 
   if (!row) {return null;}
 
   const food = parseJsonObject(row.food) ?? {};
-  const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+  // A cancelled ticket opens with the lines its Void KOT row counted, including
+  // the ones Remove item took off it, so the row and its drill-down never
+  // disagree about what was voided. A live order shows only what is on it.
+  const list = fromOrderStatusCode(row.status) === "Cancelled"
+    ? voidKotLines(food)
+    : (Array.isArray(food.items) ? (food.items as unknown[]) : []);
   let qty = 0, value = 0;
   const items = list.map((raw) => {
     const it = (raw ?? {}) as Record<string, unknown>;

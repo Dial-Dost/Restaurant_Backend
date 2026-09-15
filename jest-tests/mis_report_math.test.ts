@@ -8,6 +8,8 @@
 import { describe, test, expect } from "@jest/globals";
 import {
   BILL_EDIT_ACTION_IDS,
+  EMPTIED_BY_KEY,
+  REMOVED_LINES_KEY,
   UNALLOCATED_METHOD,
   UNATTRIBUTED_GROUP,
   addToLadder,
@@ -28,6 +30,10 @@ import {
   serviceChargeBasisLabel,
   settlementByMethod,
   sharePct,
+  stampLineRemoval,
+  voidItemsText,
+  voidKotLines,
+  voidLineIdentity,
   zeroLadder,
   type SettlementBill,
 } from "../mis_report_math";
@@ -705,5 +711,83 @@ describe("a payment mix in one cell", () => {
 
   test("nothing tendered is an empty cell, not a lone separator", () => {
     expect(formatMethodSplit([])).toBe("");
+  });
+});
+
+describe("a voided ticket's dishes in one cell", () => {
+  test("Name (Variation) xQty, one entry per line, joined by semicolons", () => {
+    expect(voidItemsText([
+      { name: "Biryani", variation: "Half", quantity: 2 },
+      { name: "Raita", variation: null, quantity: 1 },
+    ])).toBe("Biryani (Half) x2; Raita x1");
+  });
+
+  test("the same dish twice stays two entries, so the cell counts what Lines counts", () => {
+    const lines = [
+      { name: "Chai", variation: null, quantity: 1 },
+      { name: "Chai", variation: null, quantity: 1 },
+    ];
+    expect(voidItemsText(lines)?.split("; ")).toHaveLength(lines.length);
+  });
+
+  test("a comma in a dish name cannot be mistaken for a line break, and nothing leaves Latin-1", () => {
+    const cell = voidItemsText([{ name: "Paneer, Butter", variation: null, quantity: 1 }]) ?? "";
+    expect(cell).toBe("Paneer, Butter x1");
+    expect(cell).not.toContain(";");
+    // The app's PDF font draws Latin-1 only: a multiplication sign would print as "?".
+    expect(voidItemsText([{ name: "Dal", variation: null, quantity: 3 }])).toMatch(/^[ -~]*$/);
+  });
+
+  test("no lines is a blank cell, not an empty string pretending to be a list", () => {
+    expect(voidItemsText([])).toBeNull();
+  });
+
+  test("a stored line is read as its dish and its size, trimmed, with nothing invented", () => {
+    expect(voidLineIdentity({ name: " Biryani ", variation_name: " Half " })).toEqual({ name: "Biryani", variation: "Half" });
+    expect(voidLineIdentity({ name: "Dal", variation_name: "" })).toEqual({ name: "Dal", variation: null });
+    // Junk from an old client: never "[object Object]", never "undefined".
+    expect(voidLineIdentity({ name: { en: "Dal" } })).toEqual({ name: "Item", variation: null });
+    expect(voidLineIdentity(null)).toEqual({ name: "Item", variation: null });
+  });
+});
+
+describe("what a bill-item removal leaves on the order", () => {
+  const AT = "2026-09-14T14:40:00.000Z";
+  const helios = { id: "l1", name: "HELIOS", price: 450, quantity: 1 };
+  const ares = { id: "l2", name: "ARES", price: 300, quantity: 2 };
+
+  test("a removal keeps the lines it took, as they stood, with the moment", () => {
+    const food = stampLineRemoval({ items: [ares], subtotal: 600 }, [helios], "remove", false, AT);
+    expect(food[REMOVED_LINES_KEY]).toEqual([{ ...helios, removed_at: AT }]);
+    expect(food.items).toEqual([ares]);
+    // Not emptied, so nothing claims it was.
+    expect(food[EMPTIED_BY_KEY]).toBeUndefined();
+  });
+
+  test("a second removal appends; the first one's lines survive it", () => {
+    const first = stampLineRemoval({ items: [ares] }, [helios], "remove", false, AT);
+    const second = stampLineRemoval({ ...first, items: [] }, [ares], "remove", true, AT);
+    expect((second[REMOVED_LINES_KEY] as { name: string }[]).map((l) => l.name)).toEqual(["HELIOS", "ARES"]);
+    expect(second[EMPTIED_BY_KEY]).toBe("remove");
+  });
+
+  test("a move records no removed lines, because the dish is still on a bill", () => {
+    const food = stampLineRemoval({ items: [] }, [helios], "move", true, AT);
+    expect(food[REMOVED_LINES_KEY]).toBeUndefined();
+    expect(food[EMPTIED_BY_KEY]).toBe("move");
+  });
+
+  test("the input blob is never mutated", () => {
+    const input = { items: [ares] };
+    stampLineRemoval(input, [helios], "remove", true, AT);
+    expect(input).toEqual({ items: [ares] });
+  });
+
+  test("the report reads the lines still on a ticket first, and the removed ones only when none are left", () => {
+    expect(voidKotLines({ items: [ares], [REMOVED_LINES_KEY]: [helios] })).toEqual([ares]);
+    expect(voidKotLines({ items: [], [REMOVED_LINES_KEY]: [helios] })).toEqual([helios]);
+    expect(voidKotLines({ items: [] })).toEqual([]);
+    // Junk in either key is no lines, never a crash.
+    expect(voidKotLines({ items: "nope", [REMOVED_LINES_KEY]: { not: "a list" } })).toEqual([]);
   });
 });
