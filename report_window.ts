@@ -518,6 +518,39 @@ export function slotBounds(
 }
 
 /**
+ * The slot on EACH day of a window, in day order: the members of rule 3's
+ * per-day union, whose outer hull slotBounds is.
+ *
+ * The hull plus a time-of-day predicate is exact for an INSTANT, because an
+ * instant has one wall clock. It is not exact for a SPAN. A cash session is
+ * opened at one moment and closed at another, and a dinner shift on 1 August
+ * (18:00-23:30) lies inside Lunch's hull over 1-3 August (the 1st 12:00 to the
+ * 3rd 17:00) without ever meeting Lunch. Asking whether a span meets the slot
+ * needs each day's interval, so this returns them.
+ *
+ * Each day is slotBounds of that day alone. So the first interval starts where
+ * the hull starts and the last ends where the hull ends, by construction rather
+ * than through a second copy of the midnight rule. A reversed or unreadable
+ * window has no days. A window wider than MAX_REPORT_DAYS is refused out loud: a
+ * resolved window never is one, and a quietly shortened list would drop shifts.
+ */
+export function slotDayBounds(
+  w: { from: string; to: string },
+  slot: Pick<TimeSlot, "start" | "end" | "crosses_midnight">,
+): { fromKey: string; fromMin: number; toKey: string; toMin: number }[] {
+  const days = countDays(w.from, w.to);
+  if (days > MAX_REPORT_DAYS) {
+    throw new RangeError(`slotDayBounds: ${String(days)} days is wider than a report window can be (${String(MAX_REPORT_DAYS)})`);
+  }
+  const out: { fromKey: string; fromMin: number; toKey: string; toMin: number }[] = [];
+  for (let i = 0; i < days; i += 1) {
+    const day = addDaysToKey(w.from, i);
+    out.push(slotBounds({ from: day, to: day }, slot));
+  }
+  return out;
+}
+
+/**
  * The business day an instant counts on under a slot: the day the slot STARTED.
  *
  * Only a crossing slot moves anything, and only its after-midnight part:

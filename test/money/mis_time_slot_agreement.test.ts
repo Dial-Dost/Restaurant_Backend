@@ -576,9 +576,139 @@ describe("a zone with daylight saving", () => {
     expect(r.rows.map((x) => x.bill_no).sort()).toEqual(["1", "2", "3"]);
     expect(r.totals.grand_total).toBe(700);
   });
+
+  test("a cash session counts under Lunch by the London wall clock of its own day, not by GMT", async () => {
+    useFixtureDb(makeDb({
+      timezone: "Europe/London",
+      counters: [{ id: COUNTER_1, code: "C1", name: "Front till", sort_order: 1 }],
+      cash_sessions: [
+        // 12:15-12:45 BST on the 29th: Lunch.
+        { counter_id: COUNTER_1, opened_at: "2026-03-29T11:15:00.000Z", closed_at: "2026-03-29T11:45:00.000Z", variance: 1 },
+        // 17:10-17:50 BST on the 29th: after Lunch, though 16:10-16:50 on a GMT clock,
+        // and well inside Lunch's hull (the 28th 12:00 to the 30th 17:00).
+        { counter_id: COUNTER_1, opened_at: "2026-03-29T16:10:00.000Z", closed_at: "2026-03-29T16:50:00.000Z", variance: 2 },
+      ],
+    }));
+    const r = await db.GetCounterSummaryReport(RID, { from: "2026-03-28", to: "2026-03-30", slot: "lunch" });
+    expect(r.rows.map((x) => ({ code: x.counter_code, sessions: x.sessions, variance: x.variance }))).toEqual([
+      { code: "C1", sessions: 1, variance: 1 },
+    ]);
+  });
 });
 
-// --- 9. THE FIXTURE IS NOT VACUOUS ------------------------------------------
+// --- 9. A SHIFT IS A SPAN ----------------------------------------------------
+
+describe("the Counter Summary's shifts under a slot", () => {
+  // Every bill read tests an INSTANT against the slot. A cash session is a span,
+  // so it is counted when it overlaps the slot's hours on at least one day of the
+  // range, and then WHOLE. The hull cannot decide that. Over 1-15 June, Lunch's
+  // hull runs from the 1st 12:00 to the 15th 17:00 and holds every dinner and
+  // breakfast shift of the fortnight.
+  const COUNTER_3 = "c3c3c3c3-3333-4333-8333-c3c3c3c3c3c3";
+  const shiftsDb = (): FixtureDb => slotDb({
+    counters: [
+      { id: COUNTER_1, code: "C1", name: "Front till", sort_order: 1 },
+      { id: COUNTER_2, code: "C2", name: "Bar till", sort_order: 2 },
+      { id: COUNTER_3, code: "C3", name: "Terrace till", sort_order: 3 },
+    ],
+    cash_sessions: [
+      // All day on the 2nd: meets Lunch, Dinner, the late night and the morning.
+      { counter_id: COUNTER_1, opened_at: ist("2026-06-02 11:00"), closed_at: ist("2026-06-02 23:00"), variance: -20 },
+      // Dinner only, on the 1st. C2 rang L2 at lunch on the 2nd, so it has a Lunch row either way.
+      { counter_id: COUNTER_2, opened_at: ist("2026-06-01 18:00"), closed_at: ist("2026-06-01 23:30"), variance: -500 },
+      // Breakfast on the 9th, opened exactly as the 8th's 22:00-02:00 night ends.
+      { counter_id: COUNTER_2, opened_at: ist("2026-06-09 02:00"), closed_at: ist("2026-06-09 09:00"), variance: 10 },
+      // Dinner only, on the 3rd, on a till that rang nothing all fortnight.
+      { counter_id: COUNTER_3, opened_at: ist("2026-06-03 18:30"), closed_at: ist("2026-06-03 23:00"), variance: 75 },
+    ],
+  });
+  const shifts = async (q: Record<string, unknown>) => {
+    const r = await db.GetCounterSummaryReport(RID, q);
+    return {
+      rows: r.rows
+        .filter((x) => x.counter_id !== null)
+        .map((x) => ({ code: x.counter_code, bills: x.bills, sessions: x.sessions, variance: x.variance })),
+      sessions: r.totals.sessions,
+      variance: r.totals.variance,
+      grand_total: r.totals.grand_total,
+    };
+  };
+
+  beforeEach(() => { useFixtureDb(shiftsDb()); });
+
+  test("Lunch over a fortnight: a dinner shift and a breakfast shift inside Lunch's hull are NOT Lunch's, and a till that only worked dinner has no Lunch row", async () => {
+    expect(await shifts(LUNCH)).toEqual({
+      rows: [
+        { code: "C1", bills: 1, sessions: 1, variance: -20 },
+        { code: "C2", bills: 1, sessions: 0, variance: null },
+      ],
+      sessions: 1,
+      variance: -20,
+      grand_total: grand(1000, 500),
+    });
+  });
+
+  test("Dinner: the dinner shifts count whole, including the till that rang nothing", async () => {
+    expect(await shifts(DINNER)).toEqual({
+      rows: [
+        { code: "C1", bills: 1, sessions: 1, variance: -20 },
+        { code: "C2", bills: 0, sessions: 1, variance: -500 },
+        { code: "C3", bills: 0, sessions: 1, variance: 75 },
+      ],
+      sessions: 3,
+      variance: -445,
+      grand_total: grand(1800, 700, 150),
+    });
+  });
+
+  test("a crossing slot: 02:00 ends the night, so a shift opened at 02:00 is not that night's", async () => {
+    const late = await shifts(LATE_NIGHT);
+    expect(late.rows).toEqual([
+      { code: "C1", bills: 0, sessions: 1, variance: -20 },
+      { code: "C2", bills: 0, sessions: 1, variance: -500 },
+      { code: "C3", bills: 0, sessions: 1, variance: 75 },
+    ]);
+    expect(late.variance).toBe(-445);
+  });
+
+  test("the morning gap: only the shifts that were open before noon", async () => {
+    const early = await shifts(EARLY);
+    expect(early.rows).toEqual([
+      { code: "C1", bills: 0, sessions: 1, variance: -20 },
+      { code: "C2", bills: 0, sessions: 1, variance: 10 },
+    ]);
+  });
+
+  test("the whole fortnight has all four shifts, and the note says what a slot does to them", async () => {
+    expect(await shifts(W)).toMatchObject({ sessions: 4, variance: -435 });
+    const r = await db.GetCounterSummaryReport(RID, LUNCH);
+    expect(r.meta.notes).toContain("Opened, Closed, Cash sessions and Cash variance describe whole shifts that overlap the slot's hours on at least one day of the range; a shift is not cut by the slot.");
+  });
+
+  test("under a slot the read binds one [start, end) per day; all day it binds the window alone", async () => {
+    const g = globalThis as unknown as FixtureGlobal;
+    const original = g.__misFixtureQuery;
+    const seen: unknown[][] = [];
+    g.__misFixtureQuery = (text: string, params?: unknown[]) => {
+      if (/from "CashSessions"/.test(text)) {seen.push(params ?? []);}
+      return fixtureQuery(text, params);
+    };
+    try {
+      await db.GetCounterSummaryReport(RID, { from: "2026-06-01", to: "2026-06-03", slot: "dinner" });
+      await db.GetCounterSummaryReport(RID, { from: "2026-06-01", to: "2026-06-03" });
+    } finally {
+      g.__misFixtureQuery = original;
+    }
+    expect(seen[0]?.slice(1)).toEqual([
+      ist("2026-06-01 18:00"), ist("2026-06-04 00:00"),
+      [ist("2026-06-01 18:00"), ist("2026-06-02 18:00"), ist("2026-06-03 18:00")],
+      [ist("2026-06-02 00:00"), ist("2026-06-03 00:00"), ist("2026-06-04 00:00")],
+    ]);
+    expect(seen[1]?.slice(1)).toEqual([ist("2026-06-01 00:00"), ist("2026-06-04 00:00")]);
+  });
+});
+
+// --- 10. THE FIXTURE IS NOT VACUOUS -----------------------------------------
 
 describe("the fixture refuses a slot it cannot see", () => {
   test("a bill read bound to a slot's outer bounds WITHOUT the time-of-day predicate throws", async () => {
@@ -591,5 +721,45 @@ describe("the fixture refuses a slot it cannot see", () => {
     const lunchBounds = [ist("2026-06-01 12:00"), ist("2026-06-15 17:00")];
     const params = [slotDb().res_id, slotDb().outlets[0]?.id, ...lunchBounds];
     await expect(fixtureQuery(sql, params)).rejects.toThrow(/time-of-day predicate on coalesce\(b\.closed_at, b\.admin_approved_at\) is missing/);
+  });
+
+  const SESSIONS_SQL = `select counter_id, count(*)::text as sessions from "CashSessions"
+      where res_id = $1 and counter_id is not null
+        and opened_at < $3 and (closed_at is null or closed_at >= $2)`;
+  const DAY_OVERLAP = `
+        and exists (select 1 from unnest($4::timestamptz[], $5::timestamptz[]) as d(lo, hi)
+                     where opened_at < d.hi and (closed_at is null or closed_at >= d.lo))`;
+  const lunchHull = [ist("2026-06-01 12:00"), ist("2026-06-03 17:00")];
+  const lunchStarts = [ist("2026-06-01 12:00"), ist("2026-06-02 12:00"), ist("2026-06-03 12:00")];
+  const lunchEnds = [ist("2026-06-01 17:00"), ist("2026-06-02 17:00"), ist("2026-06-03 17:00")];
+
+  test("a cash-session read bound to a slot's hull WITHOUT the per-day overlap throws", async () => {
+    useFixtureDb(slotDb());
+    await expect(fixtureQuery(`${SESSIONS_SQL} group by counter_id`, [RES_ID, ...lunchHull]))
+      .rejects.toThrow(/cash-session read is bound to a time slot but has no per-day overlap/);
+  });
+
+  test("per-day bounds that are not exactly the slot's days are refused", async () => {
+    useFixtureDb(slotDb());
+    const sql = `${SESSIONS_SQL}${DAY_OVERLAP} group by counter_id`;
+    // The right days pass.
+    await expect(fixtureQuery(sql, [RES_ID, ...lunchHull, lunchStarts, lunchEnds])).resolves.toBeDefined();
+    // The hull passed off as the only day.
+    await expect(fixtureQuery(sql, [RES_ID, ...lunchHull, [lunchHull[0]], [lunchHull[1]]]))
+      .rejects.toThrow(/not the slot's days — 1 starts and 1 ends for 3 days/);
+    // A day missing.
+    await expect(fixtureQuery(sql, [RES_ID, ...lunchHull, lunchStarts.slice(0, 2), lunchEnds.slice(0, 2)]))
+      .rejects.toThrow(/not the slot's days/);
+    // Right count, wrong clock: every day ending at 18:00.
+    const lateEnds = [ist("2026-06-01 18:00"), ist("2026-06-02 18:00"), ist("2026-06-03 17:00")];
+    await expect(fixtureQuery(sql, [RES_ID, ...lunchHull, lunchStarts, lateEnds]))
+      .rejects.toThrow(/day 0 \(2026-06-01\) ends at/);
+  });
+
+  test("a per-day overlap on a whole-day binding throws", async () => {
+    useFixtureDb(slotDb());
+    const wholeDay = [ist("2026-06-01 00:00"), ist("2026-06-04 00:00")];
+    await expect(fixtureQuery(`${SESSIONS_SQL}${DAY_OVERLAP} group by counter_id`, [RES_ID, ...wholeDay, [wholeDay[0]], [wholeDay[1]]]))
+      .rejects.toThrow(/per-day session overlap on a whole-day binding/);
   });
 });

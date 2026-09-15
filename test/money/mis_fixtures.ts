@@ -40,6 +40,11 @@
 //     outer bounds but forgot the fragment fails here instead of quietly
 //     counting every hour between them. Without this, every slot test would pass
 //     vacuously against the whole day;
+//   * a CASH SESSION is a span, so under a slot it is modelled by the per-day
+//     overlap its read binds instead ($4/$5, one [lo, hi) per day). Those arrays
+//     are re-derived from the hull and refused unless they are exactly the
+//     slot's days, and they are REQUIRED under a slot for the same reason as the
+//     fragment above (see sessionSlotTest);
 //   * requireShape() asserts the load-bearing fragments are still in the query.
 //     Deleting `coalesce(o.status::text, '1') <> '5'` from the item read would
 //     otherwise leave this suite green while cancelled food became revenue.
@@ -419,6 +424,92 @@ function windowTest(q: string, params: unknown[], col: string, fromIdx = 2, toId
     const m = wallMinute(iso, d.timezone).minute;
     return crosses ? m >= start || m < end : m >= start && m < end;
   };
+}
+
+/** Calendar day (YYYY-MM-DD) of an instant in `tz`. */
+function wallDay(iso: string, tz: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date(iso));
+  const get = (t: string): string => parts.find((x) => x.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** A YYYY-MM-DD key moved by whole calendar days. */
+function shiftDay(key: string, days: number): string {
+  const [y, m, dd] = key.split("-").map(Number);
+  return new Date(Date.UTC(y ?? 0, (m ?? 1) - 1, (dd ?? 1) + days)).toISOString().slice(0, 10);
+}
+
+/** The per-day overlap the cash-session read carries under a slot, read literally. */
+const SESSION_DAY_OVERLAP =
+  /and exists \(select 1 from unnest\(\$4::timestamptz\[\], \$5::timestamptz\[\]\) as d\(lo, hi\)\s+where opened_at < d\.hi and \(closed_at is null or closed_at >= d\.lo\)\)/i;
+
+/**
+ * The per-day overlap a cash-session read binds under a time slot, as a test on
+ * one session's opened/closed instants.
+ *
+ * A session is a SPAN, so the hull [$2, $3) cannot say whether it met the slot:
+ * a dinner shift on 1 June lies inside Lunch's hull over 1-15 June. The reader
+ * binds each day's [lo, hi) as $4/$5, and this does NOT take them on trust. It
+ * re-derives the slot from the hull (its start is the hull's first wall minute,
+ * its end the hull's last, 00:00 meaning 24:00) and the days from the hull's
+ * dates. Then it refuses arrays that are not exactly one interval per day with
+ * those wall clocks. A reader that bound the wrong days fails here. So does one
+ * that bound a slot's hull with no per-day test at all, instead of quietly
+ * counting every shift between the outer bounds.
+ *
+ * The wall clocks are CHECKED with Intl rather than built with the reader's
+ * conversion, so the two cannot agree by sharing a bug. (A slot edge inside a
+ * DST gap has no wall reading to match; no fixture zone puts one there.)
+ */
+function sessionSlotTest(q: string, params: unknown[]): (opened: number, closed: number | null) => boolean {
+  const d = requireDb();
+  const tz = d.timezone;
+  const from = params[1], to = params[2];
+  const hasOverlap = SESSION_DAY_OVERLAP.test(q);
+  if (isLocalMidnight(from, tz) && isLocalMidnight(to, tz)) {
+    if (hasOverlap || params.length > 3) {
+      throw new Error(`mis fixture: a per-day session overlap on a whole-day binding — the hull lost the slot\n  ${q.slice(0, 260)}`);
+    }
+    return () => true;
+  }
+  if (!hasOverlap) {
+    throw new Error(`mis fixture: the cash-session read is bound to a time slot but has no per-day overlap — every shift between the outer bounds would be counted\n  ${q.slice(0, 260)}`);
+  }
+  const lo = params[3], hi = params[4];
+  if (typeof from !== "string" || typeof to !== "string" || !Array.isArray(lo) || !Array.isArray(hi)) {
+    throw new Error("mis fixture: a slot-bound cash-session read must bind its hull and two arrays of day bounds");
+  }
+  const refuse = (why: string): never => {
+    throw new Error(`mis fixture: the cash-session day bounds are not the slot's days — ${why}`);
+  };
+  const start = wallMinute(from, tz).minute;
+  const endWall = wallMinute(to, tz).minute;
+  // The slot ends on the NEXT day when it crosses midnight or runs to 24:00.
+  const nextDay = endWall === 0 || endWall < start;
+  const firstDay = wallDay(from, tz);
+  const lastDay = nextDay ? shiftDay(wallDay(to, tz), -1) : wallDay(to, tz);
+  const days = Math.round((Date.parse(`${lastDay}T00:00:00Z`) - Date.parse(`${firstDay}T00:00:00Z`)) / 86_400_000) + 1;
+  if (lo.length !== days || hi.length !== days) {
+    refuse(`${String(lo.length)} starts and ${String(hi.length)} ends for ${String(days)} days`);
+  }
+  const spans = lo.map((raw, i) => {
+    const a = String(raw), z = String(hi[i]);
+    const day = shiftDay(firstDay, i);
+    const wa = wallMinute(a, tz), wz = wallMinute(z, tz);
+    if (wallDay(a, tz) !== day || wa.minute !== start || wa.second !== 0) {
+      refuse(`day ${String(i)} starts at ${a}, not at minute ${String(start)} of ${day}`);
+    }
+    if (wallDay(z, tz) !== (nextDay ? shiftDay(day, 1) : day) || wz.minute !== endWall || wz.second !== 0) {
+      refuse(`day ${String(i)} (${day}) ends at ${z}`);
+    }
+    return { lo: new Date(a).getTime(), hi: new Date(z).getTime() };
+  });
+  if (spans[0]?.lo !== new Date(from).getTime() || spans[spans.length - 1]?.hi !== new Date(to).getTime()) {
+    refuse("the first day does not start where the hull starts, or the last does not end where it ends");
+  }
+  return (opened, closed) => spans.some((s) => opened < s.hi && (closed === null || closed >= s.lo));
 }
 
 /** The settlement clock, spelled exactly as the readers spell it. */
@@ -823,6 +914,8 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       "sessions are keyed to the till, never to the nullable outlet_id on this legacy table");
     const rid = String(params[0] ?? "");
     const from = params[1], to = params[2];
+    // Checked before the loop, so a malformed slot binding fails with no rows too.
+    const meetsSlot = sessionSlotTest(q, params);
     const acc = new Map<string, { sessions: number; opened: number; closed: number | null; open: boolean; variance: number }>();
     for (const c of d.cash_sessions) {
       if (resOf(c) !== rid) {continue;}
@@ -831,6 +924,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       const before = typeof to === "string" ? new Date(to).getTime() : Number.POSITIVE_INFINITY;
       const after = typeof from === "string" ? new Date(from).getTime() : Number.NEGATIVE_INFINITY;
       if (!(opened < before && (closed === null || closed >= after))) {continue;}
+      if (!meetsSlot(opened, closed)) {continue;}
       const e = acc.get(c.counter_id) ?? { sessions: 0, opened, closed: null, open: false, variance: 0 };
       e.sessions += 1;
       e.opened = Math.min(e.opened, opened);

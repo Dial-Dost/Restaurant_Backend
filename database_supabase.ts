@@ -264,6 +264,7 @@ import {
   resolveTimeSlot,
   serviceDayKey,
   slotBounds,
+  slotDayBounds,
   timeBucketKey,
   timeBucketMode,
   timeBucketOrder,
@@ -34806,12 +34807,34 @@ async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisC
 function slotWindowInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot | null): { fromIso: string; toIso: string } {
   if (!slot) {return windowInstants(w, tz);}
   const b = slotBounds(w, slot);
-  const at = (key: string, minute: number): string => {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
-    if (!m) {return new Date(NaN).toISOString();}
-    return zonedWallToUtc(Number(m[1]), Number(m[2]), Number(m[3]), Math.floor(minute / 60), minute % 60, tz).toISOString();
-  };
-  return { fromIso: at(b.fromKey, b.fromMin), toIso: at(b.toKey, b.toMin) };
+  return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
+}
+
+/** A minute past local midnight of a YYYY-MM-DD day in `tz`, as the UTC instant SQL binds. */
+function slotWallInstant(key: string, minute: number, tz: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+  if (!m) {return new Date(NaN).toISOString();}
+  return zonedWallToUtc(Number(m[1]), Number(m[2]), Number(m[3]), Math.floor(minute / 60), minute % 60, tz).toISOString();
+}
+
+/**
+ * [lo, hi) of the slot on EACH day of a window, as two parallel arrays to bind.
+ *
+ * This is for a read that asks whether a SPAN of time meets the slot, not
+ * whether an instant falls in it. The cash-session overlap is the one such read.
+ * slotDayBounds explains why the hull and misTimeSql cannot answer that. The
+ * instants come from the same conversion as slotWindowInstants, so lo[0] is its
+ * fromIso and the last hi is its toIso, and a DST day follows the wall clock
+ * exactly as the bill reads do.
+ */
+function slotDayInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot): { lo: string[]; hi: string[] } {
+  const lo: string[] = [];
+  const hi: string[] = [];
+  for (const b of slotDayBounds(w, slot)) {
+    lo.push(slotWallInstant(b.fromKey, b.fromMin, tz));
+    hi.push(slotWallInstant(b.toKey, b.toMin, tz));
+  }
+  return { lo, hi };
 }
 
 /** An IANA zone name as it may appear INLINE in SQL. context.timezone is already Intl-checked. */
@@ -34941,7 +34964,7 @@ const MIS_SLOT_SUBJECT: Record<string, string> = {
 };
 const MIS_SLOT_EXTRA: Record<string, string> = {
   executive_summary: "The comparison period is cut by the same time slot, so growth compares like with like.",
-  counter_summary: "Opened, Closed, Cash sessions and Cash variance describe whole shifts that overlap the slot's hours; a shift is not cut by the slot.",
+  counter_summary: "Opened, Closed, Cash sessions and Cash variance describe whole shifts that overlap the slot's hours on at least one day of the range; a shift is not cut by the slot.",
 };
 
 async function misMeta(mc: MisContext, report: string, title: string, notes: string[]): Promise<MisReportMeta> {
@@ -41149,7 +41172,7 @@ export interface CounterSummaryRow {
   by_method: { method: string; label?: string; amount: number }[];
   /** The same cut as one spreadsheet cell. */
   payment_modes: string;
-  /** Cash sessions on this till that overlap the window (migration 038). */
+  /** Cash sessions on this till that overlap the window (migration 038) — under a slot, its hours on some day of it. */
   sessions: number;
   opened_at: string | null;
   /** Null while any overlapping session is still open. */
@@ -41209,6 +41232,8 @@ async function fetchMisBillCounters(mc: MisContext): Promise<Map<string, { count
 
 /** The shift half of migration 038: cash sessions on a till, over a window. */
 async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>> {
+  // Under a time slot, the slot's own interval on each day of the window.
+  const days = mc.window.slot ? slotDayInstants(mc.window, mc.tz, mc.window.slot) : null;
   const rows = await captureRead("CashSessions.counter_id", () => runQuery<{
     counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null;
   }>(
@@ -41217,10 +41242,20 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
     // counter is per-outlet by construction (038) — so keying on the counter is
     // both exact and immune to that null. Sessions that OVERLAP the window are
     // included: a shift that opened yesterday and is still counting money today
-    // is this window's shift. UNDER A TIME SLOT the overlap is against the
-    // slot's OUTER bounds and deliberately NOT cut per day by misTimeSql: a
-    // shift is a whole drawer count, and half of a variance is no number at all.
-    // The report's notes say so (MIS_SLOT_EXTRA).
+    // is this window's shift.
+    //
+    // UNDER A TIME SLOT a shift counts only when it overlaps the slot's hours ON
+    // AT LEAST ONE DAY of the window. The EXISTS walks each day's [lo, hi),
+    // bound as $4/$5 (slotDayInstants). The hull test above it stays: with no
+    // slot it is the whole test, and under one it still narrows the scan. The
+    // hull ALONE is not enough: a session is a span, not an instant, so
+    // misTimeSql cannot cut it, and a dinner shift on the 1st lies inside Lunch's
+    // hull over 1-3 August without ever meeting Lunch. Counted, it would add its
+    // drawer and its variance to a Lunch report, and a row for a till that rang
+    // nothing at lunch. A shift that does meet the slot is still counted WHOLE,
+    // never cut by it: a shift is a whole drawer count, and half of a variance
+    // is no number at all. The report's notes say so (MIS_SLOT_EXTRA). `d` names
+    // only lo and hi, so opened_at and closed_at inside it are the session's.
     `select counter_id,
             count(*)::text as sessions,
             min(opened_at) as opened_at,
@@ -41228,9 +41263,13 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
             coalesce(sum(variance), 0)::float as variance
        from "CashSessions"
       where res_id = $1 and counter_id is not null
-        and opened_at < $3 and (closed_at is null or closed_at >= $2)
+        and opened_at < $3 and (closed_at is null or closed_at >= $2)${days ? `
+        and exists (select 1 from unnest($4::timestamptz[], $5::timestamptz[]) as d(lo, hi)
+                     where opened_at < d.hi and (closed_at is null or closed_at >= d.lo))` : ""}
       group by counter_id`,
-    [mc.context.res_id, mc.window.fromIso, mc.window.toIso],
+    days
+      ? [mc.context.res_id, mc.window.fromIso, mc.window.toIso, days.lo, days.hi]
+      : [mc.context.res_id, mc.window.fromIso, mc.window.toIso],
   ), [] as { counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null }[]);
   const out = new Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>();
   for (const r of rows) {
@@ -41275,7 +41314,8 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
  * sessions on that till that overlap the window, and Closed is deliberately
  * BLANK while any of them is still open — a shift that has not been counted has
  * no closing time, and inventing one would make an uncounted drawer look
- * reconciled.
+ * reconciled. Under a time slot, "overlap the window" means overlapping the
+ * slot's hours on at least one day of it (fetchMisCounterSessions).
  */
 export async function GetCounterSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<CounterSummaryReport> {
   const mc = await misContext(restaurantId, q);

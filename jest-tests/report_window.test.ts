@@ -39,6 +39,7 @@ import {
   sessionOf,
   slotBounds,
   slotContains,
+  slotDayBounds,
   timeBucketKey,
   timeBucketMode,
   timeBucketOrder,
@@ -375,6 +376,72 @@ describe("time slots: which instants, which day", () => {
     expect(slotBounds(w, slotFor({ slot: "lunch" }))).toEqual({ fromKey: "2026-08-01", fromMin: 720, toKey: "2026-08-15", toMin: 1020 });
     expect(slotBounds(w, slotFor({ slot: "dinner" }))).toEqual({ fromKey: "2026-08-01", fromMin: 1080, toKey: "2026-08-16", toMin: 0 });
     expect(slotBounds(w, slotFor({ time_from: "22:00", time_to: "02:00" }))).toEqual({ fromKey: "2026-08-01", fromMin: 1320, toKey: "2026-08-16", toMin: 120 });
+  });
+
+  // The hull is exact for an instant and wrong for a SPAN: a cash session from
+  // 18:00 to 23:30 on the 1st lies inside Lunch's hull over 1-3 August without
+  // ever meeting Lunch. The per-day intervals are what a span is tested against.
+  test("per-day bounds: one interval per day, each the slot on that day alone", () => {
+    const w = { from: "2026-08-01", to: "2026-08-03" };
+    expect(slotDayBounds(w, slotFor({ slot: "lunch" }))).toEqual([
+      { fromKey: "2026-08-01", fromMin: 720, toKey: "2026-08-01", toMin: 1020 },
+      { fromKey: "2026-08-02", fromMin: 720, toKey: "2026-08-02", toMin: 1020 },
+      { fromKey: "2026-08-03", fromMin: 720, toKey: "2026-08-03", toMin: 1020 },
+    ]);
+    // Dinner runs to 24:00, the start of the NEXT day; it does not cross midnight.
+    expect(slotDayBounds(w, slotFor({ slot: "dinner" }))).toEqual([
+      { fromKey: "2026-08-01", fromMin: 1080, toKey: "2026-08-02", toMin: 0 },
+      { fromKey: "2026-08-02", fromMin: 1080, toKey: "2026-08-03", toMin: 0 },
+      { fromKey: "2026-08-03", fromMin: 1080, toKey: "2026-08-04", toMin: 0 },
+    ]);
+    // A crossing slot's night belongs to the day it STARTED, month boundary included.
+    expect(slotDayBounds({ from: "2026-07-31", to: "2026-08-01" }, slotFor({ time_from: "22:00", time_to: "02:00" }))).toEqual([
+      { fromKey: "2026-07-31", fromMin: 1320, toKey: "2026-08-01", toMin: 120 },
+      { fromKey: "2026-08-01", fromMin: 1320, toKey: "2026-08-02", toMin: 120 },
+    ]);
+  });
+
+  test("per-day bounds: a dinner-only span meets Dinner's days and none of Lunch's, though Lunch's hull holds it", () => {
+    const w = { from: "2026-08-01", to: "2026-08-03" };
+    // Minutes from 1 Aug 00:00, so the three days can be compared on one line.
+    const at = (key: string, minute: number): number => (countDays(w.from, key) - 1) * 1440 + minute;
+    const meets = (bounds: ReturnType<typeof slotDayBounds>, open: number, close: number): boolean =>
+      bounds.some((b) => open < at(b.toKey, b.toMin) && close >= at(b.fromKey, b.fromMin));
+    const hullMeets = (slot: TimeSlot, open: number, close: number): boolean => {
+      const h = slotBounds(w, slot);
+      return open < at(h.toKey, h.toMin) && close >= at(h.fromKey, h.fromMin);
+    };
+    const lunch = slotFor({ slot: "lunch" }), dinner = slotFor({ slot: "dinner" });
+    const dinnerShift = [at("2026-08-01", 1080), at("2026-08-01", 1410)] as const;
+    expect(hullMeets(lunch, ...dinnerShift)).toBe(true);
+    expect(meets(slotDayBounds(w, lunch), ...dinnerShift)).toBe(false);
+    expect(meets(slotDayBounds(w, dinner), ...dinnerShift)).toBe(true);
+    // An all-day shift on the 2nd meets both.
+    const allDay = [at("2026-08-02", 660), at("2026-08-02", 1380)] as const;
+    expect(meets(slotDayBounds(w, lunch), ...allDay)).toBe(true);
+    expect(meets(slotDayBounds(w, dinner), ...allDay)).toBe(true);
+  });
+
+  test("per-day bounds share the hull's ends exactly, and one day is the hull", () => {
+    const w = { from: "2026-07-30", to: "2026-08-02" };
+    for (const q of [{ slot: "lunch" }, { slot: "dinner" }, { time_from: "22:00", time_to: "02:00" }, { time_from: "00:00", time_to: "12:00" }]) {
+      const slot = slotFor(q);
+      const days = slotDayBounds(w, slot);
+      const hull = slotBounds(w, slot);
+      expect(days).toHaveLength(4);
+      expect({ fromKey: days[0]?.fromKey, fromMin: days[0]?.fromMin }).toEqual({ fromKey: hull.fromKey, fromMin: hull.fromMin });
+      expect({ toKey: days[3]?.toKey, toMin: days[3]?.toMin }).toEqual({ toKey: hull.toKey, toMin: hull.toMin });
+      expect(slotDayBounds({ from: "2026-08-02", to: "2026-08-02" }, slot)).toEqual([slotBounds({ from: "2026-08-02", to: "2026-08-02" }, slot)]);
+    }
+  });
+
+  test("per-day bounds: a reversed or unreadable window has no days, and a window no report can have is refused", () => {
+    const lunch = slotFor({ slot: "lunch" });
+    expect(slotDayBounds({ from: "2026-08-03", to: "2026-08-01" }, lunch)).toEqual([]);
+    expect(slotDayBounds({ from: "garbage", to: "2026-08-01" }, lunch)).toEqual([]);
+    const widest = { from: addDaysToKey("2026-08-01", -(MAX_REPORT_DAYS - 1)), to: "2026-08-01" };
+    expect(slotDayBounds(widest, lunch)).toHaveLength(MAX_REPORT_DAYS);
+    expect(() => slotDayBounds({ from: addDaysToKey(widest.from, -1), to: "2026-08-01" }, lunch)).toThrow(RangeError);
   });
 
   test("a crossing slot's after-midnight hours belong to the day it STARTED", () => {

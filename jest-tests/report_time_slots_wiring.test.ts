@@ -115,11 +115,27 @@ describe("every MIS window predicate carries the time slot, on its own clock", (
     }
   });
 
-  test("the cash-session overlap is the ONE deliberate exemption, and says so", () => {
+  // A cash session is a SPAN, so misTimeSql (a test on one instant's wall clock)
+  // cannot cut it, and the hull alone holds every shift between the first day's
+  // slot start and the last day's slot end: a dinner shift sits inside Lunch's
+  // hull on any multi-day window. The overlap is therefore tested per day.
+  test("the cash-session overlap is tested against the slot's hours ON EACH DAY, not the hull, and says so", () => {
     const fn = body("fetchMisCounterSessions");
     expect(fn).not.toContain("misTimeSql(");
-    expect(fn).toMatch(/UNDER A TIME SLOT the overlap is against the\s+\/\/ slot's OUTER bounds/);
-    expect(DB_SRC).toMatch(/counter_summary: "Opened, Closed, Cash sessions and Cash variance describe whole shifts/);
+    expect(fn).toContain("const days = mc.window.slot ? slotDayInstants(mc.window, mc.tz, mc.window.slot) : null;");
+    // The hull stays (the whole test with no slot) and the EXISTS is added under one.
+    expect(fn).toContain("and opened_at < $3 and (closed_at is null or closed_at >= $2)${days ? `");
+    expect(fn).toContain("and exists (select 1 from unnest($4::timestamptz[], $5::timestamptz[]) as d(lo, hi)");
+    expect(fn).toContain("where opened_at < d.hi and (closed_at is null or closed_at >= d.lo))` : \"\"}");
+    expect(fn).toContain("[mc.context.res_id, mc.window.fromIso, mc.window.toIso, days.lo, days.hi]");
+    expect(fn).toMatch(/UNDER A TIME SLOT a shift counts only when it overlaps the slot's hours ON\s+\/\/ AT LEAST ONE DAY/);
+    // The days are slotDayBounds, converted exactly as the hull is.
+    const days = body("slotDayInstants");
+    expect(days).toContain("for (const b of slotDayBounds(w, slot))");
+    expect(days).toContain("slotWallInstant(b.fromKey, b.fromMin, tz)");
+    expect(days).toContain("slotWallInstant(b.toKey, b.toMin, tz)");
+    expect(body("slotWindowInstants")).toContain("slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz)");
+    expect(DB_SRC).toContain("counter_summary: \"Opened, Closed, Cash sessions and Cash variance describe whole shifts that overlap the slot's hours on at least one day of the range; a shift is not cut by the slot.\",");
   });
 
   test("misTimeSql inlines only checked values, parenthesised against :: precedence", () => {
