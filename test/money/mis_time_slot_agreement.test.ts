@@ -523,6 +523,37 @@ describe("the restaurant's own presets", () => {
     expect(await db.GetReportTimeSlots(RID)).toMatchObject({ is_default: true, slots: [{ id: "lunch" }, { id: "dinner" }] });
   });
 
+  test("the missing column is warned about ONCE per process, not once per toolbar load and report", async () => {
+    // 2.0.0 ships the column as runtime DDL before migration 049 is applied by
+    // hand, so a live backend can spend a while answering from the defaults. A
+    // FRESH copy of the data layer, so the once-flag starts unset whatever ran
+    // earlier in this file (the test above trips it in the shared copy).
+    await jest.isolateModulesAsync(async () => {
+      const { logger } = await import("../../observability");
+      const fresh = await import("../../database_supabase");
+      const said: unknown[][] = [];
+      const warn = jest.spyOn(logger, "warn").mockImplementation((...args: unknown[]) => { said.push(args); });
+      try {
+        useFixtureDb(slotDb({ report_time_slots_missing: true }));
+        const missing = (): unknown[][] => said.filter((args) => args.includes("mis_time_slots_column_missing"));
+
+        expect(await fresh.GetReportTimeSlots(RID)).toMatchObject({ is_default: true });
+        expect(missing()).toHaveLength(1);
+        expect(missing()[0]![0]).toEqual({ what: "Restaurant.report_time_slots" });
+
+        // Every other read that needs the presets still answers from the
+        // defaults — and says nothing more.
+        await fresh.GetReportTimeSlots(RID);
+        expect((await fresh.GetSalesSummaryReport(RID, LUNCH)).totals.grand_total).toBe(grand(1000, 500));
+        await fresh.GetSalesSummaryReport(RID, { ...W, bucket: "session" });
+        await fresh.GetOrderSummaryReport(RID, q500(DINNER));
+        expect(missing()).toHaveLength(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
   test("a stored value that no longer validates is the defaults, visibly", async () => {
     useFixtureDb(slotDb({ report_time_slots: { version: 1, slots: [{ id: "x", label: "Bad", start: "12:00", end: "12:00" }] } }));
     expect(await db.GetReportTimeSlots(RID)).toMatchObject({ is_default: true });

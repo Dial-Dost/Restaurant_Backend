@@ -34946,6 +34946,20 @@ function misTimeSql(col: string, mc: Pick<MisContext, "window" | "tz">): string 
 }
 
 /**
+ * Whether this process has already said "report_time_slots is missing".
+ *
+ * ONCE PER PROCESS, because the 42703 is a fact about the SCHEMA, not about the
+ * request. The column ships as runtime DDL first (ensureBrandingColumns) with
+ * migration 049 hand-applied later, so a freshly deployed backend can read the
+ * presets before anything has created the column — and every Reports toolbar
+ * load, every ?slot= and every session cut in that window would otherwise file
+ * the same warn, burying the deploy log an operator is reading at that moment.
+ * One line says it; the defaults are what every read answers meanwhile; the
+ * next process says it again if it is still true.
+ */
+let timeSlotsColumnMissingWarned = false;
+
+/**
  * The restaurant's presets, and whether they are the built-in defaults.
  *
  * DEFENSIVE BY DESIGN: a tenant on a database where migration 049 has not run
@@ -34964,7 +34978,10 @@ async function loadReportTimeSlots(resId: string, client?: PoolClient): Promise<
     raw = rows[0]?.report_time_slots ?? null;
   } catch (err) {
     if ((err as { code?: unknown })?.code !== "42703") {throw err;}
-    logger.warn({ what: "Restaurant.report_time_slots" }, "mis_time_slots_column_missing");
+    if (!timeSlotsColumnMissingWarned) {
+      timeSlotsColumnMissingWarned = true;
+      logger.warn({ what: "Restaurant.report_time_slots" }, "mis_time_slots_column_missing");
+    }
   }
   const stored = parseStoredTimeSlots(raw);
   return stored
