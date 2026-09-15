@@ -34648,9 +34648,10 @@ export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number):
 //
 // READ-ONLY. Nothing in this section writes a report row — SetReportTimeSlots
 // saves configuration (migration 049), never money — and nothing here touches
-// the idempotency outbox. No migration was needed: every column read below already
-// exists (the lazy ensure* helpers are called only so a tenant that predates a
-// column still reads rather than 42703-ing).
+// the idempotency outbox. No report needs a migration: every column read below
+// already exists (the lazy ensure* helpers are called only so a tenant that
+// predates a column still reads rather than 42703-ing), and the one column that
+// may not — "Restaurant".report_time_slots — reads as the default time slots.
 //
 // OUTLET SCOPE follows the house pattern exactly: `og` is "true" in the
 // admin/manager ALL-OUTLETS aggregate read (isAllOutlets(), set by the
