@@ -9,7 +9,7 @@
 // that is not the six-field sales export.
 
 import { describe, test, expect } from "@jest/globals";
-import { renderReport, renderSalesCsv } from "../report_render";
+import { renderPnlCsv, renderReport, renderSalesCsv } from "../report_render";
 import type { SalesReport, GstReport, ProfitAndLoss } from "../database_supabase";
 
 const META = { periodFrom: "2026-08-01", periodTo: "2026-08-10" };
@@ -22,11 +22,13 @@ const salesReport = (days: number): SalesReport => ({
   total_service_charge: 7,
   total_refund: 2,
   total_refunded_tax: 0.1,
+  total_net: 88,
+  total_round_off: 0,
   net_sales: 98,
   bill_count: days,
   by_day: Array.from({ length: days }, (_, i) => ({
     date: `2026-08-${String((i % 28) + 1).padStart(2, "0")}`,
-    sales: 100, tax: 5, service_charge: 7, refund: 2, bills: 3,
+    sales: 100, net: 88, tax: 5, service_charge: 7, refund: 2, bills: 3,
   })),
   by_method: [],
 });
@@ -72,15 +74,32 @@ describe("renderSalesCsv", () => {
   test("keeps the Total row the interactive export already emitted, and adds Service Charge", () => {
     const csv = renderSalesCsv(salesReport(2));
     const lines = csv.split("\n");
-    expect(lines[0]).toBe("Date,Bills,Sales,Tax,Service Charge,Refunds");
-    expect(lines[1]).toBe("2026-08-01,3,100,5,7,2");
-    expect(lines[lines.length - 1]).toBe("Total,2,100,5,7,2");
+    expect(lines[0]).toBe("Date,Bills,Gross sales,Tax,Service Charge,Refunds,Net sales");
+    expect(lines[1]).toBe("2026-08-01,3,100,5,7,2,88");
+    expect(lines[lines.length - 1]).toBe("Total,2,100,5,7,2,88");
+  });
+
+  // Gross and Net, in the client's words. Net rides at the END so a scheduled
+  // delivery parsed by position keeps every column it already knew where it was.
+  test("Gross sales is the grand total in the third column, and Net sales is APPENDED, never inserted", () => {
+    const header = renderSalesCsv(salesReport(1)).split("\n")[0].split(",");
+    expect(header.slice(0, 6)).toEqual(["Date", "Bills", "Gross sales", "Tax", "Service Charge", "Refunds"]);
+    expect(header[header.length - 1]).toBe("Net sales");
+    expect(header.filter((h) => /net/i.test(h))).toEqual(["Net sales"]);
+  });
+});
+
+describe("renderPnlCsv", () => {
+  test("the ex-tax revenue line is not called Net — Net means pre-service-charge everywhere else", () => {
+    const lines = renderPnlCsv(pnlReport(0)).split("\n");
+    expect(lines).toContain("Revenue ex-tax (after refunds),940");
+    expect(lines.some((l) => l.startsWith("Net revenue"))).toBe(false);
   });
 });
 
 describe("renderReport truncation", () => {
   const cases: { key: "sales" | "gst" | "pnl"; payload: SalesReport | GstReport | ProfitAndLoss; fields: number }[] = [
-    { key: "sales", payload: salesReport(200), fields: 6 },
+    { key: "sales", payload: salesReport(200), fields: 7 },
     { key: "gst", payload: gstReport(200), fields: 4 },
     { key: "pnl", payload: pnlReport(200), fields: 2 },
   ];

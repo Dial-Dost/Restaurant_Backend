@@ -242,11 +242,13 @@ describe("the three headline numbers agree", () => {
     expect(sales.totals.tax).toBe(sum(IN_WINDOW_FOOD.map((f) => r2(r2(f + r2(f * 0.01)) * 0.025) * 2)));
   });
 
-  test("a discount is reported as money, and gross minus discount is net", async () => {
+  test("a discount is reported as money, and item total minus discount is net", async () => {
     const sales = await db.GetSalesSummaryReport(RID, W);
     expect(sales.totals.discount).toBe(200);
-    expect(sales.totals.gross).toBe(r2(EXPECTED_NET + 200));
-    expect(r2(sales.totals.gross - sales.totals.discount)).toBe(sales.totals.net);
+    expect(sales.totals.item_total).toBe(r2(EXPECTED_NET + 200));
+    expect(r2(sales.totals.item_total - sales.totals.discount)).toBe(sales.totals.net);
+    // The deprecated alias installed tills read — same value, never the grand total.
+    expect(sales.totals.gross).toBe(sales.totals.item_total);
   });
 
   test("the Discount report's totals agree with the Sales Summary's discount", async () => {

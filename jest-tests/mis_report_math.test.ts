@@ -70,20 +70,50 @@ describe("the money ladder", () => {
     expect(r2(acc.net + acc.service_charge + acc.tax + acc.round_off)).toBe(acc.grand_total);
   });
 
-  test("gross minus discount === net, so the top of the ladder is derived, not guessed", () => {
+  test("item total minus discount === net, so the top of the ladder is derived, not guessed", () => {
     const m = composeBillMoney({ grand_total: 1060.5, charges, discount_type: "flat", discount_value: 150 });
     expect(m.discount).toBe(150);
-    expect(r2(m.gross - m.discount)).toBe(m.net);
+    expect(m.item_total).toBe(1150);
+    expect(r2(m.item_total - m.discount)).toBe(m.net);
     // The discount does NOT move the bottom of the ladder: total_amt is stored
-    // already net of it, which is the whole reason gross is derived upward.
+    // already net of it, which is the whole reason item_total is derived upward.
     expect(m.grand_total).toBe(1060.5);
   });
 
-  test("a bill with no discount has gross === net", () => {
+  test("a bill with no discount has item total === net", () => {
     const m = composeBillMoney({ grand_total: 1060.5, charges });
-    expect(m.gross).toBe(m.net);
+    expect(m.item_total).toBe(m.net);
     expect(m.discount).toBe(0);
     expect(m.discount_estimated).toBe(false);
+  });
+
+  // THE CLIENT'S TWO WORDS. Gross is the grand total — service charge, tax and
+  // round off in; Net is the item total less discount — all three out. A
+  // restaurant that never discounts (every production tenant in the last 30
+  // days) must still see two DIFFERENT numbers, which is the whole complaint.
+  test("Gross (grand_total) and Net differ by exactly service charge + tax + round off, discount or not", () => {
+    const gaia = { taxable_base: 4745, service_charge: 0, tax_total: 237.26, round_off: -0.26 };
+    for (const m of [
+      composeBillMoney({ grand_total: 4982, charges: gaia }),
+      composeBillMoney({ grand_total: 1060.5, charges, discount_type: "percent", discount_value: 10 }),
+    ]) {
+      expect(m.grand_total).not.toBe(m.net);
+      expect(r2(m.grand_total - m.net)).toBe(r2(m.service_charge + m.tax + m.round_off));
+    }
+  });
+
+  // `gross` is what installed 1.9.x tills read for their pre-discount tile. Its
+  // value must not move while that alias lives — repointed at grand_total, an old
+  // till would print "Gross 4982 − Discount 0 = Net 4745".
+  test("the deprecated `gross` alias stays the item total, never the grand total", () => {
+    const m = composeBillMoney({ grand_total: 1060.5, charges, discount_type: "flat", discount_value: 150 });
+    expect(m.gross).toBe(m.item_total);
+    expect(m.gross).not.toBe(m.grand_total);
+    const acc = addToLadder(zeroLadder(), m);
+    addToLadder(acc, composeBillMoney({ grand_total: 1060.5, charges }));
+    expect(acc.item_total).toBe(2150);
+    expect(acc.gross).toBe(acc.item_total);
+    expect(r2(acc.item_total - acc.discount)).toBe(acc.net);
   });
 });
 

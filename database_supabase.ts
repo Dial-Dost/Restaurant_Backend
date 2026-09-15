@@ -18017,9 +18017,18 @@ export interface SalesReport {
   total_refund: number;
   // The share of total_tax that sits inside refunded bills (see refundedTaxOf).
   total_refunded_tax: number;
+  // total_sales is the client's GROSS (the grand total, before refunds). This is
+  // its NET: Σ taxable_base — the item total less discounts, before service
+  // charge, tax and round off — the same classifier, so it equals the MIS Sales
+  // Summary's Net for the same days (test/money pins it).
+  total_net: number;
+  total_round_off: number;
+  // DEPRECATED NAME, unchanged value: total_sales − refunds, tax and all. Kept
+  // for installed clients and scheduled readers; no screen may label it "Net"
+  // again — it is "Gross after refunds".
   net_sales: number;
   bill_count: number;
-  by_day: { date: string; sales: number; tax: number; service_charge: number; refund: number; bills: number }[];
+  by_day: { date: string; sales: number; net: number; tax: number; service_charge: number; refund: number; bills: number }[];
   // Grouped by the STORED id; `label` is the owner's name for it (Settings >
   // Payments), so a renamed or custom mode reads right without splitting history.
   by_method: { method: string; label?: string; sales: number; bills: number }[];
@@ -18032,7 +18041,8 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
   const scPct = await getServiceChargePercent(context.res_id);
 
   let totalSales = 0, totalTax = 0, totalService = 0, totalRefund = 0, totalRefundedTax = 0;
-  const byDay = new Map<string, { sales: number; tax: number; service_charge: number; refund: number; bills: number }>();
+  let totalNet = 0, totalRoundOff = 0;
+  const byDay = new Map<string, { sales: number; net: number; tax: number; service_charge: number; refund: number; bills: number }>();
   const byMethod = new Map<string, { sales: number; bills: number }>();
   for (const b of bills) {
     const gross = b.total_amt;
@@ -18040,13 +18050,16 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     const tax = charges.tax_total;
     const service = charges.service_charge;
     totalSales = round2(totalSales + gross);
+    totalNet = round2(totalNet + charges.taxable_base);
+    totalRoundOff = round2(totalRoundOff + charges.round_off);
     totalTax = round2(totalTax + tax);
     totalService = round2(totalService + service);
     totalRefund = round2(totalRefund + b.refund_amount);
     totalRefundedTax = round2(totalRefundedTax + refundedTaxOf(b, tax));
     const day = dayKeyOf(b.settled_at, context.timezone);
-    const dd = byDay.get(day) ?? { sales: 0, tax: 0, service_charge: 0, refund: 0, bills: 0 };
+    const dd = byDay.get(day) ?? { sales: 0, net: 0, tax: 0, service_charge: 0, refund: 0, bills: 0 };
     dd.sales = round2(dd.sales + gross); dd.tax = round2(dd.tax + tax);
+    dd.net = round2(dd.net + charges.taxable_base);
     dd.service_charge = round2(dd.service_charge + service);
     dd.refund = round2(dd.refund + b.refund_amount); dd.bills += 1;
     byDay.set(day, dd);
@@ -18078,6 +18091,8 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     total_service_charge: totalService,
     total_refund: totalRefund,
     total_refunded_tax: totalRefundedTax,
+    total_net: totalNet,
+    total_round_off: totalRoundOff,
     net_sales: round2(totalSales - totalRefund),
     bill_count: bills.length,
     by_day: [...byDay.entries()].filter(([d]) => d).sort((a, b) => a[0].localeCompare(b[0])).map(([date, v]) => ({ date, ...v })),
@@ -18290,7 +18305,7 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
 
   const notes = [
     "Bill totals are stored net of discount, so the sales, GST and P&L figures already reflect these discounts — don't subtract them again.",
-    "Discounts come off the items subtotal before service charge and taxes, so a pre-discount gross sales figure isn't derivable from settled totals and is deliberately not shown.",
+    "Discounts come off the item total before service charge and taxes. Settled totals are stored after the discount, so the pre-discount item total is reconstructed per bill; the MIS Discount report shows each discounted bill's Item total, Net and Gross side by side.",
   ];
   if (estimatedBills > 0) {
     notes.push(`${estimatedBills} bill(s) carried a percentage discount; their money value is reconstructed from the settled total using the current service-charge % and is an estimate.`);
@@ -34604,7 +34619,7 @@ export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number):
 // ============================================================================
 //
 // THE MONEY IS DEFINED IN mis_report_math.ts, NOT HERE. That module carries the
-// one Gross → Discount → Net → Tax → Service Charge → Round Off → Grand Total
+// one Item total → Discount → Net → Service Charge → Tax → Round Off → Gross
 // ladder every report below composes, the discount reconstruction, the
 // settlement allocation, the period-on-period rules and the bill-edit
 // classifier — all pure, all jest-proven without a pg pool. Read its header
@@ -34707,7 +34722,15 @@ const NOTE_COVERS_ONCE =
 const NOTE_PER_COVER_PRETAX =
   "Per-cover figures are PRE-TAX (net of discount, before service charge and tax) — the house APC convention. Average bill value is the tax-inclusive grand total.";
 const NOTE_ROUND_OFF =
-  "Round off is what rounded each bill to the rupee (recorded at settle). It sits inside the grand total and outside net sales, service charge and tax; bills settled before rounding carry 0.";
+  "Round off is what rounded each bill to the rupee (recorded at settle). It sits inside Gross (the grand total) and outside Net, service charge and tax; bills settled before rounding carry 0.";
+/**
+ * THE THREE WORDS, defined once, on every report that prints them. The client's
+ * definitions — see the vocabulary block in the header of mis_report_math.ts.
+ * The web XLSX notes sheet and the app's CSV/PDF preamble print meta.notes, so
+ * the definition travels with every export too.
+ */
+const NOTE_GROSS_NET =
+  "Gross is the grand total of the bills: net + service charge + tax + round off, before refunds. Net is the item total less discounts, before service charge, tax and round off. Item total is the menu-price value of the bill lines before any discount.";
 const NOTE_DISCOUNT_ESTIMATE =
   "A discount stored as a percentage did not have its money value snapshotted; it is reconstructed from the settled total. Those bills are counted in estimated_discount_bills.";
 
@@ -35180,7 +35203,7 @@ export interface ItemWiseRow {
   /** Menu-price value of those units: the revenue given away on this dish. */
   nc_value: number;
   avg_selling_price: number | null;
-  /** Share of the report's total gross. */
+  /** Share of the report's total item total. */
   contribution_pct: number | null;
   dine_in_qty: number;
   takeaway_qty: number;
@@ -35216,9 +35239,12 @@ const ITEM_WISE_COLUMNS: MisColumn[] = [
   { key: "name", label: "Item", type: "text" },
   { key: "category", label: "Category", type: "text" },
   { key: "qty", label: "Qty", type: "int", total: true },
-  { key: "gross_amount", label: "Gross", type: "money", total: true },
-  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // "Item total", and only that. Neither the client's Gross (which carries the
+  // bill's service charge and tax) nor its Net (which is after the bill's
+  // discount) exists on a LINE — all three live on the bill — so the old
+  // Discount (always 0) and Net (always = this) columns are gone from the grid.
+  // discount_amount / net_amount stay on the payload for installed 1.9.x tills.
+  { key: "gross_amount", label: "Item total", type: "money", total: true },
   { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
   { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
   { key: "avg_selling_price", label: "Avg selling price", type: "money" },
@@ -35246,10 +35272,11 @@ const ITEM_WISE_COLUMNS: MisColumn[] = [
  *   * Category is recovered by joining that name to the current menu. Rename a
  *     dish and the join silently stops matching, which is why `category_exact`
  *     is false and the UI is expected to label the column as indicative.
- *   * The money is the MENU PRICE. Discounts here are applied to the BILL, never
- *     to a line, so item net equals item gross and `discount_amount` is a
- *     truthful zero. The window's bill-level discount is reported alongside
- *     rather than smeared across the lines as an invented per-item number.
+ *   * The money is the MENU PRICE — the "Item total". Discounts here are applied
+ *     to the BILL, never to a line, so `net_amount` equals `gross_amount` and
+ *     `discount_amount` is a truthful zero (both kept on the payload, neither a
+ *     column). The window's bill-level discount is reported alongside rather
+ *     than smeared across the lines as an invented per-item number.
  */
 export async function GetItemWiseReport(restaurantId: string, q: MisReportQuery = {}): Promise<ItemWiseReport> {
   const mc = await misContext(restaurantId, q);
@@ -35371,9 +35398,9 @@ export async function GetItemWiseReport(restaurantId: string, q: MisReportQuery 
       NOTE_CANCELLED_EXCLUDED,
       "There is no OrderItems table: an order line carries only a name, a price and a quantity. Items are aggregated by NAME, so renaming a dish splits its history into two rows.",
       "Category is recovered by matching the item name against the CURRENT menu. A renamed or deleted menu item shows no category. Treat this column as indicative, not exact.",
-      "Amounts are the MENU PRICE charged on the line (price × quantity) — before any bill-level discount, service charge or tax.",
-      "Discounts in this system are applied to the BILL, never to a line, so item discount is a truthful 0 and net equals gross. The window's bill-level discount is reported as bill_level_discount.",
-      "NC qty / NC value are the part of this dish that was served but never charged for. They are counted INSIDE Qty and Gross — the food was made — and shown again separately as the revenue given away. Every bill total elsewhere is already net of them.",
+      "Item total is the MENU PRICE charged on the line (price × quantity) — before any bill-level discount, service charge, tax or round off.",
+      "Gross and Net are BILL figures (see the Sales Summary): a discount, a service charge and tax are applied to the whole bill, never to a line, so neither can be put on a dish honestly and this report shows only the item total. The window's bill-level discount is reported as bill_level_discount.",
+      "NC qty / NC value are the part of this dish that was served but never charged for. They are counted INSIDE Qty and Item total — the food was made — and shown again separately as the revenue given away. Every bill total elsewhere is already net of them.",
     ]),
     columns: ITEM_WISE_COLUMNS,
     rows: rowsOut,
@@ -35403,8 +35430,12 @@ export interface DiscountReportRow {
   /** From an approval request, when the discount went through one. */
   requested_by: string | null;
   approved_by: string | null;
+  /** "Item total": the bill's pre-discount value. */
+  item_total: number;
+  /** @deprecated Same value as `item_total`, for installed 1.9.x tills. */
   gross: number;
   net: number;
+  /** "Gross". */
   grand_total: number;
 }
 
@@ -35416,10 +35447,21 @@ export interface DiscountReport {
     discounted_bills: number;
     estimated_bills: number;
     discount_amount: number;
+    /** Over the DISCOUNTED bills only, like `net` and `grand_total` beside it. */
+    item_total: number;
+    /** @deprecated Same value as `item_total`. */
     gross: number;
     net: number;
     grand_total: number;
-    /** Discount as a share of the window's gross — the number that gets watched. */
+    /**
+     * Discount as a share of the WHOLE WINDOW's item total — every settled bill,
+     * not only the discounted ones, because "how much of what we sold did we give
+     * away" is the number that gets watched. On the item total, never on Gross:
+     * a share of the tax-inclusive total would understate discounting by the tax
+     * and service charge riding on it.
+     */
+    discount_pct_of_item_total: number | null;
+    /** @deprecated Same value as `discount_pct_of_item_total`. */
     discount_pct_of_gross: number | null;
   };
   page: MisPage;
@@ -35436,9 +35478,9 @@ const DISCOUNT_COLUMNS: MisColumn[] = [
   { key: "reason", label: "Reason", type: "text" },
   { key: "requested_by", label: "Requested by", type: "text" },
   { key: "approved_by", label: "Approved by", type: "text" },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
 ];
 
 /**
@@ -35544,6 +35586,7 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
       reason: r.reason?.trim() || null,
       requested_by: r.requested_by?.trim() || null,
       approved_by: r.decided_by?.trim() || null,
+      item_total: money.item_total,
       gross: money.gross,
       net: money.net,
       grand_total: money.grand_total,
@@ -35564,6 +35607,8 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
       NOTE_DISCOUNT_ESTIMATE,
       "Requested by / Approved by are populated only for discounts that went through the approval threshold. A discount applied directly records no actor, and both columns stay blank rather than being inferred.",
       "Bill totals are already NET of these discounts — this report is context, never a figure to subtract from revenue a second time.",
+      NOTE_GROSS_NET,
+      "Item total, Net and Gross in the totals row cover the discounted bills only. The discount percentage is taken against the WHOLE window's item total — every settled bill — so it is the share of everything sold that was given away.",
     ]),
     columns: DISCOUNT_COLUMNS,
     rows: out,
@@ -35571,9 +35616,11 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
       discounted_bills: ladder.discounted_bills,
       estimated_bills: ladder.estimated_discount_bills,
       discount_amount: ladder.discount,
+      item_total: discountedLadder.item_total,
       gross: discountedLadder.gross,
       net: discountedLadder.net,
       grand_total: discountedLadder.grand_total,
+      discount_pct_of_item_total: sharePct(ladder.discount, ladder.item_total),
       discount_pct_of_gross: sharePct(ladder.discount, ladder.gross),
     },
     page,
@@ -35977,13 +36024,16 @@ const SALES_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "bucket", label: "Period", type: "text" },
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
   { key: "service_charge", label: "Service charge", type: "money", total: true },
   { key: "tax", label: "Tax", type: "money", total: true },
-  { key: "round_off", label: "Round off", type: "money", total: true, default_on: false },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  // ON by default: Net + service charge + tax + round off IS Gross, and a
+  // default layout whose visible rungs stop a few paise short of its own Gross
+  // column is the first thing an auditor circles.
+  { key: "round_off", label: "Round off", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "refund", label: "Refunds", type: "money", total: true },
   // Beside the ladder, never inside it — and on the COMP clock, not the
   // settlement clock the rest of the row is on. Both facts are in the notes and
@@ -36044,7 +36094,8 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
       NOTE_PER_COVER_PRETAX,
       NOTE_ROUND_OFF,
       NOTE_DISCOUNT_ESTIMATE,
-      "Grand total here equals the sum of the Order Summary rows, the sum of the Settlement Summary rows and the sum of the Counter Summary rows for the same window and outlet scope.",
+      NOTE_GROSS_NET,
+      "Gross here equals the sum of the Order Summary rows, the sum of the Settlement Summary rows and the sum of the Counter Summary rows for the same window and outlet scope.",
       "The order-type split counts the bill against the order it was raised from; a bill whose order row is gone is not in that split, though its money is in the totals.",
       NOTE_NC_BESIDE_LADDER,
       NOTE_NC_CLOCK,
@@ -36078,11 +36129,16 @@ export interface OrderSummaryRow {
   covers: number | null;
   waiter: string | null;
   item_count: number;
+  /** "Item total": pre-discount. */
+  item_total: number;
+  /** @deprecated Same value as `item_total`, for installed 1.9.x tills. */
   gross: number;
   discount: number;
   net: number;
   service_charge: number;
   tax: number;
+  round_off: number;
+  /** "Gross". */
   grand_total: number;
   refund: number;
   payment_method: string | null;
@@ -36106,12 +36162,15 @@ const ORDER_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "covers", label: "Covers", type: "int" },
   { key: "waiter", label: "Waiter", type: "text" },
   { key: "item_count", label: "Items", type: "int", total: true },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
   { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
   { key: "tax", label: "Tax", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  // The rung that was missing: without it no row's Net + SC + Tax reached its
+  // own Gross, and the gap was the paise the bill was rounded by.
+  { key: "round_off", label: "Round off", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "refund", label: "Refund", type: "money", total: true, default_on: false },
   { key: "payment_method", label: "Payment", type: "text" },
   { key: "status", label: "Status", type: "text" },
@@ -36205,11 +36264,13 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
       covers: r.session_covers == null ? null : Math.max(1, Math.round(parseNumeric(r.session_covers))),
       waiter: waiter || null,
       item_count: Math.max(0, Math.round(Number(r.item_count ?? 0))),
+      item_total: money.item_total,
       gross: money.gross,
       discount: money.discount,
       net: money.net,
       service_charge: money.service_charge,
       tax: money.tax,
+      round_off: money.round_off,
       grand_total: money.grand_total,
       refund: money.refund,
       payment_method: r.payment_method?.trim() || null,
@@ -36224,7 +36285,9 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
       "Covers on a row are the SEATING's party size, so two split bills on one table each show the same party. The totals row still counts that party once.",
       "Items is the line count of the order the bill was raised from, not the merged item count of every order on the table.",
       NOTE_DISCOUNT_ESTIMATE,
-      "The totals row covers the WHOLE window, not the page on screen, and equals the Sales Summary's grand total for the same window.",
+      NOTE_GROSS_NET,
+      NOTE_ROUND_OFF,
+      "The totals row covers the WHOLE window, not the page on screen, and its Gross equals the Sales Summary's for the same window.",
     ]),
     columns: ORDER_SUMMARY_COLUMNS,
     rows: out,
@@ -36296,11 +36359,11 @@ const EXECUTIVE_COLUMNS: MisColumn[] = [
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "abv", label: "ABV", type: "money" },
   { key: "apc", label: "APC (pre-tax)", type: "money" },
   { key: "nc_value", label: "NC given away", type: "money", total: true, default_on: false },
-  { key: "previous_grand_total", label: "Previous period", type: "money", total: true },
+  { key: "previous_grand_total", label: "Previous period (gross)", type: "money", total: true },
   { key: "growth_pct", label: "Growth %", type: "percent" },
   { key: "share_pct", label: "% of group", type: "percent" },
 ];
@@ -36403,6 +36466,7 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
       NOTE_CANCELLED_EXCLUDED,
       NOTE_COVERS_ONCE,
       NOTE_PER_COVER_PRETAX,
+      NOTE_GROSS_NET,
       mc.allOutlets
         ? "Showing every outlet of this restaurant. Group totals are the sum of the outlet rows."
         : "Showing one outlet. Switch the outlet selector to All to compare branches.",
@@ -36475,10 +36539,10 @@ const COVER_SIZE_COLUMNS: MisColumn[] = [
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "spend_per_cover", label: "Spend per cover (pre-tax)", type: "money" },
   { key: "avg_bill_value", label: "Avg bill value", type: "money" },
-  { key: "share_pct", label: "% of sales", type: "percent" },
+  { key: "share_pct", label: "% of gross", type: "percent" },
 ];
 
 /**
@@ -36541,6 +36605,7 @@ export async function GetCoverSizeSummaryReport(restaurantId: string, q: MisRepo
       NOTE_COVERS_ONCE,
       "A party is one SEATING. Every bill raised on that seating sits in the same bucket, and the party is counted once however many ways the bill was split.",
       NOTE_PER_COVER_PRETAX,
+      NOTE_GROSS_NET,
       "Bills whose seating cannot be resolved sit in the blank party-size row: their money is included so the buckets still add up to the Sales Summary, but they contribute no covers.",
     ]),
     columns: COVER_SIZE_COLUMNS,
@@ -36583,7 +36648,9 @@ const SETTLEMENT_COLUMNS: MisColumn[] = [
   { key: "amount", label: "Collected", type: "money", total: true },
   { key: "share_pct", label: "% of takings", type: "percent" },
   { key: "refund", label: "Refunds", type: "money", total: true },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // NOT the client's Net (which is pre-tax): this is Collected less refunds, tax
+  // and all. Named for what it is so "Net" keeps exactly one meaning.
+  { key: "net_amount", label: "After refunds", type: "money", total: true },
 ];
 
 /**
@@ -36638,9 +36705,9 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
   return {
     meta: await misMeta(mc, "settlement_summary", "Settlement Summary", [
       NOTE_SETTLEMENT_BASIS,
-      "Collected totals equal the Sales Summary's grand total for the same window — that equality is what makes this a cash-up sheet.",
+      "Collected totals equal the Sales Summary's Gross (the grand total) for the same window — that equality is what makes this a cash-up sheet.",
       "A bill settled with more than one mode counts once under each mode it touched, so the bill counts here can add up to more than the bill count.",
-      "Refunds have no payment mode of their own; each is attributed to the mode(s) its bill was paid with, in proportion. Collected is what was taken at the till; Net is what survived the refunds.",
+      "Refunds have no payment mode of their own; each is attributed to the mode(s) its bill was paid with, in proportion. Collected is what was taken at the till; After refunds is what survived the refunds. It still carries the tax, so it is not Net.",
       "Anything in the Unallocated row is money whose split-tender parts did not add back to the bill total. It should always be zero; if it is not, those bills need looking at.",
     ]),
     columns: SETTLEMENT_COLUMNS,
@@ -36676,9 +36743,10 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
 //
 //   NET   = taxable_base. Post-discount, PRE service charge, PRE tax. This is the
 //           figure the Sales Summary calls Net and the one an accountant means.
-//   GROSS = "Bills".total_amt. Tax-inclusive, exactly what the guest paid. It is
-//           NOT "net before discount" — that is `gross` inside BillMoney, which
-//           is a different question and deliberately not on this card.
+//   GROSS = "Bills".total_amt: service charge, tax and round off included,
+//           exactly what the guest paid — the MIS reports' Gross column. It is
+//           NOT "net before discount"; that is `item_total` inside BillMoney (and
+//           its deprecated alias `gross`), and deliberately not on this card.
 //   ONLINE = a bill whose orders arrived through an ONLINE channel: an aggregator
 //           (Swiggy, Zomato, anything AddOrder stamped with a source name) or a
 //           DELIVERY order. A counter takeaway is a walk-in and is NOT online;
@@ -36871,15 +36939,15 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     today_net: fig(todayNet, "Today's net sale",
       "Settled today, after discounts and before service charge and tax. The figure the Sales Summary calls Net."),
     today_gross: fig(todayGross, "Today's gross sale",
-      "Settled today, tax inclusive \u2014 exactly what guests paid."),
+      "Settled today, including service charge, tax and round off \u2014 exactly what guests paid."),
     online_net: fig(onlineNet, "Online sale (net)",
       "Today's delivery and aggregator orders, before service charge and tax. A counter takeaway is a walk-in and is not counted."),
     online_gross: fig(onlineGross, "Online sale (gross)",
-      "Today's delivery and aggregator orders, tax inclusive."),
+      "Today's delivery and aggregator orders, including service charge, tax and round off."),
     cash_collection: fig(cash, "Cash collection",
       "Cash taken today. A bill split across modes counts only its cash part."),
     month_to_date: fig(monthGross, "Month to date",
-      `Gross sales from ${monthFrom} to today, tax inclusive.`),
+      `Gross sales from ${monthFrom} to today, including service charge, tax and round off.`),
     // A released ₹0 table is a bill with no mode and no money. It stays in
     // today_bills (as it always has) but a row reading "Other ₹0.00" is noise on
     // the one screen a cashier reads at close. Filtering it moves no total.
@@ -39718,7 +39786,7 @@ const VARIATION_BASE_LABEL = "Base (no variation)";
 const NOTE_ITEM_CLOCK =
   "Aggregated by ORDER PLACEMENT time, not settlement time, exactly as Item Wise is. It ties to Item Wise for the same window and will NOT tie to the Sales Summary.";
 const NOTE_ITEM_BASIS =
-  "Amounts are the MENU PRICE charged on the line (price x quantity) — before any bill-level discount, service charge or tax. Discounts in this system are BILL-level, so line discount is a truthful 0 and net equals gross.";
+  "Item total is the MENU PRICE charged on the line (price x quantity) — before any bill-level discount, service charge, tax or round off. Gross and Net are BILL figures (see the Sales Summary) and cannot be put on a line honestly, so this report shows only the item total.";
 const NOTE_ACT_CLOCK =
   "Rows are bucketed by when the ACT happened, not by when the bill settled. An act on a table that pays after midnight falls on the day of the act.";
 
@@ -40372,9 +40440,9 @@ const GROUP_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "group_name", label: "Group", type: "text" },
   { key: "items", label: "Items", type: "int", total: true },
   { key: "qty", label: "Qty", type: "int", total: true },
-  { key: "gross_amount", label: "Gross", type: "money", total: true },
-  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // "Item total" only — see ITEM_WISE_COLUMNS. discount_amount / net_amount stay
+  // on the payload, off the grid.
+  { key: "gross_amount", label: "Item total", type: "money", total: true },
   { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
   { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
   { key: "contribution_pct", label: "% contribution", type: "percent" },
@@ -40473,7 +40541,7 @@ export async function GetGroupSummaryReport(restaurantId: string, q: MisReportQu
       `A dish that is on the menu but in no group is reported under "${UNCLASSIFIED_GROUP}": a configuration gap, and it disappears as the menu is classified. A line that matches no menu row at all — a dish deleted or renamed since, an off-menu charge — is reported under "${UNATTRIBUTED_GROUP}": a history gap that cannot be closed backwards. Neither is ever folded into a real group.`,
       "A line is matched to its dish by the menu id the server stamps on it (migration 039), and by NAME for lines written before that. A dish renamed since it was sold is therefore unattributed here and category-less in Item Wise — one gap, reported consistently in both.",
       "Groups are resolved when the report is read, never stored on the order line, so reclassifying a dish corrects its whole history rather than only its future.",
-      "Gross here equals Item Wise's gross for the same window: it is the same set of lines, cut a different way.",
+      "Item total here equals Item Wise's item total for the same window: it is the same set of lines, cut a different way.",
     ]),
     columns: GROUP_SUMMARY_COLUMNS,
     rows,
@@ -40546,9 +40614,8 @@ const VARIATION_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "qty", label: "Qty", type: "int", total: true },
   { key: "avg_price", label: "Sold at", type: "money" },
   { key: "list_price", label: "Configured price", type: "money" },
-  { key: "gross_amount", label: "Gross", type: "money", total: true },
-  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // "Item total" only — see ITEM_WISE_COLUMNS.
+  { key: "gross_amount", label: "Item total", type: "money", total: true },
   { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
   { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
   { key: "item_share_pct", label: "% of item", type: "percent" },
@@ -40682,7 +40749,7 @@ export async function GetVariationSummaryReport(restaurantId: string, q: MisRepo
       NOTE_ITEM_CLOCK,
       NOTE_CANCELLED_EXCLUDED,
       NOTE_ITEM_BASIS,
-      "Only dishes that are sold in variations appear here, so these totals are a SUBSET of Item Wise's for the same window. window_gross carries Item Wise's total so the size of that subset is visible.",
+      "Only dishes that are sold in variations appear here, so these totals are a SUBSET of Item Wise's for the same window. window_gross carries Item Wise's item total so the size of that subset is visible.",
       "A line counts as a variation only because the server stamped one on it. A variation is never inferred from an item name, so a hand-typed off-menu line is not read as a size that was sold.",
       "A line naming a variation this menu no longer has keeps that label, is marked unresolved and shows no configured price — it was a real sale of something since retired.",
       "Sold at is what the lines actually carried; Configured price is the variation's price today. The variation price is a FLOOR, not a fixed rate, so the two can legitimately differ.",
@@ -40892,11 +40959,16 @@ export interface CounterSummaryRow {
   cashier_count: number;
   bills: number;
   covers: number;
+  /** "Item total": pre-discount. */
+  item_total: number;
+  /** @deprecated Same value as `item_total`, for installed 1.9.x tills. */
   gross: number;
   discount: number;
   net: number;
   service_charge: number;
   tax: number;
+  round_off: number;
+  /** "Gross". */
   grand_total: number;
   refund: number;
   /** The mode cut, machine-readable. Sums to grand_total exactly. `label` is display only. */
@@ -40927,12 +40999,14 @@ const COUNTER_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "cashiers", label: "Cashiers", type: "text" },
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true, default_on: false },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
   { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
   { key: "tax", label: "Tax", type: "money", total: true, default_on: false },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  // The rung the Order Summary was also missing — see ORDER_SUMMARY_COLUMNS.
+  { key: "round_off", label: "Round off", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "refund", label: "Refunds", type: "money", total: true, default_on: false },
   { key: "payment_modes", label: "Payment modes", type: "text" },
   { key: "opened_at", label: "Opened", type: "datetime" },
@@ -41110,11 +41184,13 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
       cashier_count: names.length,
       bills: l.bills,
       covers: l.covers,
+      item_total: l.item_total,
       gross: l.gross,
       discount: l.discount,
       net: l.net,
       service_charge: l.service_charge,
       tax: l.tax,
+      round_off: l.round_off,
       grand_total: l.grand_total,
       refund: l.refund,
       by_method: [...parts]
@@ -41141,7 +41217,9 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
     meta: await misMeta(mc, "counter_summary", "Counter Summary", [
       NOTE_SETTLEMENT_BASIS,
       NOTE_COVERS_ONCE,
-      "Grand total here equals the Sales Summary's grand total for the same window: this is the same set of bills, cut by the till that rang them.",
+      NOTE_GROSS_NET,
+      NOTE_ROUND_OFF,
+      "Gross here equals the Sales Summary's Gross for the same window: this is the same set of bills, cut by the till that rang them.",
       `Bills that recorded no till are collected in the "${COUNTER_UNASSIGNED_CODE}" row. That is every bill written before billing counters existed, and every bill on an outlet with a single till — the row is normal, not an error.`,
       "The payment-mode split is the same allocation the Settlement Summary uses, including its Unallocated bucket, so a shortfall on one till traces into the same numbers as the cash-up sheet.",
       "The counter is the TILL and the cash session is the SHIFT. Opened and Closed are the earliest opening and the latest closing of the sessions on that till that overlap this window; Closed is blank while any of them is still open, because a drawer that has not been counted has no closing time.",
