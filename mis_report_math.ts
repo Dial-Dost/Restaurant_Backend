@@ -22,17 +22,35 @@
  *                      and there is no OrderItems table), never stored, and NOT
  *                      part of this ladder — see the Item Wise note below.
  *     ────────────────────────────────────────────────────────────────────────
- *       gross          = net + discount                            (DERIVED UP)
+ *       item_total     = net + discount   "Item total"             (DERIVED UP)
  *     − discount       Bills.discount_value resolved to money (billDiscountMoney)
  *     ────────────────────────────────────────────────────────────────────────
- *     = net            closedBillCharges().taxable_base   ← THE ANCHOR
+ *     = net            closedBillCharges().taxable_base   "Net"   ← THE ANCHOR
  *     + service_charge closedBillCharges().service_charge
  *     + tax            closedBillCharges().tax_total
  *     + round_off      closedBillCharges().round_off  ("Bills".round_off, 048)
  *     ────────────────────────────────────────────────────────────────────────
- *     = grand_total    Bills.total_amt   (TAX-INCLUSIVE, already net of discount)
+ *     = grand_total    Bills.total_amt   "Gross"  (TAX-INCLUSIVE, already net
+ *                                                  of discount, before refunds)
  *
- * WHY `net` IS THE ANCHOR AND `gross` IS DERIVED UPWARD. The only stored money
+ * THE THREE WORDS, AND WHY THEY ARE THESE. The client's own definitions: GROSS
+ * is "the total value of all the bills including service charge, taxes and so
+ * on" — the grand total, round off included, because that is the figure printed
+ * on the bill and taken at the till. NET is "just the menu price value of the
+ * bills" with the discount, service charge and tax taken back out — `net`. The
+ * rung ABOVE the discount had been called "gross", which put one word on two
+ * different numbers and printed Gross === Net on every report of a restaurant
+ * that never discounts. It is now "Item total" (`item_total`). Every column
+ * labelled Gross is keyed grand_total and every one labelled Net is keyed net;
+ * test/money pins that on every payload.
+ *
+ * `gross` IS A DEPRECATED ALIAS OF `item_total`, same value, kept because
+ * installed 1.9.x tills read ladder['gross'] for their pre-discount tile. It must
+ * NEVER be repointed at grand_total: an old till would then print
+ * "Gross 4982 − Discount 0 = Net 4745", arithmetic that does not add up. Remove
+ * it once the minimum app version reads item_total.
+ *
+ * WHY `net` IS THE ANCHOR AND `item_total` IS DERIVED UPWARD. The only stored money
  * fact on a settled bill is total_amt, the tax-inclusive grand total. Everything
  * above it is recovered by SUBTRACTION inside closedBillCharges, which is what
  * makes `net + service_charge + tax + round_off === grand_total` hold EXACTLY, per bill, in
@@ -92,7 +110,7 @@
  * the money exists. An order placed at 23:50 and settled at 00:10 belongs to two
  * different days in the two views, and no amount of arithmetic reconciles that.
  * The Item Wise payload says so in its own `notes`, and its money basis is the
- * MENU PRICE (price × quantity), which is above `gross` on the ladder: it carries
+ * MENU PRICE (price × quantity), which is above `item_total` on the ladder: it carries
  * no bill-level discount, no service charge and no tax. The Group Summary and
  * the Variation Summary are the SAME cut of the SAME lines on the SAME clock, so
  * those three tie to each other exactly and to nothing else — jest proves that
@@ -107,7 +125,12 @@ import { addDaysToKey, countDays } from "./report_window.js";
 
 /** One settled bill's money, composed exactly as the ladder above. */
 export interface BillMoney {
-  /** net + discount. Pre-discount food value. DERIVED, never stored. */
+  /** "Item total": net + discount. Pre-discount food value. DERIVED, never stored. */
+  item_total: number;
+  /**
+   * @deprecated Same value as `item_total`, for installed 1.9.x tills. NOT the
+   * client's Gross — that is `grand_total`. See the header before touching it.
+   */
   gross: number;
   /** Money removed by a bill discount or coupon. See billDiscountMoney. */
   discount: number;
@@ -117,7 +140,7 @@ export interface BillMoney {
   tax: number;
   /** "Bills".round_off (migration 048): what rounded the bill to the rupee. 0 before it. */
   round_off: number;
-  /** "Bills".total_amt. net + service_charge + tax + round_off, exactly. */
+  /** "Gross": "Bills".total_amt. net + service_charge + tax + round_off, exactly. */
   grand_total: number;
   /** "Bills".refund_amount. Reverses a TAX-INCLUSIVE amount. */
   refund: number;
@@ -214,8 +237,10 @@ export function composeBillMoney(input: {
   const tax = round2(input.charges.tax_total);
   const d = billDiscountMoney(net, input.discount_type, input.discount_value ?? 0);
   const refund = round2(Math.max(0, input.refund_amount ?? 0));
+  const item_total = round2(net + d.discount);
   return {
-    gross: round2(net + d.discount),
+    item_total,
+    gross: item_total,
     discount: d.discount,
     net,
     service_charge,
@@ -231,7 +256,7 @@ export function composeBillMoney(input: {
 /** An empty rung set — what a window with no bills must return (never a 500). */
 export function zeroLadder(): LadderTotals {
   return {
-    gross: 0, discount: 0, net: 0, service_charge: 0, tax: 0,
+    item_total: 0, gross: 0, discount: 0, net: 0, service_charge: 0, tax: 0,
     round_off: 0, grand_total: 0, refund: 0, refunded_tax: 0,
     bills: 0, covers: 0, discounted_bills: 0, estimated_discount_bills: 0,
   };
@@ -239,6 +264,8 @@ export function zeroLadder(): LadderTotals {
 
 /** The ladder, summed over a set of bills, plus the counts that qualify it. */
 export interface LadderTotals {
+  item_total: number;
+  /** @deprecated Same value as `item_total` — see BillMoney.gross. */
   gross: number;
   discount: number;
   net: number;
@@ -258,6 +285,7 @@ export interface LadderTotals {
 
 /** Add one bill onto a running total. Mutates and returns `acc` (hot loop). */
 export function addToLadder(acc: LadderTotals, m: BillMoney): LadderTotals {
+  acc.item_total = round2(acc.item_total + m.item_total);
   acc.gross = round2(acc.gross + m.gross);
   acc.discount = round2(acc.discount + m.discount);
   acc.net = round2(acc.net + m.net);

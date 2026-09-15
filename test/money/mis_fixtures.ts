@@ -815,6 +815,27 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       }));
   }
 
+  // --- getSettledBills: the ACCOUNTING readers' bill read (GetSalesReport) ---
+  // Unaliased, and it selects no ids — which is how it is told apart from the
+  // MIS reads below. Modelled so a test can hold the accounting Net and the MIS
+  // Net to one number over the same bills, rather than trusting two readers
+  // that happen to share a classifier.
+  if (/from "Bills" where res_id = \$1/i.test(q) && /as settled_at/i.test(q)) {
+    requireShape(q, "coalesce(closed_at, admin_approved_at) >= $3",
+      "the settlement basis the MIS readers use too — two clocks would be two answers");
+    requireShape(q, "coalesce(closed_at, admin_approved_at) < $4",
+      "the EXCLUSIVE upper bound is what makes the range inclusive of its last day");
+    return billsMatching(q, params).map((b) => ({
+      settled_at: new Date(b.settled_at),
+      total_amt: b.total_amt,
+      tax_breakdown: b.tax_breakdown,
+      ...(/\bround_off\b/i.test(q) ? { round_off: b.round_off ?? 0 } : {}),
+      payment_method: b.payment_method ?? null,
+      payment_splits: b.payment_splits ?? null,
+      refund_amount: b.refund_amount ?? 0,
+    }));
+  }
+
   // --- "Bills" ---
   if (/from "Bills" b/i.test(q)) {
     requireShape(q, "b.res_id = $1", "the tenant predicate is the only thing between one restaurant's money and another's");

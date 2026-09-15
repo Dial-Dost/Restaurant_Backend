@@ -193,6 +193,10 @@ describe("settled-bill readers subtract the recorded round-off before they reach
     expect(report.total_discount).toBe(527.22);
     expect(report.manual_discount).toBe(527.22);
     expect(report.total_sales).toBe(GRAND);
+    // The notes never call these totals "net of discount": Net is the defined
+    // word for item total less discount (client item 1), and total_sales is Gross.
+    expect(report.notes.join(" ")).not.toMatch(/\bnet of\b/i);
+    expect(report.notes[0]).toMatch(/stored after discount/);
   });
 
   test("GetStaffPerformance: APC is pre-tax food per cover — 4745 / 2, for the waiter and the house", async () => {
