@@ -36,6 +36,7 @@ import { describe, test, expect, beforeEach, jest } from "@jest/globals";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { quoteServiceChargeWaiver } from "../../billing_math";
+import { classifyBillEdit } from "../../mis_report_math";
 
 const mockIds = {
   res: "11111111-1111-4111-8111-111111111111",
@@ -52,14 +53,24 @@ const mockDb: {
   subtotal: number;
   items: number;
   printCount: number;
-} = { taxConfig: null, scPct: 0, waiver: null, subtotal: 0, items: 1, printCount: 0 };
+  /** The open bill's row and invoice number — null until something mints them. */
+  billId: string | null;
+  billNo: string | null;
+} = { taxConfig: null, scPct: 0, waiver: null, subtotal: 0, items: 1, printCount: 0, billId: null, billNo: null };
 
 /** Every AddAuditLogEntry(res, outlet, emp, action, description, category, details). */
 const mockAudit: unknown[][] = [];
 /** Every ReceiptOptions handed to the ESC/POS renderer. THIS IS THE PAPER. */
 const mockReceipts: Record<string, unknown>[] = [];
 const mockCalls: { fn: string; args: unknown[] }[] = [];
-const mockNext: { waive: ((...a: unknown[]) => Promise<unknown>) | null; dispatchFails: boolean } = { waive: null, dispatchFails: false };
+const mockNext: {
+  waive: ((...a: unknown[]) => Promise<unknown>) | null;
+  dispatchFails: boolean;
+  /** What ResolveAuthoriser answers for the named authoriser. */
+  authoriser: "ok" | "not_found" | "not_permitted";
+  /** Every audit write rejects (the database refusing the insert). */
+  auditFails: boolean;
+} = { waive: null, dispatchFails: false, authoriser: "ok", auditFails: false };
 
 jest.mock("pg", () => {
   const answer = (sql: string): unknown[] => {
@@ -87,7 +98,12 @@ jest.mock("pg", () => {
   return { Pool: FakePool, default: { Pool: FakePool } };
 });
 
-jest.mock("../../realtime", () => ({ __esModule: true, emitRestaurant: jest.fn(), emitOutlet: jest.fn() }));
+jest.mock("../../realtime", () => ({
+  __esModule: true,
+  // Recorded in call order with everything else, so "after the commit" is checkable.
+  emitRestaurant: (...args: unknown[]) => { mockCalls.push({ fn: "emitRestaurant", args }); },
+  emitOutlet: jest.fn(),
+}));
 
 jest.mock("../../database_supabase", () => {
   const actual = jest.requireActual("../../database_supabase") as Record<string, any>;
@@ -105,7 +121,7 @@ jest.mock("../../database_supabase", () => {
       const cfg = await actual.GetBillChargeConfigForTable(mockIds.res, "T1");
       const charges = actual.computeBillCharges(mockDb.subtotal, cfg.taxConfig, cfg.scPct, cfg.includeServiceCharge);
       return {
-        bill_id: mockIds.bill, table_id: mockIds.table,
+        bill_id: mockDb.billId, table_id: mockIds.table,
         total_amt: mockDb.subtotal, subtotal: mockDb.subtotal,
         discount: 0, discount_type: null, discount_value: 0,
         service_charge: charges.service_charge, service_charge_percent: charges.service_charge_percent,
@@ -113,7 +129,7 @@ jest.mock("../../database_supabase", () => {
         service_charge_basis: cfg.basis, service_charge_applied: cfg.service_charge_applied,
         taxes: charges.taxes, tax_total: charges.tax_total, round_off: charges.round_off, grand_total: charges.grand_total,
         items: [{ name: "Dal Makhani", price: mockDb.subtotal, quantity: 1 }],
-        covers: 2, customer: null, customer_gstin: null, bill_no: "B-1", coupon_code: null,
+        covers: 2, customer: null, customer_gstin: null, bill_no: mockDb.billNo, coupon_code: null,
         order_notes: [] as string[], order_ids: [], kot_nos: [],
         print_count: mockDb.printCount,
         bill_printed_at: mockDb.printCount > 0 ? "2026-09-15T10:00:00.000Z" : null,
@@ -127,9 +143,14 @@ jest.mock("../../database_supabase", () => {
     GetEmployeeDetailsFromEmpID: () => Promise.resolve({
       id: "emp-1", res_id: mockIds.res, outlet_id: mockIds.outlet, username: "cashier1", emp_Fname: "Cashier", emp_Lname: "One",
     }),
-    AddAuditLogEntry: (...args: unknown[]) => { mockAudit.push(args); return Promise.resolve(undefined); },
+    AddAuditLogEntry: (...args: unknown[]) => {
+      if (mockNext.auditFails) { return Promise.reject(new Error("fixture: Audit_logs insert refused")); }
+      mockAudit.push(args);
+      return Promise.resolve(undefined);
+    },
     ResolveAuthoriser: (...args: unknown[]) => {
       record("ResolveAuthoriser", args);
+      if (mockNext.authoriser !== "ok") { return Promise.resolve({ ok: false, reason: mockNext.authoriser }); }
       return Promise.resolve({ ok: true, identity: { employee_id: "emp-2", username: "manager01", display_name: "Manager One" } });
     },
     WaiveServiceCharge: (...args: unknown[]) => {
@@ -191,6 +212,8 @@ const MANAGER = identity("manager", [ADD_ORDERS, WAIVE]);
 const CASHIER = identity("cashier", [ADD_ORDERS]);
 /** A waiter the tenant HAS granted the waiver — C3 still holds them to one print. */
 const GRANTED_WAITER = identity("waiter", [ADD_ORDERS, WAIVE]);
+/** A session minted before the username was carried: it cannot sign a waiver. */
+const UNSIGNED_MANAGER = { ...MANAGER, employeeUsername: undefined };
 
 const ROUTE = "/bills/service-charge-waiver/print";
 const WAIVER_FORM = { waiver_kind: "guest_request", reason: "Guest asked", authorised_by: "manager01" };
@@ -246,6 +269,12 @@ function waiverRow(id: string, quote?: ReturnType<typeof quoteServiceChargeWaive
 function commitsAWaiver(): (...a: unknown[]) => Promise<unknown> {
   return async () => {
     const quote = quoteServiceChargeWaiver(mockDb.subtotal, mockDb.taxConfig, mockDb.scPct);
+    // ensureOpenBillIdForTable: a table with no "Bills" row gets one, and with
+    // it an invoice number, inside the waiver's transaction.
+    if (mockDb.billId === null) {
+      mockDb.billId = mockIds.bill;
+      mockDb.billNo = "B-42";
+    }
     mockDb.waiver = waiverRow("w-new", quote);
     return {
       record: {
@@ -263,12 +292,16 @@ function commitsAWaiver(): (...a: unknown[]) => Promise<unknown> {
 
 const called = (fn: string): number => mockCalls.filter((c) => c.fn === fn).length;
 const auditsUnder = (actionId: string): unknown[][] => mockAudit.filter((a) => a[3] === actionId);
+/** Index into mockCalls of each "bill:updated" announcement, with its payload. */
+const billAnnouncements = (): { at: number; payload: unknown }[] =>
+  mockCalls.flatMap((c, at) => (c.fn === "emitRestaurant" && c.args[1] === "bill:updated" ? [{ at, payload: c.args[2] }] : []));
 const nothingWritten = (): void => {
   expect(called("WaiveServiceCharge")).toBe(0);
   expect(called("dispatchPrintJob")).toBe(0);
   expect(called("RecordClientRenderedBillPrint")).toBe(0);
   expect(mockReceipts).toHaveLength(0);
   expect(auditsUnder(WAIVE)).toHaveLength(0);
+  expect(billAnnouncements()).toHaveLength(0);
 };
 
 beforeEach(async () => {
@@ -284,11 +317,15 @@ beforeEach(async () => {
   mockDb.subtotal = 5499;
   mockDb.items = 1;
   mockDb.printCount = 0;
+  mockDb.billId = mockIds.bill;
+  mockDb.billNo = "B-1";
   mockAudit.length = 0;
   mockReceipts.length = 0;
   mockCalls.length = 0;
   mockNext.waive = commitsAWaiver();
   mockNext.dispatchFails = false;
+  mockNext.authoriser = "ok";
+  mockNext.auditFails = false;
 });
 
 // ============================================================================
@@ -489,6 +526,212 @@ describe("refusals are answered before any waiver is written", () => {
     expect(answer.status).toBe(403);
     expect(answer.body.requiredPermission).toBe(ADD_ORDERS);
     nothingWritten();
+  });
+});
+
+// ============================================================================
+// A REFUSED REMOVAL IS ON THE RECORD
+// ============================================================================
+//
+// Before 2.0.0 the till asked POST /print/bill for no_service_charge:true, and
+// with no waiver on the bill that print left "asked WITHOUT the service charge;
+// no waiver is recorded" in the audit log — production has these. Both clients
+// now call this route instead, and a refusal prints nothing, so unless the
+// refusal files its own line the attempt is simply gone from the log.
+
+const REFUSED_PREFIX = "REFUSED removal of the service charge on table T1 — ";
+const refusalLines = (): unknown[][] => auditsUnder(ADD_ORDERS).filter((a) => String(a[4]).startsWith("REFUSED removal of the service charge"));
+
+describe("a refused removal of a charge that is on the bill files exactly one REFUSED line", () => {
+  test.each([
+    {
+      label: "no waive permission (403)", auth: CASHIER, body: WAIVER_FORM, status: 403,
+      refusal: "waiver_required", authorised_by: null,
+      sentence: "the caller does not hold the 'Waive Service Charge' permission",
+    },
+    {
+      label: "no kind (400)", auth: MANAGER, body: { reason: "Guest asked", authorised_by: "manager01" }, status: 400,
+      refusal: "reason_required", authorised_by: null, sentence: "no waiver kind or reason was given",
+    },
+    {
+      label: "no reason (400)", auth: MANAGER, body: { waiver_kind: "guest_request", authorised_by: "manager01" }, status: 400,
+      refusal: "reason_required", authorised_by: null, sentence: "no waiver kind or reason was given",
+    },
+    {
+      label: "no authoriser (400)", auth: MANAGER, body: { waiver_kind: "guest_request", reason: "Guest asked" }, status: 400,
+      refusal: "authoriser_missing", authorised_by: null, sentence: "no authoriser was named",
+    },
+    {
+      label: "a session with no username (400)", auth: UNSIGNED_MANAGER, body: WAIVER_FORM, status: 400,
+      refusal: "no_username", authorised_by: null, sentence: "the session carries no username to sign a waiver with",
+    },
+  ])("$label", async ({ auth, body, status, refusal, authorised_by, sentence }) => {
+    const answer = await call(ROUTE, { table_name: "T1", ...body }, auth);
+    expect(answer.status).toBe(status);
+    expect(mockAudit).toHaveLength(1);
+    const [line] = refusalLines();
+    expect(line![4]).toBe(`${REFUSED_PREFIX}${sentence}; nothing was waived or printed`);
+    expect(line![5]).toBe("Bill");
+    expect(line![6]).toEqual({
+      table: "T1", refused: true, refusal,
+      service_charge_basis: "tax_line", service_charge_waiver_required: true, authorised_by,
+    });
+    nothingWritten();
+  });
+
+  test.each([
+    ["not_found", 400, "the named authoriser is not a staff member of this outlet"],
+    ["not_permitted", 403, "the named authoriser may not authorise a service-charge waiver"],
+  ] as const)("an authoriser the lookup refuses (%s) -> %i, one line naming them in the details only", async (reason, status, sentence) => {
+    mockNext.authoriser = reason;
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM, authorised_by: "note on dessert" }, MANAGER);
+    expect(answer.status).toBe(status);
+    expect(mockAudit).toHaveLength(1);
+    const [line] = refusalLines();
+    expect(line![4]).toBe(`${REFUSED_PREFIX}${sentence}; nothing was waived or printed`);
+    expect(line![6]).toMatchObject({ refusal: `authoriser_${reason}`, authorised_by: "note on dessert" });
+    // Typed text stays out of the sentence the Bill Edit classifier pattern-matches.
+    expect(String(line![4])).not.toContain("note on dessert");
+    nothingWritten();
+  });
+
+  test("every refusal line is a control record, not a bill edit", async () => {
+    const cases: [unknown, Record<string, unknown>][] = [
+      [CASHIER, WAIVER_FORM],
+      [MANAGER, { reason: "Guest asked", authorised_by: "manager01" }],
+      [MANAGER, { waiver_kind: "guest_request", reason: "Guest asked" }],
+      [UNSIGNED_MANAGER, WAIVER_FORM],
+    ];
+    for (const [auth, body] of cases) { await call(ROUTE, { table_name: "T1", ...body }, auth); }
+    mockNext.authoriser = "not_found";
+    await call(ROUTE, { table_name: "T1", ...WAIVER_FORM, authorised_by: "note on dessert" }, MANAGER);
+    mockNext.authoriser = "not_permitted";
+    await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER);
+
+    const lines = refusalLines();
+    expect(lines).toHaveLength(6);
+    for (const line of lines) {
+      expect(classifyBillEdit(String(line[3]), String(line[4]), line[6] as Record<string, unknown>)).toBeNull();
+    }
+  });
+
+  test("a failed audit write never turns the refusal into a 500", async () => {
+    mockNext.auditFails = true;
+    expect((await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, CASHIER)).status).toBe(403);
+    expect((await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01" }, MANAGER)).status).toBe(400);
+    mockNext.authoriser = "not_permitted";
+    expect((await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER)).status).toBe(403);
+    nothingWritten();
+  });
+
+  test("not attempts on a charge: an empty table and a bill with no charge file nothing; C3 files only its own line", async () => {
+    mockDb.items = 0;
+    expect((await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, CASHIER)).status).toBe(400);
+    expect(mockAudit).toHaveLength(0);
+
+    mockDb.items = 1;
+    mockDb.taxConfig = { SGST: 2.5, CGST: 2.5 };
+    expect((await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, CASHIER)).body.nothing_to_remove).toBe(true);
+    expect(mockAudit).toHaveLength(0);
+
+    mockDb.taxConfig = { SGST: 2.5, CGST: 2.5, "Service Charge": 10 };
+    mockDb.printCount = 1;
+    expect((await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, identity("waiter", [ADD_ORDERS]))).body.reprint_needs_senior).toBe(true);
+    expect(mockAudit.map((a) => String(a[4]))).toEqual(["REFUSED reprint of table T1's bill — already printed 1 time(s); reprints need a senior role"]);
+    nothingWritten();
+  });
+
+  test("a removal that goes through files no REFUSED line", async () => {
+    expect((await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER)).status).toBe(200);
+    expect(refusalLines()).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// WHAT THE ROUTE'S NOTES PROMISE, PINNED
+// ============================================================================
+
+describe("the paper and the floor see the state AFTER the commit", () => {
+  test("a bill number the waiver MINTED is on the thermal paper", async () => {
+    mockDb.billId = null;
+    mockDb.billNo = null;
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER);
+    expect(answer.status).toBe(200);
+    // The first read saw a table with no bill; the waiver minted it.
+    expect(mockDb.billNo).toBe("B-42");
+    expect(mockReceipts).toHaveLength(1);
+    expect(mockReceipts[0]!.billNo).toBe("B-42");
+    expect(answer.body.billId).toBe(mockIds.bill);
+  });
+
+  test("...and in the web dashboard's printable_bill", async () => {
+    mockDb.billId = null;
+    mockDb.billNo = null;
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM, render: "client" }, MANAGER);
+    expect(answer.body.printable_bill.bill_no).toBe("B-42");
+    expect(answer.body.billId).toBe(mockIds.bill);
+  });
+
+  test("other tills are told the bill changed — once, after the waiver commits", async () => {
+    await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER);
+    const told = billAnnouncements();
+    expect(told).toHaveLength(1);
+    expect(told[0]!.payload).toEqual({ table: "T1" });
+    expect(mockCalls[told[0]!.at]!.args[0]).toBe(mockIds.res);
+    const waived = mockCalls.findIndex((c) => c.fn === "WaiveServiceCharge");
+    expect(waived).toBeGreaterThanOrEqual(0);
+    expect(told[0]!.at).toBeGreaterThan(waived);
+  });
+
+  test("a reprint of an existing waiver changes nothing, so it announces nothing", async () => {
+    mockDb.waiver = waiverRow("w-live", quoteServiceChargeWaiver(5499, mockDb.taxConfig, 0));
+    expect((await call(ROUTE, { table_name: "T1" }, CASHIER)).status).toBe(200);
+    expect(billAnnouncements()).toHaveLength(0);
+  });
+
+  test("a 23505 with no waiver to re-read -> 409, and nothing prints", async () => {
+    mockNext.waive = () => Promise.reject(Object.assign(new Error("duplicate key value violates unique constraint"), { code: "23505" }));
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER);
+    expect(answer.status).toBe(409);
+    expect(answer.body.error).toBe("This bill's service charge has already been waived.");
+    expect(mockReceipts).toHaveLength(0);
+    expect(called("dispatchPrintJob")).toBe(0);
+    expect(called("RecordClientRenderedBillPrint")).toBe(0);
+    expect(auditsUnder(WAIVE)).toHaveLength(0);
+  });
+
+  /** The waiver commits and is gone again (reversed on another till) before the paper is read. */
+  const commitsThenVanishes = (): (() => Promise<unknown>) => {
+    const commit = commitsAWaiver();
+    return async () => {
+      const result = await commit();
+      mockDb.waiver = null;
+      return result;
+    };
+  };
+
+  test("render client: the reply reports the RE-READ bill — charge still on, and its total", async () => {
+    mockNext.waive = commitsThenVanishes();
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM, render: "client" }, MANAGER);
+    expect(answer.status).toBe(200);
+    expect(answer.body.printable_bill.service_charge_waived).toBe(false);
+    expect(answer.body).toMatchObject({
+      printed: true, waiver_created: true, service_charge_removed: false,
+      grand_total_before: 6324, grand_total_after: 6324,
+    });
+  });
+
+  test("thermal: the paper, the reply and the print's audit line all say the charge is ON", async () => {
+    mockNext.waive = commitsThenVanishes();
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER);
+    expect(answer.status).toBe(200);
+    expect(Number(mockReceipts[0]!.grandTotal)).toBe(6324);
+    expect(answer.body).toMatchObject({ printed: true, service_charge_removed: false, grand_total_after: 6324 });
+    const prints = auditsUnder(ADD_ORDERS);
+    expect(prints.map((a) => String(a[4]))).toEqual([
+      "Printed bill for table T1 (asked WITHOUT the service charge; no waiver is recorded, so the charge is ON this bill)",
+    ]);
+    expect(prints[0]![6]).toMatchObject({ no_service_charge: true, service_charge_removed: false, service_charge_waiver_required: true });
   });
 });
 

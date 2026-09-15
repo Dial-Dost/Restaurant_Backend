@@ -202,6 +202,9 @@ const sRemoveServiceChargeAndPrint = z.object({
 
 // --- Shared handler plumbing -------------------------------------------------
 
+/** The refusals resolveActors answers itself (its 500 is not one). */
+type ActorRefusal = "no_username" | "authoriser_missing" | "authoriser_not_found" | "authoriser_not_permitted";
+
 /**
  * Resolve BOTH names for one capture write: the acting user (session only) and
  * the authoriser (body, resolved and permission-checked).
@@ -209,6 +212,11 @@ const sRemoveServiceChargeAndPrint = z.object({
  * Answers the request itself and returns null on every failure, so a handler
  * reads as `const who = await resolveActors(...); if (!who) {return;}` — the same
  * shape enforcePermission uses.
+ *
+ * `onRefused` is told about each 400/403 BEFORE it is answered, for a caller
+ * that puts its refusals on the record (the composite waiver-and-print route).
+ * A 500 from the authoriser lookup is a failure to decide, not a refusal, and is
+ * not reported to it.
  */
 async function resolveActors(
 	req: Request,
@@ -216,6 +224,7 @@ async function resolveActors(
 	restaurantId: string,
 	actionId: string,
 	act: string,
+	onRefused?: (refusal: ActorRefusal, authorisedBy: string | null) => Promise<void>,
 ): Promise<{
 	employee_id: string | null;
 	username: string;
@@ -228,12 +237,14 @@ async function resolveActors(
 		// A session with no username cannot sign a control ledger. This is not a
 		// 401 (the session is valid) and not a silent fallback to a display name
 		// or an employee id — the column stores a login identity or nothing.
+		await onRefused?.("no_username", null);
 		res.status(400).json({ error: "Your session does not carry a username. Sign out and sign in again." });
 		return null;
 	}
 	const raw = (req.body ?? {}) as Record<string, unknown>;
 	const wanted = typeof raw.authorised_by === "string" ? raw.authorised_by.trim() : "";
 	if (!wanted) {
+		await onRefused?.("authoriser_missing", null);
 		res.status(400).json({ error: `authorised_by is required — record who approved ${act}.` });
 		return null;
 	}
@@ -247,8 +258,10 @@ async function resolveActors(
 	}
 	if (!resolved.ok) {
 		if (resolved.reason === "not_found") {
+			await onRefused?.("authoriser_not_found", wanted);
 			res.status(400).json({ error: `No staff member '${wanted}' in this outlet — authorised_by must name one.` });
 		} else {
+			await onRefused?.("authoriser_not_permitted", wanted);
 			res.status(403).json({ error: `'${wanted}' is not permitted to authorise ${act}.` });
 		}
 		return null;
@@ -322,6 +335,61 @@ async function auditServiceChargeWaiver(
 			},
 		);
 	} catch (err) { logger.warn({ err }, "log_audit service_charge_waiver failed"); }
+}
+
+/** Why a "Remove service charge & print" was refused, as the audit line says it. */
+const SERVICE_CHARGE_REMOVAL_REFUSALS = {
+	waiver_required: "the caller does not hold the 'Waive Service Charge' permission",
+	reason_required: "no waiver kind or reason was given",
+	no_username: "the session carries no username to sign a waiver with",
+	authoriser_missing: "no authoriser was named",
+	authoriser_not_found: "the named authoriser is not a staff member of this outlet",
+	authoriser_not_permitted: "the named authoriser may not authorise a service-charge waiver",
+} as const satisfies Record<"waiver_required" | "reason_required" | ActorRefusal, string>;
+
+/**
+ * A REFUSED "REMOVE SERVICE CHARGE & PRINT", ON THE RECORD.
+ *
+ * AUDITED EVEN THOUGH NOTHING HAPPENED, like a refused reprint (C3) and a
+ * refused item removal: an attempt to take the service charge off a bill that
+ * is carrying one is exactly what a manager scans the log for. Before 2.0.0 the
+ * same attempt went through POST /print/bill with no_service_charge:true and
+ * left "asked WITHOUT the service charge; no waiver is recorded" behind; the
+ * composite route replaced that request in both clients, so without this line
+ * the attempt vanished from the log along with the paper.
+ *
+ * Filed only for refusals where a charge IS on the bill and no waiver is: the
+ * missing permission, the missing kind or reason, and resolveActors' 400/403s.
+ * An empty table, a bill with no charge (nothing_to_remove) and C3 are not
+ * attempts on a charge — and C3 files its own line.
+ *
+ * THE SENTENCE CARRIES NO TYPED TEXT. The Bill Edit classifier reads catch-all
+ * sentences by pattern, so a typed authoriser name could make a refusal look
+ * like an edit; the name goes in the details. `service_charge_waiver_required`
+ * keeps the key the old print line used, and it is true on every refusal here
+ * for the reason it was true there: a waiver is what this needed.
+ *
+ * Best-effort: a failed audit write must never turn a 4xx into a 500.
+ */
+async function auditRefusedServiceChargeRemoval(
+	req: Request,
+	tableName: string,
+	refusal: keyof typeof SERVICE_CHARGE_REMOVAL_REFUSALS,
+	basis: string,
+	authorisedBy: string | null,
+): Promise<void> {
+	try {
+		await log_audit(
+			req, "4ad474d4-5230-449c-874f-6a238b833bca",
+			`REFUSED removal of the service charge on table ${tableName} — ${SERVICE_CHARGE_REMOVAL_REFUSALS[refusal]}; nothing was waived or printed`,
+			Audit_log_category.Bill,
+			{
+				table: tableName, refused: true, refusal,
+				service_charge_basis: basis, service_charge_waiver_required: true,
+				authorised_by: authorisedBy,
+			},
+		);
+	} catch (err) { logger.warn({ err }, "log_audit service_charge_removal_refusal failed"); }
 }
 
 /** Best-effort floor refresh. Never fails a write that already committed. */
@@ -728,6 +796,10 @@ app.post("/bills/service-charge-waiver/:id/reverse", validateAction(PERM_SERVICE
 	  6. the kind, the reason and the authoriser, then resolveActors — the same
 	     400/403 answers the waiver route gives.
 
+	Steps 5 and 6 refuse an attempt on a charge that IS on the bill, so each of
+	their refusals files a REFUSED line first (auditRefusedServiceChargeRemoval)
+	— the record the old no_service_charge print left, which this route replaced.
+
 	Then the waiver is WaiveServiceCharge, unchanged, and its audit line is
 	auditServiceChargeWaiver's — so the Service Charge Deny report and the Bill
 	Edit report see the same row and the same line whichever route wrote it. A
@@ -800,8 +872,11 @@ app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449
 			res.status(400).json({ error: "This bill carries no service charge, so there is nothing to remove.", nothing_to_remove: true });
 			return;
 		}
+		// From here on a charge is on the bill and no waiver is, so every refusal
+		// is a refused attempt on that charge and goes on the record first.
 		// --- 5: the second gate. Named, in the shape validateAction refuses in. --
 		if (!callerHasPermission(req, PERM_SERVICE_CHARGE_WAIVER)) {
+			await auditRefusedServiceChargeRemoval(req, tableName, "waiver_required", basis, null);
 			res.status(403).json({
 				error: "Forbidden",
 				details: "Removing the service charge needs the 'Waive Service Charge' permission. Ask a manager to do it, or an admin to grant it to your role.",
@@ -814,10 +889,14 @@ app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449
 		const kind = String(body.waiver_kind ?? "").trim();
 		const reason = String(body.reason ?? "").trim();
 		if (!kind || !reason) {
+			await auditRefusedServiceChargeRemoval(req, tableName, "reason_required", basis, null);
 			res.status(400).json({ error: "Say why the service charge is coming off — waiver_kind and reason are required." });
 			return;
 		}
-		const who = await resolveActors(req, res, restaurantId, PERM_SERVICE_CHARGE_WAIVER, "a service-charge waiver");
+		const who = await resolveActors(
+			req, res, restaurantId, PERM_SERVICE_CHARGE_WAIVER, "a service-charge waiver",
+			(refusal, authorisedBy) => auditRefusedServiceChargeRemoval(req, tableName, refusal, basis, authorisedBy),
+		);
 		if (!who) {return;}
 
 		try {
