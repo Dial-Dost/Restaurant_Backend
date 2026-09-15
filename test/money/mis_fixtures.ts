@@ -32,6 +32,19 @@
 //     ALL-OUTLETS aggregate read, `(false or …)` pins to $2 — which is exactly
 //     what isAllOutlets() inlines, so an accidental `true` fails loudly;
 //   * the window is applied half-open on [$3, $4), the shape the readers bind;
+//   * a TIME SLOT is modelled from the SQL TEXT too: the time-of-day fragment
+//     misTimeSql appends is parsed back out (zone, start, end, crossing) and
+//     applied to each row's wall clock, on the column the fragment names. And it
+//     is REQUIRED whenever the bound instants are not local midnights — which is
+//     exactly when a reader resolved a slot — so a reader that bound a slot's
+//     outer bounds but forgot the fragment fails here instead of quietly
+//     counting every hour between them. Without this, every slot test would pass
+//     vacuously against the whole day;
+//   * a CASH SESSION is a span, so under a slot it is modelled by the per-day
+//     overlap its read binds instead ($4/$5, one [lo, hi) per day). Those arrays
+//     are re-derived from the hull and refused unless they are exactly the
+//     slot's days, and they are REQUIRED under a slot for the same reason as the
+//     fragment above (see sessionSlotTest);
 //   * requireShape() asserts the load-bearing fragments are still in the query.
 //     Deleting `coalesce(o.status::text, '1') <> '5'` from the item read would
 //     otherwise leave this suite green while cancelled food became revenue.
@@ -291,6 +304,10 @@ export interface FixtureDb {
   alert_void_count?: number;
   /** What RunExceptionChecks put on the bell. Written by the REAL AddNotification. */
   notifications?: { title: string; meta: Record<string, unknown> }[];
+  /** "Restaurant".report_time_slots (migration 049) — null/absent is the defaults. */
+  report_time_slots?: unknown;
+  /** True models a database migration 049 never reached: reading the column is 42703. */
+  report_time_slots_missing?: boolean;
 }
 
 export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
@@ -370,26 +387,175 @@ function inWindow(iso: string, fromIso: unknown, toIso: unknown): boolean {
   return t >= a && t < z;
 }
 
+/** Wall-clock minute of day of an instant in `tz` (seconds dropped: slot edges are whole minutes). */
+function wallMinute(iso: string, tz: string): { minute: number; second: number } {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(new Date(iso));
+  const get = (t: string): number => Number(parts.find((x) => x.type === t)?.value ?? 0);
+  return { minute: (get("hour") % 24) * 60 + get("minute"), second: get("second") };
+}
+
+/** Is a bound instant local midnight in the tenant's zone? An absent bound counts as one. */
+function isLocalMidnight(value: unknown, tz: string): boolean {
+  if (typeof value !== "string") {return true;}
+  const w = wallMinute(value, tz);
+  return w.minute === 0 && w.second === 0;
+}
+
+const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The window a query binds, as a row test: [$from, $to) AND the time-of-day
+ * fragment, when there is one, on the column `col` names.
+ *
+ * The fragment's grammar is misTimeSql's, read literally:
+ *   ((col) at time zone 'TZ')::time >= 'HH:mm'::time [and|or ((col) at time zone 'TZ')::time < 'HH:mm'::time]
+ * `or` is a slot that crosses midnight; no upper bound is an end of 24:00.
+ */
+function windowTest(q: string, params: unknown[], col: string, fromIdx = 2, toIdx = 3): (iso: string) => boolean {
+  const d = requireDb();
+  const from = params[fromIdx], to = params[toIdx];
+  const clock = `\\(\\(${escapeRe(col)}\\) at time zone '([^']+)'\\)::time`;
+  const lower = new RegExp(`${clock} >= '(\\d{2}):(\\d{2})'::time`, "i").exec(q);
+  const midnights = isLocalMidnight(from, d.timezone) && isLocalMidnight(to, d.timezone);
+  if (!lower) {
+    if (/at time zone '[^']+'\)::time/i.test(q) || !midnights) {
+      throw new Error(`mis fixture: the window is bound to a time slot but the time-of-day predicate on ${col} is missing — every hour between the outer bounds would be counted\n  ${q.slice(0, 260)}`);
+    }
+    return (iso) => inWindow(iso, from, to);
+  }
+  if (lower[1] !== d.timezone) {
+    throw new Error(`mis fixture: the time slot is read in zone '${lower[1]}', not the restaurant's '${d.timezone}'`);
+  }
+  const start = Number(lower[2]) * 60 + Number(lower[3]);
+  const upper = new RegExp(`${clock} < '(\\d{2}):(\\d{2})'::time`, "i").exec(q);
+  const end = upper ? Number(upper[2]) * 60 + Number(upper[3]) : 1440;
+  const crosses = new RegExp(`${clock} >= '\\d{2}:\\d{2}'::time or ${clock} < `, "i").test(q);
+  if (crosses !== end < start) {
+    throw new Error(`mis fixture: a ${crosses ? "crossing (or)" : "same-day (and)"} predicate for ${String(start)}-${String(end)} minutes cannot be right\n  ${q.slice(0, 260)}`);
+  }
+  if (midnights) {
+    throw new Error(`mis fixture: a time-of-day predicate on a whole-day binding — the outer bounds lost the slot\n  ${q.slice(0, 260)}`);
+  }
+  return (iso) => {
+    if (!inWindow(iso, from, to)) {return false;}
+    const m = wallMinute(iso, d.timezone).minute;
+    return crosses ? m >= start || m < end : m >= start && m < end;
+  };
+}
+
+/** Calendar day (YYYY-MM-DD) of an instant in `tz`. */
+function wallDay(iso: string, tz: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date(iso));
+  const get = (t: string): string => parts.find((x) => x.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** A YYYY-MM-DD key moved by whole calendar days. */
+function shiftDay(key: string, days: number): string {
+  const [y, m, dd] = key.split("-").map(Number);
+  return new Date(Date.UTC(y ?? 0, (m ?? 1) - 1, (dd ?? 1) + days)).toISOString().slice(0, 10);
+}
+
+/** The per-day overlap the cash-session read carries under a slot, read literally. */
+const SESSION_DAY_OVERLAP =
+  /and exists \(select 1 from unnest\(\$4::timestamptz\[\], \$5::timestamptz\[\]\) as d\(lo, hi\)\s+where opened_at < d\.hi and \(closed_at is null or closed_at >= d\.lo\)\)/i;
+
+/**
+ * The per-day overlap a cash-session read binds under a time slot, as a test on
+ * one session's opened/closed instants.
+ *
+ * A session is a SPAN, so the hull [$2, $3) cannot say whether it met the slot:
+ * a dinner shift on 1 June lies inside Lunch's hull over 1-15 June. The reader
+ * binds each day's [lo, hi) as $4/$5, and this does NOT take them on trust. It
+ * re-derives the slot from the hull (its start is the hull's first wall minute,
+ * its end the hull's last, 00:00 meaning 24:00) and the days from the hull's
+ * dates. Then it refuses arrays that are not exactly one interval per day with
+ * those wall clocks. A reader that bound the wrong days fails here. So does one
+ * that bound a slot's hull with no per-day test at all, instead of quietly
+ * counting every shift between the outer bounds.
+ *
+ * The wall clocks are CHECKED with Intl rather than built with the reader's
+ * conversion, so the two cannot agree by sharing a bug. (A slot edge inside a
+ * DST gap has no wall reading to match; no fixture zone puts one there.)
+ */
+function sessionSlotTest(q: string, params: unknown[]): (opened: number, closed: number | null) => boolean {
+  const d = requireDb();
+  const tz = d.timezone;
+  const from = params[1], to = params[2];
+  const hasOverlap = SESSION_DAY_OVERLAP.test(q);
+  if (isLocalMidnight(from, tz) && isLocalMidnight(to, tz)) {
+    if (hasOverlap || params.length > 3) {
+      throw new Error(`mis fixture: a per-day session overlap on a whole-day binding — the hull lost the slot\n  ${q.slice(0, 260)}`);
+    }
+    return () => true;
+  }
+  if (!hasOverlap) {
+    throw new Error(`mis fixture: the cash-session read is bound to a time slot but has no per-day overlap — every shift between the outer bounds would be counted\n  ${q.slice(0, 260)}`);
+  }
+  const lo = params[3], hi = params[4];
+  if (typeof from !== "string" || typeof to !== "string" || !Array.isArray(lo) || !Array.isArray(hi)) {
+    throw new Error("mis fixture: a slot-bound cash-session read must bind its hull and two arrays of day bounds");
+  }
+  const refuse = (why: string): never => {
+    throw new Error(`mis fixture: the cash-session day bounds are not the slot's days — ${why}`);
+  };
+  const start = wallMinute(from, tz).minute;
+  const endWall = wallMinute(to, tz).minute;
+  // The slot ends on the NEXT day when it crosses midnight or runs to 24:00.
+  const nextDay = endWall === 0 || endWall < start;
+  const firstDay = wallDay(from, tz);
+  const lastDay = nextDay ? shiftDay(wallDay(to, tz), -1) : wallDay(to, tz);
+  const days = Math.round((Date.parse(`${lastDay}T00:00:00Z`) - Date.parse(`${firstDay}T00:00:00Z`)) / 86_400_000) + 1;
+  if (lo.length !== days || hi.length !== days) {
+    refuse(`${String(lo.length)} starts and ${String(hi.length)} ends for ${String(days)} days`);
+  }
+  const spans = lo.map((raw, i) => {
+    const a = String(raw), z = String(hi[i]);
+    const day = shiftDay(firstDay, i);
+    const wa = wallMinute(a, tz), wz = wallMinute(z, tz);
+    if (wallDay(a, tz) !== day || wa.minute !== start || wa.second !== 0) {
+      refuse(`day ${String(i)} starts at ${a}, not at minute ${String(start)} of ${day}`);
+    }
+    if (wallDay(z, tz) !== (nextDay ? shiftDay(day, 1) : day) || wz.minute !== endWall || wz.second !== 0) {
+      refuse(`day ${String(i)} (${day}) ends at ${z}`);
+    }
+    return { lo: new Date(a).getTime(), hi: new Date(z).getTime() };
+  });
+  if (spans[0]?.lo !== new Date(from).getTime() || spans[spans.length - 1]?.hi !== new Date(to).getTime()) {
+    refuse("the first day does not start where the hull starts, or the last does not end where it ends");
+  }
+  return (opened, closed) => spans.some((s) => opened < s.hi && (closed === null || closed >= s.lo));
+}
+
+/** The settlement clock, spelled exactly as the readers spell it. */
+const BILL_CLOCK = "coalesce(b.closed_at, b.admin_approved_at)";
+
 /** Tenant + outlet + window, applied the way the bound query says to apply them. */
 function billsMatching(q: string, params: unknown[]): FixtureBill[] {
   const d = requireDb();
   const all = allOutletsFrom(q);
   const rid = String(params[0] ?? ""), oid = String(params[1] ?? "");
+  const inSlot = windowTest(q, params, BILL_CLOCK);
   return d.bills.filter((b) =>
     resOf(b) === rid
     && (all || outletOf(b) === oid)
     && isSettled(b)
-    && inWindow(b.settled_at, params[2], params[3]));
+    && inSlot(b.settled_at));
 }
 
 function ordersMatching(q: string, params: unknown[]): FixtureOrder[] {
   const d = requireDb();
   const all = allOutletsFrom(q);
   const rid = String(params[0] ?? ""), oid = String(params[1] ?? "");
+  const inSlot = windowTest(q, params, "o.created_at");
   return d.orders.filter((o) =>
     resOf(o) === rid
     && (all || outletOf(o) === oid)
-    && inWindow(o.created_at, params[2], params[3]));
+    && inSlot(o.created_at));
 }
 
 const like = (value: string | null | undefined, pattern: unknown): boolean => {
@@ -439,13 +605,15 @@ function captureRowsMatching<T extends { res_id?: string; outlet_id?: string }>(
   params: unknown[],
   rows: readonly T[],
   at: (r: T) => string,
+  col: string,
 ): T[] {
   const all = allOutletsFrom(q);
   const rid = String(params[0] ?? ""), oid = String(params[1] ?? "");
+  const inSlot = windowTest(q, params, col);
   return rows.filter((r) =>
     resOf(r) === rid
     && (all || outletOf(r) === oid)
-    && inWindow(at(r), params[2], params[3]));
+    && inSlot(at(r)));
 }
 
 // --- row builders ------------------------------------------------------------
@@ -574,6 +742,18 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   if (/select payment_config from "Restaurant" where id = \$1/i.test(q)) {
     return params[0] === d.res_id ? [{ payment_config: d.payment_config ?? null }] : [];
   }
+  // loadReportTimeSlots — the presets behind ?slot= and the session cut.
+  if (/select report_time_slots from "Restaurant" where id = \$1/i.test(q)) {
+    if (d.report_time_slots_missing) {
+      throw Object.assign(new Error('column "report_time_slots" does not exist'), { code: "42703" });
+    }
+    return params[0] === d.res_id ? [{ report_time_slots: d.report_time_slots ?? null }] : [];
+  }
+  // SetReportTimeSlots — the preset save. Tenant-bound: another id writes nothing.
+  if (/^update "Restaurant" set report_time_slots = \$2::jsonb where id = \$1$/i.test(q)) {
+    if (params[0] === d.res_id) {d.report_time_slots = typeof params[1] === "string" ? JSON.parse(params[1]) : null;}
+    return [];
+  }
 
   // --- "Outlets" ---
   if (/select outlet_name from "Outlets" where id = \$1 and res_id = \$2/i.test(q)) {
@@ -616,7 +796,8 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   // --- 034: non-chargeables ---
   if (/from "OrderItemNonChargeable"/i.test(q)) {
     requireShape(q, "res_id = $1", "the tenant predicate");
-    const rows = captureRowsMatching(q, params, d.non_chargeables, (n) => n.created_at);
+    const rows = captureRowsMatching(q, params, d.non_chargeables, (n) => n.created_at,
+      /from "OrderItemNonChargeable" n/i.test(q) ? "n.created_at" : "created_at");
     // The ladder-side read: what a window gave away, per outlet, nothing else.
     if (!/from "OrderItemNonChargeable" n/i.test(q)) {
       return rows.map((n) => ({
@@ -679,7 +860,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   // --- 036: service-charge waivers ---
   if (/from "ServiceChargeWaivers" w/i.test(q)) {
     requireShape(q, "w.res_id = $1", "the tenant predicate");
-    const rows = captureRowsMatching(q, params, d.waivers, (w) => w.waived_at);
+    const rows = captureRowsMatching(q, params, d.waivers, (w) => w.waived_at, "w.waived_at");
     const search = params[4];
     const filtered = typeof search === "string" && search.includes("%")
       ? rows.filter((w) =>
@@ -724,7 +905,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     requireShape(q, "and tn.voided_at is null",
       "a tender keyed twice and voided carries no tip anybody is owed");
     requireShape(q, "and tn.tip_amount > 0", "the tip report reports tips");
-    const rows = captureRowsMatching(q, params, d.tenders, (t) => t.settled_at)
+    const rows = captureRowsMatching(q, params, d.tenders, (t) => t.settled_at, "tn.settled_at")
       .filter((t) => !t.voided_at && (t.tip_amount ?? 0) > 0);
     const search = params[4];
     const filtered = typeof search === "string" && search.includes("%")
@@ -784,6 +965,8 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       "sessions are keyed to the till, never to the nullable outlet_id on this legacy table");
     const rid = String(params[0] ?? "");
     const from = params[1], to = params[2];
+    // Checked before the loop, so a malformed slot binding fails with no rows too.
+    const meetsSlot = sessionSlotTest(q, params);
     const acc = new Map<string, { sessions: number; opened: number; closed: number | null; open: boolean; variance: number }>();
     for (const c of d.cash_sessions) {
       if (resOf(c) !== rid) {continue;}
@@ -792,6 +975,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       const before = typeof to === "string" ? new Date(to).getTime() : Number.POSITIVE_INFINITY;
       const after = typeof from === "string" ? new Date(from).getTime() : Number.NEGATIVE_INFINITY;
       if (!(opened < before && (closed === null || closed >= after))) {continue;}
+      if (!meetsSlot(opened, closed)) {continue;}
       const e = acc.get(c.counter_id) ?? { sessions: 0, opened, closed: null, open: false, variance: 0 };
       e.sessions += 1;
       e.opened = Math.min(e.opened, opened);
@@ -1254,10 +1438,11 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       "the action-id prefilter; without it every audit row in the window is a candidate");
     const all = allOutletsFrom(q);
     const ids = Array.isArray(params[4]) ? (params[4] as string[]) : [];
+    const inSlot = windowTest(q, params, "l.created_at");
     let rows = d.audits.filter((a) =>
       resOf(a) === params[0]
       && (all || outletOf(a) === params[1])
-      && inWindow(a.created_at, params[2], params[3])
+      && inSlot(a.created_at)
       && ids.includes(a.action_id));
     const search = params[5];
     if (typeof search === "string" && search.includes("%")) {

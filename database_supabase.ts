@@ -256,6 +256,27 @@ import {
   resolveReportWindow,
   type ReportWindowQuery,
   type ResolvedReportWindow,
+  DEFAULT_TIME_SLOTS,
+  TimeSlotConfigError,
+  fixedTimeBuckets,
+  formatClock,
+  parseStoredTimeSlots,
+  resolveTimeSlot,
+  serviceDayKey,
+  slotBounds,
+  slotDayBounds,
+  timeBucketKey,
+  timeBucketMode,
+  timeBucketOrder,
+  timeSlotMeta,
+  timeSlotNeedsPresets,
+  timeSlotNote,
+  timeSlotsForStorage,
+  validateTimeSlotPresets,
+  type TimeBucketMode,
+  type TimeSlot,
+  type TimeSlotMeta,
+  type TimeSlotPreset,
 } from "./report_window.js";
 // The MIS / control reports' money ladder and the pure rules they share. Kept in
 // their own module for the billing_math.ts reason: jest proves every rung, the
@@ -326,6 +347,7 @@ export {
   resolveReportWindow,
 } from "./report_window.js";
 export type { ReportWindowQuery, ResolvedReportWindow, WindowClamp } from "./report_window.js";
+export type { TimeBucketMode, TimeSlotMeta, TimeSlotPreset } from "./report_window.js";
 import {
   computeStockStatus,
   inventoryStatusOf,
@@ -27306,6 +27328,11 @@ async function ensureBrandingColumns(): Promise<void> {
   // configured", which resolves to an EMPTY catalogue — no badge renders
   // anywhere until the owner adds one, so every existing tenant is unchanged.
   await runQuery(`alter table "Restaurant" add column if not exists menu_badges jsonb default null`);
+  // The Reports section's time-slot presets (migration 049, report_window.ts).
+  // Restaurant-wide, so the ALL-OUTLETS read has one definition of Lunch. NULL
+  // means "never configured" and resolves to DEFAULT_TIME_SLOTS; the report
+  // readers also survive this column being absent (42703 -> defaults).
+  await runQuery(`alter table "Restaurant" add column if not exists report_time_slots jsonb default null`);
   brandingColsEnsured = true;
 }
 
@@ -34684,10 +34711,12 @@ export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number):
 // Item Wise is the exception and says so in its own notes: it buckets by ORDER
 // PLACEMENT time because an item has no settlement of its own.
 //
-// READ-ONLY. Nothing in this section writes, and nothing here touches the
-// idempotency outbox. No migration was needed: every column read below already
-// exists (the lazy ensure* helpers are called only so a tenant that predates a
-// column still reads rather than 42703-ing).
+// READ-ONLY. Nothing in this section writes a report row — SetReportTimeSlots
+// saves configuration (migration 049), never money — and nothing here touches
+// the idempotency outbox. No report needs a migration: every column read below
+// already exists (the lazy ensure* helpers are called only so a tenant that
+// predates a column still reads rather than 42703-ing), and the one column that
+// may not — "Restaurant".report_time_slots — reads as the default time slots.
 //
 // OUTLET SCOPE follows the house pattern exactly: `og` is "true" in the
 // admin/manager ALL-OUTLETS aggregate read (isAllOutlets(), set by the
@@ -34700,8 +34729,11 @@ export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number):
 export interface MisWindow extends ResolvedReportWindow {
   fromIso: string;
   /** EXCLUSIVE — local midnight of the day AFTER `to`. This is what makes the
-   *  range inclusive of its last day; see windowInstants. */
+   *  range inclusive of its last day; see windowInstants. With a time slot both
+   *  instants are the slot's OUTER bounds instead; see slotWindowInstants. */
   toIso: string;
+  /** The part of each day the report is cut by. null = all day. */
+  slot: TimeSlot | null;
 }
 
 /** Everything the nine share: identity, zone, scope and the resolved window. */
@@ -34712,6 +34744,9 @@ interface MisContext {
   allOutlets: boolean;
   window: MisWindow;
   tz: string;
+  /** The restaurant's time-slot presets — READ ONLY when a preset id or the
+   *  session cut needs them, and empty otherwise. */
+  presets: readonly TimeSlotPreset[];
 }
 
 /** How a client asks for any of the nine. All values arrive raw off the query string. */
@@ -34720,7 +34755,7 @@ export interface MisReportQuery extends ReportWindowQuery {
   search?: unknown;
   limit?: unknown;
   offset?: unknown;
-  /** The time-wise toggle: "day" (default) or "hour". */
+  /** The time-wise toggle: "day" (default), "hour", "hour_of_day" or "session". */
   bucket?: unknown;
 }
 
@@ -34740,6 +34775,8 @@ export interface MisReportMeta {
   report: string;
   title: string;
   window: ResolvedReportWindow;
+  /** The part of each day this payload was cut by; null = all day. */
+  time_slot: TimeSlotMeta | null;
   timezone: string;
   outlet_scope: "outlet" | "all";
   outlet_id: string | null;
@@ -34801,14 +34838,206 @@ async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisC
     defaultDays: MIS_DEFAULT_DAYS,
     maxDays: MAX_REPORT_DAYS,
   });
+  // THE TIME SLOT, resolved once for every read below (report_window.ts). The
+  // presets are read only when something names one — a preset id, or the
+  // session cut — so an all-day report issues exactly the queries it always did.
+  // An unusable slot is ALL DAY with its clamp appended to the window's own.
+  const presets = timeSlotNeedsPresets(q) || misBucketMode(q) === "session"
+    ? (await loadReportTimeSlots(context.res_id)).slots
+    : [];
+  const { slot, clamped } = resolveTimeSlot(q, presets);
   return {
     context,
     og: allOutlets ? "true" : "false",
     allOutlets,
-    window: { ...resolved, ...windowInstants(resolved, tz) },
+    window: {
+      ...resolved,
+      clamped: clamped.length > 0 ? [...resolved.clamped, ...clamped] : resolved.clamped,
+      ...slotWindowInstants(resolved, tz, slot),
+      slot,
+    },
     tz,
+    presets,
   };
 }
+
+// --- Time slots (report_window.ts) -------------------------------------------
+//
+// The contract — which clock, half-open minutes, a crossing slot belongs to the
+// day it starts on, all day is no slot — lives in report_window.ts and is proved
+// there. What lives here is only what needs the database or the zone: the
+// presets' storage, the instants a slot binds, and the SQL fragment every window
+// predicate carries.
+
+/**
+ * [fromIso, toIso) for a window, cut by a slot's OUTER bounds.
+ *
+ * No slot is windowInstants, untouched. With one, the first instant is the
+ * slot's start on `from` and the last is its end on `to` (or on `to`+1 when it
+ * ends at or after midnight). misTimeSql removes the gaps between the days.
+ */
+function slotWindowInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot | null): { fromIso: string; toIso: string } {
+  if (!slot) {return windowInstants(w, tz);}
+  const b = slotBounds(w, slot);
+  return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
+}
+
+/** A minute past local midnight of a YYYY-MM-DD day in `tz`, as the UTC instant SQL binds. */
+function slotWallInstant(key: string, minute: number, tz: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+  if (!m) {return new Date(NaN).toISOString();}
+  return zonedWallToUtc(Number(m[1]), Number(m[2]), Number(m[3]), Math.floor(minute / 60), minute % 60, tz).toISOString();
+}
+
+/**
+ * [lo, hi) of the slot on EACH day of a window, as two parallel arrays to bind.
+ *
+ * This is for a read that asks whether a SPAN of time meets the slot, not
+ * whether an instant falls in it. The cash-session overlap is the one such read.
+ * slotDayBounds explains why the hull and misTimeSql cannot answer that. The
+ * instants come from the same conversion as slotWindowInstants, so lo[0] is its
+ * fromIso and the last hi is its toIso, and a DST day follows the wall clock
+ * exactly as the bill reads do.
+ */
+function slotDayInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot): { lo: string[]; hi: string[] } {
+  const lo: string[] = [];
+  const hi: string[] = [];
+  for (const b of slotDayBounds(w, slot)) {
+    lo.push(slotWallInstant(b.fromKey, b.fromMin, tz));
+    hi.push(slotWallInstant(b.toKey, b.toMin, tz));
+  }
+  return { lo, hi };
+}
+
+/** An IANA zone name as it may appear INLINE in SQL. context.timezone is already Intl-checked. */
+const MIS_SQL_ZONE = /^[A-Za-z0-9_+\-/]{1,64}$/;
+
+/**
+ * The time-of-day predicate for one window column, or "" with no slot.
+ *
+ * APPENDED AT EVERY MIS WINDOW PREDICATE, right after its `< $4`, on the column
+ * that predicate bounds — the settlement stamp, the order's placement, the
+ * comp, the waiver, the tender, the edit. One site without it and Σ Settlement
+ * stops equalling the Sales Summary under a slot while every all-day test stays
+ * green, which is why a jest wiring test pairs them and the fixture refuses a
+ * slot-bound query that lacks it.
+ *
+ * INLINE LITERALS, not parameters, so the existing `$n` numbering of fifteen
+ * readers (and their search/limit/offset arithmetic) is untouched. Nothing here
+ * comes from the request: the times are formatted from integers the resolver
+ * produced and re-checked, and the zone is the tenant's Intl-validated zone
+ * re-checked against a strict pattern — the same posture as the inlined `og`.
+ *
+ * `(col at time zone 'TZ')::time` is the wall clock of a timestamptz in the
+ * restaurant's zone. Parenthesised on purpose: `::` binds tighter than AT TIME
+ * ZONE, so without them the cast would apply to the zone string.
+ */
+function misTimeSql(col: string, mc: Pick<MisContext, "window" | "tz">): string {
+  const slot = mc.window.slot;
+  if (!slot) {return "";}
+  const ok = Number.isInteger(slot.start) && slot.start >= 0 && slot.start < 1440
+    && Number.isInteger(slot.end) && slot.end > 0 && slot.end <= 1440;
+  if (!ok || !MIS_SQL_ZONE.test(mc.tz)) {throw new Error("mis time slot: refusing to inline an unchecked time or zone");}
+  const clock = `((${col}) at time zone '${mc.tz}')::time`;
+  const from = `${clock} >= '${formatClock(slot.start)}'::time`;
+  if (slot.end === 1440) {return ` and ${from}`;}
+  const to = `${clock} < '${formatClock(slot.end)}'::time`;
+  return slot.crosses_midnight ? ` and (${from} or ${to})` : ` and ${from} and ${to}`;
+}
+
+/**
+ * The restaurant's presets, and whether they are the built-in defaults.
+ *
+ * DEFENSIVE BY DESIGN: a tenant on a database where migration 049 has not run
+ * (42703) and a tenant that never saved presets (NULL) both get
+ * DEFAULT_TIME_SLOTS, and so does a stored value that no longer validates. A
+ * report must never 500 because of how its toolbar is configured.
+ */
+async function loadReportTimeSlots(resId: string, client?: PoolClient): Promise<{ slots: TimeSlotPreset[]; is_default: boolean }> {
+  let raw: unknown = null;
+  try {
+    const rows = await runQuery<{ report_time_slots: unknown }>(
+      `select report_time_slots from "Restaurant" where id = $1 limit 1${client ? " for update" : ""}`,
+      [resId],
+      client,
+    );
+    raw = rows[0]?.report_time_slots ?? null;
+  } catch (err) {
+    if ((err as { code?: unknown })?.code !== "42703") {throw err;}
+    logger.warn({ what: "Restaurant.report_time_slots" }, "mis_time_slots_column_missing");
+  }
+  const stored = parseStoredTimeSlots(raw);
+  return stored
+    ? { slots: stored, is_default: false }
+    : { slots: DEFAULT_TIME_SLOTS.map((s) => ({ ...s })), is_default: true };
+}
+
+/** GET /reports/mis/time-slots — the presets the Reports toolbar offers. */
+export async function GetReportTimeSlots(restaurantId: string): Promise<{ slots: TimeSlotPreset[]; is_default: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  return loadReportTimeSlots(context.res_id);
+}
+
+/**
+ * PUT /reports/mis/time-slots — REPLACE the whole preset list.
+ *
+ * Refused out loud: an invalid list throws TimeSlotConfigError (one sentence)
+ * before anything is written, and the route answers 400 with it. An empty list
+ * is the owner asking for the defaults back, and stores NULL.
+ *
+ * SNAPSHOT BEFORE MUTATE: the stored value is read `for update` in the same
+ * transaction as the write, so the audit entry's before-state is the value this
+ * save actually replaced, and two editors saving at once take turns.
+ */
+export async function SetReportTimeSlots(
+  restaurantId: string,
+  input: unknown,
+): Promise<{ before: { slots: TimeSlotPreset[]; is_default: boolean }; after: { slots: TimeSlotPreset[]; is_default: boolean } }> {
+  const checked = validateTimeSlotPresets(input);
+  if (!checked.ok) {throw new TimeSlotConfigError(checked.error);}
+  const context = await requireRestaurantContext(restaurantId);
+  // DDL outside the transaction, memoized — never inside a settle.
+  await ensureBrandingColumns();
+  const stored = timeSlotsForStorage(checked.slots);
+  return withTransaction(async (client) => {
+    const before = await loadReportTimeSlots(context.res_id, client);
+    await runQuery(
+      `update "Restaurant" set report_time_slots = $2::jsonb where id = $1`,
+      [context.res_id, stored === null ? null : JSON.stringify(stored)],
+      client,
+    );
+    const after = stored === null
+      ? { slots: DEFAULT_TIME_SLOTS.map((s) => ({ ...s })), is_default: true }
+      : { slots: stored.slots, is_default: false };
+    return { before, after };
+  });
+}
+
+/**
+ * What each report's clock stamps, for the sentence misMeta adds under a slot —
+ * plus, where a report has something the slot does NOT cut, that too.
+ */
+const MIS_SLOT_SUBJECT: Record<string, string> = {
+  sales_summary: "bills SETTLED",
+  order_summary: "bills SETTLED",
+  cover_size_summary: "bills SETTLED",
+  settlement_summary: "bills SETTLED",
+  discount: "bills SETTLED",
+  executive_summary: "bills SETTLED",
+  counter_summary: "bills SETTLED",
+  item_wise: "order lines PLACED",
+  group_summary: "order lines PLACED",
+  variation_summary: "order lines PLACED",
+  void_kot: "orders PLACED",
+  nc_summary: "items COMPED",
+  service_charge_deny: "service charges WAIVED",
+  tip_summary: "tips SETTLED",
+  bill_edit: "edits MADE",
+};
+const MIS_SLOT_EXTRA: Record<string, string> = {
+  executive_summary: "The comparison period is cut by the same time slot, so growth compares like with like.",
+  counter_summary: "Opened, Closed, Cash sessions and Cash variance describe whole shifts that overlap the slot's hours on at least one day of the range; a shift is not cut by the slot.",
+};
 
 async function misMeta(mc: MisContext, report: string, title: string, notes: string[]): Promise<MisReportMeta> {
   let outletName: string | null = null;
@@ -34825,12 +35054,21 @@ async function misMeta(mc: MisContext, report: string, title: string, notes: str
     report,
     title,
     window: { from: mc.window.from, to: mc.window.to, days: mc.window.days, source: mc.window.source, clamped: mc.window.clamped },
+    time_slot: timeSlotMeta(mc.window.slot),
     timezone: mc.tz,
     outlet_scope: mc.allOutlets ? "all" : "outlet",
     outlet_id: mc.allOutlets ? null : mc.context.outlet_id,
     outlet_name: outletName,
     generated_at: new Date().toISOString(),
-    notes,
+    // Under a slot the notes say which minutes of which clock were counted. With
+    // none they are exactly the report's own.
+    notes: mc.window.slot
+      ? [
+        ...notes,
+        timeSlotNote(mc.window.slot, MIS_SLOT_SUBJECT[report] ?? "rows"),
+        ...(MIS_SLOT_EXTRA[report] ? [MIS_SLOT_EXTRA[report]] : []),
+      ]
+      : notes,
   };
 }
 
@@ -34846,9 +35084,8 @@ function misSearch(q: MisReportQuery): string | null {
   return s.length > 0 ? s : null;
 }
 
-function misBucketMode(q: MisReportQuery): "day" | "hour" {
-  const raw = Array.isArray(q.bucket) ? q.bucket[0] : q.bucket;
-  return String(raw ?? "").trim().toLowerCase() === "hour" ? "hour" : "day";
+function misBucketMode(q: MisReportQuery): TimeBucketMode {
+  return timeBucketMode(q.bucket);
 }
 
 // --- Reading a capture table that may not exist yet --------------------------
@@ -34969,7 +35206,7 @@ async function fetchMisNonChargeables(mc: MisContext): Promise<MisNcRow[]> {
     `select created_at, outlet_id, quantity, value, (reversed_at is not null) as reversed
        from "OrderItemNonChargeable"
       where res_id = $1 and (${mc.og} or outlet_id = $2)
-        and created_at >= $3 and created_at < $4`,
+        and created_at >= $3 and created_at < $4${misTimeSql("created_at", mc)}`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   ), [] as MisNcRow[]);
 }
@@ -34992,12 +35229,17 @@ function misNcByOutlet(rows: readonly MisNcRow[]): Map<string, MisNonChargeableT
 }
 
 /** The comps of a window, cut into the SAME bucket keys misSeries uses. */
-function misNcByBucket(rows: readonly MisNcRow[], tz: string, mode: "day" | "hour"): Map<string, MisNonChargeableTotals> {
+function misNcByBucket(rows: readonly MisNcRow[], mc: MisContext, mode: TimeBucketMode): Map<string, MisNonChargeableTotals> {
   const out = new Map<string, MisNonChargeableTotals>();
   for (const r of rows) {
-    const clock = zonedClockParts(r.created_at, tz);
+    const clock = zonedClockParts(r.created_at, mc.tz);
     if (!clock) {continue;}
-    const key = mode === "hour" ? `${clock.key}T${String(clock.hour).padStart(2, "0")}` : clock.key;
+    // The same key function the bills use, on the comp's own clock: a crossing
+    // slot's after-midnight comp counts on the day its slot started.
+    const minute = clock.hour * 60 + clock.minute;
+    const key = timeBucketKey(mode, {
+      serviceDay: serviceDayKey(clock.key, minute, mc.window.slot), calendarDay: clock.key, minute,
+    }, mc.presets);
     const acc = out.get(key) ?? zeroNonChargeable();
     addNonChargeable(acc, r);
     out.set(key, acc);
@@ -35060,11 +35302,19 @@ interface MisBillRow {
 const MIS_ITEMS_JSON = `case when jsonb_typeof((o.food)::jsonb->'items') = 'array'
                              then (o.food)::jsonb->'items' else '[]'::jsonb end`;
 
-const MIS_SETTLED_PREDICATE = `
+/**
+ * The settlement-clock window predicate on "Bills" b, cut by the report's time
+ * slot. A FUNCTION rather than the constant it was, so the only way to get the
+ * predicate is to say which slot applies: every MIS reader passes its context,
+ * and the Overview headline — which is whole-day by definition — passes null.
+ */
+function misSettledPredicate(mc: Pick<MisContext, "window" | "tz"> | null): string {
+  return `
   (b.admin_approved_at is not null or b.closed_at is not null)
   and coalesce(b.closed_at, b.admin_approved_at) >= $3
-  and coalesce(b.closed_at, b.admin_approved_at) < $4
+  and coalesce(b.closed_at, b.admin_approved_at) < $4${mc ? misTimeSql("coalesce(b.closed_at, b.admin_approved_at)", mc) : ""}
 `;
+}
 
 /** The seating a bill belongs to. Same rule as CLOSED_BILL_JOINS; see above. */
 const MIS_SESSION_LATERAL = `
@@ -35093,7 +35343,7 @@ async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
        from "Bills" b
        ${MIS_SESSION_LATERAL}
       where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}
+        and ${misSettledPredicate(mc)}
       order by coalesce(b.closed_at, b.admin_approved_at) asc, b.id asc`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   );
@@ -35103,8 +35353,12 @@ async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
 interface MisBill {
   row: MisBillRow;
   money: BillMoney;
+  /** The BUSINESS day: the calendar day, or under a crossing slot the day it started. */
   day: string;
   hour: number;
+  /** The local calendar day and minute of day the bill settled at. */
+  calendar_day: string;
+  minute: number;
   session_id: string | null;
   covers: number;
 }
@@ -35115,7 +35369,7 @@ interface MisBill {
  * `scPct` is read once for the whole set, not per bill, so the service-charge
  * classification here is identical to the one the bill-detail screen shows.
  */
-function composeMisBills(rows: MisBillRow[], scPct: number, tz: string): MisBill[] {
+function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: TimeSlot | null = null): MisBill[] {
   return rows.map((row) => {
     const grand = round2(parseNumeric(row.total_amt));
     const charges = closedBillCharges(grand, parseTaxLines(row.tax_breakdown), scPct, parseNumeric(row.round_off));
@@ -35129,8 +35383,10 @@ function composeMisBills(rows: MisBillRow[], scPct: number, tz: string): MisBill
         discount_value: parseNumeric(row.discount_value),
         refund_amount: parseNumeric(row.refund_amount),
       }),
-      day: clock?.key ?? "",
+      day: clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot) : "",
       hour: clock?.hour ?? 0,
+      calendar_day: clock?.key ?? "",
+      minute: clock ? clock.hour * 60 + clock.minute : 0,
       session_id: row.session_id,
       covers: row.session_id ? Math.max(1, Math.round(parseNumeric(row.session_covers)) || 1) : 0,
     };
@@ -35179,9 +35435,9 @@ function misLadder(bills: MisBill[], seenSessions?: Set<string>): MisLadder {
   };
 }
 
-/** Bucket key for the time-wise toggle, in the TENANT's calendar. */
-function misBucketKey(b: MisBill, mode: "day" | "hour"): string {
-  return mode === "hour" ? `${b.day}T${String(b.hour).padStart(2, "0")}` : b.day;
+/** Bucket key for the time-wise toggle, in the TENANT's calendar. See timeBucketKey. */
+function misBucketKey(b: MisBill, mode: TimeBucketMode, presets: readonly TimeSlotPreset[]): string {
+  return timeBucketKey(mode, { serviceDay: b.day, calendarDay: b.calendar_day, minute: b.minute }, presets);
 }
 
 /**
@@ -35198,6 +35454,7 @@ function misBucketKey(b: MisBill, mode: "day" | "hour"): string {
 function misNcCompletedSeries(
   series: (MisLadder & { bucket: string })[],
   ncByBucket: Map<string, MisNonChargeableTotals>,
+  order: (a: string, z: string) => number = (a, z) => a.localeCompare(z),
 ): (MisLadder & { bucket: string; nc_value: number; nc_qty: number })[] {
   const out = series.map((row) => {
     const b = ncByBucket.get(row.bucket);
@@ -35213,21 +35470,29 @@ function misNcCompletedSeries(
       nc_qty: v.qty,
     });
   }
-  return out.sort((a, z) => a.bucket.localeCompare(z.bucket));
+  return out.sort((a, z) => order(a.bucket, z.bucket));
 }
 
-/** by_day / by_hour series, covers attributed to a session's FIRST bucket only. */
-function misSeries(bills: MisBill[], mode: "day" | "hour"): (MisLadder & { bucket: string })[] {
-  const buckets = new Map<string, MisBill[]>();
+/**
+ * The time-wise series, covers attributed to a seating's FIRST bucket only.
+ *
+ * FIRST IN THE SERIES' OWN ORDER (timeBucketOrder), so Σ covers over the rows is
+ * the window's covers in every mode. The session cut seeds one row per preset
+ * even when it settled nothing — a Dinner with no trade is a row of zeros, not a
+ * missing row — and Outside sessions appears only when something landed there.
+ */
+function misSeries(bills: MisBill[], mode: TimeBucketMode, presets: readonly TimeSlotPreset[] = []): (MisLadder & { bucket: string })[] {
+  const buckets = new Map<string, MisBill[]>(fixedTimeBuckets(mode, presets).map((key) => [key, []]));
   for (const b of bills) {
     if (!b.day) {continue;}
-    const key = misBucketKey(b, mode);
+    const key = misBucketKey(b, mode, presets);
     const list = buckets.get(key);
     if (list) {list.push(b);} else {buckets.set(key, [b]);}
   }
+  const order = timeBucketOrder(mode, presets);
   const seen = new Set<string>();
   return [...buckets.entries()]
-    .sort((a, z) => a[0].localeCompare(z[0]))
+    .sort((a, z) => order(a[0], z[0]))
     .map(([bucket, list]) => ({ bucket, ...misLadder(list, seen) }));
 }
 
@@ -35351,7 +35616,7 @@ export async function GetItemWiseReport(restaurantId: string, q: MisReportQuery 
               coalesce(nullif(trim((o.food)::jsonb->>'order_type'), ''), 'dine_in') as channel
          from "Orders" o, jsonb_array_elements(${MIS_ITEMS_JSON}) item
         where o.res_id = $1 and (${mc.og} or o.outlet_id = $2)
-          and o.created_at >= $3 and o.created_at < $4
+          and o.created_at >= $3 and o.created_at < $4${misTimeSql("o.created_at", mc)}
           -- Cancelled is not a sale. Same exclusion as every other revenue read.
           and coalesce(o.status::text, '1') <> '5'
           ${searchSql}
@@ -35559,7 +35824,7 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
   const where: string[] = [
     `b.res_id = $1`,
     `(${mc.og} or b.outlet_id = $2)`,
-    MIS_SETTLED_PREDICATE.trim(),
+    misSettledPredicate(mc).trim(),
     // A discount OR a coupon: a 100%-off gift voucher can leave discount_value 0.
     `(coalesce(b.discount_value, 0) > 0 or coalesce(b.coupon_code, '') <> '')`,
   ];
@@ -35822,7 +36087,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
     // count, the totals and the page all agree; shared with the void-streak alert.
     VOID_KOT_ORDER_SQL,
     `o.created_at >= $3`,
-    `o.created_at < $4`,
+    `o.created_at < $4${misTimeSql("o.created_at", mc)}`,
   ];
   if (search) {
     params.push(`%${search}%`);
@@ -36050,7 +36315,7 @@ export async function GetBillEditReport(restaurantId: string, q: MisReportQuery 
     `l.res_id = $1`,
     `(${mc.og} or l.outlet_id = $2)`,
     `l.created_at >= $3`,
-    `l.created_at < $4`,
+    `l.created_at < $4${misTimeSql("l.created_at", mc)}`,
     `l.action_id::text = any($5::text[])`,
   ];
   if (search) {
@@ -36128,8 +36393,8 @@ export interface SalesSummaryReport {
   meta: MisReportMeta;
   columns: MisColumn[];
   totals: SalesLadder;
-  /** The time-wise cut: one row per tenant-calendar day, or per hour. */
-  bucket: "day" | "hour";
+  /** The time-wise cut: per business day, per date x hour, per hour of day, or per session. */
+  bucket: TimeBucketMode;
   series: (SalesLadder & { bucket: string })[];
   by_order_type: { order_type: string; bills: number; grand_total: number; share_pct: number | null }[];
   /**
@@ -36177,11 +36442,12 @@ const SALES_SUMMARY_COLUMNS: MisColumn[] = [
 export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<SalesSummaryReport> {
   const mc = await misContext(restaurantId, q);
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
-  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
+  // The slot moves a crossing slot's after-midnight bills onto the day it began.
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot);
   const bucket = misBucketMode(q);
   const ncRows = await fetchMisNonChargeables(mc);
   const nc = misNcTotals(ncRows);
-  const ncByBucket = misNcByBucket(ncRows, mc.tz, bucket);
+  const ncByBucket = misNcByBucket(ncRows, mc, bucket);
 
   // Order type lives in the ORDER's food JSON, so it is one extra grouped read
   // rather than a column on the bill.
@@ -36192,7 +36458,7 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
        from "Bills" b
        join "Orders" o on o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
       where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}
+        and ${misSettledPredicate(mc)}
       group by 1`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   );
@@ -36230,7 +36496,7 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
     // zero-ladder row rather than being dropped. Dropping it is the one way this
     // column could stop summing to its own total, and a column that does not is
     // the first thing an auditor checks.
-    series: misNcCompletedSeries(misSeries(bills, bucket), ncByBucket),
+    series: misNcCompletedSeries(misSeries(bills, bucket, mc.presets), ncByBucket, timeBucketOrder(bucket, mc.presets)),
     by_order_type: [...typeAcc.entries()]
       .map(([order_type, v]) => ({ order_type, bills: v.bills, grand_total: v.total, share_pct: sharePct(v.total, typeTotal) }))
       .sort((a, z) => z.grand_total - a.grand_total),
@@ -36323,7 +36589,7 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
   const search = misSearch(q);
 
   const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
-  const where: string[] = [`b.res_id = $1`, `(${mc.og} or b.outlet_id = $2)`, MIS_SETTLED_PREDICATE.trim()];
+  const where: string[] = [`b.res_id = $1`, `(${mc.og} or b.outlet_id = $2)`, misSettledPredicate(mc).trim()];
   if (search) {
     params.push(`%${search}%`);
     const p = `$${String(params.length)}`;
@@ -36519,13 +36785,16 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
 
   const prev = previousWindow(mc.window.from, mc.window.to);
-  const prevInstants = windowInstants(prev, mc.tz);
+  // The previous period is cut by the SAME slot: Lunch against last month's
+  // Lunch, never against last month's whole day.
+  const prevInstants = slotWindowInstants(prev, mc.tz, mc.window.slot);
   const prevMc: MisContext = {
     ...mc,
     window: {
       from: prev.from, to: prev.to, days: countDays(prev.from, prev.to),
       source: mc.window.source, clamped: [],
       ...prevInstants,
+      slot: mc.window.slot,
     },
   };
 
@@ -37009,7 +37278,7 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
             ) as is_online
        from "Bills" b
       where b.res_id = $1 and (${og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}
+        and ${misSettledPredicate(null)}
       order by coalesce(b.closed_at, b.admin_approved_at) asc, b.id asc`,
     [context.res_id, context.outlet_id, from, to],
   );
@@ -39967,7 +40236,7 @@ async function fetchMisOrderLines(mc: MisContext): Promise<MisOrderLineRow[]> {
               coalesce((item->>'price')::numeric, 0) as price
          from "Orders" o, jsonb_array_elements(${MIS_ITEMS_JSON}) item
         where o.res_id = $1 and (${mc.og} or o.outlet_id = $2)
-          and o.created_at >= $3 and o.created_at < $4
+          and o.created_at >= $3 and o.created_at < $4${misTimeSql("o.created_at", mc)}
           and coalesce(o.status::text, '1') <> '5'
      )
      select name, menu_id, variation_id, variation_name, nc,
@@ -40213,7 +40482,7 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
           limit 1
        ) bl on true
       where n.res_id = $1 and (${mc.og} or n.outlet_id = $2)
-        and n.created_at >= $3 and n.created_at < $4
+        and n.created_at >= $3 and n.created_at < $4${misTimeSql("n.created_at", mc)}
         ${searchSql}
       order by n.created_at desc, n.id desc`,
     params,
@@ -40447,7 +40716,7 @@ export async function GetServiceChargeDenyReport(restaurantId: string, q: MisRep
        left join "Tables" t on t.id = w.table_id and t.res_id = w.res_id and t.outlet_id = w.outlet_id
        left join "Bills" b on b.id = w.bill_id and b.res_id = w.res_id and b.outlet_id = w.outlet_id
       where w.res_id = $1 and (${mc.og} or w.outlet_id = $2)
-        and w.waived_at >= $3 and w.waived_at < $4
+        and w.waived_at >= $3 and w.waived_at < $4${misTimeSql("w.waived_at", mc)}
         ${searchSql}
       order by w.waived_at desc, w.id desc`,
     params,
@@ -41007,7 +41276,7 @@ export async function GetTipSummaryReport(restaurantId: string, q: MisReportQuer
        left join "Bills" b on b.id = tn.bill_id and b.res_id = tn.res_id and b.outlet_id = tn.outlet_id
        left join "Orders" o on o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
       where tn.res_id = $1 and (${mc.og} or tn.outlet_id = $2)
-        and tn.settled_at >= $3 and tn.settled_at < $4
+        and tn.settled_at >= $3 and tn.settled_at < $4${misTimeSql("tn.settled_at", mc)}
         and tn.voided_at is null
         and tn.tip_amount > 0
         ${searchSql}
@@ -41109,7 +41378,7 @@ export interface CounterSummaryRow {
   by_method: { method: string; label?: string; amount: number }[];
   /** The same cut as one spreadsheet cell. */
   payment_modes: string;
-  /** Cash sessions on this till that overlap the window (migration 038). */
+  /** Cash sessions on this till that overlap the window (migration 038) — under a slot, its hours on some day of it. */
   sessions: number;
   opened_at: string | null;
   /** Null while any overlapping session is still open. */
@@ -41161,7 +41430,7 @@ async function fetchMisBillCounters(mc: MisContext): Promise<Map<string, { count
        from "Bills" b
        left join "Employees" e on e.id = b.emp_id and e.res_id = b.res_id and e.outlet_id = b.outlet_id
       where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}`,
+        and ${misSettledPredicate(mc)}`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   ), [] as { id: string; counter_id: string | null; fname: string | null; lname: string | null }[]);
   const out = new Map<string, { counter_id: string | null; cashier: string | null }>();
@@ -41174,6 +41443,8 @@ async function fetchMisBillCounters(mc: MisContext): Promise<Map<string, { count
 
 /** The shift half of migration 038: cash sessions on a till, over a window. */
 async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>> {
+  // Under a time slot, the slot's own interval on each day of the window.
+  const days = mc.window.slot ? slotDayInstants(mc.window, mc.tz, mc.window.slot) : null;
   const rows = await captureRead("CashSessions.counter_id", () => runQuery<{
     counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null;
   }>(
@@ -41183,6 +41454,19 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
     // both exact and immune to that null. Sessions that OVERLAP the window are
     // included: a shift that opened yesterday and is still counting money today
     // is this window's shift.
+    //
+    // UNDER A TIME SLOT a shift counts only when it overlaps the slot's hours ON
+    // AT LEAST ONE DAY of the window. The EXISTS walks each day's [lo, hi),
+    // bound as $4/$5 (slotDayInstants). The hull test above it stays: with no
+    // slot it is the whole test, and under one it still narrows the scan. The
+    // hull ALONE is not enough: a session is a span, not an instant, so
+    // misTimeSql cannot cut it, and a dinner shift on the 1st lies inside Lunch's
+    // hull over 1-3 August without ever meeting Lunch. Counted, it would add its
+    // drawer and its variance to a Lunch report, and a row for a till that rang
+    // nothing at lunch. A shift that does meet the slot is still counted WHOLE,
+    // never cut by it: a shift is a whole drawer count, and half of a variance
+    // is no number at all. The report's notes say so (MIS_SLOT_EXTRA). `d` names
+    // only lo and hi, so opened_at and closed_at inside it are the session's.
     `select counter_id,
             count(*)::text as sessions,
             min(opened_at) as opened_at,
@@ -41190,9 +41474,13 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
             coalesce(sum(variance), 0)::float as variance
        from "CashSessions"
       where res_id = $1 and counter_id is not null
-        and opened_at < $3 and (closed_at is null or closed_at >= $2)
+        and opened_at < $3 and (closed_at is null or closed_at >= $2)${days ? `
+        and exists (select 1 from unnest($4::timestamptz[], $5::timestamptz[]) as d(lo, hi)
+                     where opened_at < d.hi and (closed_at is null or closed_at >= d.lo))` : ""}
       group by counter_id`,
-    [mc.context.res_id, mc.window.fromIso, mc.window.toIso],
+    days
+      ? [mc.context.res_id, mc.window.fromIso, mc.window.toIso, days.lo, days.hi]
+      : [mc.context.res_id, mc.window.fromIso, mc.window.toIso],
   ), [] as { counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null }[]);
   const out = new Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>();
   for (const r of rows) {
@@ -41237,7 +41525,8 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
  * sessions on that till that overlap the window, and Closed is deliberately
  * BLANK while any of them is still open — a shift that has not been counted has
  * no closing time, and inventing one would make an uncounted drawer look
- * reconciled.
+ * reconciled. Under a time slot, "overlap the window" means overlapping the
+ * slot's hours on at least one day of it (fetchMisCounterSessions).
  */
 export async function GetCounterSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<CounterSummaryReport> {
   const mc = await misContext(restaurantId, q);
