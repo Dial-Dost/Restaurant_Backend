@@ -754,6 +754,17 @@ app.post("/bills/service-charge-waiver/:id/reverse", validateAction(PERM_SERVICE
 
 	No idempotent(), for the reasons in this file's header: it can mint a bill,
 	and a repeated request for paper is a request for a second piece of paper.
+
+	============================================================================
+	A PRINT DOOR THAT IS NOT UNDER /print/
+	============================================================================
+	The thermal path ends in /print/bill's 'bill:print' emit. The serverless
+	topology (deploy/template.yaml, parked) serves /print/* and /publish/* from
+	the always-on task that owns the printer sockets, because an emit made on
+	Lambda can be frozen in the container. This path matches neither, so the
+	template names it as its own behaviour. Move or rename the route and that
+	behaviour must follow, or a committed waiver answers printed:true with no
+	paper — jest-tests/bill_print_doors_always_on.test.ts fails if it does not.
 */
 app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), validateBody(sRemoveServiceChargeAndPrint), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);

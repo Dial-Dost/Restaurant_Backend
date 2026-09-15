@@ -89,6 +89,7 @@ cold-start crash in CloudWatch rather than as a compiler error.
   Windows app  --->  |  /socket.io/*   -->  ALB  -->  ECS Fargate  (always-on)  |
   Dashboard    --->  |  /print/*       -->  ALB  -->  ECS Fargate  (always-on)  |
   Guest QR     --->  |  /publish/*     -->  ALB  -->  ECS Fargate  (always-on)  |
+  Till / web   --->  |  /bills/service-charge-waiver/print --> ALB --> Fargate  |
                      |  everything else -->  HTTP API  -->  Lambda              |
                      +---------------------------------------------------------+
                                           |
@@ -165,16 +166,27 @@ actually leaving the container. Printing never depended on it — see the table
 below.
 
 For most events (`order:updated`, `table:updated`) a rare delay is survivable. For
-printing it is not. So the two routes that emit `bill:print` are **not served by
+printing it is not. So the routes that emit `bill:print` are **not served by
 Lambda at all**:
 
 | Route | Source | Served by |
 |---|---|---|
 | `POST /print/bill` (also emits the per-station KOTs) | routes/bills.ts:506 | Fargate |
 | `POST /publish/bill` | routes/bills.ts:463 | Fargate |
+| `POST /bills/service-charge-waiver/print` (records the waiver, then prints through `printOpenTableBill`) | routes/mis_capture.ts | Fargate |
 
 CloudFront routes `/print/*` and `/publish/*` to the ALB. On that task the emit is
 an in-process delivery to a socket it already owns — no Redis hop, no freeze.
+
+The third door is the exception to "everything that prints is under `/print/`".
+"Remove service charge & print" (client item 6) sits under `/bills/` beside the
+other waiver routes, so the template names its exact path as a fourth behaviour
+rather than widening to `/bills/*`, which would move every ordinary bill read and
+write onto the task. On Lambda it would be the worst version of a lost emit: the
+waiver commits, the answer says `printed: true`, and no paper comes out.
+`jest-tests/bill_print_doors_always_on.test.ts` reads every route that dispatches a
+bill print and fails if no `realtimeAlb` behaviour in `template.yaml` matches it,
+so a fourth door cannot be added under a new prefix and quietly land on Lambda.
 
 **One hostname is mandatory, not cosmetic.** `printer_service.dart:96` calls
 `io.io(AppConfig.backendUrl, opts)` — the Socket.IO client is constructed from

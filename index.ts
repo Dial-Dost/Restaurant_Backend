@@ -517,8 +517,9 @@ app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
 // idles can still have `io === null`, and the emit is then dropped with no log
 // line, no metric and no error: a stale KDS/orders/tables/waitlist screen until
 // someone hits refresh, on cold containers only, which is the hardest possible
-// thing to reproduce. (Printing is unaffected — POST /print/bill and
-// POST /publish/bill are routed to the always-on task, see deploy/README.md 2.1.)
+// thing to reproduce. (Printing is unaffected — POST /print/bill,
+// POST /publish/bill and POST /bills/service-charge-waiver/print are routed to
+// the always-on task, see deploy/README.md 2.1.)
 //
 // So the serverless entrypoint awaits THIS before it serves anything
 // (lambda.ts), while bootstrap() below awaits the same promise at the same point
