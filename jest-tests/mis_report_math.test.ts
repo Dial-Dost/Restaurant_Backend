@@ -22,8 +22,11 @@ import {
   formatMethodSplit,
   growthPct,
   humaniseVocabulary,
+  isOrderCancelSentence,
+  linesTakenOff,
   liveMoney,
   orderChannel,
+  orderLineLabel,
   perCover,
   previousWindow,
   refundedTaxShare,
@@ -511,6 +514,28 @@ describe("classifyBillEdit", () => {
     expect(classifyBillEdit(CATCH_ALL, "Order 9f2 -> Served", { order_id: "9f2", status: "Served" })).toBeNull();
   });
 
+  test("a cancel that carries its reason is still a cancel, and an undo of one is not", () => {
+    // The status route appends the reason it now captures. A suffix match missed
+    // every one of those, and matched the undo registry's sentence instead.
+    expect(classifyBillEdit(CATCH_ALL, "Order 9f2 -> Cancelled — reason: Other", { order_id: "9f2", status: "Cancelled", reason: "Other" })?.kind)
+      .toBe("order_cancelled");
+    expect(classifyBillEdit(CATCH_ALL, "Order 9f2 -> canceled", { order_id: "9f2", status: "canceled" })?.kind).toBe("order_cancelled");
+    expect(classifyBillEdit(CATCH_ALL, "Undid: Order 9f2 -> Cancelled", { undo_of: "a1" })).toBeNull();
+    // The void route keeps its own kind, by its action id, whatever its sentence says.
+    expect(classifyBillEdit("c1f83b26-5a97-4e40-b8d3-7e02a9c4f156", "Voided order 9f2 (wrong_entry, ₹50.00, before_print)", { order_id: "9f2" })?.kind)
+      .toBe("order_voided");
+  });
+
+  test("the cancel sentence is anchored at the start, as the Void KOT join's ilike is", () => {
+    // SQL twin: l.reason ilike 'Order % -> Cancel%'.
+    expect(isOrderCancelSentence("Order 9f2 -> Cancelled")).toBe(true);
+    expect(isOrderCancelSentence("order 9f2 -> CANCELLED — reason: Guest left")).toBe(true);
+    expect(isOrderCancelSentence("Undid: Order 9f2 -> Cancelled")).toBe(false);
+    expect(isOrderCancelSentence("Removed 1x Chai (50.00) from order 9f2 -> Cancelled table")).toBe(false);
+    expect(isOrderCancelSentence("Order 9f2 -> Served")).toBe(false);
+    expect(isOrderCancelSentence(null)).toBe(false);
+  });
+
   test("the dedicated action ids classify without any text matching", () => {
     expect(classifyBillEdit("d6bebeb5-111f-4371-b373-a99158116d71", null, { order_id: "9f2", item: { name: "Dal" } })?.kind).toBe("item_added");
     expect(classifyBillEdit("371ecf9f-303e-4114-92fb-3a5120d1565e", null, { order_id: "9f2", deleted_item_id: "line-3" })?.kind).toBe("item_removed");
@@ -742,6 +767,13 @@ describe("a voided ticket's dishes in one cell", () => {
     expect(voidItemsText([])).toBeNull();
   });
 
+  test("the cell and the drill-down label a line alike: the dish, and its size when it has one", () => {
+    expect(orderLineLabel({ name: "Biryani", variation: "Half" })).toBe("Biryani (Half)");
+    expect(orderLineLabel({ name: "Raita", variation: null })).toBe("Raita");
+    const lines = [{ name: "Biryani", variation: "Half", quantity: 1 }, { name: "Biryani", variation: "Full", quantity: 1 }];
+    expect(voidItemsText(lines)).toBe(lines.map((l) => `${orderLineLabel(l)} x1`).join("; "));
+  });
+
   test("a stored line is read as its dish and its size, trimmed, with nothing invented", () => {
     expect(voidLineIdentity({ name: " Biryani ", variation_name: " Half " })).toEqual({ name: "Biryani", variation: "Half" });
     expect(voidLineIdentity({ name: "Dal", variation_name: "" })).toEqual({ name: "Dal", variation: null });
@@ -781,6 +813,30 @@ describe("what a bill-item removal leaves on the order", () => {
     const input = { items: [ares] };
     stampLineRemoval(input, [helios], "remove", true, AT);
     expect(input).toEqual({ items: [ares] });
+  });
+
+  test("an items-split write took off exactly the lines that are gone, as they stood", () => {
+    expect(linesTakenOff([helios, ares], [ares])).toEqual([helios]);
+    expect(linesTakenOff([helios, ares], [])).toEqual([helios, ares]);
+    // Adding a line takes nothing off.
+    expect(linesTakenOff([helios], [helios, ares])).toEqual([]);
+  });
+
+  test("a line moved between Served and Preparing, or re-quantified, is the same line", () => {
+    // The split is flattened Served-first, so a moved line changes position.
+    expect(linesTakenOff([helios, ares], [ares, helios])).toEqual([]);
+    expect(linesTakenOff([ares], [{ ...ares, quantity: 1 }])).toEqual([]);
+    // An old client's id-less line is known by dish, size and price.
+    const chai = { name: "Chai", price: 50, quantity: 2 };
+    expect(linesTakenOff([chai], [{ ...chai, quantity: 1 }])).toEqual([]);
+    expect(linesTakenOff([chai], [{ ...chai, price: 60 }])).toEqual([chai]);
+    expect(linesTakenOff([{ ...chai, variation_name: "Large" }], [chai])).toEqual([{ ...chai, variation_name: "Large" }]);
+  });
+
+  test("matching is one for one: two identical lines of which one survived are one removal", () => {
+    const chai = { name: "Chai", price: 50, quantity: 1 };
+    expect(linesTakenOff([chai, chai], [chai])).toEqual([chai]);
+    expect(linesTakenOff([{ id: "x", ...chai }, { id: "x", ...chai }], [{ id: "x", ...chai }])).toHaveLength(1);
   });
 
   test("the report reads the lines still on a ticket first, and the removed ones only when none are left", () => {

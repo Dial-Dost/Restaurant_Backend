@@ -2000,3 +2000,169 @@ describe("Void KOT: who voided it", () => {
     expect(by(VOID_ID)?.voided_by).toBe("Asha Rao");
   });
 });
+
+// --- Void KOT: the readers and writers that must say what the report says ---
+//
+// The report's rules are only as good as the other code that touches the same
+// orders and the same audit rows. Each group below drives that REAL code and
+// checks it against the REAL Void KOT report.
+
+describe("Void KOT: a line stripped through the order-edit dialog", () => {
+  // DELETE /orders/:id/items/:itemId strips one line by handing
+  // UpdateOrderItemsSplit the split with that line filtered out, exactly as this
+  // does. Stripping the last line leaves the order ACTIVE with no lines. Releasing
+  // the table then sets status 5 and nothing else (ReleaseTable's bare
+  // `update "Orders" set status = 5`, which never touches food). Before the
+  // stamp, that row read Items blank, Lines 0, Value 0.
+  const STRIPPED_ID = "99999999-cccc-4ccc-8ccc-999999999999";
+  const lines = [
+    { id: "l-helios", name: "Helios", variation_name: "Large", quantity: 1, price: 450 },
+    { id: "l-ares", name: "Ares", quantity: 2, price: 300 },
+  ];
+  const splitWithout = (...ids: string[]): unknown[] =>
+    [["Served", lines.filter((l) => !ids.includes(l.id))], ["Preparing", []]];
+  const tenantWithOpenTicket = (): FixtureDb => standardDb({
+    orders: [
+      ...standardDb().orders,
+      order({ id: STRIPPED_ID, created_at: "2026-06-10T12:00:00.000Z", status: 3, table_name: "T12", items: lines }),
+    ],
+  });
+
+  test("the dishes and their value reach the row, the totals and the drill-down", async () => {
+    const tenant = tenantWithOpenTicket();
+    useFixtureDb(tenant);
+    await db.UpdateOrderItemsSplit(RID, STRIPPED_ID, splitWithout("l-ares"), { isAdmin: true });
+    await db.UpdateOrderItemsSplit(RID, STRIPPED_ID, splitWithout("l-ares", "l-helios"), { isAdmin: true });
+    // Still active, so not a void yet and not on the report.
+    expect((await db.GetVoidKotReport(RID, { ...W, limit: 500 })).rows.map((r) => r.order_id)).not.toContain(STRIPPED_ID);
+
+    // The release.
+    const ticket = tenant.orders.find((o) => o.id === STRIPPED_ID);
+    if (!ticket) {throw new Error("fixture lost the ticket");}
+    ticket.status = 5;
+
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    const row = voids.rows.find((r) => r.order_id === STRIPPED_ID);
+    // In the order the lines came off.
+    expect(row).toMatchObject({ item_count: 2, qty: 3, value: 1050, items_text: "Ares x2; Helios (Large) x1" });
+    expectRowsAddUp(voids);
+    const detail = await db.GetMisOrderDetail(RID, STRIPPED_ID);
+    expect(detail?.value).toBe(1050);
+    expect(detail?.items.map((i) => i.name)).toEqual(["Ares", "Helios (Large)"]);
+  });
+
+  test("moving a line between Served and Preparing takes nothing off", async () => {
+    const tenant = tenantWithOpenTicket();
+    useFixtureDb(tenant);
+    await db.UpdateOrderItemsSplit(RID, STRIPPED_ID, [["Served", [lines[0]]], ["Preparing", [lines[1]]]], { isAdmin: true });
+    const ticket = tenant.orders.find((o) => o.id === STRIPPED_ID);
+    expect(ticket?.items).toHaveLength(2);
+    expect(ticket?.removed_items).toBeUndefined();
+    expect(ticket?.emptied_by).toBeUndefined();
+  });
+});
+
+describe("Void KOT: the void-streak alert counts what the report lists", () => {
+  // The bell's "N orders voided in 24h" is the owner's cue to open this report.
+  // It counted every status-5 order, so a ticket emptied by Move item rang it
+  // although the report leaves that ticket out.
+  const now = Date.now();
+  const minutesAgo = (m: number): string => new Date(now - m * 60_000).toISOString();
+  const dayKey = (offsetDays: number): string => new Date(now + offsetDays * 86_400_000).toISOString().slice(0, 10);
+  const AROUND_NOW = { from: dayKey(-1), to: dayKey(1), limit: 500 };
+  const CANCELLED_ID = "aaaaaaaa-0000-4000-8000-000000000001";
+  const MOVED_FROM_ID = "aaaaaaaa-0000-4000-8000-000000000002";
+  const REMOVED_ID = "aaaaaaaa-0000-4000-8000-000000000003";
+
+  const liveTenant = (threshold: number): FixtureDb => makeDb({
+    timezone: IST,
+    alert_void_count: threshold,
+    orders: [
+      order({ id: CANCELLED_ID, created_at: minutesAgo(90), status: 5, table_name: "T1", items: [{ name: "Dal", quantity: 1, price: 400 }] }),
+      order({ id: MOVED_FROM_ID, created_at: minutesAgo(60), status: 1, table_name: "31A", items: [{ name: "Puchka", quantity: 1, price: 200 }] }),
+      order({ id: REMOVED_ID, created_at: minutesAgo(30), status: 1, table_name: "T12", items: [{ name: "Helios", quantity: 1, price: 450 }] }),
+    ],
+    tables: ["31"],
+  });
+
+  test("a move is not counted: two voids, not three, on the bell and in the report", async () => {
+    const tenant = liveTenant(3);
+    useFixtureDb(tenant);
+    await db.MoveBillItem(RID, "31A", "31", "Puchka", 200);
+    await db.RemoveBillItem(RID, "T12", "Helios", 450);
+    expect((await db.GetVoidKotReport(RID, AROUND_NOW)).totals.voids).toBe(2);
+    // Three orders are status 5. Two of them are voids, so a threshold of 3 is not reached.
+    expect(tenant.orders.filter((o) => o.status === 5)).toHaveLength(3);
+    await db.RunExceptionChecks(RID);
+    expect(tenant.notifications ?? []).toEqual([]);
+  });
+
+  test("at the threshold the bell names the same number the report totals", async () => {
+    const tenant = liveTenant(2);
+    useFixtureDb(tenant);
+    await db.MoveBillItem(RID, "31A", "31", "Puchka", 200);
+    await db.RemoveBillItem(RID, "T12", "Helios", 450);
+    const voids = await db.GetVoidKotReport(RID, AROUND_NOW);
+    await db.RunExceptionChecks(RID);
+    const bell = tenant.notifications ?? [];
+    expect(bell).toHaveLength(1);
+    expect(bell[0]?.meta).toMatchObject({ alert_key: "void_streak", voided: voids.totals.voids });
+    expect(bell[0]?.title).toContain(`${String(voids.totals.voids)} orders voided`);
+  });
+});
+
+describe("Void KOT and Bill Edit read one cancel sentence the same way", () => {
+  const REASONED_ID = "bbbbbbbb-0000-4000-8000-000000000001";
+  const UNDONE_ID = "bbbbbbbb-0000-4000-8000-000000000002";
+
+  test("a cancel with a reason is in both reports, and an undo of a cancel is in neither", async () => {
+    useFixtureDb(standardDb({
+      orders: [
+        ...standardDb().orders,
+        order({ id: REASONED_ID, created_at: "2026-06-11T09:00:00.000Z", status: 5, items: [{ name: "Dal", quantity: 1, price: 400 }] }),
+        order({ id: UNDONE_ID, created_at: "2026-06-11T10:00:00.000Z", status: 5, items: [{ name: "Chai", quantity: 1, price: 50 }] }),
+      ],
+      audits: [
+        ...standardDb().audits,
+        // PATCH /orders/:id/status, as it has written since the reason was captured.
+        { id: "e1", created_at: "2026-06-11T09:05:00.000Z", action_id: CATCH_ALL, action_name: "Add Orders",
+          reason: `Order ${REASONED_ID} -> Cancelled — reason: Other`,
+          details: { order_id: REASONED_ID, status: "Cancelled", reason: "Other" }, fname: "Ravi", lname: "Kumar" },
+        // The undo registry reversing a cancel.
+        { id: "e2", created_at: "2026-06-11T10:05:00.000Z", action_id: CATCH_ALL, action_name: "Add Orders",
+          reason: `Undid: Order ${UNDONE_ID} -> Cancelled`, details: { order_id: UNDONE_ID }, fname: "Not", lname: "This" },
+      ],
+    }));
+    const voids = await db.GetVoidKotReport(RID, { ...W, limit: 500 });
+    const edits = await db.GetBillEditReport(RID, { ...W, limit: 500 });
+    const cancelledInBillEdit = (id: string): boolean => edits.rows.some((r) => r.kind === "order_cancelled" && r.order_id === id);
+
+    expect(voids.rows.find((r) => r.order_id === REASONED_ID)?.voided_by).toBe("Ravi Kumar");
+    expect(cancelledInBillEdit(REASONED_ID)).toBe(true);
+
+    expect(voids.rows.find((r) => r.order_id === UNDONE_ID)?.voided_by).toBeNull();
+    expect(cancelledInBillEdit(UNDONE_ID)).toBe(false);
+    // The standard trail's two edits, plus the reasoned cancel. The undo adds none.
+    expect(edits.totals.edits).toBe(3);
+  });
+});
+
+describe("Void KOT: the drill-down names a line the way the row does", () => {
+  test("two sizes of one dish open as two lines that say which is which", async () => {
+    useFixtureDb(standardDb({
+      orders: [
+        order({
+          id: VOID_ID, created_at: "2026-06-06T10:00:00.000Z", status: 5, table_name: "T9",
+          items: [
+            { name: "Biryani", variation_name: "Half", quantity: 1, price: 350 },
+            { name: "Biryani", variation_name: "Full", quantity: 1, price: 600 },
+          ],
+        }),
+      ],
+    }));
+    const row = (await db.GetVoidKotReport(RID, { ...W, limit: 500 })).rows.find((r) => r.order_id === VOID_ID);
+    expect(row?.items_text).toBe("Biryani (Half) x1; Biryani (Full) x1");
+    const detail = await db.GetMisOrderDetail(RID, VOID_ID);
+    expect(detail?.items.map((i) => `${i.name} x${String(i.quantity)}`).join("; ")).toBe(row?.items_text);
+  });
+});

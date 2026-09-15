@@ -277,8 +277,10 @@ import {
   formatMethodSplit,
   growthPct,
   humaniseVocabulary,
+  linesTakenOff,
   liveMoney,
   orderChannel,
+  orderLineLabel,
   perCover,
   previousWindow,
   serviceChargeBasisLabel,
@@ -13437,15 +13439,29 @@ export async function UpdateOrderItemsSplit(
   }
 
   // include status in the food JSON payload so UI can read textual status
-  const newPayload = {
-    ...payload,
-    items: flattened,
-    items_split,
-    status: newStatus,
-    subtotal: repricedSubtotal,
-    // `total` is the PRE-TAX base the bill builds on (see sumOrderTotalsForTable).
-    total: repricedSubtotal,
-  };
+  //
+  // THE LINES THIS WRITE TOOK OFF ARE KEPT ON THE ORDER (stampLineRemoval, in the
+  // same update). DELETE /orders/:id/items/:itemId strips lines through here, and
+  // stripping the last one leaves an active order with no lines that a table
+  // release later cancels. Without the stamp its Void KOT row named no dish and
+  // counted no value. Moving a line between Served and Preparing, or adding one,
+  // takes nothing off and stamps nothing. See linesTakenOff.
+  const takenOff = linesTakenOff(previousLines, flattened as unknown[]);
+  const newPayload = stampLineRemoval(
+    {
+      ...payload,
+      items: flattened,
+      items_split,
+      status: newStatus,
+      subtotal: repricedSubtotal,
+      // `total` is the PRE-TAX base the bill builds on (see sumOrderTotalsForTable).
+      total: repricedSubtotal,
+    },
+    takenOff,
+    "remove",
+    takenOff.length > 0 && flattened.length === 0,
+    new Date().toISOString(),
+  );
   // update both the JSON food column and the numeric status column
   await runQuery(
     `update "Orders" set food = $1::json, status = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
@@ -29288,11 +29304,14 @@ export async function RunExceptionChecks(restaurantId: string): Promise<void> {
 
   // (b) Void streak. Orders have no voided_at timestamp, so "voided in 24h"
   // means orders CREATED in the window that are now status 5 (covers both admin
-  // voids and release-without-payment voids).
+  // voids and release-without-payment voids). Which status-5 orders are voids is
+  // VOID_KOT_ORDER_SQL, the Void KOT report's own rule: a ticket emptied by
+  // moving its dishes to another table is not one, so the bell never counts a
+  // void the report the owner opens next does not list.
   if (voidThreshold > 0) {
     const voided = (await runQuery<{ n: number }>(
-      `select count(*)::int as n from "Orders"
-        where res_id = $1 and status::text = '5' and created_at >= now() - interval '24 hours'`,
+      `select count(*)::int as n from "Orders" o
+        where o.res_id = $1 and ${VOID_KOT_ORDER_SQL} and o.created_at >= now() - interval '24 hours'`,
       [rid],
     ))[0]?.n ?? 0;
     if (voided >= voidThreshold && !(await hasRecentAlert(rid, "void_streak"))) {
@@ -35680,6 +35699,22 @@ const VOID_KOT_LINES_JSON = `case when jsonb_typeof((o.food)::jsonb->'items') = 
                                  else '[]'::jsonb end`;
 
 /**
+ * WHICH ORDERS ARE VOIDS: status 5, less the tickets a MOVE emptied.
+ *
+ * A TICKET EMPTIED BY MOVING ITS DISHES IS NOT A VOID. The food was served and
+ * billed at the other table. Listing it made a move look like a cancellation
+ * with nothing on it. Excluded only when a move emptied it AND no removal left
+ * lines on it: a ticket that lost one dish to Remove item and its last dish to
+ * Move item still reports the removed dish.
+ *
+ * ONE FRAGMENT, TWO READERS. The Void KOT where-list (so its count, totals and
+ * page agree) and the void-streak alert in RunExceptionChecks. The alert counted
+ * every status-5 order, so a service with moves rang the bell with voids the
+ * report did not list. Written against the alias `o`.
+ */
+const VOID_KOT_ORDER_SQL = `(coalesce(o.status::text, '1') = '5' and not (coalesce((o.food)::jsonb->>'${EMPTIED_BY_KEY}', '') = 'move' and jsonb_array_length(${VOID_KOT_LINES_JSON}) = 0))`;
+
+/**
  * THE AUDIT SENTENCES THAT MEAN "THIS ORDER WAS CANCELLED".
  *
  * The join used to read `reason ilike '%Cancelled'`, which matched only the
@@ -35691,7 +35726,10 @@ const VOID_KOT_LINES_JSON = `case when jsonb_typeof((o.food)::jsonb->'items') = 
  * Both are anchored at the START, so the undo registry's `Undid: Order <id> -> Cancelled`
  * (which reverses a cancel) can never be read as one. `Cancel%` also takes the
  * route's accepted spelling "canceled". A line removal on the same order carries
- * the order id too, but no removal says either sentence.
+ * the order id too, but no removal says either sentence. The Bill Edit report
+ * reads the status route's sentence with isOrderCancelSentence
+ * (mis_report_math.ts), the same start-anchored rule, so the two reports never
+ * disagree about one audit row.
  */
 const VOID_KOT_CANCEL_AUDIT_SQL = `(l.reason ilike 'Order % -> Cancel%' or l.reason ilike 'Voided order %')`;
 
@@ -35723,14 +35761,9 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
   const where: string[] = [
     `o.res_id = $1`,
     `(${mc.og} or o.outlet_id = $2)`,
-    `coalesce(o.status::text, '1') = '5'`,
-    // A TICKET EMPTIED BY MOVING ITS DISHES IS NOT A VOID. The food was served
-    // and billed at the other table. Listing it made a move look like a
-    // cancellation with nothing on it. Excluded only when a move emptied it AND
-    // no removal left lines on it: a ticket that lost one dish to Remove item
-    // and its last dish to Move item still reports the removed dish. In the
-    // where-list, so the count, the totals and the page all agree.
-    `not (coalesce((o.food)::jsonb->>'${EMPTIED_BY_KEY}', '') = 'move' and jsonb_array_length(${VOID_KOT_LINES_JSON}) = 0)`,
+    // Status 5, less the tickets a move emptied. In the where-list, so the
+    // count, the totals and the page all agree; shared with the void-streak alert.
+    VOID_KOT_ORDER_SQL,
     `o.created_at >= $3`,
     `o.created_at < $4`,
   ];
@@ -37059,7 +37092,10 @@ export async function GetMisOrderDetail(restaurantId: string, orderId: string): 
     qty += quantity;
     value = round2(value + price * quantity);
     return {
-      name: String(it.name ?? "Item"),
+      // The dish AND its size, labelled exactly as the Void KOT row's Items cell
+      // labels it, so "Biryani (Half) x1; Biryani (Full) x1" opens as two lines
+      // that say which is which rather than two lines both called "Biryani".
+      name: orderLineLabel(voidLineIdentity(it)),
       quantity,
       price,
       line_total: round2(price * quantity),

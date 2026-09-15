@@ -94,6 +94,8 @@ export interface FixtureBill {
 
 /** One order line, including the flags migrations 034 and 039 stamp on it. */
 export interface FixtureOrderItem {
+  /** The line id DELETE /orders/:id/items/:itemId addresses. Old clients wrote none. */
+  id?: string;
   name: string;
   quantity: number;
   price: number;
@@ -285,6 +287,10 @@ export interface FixtureDb {
    * any order names exists already. Only the bill-item writers look tables up.
    */
   tables?: string[];
+  /** "Restaurant".alert_void_count — the void-streak alert's threshold. Absent = off. */
+  alert_void_count?: number;
+  /** What RunExceptionChecks put on the bell. Written by the REAL AddNotification. */
+  notifications?: { title: string; meta: Record<string, unknown> }[];
 }
 
 export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
@@ -485,6 +491,25 @@ function foodOf(o: FixtureOrder): Record<string, unknown> {
     ...(o.emptied_by ? { emptied_by: o.emptied_by } : {}),
   };
 }
+
+/**
+ * THE VOID KOT RULE, WRITTEN OUT AGAIN rather than imported from the reader, so a
+ * reader that changed the rule disagrees with this and fails.
+ *
+ * The SQL text is what the readers must carry WHOLE (whitespace collapsed, as
+ * fixtureQuery collapses it). The TypeScript below is what that SQL does, applied
+ * to the fixture rows:
+ *   * the lines a cancelled ticket reports are the ones still on it, or, when
+ *     none are, the ones a removal took off it;
+ *   * a ticket is a void when it is status 5, unless a MOVE emptied it and no
+ *     removal left lines on it.
+ */
+const VOID_LINES_SQL = "case when jsonb_typeof((o.food)::jsonb->'items') = 'array' and jsonb_array_length((o.food)::jsonb->'items') > 0 then (o.food)::jsonb->'items' when jsonb_typeof((o.food)::jsonb->'removed_items') = 'array' then (o.food)::jsonb->'removed_items' else '[]'::jsonb end";
+const VOID_ORDER_SQL = `(coalesce(o.status::text, '1') = '5' and not (coalesce((o.food)::jsonb->>'emptied_by', '') = 'move' and jsonb_array_length(${VOID_LINES_SQL}) = 0))`;
+
+const linesOf = (o: FixtureOrder): FixtureOrderItem[] => (o.items.length > 0 ? o.items : (o.removed_items ?? []));
+const isReportedVoid = (o: FixtureOrder): boolean =>
+  o.status === 5 && !(o.emptied_by === "move" && linesOf(o).length === 0);
 
 /** A table's synthetic id. Stable, so the writers' `table_id = $3` can be matched. */
 const tableIdOf = (name: string): string => `tbl-${name.trim().toLowerCase()}`;
@@ -980,6 +1005,63 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     return [];
   }
   if (/^update "Tables" set is_occupied = true where id = \$1/i.test(q)) {return [];}
+
+  // --- UpdateOrderItemsSplit: the write DELETE /orders/:id/items/:itemId strips a line through ---
+  //
+  // Only the statements it issues for a caller who may write off (the gate's
+  // reads are skipped), so a test can strip lines with the REAL writer and read
+  // the ticket back through the REAL Void KOT report.
+  if (/^select status from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
+    return o ? [{ status: o.status }] : [];
+  }
+  if (/^select food, table_id from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
+    return o ? [{ food: foodOf(o), table_id: tableIdOf(o.table_name ?? "") }] : [];
+  }
+  if (/^select barked_at from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
+    return o ? [{ barked_at: new Date(o.created_at) }] : [];
+  }
+  if (/^update "Orders" set food = \$1::json, status = \$2 where id = \$3 and res_id = \$4 and outlet_id = \$5$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[2] && resOf(x) === params[3] && outletOf(x) === params[4]);
+    if (!o) {return [];}
+    const food = JSON.parse(String(params[0])) as Record<string, unknown>;
+    o.items = Array.isArray(food.items) ? (food.items as FixtureOrderItem[]) : [];
+    o.removed_items = Array.isArray(food.removed_items) ? (food.removed_items as FixtureOrderItem[]) : undefined;
+    o.emptied_by = typeof food.emptied_by === "string" ? food.emptied_by : undefined;
+    o.status = Number(params[1]);
+    return [];
+  }
+
+  // --- RunExceptionChecks: the void-streak alert ---
+  //
+  // The alert and the Void KOT report must agree about which orders are voids,
+  // so the count is re-derived here by the report's STATED rule (the same one
+  // the Void KOT branch below applies), and the SQL must carry the report's own
+  // fragment, whole.
+  if (/^select alert_discount_pct, alert_void_count from "Restaurant" where id = \$1/i.test(q)) {
+    return params[0] === d.res_id ? [{ alert_discount_pct: 0, alert_void_count: d.alert_void_count ?? 0 }] : [];
+  }
+  if (/^select count\(\*\)::int as n from "Orders" o where /i.test(q)) {
+    requireShape(q, "o.res_id = $1", "the tenant predicate");
+    requireShape(q, VOID_ORDER_SQL,
+      "the alert counts voids by the Void KOT report's own rule; a bare status = 5 counted tickets a MOVE emptied, which the report does not list");
+    requireShape(q, "o.created_at >= now() - interval '24 hours'", "the alert's window");
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+    return [{
+      n: d.orders.filter((o) =>
+        resOf(o) === params[0] && isReportedVoid(o) && new Date(o.created_at).getTime() >= since).length,
+    }];
+  }
+  if (/^select count\(\*\)::int as n from "Notifications" where res_id = \$1 and meta->>'alert_key' = \$2/i.test(q)) {
+    return [{ n: (d.notifications ?? []).filter((n) => params[0] === d.res_id && n.meta.alert_key === params[1]).length }];
+  }
+  if (/^insert into "Notifications" \(res_id, outlet_id, type, title, body, meta\)/i.test(q)) {
+    d.notifications = [...(d.notifications ?? []), { title: String(params[3]), meta: JSON.parse(String(params[5])) as Record<string, unknown> }];
+    return [];
+  }
+  if (/from "Feedback_entries" where res_id = \$1 and overall_rating <= 2/i.test(q)) {return [{ n: 0 }];}
   if (/from information_schema\.columns where table_schema = 'public' and table_name = 'Orders' and column_name = 'barked_at'/i.test(q)) {
     return [{ column_name: "barked_at" }];
   }
@@ -1065,16 +1147,11 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     // VOID KOT — every read of it is scoped to status 5.
     requireShape(q, "coalesce(o.status::text, '1') = '5'",
       "a void IS status 5; without this the report would list live orders as cancelled");
-    requireShape(q, "coalesce((o.food)::jsonb->>'emptied_by', '') = 'move'",
-      "a ticket emptied by MOVING its dishes is not a void; without this the food is listed as cancelled while it is billed at the other table");
-    requireShape(q, "then (o.food)::jsonb->'removed_items'",
-      "a ticket emptied by Remove item reports the lines it lost; without this its row names no dish and its value leaves the totals");
-    rows = rows.filter((o) => o.status === 5);
-    // The lines a cancelled ticket reports, by the reader's STATED rule, written
-    // out again here rather than imported, so a reader that changed the rule
-    // disagrees with this and fails.
-    const linesOf = (o: FixtureOrder): FixtureOrderItem[] => (o.items.length > 0 ? o.items : (o.removed_items ?? []));
-    rows = rows.filter((o) => !(o.emptied_by === "move" && linesOf(o).length === 0));
+    // The WHOLE clause, not a fragment of it: `= 0` turned into `>= 0` kept every
+    // fragment present while hiding every remove-then-move ticket and its money.
+    requireShape(q, VOID_ORDER_SQL,
+      "a ticket emptied by MOVING its dishes is not a void, and one that lost a dish to Remove item still is; without this exact clause the food is listed as cancelled while it is billed at the other table, or a removed dish's value leaves the totals");
+    rows = rows.filter(isReportedVoid);
     const search = params[4];
     if (typeof search === "string" && search.includes("%")) {
       rows = rows.filter((o) =>
@@ -1093,7 +1170,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
         "an order with no lines adds no qty; coalescing the NULL row's quantity to 1 did");
       // The totals must expand the SAME fallback list the rows are built from.
       // The where-list names removed_items too, so this is checked at the lateral.
-      requireShape(q, "left join lateral jsonb_array_elements(case when jsonb_typeof((o.food)::jsonb->'items') = 'array' and jsonb_array_length((o.food)::jsonb->'items') > 0 then (o.food)::jsonb->'items' when jsonb_typeof((o.food)::jsonb->'removed_items') = 'array'",
+      requireShape(q, `left join lateral jsonb_array_elements(${VOID_LINES_SQL}) item on true`,
         "the totals must expand the lines a removal left on the ticket, or the rows outgrow the total");
       let qty = 0, value = 0, lines = 0;
       for (const o of rows) {
