@@ -578,6 +578,7 @@ describe("no money path asks for the service charge off at compute time", () => 
   test.each([
     ["database_supabase.ts", "every settle path re-prices through openBillChargeConfig; a print-time flag must not reach it"],
     ["routes/bills.ts", "the printed ladder is the charged ladder — the print may not build its own"],
+    ["routes/mis_capture.ts", "\"Remove service charge & print\" takes the charge off by recording a waiver, never by asking the print for less"],
   ])("%s never passes withoutServiceCharge", (file, why) => {
     const src = readFileSync(join(BACKEND, file), "utf8");
     // The option as a CALLER would supply it: a bare object-literal key. The
