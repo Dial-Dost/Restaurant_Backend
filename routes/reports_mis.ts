@@ -2,8 +2,9 @@
  * MIS / CONTROL REPORTS — the HTTP surface for the fifteen documents an owner or
  * an auditor reads (Insights → Reports).
  *
- * READ-ONLY, ALL OF IT. Nothing here writes a row, nothing touches the
- * idempotency outbox, and no migration was needed to ship it.
+ * READ-ONLY, ALL OF IT, with ONE exception: PUT /reports/mis/time-slots saves
+ * the restaurant's time-slot presets (migration 049) — configuration, never
+ * money. No report writes a row, and nothing touches the idempotency outbox.
  *
  * MOUNTED UNDER /reports/ ON PURPOSE, exactly as the scheduled-report routes
  * reasoned: FEATURE_BY_PREFIX already maps that prefix to the "accounting" plan
@@ -36,13 +37,17 @@
  *                                    admin/manager ALL-OUTLETS aggregate read
  *   ?search=                         Bill No. / KOT (order id) / table / mode
  *   ?limit= &offset=                 the row-level reports
- *   ?bucket=day|hour                 the time-wise toggle
+ *   ?bucket=day|hour|hour_of_day|session   the Sales Summary's time-wise cut
+ *   ?slot=<preset id> | ?time_from=HH:mm&time_to=HH:mm
+ *                                    the part of each day (report_window.ts);
+ *                                    custom wins, all day when absent
  * Every payload carries `meta` (the window the SERVER used, with any clamp
  * NAMED), `columns` (which drives the client's column picker AND its totals row)
  * and `totals`. Add `.csv` to any of the nine for the same table as a sheet.
  */
 import type { Express, Request, Response } from "express";
 import {
+	Audit_log_category,
 	GetBillEditReport,
 	GetClosedBill,
 	GetCounterSummaryReport,
@@ -54,19 +59,22 @@ import {
 	GetMisOrderDetail,
 	GetNcSummaryReport,
 	GetOrderSummaryReport,
+	GetReportTimeSlots,
 	GetSalesSummaryReport,
 	GetServiceChargeDenyReport,
 	GetSettlementSummaryReport,
 	GetTipSummaryReport,
 	GetVariationSummaryReport,
 	GetVoidKotReport,
+	SetReportTimeSlots,
 	type MisColumn,
 	type MisReportQuery,
 	type MisReportMeta,
 } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { renderMisCsv } from "../report_render.js";
-import { ACCOUNTING_PERM, extractRestaurantId, validateAction } from "./_shared.js";
+import { TIME_BUCKET_MODES, TimeSlotConfigError, timeSlotFileSuffix, timeSlotPresetWire, type TimeSlotPreset } from "../report_window.js";
+import { ACCOUNTING_PERM, PERM_SETTINGS, callerHasPermission, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
 
 
 /**
@@ -88,13 +96,34 @@ function misQuery(req: Request): MisReportQuery {
 		limit: req.query.limit,
 		offset: req.query.offset,
 		bucket: req.query.bucket,
+		// The time slot, raw like the dates: only the data layer has the presets
+		// and the zone that give "lunch" and "12:00" a meaning.
+		slot: req.query.slot,
+		time_from: req.query.time_from,
+		time_to: req.query.time_to,
 	};
 }
 
-/** Filename an export downloads as: report, window, and the outlet scope. */
+/**
+ * Filename an export downloads as: report, outlet scope, window — and the time
+ * slot, ONLY when one was applied, so an all-day sheet keeps the name it always
+ * had. The suffix rule is timeSlotFileSuffix's, which the clients mirror.
+ */
 function misFilename(meta: MisReportMeta): string {
 	const scope = meta.outlet_scope === "all" ? "all-outlets" : (meta.outlet_name ?? "outlet").replace(/[^A-Za-z0-9._-]+/g, "-");
-	return `${meta.report}_${scope}_${meta.window.from}_to_${meta.window.to}.csv`;
+	return `${meta.report}_${scope}_${meta.window.from}_to_${meta.window.to}${timeSlotFileSuffix(meta.time_slot)}.csv`;
+}
+
+/** The catalogue's report keys, in tab order. Every one of them honours the time slot. */
+const MIS_REPORT_KEYS = [
+	"item_wise", "discount", "void_kot", "bill_edit", "sales_summary", "order_summary",
+	"executive_summary", "cover_size_summary", "settlement_summary", "nc_summary",
+	"service_charge_deny", "group_summary", "variation_summary", "tip_summary", "counter_summary",
+] as const;
+
+/** GET and PUT /reports/mis/time-slots answer the same shape. */
+function timeSlotsBody(slots: readonly TimeSlotPreset[], isDefault: boolean, canEdit: boolean) {
+	return { slots: slots.map(timeSlotPresetWire), can_edit: canEdit, is_default: isDefault };
 }
 
 function sendMisCsv(res: Response, meta: MisReportMeta, columns: readonly MisColumn[], rows: readonly object[], totals: object | null): void {
@@ -174,7 +203,10 @@ app.get("/reports/mis", validateAction(ACCOUNTING_PERM), (_req: Request, res: Re
 			outlet: { header: "X-Outlet-Id", query: "outletId", all_sentinel: "all" },
 			search: "search",
 			paging: ["limit", "offset"],
-			time_wise: { param: "bucket", values: ["day", "hour"], applies_to: ["sales_summary"] },
+			time_wise: { param: "bucket", values: [...TIME_BUCKET_MODES], applies_to: ["sales_summary"] },
+			// The part of each day. EVERY report takes it, each on its own clock
+			// (see `basis`); the presets live at presets_path.
+			time_slot: { params: ["slot", "time_from", "time_to"], presets_path: "/reports/mis/time-slots", applies_to: [...MIS_REPORT_KEYS] },
 			csv_suffix: ".csv",
 			// Which clock each report buckets on, so a client can label the toolbar
 			// honestly instead of implying that every tab answers the same question
@@ -247,6 +279,56 @@ app.get("/reports/mis/tip-summary.csv", validateAction(ACCOUNTING_PERM), misHand
 
 app.get("/reports/mis/counter-summary", validateAction(ACCOUNTING_PERM), misHandler("counter_summary", GetCounterSummaryReport, (p) => p.rows, false));
 app.get("/reports/mis/counter-summary.csv", validateAction(ACCOUNTING_PERM), misHandler("counter_summary", GetCounterSummaryReport, (p) => p.rows, true));
+
+// --- Time slots -------------------------------------------------------------
+//
+// The presets behind ?slot=. READING them is a view concern — they reveal no
+// data, and anyone who can open a report can already pick custom times — so the
+// read is on ACCOUNTING_PERM, with `can_edit` telling the toolbar whether to
+// offer "Manage". CHANGING them changes what "Lunch" means for everyone in the
+// restaurant, so the write is PERM_SETTINGS, which the owner always holds.
+// Both are literals under /reports/mis/ with no `:param` sibling, and sit above
+// the drill-downs like the fifteen.
+
+app.get("/reports/mis/time-slots", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	try {
+		const { slots, is_default } = await GetReportTimeSlots(restaurantId);
+		res.json(timeSlotsBody(slots, is_default, callerHasPermission(req, PERM_SETTINGS)));
+	} catch (e) {
+		logger.error({ err: e }, "mis_time_slots_read_failed");
+		res.status(500).json({ error: "Unable to load the report time slots" });
+	}
+});
+
+// REPLACES the whole list; an empty list is "back to the defaults". A refusal is
+// the owner's to fix, so it is a 400 with one plain sentence and nothing written.
+// Audited with the list it replaced (read in the same transaction as the write).
+app.put("/reports/mis/time-slots", validateAction(PERM_SETTINGS), async (req: Request, res: Response) => {
+	const restaurantId = extractRestaurantId(req);
+	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
+	const body = (req.body ?? {}) as { slots?: unknown };
+	try {
+		const { before, after } = await SetReportTimeSlots(restaurantId, body.slots);
+		try {
+			await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33",
+				after.is_default
+					? "Reset report time slots to the defaults"
+					: `Updated report time slots: ${after.slots.map((s) => `${s.label} ${s.start}-${s.end}`).join(", ")}`,
+				Audit_log_category.General,
+				{ report_time_slots: { before: before.is_default ? null : before.slots, after: after.is_default ? null : after.slots } });
+		} catch (err) { logger.warn({ err }, "log_audit report time slots failed"); }
+		res.json(timeSlotsBody(after.slots, after.is_default, callerHasPermission(req, PERM_SETTINGS)));
+	} catch (err) {
+		if (err instanceof TimeSlotConfigError) {
+			res.status(400).json({ error: "Invalid time slots", details: err.message });
+			return;
+		}
+		logger.error({ err }, "mis_time_slots_save_failed");
+		res.status(500).json({ error: "Unable to save the report time slots" });
+	}
+});
 
 // --- Drill-down -------------------------------------------------------------
 

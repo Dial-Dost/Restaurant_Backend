@@ -256,6 +256,27 @@ import {
   resolveReportWindow,
   type ReportWindowQuery,
   type ResolvedReportWindow,
+  DEFAULT_TIME_SLOTS,
+  TimeSlotConfigError,
+  fixedTimeBuckets,
+  formatClock,
+  parseStoredTimeSlots,
+  resolveTimeSlot,
+  serviceDayKey,
+  slotBounds,
+  slotDayBounds,
+  timeBucketKey,
+  timeBucketMode,
+  timeBucketOrder,
+  timeSlotMeta,
+  timeSlotNeedsPresets,
+  timeSlotNote,
+  timeSlotsForStorage,
+  validateTimeSlotPresets,
+  type TimeBucketMode,
+  type TimeSlot,
+  type TimeSlotMeta,
+  type TimeSlotPreset,
 } from "./report_window.js";
 // The MIS / control reports' money ladder and the pure rules they share. Kept in
 // their own module for the billing_math.ts reason: jest proves every rung, the
@@ -264,6 +285,8 @@ import {
 // nine readers at the bottom of this file are the only consumers.
 import {
   BILL_EDIT_ACTION_IDS,
+  EMPTIED_BY_KEY,
+  REMOVED_LINES_KEY,
   UNALLOCATED_METHOD,
   UNATTRIBUTED_GROUP,
   addToLadder,
@@ -275,17 +298,24 @@ import {
   formatMethodSplit,
   growthPct,
   humaniseVocabulary,
+  linesTakenOff,
   liveMoney,
   orderChannel,
+  orderLineLabel,
   perCover,
   previousWindow,
   serviceChargeBasisLabel,
   settlementByMethod,
   sharePct,
+  stampLineRemoval,
+  voidItemsText,
+  voidKotLines,
+  voidLineIdentity,
   zeroLadder,
   type BillEditKind,
   type BillMoney,
   type LadderTotals,
+  type LineRemovalMode,
   type SettlementBill,
   type SettlementMethodRow,
   type SettlementPart,
@@ -317,6 +347,7 @@ export {
   resolveReportWindow,
 } from "./report_window.js";
 export type { ReportWindowQuery, ResolvedReportWindow, WindowClamp } from "./report_window.js";
+export type { TimeBucketMode, TimeSlotMeta, TimeSlotPreset } from "./report_window.js";
 import {
   computeStockStatus,
   inventoryStatusOf,
@@ -4348,7 +4379,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; taxes: BillTaxLine[]; tax_total: number; round_off: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; service_charge_basis: OpenBillChargeConfig["basis"]; service_charge_applied: boolean; taxes: BillTaxLine[]; tax_total: number; round_off: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -4636,6 +4667,14 @@ export async function GetBillForTable(
     // higher total than the one on screen.
     service_charge_waived: chargeCfg.waiver !== null,
     service_charge_waiver: chargeCfg.waiver,
+    // WHICH SHAPE CARRIES THIS OUTLET'S CHARGE, AND WHETHER IT IS ON THIS BILL
+    // NOW — the resolver's own answers, so a client deciding whether to offer
+    // "Remove service charge & print" does not guess. `service_charge` above is
+    // only the restaurant_percent leg and is 0 on every tax_line tenant (most of
+    // the fleet), and matching tax-line NAMES differs by client (/service\s*charge/i
+    // here, contains('service charge') in Dart). "none" = nothing to remove.
+    service_charge_basis: chargeCfg.basis,
+    service_charge_applied: chargeCfg.service_charge_applied,
     taxes,
     tax_total,
     // Migration 048: what rounded `grand_total` to the rupee. Every screen and
@@ -13430,15 +13469,29 @@ export async function UpdateOrderItemsSplit(
   }
 
   // include status in the food JSON payload so UI can read textual status
-  const newPayload = {
-    ...payload,
-    items: flattened,
-    items_split,
-    status: newStatus,
-    subtotal: repricedSubtotal,
-    // `total` is the PRE-TAX base the bill builds on (see sumOrderTotalsForTable).
-    total: repricedSubtotal,
-  };
+  //
+  // THE LINES THIS WRITE TOOK OFF ARE KEPT ON THE ORDER (stampLineRemoval, in the
+  // same update). DELETE /orders/:id/items/:itemId strips lines through here, and
+  // stripping the last one leaves an active order with no lines that a table
+  // release later cancels. Without the stamp its Void KOT row named no dish and
+  // counted no value. Moving a line between Served and Preparing, or adding one,
+  // takes nothing off and stamps nothing. See linesTakenOff.
+  const takenOff = linesTakenOff(previousLines, flattened as unknown[]);
+  const newPayload = stampLineRemoval(
+    {
+      ...payload,
+      items: flattened,
+      items_split,
+      status: newStatus,
+      subtotal: repricedSubtotal,
+      // `total` is the PRE-TAX base the bill builds on (see sumOrderTotalsForTable).
+      total: repricedSubtotal,
+    },
+    takenOff,
+    "remove",
+    takenOff.length > 0 && flattened.length === 0,
+    new Date().toISOString(),
+  );
   // update both the JSON food column and the numeric status column
   await runQuery(
     `update "Orders" set food = $1::json, status = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
@@ -14064,6 +14117,14 @@ export interface RemovedBillLine {
  * So every removed line is returned as it stood. The `{ name, price, quantity }`
  * summary is kept for the callers and the audit line that already read it, and
  * `value` is the one number a move must preserve.
+ *
+ * `mode` SAYS WHICH OF THE TWO THIS IS, because the order it empties means
+ * different things. A removal is a void: the order keeps the lines it lost, so
+ * its Void KOT row still names the dishes and their value. A move is not a void,
+ * because the food lives on at the destination: the order is only marked as
+ * emptied by a move, and the Void KOT report leaves it out. See stampLineRemoval
+ * (mis_report_math.ts) for why this is recorded on the order rather than in the
+ * void ledger.
  */
 async function removeItemFromTableOrders(
   context: RestaurantContext,
@@ -14071,6 +14132,7 @@ async function removeItemFromTableOrders(
   itemName: string,
   itemPrice: number,
   client: PoolClient,
+  mode: LineRemovalMode,
 ): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number } | null> {
   const orders = await runQuery<{ id: string; food: unknown }>(
     `select id, food from "Orders"
@@ -14114,7 +14176,13 @@ async function removeItemFromTableOrders(
       split = split.map((t: any) => Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter((it: any) => !matches(it))] : t);
     }
     const subtotal = round2(keep.reduce((s, it) => s + (Number(it?.price) || 0) * Math.max(1, Math.round(Number(it?.quantity) || 1)), 0));
-    const newFood: Record<string, any> = { ...f, items: keep, subtotal, total: subtotal };
+    const newFood: Record<string, any> = stampLineRemoval(
+      { ...f, items: keep, subtotal, total: subtotal },
+      items.filter((it) => matches(it)),
+      mode,
+      keep.length === 0,
+      new Date().toISOString(),
+    );
     if (split !== undefined) {newFood.items_split = split;}
     if (keep.length === 0) {
       await runQuery(`update "Orders" set food = $4::json, status = 5 where id = $1 and res_id = $2 and outlet_id = $3`,
@@ -14215,7 +14283,7 @@ export async function RemoveBillItem(
     const tableId = await tableIdByName(context, tableName, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
-    const removed = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client);
+    const removed = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove");
     if (!removed) {throw new Error("Item not found on this table's bill");}
     return { success: true, removed };
   });
@@ -14650,7 +14718,7 @@ export async function MoveBillItem(
     await assertBillEditable(context, fromId, client);
     await assertBillEditable(context, toId, client);
 
-    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client);
+    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client, "move");
     if (!moved) {throw new Error("Item not found on the source table");}
 
     // Ensure the destination table is occupied so the order/bill attaches.
@@ -18017,9 +18085,18 @@ export interface SalesReport {
   total_refund: number;
   // The share of total_tax that sits inside refunded bills (see refundedTaxOf).
   total_refunded_tax: number;
+  // total_sales is the client's GROSS (the grand total, before refunds). This is
+  // its NET: Σ taxable_base — the item total less discounts, before service
+  // charge, tax and round off — the same classifier, so it equals the MIS Sales
+  // Summary's Net for the same days (test/money pins it).
+  total_net: number;
+  total_round_off: number;
+  // DEPRECATED NAME, unchanged value: total_sales − refunds, tax and all. Kept
+  // for installed clients and scheduled readers; no screen may label it "Net"
+  // again — it is "Gross after refunds".
   net_sales: number;
   bill_count: number;
-  by_day: { date: string; sales: number; tax: number; service_charge: number; refund: number; bills: number }[];
+  by_day: { date: string; sales: number; net: number; tax: number; service_charge: number; refund: number; bills: number }[];
   // Grouped by the STORED id; `label` is the owner's name for it (Settings >
   // Payments), so a renamed or custom mode reads right without splitting history.
   by_method: { method: string; label?: string; sales: number; bills: number }[];
@@ -18032,7 +18109,8 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
   const scPct = await getServiceChargePercent(context.res_id);
 
   let totalSales = 0, totalTax = 0, totalService = 0, totalRefund = 0, totalRefundedTax = 0;
-  const byDay = new Map<string, { sales: number; tax: number; service_charge: number; refund: number; bills: number }>();
+  let totalNet = 0, totalRoundOff = 0;
+  const byDay = new Map<string, { sales: number; net: number; tax: number; service_charge: number; refund: number; bills: number }>();
   const byMethod = new Map<string, { sales: number; bills: number }>();
   for (const b of bills) {
     const gross = b.total_amt;
@@ -18040,13 +18118,16 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     const tax = charges.tax_total;
     const service = charges.service_charge;
     totalSales = round2(totalSales + gross);
+    totalNet = round2(totalNet + charges.taxable_base);
+    totalRoundOff = round2(totalRoundOff + charges.round_off);
     totalTax = round2(totalTax + tax);
     totalService = round2(totalService + service);
     totalRefund = round2(totalRefund + b.refund_amount);
     totalRefundedTax = round2(totalRefundedTax + refundedTaxOf(b, tax));
     const day = dayKeyOf(b.settled_at, context.timezone);
-    const dd = byDay.get(day) ?? { sales: 0, tax: 0, service_charge: 0, refund: 0, bills: 0 };
+    const dd = byDay.get(day) ?? { sales: 0, net: 0, tax: 0, service_charge: 0, refund: 0, bills: 0 };
     dd.sales = round2(dd.sales + gross); dd.tax = round2(dd.tax + tax);
+    dd.net = round2(dd.net + charges.taxable_base);
     dd.service_charge = round2(dd.service_charge + service);
     dd.refund = round2(dd.refund + b.refund_amount); dd.bills += 1;
     byDay.set(day, dd);
@@ -18078,6 +18159,8 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     total_service_charge: totalService,
     total_refund: totalRefund,
     total_refunded_tax: totalRefundedTax,
+    total_net: totalNet,
+    total_round_off: totalRoundOff,
     net_sales: round2(totalSales - totalRefund),
     bill_count: bills.length,
     by_day: [...byDay.entries()].filter(([d]) => d).sort((a, b) => a[0].localeCompare(b[0])).map(([date, v]) => ({ date, ...v })),
@@ -18289,8 +18372,8 @@ export async function GetDiscountsReport(restaurantId: string, fromIso?: string,
   const giftTotal = round2(byCoupon.filter((c) => c.kind === "gift").reduce((s, c) => s + c.amount, 0));
 
   const notes = [
-    "Bill totals are stored net of discount, so the sales, GST and P&L figures already reflect these discounts — don't subtract them again.",
-    "Discounts come off the items subtotal before service charge and taxes, so a pre-discount gross sales figure isn't derivable from settled totals and is deliberately not shown.",
+    "Bill totals are stored after discount, so the sales, GST and P&L figures already reflect these discounts — don't subtract them again.",
+    "Discounts come off the item total before service charge and taxes. Settled totals are stored after the discount, so the pre-discount item total is reconstructed per bill; the MIS Discount report shows each discounted bill's Item total, Net and Gross side by side.",
   ];
   if (estimatedBills > 0) {
     notes.push(`${estimatedBills} bill(s) carried a percentage discount; their money value is reconstructed from the settled total using the current service-charge % and is an estimate.`);
@@ -27245,6 +27328,11 @@ async function ensureBrandingColumns(): Promise<void> {
   // configured", which resolves to an EMPTY catalogue — no badge renders
   // anywhere until the owner adds one, so every existing tenant is unchanged.
   await runQuery(`alter table "Restaurant" add column if not exists menu_badges jsonb default null`);
+  // The Reports section's time-slot presets (migration 049, report_window.ts).
+  // Restaurant-wide, so the ALL-OUTLETS read has one definition of Lunch. NULL
+  // means "never configured" and resolves to DEFAULT_TIME_SLOTS; the report
+  // readers also survive this column being absent (42703 -> defaults).
+  await runQuery(`alter table "Restaurant" add column if not exists report_time_slots jsonb default null`);
   brandingColsEnsured = true;
 }
 
@@ -29266,11 +29354,14 @@ export async function RunExceptionChecks(restaurantId: string): Promise<void> {
 
   // (b) Void streak. Orders have no voided_at timestamp, so "voided in 24h"
   // means orders CREATED in the window that are now status 5 (covers both admin
-  // voids and release-without-payment voids).
+  // voids and release-without-payment voids). Which status-5 orders are voids is
+  // VOID_KOT_ORDER_SQL, the Void KOT report's own rule: a ticket emptied by
+  // moving its dishes to another table is not one, so the bell never counts a
+  // void the report the owner opens next does not list.
   if (voidThreshold > 0) {
     const voided = (await runQuery<{ n: number }>(
-      `select count(*)::int as n from "Orders"
-        where res_id = $1 and status::text = '5' and created_at >= now() - interval '24 hours'`,
+      `select count(*)::int as n from "Orders" o
+        where o.res_id = $1 and ${VOID_KOT_ORDER_SQL} and o.created_at >= now() - interval '24 hours'`,
       [rid],
     ))[0]?.n ?? 0;
     if (voided >= voidThreshold && !(await hasRecentAlert(rid, "void_streak"))) {
@@ -34604,7 +34695,7 @@ export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number):
 // ============================================================================
 //
 // THE MONEY IS DEFINED IN mis_report_math.ts, NOT HERE. That module carries the
-// one Gross → Discount → Net → Tax → Service Charge → Round Off → Grand Total
+// one Item total → Discount → Net → Service Charge → Tax → Round Off → Gross
 // ladder every report below composes, the discount reconstruction, the
 // settlement allocation, the period-on-period rules and the bill-edit
 // classifier — all pure, all jest-proven without a pg pool. Read its header
@@ -34620,10 +34711,12 @@ export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number):
 // Item Wise is the exception and says so in its own notes: it buckets by ORDER
 // PLACEMENT time because an item has no settlement of its own.
 //
-// READ-ONLY. Nothing in this section writes, and nothing here touches the
-// idempotency outbox. No migration was needed: every column read below already
-// exists (the lazy ensure* helpers are called only so a tenant that predates a
-// column still reads rather than 42703-ing).
+// READ-ONLY. Nothing in this section writes a report row — SetReportTimeSlots
+// saves configuration (migration 049), never money — and nothing here touches
+// the idempotency outbox. No report needs a migration: every column read below
+// already exists (the lazy ensure* helpers are called only so a tenant that
+// predates a column still reads rather than 42703-ing), and the one column that
+// may not — "Restaurant".report_time_slots — reads as the default time slots.
 //
 // OUTLET SCOPE follows the house pattern exactly: `og` is "true" in the
 // admin/manager ALL-OUTLETS aggregate read (isAllOutlets(), set by the
@@ -34636,8 +34729,11 @@ export async function PurgeExpiredIdempotencyKeys(resId: string, limit: number):
 export interface MisWindow extends ResolvedReportWindow {
   fromIso: string;
   /** EXCLUSIVE — local midnight of the day AFTER `to`. This is what makes the
-   *  range inclusive of its last day; see windowInstants. */
+   *  range inclusive of its last day; see windowInstants. With a time slot both
+   *  instants are the slot's OUTER bounds instead; see slotWindowInstants. */
   toIso: string;
+  /** The part of each day the report is cut by. null = all day. */
+  slot: TimeSlot | null;
 }
 
 /** Everything the nine share: identity, zone, scope and the resolved window. */
@@ -34648,6 +34744,9 @@ interface MisContext {
   allOutlets: boolean;
   window: MisWindow;
   tz: string;
+  /** The restaurant's time-slot presets — READ ONLY when a preset id or the
+   *  session cut needs them, and empty otherwise. */
+  presets: readonly TimeSlotPreset[];
 }
 
 /** How a client asks for any of the nine. All values arrive raw off the query string. */
@@ -34656,7 +34755,7 @@ export interface MisReportQuery extends ReportWindowQuery {
   search?: unknown;
   limit?: unknown;
   offset?: unknown;
-  /** The time-wise toggle: "day" (default) or "hour". */
+  /** The time-wise toggle: "day" (default), "hour", "hour_of_day" or "session". */
   bucket?: unknown;
 }
 
@@ -34676,6 +34775,8 @@ export interface MisReportMeta {
   report: string;
   title: string;
   window: ResolvedReportWindow;
+  /** The part of each day this payload was cut by; null = all day. */
+  time_slot: TimeSlotMeta | null;
   timezone: string;
   outlet_scope: "outlet" | "all";
   outlet_id: string | null;
@@ -34707,7 +34808,15 @@ const NOTE_COVERS_ONCE =
 const NOTE_PER_COVER_PRETAX =
   "Per-cover figures are PRE-TAX (net of discount, before service charge and tax) — the house APC convention. Average bill value is the tax-inclusive grand total.";
 const NOTE_ROUND_OFF =
-  "Round off is what rounded each bill to the rupee (recorded at settle). It sits inside the grand total and outside net sales, service charge and tax; bills settled before rounding carry 0.";
+  "Round off is what rounded each bill to the rupee (recorded at settle). It sits inside Gross (the grand total) and outside Net, service charge and tax; bills settled before rounding carry 0.";
+/**
+ * THE THREE WORDS, defined once, on every report that prints them. The client's
+ * definitions — see the vocabulary block in the header of mis_report_math.ts.
+ * The web XLSX notes sheet and the app's CSV/PDF preamble print meta.notes, so
+ * the definition travels with every export too.
+ */
+const NOTE_GROSS_NET =
+  "Gross is the grand total of the bills: net + service charge + tax + round off, before refunds. Net is the item total less discounts, before service charge, tax and round off. Item total is the menu-price value of the bill lines before any discount.";
 const NOTE_DISCOUNT_ESTIMATE =
   "A discount stored as a percentage did not have its money value snapshotted; it is reconstructed from the settled total. Those bills are counted in estimated_discount_bills.";
 
@@ -34729,14 +34838,223 @@ async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisC
     defaultDays: MIS_DEFAULT_DAYS,
     maxDays: MAX_REPORT_DAYS,
   });
+  // THE TIME SLOT, resolved once for every read below (report_window.ts). The
+  // presets are read only when something names one — a preset id, or the
+  // session cut — so an all-day report issues exactly the queries it always did.
+  // An unusable slot is ALL DAY with its clamp appended to the window's own.
+  const presets = timeSlotNeedsPresets(q) || misBucketMode(q) === "session"
+    ? (await loadReportTimeSlots(context.res_id)).slots
+    : [];
+  const { slot, clamped } = resolveTimeSlot(q, presets);
   return {
     context,
     og: allOutlets ? "true" : "false",
     allOutlets,
-    window: { ...resolved, ...windowInstants(resolved, tz) },
+    window: {
+      ...resolved,
+      clamped: clamped.length > 0 ? [...resolved.clamped, ...clamped] : resolved.clamped,
+      ...slotWindowInstants(resolved, tz, slot),
+      slot,
+    },
     tz,
+    presets,
   };
 }
+
+// --- Time slots (report_window.ts) -------------------------------------------
+//
+// The contract — which clock, half-open minutes, a crossing slot belongs to the
+// day it starts on, all day is no slot — lives in report_window.ts and is proved
+// there. What lives here is only what needs the database or the zone: the
+// presets' storage, the instants a slot binds, and the SQL fragment every window
+// predicate carries.
+
+/**
+ * [fromIso, toIso) for a window, cut by a slot's OUTER bounds.
+ *
+ * No slot is windowInstants, untouched. With one, the first instant is the
+ * slot's start on `from` and the last is its end on `to` (or on `to`+1 when it
+ * ends at or after midnight). misTimeSql removes the gaps between the days.
+ */
+function slotWindowInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot | null): { fromIso: string; toIso: string } {
+  if (!slot) {return windowInstants(w, tz);}
+  const b = slotBounds(w, slot);
+  return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
+}
+
+/** A minute past local midnight of a YYYY-MM-DD day in `tz`, as the UTC instant SQL binds. */
+function slotWallInstant(key: string, minute: number, tz: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+  if (!m) {return new Date(NaN).toISOString();}
+  return zonedWallToUtc(Number(m[1]), Number(m[2]), Number(m[3]), Math.floor(minute / 60), minute % 60, tz).toISOString();
+}
+
+/**
+ * [lo, hi) of the slot on EACH day of a window, as two parallel arrays to bind.
+ *
+ * This is for a read that asks whether a SPAN of time meets the slot, not
+ * whether an instant falls in it. The cash-session overlap is the one such read.
+ * slotDayBounds explains why the hull and misTimeSql cannot answer that. The
+ * instants come from the same conversion as slotWindowInstants, so lo[0] is its
+ * fromIso and the last hi is its toIso, and a DST day follows the wall clock
+ * exactly as the bill reads do.
+ */
+function slotDayInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot): { lo: string[]; hi: string[] } {
+  const lo: string[] = [];
+  const hi: string[] = [];
+  for (const b of slotDayBounds(w, slot)) {
+    lo.push(slotWallInstant(b.fromKey, b.fromMin, tz));
+    hi.push(slotWallInstant(b.toKey, b.toMin, tz));
+  }
+  return { lo, hi };
+}
+
+/** An IANA zone name as it may appear INLINE in SQL. context.timezone is already Intl-checked. */
+const MIS_SQL_ZONE = /^[A-Za-z0-9_+\-/]{1,64}$/;
+
+/**
+ * The time-of-day predicate for one window column, or "" with no slot.
+ *
+ * APPENDED AT EVERY MIS WINDOW PREDICATE, right after its `< $4`, on the column
+ * that predicate bounds — the settlement stamp, the order's placement, the
+ * comp, the waiver, the tender, the edit. One site without it and Σ Settlement
+ * stops equalling the Sales Summary under a slot while every all-day test stays
+ * green, which is why a jest wiring test pairs them and the fixture refuses a
+ * slot-bound query that lacks it.
+ *
+ * INLINE LITERALS, not parameters, so the existing `$n` numbering of fifteen
+ * readers (and their search/limit/offset arithmetic) is untouched. Nothing here
+ * comes from the request: the times are formatted from integers the resolver
+ * produced and re-checked, and the zone is the tenant's Intl-validated zone
+ * re-checked against a strict pattern — the same posture as the inlined `og`.
+ *
+ * `(col at time zone 'TZ')::time` is the wall clock of a timestamptz in the
+ * restaurant's zone. Parenthesised on purpose: `::` binds tighter than AT TIME
+ * ZONE, so without them the cast would apply to the zone string.
+ */
+function misTimeSql(col: string, mc: Pick<MisContext, "window" | "tz">): string {
+  const slot = mc.window.slot;
+  if (!slot) {return "";}
+  const ok = Number.isInteger(slot.start) && slot.start >= 0 && slot.start < 1440
+    && Number.isInteger(slot.end) && slot.end > 0 && slot.end <= 1440;
+  if (!ok || !MIS_SQL_ZONE.test(mc.tz)) {throw new Error("mis time slot: refusing to inline an unchecked time or zone");}
+  const clock = `((${col}) at time zone '${mc.tz}')::time`;
+  const from = `${clock} >= '${formatClock(slot.start)}'::time`;
+  if (slot.end === 1440) {return ` and ${from}`;}
+  const to = `${clock} < '${formatClock(slot.end)}'::time`;
+  return slot.crosses_midnight ? ` and (${from} or ${to})` : ` and ${from} and ${to}`;
+}
+
+/**
+ * Whether this process has already said "report_time_slots is missing".
+ *
+ * ONCE PER PROCESS, because the 42703 is a fact about the SCHEMA, not about the
+ * request. The column ships as runtime DDL first (ensureBrandingColumns) with
+ * migration 049 hand-applied later, so a freshly deployed backend can read the
+ * presets before anything has created the column — and every Reports toolbar
+ * load, every ?slot= and every session cut in that window would otherwise file
+ * the same warn, burying the deploy log an operator is reading at that moment.
+ * One line says it; the defaults are what every read answers meanwhile; the
+ * next process says it again if it is still true.
+ */
+let timeSlotsColumnMissingWarned = false;
+
+/**
+ * The restaurant's presets, and whether they are the built-in defaults.
+ *
+ * DEFENSIVE BY DESIGN: a tenant on a database where migration 049 has not run
+ * (42703) and a tenant that never saved presets (NULL) both get
+ * DEFAULT_TIME_SLOTS, and so does a stored value that no longer validates. A
+ * report must never 500 because of how its toolbar is configured.
+ */
+async function loadReportTimeSlots(resId: string, client?: PoolClient): Promise<{ slots: TimeSlotPreset[]; is_default: boolean }> {
+  let raw: unknown = null;
+  try {
+    const rows = await runQuery<{ report_time_slots: unknown }>(
+      `select report_time_slots from "Restaurant" where id = $1 limit 1${client ? " for update" : ""}`,
+      [resId],
+      client,
+    );
+    raw = rows[0]?.report_time_slots ?? null;
+  } catch (err) {
+    if ((err as { code?: unknown })?.code !== "42703") {throw err;}
+    if (!timeSlotsColumnMissingWarned) {
+      timeSlotsColumnMissingWarned = true;
+      logger.warn({ what: "Restaurant.report_time_slots" }, "mis_time_slots_column_missing");
+    }
+  }
+  const stored = parseStoredTimeSlots(raw);
+  return stored
+    ? { slots: stored, is_default: false }
+    : { slots: DEFAULT_TIME_SLOTS.map((s) => ({ ...s })), is_default: true };
+}
+
+/** GET /reports/mis/time-slots — the presets the Reports toolbar offers. */
+export async function GetReportTimeSlots(restaurantId: string): Promise<{ slots: TimeSlotPreset[]; is_default: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  return loadReportTimeSlots(context.res_id);
+}
+
+/**
+ * PUT /reports/mis/time-slots — REPLACE the whole preset list.
+ *
+ * Refused out loud: an invalid list throws TimeSlotConfigError (one sentence)
+ * before anything is written, and the route answers 400 with it. An empty list
+ * is the owner asking for the defaults back, and stores NULL.
+ *
+ * SNAPSHOT BEFORE MUTATE: the stored value is read `for update` in the same
+ * transaction as the write, so the audit entry's before-state is the value this
+ * save actually replaced, and two editors saving at once take turns.
+ */
+export async function SetReportTimeSlots(
+  restaurantId: string,
+  input: unknown,
+): Promise<{ before: { slots: TimeSlotPreset[]; is_default: boolean }; after: { slots: TimeSlotPreset[]; is_default: boolean } }> {
+  const checked = validateTimeSlotPresets(input);
+  if (!checked.ok) {throw new TimeSlotConfigError(checked.error);}
+  const context = await requireRestaurantContext(restaurantId);
+  // DDL outside the transaction, memoized — never inside a settle.
+  await ensureBrandingColumns();
+  const stored = timeSlotsForStorage(checked.slots);
+  return withTransaction(async (client) => {
+    const before = await loadReportTimeSlots(context.res_id, client);
+    await runQuery(
+      `update "Restaurant" set report_time_slots = $2::jsonb where id = $1`,
+      [context.res_id, stored === null ? null : JSON.stringify(stored)],
+      client,
+    );
+    const after = stored === null
+      ? { slots: DEFAULT_TIME_SLOTS.map((s) => ({ ...s })), is_default: true }
+      : { slots: stored.slots, is_default: false };
+    return { before, after };
+  });
+}
+
+/**
+ * What each report's clock stamps, for the sentence misMeta adds under a slot —
+ * plus, where a report has something the slot does NOT cut, that too.
+ */
+const MIS_SLOT_SUBJECT: Record<string, string> = {
+  sales_summary: "bills SETTLED",
+  order_summary: "bills SETTLED",
+  cover_size_summary: "bills SETTLED",
+  settlement_summary: "bills SETTLED",
+  discount: "bills SETTLED",
+  executive_summary: "bills SETTLED",
+  counter_summary: "bills SETTLED",
+  item_wise: "order lines PLACED",
+  group_summary: "order lines PLACED",
+  variation_summary: "order lines PLACED",
+  void_kot: "orders PLACED",
+  nc_summary: "items COMPED",
+  service_charge_deny: "service charges WAIVED",
+  tip_summary: "tips SETTLED",
+  bill_edit: "edits MADE",
+};
+const MIS_SLOT_EXTRA: Record<string, string> = {
+  executive_summary: "The comparison period is cut by the same time slot, so growth compares like with like.",
+  counter_summary: "Opened, Closed, Cash sessions and Cash variance describe whole shifts that overlap the slot's hours on at least one day of the range; a shift is not cut by the slot.",
+};
 
 async function misMeta(mc: MisContext, report: string, title: string, notes: string[]): Promise<MisReportMeta> {
   let outletName: string | null = null;
@@ -34753,12 +35071,21 @@ async function misMeta(mc: MisContext, report: string, title: string, notes: str
     report,
     title,
     window: { from: mc.window.from, to: mc.window.to, days: mc.window.days, source: mc.window.source, clamped: mc.window.clamped },
+    time_slot: timeSlotMeta(mc.window.slot),
     timezone: mc.tz,
     outlet_scope: mc.allOutlets ? "all" : "outlet",
     outlet_id: mc.allOutlets ? null : mc.context.outlet_id,
     outlet_name: outletName,
     generated_at: new Date().toISOString(),
-    notes,
+    // Under a slot the notes say which minutes of which clock were counted. With
+    // none they are exactly the report's own.
+    notes: mc.window.slot
+      ? [
+        ...notes,
+        timeSlotNote(mc.window.slot, MIS_SLOT_SUBJECT[report] ?? "rows"),
+        ...(MIS_SLOT_EXTRA[report] ? [MIS_SLOT_EXTRA[report]] : []),
+      ]
+      : notes,
   };
 }
 
@@ -34774,9 +35101,8 @@ function misSearch(q: MisReportQuery): string | null {
   return s.length > 0 ? s : null;
 }
 
-function misBucketMode(q: MisReportQuery): "day" | "hour" {
-  const raw = Array.isArray(q.bucket) ? q.bucket[0] : q.bucket;
-  return String(raw ?? "").trim().toLowerCase() === "hour" ? "hour" : "day";
+function misBucketMode(q: MisReportQuery): TimeBucketMode {
+  return timeBucketMode(q.bucket);
 }
 
 // --- Reading a capture table that may not exist yet --------------------------
@@ -34897,7 +35223,7 @@ async function fetchMisNonChargeables(mc: MisContext): Promise<MisNcRow[]> {
     `select created_at, outlet_id, quantity, value, (reversed_at is not null) as reversed
        from "OrderItemNonChargeable"
       where res_id = $1 and (${mc.og} or outlet_id = $2)
-        and created_at >= $3 and created_at < $4`,
+        and created_at >= $3 and created_at < $4${misTimeSql("created_at", mc)}`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   ), [] as MisNcRow[]);
 }
@@ -34920,12 +35246,17 @@ function misNcByOutlet(rows: readonly MisNcRow[]): Map<string, MisNonChargeableT
 }
 
 /** The comps of a window, cut into the SAME bucket keys misSeries uses. */
-function misNcByBucket(rows: readonly MisNcRow[], tz: string, mode: "day" | "hour"): Map<string, MisNonChargeableTotals> {
+function misNcByBucket(rows: readonly MisNcRow[], mc: MisContext, mode: TimeBucketMode): Map<string, MisNonChargeableTotals> {
   const out = new Map<string, MisNonChargeableTotals>();
   for (const r of rows) {
-    const clock = zonedClockParts(r.created_at, tz);
+    const clock = zonedClockParts(r.created_at, mc.tz);
     if (!clock) {continue;}
-    const key = mode === "hour" ? `${clock.key}T${String(clock.hour).padStart(2, "0")}` : clock.key;
+    // The same key function the bills use, on the comp's own clock: a crossing
+    // slot's after-midnight comp counts on the day its slot started.
+    const minute = clock.hour * 60 + clock.minute;
+    const key = timeBucketKey(mode, {
+      serviceDay: serviceDayKey(clock.key, minute, mc.window.slot), calendarDay: clock.key, minute,
+    }, mc.presets);
     const acc = out.get(key) ?? zeroNonChargeable();
     addNonChargeable(acc, r);
     out.set(key, acc);
@@ -34988,11 +35319,19 @@ interface MisBillRow {
 const MIS_ITEMS_JSON = `case when jsonb_typeof((o.food)::jsonb->'items') = 'array'
                              then (o.food)::jsonb->'items' else '[]'::jsonb end`;
 
-const MIS_SETTLED_PREDICATE = `
+/**
+ * The settlement-clock window predicate on "Bills" b, cut by the report's time
+ * slot. A FUNCTION rather than the constant it was, so the only way to get the
+ * predicate is to say which slot applies: every MIS reader passes its context,
+ * and the Overview headline — which is whole-day by definition — passes null.
+ */
+function misSettledPredicate(mc: Pick<MisContext, "window" | "tz"> | null): string {
+  return `
   (b.admin_approved_at is not null or b.closed_at is not null)
   and coalesce(b.closed_at, b.admin_approved_at) >= $3
-  and coalesce(b.closed_at, b.admin_approved_at) < $4
+  and coalesce(b.closed_at, b.admin_approved_at) < $4${mc ? misTimeSql("coalesce(b.closed_at, b.admin_approved_at)", mc) : ""}
 `;
+}
 
 /** The seating a bill belongs to. Same rule as CLOSED_BILL_JOINS; see above. */
 const MIS_SESSION_LATERAL = `
@@ -35021,7 +35360,7 @@ async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
        from "Bills" b
        ${MIS_SESSION_LATERAL}
       where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}
+        and ${misSettledPredicate(mc)}
       order by coalesce(b.closed_at, b.admin_approved_at) asc, b.id asc`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   );
@@ -35031,8 +35370,12 @@ async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
 interface MisBill {
   row: MisBillRow;
   money: BillMoney;
+  /** The BUSINESS day: the calendar day, or under a crossing slot the day it started. */
   day: string;
   hour: number;
+  /** The local calendar day and minute of day the bill settled at. */
+  calendar_day: string;
+  minute: number;
   session_id: string | null;
   covers: number;
 }
@@ -35043,7 +35386,7 @@ interface MisBill {
  * `scPct` is read once for the whole set, not per bill, so the service-charge
  * classification here is identical to the one the bill-detail screen shows.
  */
-function composeMisBills(rows: MisBillRow[], scPct: number, tz: string): MisBill[] {
+function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: TimeSlot | null = null): MisBill[] {
   return rows.map((row) => {
     const grand = round2(parseNumeric(row.total_amt));
     const charges = closedBillCharges(grand, parseTaxLines(row.tax_breakdown), scPct, parseNumeric(row.round_off));
@@ -35057,8 +35400,10 @@ function composeMisBills(rows: MisBillRow[], scPct: number, tz: string): MisBill
         discount_value: parseNumeric(row.discount_value),
         refund_amount: parseNumeric(row.refund_amount),
       }),
-      day: clock?.key ?? "",
+      day: clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot) : "",
       hour: clock?.hour ?? 0,
+      calendar_day: clock?.key ?? "",
+      minute: clock ? clock.hour * 60 + clock.minute : 0,
       session_id: row.session_id,
       covers: row.session_id ? Math.max(1, Math.round(parseNumeric(row.session_covers)) || 1) : 0,
     };
@@ -35107,9 +35452,9 @@ function misLadder(bills: MisBill[], seenSessions?: Set<string>): MisLadder {
   };
 }
 
-/** Bucket key for the time-wise toggle, in the TENANT's calendar. */
-function misBucketKey(b: MisBill, mode: "day" | "hour"): string {
-  return mode === "hour" ? `${b.day}T${String(b.hour).padStart(2, "0")}` : b.day;
+/** Bucket key for the time-wise toggle, in the TENANT's calendar. See timeBucketKey. */
+function misBucketKey(b: MisBill, mode: TimeBucketMode, presets: readonly TimeSlotPreset[]): string {
+  return timeBucketKey(mode, { serviceDay: b.day, calendarDay: b.calendar_day, minute: b.minute }, presets);
 }
 
 /**
@@ -35126,6 +35471,7 @@ function misBucketKey(b: MisBill, mode: "day" | "hour"): string {
 function misNcCompletedSeries(
   series: (MisLadder & { bucket: string })[],
   ncByBucket: Map<string, MisNonChargeableTotals>,
+  order: (a: string, z: string) => number = (a, z) => a.localeCompare(z),
 ): (MisLadder & { bucket: string; nc_value: number; nc_qty: number })[] {
   const out = series.map((row) => {
     const b = ncByBucket.get(row.bucket);
@@ -35141,21 +35487,29 @@ function misNcCompletedSeries(
       nc_qty: v.qty,
     });
   }
-  return out.sort((a, z) => a.bucket.localeCompare(z.bucket));
+  return out.sort((a, z) => order(a.bucket, z.bucket));
 }
 
-/** by_day / by_hour series, covers attributed to a session's FIRST bucket only. */
-function misSeries(bills: MisBill[], mode: "day" | "hour"): (MisLadder & { bucket: string })[] {
-  const buckets = new Map<string, MisBill[]>();
+/**
+ * The time-wise series, covers attributed to a seating's FIRST bucket only.
+ *
+ * FIRST IN THE SERIES' OWN ORDER (timeBucketOrder), so Σ covers over the rows is
+ * the window's covers in every mode. The session cut seeds one row per preset
+ * even when it settled nothing — a Dinner with no trade is a row of zeros, not a
+ * missing row — and Outside sessions appears only when something landed there.
+ */
+function misSeries(bills: MisBill[], mode: TimeBucketMode, presets: readonly TimeSlotPreset[] = []): (MisLadder & { bucket: string })[] {
+  const buckets = new Map<string, MisBill[]>(fixedTimeBuckets(mode, presets).map((key) => [key, []]));
   for (const b of bills) {
     if (!b.day) {continue;}
-    const key = misBucketKey(b, mode);
+    const key = misBucketKey(b, mode, presets);
     const list = buckets.get(key);
     if (list) {list.push(b);} else {buckets.set(key, [b]);}
   }
+  const order = timeBucketOrder(mode, presets);
   const seen = new Set<string>();
   return [...buckets.entries()]
-    .sort((a, z) => a[0].localeCompare(z[0]))
+    .sort((a, z) => order(a[0], z[0]))
     .map(([bucket, list]) => ({ bucket, ...misLadder(list, seen) }));
 }
 
@@ -35180,7 +35534,7 @@ export interface ItemWiseRow {
   /** Menu-price value of those units: the revenue given away on this dish. */
   nc_value: number;
   avg_selling_price: number | null;
-  /** Share of the report's total gross. */
+  /** Share of the report's total item total. */
   contribution_pct: number | null;
   dine_in_qty: number;
   takeaway_qty: number;
@@ -35216,9 +35570,12 @@ const ITEM_WISE_COLUMNS: MisColumn[] = [
   { key: "name", label: "Item", type: "text" },
   { key: "category", label: "Category", type: "text" },
   { key: "qty", label: "Qty", type: "int", total: true },
-  { key: "gross_amount", label: "Gross", type: "money", total: true },
-  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // "Item total", and only that. Neither the client's Gross (which carries the
+  // bill's service charge and tax) nor its Net (which is after the bill's
+  // discount) exists on a LINE — all three live on the bill — so the old
+  // Discount (always 0) and Net (always = this) columns are gone from the grid.
+  // discount_amount / net_amount stay on the payload for installed 1.9.x tills.
+  { key: "gross_amount", label: "Item total", type: "money", total: true },
   { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
   { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
   { key: "avg_selling_price", label: "Avg selling price", type: "money" },
@@ -35246,10 +35603,11 @@ const ITEM_WISE_COLUMNS: MisColumn[] = [
  *   * Category is recovered by joining that name to the current menu. Rename a
  *     dish and the join silently stops matching, which is why `category_exact`
  *     is false and the UI is expected to label the column as indicative.
- *   * The money is the MENU PRICE. Discounts here are applied to the BILL, never
- *     to a line, so item net equals item gross and `discount_amount` is a
- *     truthful zero. The window's bill-level discount is reported alongside
- *     rather than smeared across the lines as an invented per-item number.
+ *   * The money is the MENU PRICE — the "Item total". Discounts here are applied
+ *     to the BILL, never to a line, so `net_amount` equals `gross_amount` and
+ *     `discount_amount` is a truthful zero (both kept on the payload, neither a
+ *     column). The window's bill-level discount is reported alongside rather
+ *     than smeared across the lines as an invented per-item number.
  */
 export async function GetItemWiseReport(restaurantId: string, q: MisReportQuery = {}): Promise<ItemWiseReport> {
   const mc = await misContext(restaurantId, q);
@@ -35275,7 +35633,7 @@ export async function GetItemWiseReport(restaurantId: string, q: MisReportQuery 
               coalesce(nullif(trim((o.food)::jsonb->>'order_type'), ''), 'dine_in') as channel
          from "Orders" o, jsonb_array_elements(${MIS_ITEMS_JSON}) item
         where o.res_id = $1 and (${mc.og} or o.outlet_id = $2)
-          and o.created_at >= $3 and o.created_at < $4
+          and o.created_at >= $3 and o.created_at < $4${misTimeSql("o.created_at", mc)}
           -- Cancelled is not a sale. Same exclusion as every other revenue read.
           and coalesce(o.status::text, '1') <> '5'
           ${searchSql}
@@ -35371,9 +35729,9 @@ export async function GetItemWiseReport(restaurantId: string, q: MisReportQuery 
       NOTE_CANCELLED_EXCLUDED,
       "There is no OrderItems table: an order line carries only a name, a price and a quantity. Items are aggregated by NAME, so renaming a dish splits its history into two rows.",
       "Category is recovered by matching the item name against the CURRENT menu. A renamed or deleted menu item shows no category. Treat this column as indicative, not exact.",
-      "Amounts are the MENU PRICE charged on the line (price × quantity) — before any bill-level discount, service charge or tax.",
-      "Discounts in this system are applied to the BILL, never to a line, so item discount is a truthful 0 and net equals gross. The window's bill-level discount is reported as bill_level_discount.",
-      "NC qty / NC value are the part of this dish that was served but never charged for. They are counted INSIDE Qty and Gross — the food was made — and shown again separately as the revenue given away. Every bill total elsewhere is already net of them.",
+      "Item total is the MENU PRICE charged on the line (price × quantity) — before any bill-level discount, service charge, tax or round off.",
+      "Gross and Net are BILL figures (see the Sales Summary): a discount, a service charge and tax are applied to the whole bill, never to a line, so neither can be put on a dish honestly and this report shows only the item total. The window's bill-level discount is reported as bill_level_discount.",
+      "NC qty / NC value are the part of this dish that was served but never charged for. They are counted INSIDE Qty and Item total — the food was made — and shown again separately as the revenue given away. Every bill total elsewhere is already net of them.",
     ]),
     columns: ITEM_WISE_COLUMNS,
     rows: rowsOut,
@@ -35403,8 +35761,12 @@ export interface DiscountReportRow {
   /** From an approval request, when the discount went through one. */
   requested_by: string | null;
   approved_by: string | null;
+  /** "Item total": the bill's pre-discount value. */
+  item_total: number;
+  /** @deprecated Same value as `item_total`, for installed 1.9.x tills. */
   gross: number;
   net: number;
+  /** "Gross". */
   grand_total: number;
 }
 
@@ -35416,10 +35778,21 @@ export interface DiscountReport {
     discounted_bills: number;
     estimated_bills: number;
     discount_amount: number;
+    /** Over the DISCOUNTED bills only, like `net` and `grand_total` beside it. */
+    item_total: number;
+    /** @deprecated Same value as `item_total`. */
     gross: number;
     net: number;
     grand_total: number;
-    /** Discount as a share of the window's gross — the number that gets watched. */
+    /**
+     * Discount as a share of the WHOLE WINDOW's item total — every settled bill,
+     * not only the discounted ones, because "how much of what we sold did we give
+     * away" is the number that gets watched. On the item total, never on Gross:
+     * a share of the tax-inclusive total would understate discounting by the tax
+     * and service charge riding on it.
+     */
+    discount_pct_of_item_total: number | null;
+    /** @deprecated Same value as `discount_pct_of_item_total`. */
     discount_pct_of_gross: number | null;
   };
   page: MisPage;
@@ -35436,9 +35809,9 @@ const DISCOUNT_COLUMNS: MisColumn[] = [
   { key: "reason", label: "Reason", type: "text" },
   { key: "requested_by", label: "Requested by", type: "text" },
   { key: "approved_by", label: "Approved by", type: "text" },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
 ];
 
 /**
@@ -35468,7 +35841,7 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
   const where: string[] = [
     `b.res_id = $1`,
     `(${mc.og} or b.outlet_id = $2)`,
-    MIS_SETTLED_PREDICATE.trim(),
+    misSettledPredicate(mc).trim(),
     // A discount OR a coupon: a 100%-off gift voucher can leave discount_value 0.
     `(coalesce(b.discount_value, 0) > 0 or coalesce(b.coupon_code, '') <> '')`,
   ];
@@ -35544,6 +35917,7 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
       reason: r.reason?.trim() || null,
       requested_by: r.requested_by?.trim() || null,
       approved_by: r.decided_by?.trim() || null,
+      item_total: money.item_total,
       gross: money.gross,
       net: money.net,
       grand_total: money.grand_total,
@@ -35563,7 +35937,11 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
       "Discounts in this system are BILL-level: there is no per-item discount to report.",
       NOTE_DISCOUNT_ESTIMATE,
       "Requested by / Approved by are populated only for discounts that went through the approval threshold. A discount applied directly records no actor, and both columns stay blank rather than being inferred.",
-      "Bill totals are already NET of these discounts — this report is context, never a figure to subtract from revenue a second time.",
+      // Not "net of these discounts": Net is a defined word (NOTE_GROSS_NET, the
+      // very next note) and the bill totals are Gross.
+      "Bill totals (Gross) are already after these discounts — this report is context, never a figure to subtract from revenue a second time.",
+      NOTE_GROSS_NET,
+      "Item total, Net and Gross in the totals row cover the discounted bills only. The discount percentage is taken against the WHOLE window's item total — every settled bill — so it is the share of everything sold that was given away.",
     ]),
     columns: DISCOUNT_COLUMNS,
     rows: out,
@@ -35571,9 +35949,11 @@ export async function GetDiscountReport(restaurantId: string, q: MisReportQuery 
       discounted_bills: ladder.discounted_bills,
       estimated_bills: ladder.estimated_discount_bills,
       discount_amount: ladder.discount,
+      item_total: discountedLadder.item_total,
       gross: discountedLadder.gross,
       net: discountedLadder.net,
       grand_total: discountedLadder.grand_total,
+      discount_pct_of_item_total: sharePct(ladder.discount, ladder.item_total),
       discount_pct_of_gross: sharePct(ladder.discount, ladder.gross),
     },
     page,
@@ -35597,7 +35977,13 @@ export interface VoidKotRow {
   qty: number;
   /** Σ price × quantity — the menu-price value that did NOT become revenue. */
   value: number;
-  items: { name: string; quantity: number; price: number }[];
+  items: { name: string; variation: string | null; quantity: number; price: number }[];
+  /**
+   * The same lines as ONE text cell (`Biryani (Half) x2; Raita x1`) — the only
+   * way a dish name reaches a spreadsheet. See voidItemsText. Null when the
+   * ticket has no lines to name.
+   */
+  items_text: string | null;
   /**
    * A2 — WHY IT WAS VOIDED, from the "OrderVoids" ledger (migration 035).
    *
@@ -35627,6 +36013,7 @@ const VOID_KOT_COLUMNS: MisColumn[] = [
   { key: "voided_at", label: "Voided", type: "datetime" },
   { key: "order_id", label: "KOT / Order", type: "text" },
   { key: "table_name", label: "Table", type: "text" },
+  { key: "items_text", label: "Items", type: "text" },
   { key: "order_type", label: "Type", type: "text" },
   { key: "item_count", label: "Lines", type: "int", total: true },
   { key: "qty", label: "Qty", type: "int", total: true },
@@ -35635,6 +36022,55 @@ const VOID_KOT_COLUMNS: MisColumn[] = [
   { key: "reason", label: "Reason", type: "text" },
   { key: "stage", label: "Stage", type: "text" },
 ];
+
+/**
+ * THE LINES A CANCELLED ORDER IS REPORTED WITH: voidKotLines (mis_report_math.ts)
+ * written in SQL. The lines still on the ticket, or, when Remove item emptied
+ * it, the lines it took off. The totals aggregate expands this and the row
+ * mapper calls the TypeScript twin. They have to choose the same list, or the
+ * page rows stop adding up to the total.
+ */
+const VOID_KOT_LINES_JSON = `case when jsonb_typeof((o.food)::jsonb->'items') = 'array'
+                                  and jsonb_array_length((o.food)::jsonb->'items') > 0
+                                 then (o.food)::jsonb->'items'
+                                 when jsonb_typeof((o.food)::jsonb->'${REMOVED_LINES_KEY}') = 'array'
+                                 then (o.food)::jsonb->'${REMOVED_LINES_KEY}'
+                                 else '[]'::jsonb end`;
+
+/**
+ * WHICH ORDERS ARE VOIDS: status 5, less the tickets a MOVE emptied.
+ *
+ * A TICKET EMPTIED BY MOVING ITS DISHES IS NOT A VOID. The food was served and
+ * billed at the other table. Listing it made a move look like a cancellation
+ * with nothing on it. Excluded only when a move emptied it AND no removal left
+ * lines on it: a ticket that lost one dish to Remove item and its last dish to
+ * Move item still reports the removed dish.
+ *
+ * ONE FRAGMENT, TWO READERS. The Void KOT where-list (so its count, totals and
+ * page agree) and the void-streak alert in RunExceptionChecks. The alert counted
+ * every status-5 order, so a service with moves rang the bell with voids the
+ * report did not list. Written against the alias `o`.
+ */
+const VOID_KOT_ORDER_SQL = `(coalesce(o.status::text, '1') = '5' and not (coalesce((o.food)::jsonb->>'${EMPTIED_BY_KEY}', '') = 'move' and jsonb_array_length(${VOID_KOT_LINES_JSON}) = 0))`;
+
+/**
+ * THE AUDIT SENTENCES THAT MEAN "THIS ORDER WAS CANCELLED".
+ *
+ * The join used to read `reason ilike '%Cancelled'`, which matched only the
+ * status route's ORIGINAL wording, `Order <id> -> Cancelled`. Two current writers
+ * say more than that, so Voided and Voided by were blank on every production row
+ * after they shipped:
+ *   * PATCH /orders/:id/status appends the reason: `Order <id> -> Cancelled — reason: Other`.
+ *   * POST /orders/:id/void writes `Voided order <id> (wrong_entry, ₹699.00, before_print) — authorised by …`.
+ * Both are anchored at the START, so the undo registry's `Undid: Order <id> -> Cancelled`
+ * (which reverses a cancel) can never be read as one. `Cancel%` also takes the
+ * route's accepted spelling "canceled". A line removal on the same order carries
+ * the order id too, but no removal says either sentence. The Bill Edit report
+ * reads the status route's sentence with isOrderCancelSentence
+ * (mis_report_math.ts), the same start-anchored rule, so the two reports never
+ * disagree about one audit row.
+ */
+const VOID_KOT_CANCEL_AUDIT_SQL = `(l.reason ilike 'Order % -> Cancel%' or l.reason ilike 'Voided order %')`;
 
 /**
  * VOID KOT — the orders that were cancelled, what was on them and who did it.
@@ -35664,9 +36100,11 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
   const where: string[] = [
     `o.res_id = $1`,
     `(${mc.og} or o.outlet_id = $2)`,
-    `coalesce(o.status::text, '1') = '5'`,
+    // Status 5, less the tickets a move emptied. In the where-list, so the
+    // count, the totals and the page all agree; shared with the void-streak alert.
+    VOID_KOT_ORDER_SQL,
     `o.created_at >= $3`,
-    `o.created_at < $4`,
+    `o.created_at < $4${misTimeSql("o.created_at", mc)}`,
   ];
   if (search) {
     params.push(`%${search}%`);
@@ -35687,20 +36125,27 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
 
   // Window totals come from their own aggregate rather than the page, for the
   // same reason every other report's do.
+  //
+  // A TICKET WITH NO LINES ADDS A VOID AND NOTHING ELSE. The left join still
+  // gives such an order one row, with a NULL `item`, so it is counted in
+  // `voids`. That row's qty used to coalesce to 1 and was counted as a line, so
+  // every empty ticket added a phantom line and a phantom qty to the total while
+  // its own row read 0 and 0. Counting `item` rather than the row keeps the
+  // total equal to the sum of the rows.
   const totalRows = await runQuery<{ voids: string; qty: number; value: number; lines: string }>(
     `with it as (
-       select o.id,
+       select o.id, item,
               coalesce((item->>'quantity')::numeric, 1) as qty,
               coalesce((item->>'price')::numeric, 0) as price
          from "Orders" o
          left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
-         left join lateral jsonb_array_elements(${MIS_ITEMS_JSON}) item on true
+         left join lateral jsonb_array_elements(${VOID_KOT_LINES_JSON}) item on true
         where ${whereSql}
      )
      select count(distinct id)::text as voids,
-            coalesce(sum(qty), 0)::float as qty,
-            coalesce(sum(price * qty), 0)::float as value,
-            count(*) filter (where qty is not null)::text as lines
+            coalesce(sum(qty) filter (where item is not null), 0)::float as qty,
+            coalesce(sum(price * qty) filter (where item is not null), 0)::float as value,
+            count(item)::text as lines
        from it`,
     params,
   );
@@ -35715,9 +36160,10 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
             v.created_at as voided_at, v.fname as voided_fname, v.lname as voided_lname, v.emp_username as voided_username
        from "Orders" o
        left join "Tables" t on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
-       -- WHO CANCELLED IT. The status route writes one audit entry per real
-       -- transition into Cancelled (an idempotent re-cancel writes none), keyed
-       -- by order id inside additional_details. Deliberately NOT matched on
+       -- WHO CANCELLED IT. The status route and the void route each write one
+       -- audit entry per real cancellation (an idempotent re-cancel writes none),
+       -- keyed by order id inside additional_details. Which sentences count is
+       -- VOID_KOT_CANCEL_AUDIT_SQL. Deliberately NOT matched on
        -- outlet: an admin acting on another branch files the entry against that
        -- branch, and res_id + order id already identify it uniquely.
        left join lateral (
@@ -35727,7 +36173,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
            left join "Login" lg on lg.emp_id = e.id and lg.res_id = e.res_id and lg.outlet_id = e.outlet_id
           where l.res_id = o.res_id
             and l.additional_details ->> 'order_id' = o.id::text
-            and l.reason ilike '%Cancelled'
+            and ${VOID_KOT_CANCEL_AUDIT_SQL}
           order by l.created_at desc
           limit 1
        ) v on true
@@ -35764,7 +36210,8 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
 
   const out: VoidKotRow[] = rows.map((r) => {
     const food = parseJsonObject(r.food) ?? {};
-    const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+    // The SAME list the totals aggregate expands (VOID_KOT_LINES_JSON).
+    const list = voidKotLines(food);
     let qty = 0, value = 0;
     const items = list.map((raw) => {
       const it = (raw ?? {}) as Record<string, unknown>;
@@ -35772,7 +36219,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
       const price = round2(parseNumeric(it.price));
       qty += quantity;
       value = round2(value + price * quantity);
-      return { name: String(it.name ?? "Item"), quantity, price };
+      return { ...voidLineIdentity(it), quantity, price };
     });
     const name = [r.voided_fname, r.voided_lname].filter((x) => (x ?? "").trim()).join(" ").trim();
     return {
@@ -35787,6 +36234,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
       qty,
       value,
       items,
+      items_text: voidItemsText(items),
       reason: voidReasons.get(String(r.id))?.reason ?? null,
       void_kind: voidReasons.get(String(r.id))?.void_kind ?? null,
       stage: voidReasons.get(String(r.id))?.stage ?? null,
@@ -35802,6 +36250,7 @@ export async function GetVoidKotReport(restaurantId: string, q: MisReportQuery =
       "Voided by / voided at come from the audit trail entry the cancel path writes. An order cancelled before that entry existed, or by a path that wrote none, shows blank.",
       "KOT numbers are keyed by a fingerprint of the ticket's CONTENT, not by order id, so a printed KOT number cannot be tied back to an order with certainty. The order id is the ticket identity here.",
       "Value is the menu-price value of the cancelled lines (price × quantity). It never appeared in revenue.",
+      "Items lists the cancelled lines as they stood on the ticket, one entry per line, as \"Name (Variation) xQty\" separated by semicolons. A ticket emptied with Remove item keeps the dishes it lost, so its row names them and counts their value. A ticket emptied by moving its dishes to another table is not a void and is not listed. A ticket emptied before removed lines were recorded shows no items and no value; it is never back-filled.",
     ]),
     columns: VOID_KOT_COLUMNS,
     rows: out,
@@ -35883,7 +36332,7 @@ export async function GetBillEditReport(restaurantId: string, q: MisReportQuery 
     `l.res_id = $1`,
     `(${mc.og} or l.outlet_id = $2)`,
     `l.created_at >= $3`,
-    `l.created_at < $4`,
+    `l.created_at < $4${misTimeSql("l.created_at", mc)}`,
     `l.action_id::text = any($5::text[])`,
   ];
   if (search) {
@@ -35961,8 +36410,8 @@ export interface SalesSummaryReport {
   meta: MisReportMeta;
   columns: MisColumn[];
   totals: SalesLadder;
-  /** The time-wise cut: one row per tenant-calendar day, or per hour. */
-  bucket: "day" | "hour";
+  /** The time-wise cut: per business day, per date x hour, per hour of day, or per session. */
+  bucket: TimeBucketMode;
   series: (SalesLadder & { bucket: string })[];
   by_order_type: { order_type: string; bills: number; grand_total: number; share_pct: number | null }[];
   /**
@@ -35977,13 +36426,16 @@ const SALES_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "bucket", label: "Period", type: "text" },
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
   { key: "service_charge", label: "Service charge", type: "money", total: true },
   { key: "tax", label: "Tax", type: "money", total: true },
-  { key: "round_off", label: "Round off", type: "money", total: true, default_on: false },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  // ON by default: Net + service charge + tax + round off IS Gross, and a
+  // default layout whose visible rungs stop a few paise short of its own Gross
+  // column is the first thing an auditor circles.
+  { key: "round_off", label: "Round off", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "refund", label: "Refunds", type: "money", total: true },
   // Beside the ladder, never inside it — and on the COMP clock, not the
   // settlement clock the rest of the row is on. Both facts are in the notes and
@@ -36007,11 +36459,12 @@ const SALES_SUMMARY_COLUMNS: MisColumn[] = [
 export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<SalesSummaryReport> {
   const mc = await misContext(restaurantId, q);
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
-  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz);
+  // The slot moves a crossing slot's after-midnight bills onto the day it began.
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot);
   const bucket = misBucketMode(q);
   const ncRows = await fetchMisNonChargeables(mc);
   const nc = misNcTotals(ncRows);
-  const ncByBucket = misNcByBucket(ncRows, mc.tz, bucket);
+  const ncByBucket = misNcByBucket(ncRows, mc, bucket);
 
   // Order type lives in the ORDER's food JSON, so it is one extra grouped read
   // rather than a column on the bill.
@@ -36022,7 +36475,7 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
        from "Bills" b
        join "Orders" o on o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
       where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}
+        and ${misSettledPredicate(mc)}
       group by 1`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   );
@@ -36044,7 +36497,8 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
       NOTE_PER_COVER_PRETAX,
       NOTE_ROUND_OFF,
       NOTE_DISCOUNT_ESTIMATE,
-      "Grand total here equals the sum of the Order Summary rows, the sum of the Settlement Summary rows and the sum of the Counter Summary rows for the same window and outlet scope.",
+      NOTE_GROSS_NET,
+      "Gross here equals the sum of the Order Summary rows, the sum of the Settlement Summary rows and the sum of the Counter Summary rows for the same window and outlet scope.",
       "The order-type split counts the bill against the order it was raised from; a bill whose order row is gone is not in that split, though its money is in the totals.",
       NOTE_NC_BESIDE_LADDER,
       NOTE_NC_CLOCK,
@@ -36059,7 +36513,7 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
     // zero-ladder row rather than being dropped. Dropping it is the one way this
     // column could stop summing to its own total, and a column that does not is
     // the first thing an auditor checks.
-    series: misNcCompletedSeries(misSeries(bills, bucket), ncByBucket),
+    series: misNcCompletedSeries(misSeries(bills, bucket, mc.presets), ncByBucket, timeBucketOrder(bucket, mc.presets)),
     by_order_type: [...typeAcc.entries()]
       .map(([order_type, v]) => ({ order_type, bills: v.bills, grand_total: v.total, share_pct: sharePct(v.total, typeTotal) }))
       .sort((a, z) => z.grand_total - a.grand_total),
@@ -36078,11 +36532,16 @@ export interface OrderSummaryRow {
   covers: number | null;
   waiter: string | null;
   item_count: number;
+  /** "Item total": pre-discount. */
+  item_total: number;
+  /** @deprecated Same value as `item_total`, for installed 1.9.x tills. */
   gross: number;
   discount: number;
   net: number;
   service_charge: number;
   tax: number;
+  round_off: number;
+  /** "Gross". */
   grand_total: number;
   refund: number;
   payment_method: string | null;
@@ -36106,12 +36565,21 @@ const ORDER_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "covers", label: "Covers", type: "int" },
   { key: "waiter", label: "Waiter", type: "text" },
   { key: "item_count", label: "Items", type: "int", total: true },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
+  // EVERY rung between Net and Gross is ON by default — service charge, tax and
+  // round off alike. Net + SC + Tax + Round off IS Gross, and a default layout
+  // that hides one of them leaves a row whose visible figures stop short of its
+  // own Gross: a 1% service charge hidden is ₹10 no reader can find. The Sales
+  // Summary has always shown all four; jest sums each row's default-visible
+  // rungs against its Gross.
+  { key: "service_charge", label: "Service charge", type: "money", total: true },
   { key: "tax", label: "Tax", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  // The rung that was missing: without it no row's Net + SC + Tax reached its
+  // own Gross, and the gap was the paise the bill was rounded by.
+  { key: "round_off", label: "Round off", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "refund", label: "Refund", type: "money", total: true, default_on: false },
   { key: "payment_method", label: "Payment", type: "text" },
   { key: "status", label: "Status", type: "text" },
@@ -36138,7 +36606,7 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
   const search = misSearch(q);
 
   const params: unknown[] = [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso];
-  const where: string[] = [`b.res_id = $1`, `(${mc.og} or b.outlet_id = $2)`, MIS_SETTLED_PREDICATE.trim()];
+  const where: string[] = [`b.res_id = $1`, `(${mc.og} or b.outlet_id = $2)`, misSettledPredicate(mc).trim()];
   if (search) {
     params.push(`%${search}%`);
     const p = `$${String(params.length)}`;
@@ -36205,11 +36673,13 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
       covers: r.session_covers == null ? null : Math.max(1, Math.round(parseNumeric(r.session_covers))),
       waiter: waiter || null,
       item_count: Math.max(0, Math.round(Number(r.item_count ?? 0))),
+      item_total: money.item_total,
       gross: money.gross,
       discount: money.discount,
       net: money.net,
       service_charge: money.service_charge,
       tax: money.tax,
+      round_off: money.round_off,
       grand_total: money.grand_total,
       refund: money.refund,
       payment_method: r.payment_method?.trim() || null,
@@ -36224,7 +36694,9 @@ export async function GetOrderSummaryReport(restaurantId: string, q: MisReportQu
       "Covers on a row are the SEATING's party size, so two split bills on one table each show the same party. The totals row still counts that party once.",
       "Items is the line count of the order the bill was raised from, not the merged item count of every order on the table.",
       NOTE_DISCOUNT_ESTIMATE,
-      "The totals row covers the WHOLE window, not the page on screen, and equals the Sales Summary's grand total for the same window.",
+      NOTE_GROSS_NET,
+      NOTE_ROUND_OFF,
+      "The totals row covers the WHOLE window, not the page on screen, and its Gross equals the Sales Summary's for the same window.",
     ]),
     columns: ORDER_SUMMARY_COLUMNS,
     rows: out,
@@ -36296,11 +36768,11 @@ const EXECUTIVE_COLUMNS: MisColumn[] = [
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "abv", label: "ABV", type: "money" },
   { key: "apc", label: "APC (pre-tax)", type: "money" },
   { key: "nc_value", label: "NC given away", type: "money", total: true, default_on: false },
-  { key: "previous_grand_total", label: "Previous period", type: "money", total: true },
+  { key: "previous_grand_total", label: "Previous period (gross)", type: "money", total: true },
   { key: "growth_pct", label: "Growth %", type: "percent" },
   { key: "share_pct", label: "% of group", type: "percent" },
 ];
@@ -36330,13 +36802,16 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
 
   const prev = previousWindow(mc.window.from, mc.window.to);
-  const prevInstants = windowInstants(prev, mc.tz);
+  // The previous period is cut by the SAME slot: Lunch against last month's
+  // Lunch, never against last month's whole day.
+  const prevInstants = slotWindowInstants(prev, mc.tz, mc.window.slot);
   const prevMc: MisContext = {
     ...mc,
     window: {
       from: prev.from, to: prev.to, days: countDays(prev.from, prev.to),
       source: mc.window.source, clamped: [],
       ...prevInstants,
+      slot: mc.window.slot,
     },
   };
 
@@ -36403,6 +36878,7 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
       NOTE_CANCELLED_EXCLUDED,
       NOTE_COVERS_ONCE,
       NOTE_PER_COVER_PRETAX,
+      NOTE_GROSS_NET,
       mc.allOutlets
         ? "Showing every outlet of this restaurant. Group totals are the sum of the outlet rows."
         : "Showing one outlet. Switch the outlet selector to All to compare branches.",
@@ -36475,10 +36951,10 @@ const COVER_SIZE_COLUMNS: MisColumn[] = [
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "spend_per_cover", label: "Spend per cover (pre-tax)", type: "money" },
   { key: "avg_bill_value", label: "Avg bill value", type: "money" },
-  { key: "share_pct", label: "% of sales", type: "percent" },
+  { key: "share_pct", label: "% of gross", type: "percent" },
 ];
 
 /**
@@ -36541,6 +37017,7 @@ export async function GetCoverSizeSummaryReport(restaurantId: string, q: MisRepo
       NOTE_COVERS_ONCE,
       "A party is one SEATING. Every bill raised on that seating sits in the same bucket, and the party is counted once however many ways the bill was split.",
       NOTE_PER_COVER_PRETAX,
+      NOTE_GROSS_NET,
       "Bills whose seating cannot be resolved sit in the blank party-size row: their money is included so the buckets still add up to the Sales Summary, but they contribute no covers.",
     ]),
     columns: COVER_SIZE_COLUMNS,
@@ -36583,7 +37060,9 @@ const SETTLEMENT_COLUMNS: MisColumn[] = [
   { key: "amount", label: "Collected", type: "money", total: true },
   { key: "share_pct", label: "% of takings", type: "percent" },
   { key: "refund", label: "Refunds", type: "money", total: true },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // NOT the client's Net (which is pre-tax): this is Collected less refunds, tax
+  // and all. Named for what it is so "Net" keeps exactly one meaning.
+  { key: "net_amount", label: "After refunds", type: "money", total: true },
 ];
 
 /**
@@ -36638,9 +37117,9 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
   return {
     meta: await misMeta(mc, "settlement_summary", "Settlement Summary", [
       NOTE_SETTLEMENT_BASIS,
-      "Collected totals equal the Sales Summary's grand total for the same window — that equality is what makes this a cash-up sheet.",
+      "Collected totals equal the Sales Summary's Gross (the grand total) for the same window — that equality is what makes this a cash-up sheet.",
       "A bill settled with more than one mode counts once under each mode it touched, so the bill counts here can add up to more than the bill count.",
-      "Refunds have no payment mode of their own; each is attributed to the mode(s) its bill was paid with, in proportion. Collected is what was taken at the till; Net is what survived the refunds.",
+      "Refunds have no payment mode of their own; each is attributed to the mode(s) its bill was paid with, in proportion. Collected is what was taken at the till; After refunds is what survived the refunds. It still carries the tax, so it is not Net.",
       "Anything in the Unallocated row is money whose split-tender parts did not add back to the bill total. It should always be zero; if it is not, those bills need looking at.",
     ]),
     columns: SETTLEMENT_COLUMNS,
@@ -36676,9 +37155,10 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
 //
 //   NET   = taxable_base. Post-discount, PRE service charge, PRE tax. This is the
 //           figure the Sales Summary calls Net and the one an accountant means.
-//   GROSS = "Bills".total_amt. Tax-inclusive, exactly what the guest paid. It is
-//           NOT "net before discount" — that is `gross` inside BillMoney, which
-//           is a different question and deliberately not on this card.
+//   GROSS = "Bills".total_amt: service charge, tax and round off included,
+//           exactly what the guest paid — the MIS reports' Gross column. It is
+//           NOT "net before discount"; that is `item_total` inside BillMoney (and
+//           its deprecated alias `gross`), and deliberately not on this card.
 //   ONLINE = a bill whose orders arrived through an ONLINE channel: an aggregator
 //           (Swiggy, Zomato, anything AddOrder stamped with a source name) or a
 //           DELIVERY order. A counter takeaway is a walk-in and is NOT online;
@@ -36815,7 +37295,7 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
             ) as is_online
        from "Bills" b
       where b.res_id = $1 and (${og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}
+        and ${misSettledPredicate(null)}
       order by coalesce(b.closed_at, b.admin_approved_at) asc, b.id asc`,
     [context.res_id, context.outlet_id, from, to],
   );
@@ -36871,15 +37351,15 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     today_net: fig(todayNet, "Today's net sale",
       "Settled today, after discounts and before service charge and tax. The figure the Sales Summary calls Net."),
     today_gross: fig(todayGross, "Today's gross sale",
-      "Settled today, tax inclusive \u2014 exactly what guests paid."),
+      "Settled today, including service charge, tax and round off \u2014 exactly what guests paid."),
     online_net: fig(onlineNet, "Online sale (net)",
       "Today's delivery and aggregator orders, before service charge and tax. A counter takeaway is a walk-in and is not counted."),
     online_gross: fig(onlineGross, "Online sale (gross)",
-      "Today's delivery and aggregator orders, tax inclusive."),
+      "Today's delivery and aggregator orders, including service charge, tax and round off."),
     cash_collection: fig(cash, "Cash collection",
       "Cash taken today. A bill split across modes counts only its cash part."),
     month_to_date: fig(monthGross, "Month to date",
-      `Gross sales from ${monthFrom} to today, tax inclusive.`),
+      `Gross sales from ${monthFrom} to today, including service charge, tax and round off.`),
     // A released ₹0 table is a bill with no mode and no money. It stays in
     // today_bills (as it always has) but a row reading "Other ₹0.00" is noise on
     // the one screen a cashier reads at close. Filtering it moves no total.
@@ -36968,7 +37448,12 @@ export async function GetMisOrderDetail(restaurantId: string, orderId: string): 
   if (!row) {return null;}
 
   const food = parseJsonObject(row.food) ?? {};
-  const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+  // A cancelled ticket opens with the lines its Void KOT row counted, including
+  // the ones Remove item took off it, so the row and its drill-down never
+  // disagree about what was voided. A live order shows only what is on it.
+  const list = fromOrderStatusCode(row.status) === "Cancelled"
+    ? voidKotLines(food)
+    : (Array.isArray(food.items) ? (food.items as unknown[]) : []);
   let qty = 0, value = 0;
   const items = list.map((raw) => {
     const it = (raw ?? {}) as Record<string, unknown>;
@@ -36977,7 +37462,10 @@ export async function GetMisOrderDetail(restaurantId: string, orderId: string): 
     qty += quantity;
     value = round2(value + price * quantity);
     return {
-      name: String(it.name ?? "Item"),
+      // The dish AND its size, labelled exactly as the Void KOT row's Items cell
+      // labels it, so "Biryani (Half) x1; Biryani (Full) x1" opens as two lines
+      // that say which is which rather than two lines both called "Biryani".
+      name: orderLineLabel(voidLineIdentity(it)),
       quantity,
       price,
       line_total: round2(price * quantity),
@@ -39718,7 +40206,7 @@ const VARIATION_BASE_LABEL = "Base (no variation)";
 const NOTE_ITEM_CLOCK =
   "Aggregated by ORDER PLACEMENT time, not settlement time, exactly as Item Wise is. It ties to Item Wise for the same window and will NOT tie to the Sales Summary.";
 const NOTE_ITEM_BASIS =
-  "Amounts are the MENU PRICE charged on the line (price x quantity) — before any bill-level discount, service charge or tax. Discounts in this system are BILL-level, so line discount is a truthful 0 and net equals gross.";
+  "Item total is the MENU PRICE charged on the line (price x quantity) — before any bill-level discount, service charge, tax or round off. Gross and Net are BILL figures (see the Sales Summary) and cannot be put on a line honestly, so this report shows only the item total.";
 const NOTE_ACT_CLOCK =
   "Rows are bucketed by when the ACT happened, not by when the bill settled. An act on a table that pays after midnight falls on the day of the act.";
 
@@ -39765,7 +40253,7 @@ async function fetchMisOrderLines(mc: MisContext): Promise<MisOrderLineRow[]> {
               coalesce((item->>'price')::numeric, 0) as price
          from "Orders" o, jsonb_array_elements(${MIS_ITEMS_JSON}) item
         where o.res_id = $1 and (${mc.og} or o.outlet_id = $2)
-          and o.created_at >= $3 and o.created_at < $4
+          and o.created_at >= $3 and o.created_at < $4${misTimeSql("o.created_at", mc)}
           and coalesce(o.status::text, '1') <> '5'
      )
      select name, menu_id, variation_id, variation_name, nc,
@@ -40011,7 +40499,7 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
           limit 1
        ) bl on true
       where n.res_id = $1 and (${mc.og} or n.outlet_id = $2)
-        and n.created_at >= $3 and n.created_at < $4
+        and n.created_at >= $3 and n.created_at < $4${misTimeSql("n.created_at", mc)}
         ${searchSql}
       order by n.created_at desc, n.id desc`,
     params,
@@ -40245,7 +40733,7 @@ export async function GetServiceChargeDenyReport(restaurantId: string, q: MisRep
        left join "Tables" t on t.id = w.table_id and t.res_id = w.res_id and t.outlet_id = w.outlet_id
        left join "Bills" b on b.id = w.bill_id and b.res_id = w.res_id and b.outlet_id = w.outlet_id
       where w.res_id = $1 and (${mc.og} or w.outlet_id = $2)
-        and w.waived_at >= $3 and w.waived_at < $4
+        and w.waived_at >= $3 and w.waived_at < $4${misTimeSql("w.waived_at", mc)}
         ${searchSql}
       order by w.waived_at desc, w.id desc`,
     params,
@@ -40372,9 +40860,9 @@ const GROUP_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "group_name", label: "Group", type: "text" },
   { key: "items", label: "Items", type: "int", total: true },
   { key: "qty", label: "Qty", type: "int", total: true },
-  { key: "gross_amount", label: "Gross", type: "money", total: true },
-  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // "Item total" only — see ITEM_WISE_COLUMNS. discount_amount / net_amount stay
+  // on the payload, off the grid.
+  { key: "gross_amount", label: "Item total", type: "money", total: true },
   { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
   { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
   { key: "contribution_pct", label: "% contribution", type: "percent" },
@@ -40473,7 +40961,7 @@ export async function GetGroupSummaryReport(restaurantId: string, q: MisReportQu
       `A dish that is on the menu but in no group is reported under "${UNCLASSIFIED_GROUP}": a configuration gap, and it disappears as the menu is classified. A line that matches no menu row at all — a dish deleted or renamed since, an off-menu charge — is reported under "${UNATTRIBUTED_GROUP}": a history gap that cannot be closed backwards. Neither is ever folded into a real group.`,
       "A line is matched to its dish by the menu id the server stamps on it (migration 039), and by NAME for lines written before that. A dish renamed since it was sold is therefore unattributed here and category-less in Item Wise — one gap, reported consistently in both.",
       "Groups are resolved when the report is read, never stored on the order line, so reclassifying a dish corrects its whole history rather than only its future.",
-      "Gross here equals Item Wise's gross for the same window: it is the same set of lines, cut a different way.",
+      "Item total here equals Item Wise's item total for the same window: it is the same set of lines, cut a different way.",
     ]),
     columns: GROUP_SUMMARY_COLUMNS,
     rows,
@@ -40546,9 +41034,8 @@ const VARIATION_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "qty", label: "Qty", type: "int", total: true },
   { key: "avg_price", label: "Sold at", type: "money" },
   { key: "list_price", label: "Configured price", type: "money" },
-  { key: "gross_amount", label: "Gross", type: "money", total: true },
-  { key: "discount_amount", label: "Discount", type: "money", total: true, default_on: false },
-  { key: "net_amount", label: "Net", type: "money", total: true },
+  // "Item total" only — see ITEM_WISE_COLUMNS.
+  { key: "gross_amount", label: "Item total", type: "money", total: true },
   { key: "nc_qty", label: "NC qty", type: "int", total: true, default_on: false },
   { key: "nc_value", label: "NC value", type: "money", total: true, default_on: false },
   { key: "item_share_pct", label: "% of item", type: "percent" },
@@ -40682,7 +41169,7 @@ export async function GetVariationSummaryReport(restaurantId: string, q: MisRepo
       NOTE_ITEM_CLOCK,
       NOTE_CANCELLED_EXCLUDED,
       NOTE_ITEM_BASIS,
-      "Only dishes that are sold in variations appear here, so these totals are a SUBSET of Item Wise's for the same window. window_gross carries Item Wise's total so the size of that subset is visible.",
+      "Only dishes that are sold in variations appear here, so these totals are a SUBSET of Item Wise's for the same window. window_gross carries Item Wise's item total so the size of that subset is visible.",
       "A line counts as a variation only because the server stamped one on it. A variation is never inferred from an item name, so a hand-typed off-menu line is not read as a size that was sold.",
       "A line naming a variation this menu no longer has keeps that label, is marked unresolved and shows no configured price — it was a real sale of something since retired.",
       "Sold at is what the lines actually carried; Configured price is the variation's price today. The variation price is a FLOOR, not a fixed rate, so the two can legitimately differ.",
@@ -40806,7 +41293,7 @@ export async function GetTipSummaryReport(restaurantId: string, q: MisReportQuer
        left join "Bills" b on b.id = tn.bill_id and b.res_id = tn.res_id and b.outlet_id = tn.outlet_id
        left join "Orders" o on o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
       where tn.res_id = $1 and (${mc.og} or tn.outlet_id = $2)
-        and tn.settled_at >= $3 and tn.settled_at < $4
+        and tn.settled_at >= $3 and tn.settled_at < $4${misTimeSql("tn.settled_at", mc)}
         and tn.voided_at is null
         and tn.tip_amount > 0
         ${searchSql}
@@ -40892,18 +41379,23 @@ export interface CounterSummaryRow {
   cashier_count: number;
   bills: number;
   covers: number;
+  /** "Item total": pre-discount. */
+  item_total: number;
+  /** @deprecated Same value as `item_total`, for installed 1.9.x tills. */
   gross: number;
   discount: number;
   net: number;
   service_charge: number;
   tax: number;
+  round_off: number;
+  /** "Gross". */
   grand_total: number;
   refund: number;
   /** The mode cut, machine-readable. Sums to grand_total exactly. `label` is display only. */
   by_method: { method: string; label?: string; amount: number }[];
   /** The same cut as one spreadsheet cell. */
   payment_modes: string;
-  /** Cash sessions on this till that overlap the window (migration 038). */
+  /** Cash sessions on this till that overlap the window (migration 038) — under a slot, its hours on some day of it. */
   sessions: number;
   opened_at: string | null;
   /** Null while any overlapping session is still open. */
@@ -40927,12 +41419,17 @@ const COUNTER_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "cashiers", label: "Cashiers", type: "text" },
   { key: "bills", label: "Bills", type: "int", total: true },
   { key: "covers", label: "Covers", type: "int", total: true, default_on: false },
-  { key: "gross", label: "Gross", type: "money", total: true },
+  { key: "item_total", label: "Item total", type: "money", total: true },
   { key: "discount", label: "Discount", type: "money", total: true },
   { key: "net", label: "Net", type: "money", total: true },
-  { key: "service_charge", label: "Service charge", type: "money", total: true, default_on: false },
-  { key: "tax", label: "Tax", type: "money", total: true, default_on: false },
-  { key: "grand_total", label: "Grand total", type: "money", total: true },
+  // All three rungs between Net and Gross ON by default, for the reason given at
+  // ORDER_SUMMARY_COLUMNS: a till whose visible rungs stop short of its Gross by
+  // the tax it collected reads as a till that is short by that much.
+  { key: "service_charge", label: "Service charge", type: "money", total: true },
+  { key: "tax", label: "Tax", type: "money", total: true },
+  // The rung the Order Summary was also missing — see ORDER_SUMMARY_COLUMNS.
+  { key: "round_off", label: "Round off", type: "money", total: true },
+  { key: "grand_total", label: "Gross", type: "money", total: true },
   { key: "refund", label: "Refunds", type: "money", total: true, default_on: false },
   { key: "payment_modes", label: "Payment modes", type: "text" },
   { key: "opened_at", label: "Opened", type: "datetime" },
@@ -40950,7 +41447,7 @@ async function fetchMisBillCounters(mc: MisContext): Promise<Map<string, { count
        from "Bills" b
        left join "Employees" e on e.id = b.emp_id and e.res_id = b.res_id and e.outlet_id = b.outlet_id
       where b.res_id = $1 and (${mc.og} or b.outlet_id = $2)
-        and ${MIS_SETTLED_PREDICATE}`,
+        and ${misSettledPredicate(mc)}`,
     [mc.context.res_id, mc.context.outlet_id, mc.window.fromIso, mc.window.toIso],
   ), [] as { id: string; counter_id: string | null; fname: string | null; lname: string | null }[]);
   const out = new Map<string, { counter_id: string | null; cashier: string | null }>();
@@ -40963,6 +41460,8 @@ async function fetchMisBillCounters(mc: MisContext): Promise<Map<string, { count
 
 /** The shift half of migration 038: cash sessions on a till, over a window. */
 async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>> {
+  // Under a time slot, the slot's own interval on each day of the window.
+  const days = mc.window.slot ? slotDayInstants(mc.window, mc.tz, mc.window.slot) : null;
   const rows = await captureRead("CashSessions.counter_id", () => runQuery<{
     counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null;
   }>(
@@ -40972,6 +41471,19 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
     // both exact and immune to that null. Sessions that OVERLAP the window are
     // included: a shift that opened yesterday and is still counting money today
     // is this window's shift.
+    //
+    // UNDER A TIME SLOT a shift counts only when it overlaps the slot's hours ON
+    // AT LEAST ONE DAY of the window. The EXISTS walks each day's [lo, hi),
+    // bound as $4/$5 (slotDayInstants). The hull test above it stays: with no
+    // slot it is the whole test, and under one it still narrows the scan. The
+    // hull ALONE is not enough: a session is a span, not an instant, so
+    // misTimeSql cannot cut it, and a dinner shift on the 1st lies inside Lunch's
+    // hull over 1-3 August without ever meeting Lunch. Counted, it would add its
+    // drawer and its variance to a Lunch report, and a row for a till that rang
+    // nothing at lunch. A shift that does meet the slot is still counted WHOLE,
+    // never cut by it: a shift is a whole drawer count, and half of a variance
+    // is no number at all. The report's notes say so (MIS_SLOT_EXTRA). `d` names
+    // only lo and hi, so opened_at and closed_at inside it are the session's.
     `select counter_id,
             count(*)::text as sessions,
             min(opened_at) as opened_at,
@@ -40979,9 +41491,13 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
             coalesce(sum(variance), 0)::float as variance
        from "CashSessions"
       where res_id = $1 and counter_id is not null
-        and opened_at < $3 and (closed_at is null or closed_at >= $2)
+        and opened_at < $3 and (closed_at is null or closed_at >= $2)${days ? `
+        and exists (select 1 from unnest($4::timestamptz[], $5::timestamptz[]) as d(lo, hi)
+                     where opened_at < d.hi and (closed_at is null or closed_at >= d.lo))` : ""}
       group by counter_id`,
-    [mc.context.res_id, mc.window.fromIso, mc.window.toIso],
+    days
+      ? [mc.context.res_id, mc.window.fromIso, mc.window.toIso, days.lo, days.hi]
+      : [mc.context.res_id, mc.window.fromIso, mc.window.toIso],
   ), [] as { counter_id: string; sessions: string; opened_at: Date | string | null; closed_at: Date | string | null; variance: number | string | null }[]);
   const out = new Map<string, { sessions: number; opened_at: string | null; closed_at: string | null; variance: number }>();
   for (const r of rows) {
@@ -41026,7 +41542,8 @@ async function fetchMisCounterSessions(mc: MisContext): Promise<Map<string, { se
  * sessions on that till that overlap the window, and Closed is deliberately
  * BLANK while any of them is still open — a shift that has not been counted has
  * no closing time, and inventing one would make an uncounted drawer look
- * reconciled.
+ * reconciled. Under a time slot, "overlap the window" means overlapping the
+ * slot's hours on at least one day of it (fetchMisCounterSessions).
  */
 export async function GetCounterSummaryReport(restaurantId: string, q: MisReportQuery = {}): Promise<CounterSummaryReport> {
   const mc = await misContext(restaurantId, q);
@@ -41110,11 +41627,13 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
       cashier_count: names.length,
       bills: l.bills,
       covers: l.covers,
+      item_total: l.item_total,
       gross: l.gross,
       discount: l.discount,
       net: l.net,
       service_charge: l.service_charge,
       tax: l.tax,
+      round_off: l.round_off,
       grand_total: l.grand_total,
       refund: l.refund,
       by_method: [...parts]
@@ -41141,7 +41660,9 @@ export async function GetCounterSummaryReport(restaurantId: string, q: MisReport
     meta: await misMeta(mc, "counter_summary", "Counter Summary", [
       NOTE_SETTLEMENT_BASIS,
       NOTE_COVERS_ONCE,
-      "Grand total here equals the Sales Summary's grand total for the same window: this is the same set of bills, cut by the till that rang them.",
+      NOTE_GROSS_NET,
+      NOTE_ROUND_OFF,
+      "Gross here equals the Sales Summary's Gross for the same window: this is the same set of bills, cut by the till that rang them.",
       `Bills that recorded no till are collected in the "${COUNTER_UNASSIGNED_CODE}" row. That is every bill written before billing counters existed, and every bill on an outlet with a single till — the row is normal, not an error.`,
       "The payment-mode split is the same allocation the Settlement Summary uses, including its Unallocated bucket, so a shortfall on one till traces into the same numbers as the cash-up sheet.",
       "The counter is the TILL and the cash session is the SHIFT. Opened and Closed are the earliest opening and the latest closing of the sessions on that till that overlap this window; Closed is blank while any of them is still open, because a drawer that has not been counted has no closing time.",

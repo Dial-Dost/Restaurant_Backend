@@ -56,7 +56,13 @@ export type WindowClamp =
   /** `to` was after today; pulled back to today. */
   | "future_to"
   /** The span exceeded the endpoint's cap; `from` moved forward to fit. */
-  | "span_capped";
+  | "span_capped"
+  /** `slot` named no preset this restaurant has; the report is ALL DAY. */
+  | "slot_unknown"
+  /** `time_from` / `time_to` was not a readable HH:mm; the report is ALL DAY. */
+  | "time_unparseable"
+  /** The custom times start and end at the same minute; the report is ALL DAY. */
+  | "time_empty";
 
 export interface ReportWindowQuery {
   /** YYYY-MM-DD (or any ISO instant) — the FIRST day of the window, inclusive. */
@@ -65,6 +71,12 @@ export interface ReportWindowQuery {
   to?: unknown;
   /** Legacy rolling span: the last N calendar days ending today. */
   days?: unknown;
+  /** A preset time slot id ("lunch"), or "all". See resolveTimeSlot. */
+  slot?: unknown;
+  /** HH:mm — a CUSTOM slot's start, inclusive. Wins over `slot`. */
+  time_from?: unknown;
+  /** HH:mm (or "24:00") — a CUSTOM slot's end, exclusive. Wins over `slot`. */
+  time_to?: unknown;
 }
 
 export interface ReportWindowLimits {
@@ -278,4 +290,551 @@ export function resolveReportWindow(
   }
 
   return { from: fromKey, to: toKey, days: span, source, clamped };
+}
+
+// ============================================================================
+// TIME SLOTS — a part of each day, laid over the days above
+// ============================================================================
+//
+// "Structure the reports section wise — select time for hour-wise reports or
+// session-wise reports ... preset time slots for 2 sessions: lunch 12pm to 5pm
+// and dinner 6pm to 12am."
+//
+// THE CONTRACT, in the order a report applies it:
+//
+//  1. A SLOT IS A FILTER ON THE CLOCK THE REPORT ALREADY USES. Settlement for the
+//     bill reports, order placement for the item reports, the moment of the act
+//     for comps, waivers, tips and edits. Nothing here picks a clock; it only
+//     says which minutes of each day count. That is what keeps Sales = Σ Order
+//     = Σ Settlement = Σ Counter true under any slot: every figure in a clock
+//     family is cut by the same minutes.
+//  2. HALF-OPEN, [start, end). A bill settled at exactly 17:00:00 is not Lunch
+//     (12:00-17:00) and would be Dinner if Dinner started at 17:00. A closed end
+//     double-counts that bill; an open start loses it.
+//  3. A SLOT THAT CROSSES MIDNIGHT BELONGS TO THE DAY IT STARTS ON. 22:00-02:00
+//     over 1-15 August is the union over D = 1..15 of [D 22:00, D+1 02:00), so
+//     16 Aug 01:30 is in (the 15th's late night) and 1 Aug 01:30 is out (the
+//     31st's). A pure clock filter over calendar days would hand Friday's
+//     late-night report Thursday's tail and drop Friday's own.
+//  4. ALL DAY IS NO SLOT. No param, `slot=all`, and 00:00-24:00 all resolve to
+//     `null`, and a null slot changes nothing — not the SQL, not the payload's
+//     numbers, not the notes, not the filename. Every report shipped before this
+//     existed is therefore exactly what it was.
+//  5. CUSTOM WINS OVER A PRESET, the way from/to win over days. A custom or
+//     preset slot that cannot be honoured falls back to ALL DAY with the reason
+//     NAMED in `clamped`, never to a guess.
+//
+// "24:00" is local midnight at the END of the day. It is accepted as an end
+// (Dinner 18:00-24:00 does NOT cross midnight), and an end of "00:00" means the
+// same thing, so 22:00-00:00 is 22:00-24:00 rather than an empty slot.
+//
+// NAMED time_slot, not "session" and not "section": TableSessions/CashSessions
+// and table sections already own those words in this codebase. The owner's
+// screen may still say "Session".
+
+/** A preset as stored in "Restaurant".report_time_slots and as the wire carries it. */
+export interface TimeSlotPreset {
+  /** A slug, [a-z0-9_-]{1,32}. What `?slot=` names. */
+  id: string;
+  /** 1-24 characters, as the owner typed it. */
+  label: string;
+  /** HH:mm, 00:00-23:59. Inclusive. */
+  start: string;
+  /** HH:mm, 00:01-24:00. Exclusive. */
+  end: string;
+}
+
+/** A slot a report actually applies, in MINUTES past local midnight. */
+export interface TimeSlot {
+  /** The preset id, or null for custom times. */
+  id: string | null;
+  label: string;
+  /** 0..1439, INCLUSIVE. */
+  start: number;
+  /** 1..1440, EXCLUSIVE. 1440 is midnight at the end of the day. */
+  end: number;
+  /** end < start: the slot runs past midnight into the next calendar day. */
+  crosses_midnight: boolean;
+  source: "preset" | "custom";
+}
+
+/** meta.time_slot — the slot a payload was cut by, or null for all day. */
+export interface TimeSlotMeta {
+  id: string | null;
+  label: string;
+  start: string;
+  end: string;
+  crosses_midnight: boolean;
+  source: "preset" | "custom";
+}
+
+/** One preset on the wire (GET/PUT /reports/mis/time-slots). */
+export interface TimeSlotPresetWire extends TimeSlotPreset {
+  crosses_midnight: boolean;
+}
+
+export const MAX_TIME_SLOTS = 8;
+export const MAX_TIME_SLOT_LABEL = 24;
+/** The `slot` value that means the whole day. Reserved: no preset may take it. */
+export const ALL_DAY_SLOT_ID = "all";
+/** meta.time_slot.label for custom times. */
+export const CUSTOM_TIME_SLOT_LABEL = "Custom";
+/** The session breakdown's row for money no preset claims. */
+export const OUTSIDE_SESSIONS_LABEL = "Outside sessions";
+
+/**
+ * The client's two sessions, exactly as asked: lunch 12pm-5pm, dinner 6pm-12am.
+ *
+ * They do NOT cover the day. 00:00-12:00 and 17:00-18:00 belong to neither, and
+ * production has real money there (bills settled 00:00-01:59 and at 17:xx), so
+ * the session breakdown always carries an Outside sessions row rather than
+ * letting that money vanish between two presets. An owner who wants Dinner to
+ * run to 02:00 can say so; the default answers the question that was asked.
+ */
+export const DEFAULT_TIME_SLOTS: readonly TimeSlotPreset[] = Object.freeze([
+  Object.freeze({ id: "lunch", label: "Lunch", start: "12:00", end: "17:00" }),
+  Object.freeze({ id: "dinner", label: "Dinner", start: "18:00", end: "24:00" }),
+]);
+
+const CLOCK = /^(\d{1,2}):(\d{2})$/;
+const SLOT_ID = /^[a-z0-9_-]{1,32}$/;
+
+/**
+ * Minutes past local midnight of an "HH:mm", or null when it is not one.
+ *
+ * "24:00" is 1440 only when `allow24` — it is a legal END and never a start.
+ * A one-digit hour ("9:30") is read, because a hand-typed query string is not a
+ * reason to answer a different question; everything written back out is HH:mm.
+ */
+export function parseClockMinutes(value: unknown, opts: { allow24?: boolean } = {}): number | null {
+  const m = CLOCK.exec(queryText(value));
+  if (!m) {return null;}
+  const h = Number(m[1]), mi = Number(m[2]);
+  if (mi > 59) {return null;}
+  if (h === 24 && mi === 0) {return opts.allow24 ? 1440 : null;}
+  if (h > 23) {return null;}
+  return h * 60 + mi;
+}
+
+/** "HH:mm" of a minute count. 1440 is "24:00". */
+export function formatClock(minutes: number): string {
+  const m = Math.max(0, Math.min(1440, Math.round(minutes)));
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+/**
+ * The slot a pair of minutes describes, or null when it is the whole day.
+ *
+ * An END of 0 is read as 1440 — "until midnight" — so an owner typing 00:00 for
+ * "midnight" can never produce an empty slot or a day-long crossing one.
+ */
+function slotOf(id: string | null, label: string, start: number, endRaw: number, source: TimeSlot["source"]): TimeSlot | null {
+  const end = endRaw === 0 ? 1440 : endRaw;
+  if (start === 0 && end === 1440) {return null;}
+  return { id, label, start, end, crosses_midnight: end < start, source };
+}
+
+/** A stored preset's minutes. Null for a preset that is not one (never saved: validated). */
+function presetMinutes(p: TimeSlotPreset): { start: number; end: number } | null {
+  const start = parseClockMinutes(p.start);
+  const endRaw = parseClockMinutes(p.end, { allow24: true });
+  if (start === null || endRaw === null) {return null;}
+  const end = endRaw === 0 ? 1440 : endRaw;
+  return start === end ? null : { start, end };
+}
+
+/** Does this minute of the day fall inside [start, end) on the 24-hour circle? */
+export function slotContains(slot: Pick<TimeSlot, "start" | "end">, minute: number): boolean {
+  return slot.end < slot.start
+    ? minute >= slot.start || minute < slot.end
+    : minute >= slot.start && minute < slot.end;
+}
+
+/**
+ * Does resolving this query need the restaurant's presets at all?
+ *
+ * Only a preset id does. Custom times, `slot=all` and no slot resolve without a
+ * read, which keeps every report that is not cut by a preset at exactly the
+ * queries it issued before slots existed.
+ */
+export function timeSlotNeedsPresets(query: ReportWindowQuery): boolean {
+  if (queryText(query.time_from) !== "" || queryText(query.time_to) !== "") {return false;}
+  const id = queryText(query.slot).toLowerCase();
+  return id !== "" && id !== ALL_DAY_SLOT_ID;
+}
+
+/**
+ * Resolve a request's time slot against the restaurant's presets.
+ *
+ * PRECEDENCE mirrors the date window's: custom `time_from`/`time_to` win over
+ * `slot`, and either custom end alone is enough — a missing start is 00:00 and a
+ * missing end is 24:00, so `?time_from=18:00` reads as "from 18:00". Every
+ * refusal falls back to ALL DAY with the reason in `clamped`; a report that
+ * silently answered a narrower (or a different) question than the one asked
+ * would be worse than one that answered the whole day and said why.
+ */
+export function resolveTimeSlot(
+  query: ReportWindowQuery,
+  presets: readonly TimeSlotPreset[],
+): { slot: TimeSlot | null; clamped: WindowClamp[] } {
+  const fromText = queryText(query.time_from), toText = queryText(query.time_to);
+  if (fromText !== "" || toText !== "") {
+    const start = fromText === "" ? 0 : parseClockMinutes(fromText);
+    const end = toText === "" ? 1440 : parseClockMinutes(toText, { allow24: true });
+    if (start === null || end === null) {return { slot: null, clamped: ["time_unparseable"] };}
+    if (start === (end === 0 ? 1440 : end)) {return { slot: null, clamped: ["time_empty"] };}
+    return { slot: slotOf(null, CUSTOM_TIME_SLOT_LABEL, start, end, "custom"), clamped: [] };
+  }
+  const id = queryText(query.slot).toLowerCase();
+  if (id === "" || id === ALL_DAY_SLOT_ID) {return { slot: null, clamped: [] };}
+  const preset = presets.find((p) => p.id === id);
+  const minutes = preset ? presetMinutes(preset) : null;
+  if (!preset || !minutes) {return { slot: null, clamped: ["slot_unknown"] };}
+  return { slot: slotOf(preset.id, preset.label, minutes.start, minutes.end, "preset"), clamped: [] };
+}
+
+/**
+ * The OUTER wall-clock bounds of a slot over a window of days.
+ *
+ * [from at start, (to or to+1) at end). The +1 applies when the slot ends at or
+ * after midnight — Dinner 18:00-24:00 ends at the start of the next day, and
+ * 22:00-02:00 on the last day ends at 02:00 of the day after it. Together with
+ * the per-row time-of-day predicate this is EXACTLY the per-day union of rule 3:
+ * the outer bounds drop the first day's pre-slot tail and the last day's
+ * post-slot head, and the time predicate removes the gaps in between. The outer
+ * bounds are also what keeps the existing range index doing the work.
+ */
+export function slotBounds(
+  w: { from: string; to: string },
+  slot: Pick<TimeSlot, "start" | "end" | "crosses_midnight">,
+): { fromKey: string; fromMin: number; toKey: string; toMin: number } {
+  const nextDay = slot.crosses_midnight || slot.end === 1440;
+  return {
+    fromKey: w.from,
+    fromMin: slot.start,
+    toKey: nextDay ? addDaysToKey(w.to, 1) : w.to,
+    toMin: slot.end % 1440,
+  };
+}
+
+/**
+ * The slot on EACH day of a window, in day order: the members of rule 3's
+ * per-day union, whose outer hull slotBounds is.
+ *
+ * The hull plus a time-of-day predicate is exact for an INSTANT, because an
+ * instant has one wall clock. It is not exact for a SPAN. A cash session is
+ * opened at one moment and closed at another, and a dinner shift on 1 August
+ * (18:00-23:30) lies inside Lunch's hull over 1-3 August (the 1st 12:00 to the
+ * 3rd 17:00) without ever meeting Lunch. Asking whether a span meets the slot
+ * needs each day's interval, so this returns them.
+ *
+ * Each day is slotBounds of that day alone. So the first interval starts where
+ * the hull starts and the last ends where the hull ends, by construction rather
+ * than through a second copy of the midnight rule. A reversed or unreadable
+ * window has no days. A window wider than MAX_REPORT_DAYS is refused out loud: a
+ * resolved window never is one, and a quietly shortened list would drop shifts.
+ */
+export function slotDayBounds(
+  w: { from: string; to: string },
+  slot: Pick<TimeSlot, "start" | "end" | "crosses_midnight">,
+): { fromKey: string; fromMin: number; toKey: string; toMin: number }[] {
+  const days = countDays(w.from, w.to);
+  if (days > MAX_REPORT_DAYS) {
+    throw new RangeError(`slotDayBounds: ${String(days)} days is wider than a report window can be (${String(MAX_REPORT_DAYS)})`);
+  }
+  const out: { fromKey: string; fromMin: number; toKey: string; toMin: number }[] = [];
+  for (let i = 0; i < days; i += 1) {
+    const day = addDaysToKey(w.from, i);
+    out.push(slotBounds({ from: day, to: day }, slot));
+  }
+  return out;
+}
+
+/**
+ * The business day an instant counts on under a slot: the day the slot STARTED.
+ *
+ * Only a crossing slot moves anything, and only its after-midnight part:
+ * 01:30 on the 16th under 22:00-02:00 is the 15th's. With no slot, or a slot
+ * that stays inside one day, the calendar day is the answer — which is why the
+ * day series of every all-day report is unchanged.
+ */
+export function serviceDayKey(calendarDay: string, minute: number, slot: TimeSlot | null): string {
+  if (slot && slot.crosses_midnight && minute < slot.end) {return addDaysToKey(calendarDay, -1);}
+  return calendarDay;
+}
+
+/** The first preset whose hours hold this minute, or null (Outside sessions). */
+export function sessionOf(presets: readonly TimeSlotPreset[], minute: number): TimeSlotPreset | null {
+  for (const p of presets) {
+    const m = presetMinutes(p);
+    if (m && slotContains(m, minute)) {return p;}
+  }
+  return null;
+}
+
+// --- The time-wise cut ---------------------------------------------------------
+
+/**
+ * How the Sales Summary's series is cut.
+ *
+ *   day          one row per business day (the default, and what it always was)
+ *   hour         one row per DATE x HOUR, keyed YYYY-MM-DDTHH (what it always was)
+ *   hour_of_day  one row per HOUR OF THE DAY across the whole window, keyed
+ *                "13:00-14:00" — "how busy is 1pm this month"
+ *   session      one row per preset, in preset order, then Outside sessions
+ */
+export type TimeBucketMode = "day" | "hour" | "hour_of_day" | "session";
+
+export const TIME_BUCKET_MODES: readonly TimeBucketMode[] = Object.freeze(["day", "hour", "hour_of_day", "session"] as TimeBucketMode[]);
+
+/** Read `?bucket=`. Anything unrecognised is the default day cut. */
+export function timeBucketMode(raw: unknown): TimeBucketMode {
+  const v = queryText(raw).toLowerCase();
+  return (TIME_BUCKET_MODES as readonly string[]).includes(v) ? (v as TimeBucketMode) : "day";
+}
+
+/** "13:00-14:00". The last hour is "23:00-24:00", never "23:00-00:00". */
+export function hourOfDayLabel(hour: number): string {
+  const h = Math.max(0, Math.min(23, Math.floor(hour)));
+  return `${formatClock(h * 60)}-${formatClock((h + 1) * 60)}`;
+}
+
+/** "Lunch (12:00-17:00)" — a session row names its hours, so two same-named presets stay apart. */
+export function sessionBucketLabel(p: TimeSlotPreset): string {
+  const m = presetMinutes(p);
+  return m ? `${p.label} (${formatClock(m.start)}-${formatClock(m.end)})` : p.label;
+}
+
+/**
+ * The bucket one instant lands in.
+ *
+ * `serviceDay` is serviceDayKey's answer and `calendarDay` the plain local date.
+ * The DAY cut uses the service day, so a crossing slot's night stays with the
+ * evening it began. The DATE x HOUR cut keeps the calendar date: "2026-08-16T01"
+ * is literally that hour, and it sorts where it happened.
+ */
+export function timeBucketKey(
+  mode: TimeBucketMode,
+  at: { serviceDay: string; calendarDay: string; minute: number },
+  presets: readonly TimeSlotPreset[],
+): string {
+  switch (mode) {
+    case "hour": return `${at.calendarDay}T${String(Math.floor(at.minute / 60)).padStart(2, "0")}`;
+    case "hour_of_day": return hourOfDayLabel(Math.floor(at.minute / 60));
+    case "session": {
+      const p = sessionOf(presets, at.minute);
+      return p ? sessionBucketLabel(p) : OUTSIDE_SESSIONS_LABEL;
+    }
+    default: return at.serviceDay;
+  }
+}
+
+/** The rows a mode shows even when nothing happened in them: every preset, for `session`. */
+export function fixedTimeBuckets(mode: TimeBucketMode, presets: readonly TimeSlotPreset[]): string[] {
+  return mode === "session" ? presets.map(sessionBucketLabel) : [];
+}
+
+/**
+ * The order a series is read in, stated rather than left to string sorting.
+ *
+ * Day, date x hour and hour-of-day keys are zero-padded, so their text order IS
+ * time order. Session rows are not: they follow the owner's preset order, and
+ * Outside sessions comes last, whatever the labels spell.
+ */
+export function timeBucketOrder(mode: TimeBucketMode, presets: readonly TimeSlotPreset[]): (a: string, z: string) => number {
+  if (mode !== "session") {return (a, z) => a.localeCompare(z);}
+  const rank = new Map<string, number>(presets.map((p, i) => [sessionBucketLabel(p), i]));
+  const rankOf = (key: string): number => rank.get(key) ?? (key === OUTSIDE_SESSIONS_LABEL ? presets.length : presets.length + 1);
+  return (a, z) => rankOf(a) - rankOf(z) || a.localeCompare(z);
+}
+
+// --- Presets: validation, storage, the wire -------------------------------------
+
+/** A refused preset save. `message` is ONE plain sentence the owner can act on. */
+export class TimeSlotConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TimeSlotConfigError";
+  }
+}
+
+export type TimeSlotValidation =
+  | { ok: true; slots: TimeSlotPreset[] }
+  | { ok: false; error: string };
+
+/** A slug from a label: "Late Night" -> "late-night". Empty when nothing survives. */
+function slugOf(text: string, max: number): string {
+  return text.toLowerCase().normalize("NFKD")
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, max).replace(/-+$/, "");
+}
+
+/** Control characters become spaces; runs of whitespace become one. */
+function cleanLabel(value: unknown): string {
+  if (typeof value !== "string") {return "";}
+  let out = "";
+  for (const ch of value) {
+    const code = ch.codePointAt(0) ?? 0;
+    out += code < 32 || code === 127 ? " " : ch;
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Validate a whole preset list, as an owner saves it.
+ *
+ * REFUSED OUT LOUD, one sentence, first problem first. The rules:
+ *   * at most MAX_TIME_SLOTS; an EMPTY list is valid (the route reads it as
+ *     "back to the defaults");
+ *   * a label of 1-24 characters (whitespace collapsed);
+ *   * HH:mm times, start 00:00-23:59, end 00:01-24:00 ("00:00" as an end is
+ *     24:00), and a start that is not its own end;
+ *   * ids are unique slugs; an entry without one gets one from its label, and
+ *     "all" is never an id because `slot=all` already means the whole day;
+ *   * NO OVERLAP on the 24-hour circle. Each minute of the day can belong to at
+ *     most one session, or the session breakdown would count a bill twice and
+ *     stop adding up to its own total.
+ */
+export function validateTimeSlotPresets(raw: unknown): TimeSlotValidation {
+  if (!Array.isArray(raw)) {return { ok: false, error: "Send the time slots as a list." };}
+  if (raw.length > MAX_TIME_SLOTS) {
+    return { ok: false, error: `You can save at most ${String(MAX_TIME_SLOTS)} time slots.` };
+  }
+
+  interface Draft { id: string | null; label: string; start: number; end: number }
+  const drafts: Draft[] = [];
+  for (const entry of raw as unknown[]) {
+    const e = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
+    const label = cleanLabel(e.label);
+    if (label.length === 0 || [...label].length > MAX_TIME_SLOT_LABEL) {
+      return { ok: false, error: `Every time slot needs a name of 1 to ${String(MAX_TIME_SLOT_LABEL)} characters.` };
+    }
+    const start = parseClockMinutes(e.start);
+    if (start === null) {return { ok: false, error: `"${label}" needs a start time between 00:00 and 23:59, written as HH:mm.` };}
+    const endRaw = parseClockMinutes(e.end, { allow24: true });
+    if (endRaw === null) {return { ok: false, error: `"${label}" needs an end time between 00:01 and 24:00, written as HH:mm.` };}
+    const end = endRaw === 0 ? 1440 : endRaw;
+    if (start === end) {return { ok: false, error: `"${label}" starts and ends at the same time.` };}
+    let id: string | null = null;
+    if (typeof e.id === "string" && e.id.trim() !== "") {
+      id = e.id.trim().toLowerCase();
+      if (!SLOT_ID.test(id)) {
+        return { ok: false, error: `"${label}" has an id that is not 1 to 32 lowercase letters, digits, - or _.` };
+      }
+      if (id === ALL_DAY_SLOT_ID) {return { ok: false, error: `"${label}" cannot use the id "all", which already means the whole day.` };}
+    }
+    drafts.push({ id, label, start, end });
+  }
+
+  const taken = new Set<string>([ALL_DAY_SLOT_ID]);
+  for (const d of drafts) {
+    if (d.id === null) {continue;}
+    if (taken.has(d.id)) {return { ok: false, error: `Two time slots use the id "${d.id}".` };}
+    taken.add(d.id);
+  }
+  drafts.forEach((d, i) => {
+    if (d.id !== null) {return;}
+    const base = slugOf(d.label, 32) || `slot-${String(i + 1)}`;
+    let candidate = base;
+    for (let n = 2; taken.has(candidate); n += 1) {
+      const suffix = `-${String(n)}`;
+      candidate = `${base.slice(0, 32 - suffix.length)}${suffix}`;
+    }
+    d.id = candidate;
+    taken.add(candidate);
+  });
+
+  // The circle, unrolled: a crossing slot is two plain intervals.
+  const pieces = (d: Draft): [number, number][] => (d.end < d.start ? [[d.start, 1440], [0, d.end]] : [[d.start, d.end]]);
+  const hours = (d: Draft): string => `${formatClock(d.start)}-${formatClock(d.end)}`;
+  for (let i = 0; i < drafts.length; i += 1) {
+    for (let j = i + 1; j < drafts.length; j += 1) {
+      const a = drafts[i], z = drafts[j];
+      const clash = pieces(a).some(([as, ae]) => pieces(z).some(([zs, ze]) => as < ze && zs < ae));
+      if (clash) {
+        return {
+          ok: false,
+          error: `"${a.label}" (${hours(a)}) overlaps "${z.label}" (${hours(z)}); a time of day can belong to only one time slot.`,
+        };
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    slots: drafts.map((d) => ({ id: d.id ?? "", label: d.label, start: formatClock(d.start), end: formatClock(d.end) })),
+  };
+}
+
+/**
+ * The presets a stored "Restaurant".report_time_slots value holds, or null for
+ * "use the defaults" — NULL, an empty list, or a value that no longer validates.
+ *
+ * Read defensively and re-validated on the way out: the column is jsonb that a
+ * human can edit, and a malformed preset must cost the owner their custom
+ * sessions (visibly: is_default comes back true), never the report.
+ */
+export function parseStoredTimeSlots(raw: unknown): TimeSlotPreset[] | null {
+  let value: unknown = raw;
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return null; }
+  }
+  const list = Array.isArray(value)
+    ? value
+    : (value && typeof value === "object" ? (value as { slots?: unknown }).slots : undefined);
+  const checked = validateTimeSlotPresets(list);
+  return checked.ok && checked.slots.length > 0 ? checked.slots : null;
+}
+
+/** What is written to the column. An empty list stores NULL: the defaults. */
+export function timeSlotsForStorage(slots: readonly TimeSlotPreset[]): { version: 1; slots: TimeSlotPreset[] } | null {
+  return slots.length === 0 ? null : { version: 1, slots: slots.map((s) => ({ ...s })) };
+}
+
+/** A preset as GET/PUT /reports/mis/time-slots return it. */
+export function timeSlotPresetWire(p: TimeSlotPreset): TimeSlotPresetWire {
+  const m = presetMinutes(p);
+  return { id: p.id, label: p.label, start: p.start, end: p.end, crosses_midnight: m ? m.end < m.start : false };
+}
+
+/** meta.time_slot. */
+export function timeSlotMeta(slot: TimeSlot | null): TimeSlotMeta | null {
+  if (!slot) {return null;}
+  return {
+    id: slot.id,
+    label: slot.label,
+    start: formatClock(slot.start),
+    end: formatClock(slot.end),
+    crosses_midnight: slot.crosses_midnight,
+    source: slot.source,
+  };
+}
+
+/**
+ * The export filename suffix: `_<label slug>-HHMM-HHMM`, or "" for all day.
+ *
+ * Only when a slot is set, so every all-day filename is the one it always was. A
+ * sheet saved from Lunch and one saved from the whole day must not overwrite
+ * each other in a Downloads folder, and must not be mistaken for each other on a
+ * desk. The web and the app build the same suffix from meta.time_slot.
+ */
+export function timeSlotFileSuffix(slot: Pick<TimeSlotMeta, "label" | "start" | "end"> | null | undefined): string {
+  if (!slot) {return "";}
+  const slug = slugOf(slot.label, 32) || "slot";
+  return `_${slug}-${slot.start.replace(":", "")}-${slot.end.replace(":", "")}`;
+}
+
+/**
+ * The sentence every report adds to its notes when a slot is set.
+ *
+ * `subject` names WHAT the report's clock stamps ("bills SETTLED", "orders
+ * PLACED"), because a slot is only meaningful next to the clock it cuts — a
+ * 17:50 order settled at 19:30 is Dinner on the Sales Summary and outside every
+ * session on Item Wise, and the owner has to be told which question each tab
+ * answered.
+ */
+export function timeSlotNote(slot: TimeSlot, subject: string): string {
+  const start = formatClock(slot.start), end = formatClock(slot.end);
+  const name = slot.source === "preset" ? `${slot.label} (${start}-${end})` : `${start}-${end}`;
+  return `Time slot ${name}: only ${subject} from ${start} up to ${end} restaurant time on each day of the range are counted, and any figure here on another clock is cut by the same hours on that clock.`
+    + (slot.crosses_midnight ? " This slot crosses midnight: its hours after midnight belong to the day it started on." : "");
 }

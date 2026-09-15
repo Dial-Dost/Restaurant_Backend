@@ -20,10 +20,15 @@ export function toCsv(headers: string[], rows: (string | number)[][]): string {
 // SalesReport.by_day carries service_charge, and the interactive export dropped
 // it — so the owner's own income was missing from the sheet they reconcile with.
 // Both callers now come through here, which is what stops the two diverging again.
+//
+// GROSS AND NET, in the client's words: "Gross sales" is the grand total (service
+// charge, tax and round off in), "Net sales" the item total less discounts. Net
+// is APPENDED as the last column, never inserted: scheduled deliveries are read
+// by position, and every column a reader already knows stays where it was.
 export function renderSalesCsv(r: SalesReport): string {
-  const rows: (string | number)[][] = r.by_day.map((d) => [d.date, d.bills, d.sales, d.tax, d.service_charge, d.refund]);
-  rows.push(["Total", r.bill_count, r.total_sales, r.total_tax, r.total_service_charge, r.total_refund]);
-  return toCsv(["Date", "Bills", "Sales", "Tax", "Service Charge", "Refunds"], rows);
+  const rows: (string | number)[][] = r.by_day.map((d) => [d.date, d.bills, d.sales, d.tax, d.service_charge, d.refund, d.net]);
+  rows.push(["Total", r.bill_count, r.total_sales, r.total_tax, r.total_service_charge, r.total_refund, r.total_net]);
+  return toCsv(["Date", "Bills", "Gross sales", "Tax", "Service Charge", "Refunds", "Net sales"], rows);
 }
 
 export function renderGstCsv(r: GstReport): string {
@@ -40,7 +45,9 @@ export function renderPnlCsv(r: ProfitAndLoss): string {
     ["Refunds", r.refunds],
     ["Tax collected", r.tax_collected],
     ["Service charge", r.service_charge],
-    ["Net revenue", r.net_revenue],
+    // Not the client's Net (that is pre-service-charge): tax out, refunds out,
+    // service charge and round off still in. Named for what it is.
+    ["Revenue ex-tax (after refunds)", r.net_revenue],
     ["Total expenses", r.total_expenses],
     ["Net profit", r.net_profit],
   ];

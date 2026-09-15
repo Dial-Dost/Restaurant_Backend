@@ -16,6 +16,7 @@ Transform: AWS::Serverless-2016-10-31
 #   Windows app   --> |  /socket.io/*  -> ALB -> ECS Fargate (always-on)       |
 #   Dashboard     --> |  /print/*      -> ALB -> ECS Fargate (always-on)       |
 #   Guest QR      --> |  /publish/*    -> ALB -> ECS Fargate (always-on)       |
+#   Till / web    --> |  /bills/service-charge-waiver/print -> ALB -> Fargate  |
 #                     |  everything else -> HTTP API -> Lambda                 |
 #                     +-------------------------------------------------------+
 #                                        |
@@ -936,7 +937,7 @@ Resources:
             # does not mind and which keeps req.ip / logging honest.
             OriginRequestPolicyId: 216adef6-36ac-47da-a4f8-3b0fe0ba1b9f
 
-          # --- The two routes whose emit must not be lost ---------------------
+          # --- The routes whose emit must not be lost -------------------------
           # POST /print/bill (routes/bills.ts:506) and POST /publish/bill
           # (routes/bills.ts:463) both end in emitOutlet(..., 'bill:print', ...). Served
           # from Lambda, that emit races the container freeze. Served from the
@@ -951,6 +952,27 @@ Resources:
             OriginRequestPolicyId: 216adef6-36ac-47da-a4f8-3b0fe0ba1b9f
 
           - PathPattern: /publish/*
+            TargetOriginId: realtimeAlb
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-36ac-47da-a4f8-3b0fe0ba1b9f
+
+          # --- The third bill-print door, which is not under /print/ ----------
+          # POST /bills/service-charge-waiver/print (routes/mis_capture.ts,
+          # client item 6) records a service-charge waiver and then prints the
+          # bill through printOpenTableBill — /print/bill's own render and
+          # dispatch, so the same 'bill:print' emit. It lives under /bills/ next
+          # to the other waiver routes, which neither pattern above matches.
+          # Served from Lambda, a committed waiver could answer printed:true
+          # while the emit was frozen in the container and no paper came out.
+          # An exact path, not /bills/*: every other /bills/ route is an
+          # ordinary read or write that belongs on Lambda.
+          # jest-tests/bill_print_doors_always_on.test.ts fails when a route
+          # that dispatches a bill print is not matched by one of these.
+          - PathPattern: /bills/service-charge-waiver/print
             TargetOriginId: realtimeAlb
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
