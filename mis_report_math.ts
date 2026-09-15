@@ -752,6 +752,27 @@ const itemName = (v: unknown): string | null => {
 };
 
 /**
+ * THE STATUS ROUTE'S "THIS ORDER WAS CANCELLED" SENTENCE.
+ *
+ * PATCH /orders/:id/status writes `Order <id> -> Cancelled`, and since the cancel
+ * reason was captured it appends one: `Order <id> -> Cancelled — reason: Other`.
+ * The old test was a SUFFIX match (`-> Cancelled` at the end), so it missed every
+ * cancel that carried a reason and dropped it from Bill Edit. It also matched the
+ * undo registry's `Undid: Order <id> -> Cancelled`, which REVERSES a cancel, and
+ * listed that as one. Anchored at the start, it takes both wordings of a cancel
+ * and neither the undo nor any other sentence that merely names the order.
+ * `cancel` without the rest also takes the route's accepted spelling "canceled".
+ *
+ * The SQL twin is VOID_KOT_CANCEL_AUDIT_SQL's `l.reason ilike 'Order % -> Cancel%'`
+ * in database_supabase.ts, so Bill Edit and Void KOT read the same audit row the
+ * same way. The void route's `Voided order <id> …` is not matched here: it has
+ * its own action id, which classifies it as "order_voided" before any text is read.
+ */
+export function isOrderCancelSentence(reason: string | null | undefined): boolean {
+  return /^order .* -> cancel/i.test((reason ?? "").trim());
+}
+
+/**
  * Classify one audit entry, or return null when it is not a bill edit.
  *
  * ORDER MATTERS: the dedicated action ids are matched first, then the shapes of
@@ -821,7 +842,7 @@ export function classifyBillEdit(
   if (/^moved item /i.test(r)) {return hit("item_moved", "Item moved");}
   if (/^merged table /i.test(r)) {return hit("tables_merged", "Tables merged");}
   if (/note on /i.test(r)) {return hit("item_note", "Item note changed");}
-  if (/->\s*Cancelled\s*$/i.test(r)) {return hit("order_cancelled", "Order cancelled");}
+  if (isOrderCancelSentence(r)) {return hit("order_cancelled", "Order cancelled");}
 
   // Printing a KOT or a bill, creating an order, firing a course: real events,
   // but not edits to a generated bill. Deliberately dropped.
@@ -983,4 +1004,186 @@ export function formatMethodSplit(parts: readonly SettlementPart[]): string {
     .sort((a, z) => z.amount - a.amount || a.method.localeCompare(z.method))
     .map((p) => `${p.method} ${round2(p.amount).toFixed(2)}`)
     .join(" | ");
+}
+
+// --- Void KOT: the lines a cancelled ticket is reported WITH -----------------
+
+/**
+ * WHERE A DISH GOES WHEN IT IS TAKEN OFF A BILL BY NAME.
+ *
+ * POST /bills/remove-item and POST /bills/move-item both run
+ * removeItemFromTableOrders, which filters the matching lines out of
+ * "Orders".food.items and, when nothing is left on an order, cancels it
+ * (status 5). The lines used to vanish with the filter. The Void KOT row for that
+ * ticket then read Lines 0, Qty 0, Value 0 and named no dish: a void the report
+ * counted but could not describe, holding money the report could not see. A
+ * ticket emptied by a MOVE was listed the same way, although its food was served
+ * at the other table.
+ *
+ * So the writer records two facts on the order, in the SAME update that filters
+ * the lines and flips the status:
+ *   * REMOVED_LINES_KEY holds every line a REMOVAL took off, exactly as it stood,
+ *     plus the moment. A move records none, because a moved dish is still on a
+ *     bill, at the destination table.
+ *   * EMPTIED_BY_KEY names which of the two emptied the order.
+ *
+ * WHY ON THE ORDER AND NOT AS "OrderVoids" ROWS. The void ledger is the other
+ * obvious home. It was not chosen, for three reasons:
+ *   1. The ledger insert would be a second statement inside the removal's
+ *      transaction. It would need a savepoint, or a missing table or a
+ *      constraint would roll the removal back. The JSON rides in the one update
+ *      that already has to succeed, so it cannot fail independently.
+ *   2. The ledger allows one row per (order, item_id). Lines written by old
+ *      clients have no id, so removing the same dish twice would keep only the
+ *      first row and understate the money.
+ *   3. The report's totals come from one aggregate over the same statement as
+ *      its rows. A line list on the order feeds that aggregate and the row mapper
+ *      the same input, so the rows add up to the total by construction.
+ *      Ledger money would need a second degrading read that has to agree with
+ *      the first.
+ * Nothing is back-filled: an order emptied before this shipped has neither key,
+ * and it still reports as it did (no lines, no value), because an audit
+ * sentence keyed by table and time cannot say which ORDER a dish came off.
+ */
+export const REMOVED_LINES_KEY = "removed_items";
+export const EMPTIED_BY_KEY = "emptied_by";
+
+/** Which bill-item writer took the lines off. */
+export type LineRemovalMode = "remove" | "move";
+
+/**
+ * The order's food after lines were taken off it: the evidence above, stamped.
+ *
+ * `food` is the blob with the matching lines ALREADY filtered out; `removed` are
+ * those lines as they stood. Pure, and it never drops a key the blob already
+ * carries, so an earlier removal's lines survive a later one.
+ */
+export function stampLineRemoval(
+  food: Readonly<Record<string, unknown>>,
+  removed: readonly unknown[],
+  mode: LineRemovalMode,
+  emptied: boolean,
+  at: string,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...food };
+  if (mode === "remove" && removed.length > 0) {
+    const prior = food[REMOVED_LINES_KEY];
+    out[REMOVED_LINES_KEY] = [
+      ...(Array.isArray(prior) ? prior : []),
+      ...removed.map((line) => (line !== null && typeof line === "object" ? { ...line, removed_at: at } : line)),
+    ];
+  }
+  if (emptied) {out[EMPTIED_BY_KEY] = mode;}
+  return out;
+}
+
+/**
+ * The lines the Void KOT report reads off a CANCELLED order.
+ *
+ * The lines still on the ticket when it has any (a cancel through the status
+ * route or the void route leaves them in place). Otherwise, the lines Remove
+ * item took off it. The SQL twin is VOID_KOT_LINES_JSON in database_supabase.ts,
+ * which the totals aggregate expands. The two have to choose the same list, or
+ * the rows stop adding up to the total.
+ */
+export function voidKotLines(food: Readonly<Record<string, unknown>>): unknown[] {
+  const items = Array.isArray(food.items) ? (food.items as unknown[]) : [];
+  if (items.length > 0) {return items;}
+  const removed = food[REMOVED_LINES_KEY];
+  return Array.isArray(removed) ? (removed as unknown[]) : [];
+}
+
+/** One cancelled line as the Void KOT row carries it. */
+export interface VoidKotLine {
+  name: string;
+  variation: string | null;
+  quantity: number;
+  price: number;
+}
+
+/** The dish and, when there is one, the size, as a stored line spells them. */
+export function voidLineIdentity(raw: unknown): { name: string; variation: string | null } {
+  const it = (raw !== null && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const name = (typeof it.name === "string" ? it.name.trim() : "") || "Item";
+  const variation = typeof it.variation_name === "string" ? it.variation_name.trim() : "";
+  return { name, variation: variation || null };
+}
+
+/**
+ * A voided ticket's dishes as ONE spreadsheet cell: `Biryani (Half) x2; Raita x1`.
+ *
+ * WHY A TEXT CELL. The row already carries `items` as an array, and every export
+ * on both clients is column-driven. A spreadsheet cannot hold an array, so the
+ * dish names never reached any file: the Excel showed a 36-character order id
+ * and a line count. Same answer as formatMethodSplit, for the same reason.
+ *
+ * `Name (Variation)` is the label the docket and the bill print (escpos.ts
+ * itemLabel), so the sheet names a dish the way the paper did. ` x` is ASCII
+ * because the app's PDF font has no multiplication sign. `; ` separates lines
+ * because a comma inside a dish name is ordinary. Every line stays its own entry,
+ * so the cell and the Lines column count the same thing. No lines is null (a
+ * blank cell), never an empty string pretending to be a list.
+ */
+export function voidItemsText(lines: readonly Pick<VoidKotLine, "name" | "variation" | "quantity">[]): string | null {
+  if (lines.length === 0) {return null;}
+  return lines
+    .map((l) => `${orderLineLabel(l)} x${String(l.quantity)}`)
+    .join("; ");
+}
+
+/**
+ * `Biryani (Half)`: the dish as the docket and the bill print it (escpos.ts
+ * itemLabel). ONE label for the Void KOT cell and the KOT drill-down, so a row
+ * reading "Biryani (Half) x1; Biryani (Full) x1" never opens a ticket with two
+ * lines both called "Biryani".
+ */
+export function orderLineLabel(line: Pick<VoidKotLine, "name" | "variation">): string {
+  return line.variation ? `${line.name} (${line.variation})` : line.name;
+}
+
+/**
+ * THE LINES AN ITEMS-SPLIT WRITE TOOK OFF AN ORDER, as they stood.
+ *
+ * UpdateOrderItemsSplit replaces an order's whole line list. DELETE
+ * /orders/:id/items/:itemId uses it to strip a line, and stripping the last one
+ * leaves the order ACTIVE with no lines. Releasing the table later cancels it
+ * (status 5), and its Void KOT row then had nothing to name and no value, the
+ * same blank row Remove item used to leave. So that write stamps what it took off
+ * with stampLineRemoval, exactly as removeItemFromTableOrders does, and every
+ * strip path records its lines on the order. The delete route also writes an
+ * "OrderVoids" scope='item' row, but after the fact, best-effort and only where
+ * migration 035 is applied. The report still reads ONE list off the order, for
+ * the reasons stampLineRemoval's header gives, so its rows keep adding up to its
+ * totals.
+ *
+ * A line is identified by its `id` when it has one, which is every line the
+ * delete route can address. A line written by an old client without an id is
+ * identified by dish, size and price, so a line whose QUANTITY was edited is the
+ * same line, not a removal plus an addition. Matching is one-for-one, so two
+ * identical id-less lines of which one survived give one removal, not two.
+ * A line moved between Served and Preparing is still on the order and is never a
+ * removal. A quantity reduced on a line that stays is not recorded: the line is
+ * still on the ticket, and the report reads a cancelled ticket's lines as they
+ * stood when it was cancelled.
+ */
+export function linesTakenOff(before: readonly unknown[], after: readonly unknown[]): unknown[] {
+  const keyOf = (raw: unknown): string => {
+    const it = (raw !== null && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+    const id = typeof it.id === "string" ? it.id.trim() : typeof it.id === "number" ? String(it.id) : "";
+    if (id) {return `id:${id}`;}
+    const { name, variation } = voidLineIdentity(it);
+    return `line:${name}|${variation ?? ""}|${String(Number(it.price) || 0)}`;
+  };
+  const remaining = new Map<string, number>();
+  for (const line of after) {
+    const k = keyOf(line);
+    remaining.set(k, (remaining.get(k) ?? 0) + 1);
+  }
+  const taken: unknown[] = [];
+  for (const line of before) {
+    const k = keyOf(line);
+    const left = remaining.get(k) ?? 0;
+    if (left > 0) {remaining.set(k, left - 1);} else {taken.push(line);}
+  }
+  return taken;
 }

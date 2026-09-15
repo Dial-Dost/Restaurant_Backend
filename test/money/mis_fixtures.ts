@@ -94,6 +94,8 @@ export interface FixtureBill {
 
 /** One order line, including the flags migrations 034 and 039 stamp on it. */
 export interface FixtureOrderItem {
+  /** The line id DELETE /orders/:id/items/:itemId addresses. Old clients wrote none. */
+  id?: string;
   name: string;
   quantity: number;
   price: number;
@@ -118,6 +120,14 @@ export interface FixtureOrder {
   /** Who took it — "Orders".food.taken_by_employee_name. */
   taken_by?: string | null;
   items: FixtureOrderItem[];
+  /**
+   * The lines POST /bills/remove-item took off this order, as the writer stamps
+   * them (stampLineRemoval, mis_report_math.ts). Written by the REAL writer when
+   * a test drives RemoveBillItem through this fixture, never set by hand there.
+   */
+  removed_items?: (FixtureOrderItem & { removed_at?: string })[];
+  /** Which bill-item writer emptied the order: "remove" or "move". */
+  emptied_by?: string;
 }
 
 export interface FixtureAudit {
@@ -272,6 +282,15 @@ export interface FixtureDb {
   order_voids: FixtureOrderVoid[];
   /** "Restaurant".payment_config — null/absent is the built-in defaults. */
   payment_config?: unknown;
+  /**
+   * Table names that exist with no order on them — a MOVE's destination. A table
+   * any order names exists already. Only the bill-item writers look tables up.
+   */
+  tables?: string[];
+  /** "Restaurant".alert_void_count — the void-streak alert's threshold. Absent = off. */
+  alert_void_count?: number;
+  /** What RunExceptionChecks put on the bell. Written by the REAL AddNotification. */
+  notifications?: { title: string; meta: Record<string, unknown> }[];
 }
 
 export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
@@ -462,6 +481,38 @@ function misBillRow(b: FixtureBill, q = "") {
 function orderOf(b: FixtureBill): FixtureOrder | undefined {
   return requireDb().orders.find((o) => o.id === b.order_id);
 }
+
+/** "Orders".food as the writers leave it: the lines, the channel and any removal evidence. */
+function foodOf(o: FixtureOrder): Record<string, unknown> {
+  return {
+    items: o.items,
+    order_type: o.order_type ?? "dine_in",
+    ...(o.removed_items ? { removed_items: o.removed_items } : {}),
+    ...(o.emptied_by ? { emptied_by: o.emptied_by } : {}),
+  };
+}
+
+/**
+ * THE VOID KOT RULE, WRITTEN OUT AGAIN rather than imported from the reader, so a
+ * reader that changed the rule disagrees with this and fails.
+ *
+ * The SQL text is what the readers must carry WHOLE (whitespace collapsed, as
+ * fixtureQuery collapses it). The TypeScript below is what that SQL does, applied
+ * to the fixture rows:
+ *   * the lines a cancelled ticket reports are the ones still on it, or, when
+ *     none are, the ones a removal took off it;
+ *   * a ticket is a void when it is status 5, unless a MOVE emptied it and no
+ *     removal left lines on it.
+ */
+const VOID_LINES_SQL = "case when jsonb_typeof((o.food)::jsonb->'items') = 'array' and jsonb_array_length((o.food)::jsonb->'items') > 0 then (o.food)::jsonb->'items' when jsonb_typeof((o.food)::jsonb->'removed_items') = 'array' then (o.food)::jsonb->'removed_items' else '[]'::jsonb end";
+const VOID_ORDER_SQL = `(coalesce(o.status::text, '1') = '5' and not (coalesce((o.food)::jsonb->>'emptied_by', '') = 'move' and jsonb_array_length(${VOID_LINES_SQL}) = 0))`;
+
+const linesOf = (o: FixtureOrder): FixtureOrderItem[] => (o.items.length > 0 ? o.items : (o.removed_items ?? []));
+const isReportedVoid = (o: FixtureOrder): boolean =>
+  o.status === 5 && !(o.emptied_by === "move" && linesOf(o).length === 0);
+
+/** A table's synthetic id. Stable, so the writers' `table_id = $3` can be matched. */
+const tableIdOf = (name: string): string => `tbl-${name.trim().toLowerCase()}`;
 
 /** The row shape GetOrderSummaryReport's page query selects. */
 function orderSummaryRow(b: FixtureBill, q = "") {
@@ -932,6 +983,125 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     throw new Error(`mis fixture: unrecognised "Bills" read — ${q.slice(0, 260)}`);
   }
 
+  // --- The two bill-item writers: RemoveBillItem and MoveBillItem ---
+  //
+  // Modelled so a test can drive the REAL writer and read what it wrote back
+  // through the REAL Void KOT reader. Only the statements those two issue. There
+  // is no open bill in this fixture, so the bill resync they finish with finds
+  // none and writes nothing.
+  if (/^select id from "Tables" where res_id = \$1 and outlet_id = \$2 and lower\(table_name\) = lower\(\$3\)/i.test(q)) {
+    const want = String(params[2] ?? "").trim().toLowerCase();
+    const names = [
+      ...d.orders.filter((o) => resOf(o) === params[0] && outletOf(o) === params[1]).map((o) => o.table_name ?? ""),
+      ...(d.tables ?? []),
+    ];
+    const hit = names.find((n) => n.trim() !== "" && n.trim().toLowerCase() === want);
+    return hit ? [{ id: tableIdOf(hit) }] : [];
+  }
+  if (/^select (admin_approved_at|id) from "Bills" where table_id = \$1 and res_id = \$2 and outlet_id = \$3 and closed_at is null/i.test(q)) {
+    return [];
+  }
+  if (/^select id, food from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and /i.test(q)) {
+    // The still-owes predicate, read out of the SQL rather than assumed: a
+    // settled or cancelled order must never lose a line to a bill edit.
+    const settled = (/coalesce\(status::text, '1'\) not in \(([^)]*)\)/i.exec(q)?.[1] ?? "")
+      .split(",").map((c) => c.trim().replace(/'/g, "")).filter(Boolean);
+    if (settled.length === 0) {throw new Error(`mis fixture: bill-item read lost its still-owes predicate\n  ${q.slice(0, 260)}`);}
+    return d.orders
+      .filter((o) =>
+        resOf(o) === params[0] && outletOf(o) === params[1]
+        && tableIdOf(o.table_name ?? "") === params[2]
+        && !settled.includes(String(o.status)))
+      .sort((a, z) => new Date(a.created_at).getTime() - new Date(z.created_at).getTime())
+      .map((o) => ({ id: o.id, food: foodOf(o) }));
+  }
+  if (/^update "Orders" set food = \$4::json(, status = 5)? where id = \$1 and res_id = \$2 and outlet_id = \$3$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
+    if (!o) {return [];}
+    const food = JSON.parse(String(params[3])) as Record<string, unknown>;
+    o.items = Array.isArray(food.items) ? (food.items as FixtureOrderItem[]) : [];
+    o.removed_items = Array.isArray(food.removed_items) ? (food.removed_items as FixtureOrderItem[]) : undefined;
+    o.emptied_by = typeof food.emptied_by === "string" ? food.emptied_by : undefined;
+    if (/status = 5/i.test(q)) {o.status = 5;}
+    return [];
+  }
+  if (/^update "Tables" set is_occupied = true where id = \$1/i.test(q)) {return [];}
+
+  // --- UpdateOrderItemsSplit: the write DELETE /orders/:id/items/:itemId strips a line through ---
+  //
+  // Only the statements it issues for a caller who may write off (the gate's
+  // reads are skipped), so a test can strip lines with the REAL writer and read
+  // the ticket back through the REAL Void KOT report.
+  if (/^select status from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
+    return o ? [{ status: o.status }] : [];
+  }
+  if (/^select food, table_id from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
+    return o ? [{ food: foodOf(o), table_id: tableIdOf(o.table_name ?? "") }] : [];
+  }
+  if (/^select barked_at from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
+    return o ? [{ barked_at: new Date(o.created_at) }] : [];
+  }
+  if (/^update "Orders" set food = \$1::json, status = \$2 where id = \$3 and res_id = \$4 and outlet_id = \$5$/i.test(q)) {
+    const o = d.orders.find((x) => x.id === params[2] && resOf(x) === params[3] && outletOf(x) === params[4]);
+    if (!o) {return [];}
+    const food = JSON.parse(String(params[0])) as Record<string, unknown>;
+    o.items = Array.isArray(food.items) ? (food.items as FixtureOrderItem[]) : [];
+    o.removed_items = Array.isArray(food.removed_items) ? (food.removed_items as FixtureOrderItem[]) : undefined;
+    o.emptied_by = typeof food.emptied_by === "string" ? food.emptied_by : undefined;
+    o.status = Number(params[1]);
+    return [];
+  }
+
+  // --- RunExceptionChecks: the void-streak alert ---
+  //
+  // The alert and the Void KOT report must agree about which orders are voids,
+  // so the count is re-derived here by the report's STATED rule (the same one
+  // the Void KOT branch below applies), and the SQL must carry the report's own
+  // fragment, whole.
+  if (/^select alert_discount_pct, alert_void_count from "Restaurant" where id = \$1/i.test(q)) {
+    return params[0] === d.res_id ? [{ alert_discount_pct: 0, alert_void_count: d.alert_void_count ?? 0 }] : [];
+  }
+  if (/^select count\(\*\)::int as n from "Orders" o where /i.test(q)) {
+    requireShape(q, "o.res_id = $1", "the tenant predicate");
+    requireShape(q, VOID_ORDER_SQL,
+      "the alert counts voids by the Void KOT report's own rule; a bare status = 5 counted tickets a MOVE emptied, which the report does not list");
+    requireShape(q, "o.created_at >= now() - interval '24 hours'", "the alert's window");
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+    return [{
+      n: d.orders.filter((o) =>
+        resOf(o) === params[0] && isReportedVoid(o) && new Date(o.created_at).getTime() >= since).length,
+    }];
+  }
+  if (/^select count\(\*\)::int as n from "Notifications" where res_id = \$1 and meta->>'alert_key' = \$2/i.test(q)) {
+    return [{ n: (d.notifications ?? []).filter((n) => params[0] === d.res_id && n.meta.alert_key === params[1]).length }];
+  }
+  if (/^insert into "Notifications" \(res_id, outlet_id, type, title, body, meta\)/i.test(q)) {
+    d.notifications = [...(d.notifications ?? []), { title: String(params[3]), meta: JSON.parse(String(params[5])) as Record<string, unknown> }];
+    return [];
+  }
+  if (/from "Feedback_entries" where res_id = \$1 and overall_rating <= 2/i.test(q)) {return [{ n: 0 }];}
+  if (/from information_schema\.columns where table_schema = 'public' and table_name = 'Orders' and column_name = 'barked_at'/i.test(q)) {
+    return [{ column_name: "barked_at" }];
+  }
+  if (/^insert into "Orders" \(id, created_at, res_id, outlet_id, food, table_id, status, barked_at\)/i.test(q)) {
+    const food = JSON.parse(String(params[3])) as Record<string, unknown>;
+    const tableName = [...d.orders.map((o) => o.table_name ?? ""), ...(d.tables ?? [])]
+      .find((n) => n.trim() !== "" && tableIdOf(n) === params[4]) ?? null;
+    d.orders.push({
+      id: String(params[0]),
+      res_id: String(params[1]),
+      outlet_id: String(params[2]),
+      table_name: tableName,
+      created_at: new Date().toISOString(),
+      status: 1,
+      items: Array.isArray(food.items) ? (food.items as FixtureOrderItem[]) : [],
+    });
+    return [];
+  }
+
   // --- "Orders" (Item Wise, Void KOT, the KOT drill-down) ---
   if (/from "Orders" o/i.test(q)) {
     // The drill-down reads ONE order by id and is not window-scoped.
@@ -944,7 +1114,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
         created_at: new Date(o.created_at),
         updated_at: null,
         status: o.status,
-        food: { items: o.items, order_type: o.order_type ?? "dine_in" },
+        food: foodOf(o),
         table_name: o.table_name ?? null,
         bill_id: bill?.id ?? null,
         bill_no: bill?.bill_no ?? null,
@@ -998,19 +1168,34 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     // VOID KOT — every read of it is scoped to status 5.
     requireShape(q, "coalesce(o.status::text, '1') = '5'",
       "a void IS status 5; without this the report would list live orders as cancelled");
-    rows = rows.filter((o) => o.status === 5);
+    // The WHOLE clause, not a fragment of it: `= 0` turned into `>= 0` kept every
+    // fragment present while hiding every remove-then-move ticket and its money.
+    requireShape(q, VOID_ORDER_SQL,
+      "a ticket emptied by MOVING its dishes is not a void, and one that lost a dish to Remove item still is; without this exact clause the food is listed as cancelled while it is billed at the other table, or a removed dish's value leaves the totals");
+    rows = rows.filter(isReportedVoid);
     const search = params[4];
     if (typeof search === "string" && search.includes("%")) {
       rows = rows.filter((o) =>
         like(o.id, search) || like(o.table_name, search)
-        || o.items.some((it) => like(it.name, search)));
+        || [...o.items, ...(o.removed_items ?? [])].some((it) => like(it.name, search)));
     }
 
     if (/count\(\*\)::text as total/i.test(q)) {return [{ total: String(rows.length) }];}
     if (/count\(distinct id\)::text as voids/i.test(q)) {
+      // A ticket with no lines is a void and nothing else. The left join hands it
+      // a NULL item, and a total that counted that row as a line would outgrow
+      // the rows it totals.
+      requireShape(q, "count(item)::text as lines",
+        "an order with no lines adds no line; counting the left join's NULL row did");
+      requireShape(q, "sum(qty) filter (where item is not null)",
+        "an order with no lines adds no qty; coalescing the NULL row's quantity to 1 did");
+      // The totals must expand the SAME fallback list the rows are built from.
+      // The where-list names removed_items too, so this is checked at the lateral.
+      requireShape(q, `left join lateral jsonb_array_elements(${VOID_LINES_SQL}) item on true`,
+        "the totals must expand the lines a removal left on the ticket, or the rows outgrow the total");
       let qty = 0, value = 0, lines = 0;
       for (const o of rows) {
-        for (const it of o.items) { qty += it.quantity; value += it.price * it.quantity; lines += 1; }
+        for (const it of linesOf(o)) { qty += it.quantity; value += it.price * it.quantity; lines += 1; }
       }
       return [{ voids: String(rows.length), qty, value, lines: String(lines) }];
     }
@@ -1018,16 +1203,27 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       const limit = Number(params[params.length - 2]);
       const offset = Number(params[params.length - 1]);
       const desc = [...rows].sort((a, z) => new Date(z.created_at).getTime() - new Date(a.created_at).getTime());
+      // WHICH AUDIT SENTENCES MEAN "CANCELLED": the status route's, with or
+      // without the reason it appends, and the void route's. Anchored at the
+      // start, so an undo of a cancel ("Undid: Order ... -> Cancelled") is not one.
+      requireShape(q, "l.reason ilike 'Order % -> Cancel%'",
+        "the status route's cancel sentence; it now appends ' — reason: ...', which a suffix match never saw");
+      requireShape(q, "l.reason ilike 'Voided order %'",
+        "the void route's sentence; without it every void recorded with an authoriser shows no actor");
+      const isCancelSentence = (r: string): boolean => /^order .* -> cancel/i.test(r) || /^voided order /i.test(r);
       return desc.slice(offset, offset + limit).map((o) => {
-        const void_entry = d.audits.find((a) =>
-          resOf(a) === resOf(o)
-          && a.details?.order_id === o.id
-          && /cancelled$/i.test(a.reason ?? ""));
+        // Newest first, as the lateral's `order by l.created_at desc limit 1` reads.
+        const void_entry = [...d.audits]
+          .sort((a, z) => new Date(z.created_at).getTime() - new Date(a.created_at).getTime())
+          .find((a) =>
+            resOf(a) === resOf(o)
+            && a.details?.order_id === o.id
+            && isCancelSentence(a.reason ?? ""));
         return {
           id: o.id,
           created_at: new Date(o.created_at),
           table_name: o.table_name ?? null,
-          food: { items: o.items, order_type: o.order_type ?? "dine_in" },
+          food: foodOf(o),
           voided_at: void_entry ? new Date(void_entry.created_at) : null,
           voided_fname: void_entry?.fname ?? null,
           voided_lname: void_entry?.lname ?? null,
