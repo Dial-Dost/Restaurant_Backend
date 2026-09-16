@@ -133,6 +133,10 @@ jest.mock("pg", () => {
       }];
     }
     if (q.includes('update "Restaurant" set')) { return [{ ...SETTINGS_ROW }]; }
+    // GetRestaurantSettings' own row. The two docket columns are NOT in it —
+    // they are read through the statements above — so answering it with the
+    // settings row is enough for the settings document to be built for real.
+    if (/^\s*select auto_push_orders,/i.test(q)) { return [{ ...SETTINGS_ROW }]; }
     if (q.includes('select default_tax from "Outlets"')) { return [{ default_tax: null }]; }
     // Everything these two paths touch is answered above. Anything else is the
     // test drifting off the statements it means to drive.
@@ -464,5 +468,58 @@ describe("SetRestaurantSettings stores the text size", () => {
     const saved = await db.SetRestaurantSettings(SLUG, { kot_print_style: "classic" });
     expect(saved.kot_print_style).toBe("classic");
     expect(saved.kot_text_size).toBe("standard");
+  });
+});
+
+// ============================================================================
+// THE READ THAT SEEDS BOTH CARDS: GET /restaurant/settings
+// ============================================================================
+//
+// The web dashboard's "KOT print style" card and the app's Settings card are
+// both seeded from this document, and both treat it as the truth. A settings
+// read that reported the DEFAULTS instead of the stored words would put
+// "Standard" in front of an owner whose kitchen prints Small (or "reference" in
+// front of a kitchen on the classic docket), and the next pick would be made
+// against a value that is not there. kot_print_style_route.test.ts mocks this
+// function, so the document is built for real here, from the same column cells
+// the saves above write.
+
+describe("GetRestaurantSettings reports what the restaurant stored", () => {
+  test("a stored size and a stored style are what the document says", async () => {
+    sizeAnswer.value = { kind: "value", value: "small" };
+    styleAnswer.value = { kind: "value", value: "classic" };
+    const settings = await db.GetRestaurantSettings(SLUG);
+    expect(settings.kot_text_size).toBe("small");
+    expect(settings.kot_print_style).toBe("classic");
+    // …each through its own statement, as the dispatcher reads them.
+    expect(sizeReads.n).toBe(1);
+    expect(styleReads.n).toBe(1);
+  });
+
+  test("the other stored words come back too — not whichever is the default", async () => {
+    // 'standard' / 'reference' are the defaults, so they cannot tell a real read
+    // from a hardcoded one; 'large' and 'classic' (above: 'small') can.
+    sizeAnswer.value = { kind: "value", value: "large" };
+    styleAnswer.value = { kind: "value", value: "reference" };
+    const settings = await db.GetRestaurantSettings(SLUG);
+    expect([settings.kot_print_style, settings.kot_text_size]).toEqual(["reference", "large"]);
+  });
+
+  test("what a save stored is what the next settings read reports", async () => {
+    await db.SetRestaurantSettings(SLUG, { kot_text_size: "small" });
+    await db.SetRestaurantSettings(SLUG, { kot_print_style: "classic" });
+    const settings = await db.GetRestaurantSettings(SLUG);
+    expect([settings.kot_print_style, settings.kot_text_size]).toEqual(["classic", "small"]);
+  });
+
+  test("both keys are ALWAYS in the document, even before migration 050 is applied", async () => {
+    // The clients detect this backend by the keys being present (an older one
+    // never sends them, and prints only the classic docket). A missing column
+    // is the default, never an absent key or a 500.
+    styleAnswer.value = { kind: "throw", err: undefinedColumn() };
+    sizeAnswer.value = { kind: "throw", err: undefinedColumn("kot_text_size") };
+    const settings = await db.GetRestaurantSettings(SLUG);
+    expect(settings).toHaveProperty("kot_print_style", "reference");
+    expect(settings).toHaveProperty("kot_text_size", "standard");
   });
 });
