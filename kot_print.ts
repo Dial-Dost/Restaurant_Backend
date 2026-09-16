@@ -248,6 +248,16 @@ export interface KotDispatchInput {
    * thing a chef reads, that this piece of paper replaces another one.
    */
   contextLine?: string | null;
+  /**
+   * Which docket this restaurant prints — "Restaurant".kot_print_style, passed
+   * straight through to the renderer (see ReceiptOptions.kotPrintStyle).
+   *
+   * Absent or NULL prints the REFERENCE docket, which is what every caller that
+   * has not been taught about the setting gets, and what an unset column means.
+   * The only other value is 'classic', which keeps the ESC/POS text docket for
+   * a kitchen whose printer cannot take a GS v 0 raster.
+   */
+  kotPrintStyle?: string | null;
 }
 
 export interface KotDispatchResult {
@@ -523,6 +533,10 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     assignedTo: input.assignedTo,
     captain: input.captain,
     orderNote: input.orderNote ?? null,
+    // THE DOCKET'S OWN FACE. Threaded, never decided here: which document a
+    // kitchen gets is a restaurant setting, and this file's job is to put the
+    // right food on it.
+    kotPrintStyle: input.kotPrintStyle ?? null,
     // Set ONLY on a cancellation slip. Spread-conditional rather than
     // `cancelled: false` so an ordinary docket's options object is byte-for-byte
     // the object it was before this field existed.
