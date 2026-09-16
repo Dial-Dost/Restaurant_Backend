@@ -177,6 +177,33 @@ export interface ReceiptOptions {
    * printed before this field existed.
    */
   cancelled?: boolean;
+  /**
+   * KOT ONLY: WHICH DOCKET THIS IS, and the owner's escape hatch from the one
+   * that needs a raster.
+   *
+   * "reference" (and absent) draws the client's reference docket. "classic"
+   * prints the ESC/POS TEXT docket this renderer has always produced — which is
+   * what a kitchen printer that ignores `GS v 0` needs, because such a printer
+   * answers a raster docket with BLANK PAPER rather than an error, and a blank
+   * ticket on the pass is an order nobody cooks.
+   *
+   * RESOLVED BY THE CALLER, never by this file: it is the restaurant's
+   * "Restaurant".kot_print_style setting, read once per docket in
+   * kot_print.ts:dispatchKot and handed down. Same division of labour as every
+   * other pre-resolved field here — the renderer holds no clock, no counter and
+   * no settings.
+   *
+   * THE UNION IS SPELLED OUT rather than imported, so the only thing this file
+   * imports stays its glyph data; kot_print_style.ts is its other half
+   * (KotPrintStyle), kotPrintStyleOf below reads it, and a source
+   * guard in jest-tests/kot_print_style.test.ts fails if the two ever drift.
+   * They must not: a renderer that stops recognising "classic" would put every
+   * escape-hatch kitchen back on blank paper, silently.
+   *
+   * ABSENT IS THE REFERENCE DOCKET, the same answer a NULL column, a missing
+   * column and an unrecognised value all get. A BILL IGNORES THIS FIELD.
+   */
+  kotPrintStyle?: "reference" | "classic";
   kind?: "bill" | "kot";
   // KOT only: the kitchen station/zone this ticket is for. When set, it is
   // printed in the header so a per-station split ticket is self-identifying.
@@ -254,22 +281,6 @@ export interface ReceiptOptions {
    * field, so a guest's copy cannot grow one.
    */
   orderNote?: string | null;
-  /**
-   * KOT ONLY: which docket this restaurant prints — "Restaurant".kot_print_style.
-   *
-   * Unset (the default, and what a NULL column means) prints the REFERENCE
-   * docket: proportional type, drawn as a raster, laid out by layoutKot. The
-   * string 'classic' prints the ESC/POS text docket this file has always
-   * printed, byte for byte.
-   *
-   * IT IS A LIVE FALLBACK, NOT DEAD CODE. The reference docket is a GS v 0
-   * bitmap, and a printer that ignores GS v 0 prints a BLANK ticket from it —
-   * silent order loss, in the one document a kitchen cooks from. No printer
-   * model is on record anywhere in production, so the owner keeps a switch.
-   *
-   * A BILL IGNORES IT COMPLETELY: a bill is not this document.
-   */
-  kotPrintStyle?: string | null;
   // The bill's grand total, AS THE BILLING LAYER COMPUTED IT.
   //
   // When present it is printed verbatim and NOTHING is recomputed or rounded

@@ -51,6 +51,7 @@ import { allocateKotNumber, kotOrderContext, kotStamp, kotTicketKey, serviceMode
 import { logger } from "./observability.js";
 import { dispatchPrintJob } from "./print_routing.js";
 import {
+  GetKotPrintStyle,
   GetMenuItems,
   GetOrderKotContext,
   GetRestaurantProfile,
@@ -248,16 +249,6 @@ export interface KotDispatchInput {
    * thing a chef reads, that this piece of paper replaces another one.
    */
   contextLine?: string | null;
-  /**
-   * Which docket this restaurant prints — "Restaurant".kot_print_style, passed
-   * straight through to the renderer (see ReceiptOptions.kotPrintStyle).
-   *
-   * Absent or NULL prints the REFERENCE docket, which is what every caller that
-   * has not been taught about the setting gets, and what an unset column means.
-   * The only other value is 'classic', which keeps the ESC/POS text docket for
-   * a kitchen whose printer cannot take a GS v 0 raster.
-   */
-  kotPrintStyle?: string | null;
 }
 
 export interface KotDispatchResult {
@@ -471,6 +462,28 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
   const serviceMode = serviceModeLabel(input.orderType);
   const kotItems = await withStations(input.restaurantId, input.items);
 
+  // WHICH DOCKET THIS RESTAURANT PRINTS, resolved HERE and nowhere else.
+  //
+  // NOT A FIELD ON KotDispatchInput, deliberately. Every KOT in the product —
+  // auto-print on placement and approval, the added-line docket, POST
+  // /print/kot/order/:id, POST /print/bill {kind:"kot"}, the cancellation slip,
+  // the table-move slip, and every per-station docket each of those splits into
+  // — funnels through this function. A field would be a thing each of those
+  // callers could forget, and a caller that forgot it would print the RASTER
+  // docket at a kitchen that had explicitly asked for text: blank paper, no
+  // error, an order nobody cooks. This project has shipped that defect class
+  // often enough to name it ("built but never called"). There is nothing to
+  // forget if there is nothing to pass.
+  //
+  // NOT WRAPPED IN A CATCH, also deliberately. GetKotPrintStyle itself never
+  // throws over a missing column or a failed read (see loadKotPrintStyle — it
+  // answers the default, or the last style this process saw for this
+  // restaurant). What is left to throw is "this restaurant does not resolve",
+  // and a dispatch that cannot resolve its restaurant is about to fail at
+  // dispatchPrintJob anyway. Swallowing it here would only trade a clear failure
+  // for a docket that might be blank.
+  const kotPrintStyle = await GetKotPrintStyle(input.restaurantId);
+
   // ONE NUMBER FOR THE WHOLE KOT. A ticket with no table id cannot be keyed
   // (see GetOrderKotContext) — it prints unnumbered rather than sharing the
   // empty-string key with every other unkeyable ticket in the outlet, which
@@ -533,10 +546,12 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     assignedTo: input.assignedTo,
     captain: input.captain,
     orderNote: input.orderNote ?? null,
-    // THE DOCKET'S OWN FACE. Threaded, never decided here: which document a
-    // kitchen gets is a restaurant setting, and this file's job is to put the
-    // right food on it.
-    kotPrintStyle: input.kotPrintStyle ?? null,
+    // THE OWNER'S ESCAPE HATCH, on every docket this function builds — including
+    // each station ticket buildKotBase64 splits this into, because the options
+    // object is spread into all of them. Unconditional, not spread-conditional
+    // like `cancelled` below: an ordinary docket's style is exactly the thing
+    // that must never be left to a default two layers away.
+    kotPrintStyle,
     // Set ONLY on a cancellation slip. Spread-conditional rather than
     // `cancelled: false` so an ordinary docket's options object is byte-for-byte
     // the object it was before this field existed.
