@@ -207,7 +207,8 @@ export interface FixtureWaiver {
   amount_waived: number;
   tax_on_waived: number;
   waiver_kind: string;
-  reason: string;
+  /** Null = recorded without one (051), as the column now allows. */
+  reason: string | null;
   waived_by: string;
   authorised_by: string;
   reversed_at?: string | null;

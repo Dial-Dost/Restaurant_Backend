@@ -1441,6 +1441,65 @@ describe("Service Charge Deny", () => {
   });
 });
 
+describe("Service Charge Deny · a waiver recorded WITHOUT a reason (migration 051)", () => {
+  // The reason became optional (client item, 2.0.1) and is stored as NULL. The
+  // row must still be a row: counted, totalled, broken down by its kind, and
+  // findable by everything but the reason it does not have.
+  const reasonless = (): FixtureDb => {
+    const d = captureDb();
+    d.waivers.push({
+      id: "w3", waived_at: "2026-06-02T09:30:00.000Z", bill_id: "b1", table_name: "T1",
+      basis: "restaurant_percent", basis_percent: 5, basis_amount: 1000, amount_waived: 50, tax_on_waived: 2.5,
+      waiver_kind: "guest_request", reason: null, waived_by: "asha", authorised_by: "manager01",
+    });
+    return d;
+  };
+  beforeEach(() => { useFixtureDb(reasonless()); });
+
+  test("its reason is null — not '', not a word nobody typed — and every other column is the waiver's", async () => {
+    const deny = await db.GetServiceChargeDenyReport(RID, { ...W, limit: 500 });
+    const row = deny.rows.find((r) => r.waiver_id === "w3");
+    expect(row?.reason).toBeNull();
+    expect(row?.waiver_kind).toBe("Guest request");
+    expect(row?.denied_by).toBe("asha");
+    expect(row?.authorised_by).toBe("manager01");
+    expect(row?.amount_waived).toBe(50);
+    expect(row?.grand_total_reduction).toBe(52.5);
+  });
+
+  test("it counts: in the totals, in by-kind, and in the denied share", async () => {
+    const deny = await db.GetServiceChargeDenyReport(RID, { ...W, limit: 500 });
+    expect(deny.totals.waivers).toBe(2);
+    expect(deny.totals.amount_waived).toBe(68);
+    expect(sum(deny.rows.map((r) => r.amount_waived))).toBe(deny.totals.amount_waived);
+    expect(sum(deny.rows.map((r) => r.grand_total_reduction))).toBe(deny.totals.grand_total_reduction);
+    expect(deny.by_kind.find((k) => k.kind === "guest_request")).toMatchObject({ waivers: 1, amount: 50 });
+    const sales = await db.GetSalesSummaryReport(RID, W);
+    expect(deny.totals.denied_pct_of_chargeable).toBe(r2((68 / (68 + sales.totals.service_charge)) * 100));
+  });
+
+  test("search finds it by its kind and its people, and a reason search simply does not match it", async () => {
+    const byKind = await db.GetServiceChargeDenyReport(RID, { ...W, limit: 500, search: "guest" });
+    expect(byKind.rows.map((r) => r.waiver_id).sort()).toEqual(["w1", "w3"]);
+    const byName = await db.GetServiceChargeDenyReport(RID, { ...W, limit: 500, search: "asha" });
+    expect(byName.rows.map((r) => r.waiver_id).sort()).toEqual(["w1", "w3"]);
+    const byReason = await db.GetServiceChargeDenyReport(RID, { ...W, limit: 500, search: "Long wait" });
+    expect(byReason.rows.map((r) => r.waiver_id)).toEqual(["w1"]);
+  });
+
+  test("the export leaves the Reason cell blank — never 'null', never a dash in quotes", async () => {
+    const deny = await db.GetServiceChargeDenyReport(RID, { ...W, limit: 500 });
+    const lines = renderMisCsv(deny.columns, deny.rows, deny.totals).split("\n");
+    const at = deny.columns.findIndex((c) => c.key === "reason");
+    const header = lines[0]!.split(",");
+    expect(header[at]).toBe("Reason");
+    const w3 = deny.rows.findIndex((r) => r.waiver_id === "w3");
+    // The rows carry no commas in this fixture, so a plain split is the cell.
+    expect(lines[w3 + 1]!.split(",")[at]).toBe("");
+    expect(lines.join("\n")).not.toMatch(/null|undefined|"—"/);
+  });
+});
+
 describe("Group Summary", () => {
   beforeEach(() => { useFixtureDb(captureDb()); });
 

@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitServiceChargeWaiverReasonSchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -640,6 +640,16 @@ async function bootstrap(): Promise<void> {
 	// once 048 is applied; never takes the server down (see its header).
 	if (await InitBillRoundOffSchema()) {
 		logger.info("✅ Bill round-off column ready (migration 048)");
+	}
+
+	// "ServiceChargeWaivers".reason made nullable (migration 051), ONCE, here,
+	// for the same reason as the step above: this is the one run with no request
+	// transaction to lose the DDL in, and nothing yet to convoy with. It also
+	// latches whether a waiver may be recorded without a reason — read from the
+	// column as it actually is afterwards. Never throws; false means the reason
+	// is still required (today's 400), and the next reasonless waiver re-checks.
+	if (await InitServiceChargeWaiverReasonSchema()) {
+		logger.info("✅ Service-charge waiver reason is optional (migration 051)");
 	}
 
 	// Run the reporting path's lazy DDL ONCE here, outside any transaction, so the

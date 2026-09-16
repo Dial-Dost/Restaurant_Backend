@@ -38469,7 +38469,11 @@ export interface ServiceChargeWaiverRecord {
   /** amount_waived + tax_on_waived, computed by Postgres (036: GENERATED). */
   grand_total_reduction: number;
   waiver_kind: ServiceChargeWaiverKind;
-  reason: string;
+  /**
+   * Optional since migration 051: null when the waiver was recorded without
+   * one. Never '' — 036's CHECK refuses a blank, so "no reason" has one spelling.
+   */
+  reason: string | null;
   waived_by_username: string;
   authorised_by_username: string;
   reversed_at: string | null;
@@ -38481,7 +38485,7 @@ interface ServiceChargeWaiverRow {
   id: string; created_at: Date; outlet_id: string; bill_id: string; table_id: string | null;
   waived_at: Date; basis: string; basis_percent: number | string; basis_amount: number | string;
   amount_waived: number | string; tax_on_waived: number | string; grand_total_reduction: number | string;
-  waiver_kind: string; reason: string; waived_by_username: string; authorised_by_username: string;
+  waiver_kind: string; reason: string | null; waived_by_username: string; authorised_by_username: string;
   reversed_at: Date | null; reversed_by_username: string | null; reversal_reason: string | null;
 }
 
@@ -38505,7 +38509,7 @@ function mapServiceChargeWaiver(r: ServiceChargeWaiverRow): ServiceChargeWaiverR
     tax_on_waived: round2(parseNumeric(r.tax_on_waived)),
     grand_total_reduction: round2(parseNumeric(r.grand_total_reduction)),
     waiver_kind: r.waiver_kind as ServiceChargeWaiverKind,
-    reason: r.reason,
+    reason: r.reason?.trim() || null,
     waived_by_username: r.waived_by_username,
     authorised_by_username: r.authorised_by_username,
     reversed_at: r.reversed_at ? new Date(r.reversed_at).toISOString() : null,
@@ -38634,7 +38638,11 @@ export interface WaiveServiceChargeInput {
   /** Or the open bill directly. One of the two is required. */
   bill_id?: string;
   waiver_kind: string;
-  reason: string;
+  /**
+   * Optional (migration 051). Blank, whitespace, null and absent all mean "no
+   * reason given" and are stored as NULL — where the column can hold one.
+   */
+  reason?: string | null;
   actor: CaptureActor;
 }
 
@@ -38653,6 +38661,12 @@ export interface WaiveServiceChargeInput {
  * overwrites it with the grand total), and a service charge is not part of a
  * pre-tax subtotal. The waiver takes effect through openBillChargeConfig, which
  * every path that computes this table's grand total now goes through.
+ *
+ * THE REASON IS OPTIONAL, THE KIND AND THE SECOND NAME ARE NOT (client item,
+ * 2.0.1: "the reason should not be mandatory"). A waiver without one stores
+ * NULL — but only on a database whose column can hold it (migration 051; see
+ * resolveServiceChargeWaiverReasonOptional). Anywhere else it is refused exactly
+ * as it always was, before any transaction opens.
  */
 export async function WaiveServiceCharge(
   restaurantId: string,
@@ -38662,8 +38676,13 @@ export async function WaiveServiceCharge(
   if (!kind) {
     throw new Error(`waiver_kind must be one of: ${SERVICE_CHARGE_WAIVER_KINDS.join(", ")}`);
   }
+  // null for blank, whitespace, null and absent alike. Only a waiver with
+  // nothing to store asks the schema anything, so one that carries a reason is
+  // today's statement on every database.
   const reason = normalizeReason(input.reason);
-  if (!reason) {throw new Error("A reason is required to waive the service charge.");}
+  if (!reason && !(await resolveServiceChargeWaiverReasonOptional())) {
+    throw new Error(SC_WAIVER_REASON_REQUIRED);
+  }
   const who = requireActor(input.actor, "waiving the service charge");
 
   return withTransaction(async (client) => {
@@ -38731,8 +38750,141 @@ export async function WaiveServiceCharge(
       grand_total_before: quote.grand_total_with,
       grand_total_after: quote.grand_total_without,
     };
+  }).catch((err: unknown) => {
+    // The column went back to NOT NULL under a running process (051 rolled
+    // back by hand). The transaction has already rolled back, so this is the
+    // one place a 23502 can be answered — as the refusal it would have been,
+    // not as a 500 — and the latch learns it for the next request.
+    if (reason === null && isWaiverReasonNotNullViolation(err)) {
+      serviceChargeWaiverReasonOptional = false;
+      throw new Error(SC_WAIVER_REASON_REQUIRED);
+    }
+    throw err;
   });
 }
+
+// --- migration 051: the waiver's reason is optional --------------------------
+//
+// "ServiceChargeWaivers".reason was NOT NULL (036). 051 drops that, and so does
+// this code, because production runs as the table's owner and a hand-applied
+// migration is a step Gate B has missed before. Two halves:
+//
+//   1. THE ENSURE. One `alter column reason drop not null`, memoized under its
+//      own ensureLazyTable key, asked for only while the column is still NOT
+//      NULL (the ALTER takes ACCESS EXCLUSIVE even when it has nothing to do,
+//      and every bill read touches this table through liveServiceChargeWaiver),
+//      with a 2-second lock_timeout set INSIDE the same statement so a busy
+//      table refuses fast instead of queueing every bill read behind it — the
+//      2026-08-24 standstill's shape. NEVER inside an open transaction: a DDL
+//      there would roll back with the request while the memo said it was done.
+//      A least-privilege runtime's 42501 is memoized as "the migration owns
+//      this", the house rule; a lock timeout is not, and is retried no sooner
+//      than SC_WAIVER_REASON_DDL_COOLDOWN_MS later.
+//
+//   2. THE LATCH. What decides whether a reasonless waiver is written is the
+//      column's ACTUAL nullability, read AFTER the ensure — never "the ensure
+//      ran", which is true on a runtime that was refused. It is resolved at
+//      boot (InitServiceChargeWaiverReasonSchema) and, while it is still false,
+//      again on the next waiver that arrives without a reason, so a 051
+//      applied by hand turns the feature on without a restart. True is sticky
+//      for the life of the process; the insert's 23502 handler above is the
+//      way back.
+//
+// A latch rather than "insert NULL, catch 23502, retry with text" for the
+// reason kotNumberLinkSchemaReady gives: the insert runs inside withTransaction,
+// and a failed statement there aborts the transaction (25P02). And a retry with
+// words nobody typed would be a fabricated reason in a control ledger.
+const SC_WAIVER_REASON_REQUIRED = "A reason is required to waive the service charge.";
+const SC_WAIVER_REASON_DDL_COOLDOWN_MS = 5 * 60_000;
+let serviceChargeWaiverReasonOptional = false;
+let scWaiverReasonDdlRetryAt = 0;
+
+function isWaiverReasonNotNullViolation(err: unknown): boolean {
+  const e = err as { code?: unknown; table?: unknown; column?: unknown } | null;
+  return e?.code === "23502" && e.table === "ServiceChargeWaivers" && e.column === "reason";
+}
+
+/** The latch as it stands, without asking the database. */
+export function isServiceChargeWaiverReasonOptional(): boolean {
+  return serviceChargeWaiverReasonOptional;
+}
+
+async function ensureServiceChargeWaiverReasonNullable(): Promise<void> {
+  await ensureLazyTable("ServiceChargeWaivers.reason_nullable", async () => {
+    await runQuery(
+      `do $$
+       begin
+         if exists (select 1 from information_schema.columns
+                     where table_schema = 'public' and table_name = 'ServiceChargeWaivers'
+                       and column_name = 'reason' and is_nullable = 'NO') then
+           perform set_config('lock_timeout', '2s', true);
+           alter table "ServiceChargeWaivers" alter column reason drop not null;
+         end if;
+       end $$`,
+    );
+  });
+}
+
+/**
+ * May a waiver be recorded without a reason HERE? Ensures the column first
+ * (see the section header), then reads what Postgres says about it.
+ *
+ * NEVER THROWS. Every failure answers false, which is the refusal every
+ * database gave before 051 — a clean 400, nothing written.
+ */
+export async function resolveServiceChargeWaiverReasonOptional(): Promise<boolean> {
+  if (serviceChargeWaiverReasonOptional) {return true;}
+  const inTransaction = (tenantStorage.getStore()?.txnDepth ?? 0) > 0;
+  if (!inTransaction && Date.now() >= scWaiverReasonDdlRetryAt) {
+    try {
+      await ensureServiceChargeWaiverReasonNullable();
+    } catch (err) {
+      scWaiverReasonDdlRetryAt = Date.now() + SC_WAIVER_REASON_DDL_COOLDOWN_MS;
+      logger.warn({ err }, "sc_waiver_reason_nullable_not_ensured");
+    }
+  }
+  try {
+    // information_schema, not a probe of the table: a missing table or column
+    // is a missing ROW here, never an error that could poison a caller.
+    const rows = await runQuery<{ is_nullable: string }>(
+      `select is_nullable from information_schema.columns
+        where table_schema = 'public' and table_name = 'ServiceChargeWaivers' and column_name = 'reason'`,
+    );
+    serviceChargeWaiverReasonOptional = rows[0]?.is_nullable === "YES";
+  } catch (err) {
+    serviceChargeWaiverReasonOptional = false;
+    logger.warn({ err }, "sc_waiver_reason_probe_failed");
+  }
+  return serviceChargeWaiverReasonOptional;
+}
+
+/**
+ * Boot step: ensure and latch ONCE, before the listener, outside any
+ * transaction. Never throws. False is loud because it is a client-visible
+ * refusal ("A reason is required") the owner was told had gone.
+ */
+export async function InitServiceChargeWaiverReasonSchema(): Promise<boolean> {
+  const optional = await resolveServiceChargeWaiverReasonOptional();
+  if (!optional) {
+    logger.warn(
+      "Service-charge waiver reason is still REQUIRED here — \"ServiceChargeWaivers\".reason is not nullable " +
+        "(or could not be read), so a waiver without a reason is refused as before. Apply migration 051; " +
+        "the next waiver without a reason re-checks, no restart needed.",
+    );
+  }
+  return optional;
+}
+
+// Test seam (jest only). The latch's whole point is the behaviour on the false
+// side, and a test cannot reach that by luck.
+export const __scWaiverReasonTestSeam = {
+  setOptional(v: boolean): void { serviceChargeWaiverReasonOptional = v; },
+  reset(): void {
+    serviceChargeWaiverReasonOptional = false;
+    scWaiverReasonDdlRetryAt = 0;
+    ddlEnsured.delete("ServiceChargeWaivers.reason_nullable");
+  },
+};
 
 /** Put the service charge back. Supersession, not deletion — see 036's header. */
 export async function ReverseServiceChargeWaiver(
@@ -40621,7 +40773,8 @@ export interface ServiceChargeDenyRow {
   /** The same reduction on a reversed row, and 0 on a live one. */
   reversed_amount: number;
   waiver_kind: string;
-  reason: string;
+  /** Null when the waiver was recorded without one (051) — a blank cell, never a word. */
+  reason: string | null;
   denied_by: string;
   authorised_by: string;
   /** The bill's own tax-inclusive total, when it has settled. */
@@ -40678,7 +40831,7 @@ interface ScDenySqlRow {
   id: string; waived_at: Date | string; bill_id: string;
   basis: string; basis_percent: number | string; basis_amount: number | string;
   amount_waived: number | string; tax_on_waived: number | string; grand_total_reduction: number | string;
-  waiver_kind: string; reason: string; waived_by_username: string; authorised_by_username: string;
+  waiver_kind: string; reason: string | null; waived_by_username: string; authorised_by_username: string;
   reversed_at: Date | null; reversed_by_username: string | null; reversal_reason: string | null;
   table_name: string | null; bill_no: string | null;
   total_amt: number | string | null; settled_at: Date | string | null;
@@ -40758,7 +40911,7 @@ export async function GetServiceChargeDenyReport(restaurantId: string, q: MisRep
       grand_total_reduction: reduction.live,
       reversed_amount: reduction.reversed,
       waiver_kind: humaniseVocabulary(r.waiver_kind),
-      reason: r.reason,
+      reason: r.reason?.trim() || null,
       denied_by: r.waived_by_username,
       authorised_by: r.authorised_by_username,
       bill_grand_total: r.settled_at ? round2(parseNumeric(r.total_amt)) : null,
