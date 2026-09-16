@@ -323,6 +323,7 @@ export function fixtureQuery(sql: string, params: unknown[] = []): { rows: unkno
     requireShape(q, "coalesce(status::text, '1') <> '6'", "an order awaiting payment approval is frozen");
     requireShape(q, "string_agg(coalesce(x ->> 'nc_id', ''), ',' order by coalesce(x ->> 'nc_id', '') collate \"C\")", "the comps it was built on are the comps still there");
     requireShape(q, "where x -> 'nc' = 'true'::jsonb", "only a real boolean flag is a comp (isNonChargeableLine)");
+    requireShape(q, "), '') = $6 returning id", "the stored comps must EQUAL the ones the write was built from");
     requireShape(q, "returning id", "a write that matched nothing must be seen");
     const o = s.orders.find((x) => x.id === params[2]);
     if (!o || !STILL_OWES(o.status) || o.status === 6 || ncFlagSignature(o.items) !== params[5]) {return { rows: [] };}
