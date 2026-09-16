@@ -16,7 +16,7 @@ import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isPushConfigured, pushPublicKey } from "../web_push.js";
 import type { GuestPoster } from "../posters.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { GetCustomerIdOrCreateCustomer, emitOrderCreated, feedbackUrlForTable, fetchWithTimeout, linkOrderToCustomer, notifyOrderCreated, optionalMobile10, queueBookingConfirm, rateLimit, refuseGuestWriteIfClosed, requireMobile10, resolveRazorpayKeys, safeClientError, timingSafeStrEqual } from "./_shared.js";
+import { GetCustomerIdOrCreateCustomer, emitOrderCreated, feedbackUrlForTable, fetchWithTimeout, linkOrderToCustomer, notifyOrderCreated, optionalMobile10, queueBookingConfirm, rateLimit, refuseGuestWriteIfClosed, refuseOrderOnPrintedBill, requireMobile10, resolveRazorpayKeys, safeClientError, timingSafeStrEqual } from "./_shared.js";
 
 
 // Resolve the table for a public QR request. Prefers the opaque ?t= token; falls
@@ -237,6 +237,23 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 		// A transient failure verifying the OTP shouldn't hard-block ordering —
 		// AddOrder still refuses unoccupied tables, which is the real guard.
 		logger.warn({ err: (err as any)?.message ?? err }, "qr_order_otp_gate_error (failing open)");
+	}
+
+	// CLIENT ITEM 6 — A PRINTED BILL TAKES NO MORE FROM THE QR PAGE. The card's
+	// QR is signed for this table, and whoever scans it after the print may be
+	// the NEXT party: their food must not land on the bill the last party is
+	// paying. Refused, never rerouted — see refuseOrderOnPrintedBill. Its own
+	// tenant scope, before the order's, so a refusal writes nothing.
+	try {
+		const guard = await withTenant(
+			{ res_id: resId, outlet_id: "", employeeId: "", role: "" },
+			() => refuseOrderOnPrintedBill(req, res, { restaurantId: slug, tableName, guest: true }),
+		);
+		if (guard.refused) {return;}
+	} catch (err) {
+		// The order path is the one that has to work; see the OTP gate above.
+		if (res.headersSent) {return;}
+		logger.warn({ err: (err as any)?.message ?? err }, "qr_order_print_guard_error (failing open)");
 	}
 
 	// Server-computed total — never trust a client-sent total for billing.

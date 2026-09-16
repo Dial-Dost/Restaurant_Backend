@@ -93,7 +93,9 @@ export const BILL_PRINT_JOB_KIND = "bill";
 
 const asTime = (v: unknown): number | null => {
 	if (v === null || v === undefined || v === "") { return null; }
-	const t = v instanceof Date ? v.getTime() : new Date(String(v)).getTime();
+	// An epoch number is an instant as it stands; `new Date(String(n))` would
+	// read "1789545774907" as a date STRING and answer NaN.
+	const t = typeof v === "number" ? v : v instanceof Date ? v.getTime() : new Date(String(v)).getTime();
 	return Number.isFinite(t) ? t : null;
 };
 
@@ -108,13 +110,60 @@ export function billPrintFallbackPrefix(tableName: string): string {
 	return `${String(tableName ?? "").trim()}-`;
 }
 
+/**
+ * WHEN THIS PARTY SAT DOWN, for the purpose of counting its prints — the
+ * EARLIER of the open bill's created_at and the earliest still-owing order.
+ *
+ * THE DEFECT THIS ENDS. Both payloads used the bill row's created_at whenever a
+ * bill row existed, and fell back to the first order only when it did not. But
+ * a bill row is often born AFTER the print: a waiter prints a table that has no
+ * "Bills" row (the job is filed under `<name>-<epoch>`), and a discount, a
+ * service-charge waiver or a tender then creates the row. The seating then
+ * "started" after its own print, the print stopped counting, the table came
+ * back onto the waiter's floor and their one print was handed back. Production
+ * GGV table 12 on 2026-09-16 only escaped it because the manager reprinted.
+ *
+ * Every order of this party was placed before its bill was printed (there is
+ * nothing to print until there is an order), so the earliest still-owing order
+ * is never later than the print, and taking the earlier of the two keeps the
+ * print inside the seating whichever row came first. Null when neither is
+ * known — a table with no bill and no order has nothing to have printed.
+ */
+export function seatingStartOf(
+	billCreatedAt: Date | string | number | null | undefined,
+	firstOrderAt: Date | string | number | null | undefined,
+): Date | null {
+	const bill = asTime(billCreatedAt);
+	const order = asTime(firstOrderAt);
+	if (bill === null && order === null) { return null; }
+	if (bill === null) { return new Date(order!); }
+	if (order === null) { return new Date(bill); }
+	return new Date(Math.min(bill, order));
+}
+
+/**
+ * The bill_id each part of a split print is filed under: `<bill id>-split-<i>of<n>`
+ * when the table has a bill row (routes/bills.ts, POST /print/bill/split). The
+ * no-row shape `<name>-split-…` is already covered by the fallback prefix.
+ */
+export function splitPrintPrefix(openBillId: string): string {
+	return `${String(openBillId ?? "").trim()}-split-`;
+}
+
 /** Does this print job belong to this table's CURRENT seating? */
 export function billPrintJobBelongsToSeating(job: BillPrintJobRow, seating: BillPrintSeating): boolean {
 	const billId = String(job?.bill_id ?? "").trim();
 	if (!billId) { return false; }
 
 	const openId = String(seating.open_bill_id ?? "").trim();
-	const addressed = (openId !== "" && billId === openId) || billId.startsWith(billPrintFallbackPrefix(seating.table_name));
+	// A SPLIT PRINT IS A PRINT OF THIS BILL. Its parts were filed under
+	// `<bill id>-split-…` and matched nothing here, so a split-printed table with
+	// a bill row read as never printed while the same table without one (whose
+	// parts start `<name>-`) read as printed — and the next-party seat, which
+	// every successful print now opens, sat beside a root that had not left the
+	// waiter's floor.
+	const addressed = (openId !== "" && (billId === openId || billId.startsWith(splitPrintPrefix(openId))))
+		|| billId.startsWith(billPrintFallbackPrefix(seating.table_name));
 	if (!addressed) { return false; }
 
 	const start = asTime(seating.seating_start);

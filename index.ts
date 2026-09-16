@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -640,6 +640,16 @@ async function bootstrap(): Promise<void> {
 	// once 048 is applied; never takes the server down (see its header).
 	if (await InitBillRoundOffSchema()) {
 		logger.info("✅ Bill round-off column ready (migration 048)");
+	}
+
+	// "Tables".parent_table_id / party_seq (migration 053, client item 6), ONCE,
+	// here, outside any transaction — for the reason the round-off step above
+	// gives, and because "Tables" is the hottest table in the product: its
+	// ALTERs must not queue behind a service's row locks. False means the
+	// columns are not there and this role cannot add them: printed tables then
+	// leave a waiter's floor with no next-party seat, exactly as before 2.0.1.
+	if (await InitTableNextPartySchema()) {
+		logger.info("✅ Next-party tables ready (migration 053)");
 	}
 
 	// Run the reporting path's lazy DDL ONCE here, outside any transaction, so the
