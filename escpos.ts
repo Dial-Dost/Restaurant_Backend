@@ -168,6 +168,31 @@ export interface ReceiptOptions {
    * printed before this field existed.
    */
   cancelled?: boolean;
+  /**
+   * KOT ONLY: WHICH DOCKET THIS IS, and the owner's escape hatch from the one
+   * that needs a raster.
+   *
+   * "reference" (and absent) draws the client's reference docket. "classic"
+   * prints the ESC/POS TEXT docket this renderer has always produced — which is
+   * what a kitchen printer that ignores `GS v 0` needs, because such a printer
+   * answers a raster docket with BLANK PAPER rather than an error, and a blank
+   * ticket on the pass is an order nobody cooks.
+   *
+   * RESOLVED BY THE CALLER, never by this file: it is the restaurant's
+   * "Restaurant".kot_print_style setting, read once per docket in
+   * kot_print.ts:dispatchKot and handed down. Same division of labour as every
+   * other pre-resolved field here — the renderer holds no clock, no counter and
+   * no settings.
+   *
+   * THE UNION IS SPELLED OUT rather than imported so this file keeps its zero
+   * imports; kot_print_style.ts is its other half (KotPrintStyle), and a source
+   * guard in jest-tests/kot_print_style.test.ts fails if the two ever drift.
+   * They must not: a renderer that stops recognising "classic" would put every
+   * escape-hatch kitchen back on blank paper, silently.
+   *
+   * Absent renders exactly what this renderer rendered before the field existed.
+   */
+  kotPrintStyle?: "reference" | "classic";
   kind?: "bill" | "kot";
   // KOT only: the kitchen station/zone this ticket is for. When set, it is
   // printed in the header so a per-station split ticket is self-identifying.

@@ -127,6 +127,7 @@ import type { Express, Request, Response } from "express";
 import {
 	Audit_log_category,
 	DeletePrintDestination,
+	GetKotPrintStyle,
 	GetPrintDeviceTargets,
 	GetRestaurantProfile,
 	ListPrintDestinations,
@@ -1129,6 +1130,15 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 
 		const profile = await GetRestaurantProfile(ctx.restaurantId).catch(() => null);
 		const restaurantName = profile?.outlet_name || profile?.restaurant_name || "Printer test";
+		// THE TEST SLIP PRINTS IN THIS RESTAURANT'S OWN KOT STYLE, and this is the
+		// one place where that matters most. The slip's whole job is to answer "does
+		// paper come out of that machine?" — so it has to be made of the same bytes
+		// the machine will be sent at service. A slip that always printed as text
+		// would come out clean on a printer that cannot draw the raster docket and
+		// tell the owner their setup is fine, which is the exact false negative this
+		// button exists to rule out. It is also the fastest way to CHECK the switch:
+		// flip to Classic, press test, read the paper.
+		const kotPrintStyle = await GetKotPrintStyle(ctx.restaurantId);
 		const stamp = new Date();
 		const results: Record<string, unknown>[] = [];
 		for (const role of roles) {
@@ -1150,6 +1160,7 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 				printedAt: stamp.toISOString().slice(0, 16).replace("T", " "),
 				orderContext: "Printer test",
 				station,
+				kotPrintStyle,
 			}, TEST_SLIP_COLS)[0];
 			if (!ticket) { continue; }
 			// bill_id is TEXT and is the handle a human uses to find this job in the
