@@ -65,6 +65,7 @@ import {
   type OutletRow,
   type RestaurantRow,
 } from "./platform_fixtures";
+import { kotPaper } from "./kot_raster_read";
 
 jest.mock("pg", () => {
   interface FixtureGlobal {
@@ -351,17 +352,29 @@ describe("KOT numbering across the 039 deploy", () => {
 });
 
 describe("the printed docket and bill", () => {
-  const render = (items: ReceiptItem[], kind: "bill" | "kot"): string =>
-    Buffer.from(buildReceiptBase64({
+  // THE STAMP IS PINNED. With no printedAt the renderer falls back to the
+  // server clock, and two renders either side of a second tick are not equal —
+  // which made the byte-identity test below fail about one run in three,
+  // depending only on how long the suite took to get here.
+  const b64 = (items: ReceiptItem[], kind: "bill" | "kot"): string =>
+    buildReceiptBase64({
       restaurantName: "Gaia", table: "T4", covers: 2, items,
-      total: 400, currency: "₹", kind, grandTotal: 400,
-    }, 48), "base64").toString("latin1");
+      total: 400, currency: "₹", kind, grandTotal: 400, printedAt: "16/09/26 10:57",
+    }, 48);
+
+  // A BILL is ESC/POS text; a KOT is the reference docket, a raster, so its
+  // words are read back off the bitmap (jest-tests/kot_raster_read.ts). Same
+  // question either way: does the paper name the price point that was sold?
+  const render = (items: ReceiptItem[], kind: "bill" | "kot"): string =>
+    kind === "kot" ? kotPaper(b64(items, kind), 48) : Buffer.from(b64(items, kind), "base64").toString("latin1");
 
   test("a line with no variation prints byte-identically to before the field existed", () => {
+    // Asserted on the BYTES, which is what the sentence claims — not on decoded
+    // text, which would let a difference in how a line is drawn slip through.
     const plain: ReceiptItem = { name: "Paneer Tikka", quantity: 1, price: 250 };
     for (const kind of ["bill", "kot"] as const) {
-      expect(render([{ ...plain, variation: null }], kind)).toBe(render([plain], kind));
-      expect(render([{ ...plain, variation: "  " }], kind)).toBe(render([plain], kind));
+      expect(b64([{ ...plain, variation: null }], kind)).toBe(b64([plain], kind));
+      expect(b64([{ ...plain, variation: "  " }], kind)).toBe(b64([plain], kind));
     }
   });
 

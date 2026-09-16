@@ -36,6 +36,7 @@ import {
   seedMenu,
   tickets,
 } from "./kot_number_fixtures";
+import { kotPaper } from "./kot_raster_read";
 
 interface EnqueuedJob {
   outlet_id: string;
@@ -97,8 +98,21 @@ beforeAll(async () => {
 
 beforeEach(() => { resetStore(); enqueued.length = 0; });
 
-/** What the pass can read on a docket: the ESC/POS bytes as printable text. */
-const paper = (escBase64: string): string => Buffer.from(escBase64, "base64").toString("utf8");
+/**
+ * WHAT THE PASS CAN READ ON A DOCKET.
+ *
+ * It used to be `Buffer.from(b64,"base64").toString("utf8")`, which worked only
+ * while the docket was ESC/POS TEXT. The docket a restaurant prints by default
+ * is now the reference one — proportional type drawn as a GS v 0 raster — so
+ * this reads the words back off the bitmap by matching the committed glyph
+ * atlas (jest-tests/kot_raster_read.ts), and falls back to the plain decode for
+ * a restaurant on 'classic'.
+ *
+ * The assertions below are unchanged, and deliberately so: they are questions
+ * about the paper the kitchen is handed, and they are still asked of the paper
+ * the kitchen is actually handed rather than of a model of it.
+ */
+const paper = (escBase64: string): string => kotPaper(escBase64, 48);
 
 const TZ = "Asia/Kolkata";
 const FIRED = new Date("2026-08-25T06:30:00Z"); // 12:00 on the 25th, IST
@@ -166,13 +180,19 @@ describe("an order the kitchen already has", () => {
     // paper before.
     expect(out.reprint).toBe(true);
     const text = paper(enqueued[0]!.esc_base64);
+    // FLATTENED, because the correction's context line is longer than the
+    // reference docket's type lets one line be, and it wraps. That is the
+    // accepted trade of the bigger type the client asked for twice — the words
+    // are all there, and a chef reads a wrapped line fine. What would not be
+    // fine is any of them MISSING, which is what these assert.
+    const flat = text.replace(/\s+/g, " ");
     // The three things a chef has to read off it.
-    expect(text).toContain("TABLE CHANGED - WAS T4");
-    expect(text).toContain("KOT - 1");
-    expect(text).toContain("Table No: T7");
+    expect(flat).toContain("TABLE CHANGED - WAS T4");
+    expect(flat).toContain("KOT - 1");
+    expect(flat).toContain("Table No: T7");
     // And the food, so the docket stands on its own if the old one is binned.
-    expect(text).toContain("Paneer Tikka");
-    expect(text).toContain("no onion");
+    expect(flat).toContain("Paneer Tikka");
+    expect(flat).toContain("no onion");
     // The ordinary "Running Table" context line is REPLACED, not appended: the
     // top line has one job and it is now the correction.
     expect(text).not.toContain("Running Table");
