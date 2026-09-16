@@ -48,7 +48,7 @@ export interface ReceiptItem {
    * Hold-and-fire has worked in the app since it shipped — a held line is dimmed
    * on the KDS and its prep timer does not start — but the paper said nothing,
    * so the kitchen cooked it anyway and the feature was defeated by its own
-   * docket. A held line therefore prints an indented "[Hold] ..." line directly
+   * docket. A held line therefore prints an indented "[Hold]" line directly
    * UNDER the dish, in the slot a kitchen note uses, and is kept out of the
    * cook-now Total Qty (see the KOT item block below).
    *
@@ -204,6 +204,23 @@ export interface ReceiptOptions {
    * column and an unrecognised value all get. A BILL IGNORES THIS FIELD.
    */
   kotPrintStyle?: "reference" | "classic";
+  /**
+   * KOT ONLY, REFERENCE DOCKET ONLY: HOW BIG ITS TYPE IS.
+   *
+   * "Restaurant".kot_text_size — 'small', 'standard' (the client's reference
+   * ticket, and what absent means) or 'large'. Resolved once per docket by
+   * kot_print.ts:dispatchKot, exactly like kotPrintStyle above, and read here
+   * by kotTextSizeOf; the dots-per-em each word means is KOT_BODY_PPEM.
+   *
+   * THE CLASSIC TEXT DOCKET IGNORES IT, byte for byte: that docket is set in the
+   * printer's own font, and the owner who switched to it did so because their
+   * printer cannot draw ours. A BILL IGNORES IT TOO.
+   *
+   * Spelled out rather than imported for the reason kotPrintStyle is; the same
+   * source guard in jest-tests/kot_print_style.test.ts holds this union against
+   * KOT_TEXT_SIZES in kot_print_style.ts.
+   */
+  kotTextSize?: "small" | "standard" | "large";
   kind?: "bill" | "kot";
   // KOT only: the kitchen station/zone this ticket is for. When set, it is
   // printed in the header so a per-station split ticket is self-identifying.
@@ -569,37 +586,98 @@ export function kotPrintStyleOf(value: unknown): KotPrintStyle {
 }
 
 /**
- * The type sizes a roll is set in, in printer DOTS PER EM.
+ * How large a restaurant's reference docket is set — "Restaurant".kot_text_size.
  *
- * 40 on the 576-dot 80mm roll and 30 on the 384-dot 58mm one. Both are a long
- * way above the 24-dot body the text docket printed, because the client asked
- * for bigger type twice; the cost is that a long dish name wraps to a second
- * line, which is accepted and which the encoder is built to render cleanly.
+ * 'standard' is the client's reference ticket and the default; the other two
+ * are a step either side of it. kot_print_style.ts holds the same three words
+ * (KotTextSize) for the settings layer.
+ */
+export type KotTextSize = "small" | "standard" | "large";
+
+/** Read a stored size. Anything that is not exactly 'small' or 'large' is 'standard'. */
+export function kotTextSizeOf(value: unknown): KotTextSize {
+  const token = String(value ?? "").trim().toLowerCase();
+  return token === "small" || token === "large" ? token : "standard";
+}
+
+/**
+ * THE BODY TYPE SIZE, in printer DOTS PER EM, for each roll and each setting.
  *
- * BANNERS ARE THE ONLY THING THAT CHANGES SIZE. REPRINT and CANCELLED print at
- * 1.4x so they are unmistakably the largest thing on the paper; everywhere else
- * emphasis is WEIGHT, exactly as the reference docket does it. Both sizes are
- * baked into the atlas — nothing is scaled at runtime.
+ * WHY THESE NUMBERS. The first reference docket set body type at 40 on the
+ * 576-dot 80mm roll (30 on 58mm), because the client had asked for bigger type
+ * twice. Having printed it, they asked for it smaller ("The font sizes must be
+ * smaller in the KOT"). Measured against their own reference photograph, the
+ * ticket they approved is 28 dots per em on 80mm — so 28 IS 'standard', and a
+ * restaurant that never opens the setting gets the photograph, dot for dot.
+ * 'small' and 'large' are a step either side of it, and the 58mm roll steps
+ * down with its narrower paper.
  *
- * These four numbers are the atlas's whole contents. scripts/build_kot_glyph_atlas.ts
- * repeats them in KOT_ATLAS_PPEM and jest-tests/kot_raster.test.ts asserts the
- * two lists still agree, so a new roll width cannot ship without its faces.
+ * The cost of the larger sizes is that a long dish name wraps to a second line,
+ * which the encoder is built to render cleanly; nothing on the paper is ever
+ * dropped to make type fit.
+ *
+ * EVERY NUMBER HERE IS BAKED INTO THE ATLAS — nothing is scaled at runtime.
+ * scripts/kot_atlas_build.ts spells the resulting faces out in KOT_ATLAS_FACES,
+ * and jest-tests/kot_raster.test.ts asserts that list is exactly kotAtlasFaces()
+ * below: no face the renderer can ask for is missing, and none it cannot ask
+ * for is shipped.
+ */
+export const KOT_BODY_PPEM: Readonly<Record<"80mm" | "58mm", Readonly<Record<KotTextSize, number>>>> = {
+  "80mm": { small: 24, standard: 28, large: 34 },
+  "58mm": { small: 22, standard: 24, large: 28 },
+};
+
+/**
+ * The type sizes one docket is set in.
+ *
+ * BANNERS ARE THE ONLY THING THAT CHANGES SIZE ON A DOCKET. REPRINT and
+ * CANCELLED print at 1.4x the body, in BOLD, so they are unmistakably the
+ * largest thing on the paper whatever size the restaurant chose; everywhere else
+ * emphasis is WEIGHT, exactly as the reference docket does it.
  */
 export interface KotProfile {
   /** Printable width of the roll, in dots. */
   widthDots: number;
+  /** The restaurant's setting this profile was resolved from. */
+  textSize: KotTextSize;
   /** Body type size, dots per em. */
   ppem: number;
-  /** REPRINT / CANCELLED size, dots per em. */
+  /** REPRINT / CANCELLED size, dots per em — always set bold. */
   bannerPpem: number;
 }
 
 /** REPRINT and CANCELLED, relative to body type. */
 export const KOT_BANNER_SCALE = 1.4;
 
-export function kotProfile(widthDots: number): KotProfile {
-  const ppem = widthDots >= 576 ? 40 : 30;
-  return { widthDots, ppem, bannerPpem: Math.round(ppem * KOT_BANNER_SCALE) };
+/**
+ * The profile for a roll `widthDots` wide at the restaurant's `textSize`
+ * (anything unrecognised, including absent, is 'standard'). A roll of 576 dots
+ * or more is set as 80mm, anything narrower as 58mm — the same split every
+ * other paper decision in this file makes.
+ */
+export function kotProfile(widthDots: number, textSize?: unknown): KotProfile {
+  const size = kotTextSizeOf(textSize);
+  const ppem = KOT_BODY_PPEM[widthDots >= 576 ? "80mm" : "58mm"][size];
+  return { widthDots, textSize: size, ppem, bannerPpem: Math.round(ppem * KOT_BANNER_SCALE) };
+}
+
+/**
+ * EVERY FACE A DOCKET CAN BE SET IN, as atlas keys ("<ppem><r|b>"), sorted.
+ *
+ * Each body size in both weights — a dish name is bold, a note is not — and
+ * each banner size in bold only, because planKotRaster never sets a banner in
+ * any other weight. This is the list the committed atlas must match exactly.
+ */
+export function kotAtlasFaces(): string[] {
+  const keys = new Set<string>();
+  for (const roll of Object.values(KOT_BODY_PPEM)) {
+    for (const ppem of Object.values(roll)) {
+      keys.add(`${ppem}r`);
+      keys.add(`${ppem}b`);
+      keys.add(`${Math.round(ppem * KOT_BANNER_SCALE)}b`);
+    }
+  }
+  return [...keys].sort((a, b) => parseInt(a, 10) - parseInt(b, 10) || a.localeCompare(b));
 }
 
 /** Body text, or a banner. There is no third size on a docket. */
@@ -632,8 +710,20 @@ export type KotRow =
   | { k: "cols"; cells: KotCell[] }
   | { k: "rule" };
 
-/** The wording under a held dish. One string, so paper and tests cannot drift. */
-export const KOT_HOLD_LINE = "[Hold] Do not cook until fired";
+/**
+ * The line under a held dish — on BOTH dockets. One string, so paper and tests
+ * cannot drift.
+ *
+ * JUST THE MARKER. It used to read "[Hold] Do not cook until fired"; the client:
+ * "When an item is on hold, on the KOT it must only say 'hold'". The tag is what
+ * a chef scans for, it sits exactly where a "[Note]" does, and the dish is
+ * still kept out of Total Qty and totalled apart under Hold Qty — the sentence
+ * after it was the one part of the line nobody needed.
+ *
+ * NOT the cancellation slip's "DO NOT COOK - THIS TICKET IS OFF", which is a
+ * different message on a different document and stays word for word.
+ */
+export const KOT_HOLD_LINE = "[Hold]";
 
 /**
  * WHAT IS ON THE PAPER, IN ORDER — the client's reference docket, transcribed.
@@ -664,7 +754,7 @@ export const KOT_HOLD_LINE = "[Hold] Do not cook until fired";
  *
  * FOUR THINGS THE REFERENCE HAS NO EQUIVALENT FOR ARE KEPT ANYWAY, because each
  * of them stops the kitchen cooking the wrong thing:
- *   - the "[Hold] …" line under a held dish, and the Hold Qty total apart from
+ *   - the "[Hold]" line under a held dish, and the Hold Qty total apart from
  *     Total Qty, without which hold-and-fire is defeated by its own docket;
  *   - the ** REPRINT ** and ** CANCELLED ** banners (an unmarked second copy is
  *     cooked twice; an unmarked cancellation is cooked at all);
@@ -680,8 +770,8 @@ export const KOT_HOLD_LINE = "[Hold] Do not cook until fired";
  *
  * `profile` is passed in rather than read by the encoder alone because every
  * paper-dependent CONTENT decision belongs here. Today there are none: both
- * rolls carry the same rows and differ only in how wide the type is, which is
- * the encoder's business.
+ * rolls and all three text sizes carry the same rows and differ only in how
+ * large the type is, which is the encoder's business.
  *
  * FOLDED TO ASCII HERE, at the one door into the layout. The atlas is ASCII
  * 32..126, so a rupee sign or an accented letter must become 'Rs' or a plain
@@ -689,10 +779,11 @@ export const KOT_HOLD_LINE = "[Hold] Do not cook until fired";
  * rather than a silent gap, which is the same rule the text docket obeys.
  */
 export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
-  // `profile` is not read today: both rolls carry the same rows and differ only
-  // in how wide the type is, which the encoder measures. It is a parameter
-  // rather than a later refactor because the first content decision that DOES
-  // depend on the paper belongs here, not in the encoder.
+  // `profile` is not read today: both rolls and all three text sizes carry the
+  // same rows and differ only in how large the type is, which the encoder
+  // measures. It is a parameter rather than a later refactor because the first
+  // content decision that DOES depend on the paper belongs here, not in the
+  // encoder.
   void profile;
   const rows: KotRow[] = [];
   const line = (text: string, align: "center" | "left", bold = false, size: KotSize = "body") => {
@@ -783,9 +874,8 @@ export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
       { text: String(qty), at: "qty", bold: false },
     ]);
     // THE HOLD, WHERE A NOTE GOES — directly under the dish it holds, in the
-    // slot a kitchen note uses, and carrying its instruction in words so the
-    // line can never be read as anything but "not this one yet". The client
-    // asked for exactly this placement twice.
+    // slot a kitchen note uses. The client asked for exactly this placement
+    // twice, and then for the line to say only "[Hold]" (see KOT_HOLD_LINE).
     if (it.held === true) { cols([{ text: KOT_HOLD_LINE, at: "name", bold: false }]); }
     // Upright and unemphasised on purpose: a docket on which everything is
     // emphasised emphasises nothing.
@@ -896,6 +986,24 @@ function kotFace(atlas: Record<string, KotFace>, ppem: number, bold: boolean): K
 }
 
 /**
+ * The face one run of text is set in.
+ *
+ * A BANNER IS ALWAYS BOLD, whatever its row asks for. It is the loudest thing
+ * on the paper, and it is the reason the atlas carries each banner size in bold
+ * only (kotAtlasFaces) — so a banner row that one day arrived with bold: false
+ * still prints, rather than throwing for a face nobody baked.
+ */
+function kotRunFace(
+  atlas: Record<string, KotFace>,
+  ppem: number,
+  bannerPpem: number,
+  size: KotSize | undefined,
+  bold: boolean,
+): KotFace {
+  return size === "banner" ? kotFace(atlas, bannerPpem, true) : kotFace(atlas, ppem, bold);
+}
+
+/**
  * A glyph, or a VISIBLE '?' when the atlas has none.
  *
  * Text reaching here has been through asciiSafe, which already turns anything
@@ -972,8 +1080,8 @@ function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, pp
   // WHITE AT BOTH EDGES, for the reason the bill sets printer margins: a roll
   // whose head is a dot or two narrower than nominal clips whatever touches the
   // edge, and on a docket the thing at the right edge is the quantity. 0.3em is
-  // ~1.5mm on 80mm and ~1.1mm on 58mm — visible, and cheap in a column that
-  // only ever holds two or three digits.
+  // 7 to 10 dots at the docket's sizes, about a millimetre — visible, and cheap
+  // in a column that only ever holds two or three digits.
   const margin = Math.round(ppem * 0.3);
   const numX = margin;
   const gutter = Math.round(ppem * 0.4);
@@ -992,7 +1100,7 @@ function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, pp
     if (row.k !== "cols" || !row.cells.some((c) => c.at === "name")) { continue; }
     for (const cell of row.cells) {
       if (cell.at !== "num") { continue; }
-      const w = kotTextWidth(kotFace(atlas, cell.size === "banner" ? bannerPpem : ppem, cell.bold), cell.text);
+      const w = kotTextWidth(kotRunFace(atlas, ppem, bannerPpem, cell.size, cell.bold), cell.text);
       if (w > numW) { numW = w; }
     }
   }
@@ -1010,7 +1118,7 @@ function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, pp
     if (row.k !== "cols") { continue; }
     for (const cell of row.cells) {
       if (cell.at !== "qty") { continue; }
-      const w = kotTextWidth(kotFace(atlas, cell.size === "banner" ? bannerPpem : ppem, cell.bold), cell.text);
+      const w = kotTextWidth(kotRunFace(atlas, ppem, bannerPpem, cell.size, cell.bold), cell.text);
       if (w > qtyW) { qtyW = w; }
     }
   }
@@ -1053,7 +1161,7 @@ export function planKotRaster(
 ): KotRasterPlan {
   const G = kotGeometry(rows, atlas, ppem, widthDots);
   const faceFor = (size: KotSize | undefined, bold: boolean) =>
-    kotFace(atlas, size === "banner" ? G.bannerPpem : G.ppem, bold);
+    kotRunFace(atlas, G.ppem, G.bannerPpem, size, bold);
   // ROW HEIGHT COMES FROM THE BOLD FACE OF THE SIZE, for every row of that size:
   // a bold line and a regular line have to sit on the same pitch or the docket
   // walks. Both are measured from the atlas's own per-face extremes, so the
@@ -1232,9 +1340,11 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   //
   // The caller counts COLUMNS (48 for 80mm, 32 for 58mm) because every other
   // door into this renderer does; the raster works in dots, and DOTS_PER_COL is
-  // the conversion this file has always used.
+  // the conversion this file has always used. The restaurant's text size picks
+  // the type from kotProfile's table — and is read nowhere below this line,
+  // which is what keeps a 'classic' docket's bytes independent of it.
   if (isKot && kotPrintStyleOf(opts.kotPrintStyle) === "reference") {
-    const profile = kotProfile(width * DOTS_PER_COL);
+    const profile = kotProfile(width * DOTS_PER_COL, opts.kotTextSize);
     return encodeKotRaster(layoutKot(opts, profile), KOT_ATLAS, profile.ppem, profile.widthDots).toString("base64");
   }
   // THE BILL'S TEXT AREA: the roll less its margins. Every bill line is laid
@@ -1710,9 +1820,9 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
         raw(ESC, 0x21, 0x00);
       }
       // THE HOLD, WHERE A NOTE GOES — directly under the dish it holds. The
-      // "[Hold]" tag is the same shape as the "[Note]" tag beneath it, and it
-      // carries its instruction in words, so the line can never be read as
-      // anything but "not this one yet".
+      // "[Hold]" tag is the same shape as the "[Note]" tag beneath it, and it is
+      // the whole line: the client asked for the marker alone (KOT_HOLD_LINE).
+      // The wrap is kept so the line obeys the column however it is worded.
       if (it.held === true) {
         for (const l of wrapText(KOT_HOLD_LINE, COL_ITEM - 1)) {tall(indent + l);}
       }
@@ -1739,8 +1849,9 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
      * the way a note appears on the food order." (1.5 said the same thing
      * earlier: dish name first, then hold.) So there is no banner and no second
      * list: the held dish prints in its own place, and the line directly under
-     * it — the slot a "[Note]" uses on their reference docket — reads "[Hold] Do
-     * not cook until fired". One numbering, so the pass calls "fire 3".
+     * it — the slot a "[Note]" uses on their reference docket — reads "[Hold]".
+     * One numbering, so the pass calls "fire 3". (It said "[Hold] Do not cook
+     * until fired" until the client asked for the marker alone.)
      *
      * WHAT STILL KEEPS IT OUT OF THE POT: Total Qty counts only what may be
      * cooked now, and the held quantity is totalled separately under it, so the

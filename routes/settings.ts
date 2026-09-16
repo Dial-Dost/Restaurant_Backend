@@ -5,7 +5,7 @@
 import type { Express, Request, Response } from "express";
 import { Audit_log_category, GetPublicBranding, GetRestaurantLogo, GetRestaurantProfile, GetRestaurantSettings, SetBranding, SetRestaurantSettings, UpdateRestaurantProfile } from "../database_supabase.js";
 import { BILL_LOGO_SVG_MAX_CHARS, billLogoDots, billLogoInkShare, cleanBillLogoSvg, rasterizeBillLogo } from "../bill_logo.js";
-import { parseKotPrintStyle } from "../kot_print_style.js";
+import { parseKotPrintStyle, parseKotTextSize } from "../kot_print_style.js";
 import { logger } from "../observability.js";
 import { PaymentConfigError } from "../payment_methods.js";
 import { uploadMenuImage } from "../storage_bucket_supabase.js";
@@ -343,6 +343,16 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 		});
 		return;
 	}
+	// The reference docket's type size, refused out loud on the same terms: an
+	// owner who picked "Small" and got a 200 for a value that stored nothing
+	// would stand at the pass wondering why the dockets did not change. Absent
+	// and null both mean "unchanged", for the read-modify-write client above.
+	if (body.kot_text_size !== undefined && body.kot_text_size !== null && parseKotTextSize(body.kot_text_size) === null) {
+		res.status(400).json({
+			error: `"${String(body.kot_text_size)}" is not a KOT text size. Use "small", "standard" (the reference docket's size) or "large".`,
+		});
+		return;
+	}
 	try {
 		// Snapshot before the write so the undo can restore ONLY the keys this
 		// request actually changed (never the whole settings document).
@@ -399,6 +409,9 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 			// has never heard of the switch cannot move a kitchen off the docket it
 			// is printing by leaving the key out.
 			kot_print_style: body.kot_print_style !== undefined ? body.kot_print_style : undefined,
+			// How large the reference docket's type is (kot_text_size, migration
+			// 050's second column). Validated above; written only on a real size.
+			kot_text_size: body.kot_text_size !== undefined ? body.kot_text_size : undefined,
 		});
 		const settingsUndo = buildSettingsUndo(priorSettings, result);
 		try {
@@ -411,6 +424,8 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 				// paper on the 14th?" — and that question is asked by someone
 				// scanning audit entries, not by someone expanding each one.
 				...(body.kot_print_style !== undefined ? { kot_print_style: result.kot_print_style } : {}),
+				// Same rule for the size: named when this request touched it.
+				...(body.kot_text_size !== undefined ? { kot_text_size: result.kot_text_size } : {}),
 				...(settingsUndo ? { undo: settingsUndo } : {}),
 			});
 		} catch (err) { logger.warn({ err }, "log_audit settings failed"); }

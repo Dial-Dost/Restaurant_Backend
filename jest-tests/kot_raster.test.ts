@@ -16,12 +16,16 @@ import { join } from "node:path";
 import { describe, test, expect } from "@jest/globals";
 import {
   DOTS_PER_COL,
+  KOT_BANNER_SCALE,
+  KOT_BODY_PPEM,
   KOT_RASTER_CHUNK_ROWS,
   buildKotBase64,
   buildReceiptBase64,
   encodeKotRaster,
+  kotAtlasFaces,
   kotPrintStyleOf,
   kotProfile,
+  kotTextSizeOf,
   kotTextWidth,
   kotWrap,
   layoutKot,
@@ -29,11 +33,13 @@ import {
   type KotDraw,
   type KotRasterPlan,
   type KotRow,
+  type KotTextSize,
   type ReceiptOptions,
 } from "../escpos";
 import { KOT_ATLAS } from "../kot_glyph_atlas";
 import { BILL_LOGO_MAX_HEIGHT } from "../bill_logo";
-import { KOT_ATLAS_PPEM, atlasToModule, buildKotGlyphAtlas } from "../scripts/kot_atlas_build";
+import { KOT_ATLAS_FACES, atlasToModule, buildKotGlyphAtlas } from "../scripts/kot_atlas_build";
+import { KOT_TEXT_SIZES } from "../kot_print_style";
 import { kotPaper, readKotRaster, rollPpems } from "./kot_raster_read";
 
 const REPO = join(__dirname, "..");
@@ -100,8 +106,14 @@ const variants: [string, ReceiptOptions][] = [
   ["a name folded from non-ASCII", { ...docket, items: [{ name: "Café Niçoise ₹250 — Thé", quantity: 1, price: 0 }] }],
 ];
 
-const plan = (opts: ReceiptOptions, cols: number): KotRasterPlan => {
-  const profile = kotProfile(cols * DOTS_PER_COL);
+/** Every text size a restaurant can choose, smallest first. */
+const SIZES: readonly KotTextSize[] = ["small", "standard", "large"];
+/** Every roll, as the column count the callers pass. */
+const ROLLS: readonly number[] = [48, 32];
+const rollName = (cols: number) => (cols === 48 ? "80mm" : "58mm");
+
+const plan = (opts: ReceiptOptions, cols: number, size?: KotTextSize): KotRasterPlan => {
+  const profile = kotProfile(cols * DOTS_PER_COL, size ?? opts.kotTextSize);
   return planKotRaster(layoutKot(opts, profile), KOT_ATLAS, profile.ppem, profile.widthDots);
 };
 const bytes = (b64: string) => Buffer.from(b64, "base64");
@@ -120,22 +132,46 @@ describe("the glyph atlas cannot drift from the script that builds it", () => {
     expect(atlasToModule(rebuilt).replace(/\r\n/g, "\n")).toBe(committed);
   });
 
-  test("every face the rolls actually ask for exists", () => {
+  test("every face any roll at any size actually asks for exists", () => {
     for (const roll of [576, 384]) {
-      const p = kotProfile(roll);
-      for (const ppem of [p.ppem, p.bannerPpem]) {
-        expect(KOT_ATLAS_PPEM).toContain(ppem);
-        for (const weight of ["r", "b"]) { expect(KOT_ATLAS[`${ppem}${weight}`]).toBeDefined(); }
+      for (const size of SIZES) {
+        const p = kotProfile(roll, size);
+        for (const weight of ["r", "b"]) { expect(KOT_ATLAS[`${p.ppem}${weight}`]).toBeDefined(); }
+        // A banner is only ever set bold (kotRunFace).
+        expect(KOT_ATLAS[`${p.bannerPpem}b`]).toBeDefined();
       }
     }
   });
 
-  test("the builder bakes NOTHING the renderer cannot ask for", () => {
-    const wanted = new Set([576, 384].flatMap((roll) => {
-      const p = kotProfile(roll);
-      return [p.ppem, p.bannerPpem];
-    }));
-    expect([...KOT_ATLAS_PPEM].sort((a, b) => a - b)).toEqual([...wanted].sort((a, b) => a - b));
+  test("the builder bakes exactly the faces the renderer can ask for — nothing missing, nothing dead", () => {
+    // The unused 30/40/42/56 faces of the first cut are the case this catches:
+    // half the table was type no docket could be set in any more.
+    const baked = KOT_ATLAS_FACES.flatMap((f) => f.weights.map((w) => `${f.ppem}${w}`));
+    expect([...baked].sort()).toEqual([...kotAtlasFaces()].sort());
+    expect(Object.keys(KOT_ATLAS).sort()).toEqual([...kotAtlasFaces()].sort());
+  });
+
+  test("and every face a real docket is drawn in is on that list", () => {
+    // kotAtlasFaces() is a claim about planKotRaster; this checks the claim
+    // against what planKotRaster actually does, banners and bold names included.
+    const used = new Set<string>();
+    for (const [, opts] of variants) {
+      for (const cols of ROLLS) {
+        for (const size of SIZES) {
+          for (const d of draws(plan({ ...opts, reprint: true }, cols, size))) {
+            used.add(`${d.face.ppem}${d.face.weight === 700 ? "b" : "r"}`);
+          }
+        }
+      }
+    }
+    expect([...used].filter((k) => !kotAtlasFaces().includes(k))).toEqual([]);
+  });
+
+  test("the module stays a reasonable size for a table that ships in the server", () => {
+    // 11 faces of ASCII: ~120KB of source. A size added without thought (or a
+    // stray weight) shows up here before it shows up in a cold start.
+    const bytes = readFileSync(join(REPO, "kot_glyph_atlas.ts")).length;
+    expect(bytes).toBeLessThan(160_000);
   });
 
   test("it is ASCII 32..126 and nothing else — the fold happens before the type", () => {
@@ -148,14 +184,123 @@ describe("the glyph atlas cannot drift from the script that builds it", () => {
   });
 });
 
+/**
+ * THE TEXT SIZE — "Restaurant".kot_text_size.
+ *
+ * The client, having printed the first reference docket: "The font sizes must
+ * be smaller in the KOT." Standard is now their reference photograph (28 dots
+ * per em on 80mm), with a step either side of it an owner can pick in Settings.
+ */
+describe("the text size a restaurant chose", () => {
+  test("the sizes are exactly the agreed table", () => {
+    expect(KOT_BODY_PPEM).toEqual({
+      "80mm": { small: 24, standard: 28, large: 34 },
+      "58mm": { small: 22, standard: 24, large: 28 },
+    });
+  });
+
+  test("STANDARD ON 80mm IS THE CLIENT'S REFERENCE PHOTOGRAPH — 28 dots per em — and it is the default", () => {
+    expect(kotProfile(576)).toEqual({ widthDots: 576, textSize: "standard", ppem: 28, bannerPpem: 39 });
+    expect(kotProfile(576, "standard")).toEqual(kotProfile(576));
+    expect(kotProfile(384)).toEqual({ widthDots: 384, textSize: "standard", ppem: 24, bannerPpem: 34 });
+  });
+
+  test("every roll and size resolves to its row of the table, and the banner is 1.4x bold, rounded", () => {
+    for (const cols of ROLLS) {
+      for (const size of SIZES) {
+        const p = kotProfile(cols * DOTS_PER_COL, size);
+        expect(p.ppem).toBe(KOT_BODY_PPEM[rollName(cols)][size]);
+        expect(p.bannerPpem).toBe(Math.round(p.ppem * KOT_BANNER_SCALE));
+        expect(p.textSize).toBe(size);
+      }
+    }
+    // The rounding, spelled out: 24→34, 28→39, 34→48, 22→31.
+    expect([24, 28, 34, 22].map((b) => Math.round(b * KOT_BANNER_SCALE))).toEqual([34, 39, 48, 31]);
+  });
+
+  test("anything that is not a size is standard — a NULL column, a missing one, a typo", () => {
+    for (const raw of [undefined, null, "", "  ", "medium", "SMALLER", 7, {}]) {
+      expect(kotTextSizeOf(raw)).toBe("standard");
+      expect(kotProfile(576, raw).ppem).toBe(28);
+    }
+    expect(kotTextSizeOf(" Small ")).toBe("small");
+    expect(kotTextSizeOf("LARGE")).toBe("large");
+  });
+
+  test("the renderer knows exactly the sizes the settings layer does", () => {
+    expect([...SIZES]).toEqual([...KOT_TEXT_SIZES]);
+    for (const size of KOT_TEXT_SIZES) { expect(kotTextSizeOf(size)).toBe(size); }
+  });
+
+  test("small < standard < large, on both rolls, in the type AND on the paper", () => {
+    for (const cols of ROLLS) {
+      const [s, m, l] = SIZES.map((size) => plan(docket, cols, size));
+      expect(s!.geometry.ppem).toBeLessThan(m!.geometry.ppem);
+      expect(m!.geometry.ppem).toBeLessThan(l!.geometry.ppem);
+      expect(s!.heightDots).toBeLessThan(m!.heightDots);
+      expect(m!.heightDots).toBeLessThan(l!.heightDots);
+    }
+  });
+
+  test("the size changes how big the words are, never which words are on the paper", () => {
+    for (const cols of ROLLS) {
+      const rows = SIZES.map((size) => layoutKot(stress, kotProfile(cols * DOTS_PER_COL, size)));
+      expect(rows[0]).toEqual(rows[1]);
+      expect(rows[2]).toEqual(rows[1]);
+    }
+  });
+
+  test("the setting reaches the paper: each size prints a different docket, the default is standard's", () => {
+    const at = (size?: KotTextSize) => buildReceiptBase64({ ...docket, ...(size ? { kotTextSize: size } : {}) }, 48);
+    expect(new Set(SIZES.map((s) => at(s))).size).toBe(3);
+    expect(at()).toBe(at("standard"));
+  });
+
+  test("THE CLASSIC TEXT DOCKET IGNORES IT, byte for byte", () => {
+    // It is set in the printer's own font, and a restaurant on it is there
+    // because its printer cannot draw ours.
+    for (const cols of ROLLS) {
+      const classic = { ...stress, kotPrintStyle: "classic" as const };
+      for (const size of SIZES) {
+        expect(buildReceiptBase64({ ...classic, kotTextSize: size }, cols)).toBe(buildReceiptBase64(classic, cols));
+      }
+    }
+  });
+
+  test("a BILL ignores it too", () => {
+    const bill: ReceiptOptions = { ...docket, kind: "bill", items: [{ name: "Tea", quantity: 1, price: 50 }], total: 50 };
+    for (const size of SIZES) {
+      expect(buildReceiptBase64({ ...bill, kotTextSize: size }, 48)).toBe(buildReceiptBase64(bill, 48));
+    }
+  });
+
+  test("every station's ticket of a split is set in the same size", () => {
+    const split: ReceiptOptions = {
+      ...docket,
+      kotTextSize: "small",
+      items: [
+        { name: "Subz Tehri", quantity: 1, price: 0, station: "Tandoor" },
+        { name: "Virgin Mojito", quantity: 2, price: 0, station: "BAR" },
+      ],
+    };
+    for (const t of buildKotBase64(split, 48)) {
+      const lines = readKotRaster(t.escBase64, 576, rollPpems(48, "small"));
+      expect(lines.filter((l) => l.leftover !== 0)).toEqual([]);
+      expect(lines.map((l) => l.text)).toContain("Table No: 33");
+    }
+  });
+});
+
 describe("nothing a docket prints crosses the edge of the roll", () => {
   for (const [name, opts] of variants) {
-    for (const cols of [48, 32]) {
-      test(`${name}, ${cols === 48 ? "80mm" : "58mm"}`, () => {
-        const p = plan(opts, cols);
-        const outside = draws(p).filter((d) => d.x0 < 0 || d.x1 > p.widthDots);
-        expect(outside.map((d) => `${d.text} [${d.x0},${d.x1}) of ${p.widthDots}`)).toEqual([]);
-      });
+    for (const cols of ROLLS) {
+      for (const size of SIZES) {
+        test(`${name}, ${rollName(cols)}, ${size}`, () => {
+          const p = plan(opts, cols, size);
+          const outside = draws(p).filter((d) => d.x0 < 0 || d.x1 > p.widthDots);
+          expect(outside.map((d) => `${d.text} [${d.x0},${d.x1}) of ${p.widthDots}`)).toEqual([]);
+        });
+      }
     }
   }
 
@@ -167,11 +312,11 @@ describe("nothing a docket prints crosses the edge of the roll", () => {
 });
 
 describe("the item table's columns", () => {
-  for (const cols of [48, 32]) {
-    const roll = cols === 48 ? "80mm" : "58mm";
+  for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
+    const roll = `${rollName(cols)}, ${size}`;
 
     test(`every quantity is flush to the same right edge — ${roll}`, () => {
-      const p = plan(stress, cols);
+      const p = plan(stress, cols, size);
       // A quantity is the only thing drawn to the right of the name column, and
       // it is right-ALIGNED: its pen moves, its right edge never does.
       const rights = p.ops
@@ -184,24 +329,25 @@ describe("the item table's columns", () => {
     });
 
     test(`a dish name never runs into the quantity column — ${roll}`, () => {
-      const p = plan(stress, cols);
+      const p = plan(stress, cols, size);
       const names = draws(p).filter((d) => d.x === p.geometry.nameX);
       expect(names.length).toBeGreaterThan(4);
       for (const d of names) { expect(d.x1).toBeLessThanOrEqual(p.geometry.qtyLeft); }
     });
 
     test(`wrapped names, [Hold] and [Note] all hang on the name column — ${roll}`, () => {
-      const p = plan(stress, cols);
+      const p = plan(stress, cols, size);
       const hangs = p.ops.filter((op) => op.draws.length === 1 && op.draws[0]!.x === p.geometry.nameX);
       const texts = hangs.map((op) => op.draws[0]!.text);
-      expect(texts.some((t) => t.startsWith("[Hold]"))).toBe(true);
+      // The hold line is the marker and nothing else.
+      expect(texts.filter((t) => t.startsWith("[Hold]"))).toEqual(["[Hold]"]);
       expect(texts.some((t) => t.startsWith("[Note]"))).toBe(true);
       // and the continuation of the 52-character dish name
       expect(texts.some((t) => t.includes("Garlic"))).toBe(true);
     });
 
     test(`the No. column and every left-aligned line share one edge — ${roll}`, () => {
-      const p = plan(docket, cols);
+      const p = plan(docket, cols, size);
       const left = draws(p).filter((d) => d.x === p.geometry.numX).map((d) => d.text);
       expect(left).toContain("Assign to: yado");
       expect(left).toContain("No.Item");
@@ -222,11 +368,11 @@ describe("the item table's columns", () => {
  * the quantity column is measured from the widest quantity.
  */
 describe("a docket long enough to need three-digit row numbers", () => {
-  for (const cols of [48, 32]) {
-    const roll = cols === 48 ? "80mm" : "58mm";
+  for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
+    const roll = `${rollName(cols)}, ${size}`;
 
     test(`no row number is ever drawn into a dish name — ${roll}`, () => {
-      const p = plan(long, cols);
+      const p = plan(long, cols, size);
       const numbered = p.ops
         .map((op) => ({
           num: op.draws.find((d) => d.x === p.geometry.numX),
@@ -245,7 +391,7 @@ describe("a docket long enough to need three-digit row numbers", () => {
     });
 
     test(`and nothing on it crosses the edge of the roll — ${roll}`, () => {
-      const p = plan(long, cols);
+      const p = plan(long, cols, size);
       const outside = draws(p).filter((d) => d.x0 < 0 || d.x1 > p.widthDots);
       expect(outside.map((d) => `${d.text} [${d.x0},${d.x1}) of ${p.widthDots}`)).toEqual([]);
     });
@@ -254,19 +400,19 @@ describe("a docket long enough to need three-digit row numbers", () => {
       // The column GROWS from the reference's 1.45em and never shrinks below it,
       // so the docket in the photograph — and every ticket of nine lines or
       // fewer — is laid out exactly as it was.
-      const ref = plan(docket, cols).geometry;
+      const ref = plan(docket, cols, size).geometry;
       expect(ref.nameX).toBe(Math.round(ref.ppem * 1.45));
       const roti = (n: number) => ({ ...docket, items: Array.from({ length: n }, () => ({ name: "Roti", quantity: 1, price: 0 })) });
-      expect(plan(roti(9), cols).geometry.nameX).toBe(ref.nameX);
-      expect(plan(roti(10), cols).geometry.nameX).toBeGreaterThan(ref.nameX);
-      expect(plan(long, cols).geometry.nameX).toBeGreaterThan(plan(roti(10), cols).geometry.nameX);
+      expect(plan(roti(9), cols, size).geometry.nameX).toBe(ref.nameX);
+      expect(plan(roti(10), cols, size).geometry.nameX).toBeGreaterThan(ref.nameX);
+      expect(plan(long, cols, size).geometry.nameX).toBeGreaterThan(plan(roti(10), cols, size).geometry.nameX);
     });
 
     test(`a nonsense row number cannot eat the dish name — ${roll}`, () => {
       // The ceiling the quantity column has, for the same reason: a number wide
       // enough to push the Item column off the roll is a number to clip the
       // gutter for, not to sacrifice the dish name to.
-      const profile = kotProfile(cols * DOTS_PER_COL);
+      const profile = kotProfile(cols * DOTS_PER_COL, size);
       const rows: KotRow[] = [{
         k: "cols",
         cells: [
@@ -287,42 +433,69 @@ describe("the banner is the largest face on the paper", () => {
     ["a reprint", { ...docket, reprint: true }, "** REPRINT **"],
     ["a cancellation", { ...docket, cancelled: true }, "** CANCELLED **"],
   ] as [string, ReceiptOptions, string][]) {
-    for (const cols of [48, 32]) {
-      test(`${label}, ${cols === 48 ? "80mm" : "58mm"}`, () => {
-        const p = plan(opts, cols);
+    for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
+      test(`${label}, ${rollName(cols)}, ${size}`, () => {
+        const p = plan(opts, cols, size);
         const all = draws(p);
         const biggest = Math.max(...all.map((d) => d.face.ppem));
         expect(biggest).toBe(p.geometry.bannerPpem);
         expect(all.filter((d) => d.face.ppem === biggest).map((d) => d.text)).toEqual([banner]);
+        // …and it is bold at every size.
+        expect(all.filter((d) => d.face.ppem === biggest).map((d) => d.face.weight)).toEqual([700]);
         // and it is the FIRST thing off the roll
         expect(all[0]!.text).toBe(banner);
       });
     }
   }
 
-  test("a banner is set larger than body type, not merely bolder", () => {
-    const p = kotProfile(576);
-    expect(p.bannerPpem).toBeGreaterThan(p.ppem);
-    expect(KOT_ATLAS[`${p.bannerPpem}b`]!.top).toBeGreaterThan(KOT_ATLAS[`${p.ppem}b`]!.top);
+  test("a banner is set larger than body type, not merely bolder — at every size", () => {
+    for (const roll of [576, 384]) {
+      for (const size of SIZES) {
+        const p = kotProfile(roll, size);
+        expect(p.bannerPpem).toBeGreaterThan(p.ppem);
+        expect(KOT_ATLAS[`${p.bannerPpem}b`]!.top).toBeGreaterThan(KOT_ATLAS[`${p.ppem}b`]!.top);
+      }
+    }
+  });
+
+  test("a banner row that arrives un-bold is still set bold, never thrown on", () => {
+    // The atlas carries banner sizes in bold only. A row asking for a regular
+    // banner must not become a docket that fails to print.
+    const profile = kotProfile(576);
+    const rows: KotRow[] = [{ k: "line", align: "center", bold: false, size: "banner", text: "** REPRINT **" }];
+    const p = planKotRaster(rows, KOT_ATLAS, profile.ppem, profile.widthDots);
+    expect(draws(p).map((d) => [d.face.ppem, d.face.weight])).toEqual([[profile.bannerPpem, 700]]);
   });
 
   test("a banner too wide for the roll steps DOWN to body size instead of breaking in half", () => {
-    // 58mm is where this bites: the reference wording fits, a longer one cannot.
-    const wide = { ...docket, cancelled: true, orderContext: "x" };
-    const p = plan(wide, 32);
-    const first = p.ops[0]!;
-    expect(first.draws.length).toBe(1);
-    expect(first.draws[0]!.text).toBe("** CANCELLED **");
+    // The reference wording fits at every size on both rolls — one run, banner
+    // size, first on the paper…
+    for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
+      const p = plan({ ...docket, cancelled: true }, cols, size);
+      const first = p.ops[0]!;
+      expect(first.draws.map((d) => [d.text, d.face.ppem])).toEqual([["** CANCELLED **", p.geometry.bannerPpem]]);
+    }
+    // …and a banner that cannot fit at banner size is set at body size, still
+    // bold, rather than wrapped into two ragged halves.
+    const profile = kotProfile(384, "large");
+    const text = "** CANCELLED - SEE MANAGER **";
+    const rows: KotRow[] = [{ k: "line", align: "center", bold: true, size: "banner", text }];
+    const p = planKotRaster(rows, KOT_ATLAS, profile.ppem, profile.widthDots);
+    expect(kotTextWidth(KOT_ATLAS[`${profile.bannerPpem}b`]!, text)).toBeGreaterThan(384);
+    expect(draws(p).map((d) => [d.face.ppem, d.face.weight])[0]).toEqual([profile.ppem, 700]);
   });
 
   test("an ordinary docket is set entirely in one size", () => {
-    const p = plan(docket, 48);
-    expect(new Set(draws(p).map((d) => d.face.ppem))).toEqual(new Set([p.geometry.ppem]));
+    for (const size of SIZES) {
+      const p = plan(docket, 48, size);
+      expect(new Set(draws(p).map((d) => d.face.ppem))).toEqual(new Set([p.geometry.ppem]));
+    }
   });
 });
 
 describe("wrapping is measured in dots, because the type is proportional", () => {
-  const face = KOT_ATLAS["40b"]!;
+  // The standard 80mm dish-name face — the one a docket wraps most often in.
+  const face = KOT_ATLAS["28b"]!;
 
   test("a word that fits stays on its line; one that does not moves down whole", () => {
     const lines = kotWrap(face, "Ghewar Berry Mousse", 200);
@@ -356,9 +529,14 @@ describe("the bytes", () => {
     expect(b.subarray(b.length - 6)).toEqual(Buffer.from([0x0a, 0x0a, 0x0a, 0x1d, 0x56, 0x00]));
   });
 
-  for (const [name, opts] of variants) {
-    for (const cols of [48, 32]) {
-      test(`${name} is one run of GS v 0 blocks, none taller than the logo cap — ${cols === 48 ? "80mm" : "58mm"}`, () => {
+  for (const [name, opts] of [
+    ...variants,
+    ["the reference docket at small", { ...docket, kotTextSize: "small" }],
+    ["the reference docket at large", { ...docket, kotTextSize: "large" }],
+    ["a long name with a hold and a note at large", { ...stress, kotTextSize: "large" }],
+  ] as [string, ReceiptOptions][]) {
+    for (const cols of ROLLS) {
+      test(`${name} is one run of GS v 0 blocks, none taller than the logo cap — ${rollName(cols)}`, () => {
         const b = raster(opts, cols);
         const p = plan(opts, cols);
         const stride = (p.widthDots + 7) >> 3;
@@ -389,8 +567,11 @@ describe("the bytes", () => {
 
   test("a docket is deterministic — render it twice, same sha256", () => {
     for (const [, opts] of variants) {
-      for (const cols of [48, 32]) {
-        expect(sha(raster(opts, cols))).toBe(sha(raster(opts, cols)));
+      for (const cols of ROLLS) {
+        for (const size of SIZES) {
+          const at = { ...opts, kotTextSize: size };
+          expect(sha(raster(at, cols))).toBe(sha(raster(at, cols)));
+        }
       }
     }
   });
@@ -405,15 +586,18 @@ describe("the bytes", () => {
 
   test("a docket is well under the print-job payload cap", () => {
     for (const [, opts] of variants) {
-      expect(buildReceiptBase64(opts, 48).length).toBeLessThan(200_000);
+      for (const size of SIZES) {
+        expect(buildReceiptBase64({ ...opts, kotTextSize: size }, 48).length).toBeLessThan(200_000);
+      }
     }
   });
 
   /**
    * WHAT THE BIGGER TYPE COSTS, WRITTEN DOWN RATHER THAN LEFT TO BE DISCOVERED.
    *
-   * A bitmap docket is ~3.9KB of base64 per printed line on the 80mm roll; the
-   * text docket is ~40 bytes. print_jobs.ts caps a PERSISTED payload at
+   * A bitmap docket is ~3.3KB of base64 per printed line on the 80mm roll at
+   * the standard size (~2.8KB small, ~4.0KB large); the text docket is ~40
+   * bytes. print_jobs.ts caps a PERSISTED payload at
    * PRINT_JOB_MAX_B64_CHARS (2,000,000 by default, an env int). Over the cap a
    * job is still emitted live — it prints — but it is not stored, so it cannot
    * be replayed to a till that was offline when it was fired.
@@ -427,22 +611,71 @@ describe("the bytes", () => {
     const CAP = 2_000_000; // print_jobs.ts PRINT_JOB_MAX_B64_CHARS default
     const lines = (n: number, name: (i: number) => string, note?: string) =>
       Array.from({ length: n }, (_, i) => ({ name: name(i), quantity: 1, price: 0, ...(note ? { note } : {}) }));
-    const size = (items: ReceiptOptions["items"]) => buildReceiptBase64({ ...docket, items }, 48).length;
+    const size = (items: ReceiptOptions["items"], kotTextSize: KotTextSize = "standard") =>
+      buildReceiptBase64({ ...docket, kotTextSize, items }, 48).length;
 
-    // A dish per line, no wrap: an ordinary ticket, however long the order.
-    expect(size(lines(50, (i) => `Roti ${i}`))).toBeLessThan(CAP / 4);
-    expect(size(lines(150, (i) => `Roti ${i}`))).toBeLessThan(CAP / 2);
+    // A dish per line, no wrap: an ordinary ticket, however long the order —
+    // even at the largest size.
+    for (const s of SIZES) {
+      expect(size(lines(50, (i) => `Roti ${i}`), s)).toBeLessThan(CAP / 4);
+      expect(size(lines(150, (i) => `Roti ${i}`), s)).toBeLessThan(CAP / 2);
+    }
     // The worst case that can actually be ordered: every line a name that wraps
-    // twice AND a note that wraps. This is the shape that crosses the cap, and
-    // it does so somewhere between 50 and 100 lines ON ONE STATION'S DOCKET.
-    const worst = (n: number) => size(lines(n, (i) => `Chargrilled Tandoori Broccoli Malai with Burnt Garlic and Extra Cheese ${i}`, "no onion, extra spicy, serve last with the mains"));
-    expect(worst(25)).toBeLessThan(CAP);
-    expect(worst(50)).toBeLessThan(CAP);
-    expect(worst(100)).toBeGreaterThan(CAP);
+    // twice AND a note that wraps. This is the shape that crosses the cap ON ONE
+    // STATION'S DOCKET — somewhere between 100 and 150 lines at the standard
+    // size, and between 50 and 100 at 'large', the heaviest setting.
+    const worst = (n: number, s: KotTextSize) => size(lines(n, (i) => `Chargrilled Tandoori Broccoli Malai with Burnt Garlic and Extra Cheese ${i}`, "no onion, extra spicy, serve last with the mains"), s);
+    expect(worst(25, "large")).toBeLessThan(CAP);
+    expect(worst(50, "large")).toBeLessThan(CAP);
+    expect(worst(100, "large")).toBeGreaterThan(CAP);
+    expect(worst(100, "standard")).toBeLessThan(CAP);
+    expect(worst(150, "standard")).toBeGreaterThan(CAP);
   });
 });
 
 describe("the printed docket really carries the words", () => {
+  const REFERENCE_PAPER = [
+    "Running Table",
+    "KOT",
+    "08/09/26 14:13",
+    "KOT - 21",
+    "Dine In: DOME SECTION",
+    "Table No: 33",
+    "Persons - 4",
+    "<RULE>",
+    "Assign to: yado",
+    "Captain: TIYASHA",
+    "<RULE>",
+    "No.Item Qty",
+    "1 Subz Tehri 1",
+    "2 Ghewar Berry Mousse 1",
+    "3 Gaia Rose Cookies 1",
+    "[Note] Hold Dessert",
+    "<RULE>",
+    "Total Qty 3",
+    "<RULE>",
+  ];
+
+  test("the reference docket reads back, line for line, at every size that fits it unwrapped", () => {
+    // Every size on 80mm, and small/standard on 58mm (large on 58mm wraps
+    // "Ghewar Berry Mousse", which is the next test's business).
+    for (const [cols, size] of [[48, "small"], [48, "standard"], [48, "large"], [32, "small"], [32, "standard"]] as [number, KotTextSize][]) {
+      const lines = readKotRaster(buildReceiptBase64({ ...docket, kotTextSize: size }, cols), cols * 12, rollPpems(cols, size));
+      expect({ cols, size, paper: lines.map((l) => l.text) }).toEqual({ cols, size, paper: REFERENCE_PAPER });
+      expect(lines.filter((l) => l.leftover !== 0)).toEqual([]);
+    }
+  });
+
+  test("a held dish reads back as the marker alone, under its name", () => {
+    const b64 = buildReceiptBase64({ ...stress, kotTextSize: "standard" }, 48);
+    const paper = readKotRaster(b64, 576, rollPpems(48)).map((l) => l.text);
+    const dish = paper.indexOf("2 Ghewar Berry Mousse 2");
+    expect(dish).toBeGreaterThan(-1);
+    expect(paper[dish + 1]).toBe("[Hold]");
+    expect(paper.join("\n")).not.toMatch(/do not cook/i);
+    expect(paper).toContain("Hold Qty 2");
+  });
+
   test("the reference docket reads back, line for line, off its own bitmap", () => {
     const lines = readKotRaster(buildReceiptBase64(docket, 48), 576, rollPpems(48));
     expect(lines.map((l) => l.text)).toEqual([
@@ -487,10 +720,10 @@ describe("the printed docket really carries the words", () => {
     expect(name.x1 - name.x0).toBeGreaterThan(kotTextWidth(name.face, "Tikka"));
   });
 
-  test("the 58mm docket reads back too, with the long name wrapped", () => {
-    const paper = kotPaper(buildReceiptBase64(docket, 32), 32);
+  test("the 58mm docket at 'large' reads back too, with the long name wrapped under itself", () => {
+    const paper = kotPaper(buildReceiptBase64({ ...docket, kotTextSize: "large" }, 32), 32, "large");
     expect(paper).toContain("Table No: 33");
-    expect(paper).toContain("Ghewar Berry");
+    expect(paper).toContain("2 Ghewar Berry 1\nMousse\n3 Gaia Rose Cookies 1");
     expect(paper).toContain("Total Qty 3");
   });
 });
@@ -600,29 +833,60 @@ describe("the TrueType half is dev-time only", () => {
  * Re-pin these DELIBERATELY, and only with a rendered picture in hand: this is
  * the document the kitchen cooks from, and a silent change to it is a silent
  * change to what comes out of the pass.
+ *
+ * Last re-pinned for the text-size setting (standard = the client's reference
+ * photograph, 28 dots per em on 80mm; was 40) and for the hold line saying only
+ * "[Hold]". Every variant is the STANDARD size — what a restaurant that never
+ * opens the setting prints — and the reference docket is pinned at all three.
  */
 describe("the reference docket's committed bytes", () => {
+  const SIZE_GOLDEN: Record<string, string> = {
+    "small @48": "34808:0d6c89ca7bf0e76a2423b2e4c415279ebe5bbee030336e706c344d536cfa9d08",
+    "standard @48": "40784:d810dadb6efe8df4636c7a49ba9f419f7e025795010c980bfaed243dc526f06b",
+    "large @48": "50288:e718d8b2a105ab9f847b2f58b88a418b8a96af268586d5848a1e11ca9afd0be3",
+    "small @32": "21576:4ff27e96952fa93517b045186ec67a0bc22e7562e82316e46fa74a573e8c336d",
+    "standard @32": "23216:f1b4a208e56f55f3802fe8597f0c2fa220e8e9a97f3f155089b6033e5e4ddb3e",
+    "large @32": "28832:1d8106674b8efbddeae987aa7952986c30b6188104823f278858a3a8c599c761",
+  };
+
+  test("the reference docket at every size, both rolls", () => {
+    const actual: Record<string, string> = {};
+    for (const size of SIZES) {
+      for (const cols of ROLLS) {
+        const b = bytes(buildReceiptBase64({ ...docket, kotTextSize: size }, cols));
+        actual[`${size} @${cols}`] = `${b.length}:${sha(b)}`;
+      }
+    }
+    expect(actual).toEqual(SIZE_GOLDEN);
+  });
+
+  test("the unset size and 'standard' are the same bytes", () => {
+    for (const cols of ROLLS) {
+      expect(buildReceiptBase64(docket, cols)).toBe(buildReceiptBase64({ ...docket, kotTextSize: "standard" }, cols));
+    }
+  });
+
   const RASTER_GOLDEN: Record<string, string> = {
-    "the reference docket @48": "58720:24e0619fc0f6947b6e621a51973b08ed906e81d186dfd59971e18da4634c847a",
-    "the reference docket @32": "33104:2a0f80fe2e75e7c420d7fa48cf8ec91c8da21a07e99cc1be8faefe8b0a919325",
-    "a long name with a hold and a note @48": "95456:599c1180d5b008e576ab2d6af540da610a7e9f7c8af56d11c49f2ec05e98f5f9",
-    "a long name with a hold and a note @32": "56928:9d49c98e26d7cc38b6f00f401c30a440db4b049a707d02f485f0d9908a3a6ac4",
-    "a reprint @48": "100136:0e420c45f4c2aea26a126a2ab440c9ceb981dc4ef6b6d0e5a70a483c4aeab624",
-    "a reprint @32": "59240:aa2f0a84a45e717d2958edecc8bc15b7c9d843371d2f02adab94d6e180a3307f",
-    "a cancellation @48": "108640:e1202db9295c2cde37766fe5541e49ec7aac572838b20c57e78a780064d4ad62",
-    "a cancellation @32": "63512:4f577ab7058f0a72a96296b309d67142299186012e029c5f6081d454340ec4f9",
-    "a per-station docket @48": "62248:aa18da8a3e9d544731751363d5e1ee1f4f8023bf99a3bcda4086ac78edfc902a",
-    "a per-station docket @32": "34888:67ffcd191d6e39c4434b4b041c863c2f156b520e9f805a63f9b5d18a85b1aaf4",
-    "an empty ticket @48": "44600:ea5bbf8695dc165ff0af95b198d158fe9c77a8ee460b363771e76ae82c450ba1",
-    "an empty ticket @32": "22440:9b7a1fd2318d52a082eddd284101f38b5462fbc82e4fa6355b7c8a65fc7a6e49",
-    "an unnumbered, unassigned ticket @48": "46688:f430934963dc058304d56fedab034babea7c5fd4997a5ef94efd7a50f0113bee",
-    "an unnumbered, unassigned ticket @32": "27056:a7e06e49b1fc093489b01522db825dfb5550892087b99976b2360829b5d6e0a1",
-    "an unbroken 60-character token @48": "55192:9d64f0997f0d9da91bfce538fd8e03270eec2e6b9ef8089ba112d4274b245dbf",
-    "an unbroken 60-character token @32": "27776:7e3d5131c6f556c134e23fec724a8339bfd17a12feac36e155b1a4979cde3ad8",
-    "a four-digit quantity @48": "48128:7aecb7d0dae9af66b679c8cc8b04480faa6ebd7dea7b2e4392c1e2282145c595",
-    "a four-digit quantity @32": "24224:c33dee0f6f61a5c8468182e2232d3083b71f5618720a7c298c10a81b6bc53f78",
-    "a name folded from non-ASCII @48": "51656:d1dd68912cd4c88f78730d663a17e6cc5c15a1e47695d6c920d0554ac0512906",
-    "a name folded from non-ASCII @32": "26000:f3d88b5af03c55f34d12ef00416e1bf4448ad324335bd0e10f6de6527333a6ab",
+    "the reference docket @48": "40784:d810dadb6efe8df4636c7a49ba9f419f7e025795010c980bfaed243dc526f06b",
+    "the reference docket @32": "23216:f1b4a208e56f55f3802fe8597f0c2fa220e8e9a97f3f155089b6033e5e4ddb3e",
+    "a long name with a hold and a note @48": "58936:4e7242563bb85846a9af1bcbe4cdf3358c669261231bfc2d89d19fe832c503ce",
+    "a long name with a hold and a note @32": "36328:960a41bfb8b4957f105a0650f049b7cd1310d25fd896a1e42a2278007d6ce0a6",
+    "a reprint @48": "62176:e694f6407e0c2d0030f44bdafc282ca33b26b4fee1e5ddce6ad1fba0b1ecdc2e",
+    "a reprint @32": "38200:492043ee8490b9b812cf1b726b3d34e02c7b7ccef7afc78b67507140221d700d",
+    "a cancellation @48": "65632:9bb34f4af8362231663937c6a56dc24d2b49fdcee3690a3a1b53348168e6d4b8",
+    "a cancellation @32": "41560:9a37a38c0d3b1495b9ec064ed5e0e91280b6dee5f8cb106938ebf41878a02f2f",
+    "a per-station docket @48": "43232:08202a6648ebdeba300a298b343df8a8764238793124abbdba87ad7d6918cf85",
+    "a per-station docket @32": "24608:70e5836e303cda6b2b7c5e68f0862f3ba4689d601783f6dd0d64d44f43eeef2e",
+    "an empty ticket @48": "30984:1b67c63b439919ead4bf6faa6a173da1ade10500b77b10c45aa00433caae985e",
+    "an empty ticket @32": "17640:c0fdbfd42dd053052369566d63d2770f553b6e5b8686884396c3f7434648f7e6",
+    "an unnumbered, unassigned ticket @48": "32424:e2ca1f072cb0ee5ad6b16f6eaa829fb8e3e4aa2ebf8e848f51c417d97f0d3b74",
+    "an unnumbered, unassigned ticket @32": "18456:2f65017a21eb1492ef051696acf75978be1f49a60b81730a71770e7f7a484e4d",
+    "an unbroken 60-character token @48": "35888:557d8fe58aee044c0e76dc6c121c5e3f71499f415540d6baeca93813ee8d2545",
+    "an unbroken 60-character token @32": "21816:c783c6c91ff9deb994fdae4aeec06b1ff79b578b5e5b021d97aad495a69e3938",
+    "a four-digit quantity @48": "33432:6b0ea96d2972534820389d57446f618273ead1b0351904dab8e371565c5914ef",
+    "a four-digit quantity @32": "19032:d91fdae8a675eb89f3a84dd79b2d39f0dc252ff62141d07dbca6fe0685e57e3b",
+    "a name folded from non-ASCII @48": "33432:2754c2ed9410b1935fb6ee86c52c2a4403b29cabefdd55c252340cd50ecc3a93",
+    "a name folded from non-ASCII @32": "19032:ef6d47b7b6e63bf18fd4b85ae716e78341579a646af7b2c2a5573a769023cd02",
   };
 
   test("every variant, both rolls", () => {

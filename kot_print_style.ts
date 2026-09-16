@@ -104,3 +104,72 @@ export function parseKotPrintStyle(raw: unknown): KotPrintStyle | null {
   const token = raw.trim().toLowerCase();
   return (KOT_PRINT_STYLES as readonly string[]).includes(token) ? (token as KotPrintStyle) : null;
 }
+
+/* ===========================================================================
+ * HOW BIG THE REFERENCE DOCKET'S TYPE IS ("Restaurant".kot_text_size)
+ *
+ * The client, after living with the reference docket: "The font sizes must be
+ * smaller in the KOT." The first cut set body type at 40 dots per em on the
+ * 80mm roll, because they had asked for BIGGER type twice before that — so the
+ * honest reading is that different kitchens want different things, and the
+ * answer is a per-restaurant choice rather than a third constant.
+ *
+ *   'small'     — a size down from the client's reference ticket.
+ *   'standard'  — the client's reference ticket, dot for dot (28 dots per em on
+ *                 80mm). What NULL, a missing column and anything unrecognised
+ *                 read as.
+ *   'large'     — a size up, for a pass read from further away.
+ *
+ * THE SIZES THEMSELVES LIVE IN escpos.ts (kotProfile), next to the atlas that
+ * has to contain every one of them; this module only knows the three words.
+ *
+ * IT APPLIES TO THE REFERENCE DOCKET ONLY. The classic text docket is set in the
+ * printer's own built-in font, which has no sizes worth offering (integer
+ * multiples of a 12x24 cell), so a restaurant on 'classic' keeps exactly the
+ * bytes it has always printed whatever this says. The settings screens say so.
+ *
+ * Same rules as the style above, for the same reasons: READS forgive anything
+ * and answer the default (this runs on the path that puts paper on the pass),
+ * WRITES refuse anything that is not one of the three words (a save that
+ * reported success while storing nothing is a save nobody re-checks).
+ * =========================================================================== */
+
+/** How large the reference docket's type is. Three values; see above. */
+export type KotTextSize = "small" | "standard" | "large";
+
+/**
+ * What a restaurant that has never chosen gets: the client's reference ticket.
+ *
+ * NOT 'small', even though "smaller" is what the client asked for. 'standard'
+ * is defined AS their reference photograph, which is already a step down from
+ * the docket they were complaining about; an owner who wants smaller still can
+ * say so in Settings.
+ */
+export const KOT_TEXT_SIZE_DEFAULT: KotTextSize = "standard";
+
+/** Every accepted value, smallest first — the order a picker offers them in. */
+export const KOT_TEXT_SIZES: readonly KotTextSize[] = ["small", "standard", "large"];
+
+/**
+ * READ a stored (or transmitted) size. Anything that is not exactly a known size
+ * becomes the default — a NULL, a column that does not exist yet (42703), a value
+ * from a future version, a typo made in psql. Case and whitespace are ignored.
+ */
+export function normalizeKotTextSize(raw: unknown): KotTextSize {
+  const token = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  return (KOT_TEXT_SIZES as readonly string[]).includes(token)
+    ? (token as KotTextSize)
+    : KOT_TEXT_SIZE_DEFAULT;
+}
+
+/**
+ * WRITE a size an owner sent. `null` means "not a size I can store" — and an
+ * absent key means the same, which every caller reads as "not in this request".
+ * The route turns a non-null refusal into a 400 naming the three sizes.
+ */
+export function parseKotTextSize(raw: unknown): KotTextSize | null {
+  if (raw === undefined || raw === null) { return null; }
+  if (typeof raw !== "string") { return null; }
+  const token = raw.trim().toLowerCase();
+  return (KOT_TEXT_SIZES as readonly string[]).includes(token) ? (token as KotTextSize) : null;
+}

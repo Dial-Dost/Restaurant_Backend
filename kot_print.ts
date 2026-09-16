@@ -52,6 +52,7 @@ import { logger } from "./observability.js";
 import { dispatchPrintJob } from "./print_routing.js";
 import {
   GetKotPrintStyle,
+  GetKotTextSize,
   GetMenuItems,
   GetOrderKotContext,
   GetRestaurantProfile,
@@ -483,6 +484,16 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
   // dispatchPrintJob anyway. Swallowing it here would only trade a clear failure
   // for a docket that might be blank.
   const kotPrintStyle = await GetKotPrintStyle(input.restaurantId);
+  // HOW LARGE THE REFERENCE DOCKET'S TYPE IS, resolved here for exactly the
+  // reasons above — one funnel, nothing for a caller to forget, never throws
+  // (see loadKotTextSize). Read even for a 'classic' restaurant: the text
+  // docket ignores it, and resolving it unconditionally keeps every docket's
+  // options object the same shape whichever style the owner picked.
+  //
+  // SEQUENTIAL, NOT Promise.all with the style. Two single-row reads are cheap;
+  // two pooled connections held at once per docket, on the path every order
+  // takes, is the wrong shape for a small session pooler.
+  const kotTextSize = await GetKotTextSize(input.restaurantId);
 
   // ONE NUMBER FOR THE WHOLE KOT. A ticket with no table id cannot be keyed
   // (see GetOrderKotContext) — it prints unnumbered rather than sharing the
@@ -552,6 +563,9 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     // like `cancelled` below: an ordinary docket's style is exactly the thing
     // that must never be left to a default two layers away.
     kotPrintStyle,
+    // …and the owner's type size, on every docket for the same reason. Only the
+    // reference docket reads it (see ReceiptOptions.kotTextSize).
+    kotTextSize,
     // Set ONLY on a cancellation slip. Spread-conditional rather than
     // `cancelled: false` so an ordinary docket's options object is byte-for-byte
     // the object it was before this field existed.

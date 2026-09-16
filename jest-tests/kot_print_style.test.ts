@@ -34,8 +34,12 @@ import { join } from "node:path";
 import {
   KOT_PRINT_STYLES,
   KOT_PRINT_STYLE_DEFAULT,
+  KOT_TEXT_SIZES,
+  KOT_TEXT_SIZE_DEFAULT,
   normalizeKotPrintStyle,
+  normalizeKotTextSize,
   parseKotPrintStyle,
+  parseKotTextSize,
 } from "../kot_print_style";
 
 const RES = "11111111-1111-4111-8111-111111111111";
@@ -44,6 +48,8 @@ const TABLE = "33333333-3333-4333-8333-333333333333";
 
 /** What GetKotPrintStyle answers for this test. */
 const mockStyle: { value: string } = { value: "reference" };
+/** What GetKotTextSize answers for this test. */
+const mockSize: { value: string } = { value: "standard" };
 /**
  * Every ReceiptOptions handed to the renderer.
  *
@@ -76,6 +82,9 @@ jest.mock("../database_supabase", () => {
     // this function has already normalized, and it is loadKotPrintStyle's job to
     // do so. kot_print_style_column.test.ts drives the real one over SQL.
     GetKotPrintStyle: () => Promise.resolve(mockStyle.value),
+    // The type size, on the same terms — kot_print_style_column.test.ts drives
+    // the real read.
+    GetKotTextSize: () => Promise.resolve(mockSize.value),
     // Two dishes on two stations, so a single dispatch produces TWO dockets and
     // the per-station split is actually exercised.
     GetMenuItems: () => Promise.resolve([
@@ -125,6 +134,7 @@ beforeEach(async () => {
     process.env.SUPABASE_DIRECT_URL || "postgres://fixture:fixture@localhost:5432/fixture";
   if (!kp) { kp = await import("../kot_print"); }
   mockStyle.value = "reference";
+  mockSize.value = "standard";
   mockReceipts.length = 0;
 });
 
@@ -197,6 +207,31 @@ describe("the vocabulary", () => {
     expect(parseKotPrintStyle("REFERENCE")).toBe("reference");
   });
 
+  test("text size: a read forgives anything and answers 'standard'", () => {
+    // The same deploy-window and hand-typed cases as the style, on the same path.
+    for (const raw of [null, undefined, "", "   ", "medium", "smaller", "x-large", 7, true, {}, []]) {
+      expect(normalizeKotTextSize(raw)).toBe(KOT_TEXT_SIZE_DEFAULT);
+    }
+    expect(KOT_TEXT_SIZE_DEFAULT).toBe("standard");
+    expect(normalizeKotTextSize(" Small ")).toBe("small");
+    expect(normalizeKotTextSize("LARGE")).toBe("large");
+    expect(normalizeKotTextSize("standard")).toBe("standard");
+  });
+
+  test("text size: a write refuses anything that is not a size, and an absent key is no change", () => {
+    for (const raw of ["", "  ", "medium", "Small please", 24, true, {}, null, undefined]) {
+      expect(parseKotTextSize(raw)).toBeNull();
+    }
+    expect(parseKotTextSize("small")).toBe("small");
+    expect(parseKotTextSize(" STANDARD ")).toBe("standard");
+    expect(parseKotTextSize("large")).toBe("large");
+  });
+
+  test("there are exactly three sizes, smallest first, and the default is the middle one", () => {
+    expect([...KOT_TEXT_SIZES]).toEqual(["small", "standard", "large"]);
+    expect(KOT_TEXT_SIZES).toContain(KOT_TEXT_SIZE_DEFAULT);
+  });
+
   test("there are exactly two styles, and the default is one of them", () => {
     // A third value would have to be taught to the renderer, the column, the
     // settings screen and the undo table in the same commit; this is where that
@@ -245,6 +280,47 @@ describe("every docket carries the restaurant's style", () => {
     const { kotPrintStyle: _a, ...referenceRest } = reference;
     const { kotPrintStyle: _b, ...classicRest } = classic;
     expect(classicRest).toEqual(referenceRest);
+  });
+});
+
+describe("every docket carries the restaurant's text size", () => {
+  test("the default reaches the renderer as a real value", async () => {
+    const { options } = await dispatch();
+    expect(options.kotTextSize).toBe("standard");
+  });
+
+  test("a restaurant that chose 'small' gets it on every station ticket", async () => {
+    mockSize.value = "small";
+    const { options, result } = await dispatch();
+    expect(options.kotTextSize).toBe("small");
+    expect(result.tickets).toBe(2);
+  });
+
+  test("…and on the cancellation slip", async () => {
+    mockSize.value = "large";
+    const { options } = await dispatch({ cancelled: true, neverAllocate: true, contextLine: "*** REASON: SPILLED ***" });
+    expect(options.kotTextSize).toBe("large");
+  });
+
+  test("it is resolved even for a classic restaurant, so the options are the same shape either way", async () => {
+    // The classic docket ignores it (escpos.test.ts pins those bytes at every
+    // size); resolving it unconditionally means a style flip is still the ONLY
+    // difference between the two options objects, as the test above demands.
+    mockStyle.value = "classic";
+    mockSize.value = "small";
+    const { options } = await dispatch();
+    expect(options.kotPrintStyle).toBe("classic");
+    expect(options.kotTextSize).toBe("small");
+  });
+
+  test("the size is the ONLY thing that changes between two sizes", async () => {
+    mockSize.value = "small";
+    const small = (await dispatch()).options;
+    mockSize.value = "large";
+    const large = (await dispatch()).options;
+    const { kotTextSize: _a, ...smallRest } = small;
+    const { kotTextSize: _b, ...largeRest } = large;
+    expect(largeRest).toEqual(smallRest);
   });
 });
 
@@ -299,14 +375,14 @@ describe("nothing builds a KOT without a style", () => {
    * they are a named object built just above it (kot_print.ts's renderOptions),
    * in which case the object's own body is what has to carry the field.
    */
-  function handsAStyle(src: string, args: string): boolean {
-    if (args.includes("kotPrintStyle")) { return true; }
+  function handsAStyle(src: string, args: string, field = "kotPrintStyle"): boolean {
+    if (args.includes(field)) { return true; }
     const named = /^\s*([A-Za-z_$][\w$]*)\s*[,)]?/.exec(`${args},`);
     const name = named?.[1];
     if (!name) { return false; }
     const declaration = new RegExp(`\\bconst ${name}\\b[^=]*=\\s*\\{`).exec(src);
     if (!declaration) { return false; }
-    return balanced(src, declaration.index + declaration[0].length, "{", "}").includes("kotPrintStyle");
+    return balanced(src, declaration.index + declaration[0].length, "{", "}").includes(field);
   }
 
   test("every caller of buildKotBase64 hands it a style", () => {
@@ -331,6 +407,31 @@ describe("nothing builds a KOT without a style", () => {
     }
   });
 
+  test("every caller of buildKotBase64 hands it a text size too", () => {
+    // The same guard for the size. A caller that forgot it would not print blank
+    // paper — it would print the standard size at a kitchen that asked for
+    // another — but "the setting does nothing on this path" is the same defect.
+    for (const caller of ["kot_print.ts", "routes/printing.ts"]) {
+      const src = read(caller);
+      for (const args of callArguments(src)) {
+        expect({ caller, args, handsASize: handsAStyle(src, args, "kotTextSize") }).toMatchObject({ handsASize: true });
+      }
+    }
+  });
+
+  test("dispatchKot and the printer test slip resolve the size themselves", () => {
+    const kp = read("kot_print.ts");
+    expect(kp).toContain("const kotTextSize = await GetKotTextSize(input.restaurantId);");
+    expect(kp).not.toMatch(/textSize\?:/);
+    expect(read("routes/printing.ts")).toContain("const kotTextSize = await GetKotTextSize(ctx.restaurantId);");
+  });
+
+  test("the reference docket's profile is built from the size the options carry", () => {
+    // The one line where the setting meets the type. Without it every docket is
+    // standard whatever the owner picked, and nothing else would fail.
+    expect(read("escpos.ts")).toContain("const profile = kotProfile(width * DOTS_PER_COL, opts.kotTextSize);");
+  });
+
   test("dispatchKot resolves the style itself rather than taking it from a caller", () => {
     // Every KOT path in the product funnels through dispatchKot. Resolving here
     // is what makes the switch impossible for a caller to forget — so a future
@@ -347,6 +448,13 @@ describe("nothing builds a KOT without a style", () => {
     // started naming the fields it forwards, a five-station order would have
     // four dockets whose style is whatever the renderer defaults to.
     expect(read("escpos.ts")).toContain("buildReceiptBase64({ ...opts, kind: \"kot\", station, items }, width)");
+  });
+
+  test("escpos.ts knows exactly the text sizes kot_print_style.ts does", () => {
+    const declaration = /kotTextSize\?:\s*([^;]+);/.exec(read("escpos.ts"));
+    expect(declaration).not.toBeNull();
+    const declared = (declaration?.[1] ?? "").split("|").map((s) => s.trim().replace(/^"|"$/g, ""));
+    expect(declared.sort()).toEqual([...KOT_TEXT_SIZES].sort());
   });
 
   test("escpos.ts knows exactly the styles kot_print_style.ts does", () => {
@@ -375,6 +483,20 @@ describe("the column is created at runtime, and the setting can be undone", () =
     // kot_print_style_migration.test.ts holds this statement against the
     // migration file, which lands in a commit of its own.
     expect(read("database_supabase.ts")).toContain('alter table "Restaurant" add column if not exists kot_print_style text`');
+  });
+
+  test("the runtime DDL creates the text-size column with no default, after the style's", () => {
+    // AFTER, because the style is the escape hatch: if this second statement
+    // fails on its own, the first has already run.
+    const src = read("database_supabase.ts");
+    const style = src.indexOf('alter table "Restaurant" add column if not exists kot_print_style text`');
+    const size = src.indexOf('alter table "Restaurant" add column if not exists kot_text_size text`');
+    expect(style).toBeGreaterThan(-1);
+    expect(size).toBeGreaterThan(style);
+  });
+
+  test("the text size can be undone too", () => {
+    expect(read("database_supabase.ts")).toContain('kot_text_size: { column: "kot_text_size"');
   });
 
   test("an undo can restore the setting", () => {

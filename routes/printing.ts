@@ -128,6 +128,7 @@ import {
 	Audit_log_category,
 	DeletePrintDestination,
 	GetKotPrintStyle,
+	GetKotTextSize,
 	GetPrintDeviceTargets,
 	GetRestaurantProfile,
 	ListPrintDestinations,
@@ -1139,6 +1140,9 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 		// button exists to rule out. It is also the fastest way to CHECK the switch:
 		// flip to Classic, press test, read the paper.
 		const kotPrintStyle = await GetKotPrintStyle(ctx.restaurantId);
+		// And at the restaurant's own type size, for the same reason: an owner who
+		// has just picked "Small" presses this to see what the kitchen will get.
+		const kotTextSize = await GetKotTextSize(ctx.restaurantId);
 		const stamp = new Date();
 		const results: Record<string, unknown>[] = [];
 		for (const role of roles) {
@@ -1161,6 +1165,7 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 				orderContext: "Printer test",
 				station,
 				kotPrintStyle,
+				kotTextSize,
 			}, TEST_SLIP_COLS)[0];
 			if (!ticket) { continue; }
 			// bill_id is TEXT and is the handle a human uses to find this job in the

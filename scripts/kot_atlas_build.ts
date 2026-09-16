@@ -16,16 +16,33 @@ import { join } from "node:path";
 import { parseTtf, rasterizeGlyph, type ParsedFont } from "./kot_ttf.js";
 
 /**
- * The only type sizes that exist, in printer dots per em.
+ * The only faces that exist: a size in printer dots per em, and the weights it
+ * is baked in.
  *
- * 40 is the body of an 80mm (576-dot) docket and 30 the body of a 58mm
- * (384-dot) one; 56 and 42 are the 1.4x banners REPRINT and CANCELLED are set
- * in. They are `kotProfile()` in escpos.ts, spelled out here because this
- * script must be runnable before the atlas it generates exists — and
- * kot_raster.test.ts asserts the two lists still agree, so a new roll width
- * cannot quietly ship without its faces.
+ * BODY SIZES, in both weights (a dish name is bold, everything else is not):
+ *   80mm (576 dots)  small 24, standard 28, large 34
+ *   58mm (384 dots)  small 22, standard 24, large 28
+ * BANNER SIZES, bold only — REPRINT and CANCELLED at 1.4x the body, rounded,
+ * and never set in any other weight (escpos.ts kotRunFace):
+ *   80mm  34, 39, 48          58mm  31, 34, 39
+ * A size that is both (34, 28 → 39) is baked once, in every weight either use
+ * needs.
+ *
+ * They are `KOT_BODY_PPEM` / `kotAtlasFaces()` in escpos.ts, spelled out here
+ * because this script must be runnable before the atlas it generates exists —
+ * and kot_raster.test.ts asserts this list IS kotAtlasFaces(), so a new size
+ * cannot ship without its faces and a dropped size cannot leave its faces
+ * behind as dead weight in the server's bundle.
  */
-export const KOT_ATLAS_PPEM = [30, 40, 42, 56] as const;
+export const KOT_ATLAS_FACES: readonly { ppem: number; weights: readonly ("r" | "b")[] }[] = [
+  { ppem: 22, weights: ["r", "b"] },
+  { ppem: 24, weights: ["r", "b"] },
+  { ppem: 28, weights: ["r", "b"] },
+  { ppem: 31, weights: ["b"] },
+  { ppem: 34, weights: ["r", "b"] },
+  { ppem: 39, weights: ["b"] },
+  { ppem: 48, weights: ["b"] },
+];
 
 /** ASCII only: everything else is folded to '?' by asciiSafe before it is set. */
 export const FIRST_CHAR = 32;
@@ -78,8 +95,8 @@ export function buildKotGlyphAtlas(fontDir: string): BuiltAtlas {
     b: parseTtf(join(fontDir, "LiberationSans-Bold.ttf")),
   };
   const atlas: BuiltAtlas = {};
-  for (const ppem of [...KOT_ATLAS_PPEM].sort((x, y) => x - y)) {
-    for (const key of ["r", "b"] as const) {
+  for (const { ppem, weights } of [...KOT_ATLAS_FACES].sort((x, y) => x.ppem - y.ppem)) {
+    for (const key of (["r", "b"] as const).filter((w) => weights.includes(w))) {
       atlas[`${ppem}${key}`] = buildFace(fonts[key], ppem, key === "b" ? 700 : 400);
     }
   }

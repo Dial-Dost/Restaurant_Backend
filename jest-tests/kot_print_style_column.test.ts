@@ -60,6 +60,13 @@ type StyleAnswer =
 const styleAnswer: { value: StyleAnswer } = { value: { kind: "value", value: null } };
 /** How many times the column was actually asked for. */
 const styleReads = { n: 0 };
+/**
+ * "Restaurant".kot_text_size, modelled the same way — its own cell, its own
+ * reads — because the whole point of its separate statement is that it can be
+ * missing or failing while the style is fine.
+ */
+const sizeAnswer: { value: StyleAnswer } = { value: { kind: "value", value: null } };
+const sizeReads = { n: 0 };
 
 /** One statement the code under test issued, and the connection it went out on. */
 interface Statement { sql: string; params: unknown[]; on: "pool" | "transaction" }
@@ -105,6 +112,16 @@ jest.mock("pg", () => {
     // after a save answer what the owner chose.
     if (q.includes("set kot_print_style")) {
       styleAnswer.value = { kind: "value", value: params[1] };
+      return [];
+    }
+    if (q.includes("select kot_text_size")) {
+      sizeReads.n += 1;
+      const a = sizeAnswer.value;
+      if (a.kind === "throw") { throw a.err; }
+      return [{ kot_text_size: a.value }];
+    }
+    if (q.includes("set kot_text_size")) {
+      sizeAnswer.value = { kind: "value", value: params[1] };
       return [];
     }
     if (q.includes('from "Restaurant" r')) {
@@ -154,12 +171,14 @@ beforeAll(async () => {
 beforeEach(() => {
   styleAnswer.value = { kind: "value", value: null };
   styleReads.n = 0;
+  sizeAnswer.value = { kind: "value", value: null };
+  sizeReads.n = 0;
   statements.length = 0;
 });
 
 /** A `pg` error for a column that is not there. */
-const undefinedColumn = (): Error & { code: string } =>
-  Object.assign(new Error(`column "kot_print_style" does not exist`), { code: "42703" });
+const undefinedColumn = (column = "kot_print_style"): Error & { code: string } =>
+  Object.assign(new Error(`column "${column}" does not exist`), { code: "42703" });
 
 describe("GetKotPrintStyle", () => {
   test("reads the restaurant's choice", async () => {
@@ -309,5 +328,141 @@ describe("SetRestaurantSettings stores the choice", () => {
     const saved = await db.SetRestaurantSettings(SLUG, { kot_print_style: "raster-v2" });
     expect(styleWrites()).toHaveLength(0);
     expect(saved.kot_print_style).toBe("classic");
+  });
+});
+
+// ============================================================================
+// "Restaurant".kot_text_size — how large the reference docket's type is
+// ============================================================================
+//
+// The same two halves as the style, with one extra property that is the reason
+// the size has a statement of its own: it can be missing or failing while the
+// style is fine, and the style — the escape hatch — must not notice.
+
+describe("GetKotTextSize", () => {
+  test("reads the restaurant's choice", async () => {
+    sizeAnswer.value = { kind: "value", value: "small" };
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("small");
+    expect(sizeReads.n).toBe(1);
+  });
+
+  test("NULL, and anything unrecognised, is the standard size — the client's reference ticket", async () => {
+    for (const value of [null, "", "medium", "SMALLER", 24]) {
+      sizeAnswer.value = { kind: "value", value };
+      await expect(db.GetKotTextSize(SLUG)).resolves.toBe("standard");
+    }
+  });
+
+  test("case and stray whitespace still select the size they name", async () => {
+    sizeAnswer.value = { kind: "value", value: " Large " };
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("large");
+  });
+
+  test("a column that does not exist yet reads as standard and never throws", async () => {
+    // The deploy window again: every KOT goes through this read.
+    sizeAnswer.value = { kind: "throw", err: undefinedColumn("kot_text_size") };
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("standard");
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("standard");
+  });
+
+  test("a failed read answers with the last size this process saw, then follows the database again", async () => {
+    sizeAnswer.value = { kind: "value", value: "large" };
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("large");
+    sizeAnswer.value = { kind: "throw", err: new Error("connection terminated unexpectedly") };
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("large");
+    sizeAnswer.value = { kind: "value", value: "small" };
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("small");
+  });
+
+  test("nothing is served from memory while the database can be read", async () => {
+    // An owner who picks "Small" and presses Print test must see small type.
+    sizeAnswer.value = { kind: "value", value: "standard" };
+    await db.GetKotTextSize(SLUG);
+    sizeAnswer.value = { kind: "value", value: "small" };
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("small");
+    expect(sizeReads.n).toBe(2);
+  });
+
+  test("A MISSING SIZE COLUMN NEVER TOUCHES THE STYLE: a classic kitchen stays classic", async () => {
+    // The reason the two columns are read by two statements. A database that
+    // has kot_print_style but not kot_text_size (the runtime DDL adds them in
+    // that order, and the second can fail alone) must still hand the escape
+    // hatch back exactly — a combined read would have 42703'd both.
+    styleAnswer.value = { kind: "value", value: "classic" };
+    sizeAnswer.value = { kind: "throw", err: undefinedColumn("kot_text_size") };
+    await expect(db.GetKotPrintStyle(SLUG)).resolves.toBe("classic");
+    await expect(db.GetKotTextSize(SLUG)).resolves.toBe("standard");
+    const reads = statements.map((s) => s.sql).filter((sql) => /select kot_/.test(sql));
+    expect(reads.some((sql) => sql.includes("kot_print_style") && sql.includes("kot_text_size"))).toBe(false);
+  });
+});
+
+/** Every statement that wrote the size, in order. */
+const sizeWrites = (): Statement[] => statements.filter((s) => s.sql.includes("set kot_text_size"));
+
+describe("SetRestaurantSettings stores the text size", () => {
+  test("choosing a size is WRITTEN, on the transaction's client", async () => {
+    await db.SetRestaurantSettings(SLUG, { kot_text_size: "small" });
+    const writes = sizeWrites();
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.sql).toContain(`update "Restaurant" set kot_text_size = $2 where id = $1`);
+    expect(writes[0]!.params).toEqual([RES, "small"]);
+    expect(writes[0]!.on).toBe("transaction");
+  });
+
+  test("…before the settings row, which stays the transaction's last statement", async () => {
+    await db.SetRestaurantSettings(SLUG, { kot_text_size: "large" });
+    const order = txnStatements();
+    const write = order.findIndex((s) => s.includes("set kot_text_size"));
+    const settingsRow = order.findIndex((s) => s.includes("auto_push_orders = coalesce"));
+    expect(write).toBeGreaterThan(0);
+    expect(settingsRow).toBeGreaterThan(write);
+    expect(settingsRow).toBe(order.length - 2);
+    expect(order[order.length - 1]).toMatch(/^COMMIT$/i);
+  });
+
+  test("the settings handed back say what was just stored", async () => {
+    const saved = await db.SetRestaurantSettings(SLUG, { kot_text_size: "large" });
+    expect(saved.kot_text_size).toBe("large");
+    // …and back to standard is just as much a write.
+    const again = await db.SetRestaurantSettings(SLUG, { kot_text_size: "standard" });
+    expect(sizeWrites().map((s) => s.params)).toEqual([[RES, "large"], [RES, "standard"]]);
+    expect(again.kot_text_size).toBe("standard");
+  });
+
+  test("a save that does not mention the size issues no size statement, and keeps the stored size", async () => {
+    sizeAnswer.value = { kind: "value", value: "small" };
+    const saved = await db.SetRestaurantSettings(SLUG, { currency: "INR" });
+    expect(sizeWrites()).toHaveLength(0);
+    expect(saved.kot_text_size).toBe("small");
+  });
+
+  test("a value that is not a size writes nothing", async () => {
+    sizeAnswer.value = { kind: "value", value: "large" };
+    const saved = await db.SetRestaurantSettings(SLUG, { kot_text_size: "huge" });
+    expect(sizeWrites()).toHaveLength(0);
+    expect(saved.kot_text_size).toBe("large");
+  });
+
+  test("the size and the style are separate writes, and one never carries the other", async () => {
+    await db.SetRestaurantSettings(SLUG, { kot_text_size: "small" });
+    expect(styleWrites()).toHaveLength(0);
+    statements.length = 0;
+    await db.SetRestaurantSettings(SLUG, { kot_print_style: "classic" });
+    expect(sizeWrites()).toHaveLength(0);
+    statements.length = 0;
+    const both = await db.SetRestaurantSettings(SLUG, { kot_print_style: "reference", kot_text_size: "large" });
+    expect(styleWrites().map((s) => s.params)).toEqual([[RES, "reference"]]);
+    expect(sizeWrites().map((s) => s.params)).toEqual([[RES, "large"]]);
+    expect([both.kot_print_style, both.kot_text_size]).toEqual(["reference", "large"]);
+  });
+
+  test("a style save still succeeds on a database that has no size column yet", async () => {
+    // The deploy window from the other side: the owner flips to classic, the
+    // size column is missing, and the save must neither fail nor lie.
+    sizeAnswer.value = { kind: "throw", err: undefinedColumn("kot_text_size") };
+    const saved = await db.SetRestaurantSettings(SLUG, { kot_print_style: "classic" });
+    expect(saved.kot_print_style).toBe("classic");
+    expect(saved.kot_text_size).toBe("standard");
   });
 });

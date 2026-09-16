@@ -251,6 +251,28 @@ describe("layoutKot — a hold prints where a note does", () => {
   };
   const heldRows = (extra: Partial<ReceiptOptions> = {}) => layoutKot({ ...held, ...extra }, P80);
 
+  test("THE HOLD LINE IS THE MARKER ALONE: '[Hold]', and nothing after it", () => {
+    // Client: "When an item is on hold, on the KOT it must only say 'hold' and
+    // NOT 'hold do not cook until fired'."
+    expect(KOT_HOLD_LINE).toBe("[Hold]");
+    const out = shapes(heldRows());
+    const dish = out.indexOf("num=2  name*=Gulab Jamun  qty=3");
+    expect(out[dish + 1]).toBe("name=[Hold]");
+    expect(words(heldRows())).not.toMatch(/do not cook|until fired/i);
+    // …and it is the same line at every text size.
+    for (const size of ["small", "standard", "large"]) {
+      expect(shapes(layoutKot(held, kotProfile(576, size)))).toEqual(out);
+    }
+  });
+
+  test("a CANCELLED slip keeps its own 'DO NOT COOK' line — a different message, untouched", () => {
+    // The hold marker lost its sentence; the cancellation did not. That line
+    // tells a kitchen to stop cooking a whole ticket, and it stays word for word.
+    const out = shapes(heldRows({ cancelled: true }));
+    expect(out[1]).toBe("C*  DO NOT COOK - THIS TICKET IS OFF");
+    expect(out).toContain("name=[Hold]");
+  });
+
   test("the held dish keeps its place and number, and [Hold] is the line directly under it", () => {
     const out = shapes(heldRows());
     const dish = out.indexOf("num=2  name*=Gulab Jamun  qty=3");

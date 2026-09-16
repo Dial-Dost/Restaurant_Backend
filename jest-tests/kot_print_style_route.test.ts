@@ -45,6 +45,7 @@ jest.mock("../database_supabase", () => {
       currency: "₹", bill_paper_width: "80mm", timezone: "Asia/Kolkata",
       auto_push_orders: true, kot_auto_print: true, bill_show_qr: true,
       kot_print_style: "reference",
+      kot_text_size: "standard",
       ...mockSettings.value,
     }),
     SetRestaurantSettings: (_id: string, opts: Record<string, unknown>) => {
@@ -54,6 +55,7 @@ jest.mock("../database_supabase", () => {
         // What the data layer would report back after the write: the stored
         // style, or the one it already had when this request did not touch it.
         kot_print_style: typeof opts.kot_print_style === "string" ? opts.kot_print_style : "reference",
+        kot_text_size: typeof opts.kot_text_size === "string" ? opts.kot_text_size : "standard",
       });
     },
     GetEmployeeDetailsFromEmpID: () => Promise.resolve({
@@ -227,6 +229,92 @@ describe("the change is audited", () => {
 
   test("a refused value is never audited — nothing happened", async () => {
     await postSettings({ kot_print_style: "raster" });
+    expect(mockAudits).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// kot_text_size — the reference docket's type size, on the same route
+// ============================================================================
+
+describe("GET /restaurant/settings carries the KOT text size", () => {
+  test("to an admin and to a cashier alike — the settings screens render it for both", async () => {
+    mockSettings.value = { kot_text_size: "small" };
+    expect((await getSettings()).body.kot_text_size).toBe("small");
+    expect((await getSettings(CASHIER)).body.kot_text_size).toBe("small");
+  });
+});
+
+describe("POST /restaurant/settings writes the KOT text size", () => {
+  test("each of the three sizes reaches the data layer", async () => {
+    for (const size of ["small", "standard", "large"]) {
+      mockSaved.length = 0;
+      const r = await postSettings({ kot_text_size: size });
+      expect(r.status).toBe(200);
+      expect(mockSaved[0]!.kot_text_size).toBe(size);
+    }
+  });
+
+  test("a value that is not a size is refused out loud, naming the sizes, and nothing is written", async () => {
+    for (const bad of ["medium", "", "  ", 24, true]) {
+      mockSaved.length = 0;
+      const r = await postSettings({ kot_text_size: bad });
+      expect(r.status).toBe(400);
+      expect(String(r.body.error)).toContain("small");
+      expect(String(r.body.error)).toContain("standard");
+      expect(String(r.body.error)).toContain("large");
+      expect(mockSaved).toHaveLength(0);
+    }
+  });
+
+  test("null and an absent key both mean 'unchanged'", async () => {
+    expect((await postSettings({ kot_text_size: null })).status).toBe(200);
+    expect(mockSaved[0]!.kot_text_size).toBeNull();
+    mockSaved.length = 0;
+    expect((await postSettings({ currency: "₹" })).status).toBe(200);
+    expect(mockSaved[0]!.kot_text_size).toBeUndefined();
+  });
+
+  test("a bad size refuses the whole request, even beside a good style", async () => {
+    // One POST, one answer: a half-applied save is the one an owner cannot see.
+    const r = await postSettings({ kot_print_style: "classic", kot_text_size: "tiny" });
+    expect(r.status).toBe(400);
+    expect(mockSaved).toHaveLength(0);
+  });
+
+  test("style and size travel together in one save", async () => {
+    const r = await postSettings({ kot_print_style: "reference", kot_text_size: "large" });
+    expect(r.status).toBe(200);
+    expect(mockSaved[0]).toMatchObject({ kot_print_style: "reference", kot_text_size: "large" });
+  });
+
+  test("a cashier cannot change it", async () => {
+    const r = await postSettings({ kot_text_size: "small" }, CASHIER);
+    expect(r.status).toBe(403);
+    expect(mockSaved).toHaveLength(0);
+  });
+
+  test("the settings permission can", async () => {
+    const r = await postSettings({ kot_text_size: "small" }, identity([PERM_SETTINGS]));
+    expect(r.status).toBe(200);
+    expect(mockSaved[0]!.kot_text_size).toBe("small");
+  });
+});
+
+describe("the text size change is audited", () => {
+  test("the entry names the size now in force", async () => {
+    await postSettings({ kot_text_size: "small" });
+    expect(mockAudits).toHaveLength(1);
+    expect(mockAudits[0]!.details?.kot_text_size).toBe("small");
+  });
+
+  test("a save that did not touch it does not name it", async () => {
+    await postSettings({ kot_print_style: "classic" });
+    expect(mockAudits[0]!.details).not.toHaveProperty("kot_text_size");
+  });
+
+  test("a refused size is never audited", async () => {
+    await postSettings({ kot_text_size: "huge" });
     expect(mockAudits).toHaveLength(0);
   });
 });

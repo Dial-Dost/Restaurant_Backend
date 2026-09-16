@@ -20,6 +20,7 @@
  * docket is under test, not in a loop over variants.
  */
 import { KOT_ATLAS, type KotFace, type KotGlyph } from "../kot_glyph_atlas.js";
+import { kotProfile } from "../escpos.js";
 
 interface Canvas { w: number; h: number; stride: number; bits: Buffer }
 
@@ -73,21 +74,43 @@ function candidatesOf(face: KotFace): Candidate[] {
   return list;
 }
 
-/** -1 when the glyph does not sit here; otherwise the ink dots it accounts for. */
-function glyphFits(cv: Canvas, c: Candidate, x: number, baseline: number): number {
+/**
+ * How many dots a glyph may share with the glyph before it.
+ *
+ * TYPE TOUCHES. At 28 dots per em, bold, the arm of an "r" and the arm of the
+ * "y" after it land on the same dot — in "Berry", on the reference docket
+ * itself. That is how a proportional face rasterises at a small size, not a
+ * smear: erasing the "r" takes the shared dot with it, and a reader that then
+ * demanded every one of the "y"'s dots still be un-read would leave the whole
+ * "y" as leftover ink. So a glyph may reuse up to this many dots that an
+ * earlier glyph on the line already accounted for. More than that is not two
+ * letters touching, it is two things drawn over each other, and the band then
+ * fails to read clean — which is what `leftover` is for.
+ */
+const SHARED_DOTS_MAX = 2;
+
+/**
+ * -1 when the glyph does not sit here; otherwise the ink dots it accounts for
+ * that nothing before it did. With `read` given, a dot an earlier glyph already
+ * accounted for may be reused, up to SHARED_DOTS_MAX of them.
+ */
+function glyphFits(cv: Canvas, c: Candidate, x: number, baseline: number, read?: Canvas): number {
   let ink = 0;
+  let shared = 0;
   for (let gy = 0; gy < c.g.h; gy++) {
     const y = baseline - c.g.t + gy;
     for (let gx = 0; gx < c.g.w; gx++) {
       if (!((c.px[gy * c.gstride + (gx >> 3)] ?? 0) & (0x80 >> (gx & 7)))) { continue; }
-      if (!dot(cv, x + c.g.l + gx, y)) { return -1; }
-      ink += 1;
+      if (dot(cv, x + c.g.l + gx, y)) { ink += 1; continue; }
+      if (read && dot(read, x + c.g.l + gx, y) && shared < SHARED_DOTS_MAX) { shared += 1; continue; }
+      return -1;
     }
   }
   return ink;
 }
 
-function erase(cv: Canvas, c: Candidate, x: number, baseline: number): void {
+/** Erase a glyph's ink from `cv` and, when given, record it as read in `read`. */
+function erase(cv: Canvas, c: Candidate, x: number, baseline: number, read?: Canvas): void {
   for (let gy = 0; gy < c.g.h; gy++) {
     for (let gx = 0; gx < c.g.w; gx++) {
       if (!((c.px[gy * c.gstride + (gx >> 3)] ?? 0) & (0x80 >> (gx & 7)))) { continue; }
@@ -95,6 +118,7 @@ function erase(cv: Canvas, c: Candidate, x: number, baseline: number): void {
       const cy = baseline - c.g.t + gy;
       if (cx < 0 || cy < 0 || cx >= cv.w || cy >= cv.h) { continue; }
       cv.bits[cy * cv.stride + (cx >> 3)]! &= ~(0x80 >> (cx & 7));
+      if (read) { read.bits[cy * read.stride + (cx >> 3)]! |= 0x80 >> (cx & 7); }
     }
   }
 }
@@ -129,6 +153,8 @@ function decodeBand(cv: Canvas, top: number, bottom: number, faces: KotFace[]): 
   let best: KotLine | null = null;
   for (const base of baselines) {
     const work: Canvas = { w: cv.w, h: cv.h, stride: cv.stride, bits: Buffer.from(cv.bits) };
+    // Every dot a glyph on this line has already accounted for — see SHARED_DOTS_MAX.
+    const read: Canvas = { w: cv.w, h: cv.h, stride: cv.stride, bits: Buffer.alloc(cv.bits.length, 0) };
     const nextInk = (from: number): number => {
       for (let x = Math.max(0, from); x < work.w; x++) {
         for (let y = top; y <= bottom; y++) { if (dot(work, x, y)) { return x; } }
@@ -141,24 +167,48 @@ function decodeBand(cv: Canvas, top: number, bottom: number, faces: KotFace[]): 
     for (let guard = 0; guard < 600; guard++) {
       const at = nextInk(pen16 >> 4);
       if (at < 0) { break; }
-      let colTop = top;
-      for (let y = top; y <= bottom; y++) { if (dot(work, at, y)) { colTop = y; break; } }
+      // WHERE THE NEXT GLYPH'S LEFT EDGE CAN BE. Normally at `at`, the first
+      // un-read ink. But when this glyph touches the one before it (see
+      // SHARED_DOTS_MAX) its leftmost column can be made entirely of the shared
+      // dots, which the neighbour's erase already took — so its left edge may sit
+      // up to SHARED_DOTS_MAX columns before `at`. Each candidate edge carries the
+      // top of its column counting dots already read on this line, which is what
+      // the per-glyph prefilter below matches on.
+      const edges: { x: number; top: number | null }[] = [];
+      for (let d = 0; d <= SHARED_DOTS_MAX; d++) {
+        const x = at - d;
+        let colTop: number | null = null;
+        for (let y = top; y <= bottom; y++) {
+          if (dot(work, x, y) || dot(read, x, y)) { colTop = y; break; }
+        }
+        edges.push({ x, top: colTop });
+      }
+      // The plain top of `at` itself, un-read ink only — the common case.
+      let atTop = top;
+      for (let y = top; y <= bottom; y++) { if (dot(work, at, y)) { atTop = y; break; } }
       let pick: { c: Candidate; ink: number; x: number } | null = null;
-      const consider = (c: Candidate) => {
-        const ink = glyphFits(work, c, at - c.g.l, base);
+      const consider = (c: Candidate, edge: number) => {
+        const ink = glyphFits(work, c, edge - c.g.l, base, read);
         // The widest glyph that fits wins a tie: "l" fits inside "h", and a
-        // reader that preferred the smaller one would spell "hi" as "li".
+        // reader that preferred the smaller one would spell "hi" as "li". The
+        // most ink wins outright, which is what stops a regular "y" that fits
+        // inside a bold one from being read in its place.
         if (ink > 0 && (!pick || ink > pick.ink || (ink === pick.ink && c.g.a > pick.c.g.a))) {
-          pick = { c, ink, x: at - c.g.l };
+          pick = { c, ink, x: edge - c.g.l };
         }
       };
-      for (const face of faces) { for (const c of candidatesOf(face)) { if (c.top0 === colTop - base) { consider(c); } } }
-      if (!pick) { for (const face of faces) { for (const c of candidatesOf(face)) { consider(c); } } }
+      for (const face of faces) {
+        for (const c of candidatesOf(face)) {
+          if (c.top0 === atTop - base) { consider(c, at); }
+          for (const e of edges) { if (e.top !== null && c.top0 === e.top - base) { consider(c, e.x); } }
+        }
+      }
+      if (!pick) { for (const face of faces) { for (const c of candidatesOf(face)) { consider(c, at); } } }
       if (!pick) { pen16 = (at + 1) * 16; continue; }
       const chosen: { c: Candidate; ink: number; x: number } = pick;
       if (out && chosen.x * 16 - pen16 >= spaceW * 0.6) { out += " "; }
       out += String.fromCharCode(chosen.c.code);
-      erase(work, chosen.c, chosen.x, base);
+      erase(work, chosen.c, chosen.x, base, read);
       pen16 = chosen.x * 16 + chosen.c.g.a;
     }
     let leftover = 0;
@@ -211,8 +261,16 @@ export function readKotRaster(escBase64: string, widthDots: number, ppems: reado
 
 /** Roll width in dots for a docket built at `cols` columns (48 = 80mm, 32 = 58mm). */
 export const rollDots = (cols: number): number => cols * 12;
-/** The faces a docket of that roll can be set in — body and banner. */
-export const rollPpems = (cols: number): number[] => (cols * 12 >= 576 ? [40, 56] : [30, 42]);
+/**
+ * The faces a docket of that roll can be set in — body and banner — at the
+ * restaurant's text size (absent = 'standard', as on the paper). Taken from
+ * kotProfile rather than restated, so a size change cannot leave this reader
+ * looking for type the docket no longer uses.
+ */
+export const rollPpems = (cols: number, textSize?: string): number[] => {
+  const p = kotProfile(rollDots(cols), textSize);
+  return [p.ppem, p.bannerPpem];
+};
 
 /**
  * WHAT THE KITCHEN'S PAPER SAYS, whichever docket the restaurant prints.
@@ -222,9 +280,9 @@ export const rollPpems = (cols: number): number[] => (cols * 12 >= 576 ? [40, 56
  * bitmap. One helper, so a suite cannot quietly stop testing the document that
  * actually ships.
  */
-export function kotPaper(escBase64: string, cols = 48): string {
+export function kotPaper(escBase64: string, cols = 48, textSize?: string): string {
   const raw = Buffer.from(escBase64, "base64");
   const isRaster = raw.includes(Buffer.from([0x1d, 0x76, 0x30, 0x00]));
   if (!isRaster) { return raw.toString("latin1"); }
-  return readKotRaster(escBase64, rollDots(cols), rollPpems(cols)).map((l) => l.text).join("\n");
+  return readKotRaster(escBase64, rollDots(cols), rollPpems(cols, textSize)).map((l) => l.text).join("\n");
 }

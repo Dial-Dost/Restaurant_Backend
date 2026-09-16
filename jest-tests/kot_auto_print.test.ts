@@ -354,6 +354,43 @@ describe("dispatchKot — which docket the restaurant gets", () => {
     expect(Buffer.from(enqueued[0]!.esc_base64, "base64").toString("latin1")).toContain("Table No: 12");
   });
 
+  // The type size, set where it lives too ("Restaurant".kot_text_size).
+  const atSize = (size: "small" | "large") => jest.spyOn(db, "GetKotTextSize").mockResolvedValue(size);
+
+  test("the restaurant's text size reaches the paper — a 'small' docket is set in small type", async () => {
+    await kp.dispatchKot(dispatch());
+    const standard = enqueued[0]!.esc_base64;
+    enqueued.length = 0;
+    resetStore();
+    const size = atSize("small");
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { size.mockRestore(); }
+    const small = enqueued[0]!.esc_base64;
+    expect(isRaster(small)).toBe(true);
+    // Same words, smaller type: it reads back in the small faces and not in the
+    // standard ones, and it is a shorter strip of paper.
+    expect(kotPaper(small, 48, "small")).toContain("Table No: 12");
+    expect(kotPaper(small, 48, "small")).toBe(kotPaper(standard, 48));
+    expect(Buffer.from(small, "base64").length).toBeLessThan(Buffer.from(standard, "base64").length);
+  });
+
+  test("a classic restaurant's docket is the same text whatever size it has chosen", async () => {
+    const style = onClassic();
+    const size = atSize("large");
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { size.mockRestore(); }
+    const large = enqueued[0]!.esc_base64;
+    enqueued.length = 0;
+    resetStore();
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { style.mockRestore(); }
+    expect(isRaster(large)).toBe(false);
+    expect(large).toBe(enqueued[0]!.esc_base64);
+  });
+
   test("every station's docket of one press obeys the setting, not just the first", async () => {
     seedMenu([
       { id: "m1", name: "Paneer Tikka", station: "TANDOOR" },
