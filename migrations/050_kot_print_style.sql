@@ -1,4 +1,11 @@
--- 050: which kitchen docket a restaurant prints — the owner's escape hatch.
+-- 050: which kitchen docket a restaurant prints — the owner's escape hatch —
+-- and how large the reference docket's type is.
+--
+-- Two columns on "Restaurant", both NULL for every existing row, both read and
+-- written by the runtime before this file is applied (see ORDER OF ROLLOUT):
+--
+--   kot_print_style  NULL / 'reference' | 'classic'
+--   kot_text_size    NULL / 'standard'  | 'small' | 'large'
 --
 -- WHAT THIS IS FOR
 -- ----------------
@@ -57,19 +64,49 @@
 -- ORDER OF ROLLOUT
 -- ----------------
 -- IDEMPOTENT, and mirrored by ensureBrandingColumns() in database_supabase.ts,
--- which issues the same statement at runtime (the idiom 040 documents, outside
--- any transaction and never inside a settle). The PRINT path does not depend on
--- this file at all: it reads the column through its own statement and a missing
--- column (42703) reads as the default, warned once per process. So the backend
--- can ship first; on a runtime that connects as the table owner the column
--- already exists by the time this runs, and this file only records it in
--- schema_migrations. A runtime repointed to app_runtime (no DDL) needs this
--- applied before anyone can SAVE the setting — reading it works either way.
+-- which issues the same two statements at runtime, in this order (the idiom 040
+-- documents, outside any transaction and never inside a settle). The PRINT path
+-- does not depend on this file at all: it reads each column through its own
+-- statement and a missing column (42703) reads as that column's default, warned
+-- once per process. So the backend can ship first; on a runtime that connects as
+-- the table owner both columns already exist by the time this runs, and this
+-- file only records them in schema_migrations. A runtime repointed to
+-- app_runtime (no DDL) needs this applied before anyone can SAVE either setting
+-- — reading them works either way.
 
 alter table "Restaurant" add column if not exists kot_print_style text;
 
 comment on column "Restaurant".kot_print_style is
   'Which kitchen docket this restaurant prints. NULL = never chosen, read as ''reference'' (the reference docket, drawn as a raster). ''classic'' = the plain ESC/POS text docket — the escape hatch for a kitchen printer that ignores GS v 0 and answers a raster with blank paper. Resolved by kot_print_style.ts; any unrecognised value reads as ''reference''.';
 
--- Grants are table-level (002_app_runtime_role.sql), so a new column needs no
--- further grant. Stated only so the omission reads as intentional.
+-- THE SECOND COLUMN: HOW LARGE THE REFERENCE DOCKET'S TYPE IS
+-- ------------------------------------------------------------
+-- The client, having printed the reference docket: "The font sizes must be
+-- smaller in the KOT." Having earlier asked for bigger type twice, the honest
+-- answer is a per-restaurant choice:
+--
+--   NULL / 'standard'  the client's reference ticket — 28 dots per em on an
+--                      80mm roll, 24 on 58mm. What everyone gets.
+--   'small'            a step down (24 on 80mm, 22 on 58mm).
+--   'large'            a step up (34 on 80mm, 28 on 58mm).
+--
+-- The numbers live in escpos.ts (KOT_BODY_PPEM) beside the glyph atlas that
+-- has to contain them; the three words and the "NULL means standard" rule live
+-- in kot_print_style.ts (KOT_TEXT_SIZE_DEFAULT). NO COLUMN DEFAULT, for the
+-- reason kot_print_style above has none.
+--
+-- IT SIZES THE REFERENCE DOCKET ONLY. The classic text docket is set in the
+-- printer's own font and prints the same bytes whatever this says.
+--
+-- ITS OWN COLUMN, READ BY ITS OWN STATEMENT (loadKotTextSize), so a database
+-- that somehow has the first column and not this one still hands every kitchen
+-- the docket its owner chose. The runtime issues the two statements in this
+-- same order.
+
+alter table "Restaurant" add column if not exists kot_text_size text;
+
+comment on column "Restaurant".kot_text_size is
+  'How large the reference kitchen docket''s type is. NULL = never chosen, read as ''standard'' (the client''s reference ticket: 28 dots per em on 80mm, 24 on 58mm). ''small'' and ''large'' are a step either side. The classic text docket ignores it. Resolved by kot_print_style.ts; any unrecognised value reads as ''standard''.';
+
+-- Grants are table-level (002_app_runtime_role.sql), so neither new column
+-- needs a further grant. Stated only so the omission reads as intentional.
