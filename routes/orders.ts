@@ -13,7 +13,7 @@ import { logger } from "../observability.js";
 import { hidesPrices, redactOrderList } from "../price_scope.js";
 import { emitRestaurant } from "../realtime.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, refuseOrderOnPrintedBill, validateAction } from "./_shared.js";
+import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, refuseOrderOnPrintedBill, reprintNeededFields, validateAction } from "./_shared.js";
 
 
 // --- Order/item preparation timers (pause/resume, mark item served) ---------
@@ -204,8 +204,9 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 			...result,
 			kot_printed: printed.printed, kot_no: printed.kot_no, kot_tickets: printed.tickets,
 			...(printed.reason ? { kot_skipped: printed.reason } : {}),
-			// The bill in the guest's hand no longer covers this order.
-			...(guard.reprintNeeded ? { reprint_needed: true } : {}),
+			// The bill in the guest's hand no longer covers this order: the
+			// flag, the sentence and the table a Reprint action prints.
+			...reprintNeededFields(guard),
 		});
 	} catch (error: any) {
 		logger.error({ err: error }, "add_order_failed");
@@ -602,7 +603,7 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			success: true, item: newItem,
 			kot_printed: printedItem.printed, kot_no: printedItem.kot_no, kot_tickets: printedItem.tickets,
 			...(printedItem.reason ? { kot_skipped: printedItem.reason } : {}),
-			...(guard.reprintNeeded ? { reprint_needed: true } : {}),
+			...reprintNeededFields(guard),
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'add_order_item_failed');

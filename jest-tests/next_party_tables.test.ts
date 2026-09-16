@@ -14,8 +14,9 @@
 //      or money on it.
 //   3. THE GUARD'S READ: the same print count the Print button reads, bounded
 //      by the same seating start.
-//   4. THE FLOOR: /get-tables names the sibling, lists it beside its root, and
-//      keeps it out of every room-counting reader.
+//   4. THE FLOOR: /get-tables names the sibling, lists it beside its root, gives
+//      it the root's booking, keeps it out of every room-counting reader, and
+//      makes the seat a print before 2.0.1 never made.
 //   5. THE NAME SPACE: "12 #2" cannot be made by hand, a sibling cannot be
 //      deleted from the floor plan, a table cannot be deleted from under its
 //      next party, and an offline seating of a retired "12 #2" comes back.
@@ -29,9 +30,11 @@ import {
   OTHER_OUTLET_ID,
   SLUG,
   addBill,
+  addBooking,
   addOrder,
   addPrint,
   addTable,
+  failNextStatementContaining,
   liveSiblingsOf,
   liveTable,
   liveTables,
@@ -306,16 +309,21 @@ describe("3. the money guard's read", () => {
     expect(await db.GetOrderingPrintGuard(SLUG, "12")).toMatchObject({ print_count: 1, parent_table: null });
   });
 
-  test("an upsert's order is measured, so a status change can be told from an addition", async () => {
+  test("an upsert's order is read LINE BY LINE, so a status change can be told from an addition", async () => {
     busyTwelve({ printed: true });
     const order = addOrder("12", 250);
+    const lineId = String((order.food.items as { id: string }[])[0]!.id);
     const guard = await db.GetOrderingPrintGuard(SLUG, "12", { orderId: order.id });
-    expect(guard).toMatchObject({ print_count: 1, existing_order: { quantity: 1, amount: 250 } });
+    expect(guard).toMatchObject({ print_count: 1, existing_lines: [{ id: lineId, quantity: 1 }] });
+    // …from the split when the order has one, as AddOrder merges from it.
+    order.food.items_split = [["Served", [{ id: lineId, quantity: 1 }]], ["Preparing", [{ id: "late", quantity: 2 }]]];
+    expect((await db.GetOrderingPrintGuard(SLUG, "12", { orderId: order.id }))?.existing_lines)
+      .toEqual([{ id: lineId, quantity: 1 }, { id: "late", quantity: 2 }]);
     // Not an order that exists: a new one.
-    expect((await db.GetOrderingPrintGuard(SLUG, "12", { orderId: "0de70000-0000-4000-8000-999999999999" }))?.existing_order)
+    expect((await db.GetOrderingPrintGuard(SLUG, "12", { orderId: "0de70000-0000-4000-8000-999999999999" }))?.existing_lines)
       .toBeNull();
     // Not asked, or nothing printed: never read at all.
-    expect((await db.GetOrderingPrintGuard(SLUG, "12"))?.existing_order).toBeNull();
+    expect((await db.GetOrderingPrintGuard(SLUG, "12"))?.existing_lines).toBeNull();
   });
 
   test("a print filed under the open bill id counts, and so does a SPLIT print of it", async () => {
@@ -387,6 +395,60 @@ describe("4. the floor", () => {
     expect(next.qr_token).not.toBe(root.qr_token);
   });
 
+  test.each([
+    ["booked (a reservation running now)", -10, "booked"],
+    ["reserved (a reservation later today)", 60, "reserved"],
+  ] as const)("a sibling carries its ROOT's booking state — %s", async (_l, offsetMin, field) => {
+    busyTwelve();
+    await db.EnsureNextPartyTable(SLUG, "12");
+    const at = new Date();
+    at.setHours(12, 0, 0, 0);
+    addBooking("12", new Date(at.getTime() + offsetMin * 60_000), 120);
+    const rows = (await db.GetTables(SLUG, at))!;
+    const other = field === "booked" ? "reserved" : "booked";
+    expect(rows.find((r) => r.table_name === "12")).toMatchObject({ [field]: true, [other]: false });
+    expect(rows.find((r) => r.table_name === "12 #2")).toMatchObject({ [field]: true, [other]: false });
+    // …and a table with no booking of its own, or of its root's, has none.
+    expect(rows.find((r) => r.table_name === "15")).toMatchObject({ booked: false, reserved: false });
+  });
+
+  test("THE SEAT A PRE-2.0.1 PRINT NEVER MADE: the floor read makes it, once, beside its table", async () => {
+    // 12 was printed before this deploy, so no print ever opened its seat.
+    busyTwelve({ printed: true });
+    expect(liveSiblingsOf("12")).toEqual([]);
+    const rows = (await db.GetTables(SLUG))!;
+    expect(rows.map((r) => r.table_name)).toEqual(["12", "12 #2", "15"]);
+    expect(rows.find((r) => r.table_name === "12 #2")).toMatchObject({ parent_table: "12", display_name: "12", occupied: false });
+    // The next poll finds it and makes nothing more.
+    await db.GetTables(SLUG);
+    expect(names(liveSiblingsOf("12"))).toEqual(["12 #2"]);
+    expect(statements().filter((q) => q.startsWith('insert into "tables"'))).toHaveLength(1);
+  });
+
+  test("…never for a table that is not printed, and never beside a family that already has a next party", async () => {
+    busyTwelve();
+    await db.GetTables(SLUG);
+    expect(liveSiblingsOf("12")).toEqual([]);
+    // Printed, with its next party already SEATED at "12 #2": no "12 #3" from a read.
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 300);
+    tick(4);
+    addPrint(`12-${String(Date.now())}`);
+    await db.GetTables(SLUG);
+    expect(names(liveSiblingsOf("12"))).toEqual(["12 #2"]);
+  });
+
+  test("…a seat that cannot be made never fails the floor, and is not retried on every poll", async () => {
+    busyTwelve({ printed: true });
+    failNextStatementContaining('insert into "tables"');
+    const rows = await db.GetTables(SLUG);
+    expect(rows?.map((r) => r.table_name)).toEqual(["12", "15"]);
+    await db.GetTables(SLUG);
+    expect(liveSiblingsOf("12")).toEqual([]);
+    expect(statements().filter((q) => q.startsWith('insert into "tables"'))).toHaveLength(1);
+  });
+
   test("the room-counting readers never see a sibling: sections, bookings, seating suggestions", async () => {
     busyTwelve();
     await db.EnsureNextPartyTable(SLUG, "12");
@@ -425,6 +487,13 @@ describe("4. the floor", () => {
     expect(body).toContain("coalesce(${col(\"is_virtual\")}, false) = false");
     expect(body).toContain("${col(\"parent_table_id\")} is null");
     expect(body).toMatch(/await nextPartyReady\(\)/);
+  });
+
+  test("the floor read's backfill runs only outside a transaction, and re-reads without backfilling", () => {
+    const body = chunk("GetTables");
+    expect(body).toMatch(/opts\.backfillNextParty !== false && \(tenantStorage\.getStore\(\)\?\.txnDepth \?\? 0\) === 0/);
+    expect(body).toMatch(/return GetTables\(restaurantId, time, \{ backfillNextParty: false \}\);/);
+    expect(body).toMatch(/if \(!claimNextPartyBackfill\(context, r\.id\)\) \{continue;\}/);
   });
 
   test("the table-wise turnaround folds a next party's seating into its table's label", () => {

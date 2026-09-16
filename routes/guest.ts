@@ -243,11 +243,14 @@ app.post("/qr/:slug/order", rateLimit("qr_order", 30, 60_000), async (req: Reque
 	// QR is signed for this table, and whoever scans it after the print may be
 	// the NEXT party: their food must not land on the bill the last party is
 	// paying. Refused, never rerouted — see refuseOrderOnPrintedBill. Its own
-	// tenant scope, before the order's, so a refusal writes nothing.
+	// tenant scope, before the order's, so a refusal writes nothing. The data
+	// layer is asked by slug, as every read on this route is; a seat it opens is
+	// announced in the res UUID's room, the one the dashboard has joined.
 	try {
+		const roomId = resId;
 		const guard = await withTenant(
 			{ res_id: resId, outlet_id: "", employeeId: "", role: "" },
-			() => refuseOrderOnPrintedBill(req, res, { restaurantId: slug, tableName, guest: true }),
+			() => refuseOrderOnPrintedBill(req, res, { restaurantId: slug, tableName, guest: true, emitRestaurantId: roomId }),
 		);
 		if (guard.refused) {return;}
 	} catch (err) {

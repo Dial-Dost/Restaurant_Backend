@@ -22,7 +22,7 @@ import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import type { ReportWindowQuery } from "../report_window.js";
 import { emitRestaurant } from "../realtime.js";
-import { billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill } from "../next_party.js";
+import { BILL_PRINTED_STATUS, billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill, reprintNeededMessage, type BillPrintedWrite } from "../next_party.js";
 import { isWaiterOnly } from "../role_scope.js";
 
 
@@ -1334,12 +1334,15 @@ function announceNextPartyTable(
  * THE MONEY GUARD ON NEW ORDERS — an order added to a table whose CURRENT
  * seating's bill has already been printed.
  *
- *   * a waiter-only login or a QR guest -> 409 { code: "bill_printed", table,
+ *   * a waiter-only login or a QR guest -> 423 { code: "bill_printed", table,
  *     next_party_table } and NOTHING is written. The sentence says where the
  *     new party's order goes, and that a same-party addition is a manager's
- *     (who can add it and reprint);
- *   * a senior role -> allowed; the caller adds `reprint_needed: true` to its
- *     answer, because the paper in the guest's hand is now short;
+ *     (who can add it and reprint). 423 and not 409: see BILL_PRINTED_STATUS
+ *     for what a 409 did to the till's offline queue;
+ *   * a senior role -> allowed; the caller spreads reprintNeededFields(guard)
+ *     into its answer (`reprint_needed: true` and the sentence both clients
+ *     show beside a Reprint action), because the paper in the guest's hand is
+ *     now short;
  *   * no print, no print state, a takeaway, or migration 053 absent -> allowed,
  *     exactly as before this guard existed.
  *
@@ -1350,14 +1353,31 @@ function announceNextPartyTable(
  *
  * AN UPSERT IS JUDGED BY WHAT IT ADDS. POST /orders also carries the
  * dashboard's status changes and its edit dialog, as a resend of an existing
- * order; `upsert` names that order, and only a resend that puts more on the
- * bill (orderUpsertAddsToBill) is refused — "Served" on a printed table is not.
+ * order; `upsert` names that order, and only a resend that AddOrder would grow
+ * (orderUpsertAddsToBill, line by line) is refused — "Served" on a printed
+ * table is not.
+ *
+ * THE OTHER DOORS INTO A PRINTED BILL. POST /bills/merge and POST
+ * /bills/move-item put food onto `to_table` just as an order does, and are
+ * gated by the same "Add Orders" permission a waiter holds. They pass
+ * `write: "merge" | "move"`: the same verdict, but no next-party seat is made
+ * or offered — that food belongs to somebody already seated — and the sentence
+ * says a manager merges or moves it and reprints.
  *
  * FAILS OPEN on a read error, in the direction bill_print_state.ts already
  * chose: the order path itself is the one that has to work.
  *
+ * `restaurantId` is what the data layer is asked with (a staff route's res id,
+ * or the QR route's slug); `emitRestaurantId` is the res UUID whose socket room
+ * the dashboard listens in, when that differs — the QR route passes it, because
+ * `restaurant:<slug>` is a room nobody joins.
+ *
  * Returns `refused: true` when it has answered (the caller returns at once).
  */
+export type PrintedBillGuard =
+	| { refused: true }
+	| { refused: false; reprintNeeded: boolean; table: string | null; parentTable: string | null };
+
 export async function refuseOrderOnPrintedBill(
 	req: Request,
 	res: Response,
@@ -1367,42 +1387,71 @@ export async function refuseOrderOnPrintedBill(
 		guest: boolean;
 		/** POST /orders only: the order id the body names, and the lines it sends. */
 		upsert?: { orderId: string | null; items: unknown };
+		/** What is being put on the bill; an order unless said otherwise. */
+		write?: BillPrintedWrite;
+		/** The res UUID for the `table:added` emit, when restaurantId is a slug. */
+		emitRestaurantId?: string;
 	},
-): Promise<{ refused: true } | { refused: false; reprintNeeded: boolean }> {
+): Promise<PrintedBillGuard> {
 	const { restaurantId, tableName, guest, upsert } = target;
+	const write = target.write ?? "order";
+	const allow = { refused: false as const, reprintNeeded: false, table: null, parentTable: null };
 	let state: Awaited<ReturnType<typeof GetOrderingPrintGuard>> = null;
 	try {
 		state = await GetOrderingPrintGuard(restaurantId, tableName, { orderId: upsert?.orderId ?? null });
 	} catch (err) {
 		logger.warn({ err, table: tableName }, "order_print_guard_read_failed (failing open)");
-		return { refused: false, reprintNeeded: false };
+		return allow;
 	}
-	if (!state) {return { refused: false, reprintNeeded: false };}
+	if (!state) {return allow;}
 	const waiterOnly = !guest && isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions });
-	const addsToBill = upsert ? orderUpsertAddsToBill(upsert.items, state.existing_order ?? null) : true;
+	const addsToBill = upsert ? orderUpsertAddsToBill(upsert.items, state.existing_lines ?? null) : true;
 	const verdict = orderOnPrintedBillVerdict({ printCount: state.print_count, waiterOnly, guest, addsToBill });
-	if (verdict === "allow") {return { refused: false, reprintNeeded: false };}
-	if (verdict === "reprint_needed") {return { refused: false, reprintNeeded: true };}
+	if (verdict === "allow") {return allow;}
+	if (verdict === "reprint_needed") {
+		return { refused: false, reprintNeeded: true, table: state.table, parentTable: state.parent_table };
+	}
 
 	// The seat is made here too, not only at print time: a print whose seat
 	// could not be made (or a seat retired since) must not leave the refusal
-	// pointing nowhere.
-	const seat = await EnsureNextPartyTable(restaurantId, state.table);
-	if (seat?.created) {announceNextPartyTable(restaurantId, seat);}
+	// pointing nowhere. Only for an ORDER — a merge or a move is never pointed
+	// at a seat (see BillPrintedWrite).
+	const seat = write === "order" ? await EnsureNextPartyTable(restaurantId, state.table) : null;
+	if (seat?.created) {announceNextPartyTable(target.emitRestaurantId ?? restaurantId, seat);}
 	if (!guest) {
+		const what = write === "merge" ? "a merge into" : write === "move" ? "an item moved onto" : "an order on";
 		try {
 			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
-				`REFUSED an order on table ${state.table} — its bill was already printed ${String(state.print_count)} time(s)`,
-				Audit_log_category.Orders,
-				{ table: state.table, refused: true, code: "bill_printed", print_count: state.print_count, next_party_table: seat?.table_name ?? null });
-		} catch {/* a failed audit write must not turn a 409 into a 500 */}
+				`REFUSED ${what} table ${state.table} — its bill was already printed ${String(state.print_count)} time(s)`,
+				write === "order" ? Audit_log_category.Orders : Audit_log_category.Bill,
+				{ table: state.table, refused: true, code: "bill_printed", write, print_count: state.print_count, next_party_table: seat?.table_name ?? null });
+		} catch {/* a failed audit write must not turn a refusal into a 500 */}
 	}
-	res.status(409).json(billPrintedRefusal({
+	res.status(BILL_PRINTED_STATUS).json(billPrintedRefusal({
 		table: state.table,
 		nextPartyTable: seat?.table_name ?? null,
 		printCount: state.print_count,
 		guest,
 		parentTable: state.parent_table,
+		write,
 	}));
 	return { refused: true };
+}
+
+/**
+ * What a route adds to its answer when a senior role has just put more on a
+ * printed bill: `reprint_needed` and the sentence both clients show beside a
+ * Reprint action (reprintNeededMessage). Nothing at all otherwise, so every
+ * other answer is byte-for-byte what it was.
+ */
+export function reprintNeededFields(
+	guard: PrintedBillGuard,
+): { reprint_needed?: true; reprint_message?: string; reprint_table?: string } {
+	if (guard.refused || !guard.reprintNeeded || !guard.table) {return {};}
+	return {
+		reprint_needed: true,
+		reprint_message: reprintNeededMessage(guard.table, guard.parentTable),
+		// The table whose paper is short: the one a Reprint action prints.
+		reprint_table: guard.table,
+	};
 }

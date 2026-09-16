@@ -126,12 +126,14 @@ import {
   freeFamilySeat,
   isReservedPartyName,
   nextFreePartySeq,
+  nextPartyLabel,
   nextPartyName,
-  orderLinesMeasure,
   parseNextPartyName,
   planNextPartyRetirement,
+  storedOrderLines,
   tableDisplayName,
   type NextPartyFamilyMember,
+  type StoredOrderLine,
 } from "./next_party.js";
 // The floor-section ordering rules (migration 041). Kept out of SQL on purpose:
 // see that module's header for why the decision lives in a pure function and
@@ -3772,9 +3774,10 @@ function noteNextPartyColumnsMissing(err: unknown): void {
   }
 }
 
-/** Test seam (jest only): forget what the latch learned. */
+/** Test seam (jest only): forget what the latch learned, and the backfill memo. */
 export function resetTableNextPartyCache(): void {
   tableNextPartyColumns = null;
+  nextPartyBackfillTried.clear();
 }
 
 /**
@@ -4113,7 +4116,25 @@ async function afterTableFreed(freed: FreedTable): Promise<void> {
 }
 
 /**
- * The root's name when [tableName] is a live sibling, else null. For the 409's
+ * GetTables' backfill memo: when each root last had a seat made for it (or
+ * tried), so a seat that cannot be made is not re-attempted on every poll.
+ * Per process, bounded; a restart simply tries once more.
+ */
+const NEXT_PARTY_BACKFILL_RETRY_MS = 5 * 60_000;
+const nextPartyBackfillTried = new Map<string, number>();
+
+function claimNextPartyBackfill(context: RestaurantContext, tableId: string): boolean {
+  const key = `${context.res_id}|${context.outlet_id}|${tableId}`;
+  const now = Date.now();
+  const last = nextPartyBackfillTried.get(key);
+  if (last !== undefined && now - last < NEXT_PARTY_BACKFILL_RETRY_MS) {return false;}
+  if (nextPartyBackfillTried.size > 5000) {nextPartyBackfillTried.clear();}
+  nextPartyBackfillTried.set(key, now);
+  return true;
+}
+
+/**
+ * The root's name when [tableName] is a live sibling, else null. For the refusal's
  * sentence and the delete guard. Null when the feature is off.
  */
 async function nextPartyParentName(context: RestaurantContext, tableId: string): Promise<string | null> {
@@ -4149,8 +4170,9 @@ export async function GetOrderingPrintGuard(
   tableName: string,
   /**
    * POST /orders is an upsert too. When the body names an order id, the
-   * stored order's lines are measured (orderLinesMeasure) so the route can
-   * tell a status change from an addition — see orderUpsertAddsToBill.
+   * stored order's lines are read the way AddOrder merges them
+   * (storedOrderLines) so the route can tell a status change from an
+   * addition — see orderUpsertAddsToBill.
    */
   opts: { orderId?: string | null } = {},
 ): Promise<{
@@ -4159,7 +4181,7 @@ export async function GetOrderingPrintGuard(
   parent_table: string | null;
   print_count: number;
   /** The named order's lines, or null when there is no such order (a new one). */
-  existing_order: { quantity: number; amount: number } | null;
+  existing_lines: StoredOrderLine[] | null;
 } | null> {
   const normalized = String(tableName ?? "").trim();
   if (!normalized) {return null;}
@@ -4192,10 +4214,10 @@ export async function GetOrderingPrintGuard(
   const start = seatingStartOf(billRows[0]?.created_at ?? null, firstOrder[0]?.first_at ?? null);
   // Nothing on the table at all: nothing can have been printed for this party.
   if (start === null && !billRows[0]) {
-    return { table: table.table_name, table_id: table.id, parent_table: null, print_count: 0, existing_order: null };
+    return { table: table.table_name, table_id: table.id, parent_table: null, print_count: 0, existing_lines: null };
   }
   const prints = await billPrintHistoryForTable(context, table.id, billRows[0]?.id ?? null, table.table_name, start);
-  let existingOrder: { quantity: number; amount: number } | null = null;
+  let existingLines: StoredOrderLine[] | null = null;
   const orderId = String(opts.orderId ?? "").trim();
   if (prints.print_count > 0 && isUuid(orderId)) {
     const orderRows = await runQuery<{ food: unknown }>(
@@ -4203,10 +4225,8 @@ export async function GetOrderingPrintGuard(
       [orderId, context.res_id, context.outlet_id],
     );
     if (orderRows[0]) {
-      // The same two shapes AddOrder merges from: the split when there is one.
-      const food = parseJsonObject(orderRows[0].food) ?? {};
-      const split = Array.isArray(food.items_split) && food.items_split.length > 0 ? food.items_split : null;
-      existingOrder = orderLinesMeasure(split ?? food.items);
+      // What AddOrder will merge the resend onto: the split when there is one.
+      existingLines = storedOrderLines(parseJsonObject(orderRows[0].food) ?? {});
     }
   }
   return {
@@ -4214,7 +4234,7 @@ export async function GetOrderingPrintGuard(
     table_id: table.id,
     parent_table: prints.print_count > 0 ? await nextPartyParentName(context, table.id) : null,
     print_count: prints.print_count,
-    existing_order: existingOrder,
+    existing_lines: existingLines,
   };
 }
 
@@ -5796,6 +5816,8 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
+  /** Internal: false on the one re-read after a backfill made a seat. */
+  opts: { backfillNextParty?: boolean } = {},
 ): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null; parent_table: string | null; party_no: number | null; display_name: string }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
@@ -6040,6 +6062,40 @@ export async function GetTables(
     const list = siblingsByRoot.get(root.id) ?? [];
     list.push(r);
     siblingsByRoot.set(root.id, list);
+  }
+
+  // THE SEAT A PRINT BEFORE 2.0.1 NEVER MADE. A seat is opened when a bill is
+  // printed, so a table printed before this deploy — and CSR Organics keeps a
+  // printed room open for a day and a half — would reach a waiter's floor with
+  // its number still missing until somebody reprinted it, which a waiter
+  // cannot. So the floor read makes it: a root table that is printed, still in
+  // use, and has no next-party row at all. After a print on 2.0.1 there always
+  // is one (retirement keeps one free seat while the root is busy), so this
+  // only ever fires for those tables, once each, and for a print whose seat
+  // could not be made at the time.
+  //
+  // NEVER FAILS THE FLOOR READ (EnsureNextPartyTable never throws), never runs
+  // inside a transaction (the seat takes its own, with the root row locked),
+  // is tried at most once per table per NEXT_PARTY_BACKFILL_RETRY_MS so a seat
+  // that cannot be made does not cost every poll a transaction, and — when it
+  // made one — the floor is read ONCE more so the new tile is in this answer.
+  if (withParty && opts.backfillNextParty !== false && (tenantStorage.getStore()?.txnDepth ?? 0) === 0) {
+    const inUse = (r: (typeof tableRows)[number]): boolean =>
+      r.is_occupied || orderedTables.has(r.id) || openBillByTable.has(r.id);
+    let made = false;
+    for (const r of tableRows) {
+      if (r.parent_table_id || siblingsByRoot.has(r.id) || !inUse(r)) {continue;}
+      if ((printStateByTable.get(r.table_name)?.print_count ?? 0) <= 0) {continue;}
+      if (!claimNextPartyBackfill(context, r.id)) {continue;}
+      const seat = await EnsureNextPartyTable(restaurantId, r.table_name);
+      if (seat?.created) {
+        made = true;
+        logger.info({ table: r.table_name, seat: seat.table_name }, "next_party_backfilled");
+      }
+    }
+    if (made) {
+      return GetTables(restaurantId, time, { backfillNextParty: false });
+    }
   }
   const ordered: (typeof tableRows)[number][] = [];
   for (const r of tableRows) {
@@ -17060,6 +17116,71 @@ export interface ReopenedBill {
   window_min: number;
 }
 
+/**
+ * ReopenBill's next-party half: bring a RETIRED sibling back, seated, for the
+ * bill being re-opened on it. Only while its root is a live table, and only
+ * when no live row already answers to its name or holds its (root, party
+ * number) — otherwise two rows would share "12 #2" and a name-keyed settle
+ * would pick one. The root row is locked first, as every other writer of a
+ * family does. `not_sibling` = not a retired next-party row: the caller's
+ * ordinary path already said all there is to say.
+ */
+async function reviveNextPartySeatForReopen(
+  context: RestaurantContext,
+  tableId: string,
+  client: PoolClient,
+): Promise<{ status: "not_sibling" } | { status: "revived"; table_name: string } | { status: "blocked"; message: string }> {
+  const rows = await runQuery<{
+    table_name: string; parent_table_id: string | null; is_deleted: boolean;
+    parent_name: string | null; parent_deleted: boolean | null;
+  }>(
+    `select t.table_name, t.parent_table_id, coalesce(t.is_deleted, false) as is_deleted,
+            p.table_name as parent_name, coalesce(p.is_deleted, false) as parent_deleted
+       from "Tables" t
+       left join "Tables" p on p.id = t.parent_table_id and p.res_id = t.res_id and p.outlet_id = t.outlet_id
+      where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+      limit 1`,
+    [tableId, context.res_id, context.outlet_id],
+    client,
+  );
+  const row = rows[0];
+  if (!row || !row.parent_table_id || row.is_deleted !== true) {return { status: "not_sibling" };}
+  const root = String(row.parent_name ?? parseNextPartyName(row.table_name)?.root ?? "").trim();
+  const spoken = root ? nextPartyLabel(root) : row.table_name;
+  if (!row.parent_name || row.parent_deleted === true) {
+    return {
+      status: "blocked",
+      message: `This bill was for ${spoken}, and table ${root || "it belonged to"} has since been deleted, so there is no table to re-open it on.`,
+    };
+  }
+  await runQuery(
+    `select id from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 for update`,
+    [row.parent_table_id, context.res_id, context.outlet_id],
+    client,
+  );
+  const revived = await runQuery<{ table_name: string }>(
+    `update "Tables" t
+        set is_deleted = false, is_occupied = true
+      where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+        and coalesce(t.is_deleted, false) = true
+        and not exists (select 1 from "Tables" x
+                         where x.res_id = t.res_id and x.outlet_id = t.outlet_id
+                           and coalesce(x.is_deleted, false) = false
+                           and (lower(x.table_name) = lower(t.table_name)
+                                or (x.parent_table_id = t.parent_table_id and x.party_seq = t.party_seq)))
+      returning t.table_name`,
+    [tableId, context.res_id, context.outlet_id],
+    client,
+  );
+  if (!revived[0]) {
+    return {
+      status: "blocked",
+      message: `This bill was for ${spoken}, and that seat ("${row.table_name}") is now another party's. Settle or release ${row.table_name} first, then re-open this bill.`,
+    };
+  }
+  return { status: "revived", table_name: revived[0].table_name };
+}
+
 // Re-open a CLOSED bill within the restaurant's configured window (admin only,
 // enforced at the route). The exact inverse of the approve/close finalization:
 // clears closed_* and the admin approval stamps (waiter confirmation + payment
@@ -17071,6 +17192,9 @@ export async function ReopenBill(
   billId: string,
   byEmployeeId?: string | null,
 ): Promise<ReopenedBill> {
+  // Resolved BEFORE the transaction: the 053 latch may issue DDL, which must
+  // never run inside one (see nextPartyReady).
+  const withNextParty = await nextPartyReady();
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
@@ -17170,6 +17294,20 @@ export async function ReopenBill(
         client,
       );
       tableName = t[0]?.table_name ?? null;
+
+      // CLIENT ITEM 6 — THE BILL WAS A NEXT PARTY'S, AND ITS SEAT HAS BEEN
+      // RETIRED. "12 #2" is soft-deleted once its party settles while 12 is free,
+      // so the update above matched nothing: the bill would be open again with
+      // no tile on any floor, "12 #2" would answer "Table not found" by name,
+      // and the next print of 12 would mint a second, live "12 #2" for every
+      // name-keyed read and settle to find instead. So the seat comes back with
+      // its bill — or, when that cannot be done cleanly, the re-open is refused
+      // in words and rolls back whole.
+      if (!tableName && withNextParty) {
+        const seat = await reviveNextPartySeatForReopen(context, bill.table_id, client);
+        if (seat.status === "blocked") {throw new Error(seat.message);}
+        if (seat.status === "revived") {tableName = seat.table_name;}
+      }
     }
 
     return {

@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   BILL_PRINTED_CODE,
+  BILL_PRINTED_STATUS,
   FIRST_NEXT_PARTY_SEQ,
   MAX_NEXT_PARTY_SEQ,
   NEXT_PARTY_CHIP,
@@ -23,11 +24,12 @@ import {
   nextPartyAfterPrintMessage,
   nextPartyLabel,
   nextPartyName,
-  orderLinesMeasure,
   orderOnPrintedBillVerdict,
   orderUpsertAddsToBill,
   parseNextPartyName,
   planNextPartyRetirement,
+  reprintNeededMessage,
+  storedOrderLines,
   tableDisplayName,
   tableSentenceName,
   takeItOnNextPartyLabel,
@@ -173,33 +175,66 @@ describe("who may add to a printed bill", () => {
     expect(orderOnPrintedBillVerdict({ printCount: 1, waiterOnly: true, guest: false, addsToBill: true })).toBe("refuse");
   });
 
-  test("an order's lines are measured the same in both stored shapes", () => {
-    const lines = [
-      { id: "a", name: "Thali", price: 525, quantity: 2 },
-      { id: "b", name: "Lassi", price: 90, quantity: 1, nc: true },
-    ];
-    expect(orderLinesMeasure(lines)).toEqual({ quantity: 3, amount: 1140 });
-    expect(orderLinesMeasure([["Served", [lines[0]]], ["Preparing", [lines[1]]]])).toEqual({ quantity: 3, amount: 1140 });
-    expect(orderLinesMeasure([])).toEqual({ quantity: 0, amount: 0 });
-    expect(orderLinesMeasure(null)).toEqual({ quantity: 0, amount: 0 });
-    // Junk lines count for nothing rather than throwing on the order path.
-    expect(orderLinesMeasure([null, "x", { price: "abc", quantity: -2 }, { price: 10 }])).toEqual({ quantity: 1, amount: 10 });
+  test("the stored order is read the way AddOrder merges from it", () => {
+    const thali = { id: "a", name: "Thali", price: 525, quantity: 2 };
+    const lassi = { id: "b", name: "Lassi", price: 90, quantity: 1, nc: true };
+    // The split, flattened, when there is one — whatever `items` says.
+    expect(storedOrderLines({ items: [{ id: "stale", quantity: 9 }], items_split: [["Served", [thali]], ["Preparing", [lassi]]] }))
+      .toEqual([{ id: "a", quantity: 2 }, { id: "b", quantity: 1 }]);
+    // Otherwise the list as it stands.
+    expect(storedOrderLines({ items: [thali, lassi] })).toEqual([{ id: "a", quantity: 2 }, { id: "b", quantity: 1 }]);
+    // An EMPTY split is no split.
+    expect(storedOrderLines({ items: [thali], items_split: [] })).toEqual([{ id: "a", quantity: 2 }]);
+    // A line with no id is not matchable; a repeated id keeps its LAST quantity.
+    expect(storedOrderLines({ items: [{ name: "x", quantity: 1 }, { id: "a", quantity: 1 }, { id: "a", quantity: 3 }] }))
+      .toEqual([{ id: "a", quantity: 3 }]);
+    // A legacy tuple-shaped `items` holds nothing AddOrder can match.
+    expect(storedOrderLines({ items: [["Served", [thali]]] })).toEqual([]);
+    // Junk reads as nothing rather than throwing on the order path.
+    for (const junk of [null, undefined, {}, { items: "x" }, { items_split: [null, "x", ["P", "not a list"]] }]) {
+      expect(storedOrderLines(junk as never)).toEqual([]);
+    }
   });
 
-  test("an UPSERT adds to the bill only when it brings more portions or more money", () => {
-    const stored = orderLinesMeasure([{ price: 525, quantity: 2 }]);
+  test("an UPSERT adds to the bill exactly when AddOrder's merge would append a line", () => {
+    const stored = storedOrderLines({ items: [{ id: "thali", price: 525, quantity: 2 }] });
     // The dashboard's status change resends the same lines: nothing added.
-    expect(orderUpsertAddsToBill([{ price: 525, quantity: 2 }], stored)).toBe(false);
+    expect(orderUpsertAddsToBill([{ id: "thali", price: 525, quantity: 2 }], stored)).toBe(false);
     // Its edit dialog with a dessert on: added.
-    expect(orderUpsertAddsToBill([{ price: 525, quantity: 2 }, { price: 120, quantity: 1 }], stored)).toBe(true);
+    expect(orderUpsertAddsToBill([{ id: "thali", price: 525, quantity: 2 }, { id: "gj", price: 120, quantity: 1 }], stored)).toBe(true);
     // One more of the same: added.
-    expect(orderUpsertAddsToBill([{ price: 525, quantity: 3 }], stored)).toBe(true);
-    // Swapped for something dearer at the same count: added.
-    expect(orderUpsertAddsToBill([{ price: 525, quantity: 1 }, { price: 700, quantity: 1 }], stored)).toBe(true);
-    // Fewer lines (a removal has its own authority): not an addition.
-    expect(orderUpsertAddsToBill([{ price: 525, quantity: 1 }], stored)).toBe(false);
+    expect(orderUpsertAddsToBill([{ id: "thali", price: 525, quantity: 3 }], stored)).toBe(true);
+    // A lower quantity, or a resend that leaves a line out: not an addition.
+    expect(orderUpsertAddsToBill([{ id: "thali", price: 525, quantity: 1 }], stored)).toBe(false);
+    expect(orderUpsertAddsToBill([], stored)).toBe(false);
+    // A line with no id is appended by AddOrder: added.
+    expect(orderUpsertAddsToBill([{ price: 525, quantity: 1 }], stored)).toBe(true);
+    // Quantities read as AddOrder reads them: absent is 1, and so is junk.
+    expect(orderUpsertAddsToBill([{ id: "thali" }], stored)).toBe(false);
+    expect(orderUpsertAddsToBill([{ id: "thali", quantity: "lots" }], stored)).toBe(false);
+    // The split shape a client may send is flattened like AddOrder flattens it.
+    expect(orderUpsertAddsToBill([["Served", [{ id: "thali", quantity: 2 }]], ["Preparing", [{ id: "gj", quantity: 1 }]]], stored)).toBe(true);
+    expect(orderUpsertAddsToBill([["Served", [{ id: "thali", quantity: 2 }]], ["Preparing", []]], stored)).toBe(false);
     // No such order: a new one, which always adds.
     expect(orderUpsertAddsToBill([], null)).toBe(true);
+  });
+
+  test("THE HOLE A TOTALS COMPARISON LEFT: a resend carrying ONLY the new line, and a same-size swap", () => {
+    // 4 x Thali at 525 printed (2,100). A waiter-only login resends the order
+    // by its id with nothing but a Gulab Jamun: smaller by every total, and
+    // AddOrder keeps the four Thalis and appends the dessert — 2,220.
+    const stored = storedOrderLines({ items: [{ id: "thali", name: "Thali", price: 525, quantity: 4 }] });
+    expect(orderUpsertAddsToBill([{ id: "new-1", name: "Gulab Jamun", price: 120, quantity: 1 }], stored)).toBe(true);
+    expect(orderOnPrintedBillVerdict({
+      printCount: 1, waiterOnly: true, guest: false,
+      addsToBill: orderUpsertAddsToBill([{ id: "new-1", name: "Gulab Jamun", price: 120, quantity: 1 }], stored),
+    })).toBe("refuse");
+    // 3 x Thali plus a new 525 dish: the same count and the same money, and a
+    // new dish on its way to the kitchen all the same.
+    expect(orderUpsertAddsToBill([
+      { id: "thali", name: "Thali", price: 525, quantity: 3 },
+      { id: "new-2", name: "Paneer Tikka", price: 525, quantity: 1 },
+    ], stored)).toBe(true);
   });
 
   test("the staff refusal says where the new party goes AND what a same-party addition needs", () => {
@@ -230,6 +265,43 @@ describe("who may add to a printed bill", () => {
     expect(body.error).not.toContain("12");
     expect(body.code).toBe(BILL_PRINTED_CODE);
     expect(body.next_party_action).toBeNull();
+  });
+
+  test("a MERGE into, or an item MOVED onto, a printed table is a manager's — no seat is offered", () => {
+    const merge = billPrintedRefusal({ table: "12", nextPartyTable: "12 #2", printCount: 1, guest: false, write: "merge" });
+    expect(merge).toEqual({
+      error: "12's bill has already been printed, so nothing more can be added to it. Ask a manager to merge it and reprint the bill.",
+      code: BILL_PRINTED_CODE,
+      table: "12",
+      next_party_table: null,
+      next_party_action: null,
+      print_count: 1,
+    });
+    const move = billPrintedRefusal({ table: "12 #2", nextPartyTable: "12 #3", printCount: 2, guest: false, parentTable: "12", write: "move" });
+    expect(move.error).toBe("12 (next party)'s bill has already been printed, so nothing more can be added to it. Ask a manager to move it and reprint the bill.");
+    expect(move.next_party_table).toBeNull();
+    expect(move.next_party_action).toBeNull();
+    // "order" is the default, word for word.
+    expect(billPrintedRefusal({ table: "12", nextPartyTable: "12 #2", printCount: 1, guest: false, write: "order" }))
+      .toEqual(billPrintedRefusal({ table: "12", nextPartyTable: "12 #2", printCount: 1, guest: false }));
+  });
+
+  test("the refusal is 423, never 409 — a 409 is 'still in flight, retry' to every till's outbox", () => {
+    expect(BILL_PRINTED_STATUS).toBe(423);
+    expect(BILL_PRINTED_STATUS).not.toBe(409);
+    // Parked on the first answer by outbox.dart's rule: a 4xx that is not 401,
+    // 408, 409 or 429.
+    expect([401, 408, 409, 429]).not.toContain(BILL_PRINTED_STATUS);
+    expect(BILL_PRINTED_STATUS).toBeGreaterThanOrEqual(400);
+    expect(BILL_PRINTED_STATUS).toBeLessThan(500);
+  });
+
+  test("a senior role's addition is answered with the reprint sentence, in the table's own words", () => {
+    expect(reprintNeededMessage("12")).toBe("12's bill was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.");
+    expect(reprintNeededMessage("12 #2", "12")).toBe("12 (next party)'s bill was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.");
+    // The server folds only on the parent it READ: a grandfathered room table
+    // that happens to be called "12 #2" is its own table and is named as one.
+    expect(reprintNeededMessage("12 #2", null)).toMatch(/^12 #2's bill was already printed/);
   });
 
   test("a printed SIBLING is named in its root's words", () => {

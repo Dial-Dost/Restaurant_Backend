@@ -20,7 +20,7 @@ import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
-import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -2026,10 +2026,16 @@ app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 	const price = Number(body.price ?? 0) || 0;
 	if (!fromTable || !toTable || !itemName) { res.status(400).json({ error: "from_table, to_table and item_name are required" }); return; }
 	try {
+		// CLIENT ITEM 6 — AN ITEM MOVED ONTO A PRINTED TABLE GROWS ITS BILL, exactly
+		// as an order would, through a door every waiter holds ("Add Orders"). The
+		// same guard, told it is a move: a waiter is refused (no seat offered —
+		// the item belongs to somebody seated), a senior role is told to reprint.
+		const guard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: toTable, guest: false, write: "move" });
+		if (guard.refused) {return;}
 		const result = await MoveBillItem(restaurantId, fromTable, toTable, itemName, price);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Moved item ${result.moved.name} from ${fromTable} to ${toTable}`, Audit_log_category.Bill, { from: fromTable, to: toTable, item: itemName }); } catch {/* ignore */}
-		res.json(result);
+		res.json({ ...result, ...reprintNeededFields(guard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'move_bill_item_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to move item') });
@@ -2584,10 +2590,16 @@ app.post('/bills/merge', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"),
 	const toTable = typeof body.to_table === "string" ? body.to_table.trim() : "";
 	if (!fromTable || !toTable) { res.status(400).json({ error: "from_table and to_table are required" }); return; }
 	try {
+		// CLIENT ITEM 6 — MERGING INTO A PRINTED TABLE puts every one of the
+		// source's orders on a bill the guest is already holding. Merging "12 #2"
+		// into a printed 12 (the same guests, one more round) is a manager's, who
+		// then reprints; a waiter is refused. See refuseOrderOnPrintedBill.
+		const guard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: toTable, guest: false, write: "merge" });
+		if (guard.refused) {return;}
 		const result = await MergeTableBills(restaurantId, fromTable, toTable);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Merged table ${fromTable} into ${toTable} (${result.moved_orders} orders)`, Audit_log_category.Bill, { from: fromTable, to: toTable }); } catch {/* ignore */}
-		res.json(result);
+		res.json({ ...result, ...reprintNeededFields(guard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'merge_bill_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to merge bills') });

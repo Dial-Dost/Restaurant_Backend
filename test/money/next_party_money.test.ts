@@ -16,7 +16,10 @@
 //     report then books — paper == drawer == report, per party;
 //   * covers are counted once per SEATING, one seating per row;
 //   * the tidy-up after a settle retires only an IDLE sibling, never one with a
-//     party on it.
+//     party on it;
+//   * re-opening a next party's bill after its seat retired brings the seat
+//     back with it — one live "12 #2", owing exactly what it settled for — or is
+//     refused whole.
 //
 // THE PRODUCTION SHAPE. Gaia Global Vegetarian, 2026-09-16: waiter Atsu seated
 // four at 12 at 07:58 and printed at 08:02 — before any "Bills" row existed, so
@@ -327,5 +330,84 @@ describe("the tidy-up after a settle retires only what is idle", () => {
     expect(liveSiblingsOf("12").map((x) => x.table_name)).toEqual(["12 #2"]);
     await db.ReleaseTable(SLUG, "12");
     expect(liveSiblingsOf("12")).toEqual([]);
+  });
+});
+
+describe("re-opening a next party's bill after its seat was retired", () => {
+  /** 12 settled first, then "12 #2" — so "12 #2" retired. Returns its bill. */
+  async function retiredNextPartyBill() {
+    const ids = await printedTwelveWithNextParty();
+    await db.FinalizeOnlinePayment(SLUG, "12", "pay_a");
+    tick(5);
+    const settled = await db.FinalizeOnlinePayment(SLUG, "12 #2", "pay_b");
+    const bill = bills().find((b) => b.payment_proof_screenshot_url === "pay_b")!;
+    expect(liveSiblingsOf("12")).toEqual([]);
+    expect(settled.total_amt).toBe(630);
+    tick(10);
+    return { ...ids, bill };
+  }
+
+  test("the seat comes back WITH its bill: same row, seated, owing what it settled for, found by name", async () => {
+    const { second, bill } = await retiredNextPartyBill();
+    const retiredId = tables().find((t) => t.table_name === "12 #2")!.id;
+
+    const out = await db.ReopenBill(SLUG, bill.id, "nirav");
+
+    expect(out.bill.table_name).toBe("12 #2");
+    expect(out.restored_orders).toBe(1);
+    const row = liveTable("12 #2");
+    expect(row.id).toBe(retiredId);
+    expect(row.is_occupied).toBe(true);
+    expect(statusOf(second.id)).toBe("6");
+    // Name-keyed reads find the re-opened money, and it is what was paid.
+    const reopened = await db.GetBillForTable(SLUG, "12 #2");
+    expect(reopened?.order_ids).toEqual([second.id]);
+    expect(reopened?.grand_total).toBe(630);
+    // 12's own bill is untouched by it.
+    expect((await db.GetBillForTable(SLUG, "12"))?.order_ids ?? []).not.toContain(second.id);
+  });
+
+  test("…and the next print of 12 does NOT mint a second live '12 #2': the next party gets '12 #3'", async () => {
+    const { bill } = await retiredNextPartyBill();
+    await db.ReopenBill(SLUG, bill.id, "nirav");
+    seat("12", 3);
+    addOrder("12", 450);
+    tick(2);
+    addPrint(`12-${String(Date.parse("2026-09-16T09:00:00.000Z"))}`);
+    const seatInfo = await db.EnsureNextPartyTable(SLUG, "12");
+    expect(seatInfo).toMatchObject({ table_name: "12 #3", created: true });
+    const live = tables().filter((t) => !t.is_deleted).map((t) => t.table_name.toLowerCase());
+    expect(new Set(live).size).toBe(live.length);
+    expect(live.filter((n) => n === "12 #2")).toHaveLength(1);
+  });
+
+  test("a seat now ANOTHER party's refuses the re-open in words, and nothing moves — bill, orders, floor", async () => {
+    const { second, bill } = await retiredNextPartyBill();
+    // A later party's live "12 #2" (a different row) holds the name.
+    addTable({ table_name: "12 #2", parent_table_id: liveTable("12").id, party_seq: 2, is_occupied: true, num_covers: 2 });
+    await expect(db.ReopenBill(SLUG, bill.id, "nirav"))
+      .rejects.toThrow('This bill was for 12 (next party), and that seat ("12 #2") is now another party\'s. Settle or release 12 #2 first, then re-open this bill.');
+    expect(bills().find((b) => b.id === bill.id)?.closed_at).not.toBeNull();
+    expect(bills().find((b) => b.id === bill.id)?.total_amt).toBe(630);
+    expect(statusOf(second.id)).toBe("4");
+    expect(tables().filter((t) => t.table_name === "12 #2" && !t.is_deleted)).toHaveLength(1);
+  });
+
+  test("a next party whose table was deleted since cannot be re-opened onto nothing", async () => {
+    const { second, bill } = await retiredNextPartyBill();
+    liveTable("12").is_deleted = true;
+    await expect(db.ReopenBill(SLUG, bill.id, "nirav"))
+      .rejects.toThrow("This bill was for 12 (next party), and table 12 has since been deleted, so there is no table to re-open it on.");
+    expect(bills().find((b) => b.id === bill.id)?.closed_at).not.toBeNull();
+    expect(statusOf(second.id)).toBe("4");
+  });
+
+  test("a ROOM table's re-open is exactly what it was: re-seated by the ordinary path", async () => {
+    const { first } = await retiredNextPartyBill();
+    const bill12 = bills().find((b) => b.payment_proof_screenshot_url === "pay_a")!;
+    const out = await db.ReopenBill(SLUG, bill12.id, "nirav");
+    expect(out.bill.table_name).toBe("12");
+    expect(liveTable("12").is_occupied).toBe(true);
+    expect(statusOf(first.id)).toBe("6");
   });
 });

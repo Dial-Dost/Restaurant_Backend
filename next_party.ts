@@ -205,7 +205,7 @@ export function planNextPartyRetirement(family: readonly NextPartyFamilyMember[]
 // The money guard on new orders.
 // ---------------------------------------------------------------------------
 
-/** The machine-readable code on the 409. Both clients key their action on it. */
+/** The machine-readable code on the refusal. Both clients key their action on it. */
 export const BILL_PRINTED_CODE = "bill_printed";
 
 /**
@@ -244,32 +244,49 @@ export function orderOnPrintedBillVerdict(input: {
 }
 
 /**
- * How much an order's lines come to, in the two shapes an order's `items` is
- * stored and sent in: the legacy list `[{price, quantity}, …]` and the split
- * `[["Served", [ … ]], ["Preparing", [ … ]]]`. `quantity` is the number of
- * portions, `amount` the list-price sum. A non-chargeable flag is ignored on
- * purpose: both sides of a comparison are measured the same way, and a client
- * copy of an NC line may or may not still carry the flag.
+ * One stored line of an order, as AddOrder keys it: by line id, with the
+ * quantity AddOrder would compare an incoming line against.
  */
-export function orderLinesMeasure(items: unknown): { quantity: number; amount: number } {
+export interface StoredOrderLine {
+	id: string;
+	quantity: number;
+}
+
+/**
+ * The lines of an INCOMING order's `items` in either shape a client sends —
+ * the list `[{id, …}, …]` or the split `[["Served", [ … ]], ["Preparing",
+ * [ … ]]]` — flattened. The tuple test is AddOrder's own: the FIRST entry
+ * decides, and a tuple whose second member is not a list contributes nothing.
+ */
+function flattenOrderItems(items: unknown): unknown[] {
 	const list: unknown[] = Array.isArray(items) ? items : [];
-	const isTuple = (t: unknown): t is [unknown, unknown[]] =>
-		Array.isArray(t) && typeof t[0] === "string" && Array.isArray(t[1]);
-	const lines = list.length > 0 && list.every(isTuple)
-		? list.flatMap((t) => (t as [unknown, unknown[]])[1])
-		: list;
-	let quantity = 0;
-	let amount = 0;
+	const first: unknown = list[0];
+	const tupleShape = Array.isArray(first) && typeof first[0] === "string" && Array.isArray(first[1]);
+	if (!tupleShape) { return list; }
+	return list.flatMap((t) => (Array.isArray(t) && Array.isArray(t[1]) ? (t[1] as unknown[]) : []));
+}
+
+/**
+ * The stored order's lines, read EXACTLY as AddOrder's merge reads them
+ * (`existingItems` / `existingById`): the split flattened when the order has a
+ * non-empty one, else its `items` list AS IT STANDS (a legacy tuple-shaped
+ * `items` holds no line AddOrder can match, so it holds none here either); a
+ * line with no id is not a line an incoming one can match; and when an id
+ * repeats, the LAST one wins.
+ */
+export function storedOrderLines(food: { items?: unknown; items_split?: unknown } | null | undefined): StoredOrderLine[] {
+	const split = Array.isArray(food?.items_split) && food.items_split.length > 0 ? (food.items_split as unknown[]) : null;
+	const lines: unknown[] = split
+		? split.flatMap((t) => (Array.isArray(t) && Array.isArray(t[1]) ? (t[1] as unknown[]) : []))
+		: Array.isArray(food?.items) ? (food.items as unknown[]) : [];
+	const byId = new Map<string, number>();
 	for (const line of lines) {
-		if (!line || typeof line !== "object" || Array.isArray(line)) { continue; }
-		const l = line as { price?: unknown; quantity?: unknown };
-		const q = Number(l.quantity ?? 1);
-		const p = Number(l.price ?? 0);
-		const qty = Number.isFinite(q) && q > 0 ? q : 0;
-		quantity += qty;
-		amount += Number.isFinite(p) ? p * qty : 0;
+		const l = (line && typeof line === "object" ? line : {}) as { id?: unknown; quantity?: unknown };
+		const id = String(l.id ?? "");
+		if (!id) { continue; }
+		byId.set(id, Number(l.quantity ?? 0) || 0);
 	}
-	return { quantity, amount: Math.round(amount * 100) / 100 };
+	return [...byId.entries()].map(([id, quantity]) => ({ id, quantity }));
 }
 
 /**
@@ -277,24 +294,74 @@ export function orderLinesMeasure(items: unknown): { quantity: number; amount: n
  *
  * POST /orders is also how the dashboard CHANGES an order: a status change
  * resends the order with its lines untouched, and the edit dialog resends it
- * with lines added (AddOrder merges the growth in as new Preparing lines). A
- * waiter changing a printed table's order to "Served" is not adding to the
- * bill and must not be refused; the same waiter adding a dessert through the
- * edit dialog is, and must be. So: more portions, or more money, than the
- * stored order holds. `existing` null = there is no such order — a new one,
- * which always adds.
+ * with lines added. A waiter changing a printed table's order to "Served" is
+ * not adding to the bill and must not be refused; the same waiter adding a
+ * dessert through the edit dialog is, and must be.
+ *
+ * DECIDED LINE BY LINE, THE WAY AddOrder MERGES — NOT BY COMPARING TOTALS.
+ * AddOrder starts from EVERY stored line and applies the incoming ones on top:
+ * a line id it does not know is appended as a new Preparing line, and a known
+ * id sent with a higher quantity has the difference appended. Lines the resend
+ * leaves out are KEPT. So a resend that names the order and carries ONLY the
+ * new dessert looks smaller than the stored order by any total, and grows the
+ * bill all the same — the hole a totals comparison left open (a waiter-only
+ * login added to a printed 4 x Thali this way, and the paper read 2,100 while
+ * the bill read 2,220). This asks AddOrder's own question instead: would the
+ * merge append anything?
+ *
+ *   * an incoming line with no id, or an id the stored order lacks -> adds;
+ *   * a known id with a quantity above the stored one               -> adds;
+ *   * anything else (the same lines, fewer, a lower quantity)        -> does not.
+ *
+ * Quantities are read as AddOrder reads them: incoming `Number(q ?? 1) || 1`,
+ * stored `Number(q ?? 0) || 0`. `existing` null = there is no such order — a
+ * new one, which always adds.
  */
 export function orderUpsertAddsToBill(
 	incomingItems: unknown,
-	existing: { quantity: number; amount: number } | null,
+	existing: readonly StoredOrderLine[] | null,
 ): boolean {
 	if (!existing) { return true; }
-	const incoming = orderLinesMeasure(incomingItems);
-	return incoming.quantity > existing.quantity || incoming.amount > existing.amount + 0.005;
+	const stored = new Map(existing.map((l) => [l.id, l.quantity]));
+	for (const line of flattenOrderItems(incomingItems)) {
+		const l = (line && typeof line === "object" ? line : {}) as { id?: unknown; quantity?: unknown };
+		const id = String(l.id ?? "");
+		const quantity = Number(l.quantity ?? 1) || 1;
+		const before = id ? stored.get(id) : undefined;
+		if (before === undefined) { return true; }
+		if (quantity > before) { return true; }
+	}
+	return false;
 }
 
 /**
- * The 409 body. `error` is a sentence both clients show as it stands, and
+ * THE STATUS OF THE REFUSAL: 423 Locked, and deliberately NOT 409.
+ *
+ * The till's outbox (restaurant_owner_app lib/services/outbox.dart — 2.0.0
+ * included, which cannot be patched in the field) reads 409 on an allowlisted
+ * write as "this Idempotency-Key is still in flight, retry", because
+ * idempotency.ts is the only thing that answers 409 there. A printed-bill
+ * refusal sent as 409 was therefore retried eight times instead of being
+ * parked, and while it sat pending the outbox's ordering rule queued every
+ * later write from that device behind it: new orders for OTHER tables read
+ * "Not sent yet" for as long as the refusal kept coming back. Any other 4xx is
+ * parked on the first answer, with this body's sentence on the chip. 423 is the
+ * one that says what happened — the bill is locked by its print — and nothing
+ * else in the backend answers it.
+ */
+export const BILL_PRINTED_STATUS = 423;
+
+/**
+ * What the refused write was. An ORDER is pointed at the next party's seat; a
+ * MERGE into, or an item MOVED onto, a printed table is food that already
+ * belongs to somebody seated, so it is only ever a manager's (add it,
+ * reprint) and no seat is offered.
+ */
+export type BillPrintedWrite = "order" | "merge" | "move";
+
+/**
+ * The refusal's body, sent with BILL_PRINTED_STATUS. `error` is a sentence
+ * both clients show as it stands, and
  * `next_party_action` is the label of the button beside it ("Take it on 12
  * (next party)") — null when there is nowhere else to take the order.
  */
@@ -314,17 +381,26 @@ export function billPrintedRefusal(input: {
 	guest: boolean;
 	/** The root's name when [table] is itself a sibling, so the sentence says "12". */
 	parentTable?: string | null;
+	/** An order (the default), or a merge into / an item moved onto [table]. */
+	write?: BillPrintedWrite;
 }): BillPrintedRefusal {
 	const named = tableSentenceName(input.table, input.parentTable ?? null);
-	const next = String(input.nextPartyTable ?? "").trim();
+	const write = input.write ?? "order";
+	// A merge or a move is never pointed anywhere: see BillPrintedWrite.
+	const next = write === "order" ? String(input.nextPartyTable ?? "").trim() : "";
 	const nextParent = parseNextPartyName(next)?.root ?? null;
 	const nextNamed = next ? tableSentenceName(next, nextParent) : "";
 	const elsewhere = next !== "" && next.toLowerCase() !== String(input.table ?? "").trim().toLowerCase();
+	const managerDoes = write === "merge"
+		? "Ask a manager to merge it and reprint the bill."
+		: write === "move"
+			? "Ask a manager to move it and reprint the bill."
+			: "Ask a manager to add it and reprint the bill.";
 	const error = input.guest
 		? "This table's bill has already been printed, so nothing more can be ordered on it here. Please ask a member of staff."
 		: elsewhere
 			? `${named}'s bill has already been printed, so nothing more can be added to it. Take a new party's order on ${nextNamed}. If it is for the same guests, ask a manager to add it and reprint the bill.`
-			: `${named}'s bill has already been printed, so nothing more can be added to it. Ask a manager to add it and reprint the bill.`;
+			: `${named}'s bill has already been printed, so nothing more can be added to it. ${managerDoes}`;
 	return {
 		error,
 		code: BILL_PRINTED_CODE,
@@ -336,7 +412,7 @@ export function billPrintedRefusal(input: {
 	};
 }
 
-/** The action both clients put beside the 409's sentence. */
+/** The action both clients put beside the refusal's sentence. */
 export function takeItOnNextPartyLabel(nextPartyTable: string): string {
 	const next = String(nextPartyTable ?? "").trim();
 	const parent = parseNextPartyName(next)?.root ?? null;
@@ -351,4 +427,18 @@ export function nextPartyAfterPrintMessage(nextPartyTable: string | null): strin
 	const next = String(nextPartyTable ?? "").trim();
 	if (!next) { return null; }
 	return `Seat the next party at ${tableSentenceName(next, parseNextPartyName(next)?.root ?? null)}.`;
+}
+
+/**
+ * THE LINE A SENIOR ROLE'S ADDITION TO A PRINTED BILL IS ANSWERED WITH.
+ *
+ * A manager, cashier or captain may add to a printed table (the refusal's own
+ * sentence sends a waiter to them for exactly that), but the paper in the
+ * guest's hand no longer covers what was added: the guest would pay the printed
+ * total while the settle books the larger one. The route answers
+ * `reprint_needed: true` with this sentence beside it as `reprint_message`, and
+ * both clients show it with a Reprint action, in these words.
+ */
+export function reprintNeededMessage(table: string, parentTable?: string | null): string {
+	return `${tableSentenceName(table, parentTable ?? null)}'s bill was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.`;
 }

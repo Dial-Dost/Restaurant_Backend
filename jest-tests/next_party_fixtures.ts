@@ -91,6 +91,14 @@ export interface SessionFix {
   left_at: string | null;
 }
 
+export interface BookingFix {
+  outlet_id: string;
+  table_id: string;
+  /** The JSON slot text decodeSlot reads. */
+  slot: string;
+  created_at: string;
+}
+
 export interface PrintJobFix {
   outlet_id: string;
   bill_id: string;
@@ -106,6 +114,7 @@ interface Store {
   sessions: SessionFix[];
   printJobs: PrintJobFix[];
   assignments: { table_id: string; employee_id: string }[];
+  bookings: BookingFix[];
   /** Outlets.default_tax, verbatim. */
   taxes: unknown;
   /** "Restaurant".service_charge — the restaurant_percent leg. */
@@ -126,7 +135,7 @@ let store: Store = freshStore();
 
 function freshStore(): Store {
   return {
-    tables: [], orders: [], bills: [], sessions: [], printJobs: [], assignments: [],
+    tables: [], orders: [], bills: [], sessions: [], printJobs: [], assignments: [], bookings: [],
     // Outlets.default_tax as the shipped seed stores it (000_base_schema.sql).
     taxes: { SGST: 2.5, CGST: 2.5 },
     scPct: 0,
@@ -169,6 +178,7 @@ function snapshot(): Snapshot {
     sessions: store.sessions.map((r) => ({ ...r })),
     printJobs: store.printJobs.map((r) => ({ ...r })),
     assignments: store.assignments.map((r) => ({ ...r })),
+    bookings: store.bookings.map((r) => ({ ...r })),
     taxes: store.taxes,
     scPct: store.scPct,
     billSeq: store.billSeq,
@@ -280,6 +290,22 @@ export function markWaiterConfirmed(billId: string, method = "Cash"): void {
   b.waiter_confirmed_at = nowIso();
   b.payment_method = method;
   for (const o of store.orders.filter((x) => x.table_id === b.table_id && isOwing(x.status))) {o.status = "6";}
+}
+
+/**
+ * A reservation holding a table, as GetTables reads one: `start` and
+ * `duration` minutes in the slot JSON.
+ */
+export function addBooking(tableName: string, start: Date, durationMin = 120): BookingFix {
+  const t = liveTable(tableName);
+  const row: BookingFix = {
+    outlet_id: t.outlet_id,
+    table_id: t.id,
+    slot: JSON.stringify({ start: start.toISOString(), duration: durationMin, status: "Confirmed" }),
+    created_at: nowIso(),
+  };
+  store.bookings.push(row);
+  return row;
 }
 
 export function addAssignment(tableName: string, employeeId: string): void {
@@ -470,6 +496,14 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   if (s.startsWith("select payment_config from \"restaurant\"")) {return { rows: [{ payment_config: null }] };}
   if (s.startsWith("select loyalty_earn_per_100")) {return { rows: [] };}
   if (s.includes('from "billtenders"')) {return { rows: [] };}
+  // GetTables' floor read of the reservations; every other booking reader sees none.
+  if (s.startsWith("select table_id, slot, created_at from \"bookings\"")) {
+    return {
+      rows: store.bookings
+        .filter((b) => inOutlet(b, params, 1))
+        .map((b) => ({ table_id: b.table_id, slot: b.slot, created_at: b.created_at })),
+    };
+  }
   if (s.includes('from "bookings"')) {return { rows: [] };}
   if (s.includes('"table_assignments"')) {
     if (s.startsWith("delete from")) {
@@ -615,6 +649,34 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
       .filter((t) => store.tables.some((p) => p.id === t.parent_table_id && !p.is_deleted))
       .sort((a, z) => (a.created_at < z.created_at ? 1 : -1))[0];
     return { rows: hit ? [{ id: hit.id, parent_table_id: hit.parent_table_id }] : [] };
+  }
+
+  // ReopenBill's next-party half: the row, and its root.
+  if (s.startsWith("select t.table_name, t.parent_table_id, coalesce(t.is_deleted, false) as is_deleted, p.table_name as parent_name")) {
+    const t = byId(0, 2);
+    const p = t?.parent_table_id ? store.tables.find((x) => x.id === t.parent_table_id) : undefined;
+    return {
+      rows: t ? [{
+        table_name: t.table_name, parent_table_id: t.parent_table_id, is_deleted: t.is_deleted,
+        parent_name: p?.table_name ?? null, parent_deleted: p ? p.is_deleted : null,
+      }] : [],
+    };
+  }
+  if (s.startsWith("update \"tables\" t set is_deleted = false, is_occupied = true where t.id = $1")) {
+    const t = byId(0, 2);
+    const clash = t && store.tables.some((x) => x !== t && !x.is_deleted && x.outlet_id === t.outlet_id
+      && (x.table_name.toLowerCase() === t.table_name.toLowerCase()
+        || (x.parent_table_id === t.parent_table_id && x.party_seq === t.party_seq)));
+    if (!t || !t.is_deleted || clash) {return { rows: [] };}
+    updateTable(t, { is_deleted: false, is_occupied: true });
+    return { rows: [{ table_name: t.table_name }] };
+  }
+  // ReopenBill's ordinary re-seat: live rows only.
+  if (s.startsWith("update \"tables\" set is_occupied = true where id = $1")) {
+    const t = byId(0, 2);
+    if (!t || t.is_deleted) {return { rows: [] };}
+    updateTable(t, { is_occupied: true });
+    return { rows: [{ table_name: t.table_name }] };
   }
 
   // Sibling insert.
@@ -886,6 +948,21 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     }
     return { rows: [] };
   }
+  // ReopenBill: this session's settled orders back to "Payment Pending Approval".
+  if (s.startsWith("update \"orders\" set status = 6, food = jsonb_set(")) {
+    const after = at(new Date(params[3] as string | Date).toISOString());
+    const upTo = at(new Date(params[4] as string | Date).toISOString());
+    const out: { id: string }[] = [];
+    for (const o of store.orders) {
+      if (!inOutlet(o, params, 1) || !tableIs(o, 2) || !["4", "7"].includes(str(o.status) || "1")) {continue;}
+      const placed = at(o.created_at);
+      if (!(placed > after && placed <= upTo)) {continue;}
+      o.status = "6";
+      o.food = { ...o.food, status: "Payment Pending Approval" };
+      out.push({ id: o.id });
+    }
+    return { rows: out };
+  }
   if (s.startsWith("update \"orders\" set status = $1, food = jsonb_set(")) {
     for (const o of store.orders) {
       if (o.table_id === str(params[2]) && inOutlet(o, params, 4) && isOwing(o.status)) {
@@ -907,6 +984,39 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   // =========================================================================
   // "Bills"
   // =========================================================================
+  // ReopenBill.
+  if (s.startsWith("select b.id, b.bill_no, b.table_id, b.total_amt, b.payment_method, b.created_at, b.closed_at")) {
+    const b = store.bills.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    return {
+      rows: b ? [{
+        id: b.id, bill_no: b.bill_no, table_id: b.table_id, total_amt: b.total_amt, payment_method: b.payment_method,
+        created_at: new Date(b.created_at), closed_at: b.closed_at ? new Date(b.closed_at) : null, refunded_at: null,
+        waiter_confirmed_at: b.waiter_confirmed_at ? new Date(b.waiter_confirmed_at) : null,
+        within_window: b.closed_at !== null && store.nowMs - at(b.closed_at) <= 240 * 60_000,
+        window_min: 240,
+      }] : [],
+    };
+  }
+  if (s.startsWith("update \"bills\" set closed_at = null, closed_by_username = null, admin_approved_at = null")) {
+    const b = store.bills.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    if (!b) {return { rows: [] };}
+    Object.assign(b, { closed_at: null, closed_by_username: null, admin_approved_at: null, admin_approved_by_username: null, status: 1 });
+    return {
+      rows: [{
+        id: b.id, status: b.status, created_at: new Date(b.created_at),
+        waiter_confirmed_at: b.waiter_confirmed_at ? new Date(b.waiter_confirmed_at) : null,
+      }],
+    };
+  }
+  if (s.startsWith("select coalesce(max(closed_at), 'epoch'::timestamptz) as prev_closed from \"bills\"")) {
+    const upTo = at(new Date(params[4] as string | Date).toISOString());
+    const prev = store.bills
+      .filter((b) => b.table_id === str(params[0]) && inOutlet(b, params, 2) && b.id !== str(params[3])
+        && b.closed_at !== null && at(b.closed_at) <= upTo)
+      .map((b) => at(b.closed_at))
+      .sort((a, z) => z - a)[0];
+    return { rows: [{ prev_closed: new Date(prev ?? 0) }] };
+  }
   if (s.startsWith("select b.id, b.bill_no, b.coupon_code")) {
     const b = openBillOf(str(params[0]), (x) => x.status !== 3 && inOutlet(x, params, 2));
     return {
