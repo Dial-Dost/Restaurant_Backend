@@ -340,8 +340,16 @@ describe("dispatchKot — which docket the restaurant gets", () => {
     expect(paper(enqueued[0]!.esc_base64)).toContain("Table No: 12");
   });
 
+  // The style is the RESTAURANT's ("Restaurant".kot_print_style), read by
+  // dispatchKot itself — no caller passes it — so these tests set it where it
+  // lives, at the read, rather than on the dispatch input.
+  const onClassic = () => jest.spyOn(db, "GetKotPrintStyle").mockResolvedValue("classic");
+
   test("'classic' reaches the renderer and puts the text docket on the roll", async () => {
-    await kp.dispatchKot(dispatch({ kotPrintStyle: "classic" }));
+    const style = onClassic();
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { style.mockRestore(); }
     expect(isRaster(enqueued[0]!.esc_base64)).toBe(false);
     expect(Buffer.from(enqueued[0]!.esc_base64, "base64").toString("latin1")).toContain("Table No: 12");
   });
@@ -351,7 +359,10 @@ describe("dispatchKot — which docket the restaurant gets", () => {
       { id: "m1", name: "Paneer Tikka", station: "TANDOOR" },
       { id: "m2", name: "Masala Papad", station: "COLD" },
     ]);
-    await kp.dispatchKot(dispatch({ kotPrintStyle: "classic" }));
+    const style = onClassic();
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { style.mockRestore(); }
     expect(enqueued.length).toBeGreaterThan(1);
     expect(enqueued.map((j) => isRaster(j.esc_base64))).toEqual(enqueued.map(() => false));
   });
