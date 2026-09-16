@@ -1,4 +1,13 @@
-// READING "Restaurant".kot_print_style WHEN THE DATABASE IS NOT COOPERATING.
+// "Restaurant".kot_print_style AGAINST A DATABASE — the read when the database
+// is not cooperating, and the write that is the owner's way out.
+//
+// Both halves are driven against the REAL functions over a fixture Pool, because
+// what is under test is SQL: a restatement of either statement in a mock would
+// pass while the shipped one did nothing. The fixture therefore behaves like the
+// column rather than like a script — what the write stores is what the next read
+// answers — so a save that stops writing is a save that reads back wrong.
+//
+// THE READ.
 //
 // This column is the owner's escape hatch from a kitchen printer that answers a
 // raster docket with blank paper, and it is read ONCE PER DOCKET on the path
@@ -17,9 +26,18 @@
 //   * a read that FAILED is "I cannot tell", and the honest answer to that is
 //     the last style this process actually saw for this restaurant.
 //
-// Driven against the REAL GetKotPrintStyle over a fixture Pool, because what is
-// under test is the SQL and its error handling — a restatement of either in a
-// mock would pass while the shipped read threw.
+// THE WRITE.
+//
+// One statement inside SetRestaurantSettings' transaction persists the choice,
+// and it is the entire escape hatch: if it stops running, an owner standing at a
+// printer that is producing blank tickets picks "Classic text docket", is told
+// the settings were saved, and the next KOT is blank again. Nothing on any
+// screen would say otherwise — the route answers 200, the audit entry is
+// written, and the setting reads back as whatever it already was.
+//
+// So the write is exercised here, not restated: the real SetRestaurantSettings
+// runs, and what is asserted is the statement it issued, the connection it
+// issued it on, and the value the caller is handed back afterwards.
 
 import { describe, test, expect, beforeAll, beforeEach, jest } from "@jest/globals";
 
@@ -32,18 +50,62 @@ type StyleAnswer =
   | { kind: "value"; value: unknown }
   | { kind: "throw"; err: unknown };
 
+/**
+ * WHAT THE COLUMN CURRENTLY HOLDS.
+ *
+ * The write path sets this, the read path answers from it — the fixture models
+ * the column rather than scripting each statement, so "the save stored it" and
+ * "the read gives it back" are the same fact here that they are in Postgres.
+ */
 const styleAnswer: { value: StyleAnswer } = { value: { kind: "value", value: null } };
 /** How many times the column was actually asked for. */
 const styleReads = { n: 0 };
 
+/** One statement the code under test issued, and the connection it went out on. */
+interface Statement { sql: string; params: unknown[]; on: "pool" | "transaction" }
+/** Every statement, in order. Reset per test. */
+const statements: Statement[] = [];
+
+/**
+ * What the big settings UPDATE returns. Only its shape matters: the fields this
+ * file asserts on are read separately (the style) or defaulted (everything
+ * else). msg_webhook_secret is already minted so no save mints a second one.
+ */
+const SETTINGS_ROW: Record<string, unknown> = {
+  auto_push_orders: true, currency: "₹", payment_config: null,
+  razorpay_key_id: null, razorpay_key_secret: null, service_charge: 0,
+  discount_approval_threshold: 0, bill_reopen_window_min: 240,
+  alert_discount_pct: 10, alert_void_count: 5,
+  loyalty_earn_per_100: 0, loyalty_point_value: 1,
+  booking_deposit_amount: 0, booking_deposit_min_party: 0,
+  booking_cancel_window_hours: 24, booking_min_spend: 0,
+  msg_provider: "none", msg_sender: null, msg_key_id: null, msg_key_secret: null,
+  msg_reminder_hours: 2, msg_webhook_secret: "already-minted",
+  feedback_config: null, bill_logo_svg: null, bill_paper_width: "80mm",
+  bill_legal_name: null, bill_gstin: null, bill_qr_note: null,
+  kitchen_sections: null, inventory_categories: null, timezone: "Asia/Kolkata",
+  require_table_otp: false, kot_auto_print: true, bill_show_qr: true,
+  theme_color: null, brand_config: null,
+};
+
 jest.mock("pg", () => {
-  const answer = (sql: string): unknown[] => {
+  const answer = (sql: string, params: unknown[]): unknown[] => {
     const q = String(sql);
+    // ensureBrandingColumns' DDL and the transaction verbs. Recorded (so the
+    // tests can see the ordering) but there is nothing to answer with.
+    if (/^\s*(alter table|begin|commit|rollback|savepoint|release|set )/i.test(q)) { return []; }
     if (q.includes("select kot_print_style")) {
       styleReads.n += 1;
       const a = styleAnswer.value;
       if (a.kind === "throw") { throw a.err; }
       return [{ kot_print_style: a.value }];
+    }
+    // THE WRITE — matched before the big settings update below, which also
+    // begins `update "Restaurant" set`. Storing it here is what makes the read
+    // after a save answer what the owner chose.
+    if (q.includes("set kot_print_style")) {
+      styleAnswer.value = { kind: "value", value: params[1] };
+      return [];
     }
     if (q.includes('from "Restaurant" r')) {
       return [{
@@ -53,19 +115,28 @@ jest.mock("pg", () => {
         timezone: "Asia/Kolkata",
       }];
     }
-    // Everything this read touches is answered above. Anything else is the test
-    // drifting off the statement it means to drive.
+    if (q.includes('update "Restaurant" set')) { return [{ ...SETTINGS_ROW }]; }
+    if (q.includes('select default_tax from "Outlets"')) { return [{ default_tax: null }]; }
+    // Everything these two paths touch is answered above. Anything else is the
+    // test drifting off the statements it means to drive.
     throw new Error(`kot_print_style fixture: no answer for: ${q.replace(/\s+/g, " ").trim().slice(0, 140)}`);
   };
+  const run = (on: "pool" | "transaction") => (sql: string, params: unknown[] = []): Promise<{ rows: unknown[] }> => {
+    statements.push({ sql: String(sql), params, on });
+    // Thrown synchronously inside `answer`, returned as a rejection — which is
+    // how `pg` surfaces a failed statement.
+    try { return Promise.resolve({ rows: answer(String(sql), params) }); }
+    catch (err) { return Promise.reject(err); }
+  };
+  /** A checked-out client — i.e. the connection a transaction runs on. */
+  class FakeClient {
+    query = run("transaction");
+    release(): void { /* back to the pool */ }
+  }
   class FakePool {
     on(): this { return this; }
-    query(sql: string): Promise<{ rows: unknown[] }> {
-      // Thrown synchronously inside `answer`, returned as a rejection — which is
-      // how `pg` surfaces a failed statement.
-      try { return Promise.resolve({ rows: answer(sql) }); }
-      catch (err) { return Promise.reject(err); }
-    }
-    connect(): Promise<never> { return Promise.reject(new Error("kot_print_style fixture: pool.connect() is not stubbed")); }
+    query = run("pool");
+    connect(): Promise<FakeClient> { return Promise.resolve(new FakeClient()); }
     end(): Promise<void> { return Promise.resolve(); }
   }
   return { Pool: FakePool, default: { Pool: FakePool } };
@@ -83,6 +154,7 @@ beforeAll(async () => {
 beforeEach(() => {
   styleAnswer.value = { kind: "value", value: null };
   styleReads.n = 0;
+  statements.length = 0;
 });
 
 /** A `pg` error for a column that is not there. */
@@ -153,5 +225,89 @@ describe("GetKotPrintStyle", () => {
     styleAnswer.value = { kind: "value", value: "classic" };
     await expect(db.GetKotPrintStyle(SLUG)).resolves.toBe("classic");
     expect(styleReads.n).toBe(2);
+  });
+});
+
+// ============================================================================
+// THE WRITE: the statement that actually persists the owner's escape hatch
+// ============================================================================
+
+/** Every statement that touched the column, in order. */
+const styleWrites = (): Statement[] => statements.filter((s) => s.sql.includes("set kot_print_style"));
+/** The transaction's statements, whitespace-flattened, in order. */
+const txnStatements = (): string[] =>
+  statements.filter((s) => s.on === "transaction").map((s) => s.sql.replace(/\s+/g, " ").trim());
+
+describe("SetRestaurantSettings stores the choice", () => {
+  test("THE ESCAPE HATCH: choosing the classic docket is WRITTEN, inside the save's transaction", async () => {
+    // If this statement stops running, an owner standing at a printer that is
+    // producing blank tickets picks "Classic text docket", is told the settings
+    // were saved, and the next KOT is blank again.
+    await db.SetRestaurantSettings(SLUG, { kot_print_style: "classic" });
+
+    const writes = styleWrites();
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.sql).toContain(`update "Restaurant" set kot_print_style = $2 where id = $1`);
+    expect(writes[0]!.params).toEqual([RES, "classic"]);
+    // ON THE TRANSACTION'S CLIENT, not the pool: the choice and the rest of the
+    // save commit or roll back together, so a save that answers 500 has not
+    // quietly moved a kitchen onto a different docket.
+    expect(writes[0]!.on).toBe("transaction");
+  });
+
+  test("...and it is the whole transaction's business, in order", async () => {
+    await db.SetRestaurantSettings(SLUG, { kot_print_style: "classic" });
+
+    const order = txnStatements();
+    const write = order.findIndex((s) => s.includes("set kot_print_style"));
+    const settingsRow = order.findIndex((s) => s.includes("auto_push_orders = coalesce"));
+    expect(order[0]).toMatch(/^BEGIN$/i);
+    expect(write).toBeGreaterThan(0);
+    // The big settings update stays this transaction's LAST statement — the
+    // invariant test/money/payment_modes_routes.test.ts pins from the source
+    // side, because payment modes must be written in the same transaction as
+    // every other setting.
+    expect(settingsRow).toBeGreaterThan(write);
+    expect(settingsRow).toBe(order.length - 2);
+    expect(order[order.length - 1]).toMatch(/^COMMIT$/i);
+  });
+
+  test("the settings the caller is handed back say what was just stored", async () => {
+    // The route echoes this document to the dashboard, which renders the radio
+    // from it. A save that stored nothing but reported 'classic' would put a
+    // checked radio in front of an owner whose kitchen is still blank-ticketing.
+    const saved = await db.SetRestaurantSettings(SLUG, { kot_print_style: "classic" });
+    expect(saved.kot_print_style).toBe("classic");
+  });
+
+  test("and back again: choosing the reference docket is just as much a write", async () => {
+    // The way out has to work in both directions — a kitchen whose printer was
+    // replaced goes back to the docket the client asked for.
+    styleAnswer.value = { kind: "value", value: "classic" };
+    const saved = await db.SetRestaurantSettings(SLUG, { kot_print_style: "reference" });
+    expect(styleWrites().map((s) => s.params)).toEqual([[RES, "reference"]]);
+    expect(saved.kot_print_style).toBe("reference");
+  });
+
+  test("A SAVE THAT DOES NOT MENTION THE SWITCH ISSUES NO STATEMENT AT ALL", async () => {
+    // Two reasons this matters. The column ships as runtime DDL and migration
+    // 050 is applied by hand, so naming it in a save that did not ask for it
+    // would make an unrelated setting fail in that window. And a kitchen that
+    // has chosen 'classic' must not be moved back onto the docket it cannot
+    // print by somebody changing the currency.
+    styleAnswer.value = { kind: "value", value: "classic" };
+    const saved = await db.SetRestaurantSettings(SLUG, { currency: "INR" });
+    expect(styleWrites()).toHaveLength(0);
+    expect(saved.kot_print_style).toBe("classic");
+  });
+
+  test("a value that is not one of the two styles writes nothing", async () => {
+    // The route refuses this with a 400 before it gets here (see
+    // kot_print_style_route.test.ts); parseKotPrintStyle refusing it again is
+    // what stops any OTHER caller of the data layer coercing a kitchen's docket.
+    styleAnswer.value = { kind: "value", value: "classic" };
+    const saved = await db.SetRestaurantSettings(SLUG, { kot_print_style: "raster-v2" });
+    expect(styleWrites()).toHaveLength(0);
+    expect(saved.kot_print_style).toBe("classic");
   });
 });
