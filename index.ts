@@ -56,6 +56,7 @@ import { registerUserRoutes } from "./routes/users.js";
 import { registerSimulationRoutes } from "./routes/simulation.js";
 import { registerPosterRoutes } from "./routes/posters.js";
 import { registerMisCaptureRoutes } from "./routes/mis_capture.js";
+import { InitBillNonChargeableSchema, registerNcSettleRoutes } from "./routes/nc_settle.js";
 import { registerMisReportRoutes } from "./routes/reports_mis.js";
 import { registerMenuTaxonomyRoutes } from "./routes/menu_taxonomy.js";
 import { registerSelfScorecardRoute } from "./routes/me.js";
@@ -458,6 +459,10 @@ registerMisReportRoutes(app);
 // These are the control ledgers the reports above read; without them the reports
 // are permanently empty, so an unregistered file here is a silent no-op.
 registerMisCaptureRoutes(app);
+// SETTLE AS NC (migration 052): the one-step "close this bill as
+// non-chargeable". Beside the capture routes it is built from; its only path is
+// a literal under /bills/order/:orderId/, which no earlier pattern matches.
+registerNcSettleRoutes(app);
 // TENDERS, TIPS AND BILLING COUNTERS (migrations 037/038). Registered after
 // everything else so no earlier pattern can swallow /bills/tenders,
 // /bills/counter, /billing-counters or /tips, and so none of them can shadow a
@@ -626,6 +631,16 @@ async function bootstrap(): Promise<void> {
 		}
 	} catch (error) {
 		logger.warn({ err: error }, "print_routing_boot_probe_failed — routing stays off, printing is unchanged");
+	}
+
+	// "OrderItemNonChargeable".scope/bill_id/settle_group (migration 052), ONCE,
+	// here, outside any transaction, for the reason 048's column gives below: a
+	// settle must never issue ALTER TABLE, because a DDL rolled back with its
+	// settle leaves the in-process memo believing it happened. Idempotent; a
+	// no-op once 052 is applied; never takes the server down. Until the columns
+	// exist, POST /bills/order/:orderId/settle-nc answers 503.
+	if (await InitBillNonChargeableSchema()) {
+		logger.info("✅ Bill non-chargeable columns ready (migration 052)");
 	}
 
 	// "Bills".round_off (migration 048), ONCE, here, outside any transaction.

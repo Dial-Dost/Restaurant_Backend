@@ -4,10 +4,10 @@
  * split, merge, refund, reopen).
  */
 import type { Express, Request, Response } from "express";
-import type { BillSectionAxis, BillTenderState, OpenBillChargeConfig } from "../database_supabase.js";
+import type { BillSectionAxis, BillTenderState, ClosedBillDetail, OpenBillChargeConfig } from "../database_supabase.js";
 import { z } from "zod";
 import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
-import { buildReceiptBase64, buildSplitReceiptsBase64, type SplitReceiptPart } from "../escpos.js";
+import { buildReceiptBase64, buildSplitReceiptsBase64, type ReceiptOptions, type SplitReceiptPart } from "../escpos.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
@@ -20,7 +20,7 @@ import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
-import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -1361,6 +1361,95 @@ export async function claimClientRenderedBillPrint(
 	};
 }
 
+/**
+ * THE RECEIPT OF A SETTLED BILL, from what was RECORDED — shared by
+ * POST /print/bill/settled (the accounting reprint) and
+ * POST /bills/order/:orderId/settle-nc (the NC bill's own paper), so a settled
+ * bill has one shape on paper whichever door printed it. Every figure is
+ * GetClosedBill's; see /print/bill/settled's header for why nothing here may be
+ * recomputed from today's configuration.
+ *
+ * An NC-settled bill (nc_settlement set) prints its settlement block under the
+ * 0.00 total: the kind and the authoriser, read back from its ledger rows.
+ * `settlement` overrides that, for the settle route, which knows the
+ * would-have-charged figure first-hand.
+ */
+export function settledBillReceiptOptions(
+	bill: ClosedBillDetail,
+	target: {
+		settings: Awaited<ReturnType<typeof GetRestaurantSettings>>;
+		profile: Awaited<ReturnType<typeof GetRestaurantProfile>> | null;
+		logo: Buffer | null;
+		reprint: boolean;
+		settlement?: ReceiptOptions["settlement"];
+	},
+): ReceiptOptions {
+	const nc = bill.nc_settlement;
+	return {
+		restaurantName: target.profile?.outlet_name || target.profile?.restaurant_name || "Receipt",
+		legalName: target.settings.bill_legal_name ?? null,
+		address: target.profile?.outlet_add ?? null,
+		phone: target.profile?.outlet_phone ?? null,
+		gstin: target.settings.bill_gstin ?? null,
+		table: bill.table_name ?? "",
+		covers: bill.covers ?? 1,
+		items: bill.items.map((i) => ({
+			name: i.variation ? `${i.name} (${i.variation})` : i.name,
+			price: i.price,
+			quantity: i.quantity,
+			note: i.note ?? undefined,
+			// A comped line stays its own line on the settled bill and prints at
+			// 0.00 (GetClosedBill keys the merge on it, as the live bill does).
+			...(i.nc ? { nc: true } : {}),
+		})),
+		// The pre-discount line total, as the settled bill reconstructed it.
+		total: bill.items_subtotal,
+		customer: bill.customer,
+		customerGstin: bill.customer_gstin ?? null,
+		billNo: bill.bill_no,
+		cashier: bill.created_by ?? null,
+		// The date the bill was RAISED, not today: a reprint is a second copy of
+		// that document, and the REPRINT banner already says it is a copy.
+		// An unreadable created_at would make Intl throw, and a date line is not
+		// worth the reprint: it falls back to now.
+		printedAt: kotStamp(Number.isFinite(Date.parse(String(bill.created_at ?? ""))) ? new Date(bill.created_at) : new Date(), target.settings.timezone || "Asia/Kolkata"),
+		discount: (bill.discount_amount ?? 0) > 0
+			? { amount: bill.discount_amount ?? 0, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" }
+			: null,
+		// Only a charge that was actually taken prints — the same rule as the
+		// original bill, so a waived bill's reprint has no service-charge line.
+		serviceCharge: bill.service_charge > 0
+			? { percent: bill.service_charge_percent, amount: bill.service_charge }
+			: null,
+		taxes: bill.taxes,
+		grandTotal: bill.grand_total,
+		// The round-off RECORDED at settle ("Bills".round_off, migration 048) —
+		// never recomputed from today's rule. 0 on a bill settled before
+		// rounding, which prints no line, exactly as the original did.
+		roundOff: bill.round_off,
+		currency: target.settings.currency ?? "\u20b9",
+		kind: "bill",
+		logo: target.logo,
+		// The settled reprint passes true — NOT OPTIONAL there, because that route
+		// can only ever produce a second copy. The NC settle's own paper is the
+		// original and passes false.
+		reprint: target.reprint,
+		// NO FEEDBACK QR ON A SETTLED BILL. The QR is signed for a live seating
+		// and invites a guest who has left to rate a meal they already rated; a
+		// reprint is an accounting document, and an NC bill an in-house record,
+		// not a table-side courtesy.
+		feedbackUrl: null,
+		// The disclaimer follows the charge that was ACTUALLY TAKEN, which for a
+		// settled bill is a recorded fact rather than a configuration question.
+		serviceChargeNote: bill.service_charge > 0
+			? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."
+			: null,
+		settlement: target.settlement !== undefined
+			? target.settlement
+			: nc ? { kind: nc.kind_label, authorisedBy: nc.authorised_by, wouldHaveCharged: nc.would_have_charged } : null,
+	};
+}
+
 export function registerBillPrintAndEditRoutes(app: Express): void {
 
 // Publish a bill ESC/POS payload to the appropriate restaurant:outlet pub/sub channel
@@ -1741,62 +1830,9 @@ app.post('/print/bill/settled', validateAction(ACCOUNTING_PERM), async (req: Req
 		// different width is a different-looking document.
 		const logo = await buildLogoEscPos(restaurantId, is58 ? 384 : 576).catch(() => null);
 
-		// EVERY FIGURE IS THE SETTLED ONE. Read the header: nothing here is
-		// derived from today's tax or service-charge configuration.
-		const escBase64 = buildReceiptBase64({
-			restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
-			legalName: settings.bill_legal_name ?? null,
-			address: profile?.outlet_add ?? null,
-			phone: profile?.outlet_phone ?? null,
-			gstin: settings.bill_gstin ?? null,
-			table: bill.table_name ?? "",
-			covers: bill.covers ?? 1,
-			items: bill.items.map((i) => ({
-				name: i.variation ? `${i.name} (${i.variation})` : i.name,
-				price: i.price,
-				quantity: i.quantity,
-				note: i.note ?? undefined,
-			})),
-			// The pre-discount line total, as the settled bill reconstructed it.
-			total: bill.items_subtotal,
-			customer: bill.customer,
-			customerGstin: bill.customer_gstin ?? null,
-			billNo: bill.bill_no,
-			cashier: bill.created_by ?? null,
-			// The date the bill was RAISED, not today: a reprint is a second copy of
-			// that document, and the REPRINT banner already says it is a copy.
-			// An unreadable created_at would make Intl throw, and a date line is not
-			// worth the reprint: it falls back to now.
-			printedAt: kotStamp(Number.isFinite(Date.parse(String(bill.created_at ?? ""))) ? new Date(bill.created_at) : new Date(), settings.timezone || "Asia/Kolkata"),
-			discount: (bill.discount_amount ?? 0) > 0
-				? { amount: bill.discount_amount ?? 0, label: bill.coupon_code ? `Coupon ${bill.coupon_code}` : "Discount" }
-				: null,
-			// Only a charge that was actually taken prints — the same rule as the
-			// original bill, so a waived bill's reprint has no service-charge line.
-			serviceCharge: bill.service_charge > 0
-				? { percent: bill.service_charge_percent, amount: bill.service_charge }
-				: null,
-			taxes: bill.taxes,
-			grandTotal: bill.grand_total,
-			// The round-off RECORDED at settle ("Bills".round_off, migration 048) —
-			// never recomputed from today's rule. 0 on a bill settled before
-			// rounding, which prints no line, exactly as the original did.
-			roundOff: bill.round_off,
-			currency: settings.currency ?? "\u20b9",
-			kind: "bill",
-			logo,
-			// NOT OPTIONAL. This route can only ever produce a second copy.
-			reprint: true,
-			// NO FEEDBACK QR ON A REPRINT. The QR is signed for a live seating and
-			// invites a guest who has left to rate a meal they already rated; a
-			// reprint is an accounting document, not a table-side courtesy.
-			feedbackUrl: null,
-			// The disclaimer follows the charge that was ACTUALLY TAKEN, which for a
-			// settled bill is a recorded fact rather than a configuration question.
-			serviceChargeNote: bill.service_charge > 0
-				? "A Voluntary Service Charge is included to support our staff. If you prefer not to contribute, please inform your server before payment and it will be removed."
-				: null,
-		}, cols);
+		// EVERY FIGURE IS THE SETTLED ONE. Read settledBillReceiptOptions: nothing
+		// there is derived from today's tax or service-charge configuration.
+		const escBase64 = buildReceiptBase64(settledBillReceiptOptions(bill, { settings, profile, logo, reprint: true }), cols);
 
 		const dispatched = await dispatchPrintJob(restaurantId, {
 			outlet_id: outletId, bill_id: bill.id, kind: "bill", station: null, esc_base64: escBase64,
@@ -2637,11 +2673,24 @@ app.post('/bills/:id/reopen', validate, async (req: Request, res: Response) => {
 	const billId = typeof req.params.id === "string" ? req.params.id.trim() : "";
 	if (!billId) { res.status(400).json({ error: "Bill id is required" }); return; }
 	try {
-		const result = await ReopenBill(restaurantId, billId, extractEmployeeId(req));
+		const result = await ReopenBill(restaurantId, billId, extractEmployeeId(req), extractEmployeeUsername(req));
 		try { if (result.bill.table_name) {emitRestaurant(restaurantId, "bill:updated", { table: result.bill.table_name });} } catch {/* ignore */}
 		try {
 			await log_audit(req, "d5e3f7a9-2b4c-4d6e-9f80-3c5b7d9e1f2a", `Re-opened bill ${result.bill.bill_no ?? result.bill.id} (table ${result.bill.table_name ?? "?"}, ${result.restored_orders} orders restored)`, Audit_log_category.Bill, { bill_id: result.bill.id, table: result.bill.table_name, restored_orders: result.restored_orders });
 		} catch {/* ignore */}
+		// A BILL SETTLED AS NC HAD ITS COMPS REVERSED BY THAT RE-OPEN. Said on
+		// the record under the comp permission's own id with the settle's
+		// `scope` flag, so the Bill Edit report files it as the NC settle undone
+		// (bill_non_chargeable_reversed) beside the settle it undid.
+		if (result.nc_reversed) {
+			try {
+				await log_audit(req, PERM_NON_CHARGEABLE, `Undid the non-chargeable settle of bill ${result.bill.bill_no ?? result.bill.id} by re-opening it (${String(result.nc_reversed.lines)} line(s), ₹${result.nc_reversed.value.toFixed(2)} back on the bill)`, Audit_log_category.Bill, {
+					scope: "bill", reversal: true, bill_id: result.bill.id, bill_no: result.bill.bill_no,
+					table: result.bill.table_name, settle_group: result.nc_reversed.settle_group,
+					nc_lines: result.nc_reversed.lines, nc_value: result.nc_reversed.value,
+				});
+			} catch {/* ignore */}
+		}
 		res.json(result);
 	} catch (e: any) {
 		logger.error({ err: e }, 'reopen_bill_failed');

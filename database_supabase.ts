@@ -42,8 +42,11 @@ import {
   DEFAULT_PAYMENT_METHODS,
   PaymentConfigError,
   displayPaymentMethod,
+  isNcSettleMethod,
   mergePaymentConfig,
   methodRequiresProof,
+  NC_SETTLE_METHOD,
+  ncPaymentPointer,
   paymentConfigForUndo,
   paymentMethodLabel,
   paymentMethodRefusal,
@@ -170,6 +173,17 @@ import {
   type VoidKind,
   type VoidStage,
 } from "./mis_capture.js";
+// Settle as NC (migration 052): the plan, the refusals and the ₹0 hardening rule
+// are decided by value in their own pure module, so this file only locks rows
+// and writes them.
+import {
+  applyBillNonChargeable,
+  describeNcSettlement,
+  ncSettleRefusal,
+  planBillNonChargeable,
+  settlesAsNonChargeable,
+  type NcSettleRefusal,
+} from "./nc_settle.js";
 // Same re-export pattern as billing_math/brand_theme: routes and tests import the
 // vocabularies and the pure resolvers from here rather than reaching past the
 // data layer for them.
@@ -2053,6 +2067,8 @@ export const __poolHygieneTestSeam = {
   resetDdlMemo(): void {
     ddlEnsured.clear();
     ddlInFlight.clear();
+    // Migration 052's catalogue answer is a schema memo too.
+    billNcColumnsSeen = false;
   },
   ensureLazyTable,
   ensureOutletColumns: (client?: PoolClient): Promise<void> => ensureOutletColumns(client),
@@ -4511,8 +4527,9 @@ export async function GetBillForTable(
       // "Gulab Jamun x3" line, and the printed bill then either charges for all
       // three or none of them — while `total` (which comes from the blob's
       // chargeable subtotal) says something different again. Keeping them apart
-      // is what lets the bill print "x2" beside the price and "x1 — NC" beside
-      // zero, adding up to the amount actually charged.
+      // is what lets the bill print the paid "x2" at its price and the comped one
+      // as "<dish> (NC)" with an Amount of 0.00 (escpos.ts ReceiptItem.nc, and
+      // the web and app bills alike), adding up to the amount actually charged.
       // THE VARIATION IS PART OF THE MERGE KEY TOO (migration 039), and for the
       // same reason `nc` is: a Half and a Full of one dish are two things sold,
       // and a bill that collapses them into one "Paneer Tikka x2" can only print
@@ -14070,6 +14087,35 @@ async function sumOrderTotalsForTable(
   return activeOrderSubtotal(rows).subtotal;
 }
 
+/**
+ * sumOrderTotalsForTable's read, handing back the still-owing LINES as well.
+ *
+ * The same statement and the same reduction, so a caller that needs both the
+ * pre-tax base and the lines behind it (the ₹0 NC hardening in
+ * ConfirmBillPaymentByWaiter) asks Postgres once and cannot see two different
+ * sets of orders.
+ */
+async function tableBillLines(
+  context: RestaurantContext,
+  tableId: string,
+  client?: PoolClient,
+): Promise<{ subtotal: number; lines: Record<string, unknown>[] }> {
+  const rows = await runQuery<{ food: unknown; status: unknown }>(
+    `select food, status from "Orders" where res_id = $1 and outlet_id = $2 and table_id = $3`,
+    [context.res_id, context.outlet_id, tableId],
+    client,
+  );
+  const lines: Record<string, unknown>[] = [];
+  for (const r of rows) {
+    if (!orderStatusStillOwes(r.status)) {continue;}
+    const f = parseJsonObject(r.food) ?? {};
+    for (const it of Array.isArray(f.items) ? (f.items as unknown[]) : []) {
+      lines.push((parseJsonObject(it) ?? {}) as Record<string, unknown>);
+    }
+  }
+  return { subtotal: activeOrderSubtotal(rows).subtotal, lines };
+}
+
 // Resolve a table id by name within a tenant context.
 async function tableIdByName(context: RestaurantContext, tableName: string, client?: PoolClient): Promise<string | null> {
   const rows = await runQuery<{ id: string }>(
@@ -16171,6 +16217,11 @@ export async function RefundBill(
     }
 
     if (!billRow) {throw new Error("No settled bill found to refund");}
+    // A non-chargeable bill took no money, so there is none to give back. A
+    // refund here would book a negative sale against a ₹0 bill.
+    if (isNcSettleMethod(billRow.payment_method)) {
+      throw new Error("Nothing was collected on a non-chargeable bill, so there is nothing to refund. Re-open it instead if it was settled by mistake.");
+    }
     // Two-phase refund: refunded_at records the INTENT. A Razorpay refund is only
     // truly complete once the gateway returns a refund id (refund_ref). So block a
     // repeat only when there's nothing left to do — a non-gateway refund (already
@@ -16240,6 +16291,11 @@ export interface ReopenedBill {
   };
   restored_orders: number;
   window_min: number;
+  /**
+   * Present when the bill had been SETTLED AS NC: the bill-scope comps that
+   * re-opening it reversed. The bill is then an ordinary unpaid bill again.
+   */
+  nc_reversed?: { lines: number; value: number; settle_group: string | null };
 }
 
 // Re-open a CLOSED bill within the restaurant's configured window (admin only,
@@ -16252,6 +16308,9 @@ export async function ReopenBill(
   restaurantId: string,
   billId: string,
   byEmployeeId?: string | null,
+  // The session's login name, stamped on any NC comp this re-open reverses
+  // (034's reversal columns must name a person).
+  byUsername?: string | null,
 ): Promise<ReopenedBill> {
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
@@ -16317,6 +16376,16 @@ export async function ReopenBill(
     );
     if (!updated[0]) {throw new Error("Failed to re-open bill");}
 
+    // A BILL SETTLED AS NC IS NOT "PAID, AWAITING APPROVAL" WHEN IT RE-OPENS.
+    // Nothing was collected, so keeping its method and waiter confirmation would
+    // let the approve step close it again as 'NC' — with its comps reversed and
+    // money on it, booked under the NC row. So its settle is undone whole: the
+    // bill-scope comps are reversed (below, after the orders are back), the
+    // marker and the confirmation are cleared, and the orders return to Served
+    // rather than to Payment Pending Approval, whose item freeze protects money
+    // a guest has paid — there is none.
+    const wasNc = isNcSettleMethod(bill.payment_method);
+
     // Restore THIS session's settled orders (Paid/Closed between the previous
     // bill's close and this bill's close) so the bill is actionable again. Older
     // sessions' orders stay settled; Cancelled orders stay cancelled.
@@ -16332,8 +16401,8 @@ export async function ReopenBill(
       );
       const restoredRows = await runQuery<{ id: string }>(
         `update "Orders"
-            set status = 6,
-                food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb('Payment Pending Approval'::text), true)
+            set status = ${wasNc ? "2" : "6"},
+                food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb('${wasNc ? "Served" : "Payment Pending Approval"}'::text), true)
           where res_id = $1 and outlet_id = $2 and table_id = $3
             and coalesce(status::text, '1') in ('4', '7')
             and created_at > $4 and created_at <= $5
@@ -16354,6 +16423,31 @@ export async function ReopenBill(
       tableName = t[0]?.table_name ?? null;
     }
 
+    let ncReversed: ReopenedBill["nc_reversed"];
+    let totalAmt = round2(parseNumeric(bill.total_amt));
+    if (wasNc) {
+      ncReversed = await reverseBillScopeNonChargeables(
+        context, bill.id, String(byUsername ?? "").trim() || "bill re-open", client,
+      );
+      // An open bill's total_amt is the running PRE-TAX subtotal (see the open
+      // bill readers), and a re-opened NC bill is an open, unpaid bill again.
+      totalAmt = bill.table_id ? await sumOrderTotalsForTable(context, bill.table_id, client) : 0;
+      await runQuery(
+        `update "Bills"
+            set payment_method = null,
+                payment_splits = null,
+                payment_proof_screenshot_url = null,
+                waiter_confirmed_at = null,
+                waiter_confirmed_by_username = null,
+                total_amt = $4,
+                tax_breakdown = '[]'::jsonb,
+                round_off = null
+          where id = $1 and res_id = $2 and outlet_id = $3`,
+        [bill.id, context.res_id, context.outlet_id, totalAmt],
+        client,
+      );
+    }
+
     return {
       success: true,
       bill: {
@@ -16361,16 +16455,17 @@ export async function ReopenBill(
         bill_no: bill.bill_no,
         table_id: bill.table_id,
         table_name: tableName,
-        total_amt: round2(parseNumeric(bill.total_amt)),
-        payment_method: bill.payment_method,
+        total_amt: totalAmt,
+        payment_method: wasNc ? null : bill.payment_method,
         status: updated[0].status,
         closed_at: null,
         admin_approved_at: null,
-        waiter_confirmed_at: bill.waiter_confirmed_at ? new Date(bill.waiter_confirmed_at).toISOString() : null,
+        waiter_confirmed_at: !wasNc && bill.waiter_confirmed_at ? new Date(bill.waiter_confirmed_at).toISOString() : null,
         created_at: new Date(bill.created_at).toISOString(),
       },
       restored_orders: restored,
       window_min: windowMin,
+      ...(wasNc && ncReversed ? { nc_reversed: ncReversed } : {}),
     };
   });
 }
@@ -16398,7 +16493,17 @@ export async function ReopenBill(
 //             closed_by_username are recorded verbatim by the settle workflow.
 
 export interface ClosedBillItem {
-  name: string; price: number; quantity: number; note: string | null; line_total: number;
+  name: string; price: number; quantity: number; note: string | null;
+  /** 0 on a non-chargeable line: the Amount a guest was charged for it. */
+  line_total: number;
+  /**
+   * Migration 034: this line was comped. Its own line on the settled bill (the
+   * merge key carries it, as the live bill's does), so the paper can print
+   * "<name> (NC)" at 0.00 and the Amount column still sums to the Sub Total.
+   * Absent on every chargeable line, which keeps a tenant that never comps
+   * byte-identical.
+   */
+  nc?: true;
   /**
    * The price point sold (migration 039), snapshotted on the order line. Absent
    * on every line written before variations existed and on every line of every
@@ -16484,6 +16589,10 @@ export interface ClosedBillDetail extends ClosedBillSummary {
   totals_reconciled: boolean;
   /** D2: earliest order placed -> settled, frozen. See service_clock.ts. */
   service: ServiceClock;
+  /** Migration 034: the menu value of the comped lines above. Beside the ladder, never in it. */
+  nc_total: number;
+  /** Set on a bill SETTLED AS NC (payment_method 'NC'): how, why and on whose say-so. */
+  nc_settlement: BillNcSettlement | null;
 }
 
 /** Terminal order statuses that belong to a settled bill (Paid, Pending-approval, Closed). */
@@ -16792,6 +16901,8 @@ async function ordersForClosedBill(
 interface ClosedBillItemAggregate {
   items: ClosedBillItem[];
   items_subtotal: number;
+  /** Σ price x quantity over the comped lines. */
+  nc_total: number;
   customer: string | null;
   customer_gstin: string | null;
   order_ids: string[];
@@ -16807,6 +16918,7 @@ function aggregateClosedBillOrders(
   let customer = "";
   let customerGstin = "";
   let items_subtotal = 0;
+  let ncTotal = 0;
   for (const o of orderRows) {
     const food = parseJsonObject(o.food) ?? {};
     if (!customer) {
@@ -16828,14 +16940,24 @@ function aggregateClosedBillOrders(
       // price. This screen is what an owner reopens a settled bill to read, so it
       // must show the same line breakdown the guest was handed on paper.
       const variation = String(it.variation_name ?? "").trim();
-      const key = `${name.toLowerCase()}@@${price}@@${variation.toLowerCase()}`;
+      // NON-CHARGEABLE IS PART OF THE KEY, exactly as it is on the live bill
+      // (GetBillForTable): a comped dessert and two paid ones are two lines, and
+      // the comped one is charged 0 — otherwise the settled bill lists three
+      // desserts at full price above a Sub Total that charged for two.
+      const nc = isNonChargeableLine(it);
+      if (nc) {ncTotal = round2(ncTotal + price * quantity);}
+      const key = `${name.toLowerCase()}@@${price}@@${variation.toLowerCase()}${nc ? "@@nc" : ""}`;
       const existing = itemMap.get(key);
       if (existing) {
         existing.quantity += quantity;
-        existing.line_total = round2(existing.price * existing.quantity);
+        existing.line_total = nc ? 0 : round2(existing.price * existing.quantity);
         if (note) {existing.note = existing.note && !existing.note.includes(note) ? `${existing.note}; ${note}` : note;}
       } else {
-        itemMap.set(key, { name, price, quantity, note: note || null, line_total: round2(price * quantity), ...(variation ? { variation } : {}) });
+        itemMap.set(key, {
+          name, price, quantity, note: note || null, line_total: nc ? 0 : round2(price * quantity),
+          ...(variation ? { variation } : {}),
+          ...(nc ? { nc: true as const } : {}),
+        });
       }
     }
     orders.push({
@@ -16849,6 +16971,7 @@ function aggregateClosedBillOrders(
   return {
     items: [...itemMap.values()],
     items_subtotal: round2(items_subtotal),
+    nc_total: ncTotal,
     customer: customer || null,
     customer_gstin: customerGstin || null,
     order_ids: orderRows.map((o) => o.id),
@@ -16968,6 +17091,11 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
 
   const summary = mapClosedBillSummary(row, scPct);
   const target_apc = await getTargetApc(context).catch(() => 0);
+  // How an NC bill was settled — read only for one, so every other bill costs
+  // no extra statement.
+  const ncSettlement = isNcSettleMethod(row.payment_method)
+    ? await readBillNcSettlement(context, row.id, agg.order_ids)
+    : null;
   // APC follows the food base this read actually settled on, so the detail agrees
   // with itself even when the reconstruction (not the current setting) is what
   // explained the service charge.
@@ -17018,6 +17146,8 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
     service: tableServiceClock(
       agg.orders.map((o) => ({ placed_at: o.created_at, settled_at: summary.settled_at })),
     ),
+    nc_total: agg.nc_total,
+    nc_settlement: ncSettlement,
   };
 }
 
@@ -20823,7 +20953,8 @@ function normalizePaymentSplits(
     const o = (s ?? {}) as Record<string, unknown>;
     const method = resolvePaymentMethod(o.method, config)?.id ?? null;
     if (!method || method === "Split" || method === "Razorpay") {
-      throw new Error(`Invalid split payment method: ${String(o.method ?? "")}`);
+      // A comp word gets the sentence that says where NC lives instead.
+      throw new Error((!method ? ncPaymentPointer(o.method) : null) ?? `Invalid split payment method: ${String(o.method ?? "")}`);
     }
     const refusal = paymentMethodRefusal(method, config, opts);
     if (refusal) {throw new Error(refusal);}
@@ -20855,7 +20986,9 @@ export async function ConfirmBillPaymentByWaiter(
       ? ("Split" as PaymentMethod)
       : (resolvePaymentMethod(paymentMethodRaw, paymentConfig)?.id ?? null);
     if (!paymentMethod) {
-      throw new Error("Invalid payment method");
+      // "NC" and the other comp words are not modes (payment_methods.ts); the
+      // person at the till is pointed at the two things that do what they meant.
+      throw new Error(ncPaymentPointer(paymentMethodRaw) ?? "Invalid payment method");
     }
     if (paymentMethod === "Split" && splits.length === 0) {
       throw new Error("A split payment needs its parts ({method, amount} rows)");
@@ -20939,7 +21072,7 @@ export async function ConfirmBillPaymentByWaiter(
     // Snapshot the charged grand total + tax lines so every settled bill is a
     // consistent basis for accounting/reporting (mirrors the customer/online
     // payment paths, which already store the grand total in total_amt).
-    const subtotalNow = await sumOrderTotalsForTable(context, tableId, client);
+    const { subtotal: subtotalNow, lines: linesNow } = await tableBillLines(context, tableId, client);
     // Same resolver as the bill view (migration 036): a service charge waived on
     // the open bill must be gone HERE too, or the guest is shown one total and
     // settled at another.
@@ -20947,6 +21080,17 @@ export async function ConfirmBillPaymentByWaiter(
     const discountNow = await getOpenBillDiscount(context, tableId, client);
     const charges = computeBillCharges(subtotalNow, chargeCfgNow.taxConfig, chargeCfgNow.scPct, chargeCfgNow.includeServiceCharge, discountNow);
     const taxJsonNow = JSON.stringify(charges.taxes);
+
+    // DECISION 6 — A ₹0 BILL WHOSE EVERY PRICED LINE WAS COMPED IS AN NC BILL.
+    // Installed 2.0.0 tills have no NC pill and post whichever mode is selected
+    // (UPI by default) on their ₹0 path, which booked fully comped tables as ₹0
+    // UPI bills. Every line was comped by someone holding the comp permission,
+    // so storing the NC marker bypasses nothing — it only lets the reports count
+    // the bill for what it is. A split is never rewritten (its parts sum to a
+    // positive total, so it cannot be here anyway).
+    const storedMethod = splits.length === 0 && settlesAsNonChargeable(charges.grand_total, linesNow)
+      ? (NC_SETTLE_METHOD as PaymentMethod)
+      : paymentMethod;
 
     // Split tender: the parts must reconstruct the charged grand total exactly
     // (±1 paisa for rounding) — a split can never lose or invent money.
@@ -20982,8 +21126,8 @@ export async function ConfirmBillPaymentByWaiter(
         returning id
       `,
       [
-        paymentMethod,
-        paymentProofScreenshotUrl || null,
+        storedMethod,
+        storedMethod === paymentMethod ? (paymentProofScreenshotUrl || null) : null,
         waiter.username,
         billId,
         context.res_id,
@@ -21001,7 +21145,7 @@ export async function ConfirmBillPaymentByWaiter(
     }
 
     await updateOrderWorkflowStatus(context, orderId, "Payment Pending Approval", client);
-    return { success: true, payment_method: paymentMethod, ...(splits.length > 0 ? { splits } : {}) };
+    return { success: true, payment_method: storedMethod, ...(splits.length > 0 ? { splits } : {}) };
   });
 }
 
@@ -21202,6 +21346,16 @@ export async function ApproveBillPaymentByAdmin(
       discountAtApproval,
     );
 
+    // AN NC BILL THAT NOW OWES MONEY IS NOT AN NC BILL. The marker was written
+    // because the bill came to ₹0 with everything comped; a comp reversed (or a
+    // dish added) since then puts money back on it, and approving would book
+    // that money under the NC row as if nobody paid it. Re-take the payment.
+    if (isNcSettleMethod(bill.payment_method) && Math.round(chargesAtApproval.grand_total * 100) !== 0) {
+      throw new Error(
+        `This bill was recorded as non-chargeable, but it now comes to ₹${chargesAtApproval.grand_total.toFixed(2)}. Take the payment again with the way it is being paid, then approve.`,
+      );
+    }
+
     // Split tender must STILL reconcile with the bill as it stands now. The
     // "parts must sum to the grand total" rule was enforced once, at
     // waiter-confirm, and never re-checked — so any bill edit landing before
@@ -21274,14 +21428,7 @@ export async function ApproveBillPaymentByAdmin(
     );
     // Loyalty earn on settle — best-effort, never fails the approval.
     try { await awardLoyaltyForSettledBill(context, tableId, client); } catch (err) { logger.warn({ err }, "loyalty_award_failed"); }
-    await completeSeatedBookingsForTable(context, tableId, client);
-    await runQuery(
-      `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null where id = $1 and res_id = $2 and outlet_id = $3`,
-      [tableId, context.res_id, context.outlet_id],
-      client,
-    );
-    await unassignTableById(context, tableId, client);
-    await softDeleteIfVirtual(context, tableId, client);
+    await finalizeSettledTable(context, tableId, client);
     return { success: true };
   });
 }
@@ -35271,6 +35418,37 @@ const NOTE_NC_CLOCK =
   "Non-chargeable figures are bucketed by the moment the item was COMPED, not by when the bill settled — a comp has no settlement of its own. On a table that opens before midnight and pays after it, the two fall on different days.";
 const NOTE_NC_REVERSED =
   "A comp that a manager reversed gave away nothing: its money reads 0 in the live columns and is carried under Reversed instead, so every money column still adds up to its own total.";
+/**
+ * THE NC-BILL RULE, stated on every report that counts bills (decision 2 of the
+ * NC settle). A bill settled as non-chargeable is a numbered bill, closed at ₹0
+ * — so it counts as a bill and its party counts as covers, exactly as a released
+ * ₹0 table always has, and no APC or ABV denominator changes. Its value is
+ * reported beside the ladder as NC, never inside it.
+ */
+const NOTE_NC_SETTLED_BILLS =
+  "Bills settled as non-chargeable (NC) close at 0.00 and add nothing to any money figure. Like a released table, each still counts as a bill and its party still counts as covers, so they lower average bill value and APC; NC bills and the value given away are reported beside the figures, never inside them.";
+
+/** How many of these bills were settled as NC — the `nc_bills` figure. */
+function misNcBillCount(bills: readonly MisBill[]): number {
+  return bills.filter((b) => isNcSettleMethod(b.row.payment_method)).length;
+}
+
+/**
+ * Each bucket's NC bill count, on the SAME keys misSeries uses. An NC bill is a
+ * bill, so its bucket already exists in the series — `nc_bills` never needs a
+ * row of its own, and a row with none reads 0.
+ */
+function misWithNcBills<T extends { bucket: string }>(
+  series: T[], bills: readonly MisBill[], mode: TimeBucketMode, presets: readonly TimeSlotPreset[],
+): (T & { nc_bills: number })[] {
+  const count = new Map<string, number>();
+  for (const b of bills) {
+    if (!b.day || !isNcSettleMethod(b.row.payment_method)) {continue;}
+    const key = misBucketKey(b, mode, presets);
+    count.set(key, (count.get(key) ?? 0) + 1);
+  }
+  return series.map((row) => ({ ...row, nc_bills: count.get(row.bucket) ?? 0 }));
+}
 
 // --- The shared bill read ----------------------------------------------------
 
@@ -36403,8 +36581,12 @@ export async function GetBillEditReport(restaurantId: string, q: MisReportQuery 
 
 // --- 5. Sales Summary --------------------------------------------------------
 
-/** The ladder, plus the comped money that sits beside it. See MIS_NC helpers. */
-export type SalesLadder = MisLadder & { nc_value: number; nc_qty: number };
+/**
+ * The ladder, plus the comped money that sits beside it. See MIS_NC helpers.
+ * `nc_bills` counts the bills SETTLED AS NC (payment_method 'NC') on the
+ * settlement clock; they are already inside `bills` — see NOTE_NC_SETTLED_BILLS.
+ */
+export type SalesLadder = MisLadder & { nc_value: number; nc_qty: number; nc_bills: number };
 
 export interface SalesSummaryReport {
   meta: MisReportMeta;
@@ -36442,6 +36624,9 @@ const SALES_SUMMARY_COLUMNS: MisColumn[] = [
   // in the column label, which is what makes carrying it here honest rather than
   // a second definition of sales.
   { key: "nc_value", label: "NC given away", type: "money", total: true, default_on: false },
+  // Already counted in Bills (they are numbered bills, closed at 0.00); this
+  // says how many of them were given away whole.
+  { key: "nc_bills", label: "NC bills", type: "int", total: true, default_on: false },
   { key: "abv", label: "ABV", type: "money" },
   { key: "apc", label: "APC (pre-tax)", type: "money" },
 ];
@@ -36503,9 +36688,10 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
       NOTE_NC_BESIDE_LADDER,
       NOTE_NC_CLOCK,
       NOTE_NC_REVERSED,
+      NOTE_NC_SETTLED_BILLS,
     ]),
     columns: SALES_SUMMARY_COLUMNS,
-    totals: { ...misLadder(bills), nc_value: nc.value, nc_qty: nc.qty },
+    totals: { ...misLadder(bills), nc_value: nc.value, nc_qty: nc.qty, nc_bills: misNcBillCount(bills) },
     bucket,
     // The comped money is attached to the SAME bucket key the ladder used, so
     // the NC column adds up to its own total exactly like every other column —
@@ -36513,7 +36699,10 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
     // zero-ladder row rather than being dropped. Dropping it is the one way this
     // column could stop summing to its own total, and a column that does not is
     // the first thing an auditor checks.
-    series: misNcCompletedSeries(misSeries(bills, bucket, mc.presets), ncByBucket, timeBucketOrder(bucket, mc.presets)),
+    series: misWithNcBills(
+      misNcCompletedSeries(misSeries(bills, bucket, mc.presets), ncByBucket, timeBucketOrder(bucket, mc.presets)),
+      bills, bucket, mc.presets,
+    ),
     by_order_type: [...typeAcc.entries()]
       .map(([order_type, v]) => ({ order_type, bills: v.bills, grand_total: v.total, share_pct: sharePct(v.total, typeTotal) }))
       .sort((a, z) => z.grand_total - a.grand_total),
@@ -37048,6 +37237,13 @@ export interface SettlementSummaryReport {
     split_bills: number;
     /** Money that split parts failed to account for. Should always be 0. */
     unallocated: number;
+    /**
+     * NOT COLLECTED, and never inside `amount`. `bills` is the Non-chargeable
+     * (NC) row's bill count (bills settled as NC, at 0.00); `value` is what was
+     * given away in the window, pre-tax, on the comp clock — the Sales
+     * Summary's `nc_bills` and `nc_value` for the same window, by construction.
+     */
+    nc: { bills: number; value: number };
   };
 }
 
@@ -37114,6 +37310,9 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
   }));
 
   const ladder = misLadder(bills);
+  // The NC figures beside the cash-up, from the same two reads the Sales
+  // Summary uses, so the two reports cannot disagree about them.
+  const nc = misNcTotals(await fetchMisNonChargeables(mc));
   return {
     meta: await misMeta(mc, "settlement_summary", "Settlement Summary", [
       NOTE_SETTLEMENT_BASIS,
@@ -37121,6 +37320,8 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
       "A bill settled with more than one mode counts once under each mode it touched, so the bill counts here can add up to more than the bill count.",
       "Refunds have no payment mode of their own; each is attributed to the mode(s) its bill was paid with, in proportion. Collected is what was taken at the till; After refunds is what survived the refunds. It still carries the tax, so it is not Net.",
       "Anything in the Unallocated row is money whose split-tender parts did not add back to the bill total. It should always be zero; if it is not, those bills need looking at.",
+      "The Non-chargeable (NC) row counts bills settled as non-chargeable. Nothing was collected on them, so the row reads 0.00 and moves no total; the value given away (pre-tax, on the comp clock, item comps included) is shown beside the sheet as NC, not collected.",
+      NOTE_NC_SETTLED_BILLS,
     ]),
     columns: SETTLEMENT_COLUMNS,
     rows,
@@ -37131,6 +37332,7 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
       net_amount: round2(rows.reduce((s, r) => s + r.net_amount, 0)),
       split_bills: splitBills,
       unallocated,
+      nc: { bills: misNcBillCount(bills), value: nc.value },
     },
   };
 }
@@ -37234,6 +37436,13 @@ export interface OverviewHeadline {
   today_unallocated: number;
   /** The block's own label and definition, server-authored like every figure. */
   by_method: HeadlineSection;
+  /**
+   * NOT COLLECTED, shown BESIDE the by-method block and never inside it: the
+   * bills settled as NC today (already in `today_bills`, adding ₹0 to every
+   * figure above) and what was given away today, pre-tax, on the comp clock.
+   * The Sales Summary's `nc_bills` / `nc_value` for today, by construction.
+   */
+  today_nc: HeadlineSection & { bills: number; value: number };
 }
 
 /** A labelled group of rows on the headline card. */
@@ -37328,6 +37537,20 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   }
 
   const byMethod = settlementByMethod(todaySettled);
+  let todayNcBills = 0;
+  for (let i = 0; i < composed.length; i += 1) {
+    if (composed[i].day === today && isNcSettleMethod(rows[i].payment_method)) {todayNcBills += 1;}
+  }
+  // Today's comps, on their own clock — the ladder-side read the Sales Summary
+  // makes, whole-day. Degrades to none before migration 034.
+  const todayRange = dayRangeOf(today, tz);
+  const todayNc = misNcTotals(await captureRead("OrderItemNonChargeable", () => runQuery<MisNcRow>(
+    `select created_at, outlet_id, quantity, value, (reversed_at is not null) as reversed
+       from "OrderItemNonChargeable"
+      where res_id = $1 and (${og} or outlet_id = $2)
+        and created_at >= $3 and created_at < $4`,
+    [context.res_id, context.outlet_id, todayRange.fromIso, todayRange.toIso],
+  ), [] as MisNcRow[]));
   // CASH IS READ OFF THE ROWS. Case-insensitive, exactly as it always was, so a
   // legacy 'cash' spelling still counts — and the only cash a split bill
   // contributes is its cash part, because that is all its Cash row holds.
@@ -37388,6 +37611,13 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
       hint: "Settled today, by how it was paid; adds up to Today's gross sale. A bill split across "
         + "modes counts each part under its own mode, and a refund comes off the modes its bill was paid "
         + "with, on the day the bill settled.",
+    },
+    today_nc: {
+      label: "Non-chargeable (NC) — not collected",
+      hint: "Given away today at menu value before tax, every comped dish included. NC bills closed "
+        + "at 0.00: they count as bills and covers, and add nothing to the figures above.",
+      bills: todayNcBills,
+      value: todayNc.value,
     },
   };
 }
@@ -38072,6 +38302,655 @@ export async function GetNonChargeableEntries(
     if (r.reversed_at) {reversed = round2(reversed + r.value);} else {total = round2(total + r.value);}
   }
   return { rows: mapped, total_value: total, reversed_value: reversed };
+}
+
+// ---------------------------------------------------------------------------
+// 052 — SETTLE AS NC: a whole bill closed as non-chargeable
+// ---------------------------------------------------------------------------
+//
+// nc_settle.ts carries the design and every rule; this block locks the rows and
+// writes them. The short version: every remaining chargeable line is comped
+// into "OrderItemNonChargeable" with scope 'bill', the chargeable subtotal is
+// then 0 by construction, and the bill closes at ₹0 with payment_method 'NC'.
+
+/**
+ * Migration 052's three columns on "OrderItemNonChargeable" (scope, bill_id,
+ * settle_group) plus its CHECK and index — mirrored here, statement for
+ * statement, because production runs as the table OWNER and this code ships
+ * before anyone applies the file by hand (the idiom 040 documents).
+ *
+ * NEVER INSIDE A SETTLE TRANSACTION. ALTER TABLE takes ACCESS EXCLUSIVE, and a
+ * DDL run inside a settle that later rolled back would vanish while
+ * ensureLazyTable's memo went on believing it happened (048's lesson). So the
+ * boot step runs it once, and the one writer that needs it awaits it BEFORE its
+ * own withTransaction. The readers never call it: they degrade on 42703.
+ */
+async function ensureBillNcColumns(): Promise<void> {
+  await ensureLazyTable("OrderItemNonChargeable.bill_scope", async () => {
+    await runQuery(
+      `alter table "OrderItemNonChargeable"
+         add column if not exists scope text not null default 'item',
+         add column if not exists bill_id uuid,
+         add column if not exists settle_group uuid`,
+    );
+    await runQuery(
+      `do $$
+       begin
+         if not exists (select 1 from pg_constraint where conname = 'orderitemnc_scope_check') then
+           alter table "OrderItemNonChargeable"
+             add constraint orderitemnc_scope_check check (scope in ('item','bill'));
+         end if;
+         if not exists (select 1 from pg_constraint where conname = 'orderitemnc_bill_scope_linked') then
+           alter table "OrderItemNonChargeable"
+             add constraint orderitemnc_bill_scope_linked
+             check (scope = 'item' or (bill_id is not null and settle_group is not null));
+         end if;
+       end $$`,
+    );
+    await runQuery(
+      `create index if not exists orderitemnc_bill_idx
+         on "OrderItemNonChargeable" (res_id, bill_id)
+         where bill_id is not null`,
+    );
+  });
+}
+
+/**
+ * Whether the three 052 columns exist, asked of Postgres rather than assumed.
+ * ensureLazyTable records success on a refused ALTER (42501 — a least-privilege
+ * runtime), so "ensured" is not "present". Memoised once TRUE: a column that
+ * exists does not stop existing while the process lives. False is re-asked, so
+ * a hand-applied migration is picked up without a restart.
+ */
+let billNcColumnsSeen = false;
+async function billNcColumnsPresent(): Promise<boolean> {
+  if (billNcColumnsSeen) {return true;}
+  const rows = await runQuery<{ n: number | string }>(
+    `select count(*)::int as n from information_schema.columns
+      where table_schema = 'public' and table_name = 'OrderItemNonChargeable'
+        and column_name in ('scope', 'bill_id', 'settle_group')`,
+  );
+  billNcColumnsSeen = Number(rows[0]?.n ?? 0) === 3;
+  return billNcColumnsSeen;
+}
+
+/**
+ * Boot-time half of ensureBillNcColumns. Never throws — a failed boot step
+ * leaves the key un-memoised and the settle's own ensure retries.
+ */
+export async function InitBillNonChargeableSchema(): Promise<boolean> {
+  try {
+    await ensureBillNcColumns();
+    if (!(await billNcColumnsPresent())) {
+      ddlEnsured.delete("OrderItemNonChargeable.bill_scope");
+      logger.error("OrderItemNonChargeable.scope/bill_id/settle_group are MISSING and could not be added by this role — apply migration 052 before bills are settled as NC");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.warn({ err }, "bill_nc_boot_ensure_failed — the settle's own ensure will retry on first use");
+    return false;
+  }
+}
+
+/**
+ * The 503 the settle route answers when the columns are neither there nor
+ * creatable. A plain sentence, because the person reading it is at a till.
+ */
+export class BillNonChargeableSchemaMissingError extends Error {
+  constructor() {
+    super("Settling a bill as non-chargeable is not available yet on this server — an administrator has to finish an update (migration 052). Comp the dishes individually in the meantime.");
+    this.name = "BillNonChargeableSchemaMissingError";
+  }
+}
+
+/** A refusal the settle answers with its own HTTP status (see ncSettleRefusal). */
+export class BillNonChargeableRefusedError extends Error {
+  readonly status: number;
+  readonly code: string;
+  constructor(refusal: NcSettleRefusal) {
+    super(refusal.error);
+    this.name = "BillNonChargeableRefusedError";
+    this.status = refusal.status;
+    this.code = refusal.code;
+  }
+}
+
+export interface SettleBillNonChargeableInput {
+  order_id: string;
+  nc_kind: string;
+  reason: string;
+  actor: CaptureActor;
+  /** The chargeable pre-tax subtotal the till was showing. Checked to the paisa. */
+  expected_value?: number | null;
+}
+
+export interface SettleBillNonChargeableResult {
+  success: true;
+  bill_id: string;
+  bill_no: string | null;
+  table_id: string;
+  table_name: string | null;
+  payment_method: string;
+  total_amt: 0;
+  /** Everything given away on the bill's orders, item comps included — pre-tax. */
+  nc_value: number;
+  /** The lines THIS settle comped (scope 'bill'). */
+  nc_lines: number;
+  /** What the guest would have paid: service charge, tax and round-off included. Informational only. */
+  would_have_charged: number;
+  settle_group: string | null;
+  non_chargeables: NonChargeableRecord[];
+  /** True when the bill was already settled as NC — a double tap or a lost response. */
+  already?: true;
+}
+
+/**
+ * The newest bill on a table, when it is a CLOSED NC bill — the replay answer.
+ * Read without a lock: it is only consulted when the order is already settled.
+ */
+async function closedNcBillForTable(
+  context: RestaurantContext,
+  tableId: string,
+  client: PoolClient,
+): Promise<{ id: string; bill_no: string | null } | null> {
+  const rows = await runQuery<{ id: string; bill_no: string | null; payment_method: string | null; closed_at: Date | null }>(
+    `select id, bill_no::text as bill_no, payment_method, closed_at from "Bills"
+      where table_id = $1 and res_id = $2 and outlet_id = $3
+      order by created_at desc limit 1`,
+    [tableId, context.res_id, context.outlet_id],
+    client,
+  );
+  const b = rows[0];
+  return b && b.closed_at && isNcSettleMethod(b.payment_method) ? { id: b.id, bill_no: b.bill_no } : null;
+}
+
+/** The live non-chargeables on a set of orders, and their total. Inside the caller's transaction. */
+async function liveNcOnOrders(
+  context: RestaurantContext,
+  orderIds: readonly string[],
+  client: PoolClient,
+): Promise<{ rows: NonChargeableRecord[]; value: number }> {
+  if (orderIds.length === 0) {return { rows: [], value: 0 };}
+  const rows = (await runQuery<NonChargeableRow>(
+    `select ${NC_SELECT} from "OrderItemNonChargeable"
+      where res_id = $1 and order_id = any($2::uuid[]) and reversed_at is null
+      order by created_at asc`,
+    [context.res_id, [...orderIds]],
+    client,
+  )).map(mapNonChargeable);
+  return { rows, value: round2(rows.reduce((s, r) => s + r.value, 0)) };
+}
+
+/**
+ * A read of a table that may not exist yet, INSIDE a transaction.
+ *
+ * captureRead's degrade is not enough in here: Postgres aborts the whole
+ * transaction on the failed statement, and every write after it would then fail
+ * with 25P02. So the read runs under its own savepoint and a missing table rolls
+ * back to it — the settle carries on as if the table were empty, which is what a
+ * table that was never created holds.
+ */
+async function optionalReadInTransaction<T>(
+  client: PoolClient,
+  what: string,
+  run: () => Promise<T>,
+  fallback: T,
+): Promise<T> {
+  await client.query("SAVEPOINT nc_optional_read");
+  try {
+    const value = await run();
+    await client.query("RELEASE SAVEPOINT nc_optional_read");
+    return value;
+  } catch (err) {
+    await client.query("ROLLBACK TO SAVEPOINT nc_optional_read");
+    if (!isCaptureTableMissing(err)) {throw err;}
+    logger.warn({ what }, "mis_capture_table_missing");
+    return fallback;
+  }
+}
+
+/**
+ * The shared tail of every settle that FREES the table: bookings completed, the
+ * table released, the waiter unassigned, a virtual table retired. Exactly the
+ * four statements ApproveBillPaymentByAdmin always ran, in its order; the NC
+ * settle runs them too, and a third settle path must call this rather than
+ * remember the list.
+ */
+async function finalizeSettledTable(context: RestaurantContext, tableId: string, client: PoolClient): Promise<void> {
+  await completeSeatedBookingsForTable(context, tableId, client);
+  await runQuery(
+    `update "Tables" set is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null where id = $1 and res_id = $2 and outlet_id = $3`,
+    [tableId, context.res_id, context.outlet_id],
+    client,
+  );
+  await unassignTableById(context, tableId, client);
+  await softDeleteIfVirtual(context, tableId, client);
+}
+
+/**
+ * SETTLE A TABLE'S BILL AS NON-CHARGEABLE, in one transaction.
+ *
+ * 1. Every refusal (ncSettleRefusal) is answered before anything is written —
+ *    and before a bill number is minted, so a refused NC burns no invoice number.
+ * 2. The still-owing orders are locked FIRST, then the open bill. A concurrent
+ *    second settle therefore waits on the orders, finds none still owing once
+ *    the first commits, and answers `already` instead of minting a fresh bill.
+ * 3. Each planned line gets a ledger row (scope 'bill', this bill, one
+ *    settle_group) and its flag, on `items` and `items_split`, and each order is
+ *    re-priced through repriceOrderFood — the same writer an item comp uses.
+ * 4. The table must then sum to 0. If it does not, something outside the plan
+ *    is charging and the whole transaction is thrown away rather than closing a
+ *    bill at ₹0 that the orders say is owed.
+ * 5. The bill closes at ₹0, 'NC', every settle stamp set by the actor; the
+ *    orders go to Paid; the table is freed. No loyalty is awarded — nothing was
+ *    spent.
+ */
+export async function SettleBillAsNonChargeable(
+  restaurantId: string,
+  input: SettleBillNonChargeableInput,
+): Promise<SettleBillNonChargeableResult> {
+  const kind = normalizeVocabulary(input.nc_kind, NON_CHARGEABLE_KINDS);
+  if (!kind) {throw new Error(`nc_kind must be one of: ${NON_CHARGEABLE_KINDS.join(", ")}`);}
+  const reason = normalizeReason(input.reason, 400);
+  if (!reason) {throw new Error("A reason is required to settle a bill as non-chargeable.");}
+  const who = requireActor(input.actor, "settling a bill as non-chargeable");
+  const orderId = String(input.order_id ?? "").trim();
+  if (!isUuid(orderId)) {throw new Error("A valid order id is required");}
+  const expected = input.expected_value === undefined || input.expected_value === null
+    ? null
+    : Number(input.expected_value);
+  if (expected !== null && !Number.isFinite(expected)) {throw new Error("expected_value must be a number");}
+
+  // Outside the transaction, for the reasons on ensureBillNcColumns.
+  await ensureBillWorkflowColumns();
+  await ensureTableOccupancyColumns();
+  try { await ensureBillNcColumns(); } catch (err) { logger.warn({ err }, "bill_nc_ensure_failed"); }
+  if (!(await billNcColumnsPresent())) {throw new BillNonChargeableSchemaMissingError();}
+
+  // The menu's price beside each line, read once and outside the lock — the
+  // same advisory snapshot MarkOrderItemNonChargeable records.
+  const menu = await GetMenuItems(restaurantId).catch(() => [] as MenuItemRecord[]);
+  const menuById = new Map(menu.map((m) => [String(m.id), m]));
+  const menuByName = new Map(menu.map((m) => [m.name.trim().toLowerCase(), m]));
+  const menuPriceOf = (line: Record<string, unknown>): number | null => {
+    const stamped = String(line.menu_id ?? "").trim();
+    const m = (stamped ? menuById.get(stamped) : undefined)
+      ?? menuById.get(String(line.id ?? ""))
+      ?? menuByName.get(String(line.name ?? "").trim().toLowerCase());
+    return m ? round2(parseNumeric(m.price)) : null;
+  };
+
+  return withTransaction(async (client) => {
+    const context = await requireRestaurantContext(restaurantId, client);
+    const orderRows = await runQuery<{ table_id: string | null; status: number | string | null }>(
+      `select table_id, status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+    if (!orderRows[0]) {throw new Error("Order not found");}
+    const tableId = orderRows[0].table_id;
+    if (!tableId) {throw new Error("Order table not found");}
+    const tableName = (await runQuery<{ table_name: string | null }>(
+      `select table_name from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [tableId, context.res_id, context.outlet_id],
+      client,
+    ))[0]?.table_name ?? null;
+
+    const replay = async (): Promise<SettleBillNonChargeableResult | null> => {
+      const done = await closedNcBillForTable(context, tableId, client);
+      if (!done) {return null;}
+      const rows = (await runQuery<NonChargeableRow>(
+        `select ${NC_SELECT} from "OrderItemNonChargeable"
+          where res_id = $1 and bill_id = $2 and reversed_at is null order by created_at asc`,
+        [context.res_id, done.id],
+        client,
+      )).map(mapNonChargeable);
+      const group = (await runQuery<{ settle_group: string | null }>(
+        `select settle_group from "OrderItemNonChargeable" where res_id = $1 and bill_id = $2 and reversed_at is null limit 1`,
+        [context.res_id, done.id],
+        client,
+      ))[0]?.settle_group ?? null;
+      return {
+        success: true, already: true,
+        bill_id: done.id, bill_no: done.bill_no, table_id: tableId, table_name: tableName,
+        payment_method: NC_SETTLE_METHOD, total_amt: 0,
+        nc_value: round2(rows.reduce((s, r) => s + r.value, 0)),
+        nc_lines: rows.length,
+        // Not recorded on any row; the first answer and the audit line carry it.
+        would_have_charged: 0,
+        settle_group: group,
+        non_chargeables: rows,
+      };
+    };
+
+    const status = Math.round(parseNumeric(orderRows[0].status));
+    if (status === 4 || status === 7) {
+      const again = await replay();
+      if (again) {return again;}
+    }
+    // Cancelled and settled answer in the house words; payment-pending is
+    // decided below with the bill in hand, so it gets the NC sentence.
+    await assertOrderStatusEditable(context, orderId, client);
+
+    // 2. Orders first, then the bill (see the header).
+    const owing = await runQuery<{ id: string; food: unknown; status: number | string | null }>(
+      `select id, food, status from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3 and ${stillOwesStatusSql()}
+        order by created_at asc, id asc
+        for update`,
+      [context.res_id, context.outlet_id, tableId],
+      client,
+    );
+    if (owing.length === 0) {
+      const again = await replay();
+      if (again) {return again;}
+    }
+    await assertTableSessionOpen(context, tableId, "settling it as non-chargeable", client);
+
+    const billRows = await runQuery<{
+      id: string; bill_no: string | null; waiter_confirmed_at: Date | null;
+      discount_value: number | string | null; coupon_code: string | null;
+    }>(
+      `select id, bill_no::text as bill_no, waiter_confirmed_at, discount_value, coupon_code
+         from "Bills"
+        where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null
+        order by created_at desc limit 1
+        for update`,
+      [tableId, context.res_id, context.outlet_id],
+      client,
+    );
+    const open = billRows[0] ?? null;
+
+    let tenderCount = 0;
+    let tenderTotal = 0;
+    let loyaltyRedeemed = false;
+    if (open) {
+      const t = await optionalReadInTransaction(client, "BillTenders", () => runQuery<{ n: number | string; total: number | string | null }>(
+        `select count(*)::int as n, coalesce(sum(amount), 0) as total from "BillTenders"
+          where res_id = $1 and bill_id = $2 and voided_at is null`,
+        [context.res_id, open.id],
+        client,
+      ), [] as { n: number | string; total: number | string | null }[]);
+      tenderCount = Number(t[0]?.n ?? 0);
+      tenderTotal = round2(parseNumeric(t[0]?.total));
+      if (parseNumeric(open.discount_value) > 0) {
+        const redeemed = await optionalReadInTransaction(client, "LoyaltyLedger", () => runQuery<{ n: number | string }>(
+          `select count(*)::int as n from "LoyaltyLedger" where res_id = $1 and bill_id = $2 and kind = 'redeem'`,
+          [context.res_id, open.id],
+          client,
+        ), [] as { n: number | string }[]);
+        loyaltyRedeemed = Number(redeemed[0]?.n ?? 0) > 0;
+      }
+    }
+
+    const orders = owing.map((o) => ({ row: o, lines: readOrderFoodLines(o.food) }));
+    const plan = planBillNonChargeable(
+      orders.map((o) => ({ id: o.row.id, items: o.lines.items })),
+      () => randomUUID(),
+    );
+    const refusal = ncSettleRefusal({
+      payment_pending: Boolean(open?.waiter_confirmed_at) || owing.some((o) => Math.round(parseNumeric(o.status)) === 6),
+      live_tender_count: tenderCount,
+      live_tender_total: tenderTotal,
+      discount_value: parseNumeric(open?.discount_value),
+      coupon_code: open?.coupon_code ?? null,
+      loyalty_redeemed: loyaltyRedeemed,
+      plan,
+      expected_value: expected,
+    });
+    if (refusal) {throw new BillNonChargeableRefusedError(refusal);}
+
+    // What the guest would have paid, priced BEFORE the comps by the same
+    // resolver and the same function every settle uses. Informational only.
+    const chargeCfg = await openBillChargeConfig(context, tableId, client);
+    const wouldHave = computeBillCharges(
+      plan.chargeable_subtotal, chargeCfg.taxConfig, chargeCfg.scPct, chargeCfg.includeServiceCharge, null,
+    ).grand_total;
+
+    // Only now may a bill number be minted.
+    let billId = open?.id ?? null;
+    let billNo = open?.bill_no ?? null;
+    if (!billId) {
+      const minted = randomUUID();
+      const no = await nextBillNo(context, client);
+      const ins = await runQuery<{ id: string; bill_no: string | null }>(
+        `insert into "Bills" (id, created_at, res_id, outlet_id, table_id, emp_id, status, order_id, total_amt, tax_breakdown, bill_no)
+         values ($1, now(), $2, $3, $4, $5, 1, $6, $7, '[]'::jsonb, $8)
+         on conflict do nothing returning id, bill_no::text as bill_no`,
+        [minted, context.res_id, context.outlet_id, tableId, who.by_id, orderId, plan.chargeable_subtotal, no],
+        client,
+      );
+      billId = ins[0]?.id ?? (await existingOpenBillId(context, tableId, client));
+      billNo = ins[0]?.bill_no ?? null;
+      if (!billId) {throw new Error("Could not open a bill for this table");}
+      if (!ins[0]) {
+        billNo = (await runQuery<{ bill_no: string | null }>(
+          `select bill_no::text as bill_no from "Bills" where id = $1`, [billId], client,
+        ))[0]?.bill_no ?? null;
+      }
+    }
+
+    // 3. The comps.
+    const settleGroup = plan.to_comp.length > 0 ? randomUUID() : null;
+    const written: NonChargeableRecord[] = [];
+    for (const o of orders) {
+      const mine = plan.to_comp.filter((p) => p.order_id === o.row.id);
+      if (mine.length === 0) {continue;}
+      const stamped: (typeof mine[number] & { nc_id: string; nc_kind: string })[] = [];
+      for (const p of mine) {
+        const ncId = randomUUID();
+        const line = o.lines.items[p.index] ?? {};
+        const inserted = await runQuery<NonChargeableRow>(
+          `insert into "OrderItemNonChargeable"
+             (id, res_id, outlet_id, order_id, item_id, item_name, table_id,
+              nc_kind, reason, quantity, unit_price, menu_price_at_nc,
+              marked_by_employee_id, marked_by_username,
+              authorised_by_employee_id, authorised_by_username,
+              scope, bill_id, settle_group)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'bill',$17,$18)
+           returning ${NC_SELECT}`,
+          [ncId, context.res_id, context.outlet_id, o.row.id, p.item_id, p.name, tableId,
+            kind, reason, p.quantity, p.unit_price, menuPriceOf(line),
+            who.by_id, who.by, who.auth_id, who.auth, billId, settleGroup],
+          client,
+        );
+        if (inserted[0]) {written.push(mapNonChargeable(inserted[0]));}
+        stamped.push({ ...p, nc_id: ncId, nc_kind: kind });
+      }
+      const next = applyBillNonChargeable(o.lines.items, o.lines.split, stamped);
+      o.lines.items = next.items;
+      o.lines.split = next.split;
+      await runQuery(
+        `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+        [o.row.id, context.res_id, context.outlet_id, repriceOrderFood(o.lines)],
+        client,
+      );
+    }
+
+    // 4. The invariant.
+    const after = await sumOrderTotalsForTable(context, tableId, client);
+    if (Math.round(after * 100) !== 0) {
+      throw new Error(`Settling as non-chargeable left ₹${after.toFixed(2)} on this table, so nothing was changed. Refresh the bill and try again.`);
+    }
+    const live = await liveNcOnOrders(context, owing.map((o) => o.id), client);
+
+    // 5. The bill, the orders, the table.
+    await ensureBillRoundOffColumn(client);
+    const closed = await runQuery<{ id: string }>(
+      `update "Bills"
+          set payment_method = $1,
+              payment_splits = null,
+              payment_proof_screenshot_url = null,
+              total_amt = 0,
+              tax_breakdown = '[]'::jsonb,
+              round_off = $6,
+              waiter_confirmed_at = now(),
+              waiter_confirmed_by_username = $2,
+              admin_approved_at = now(),
+              admin_approved_by_username = $2,
+              closed_at = now(),
+              closed_by_username = $2,
+              status = 2
+        where id = $3 and res_id = $4 and outlet_id = $5 and closed_at is null and status <> 3
+        returning id`,
+      // round_off 0, not NULL: the bill WAS settled under rounding, and a 0.00
+      // total had nothing to round (NULL means "settled before rounding").
+      [NC_SETTLE_METHOD, who.by, billId, context.res_id, context.outlet_id, 0],
+      client,
+    );
+    if (!closed[0]) {throw new Error("This bill could not be closed — refresh it and try again.");}
+    await updateOrderWorkflowStatus(context, orderId, "Paid", client);
+    await finalizeSettledTable(context, tableId, client);
+
+    return {
+      success: true,
+      bill_id: billId,
+      bill_no: billNo,
+      table_id: tableId,
+      table_name: tableName,
+      payment_method: NC_SETTLE_METHOD,
+      total_amt: 0,
+      nc_value: live.value,
+      nc_lines: written.length,
+      would_have_charged: wouldHave,
+      settle_group: settleGroup,
+      non_chargeables: written,
+    };
+  });
+}
+
+/** How an NC-settled bill was settled, as the closed bill and its paper describe it. */
+export interface BillNcSettlement {
+  kind: string;
+  kind_label: string;
+  authorised_by: string;
+  marked_by: string;
+  reason: string;
+  /** Live comps on the bill's orders, both scopes. */
+  lines: number;
+  /** Their pre-tax value. */
+  value: number;
+  /** From the settle's audit line, when it can be read. Informational only. */
+  would_have_charged: number | null;
+}
+
+/**
+ * The settlement behind a closed NC bill: its comps (the bill-scope ones decide
+ * the kind and the names; item comps made earlier count towards the value), and
+ * — best-effort — the would-have-charged figure the settle's audit line kept.
+ *
+ * Degrades to the order read alone before migration 052 (a ₹0 bill made 'NC' by
+ * the hardening rule has only item comps anyway), and to null when even 034 is
+ * missing. Never throws: this decorates a read.
+ */
+async function readBillNcSettlement(
+  context: RestaurantContext,
+  billId: string,
+  orderIds: readonly string[],
+): Promise<BillNcSettlement | null> {
+  try {
+    const ids = [...new Set(orderIds.filter((o) => isUuid(o)))];
+    type Row = { nc_kind: string; authorised_by_username: string; marked_by_username: string; reason: string; value: number | string; scope: string | null };
+    // The catalogue, not a caught 42703, decides which statement runs — a
+    // failed statement would abort a caller's transaction.
+    const rows = (await billNcColumnsPresent().catch(() => false))
+      ? await captureRead("OrderItemNonChargeable", () => runQuery<Row>(
+        `select nc_kind, authorised_by_username, marked_by_username, reason, value, scope
+           from "OrderItemNonChargeable"
+          where res_id = $1 and reversed_at is null and (bill_id = $2 or order_id = any($3::uuid[]))
+          order by created_at asc`,
+        [context.res_id, billId, ids],
+      ), [] as Row[])
+      : await captureRead("OrderItemNonChargeable", () => runQuery<Row>(
+        `select nc_kind, authorised_by_username, marked_by_username, reason, value, null::text as scope
+           from "OrderItemNonChargeable"
+          where res_id = $1 and reversed_at is null and order_id = any($2::uuid[])
+          order by created_at asc`,
+        [context.res_id, ids],
+      ), [] as Row[]);
+    const described = describeNcSettlement(rows.map((r) => ({
+      nc_kind: r.nc_kind,
+      authorised_by: r.authorised_by_username,
+      marked_by: r.marked_by_username,
+      reason: r.reason,
+      value: round2(parseNumeric(r.value)),
+      scope: r.scope,
+    })));
+    if (!described) {return null;}
+    let wouldHave: number | null = null;
+    try {
+      const a = await runQuery<{ v: string | null }>(
+        `select additional_details->>'would_have_charged' as v from "Audit_logs"
+          where res_id = $1 and action_id = $2
+            and additional_details->>'bill_id' = $3 and additional_details->>'scope' = 'bill'
+          order by created_at desc limit 1`,
+        [context.res_id, NC_AUDIT_ACTION_ID, billId],
+      );
+      const v = Number(a[0]?.v);
+      wouldHave = a[0]?.v != null && Number.isFinite(v) ? round2(v) : null;
+    } catch { /* the figure is informational; the settlement reads without it */ }
+    return { ...described, would_have_charged: wouldHave };
+  } catch (err) {
+    logger.warn({ err }, "bill_nc_settlement_read_failed");
+    return null;
+  }
+}
+
+/** PERM_NON_CHARGEABLE — the action id the comp routes and the NC settle audit under. */
+const NC_AUDIT_ACTION_ID = "b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472";
+
+/**
+ * Undo an NC settle's comps when its bill is re-opened, inside ReopenBill's
+ * transaction. Supersession, exactly as ReverseNonChargeable does it: the rows
+ * stay, stamped, and the flags come off the lines they point at. Returns what
+ * was reversed so the route can say so on the record. A no-op before 052.
+ */
+async function reverseBillScopeNonChargeables(
+  context: RestaurantContext,
+  billId: string,
+  byUsername: string,
+  client: PoolClient,
+): Promise<{ lines: number; value: number; settle_group: string | null }> {
+  if (!(await billNcColumnsPresent())) {return { lines: 0, value: 0, settle_group: null };}
+  const reversed = await runQuery<{ id: string; order_id: string; value: number | string; settle_group: string | null }>(
+    `update "OrderItemNonChargeable"
+        set reversed_at = now(), reversed_by_username = $3, reversal_reason = $4
+      where res_id = $1 and bill_id = $2 and scope = 'bill' and reversed_at is null
+      returning id, order_id, value, settle_group`,
+    [context.res_id, billId, byUsername, "Bill re-opened — the non-chargeable settle is undone"],
+    client,
+  );
+  if (reversed.length === 0) {return { lines: 0, value: 0, settle_group: null };}
+  const ncIds = new Set(reversed.map((r) => r.id));
+  for (const orderId of [...new Set(reversed.map((r) => r.order_id))]) {
+    const rows = await runQuery<{ food: unknown }>(
+      `select food from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1 for update`,
+      [orderId, context.res_id, context.outlet_id],
+      client,
+    );
+    if (!rows[0]) {continue;}
+    const lines = readOrderFoodLines(rows[0].food);
+    const clear = (arr: Record<string, unknown>[]): Record<string, unknown>[] =>
+      arr.map((it) => {
+        if (!ncIds.has(String(it.nc_id ?? ""))) {return it;}
+        const copy = { ...it };
+        delete copy.nc; delete copy.nc_id; delete copy.nc_kind;
+        return copy;
+      });
+    lines.items = clear(lines.items);
+    if (lines.split !== null) {lines.split = lines.split.map(([l, arr]) => [l, clear(arr)]);}
+    await runQuery(
+      `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+      [orderId, context.res_id, context.outlet_id, repriceOrderFood(lines)],
+      client,
+    );
+  }
+  return {
+    lines: reversed.length,
+    value: round2(reversed.reduce((s, r) => s + parseNumeric(r.value), 0)),
+    settle_group: reversed[0]?.settle_group ?? null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -40370,6 +41249,8 @@ export interface NcSummaryRow {
   reversed_at: string | null;
   reversed_by: string | null;
   reversal_reason: string | null;
+  /** "Item" — one dish comped — or "Bill": part of a bill settled as NC (migration 052). */
+  scope: string;
 }
 
 export interface NcSummaryReport {
@@ -40388,6 +41269,8 @@ export interface NcSummaryReport {
     loss_pct_of_net: number | null;
   };
   by_kind: { kind: string; label: string; entries: number; quantity: number; loss: number }[];
+  /** The same live money cut by scope. Σ loss === totals.loss. */
+  by_scope: { scope: "item" | "bill"; label: string; entries: number; quantity: number; loss: number }[];
   page: MisPage;
   /** False — the category column is a name join and a rename silently breaks it. */
   category_exact: boolean;
@@ -40399,6 +41282,8 @@ const NC_SUMMARY_COLUMNS: MisColumn[] = [
   { key: "order_id", label: "KOT / Order", type: "text", default_on: false },
   { key: "item_name", label: "Item", type: "text" },
   { key: "category", label: "Category", type: "text" },
+  // Item = one dish comped; Bill = part of a bill settled as NC.
+  { key: "scope", label: "Scope", type: "text" },
   { key: "quantity", label: "Qty", type: "int", total: true },
   { key: "menu_price", label: "Menu price", type: "money" },
   { key: "nc_price", label: "NC price", type: "money" },
@@ -40424,6 +41309,8 @@ interface NcSummarySqlRow {
   reversed_at: Date | null; reversed_by_username: string | null; reversal_reason: string | null;
   table_name: string | null; order_type: string | null; waiter: string | null;
   bill_id: string | null; bill_no: string | null;
+  /** Migration 052. Absent (read as 'item') when the columns are not there yet. */
+  scope?: string | null;
 }
 
 /**
@@ -40471,7 +41358,14 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
                        or t.table_name ilike ${p} or n.order_id::text ilike ${p} or bl.bill_no ilike ${p})`;
   }
 
-  const rows = await captureRead("OrderItemNonChargeable", () => runQuery<NcSummarySqlRow>(
+  // MIGRATION 052 IS READ WHEN IT IS THERE. A bill settled as NC stores its
+  // bill on every row it wrote, and that stored link wins over the resolution
+  // below. Before 052 is applied the same query runs without the two columns,
+  // and every row reads as an item comp, which is all such a database can hold.
+  // Asked of the catalogue rather than tried and caught: a report can run inside
+  // a transaction (the scheduled sweep), where a 42703 would abort everything
+  // after it.
+  const ncSummarySql = (withStoredBill: boolean): string =>
     `select n.id, n.created_at, n.order_id, n.item_name, n.nc_kind, n.reason,
             n.quantity, n.unit_price, n.menu_price_at_nc, n.value,
             n.marked_by_username, n.authorised_by_username,
@@ -40479,10 +41373,13 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
             t.table_name,
             (o.food)::jsonb->>'order_type'             as order_type,
             (o.food)::jsonb->>'taken_by_employee_name' as waiter,
-            bl.bill_id, bl.bill_no
+            ${withStoredBill
+    ? "n.scope, coalesce(sb.id, bl.bill_id) as bill_id, coalesce(sb.bill_no::text, bl.bill_no) as bill_no"
+    : "bl.bill_id, bl.bill_no"}
        from "OrderItemNonChargeable" n
        left join "Tables" t on t.id = n.table_id and t.res_id = n.res_id and t.outlet_id = n.outlet_id
        left join "Orders" o on o.id = n.order_id and o.res_id = n.res_id and o.outlet_id = n.outlet_id
+       ${withStoredBill ? `left join "Bills" sb on sb.id = n.bill_id and sb.res_id = n.res_id` : ""}
        -- THE BILL THE COMP REDUCED. See the header: the first bill on this table
        -- that settled at or after the comp, or an open one when none has; and
        -- "Bills".order_id for a table-less (takeaway) order. 'infinity' sorts an
@@ -40500,9 +41397,11 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
        ) bl on true
       where n.res_id = $1 and (${mc.og} or n.outlet_id = $2)
         and n.created_at >= $3 and n.created_at < $4${misTimeSql("n.created_at", mc)}
-        ${searchSql}
-      order by n.created_at desc, n.id desc`,
-    params,
+        ${searchSql.replace("bl.bill_no ilike", withStoredBill ? "coalesce(sb.bill_no::text, bl.bill_no) ilike" : "bl.bill_no ilike")}
+      order by n.created_at desc, n.id desc`;
+  const withStoredBill = await billNcColumnsPresent().catch(() => false);
+  const rows = await captureRead("OrderItemNonChargeable", () => runQuery<NcSummarySqlRow>(
+    ncSummarySql(withStoredBill), params,
   ), [] as NcSummarySqlRow[]);
 
   const categoryByName = new Map<string, string>();
@@ -40543,6 +41442,7 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
       reversed_at: iso(r.reversed_at),
       reversed_by: r.reversed_by_username,
       reversal_reason: r.reversal_reason,
+      scope: r.scope === "bill" ? "Bill" : "Item",
     };
   });
 
@@ -40557,6 +41457,18 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
     e.loss = round2(e.loss + row.loss);
     byKind.set(raw.nc_kind, e);
   }
+
+  // The same live money by scope — the item comps and the bills settled as NC.
+  const byScope = (["item", "bill"] as const).map((scope) => {
+    const mine = out.filter((r, i) => !r.reversed && (rows[i].scope === "bill" ? "bill" : "item") === scope);
+    return {
+      scope,
+      label: scope === "bill" ? "Bill settled as NC" : "Item comped",
+      entries: mine.length,
+      quantity: round2(mine.reduce((s, r) => s + r.quantity, 0)),
+      loss: round2(mine.reduce((s, r) => s + r.loss, 0)),
+    };
+  });
 
   // Net sales for the same window, for scale. On the SETTLEMENT clock while the
   // rows are on the comp clock — declared in the notes rather than quietly
@@ -40577,6 +41489,8 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
       "The Bill column is the first bill on the comp's table that settled at or after the comp (or the bill raised from the order, for a takeaway with no table). It is a resolution, not a stored link, and is blank where neither finds one.",
       "Category is recovered by matching the item name against the CURRENT menu, exactly as Item Wise does. A renamed or deleted dish shows no category.",
       "Net sales is shown for scale only and is on the SETTLEMENT clock, unlike the rows above it.",
+      "Scope Bill marks the lines of a bill settled as non-chargeable: every remaining dish was comped at once and the bill closed at 0.00, so it appears in the Settlement Summary as Non-chargeable (NC) with nothing collected. Such a row shows the bill it closed directly rather than by resolution. Loss is the same pre-tax line value as an item comp; what the guest would have paid with service charge and tax is not a loss that existed and is not reported here.",
+      NOTE_NC_SETTLED_BILLS,
     ]),
     columns: NC_SUMMARY_COLUMNS,
     rows: out.slice(page.offset, page.offset + page.limit),
@@ -40593,6 +41507,7 @@ export async function GetNcSummaryReport(restaurantId: string, q: MisReportQuery
     by_kind: [...byKind.entries()]
       .map(([kind, v]) => ({ kind, ...v }))
       .sort((a, z) => z.loss - a.loss || a.kind.localeCompare(z.kind)),
+    by_scope: byScope,
     page,
     category_exact: false,
   };
