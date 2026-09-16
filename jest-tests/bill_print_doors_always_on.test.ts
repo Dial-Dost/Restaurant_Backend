@@ -136,10 +136,11 @@ describe("the reader itself — a suite that finds nothing proves nothing", () =
       "POST /print/kot/order/:id",
       "POST /print/test",
       "POST /bills/service-charge-waiver/print",
+      "POST /bills/order/:orderId/settle-nc",
     ]));
   });
 
-  test("outside /print/ and /publish/ there is exactly one door, and it is the waiver print", () => {
+  test("outside /print/ and /publish/ there are exactly two doors: the waiver print and the NC settle", () => {
     // Closed on purpose. A second name here is either a new door under a new
     // prefix — which needs its own behaviour, a README row and a line in this
     // list — or the body scan crediting a top-level helper's dispatch (such as
@@ -148,7 +149,7 @@ describe("the reader itself — a suite that finds nothing proves nothing", () =
     const elsewhere = DOORS
       .filter((d) => !/^\/(print|publish)\//.test(d.path))
       .map((d) => `${d.method} ${d.path}`);
-    expect(elsewhere).toEqual(["POST /bills/service-charge-waiver/print"]);
+    expect(elsewhere.sort()).toEqual(["POST /bills/order/:orderId/settle-nc", "POST /bills/service-charge-waiver/print"]);
   });
 
   test("the wildcard reader follows CloudFront's rules", () => {
@@ -172,6 +173,13 @@ describe("every door that prints is served by the always-on task", () => {
     expect(onTask("/bills/service-charge-waiver/print")).toBe(true);
   });
 
+  test('"Settle as NC" too, and its wildcard reaches no sibling settle route', () => {
+    expect(onTask("/bills/order/x/settle-nc")).toBe(true);
+    for (const sibling of ["/bills/order/x", "/bills/order/x/close", "/bills/order/x/waiter-confirm-payment", "/bills/order/x/admin-approve-payment", "/bills/order/x/status"]) {
+      expect(onTask(sibling)).toBe(false);
+    }
+  });
+
   test("and no ordinary route is dragged onto the task by a pattern wider than the doors", () => {
     // /print/*, /publish/* and /socket.io/* are the task's by design, whatever
     // they do. Anywhere else, only a door belongs there: a `/bills/*` behaviour
@@ -188,5 +196,7 @@ describe("every door that prints is served by the always-on task", () => {
   test("the documents that describe the topology name the third door", () => {
     expect(read("deploy/README.md")).toContain("`POST /bills/service-charge-waiver/print`");
     expect(read("lambda.ts")).toContain("POST /bills/service-charge-waiver/print");
+    expect(read("deploy/README.md")).toContain("`POST /bills/order/:orderId/settle-nc`");
+    expect(read("lambda.ts")).toContain("/bills/order/:orderId/settle-nc");
   });
 });

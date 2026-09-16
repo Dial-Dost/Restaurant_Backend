@@ -73,8 +73,11 @@ const ROUND_OFF_SQL_FUNCTIONS = [
   "ListOpenBills", "getSettledBills", "GetDiscountsReport", "GetCustomerSegments",
   "GetStaffPerformance", "GetSimulationRawStats", "fetchMisBills", "GetDiscountReport",
   "GetOrderSummaryReport", "GetOverviewHeadline",
-  // the four settle writers
+  // the five settle writers (the fifth closes a bill as non-chargeable, at 0.00)
   "ConfirmBillPaymentByWaiter", "SubmitCustomerPayment", "ApproveBillPaymentByAdmin", "FinalizeOnlinePayment",
+  "SettleBillAsNonChargeable",
+  // re-opening an NC bill makes it an open, unpaid bill again (pre-tax total, no round-off)
+  "ReopenBill",
   // every writer that rewrites total_amt as something other than a charged grand total
   "ReleaseTable", "AddOrder", "removeItemFromTableOrders", "MoveBillItem", "MergeTableBills",
   "resyncOpenBillTotal", "AddBill", "ReplaceBill", "MarkOrderItemNonChargeable", "ReverseNonChargeable",

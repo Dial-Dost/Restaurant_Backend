@@ -191,6 +191,12 @@ export interface FixtureNonChargeable {
   reversed_at?: string | null;
   reversed_by?: string | null;
   reversal_reason?: string | null;
+  /**
+   * 052 — 'bill' when the row was written by a settle-as-NC, which also stores
+   * the bill it closed. Absent = 'item', the column default.
+   */
+  scope?: "item" | "bill";
+  bill_id?: string | null;
 }
 
 /** 036 — one service-charge waiver. grand_total_reduction is derived, as in SQL. */
@@ -308,6 +314,12 @@ export interface FixtureDb {
   report_time_slots?: unknown;
   /** True models a database migration 049 never reached: reading the column is 42703. */
   report_time_slots_missing?: boolean;
+  /**
+   * True models a database migration 052 never reached: the catalogue does not
+   * list "OrderItemNonChargeable".scope/bill_id/settle_group, and selecting any
+   * of them is 42703 — which the NC Summary must never try.
+   */
+  nc_bill_columns_missing?: boolean;
 }
 
 export function makeDb(over: Partial<FixtureDb> = {}): FixtureDb {
@@ -793,9 +805,17 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     return out;
   }
 
+  // --- 052: are the bill-scope columns there? (billNcColumnsPresent) ---
+  if (/from information_schema\.columns where table_schema = 'public' and table_name = 'OrderItemNonChargeable'/i.test(q)) {
+    return [{ n: d.nc_bill_columns_missing ? 0 : 3 }];
+  }
+
   // --- 034: non-chargeables ---
   if (/from "OrderItemNonChargeable"/i.test(q)) {
     requireShape(q, "res_id = $1", "the tenant predicate");
+    if (d.nc_bill_columns_missing && /\bn\.(scope|bill_id|settle_group)\b/i.test(q)) {
+      throw Object.assign(new Error('column n.scope does not exist'), { code: "42703" });
+    }
     const rows = captureRowsMatching(q, params, d.non_chargeables, (n) => n.created_at,
       /from "OrderItemNonChargeable" n/i.test(q) ? "n.created_at" : "created_at");
     // The ladder-side read: what a window gave away, per outlet, nothing else.
@@ -819,6 +839,14 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       "a comp belongs to the first bill that settled at or after it, not the table's most recent one");
     requireShape(q, "coalesce(b.closed_at, b.admin_approved_at) >= n.created_at",
       "a bill that closed BEFORE the comp belongs to a previous seating");
+    // 052: the stored bill of a bill-scope row wins over the resolution.
+    const storedBill = /\bn\.scope\b/i.test(q);
+    if (storedBill) {
+      requireShape(q, "coalesce(sb.id, bl.bill_id) as bill_id",
+        "a bill settled as NC names its own bill; resolving one instead can pick another seating's");
+      requireShape(q, `left join "Bills" sb on sb.id = n.bill_id and sb.res_id = n.res_id`,
+        "the stored bill is read in the row's own tenant");
+    }
     const search = params[4];
     const filtered = typeof search === "string" && search.includes("%")
       ? rows.filter((n) =>
@@ -831,7 +859,8 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       .sort((a, z) => new Date(z.created_at).getTime() - new Date(a.created_at).getTime())
       .map((n) => {
         const order = d.orders.find((o) => o.id === n.order_id);
-        const bill = billForNonChargeable(n);
+        const stored = storedBill && n.bill_id ? d.bills.find((b) => b.id === n.bill_id && resOf(b) === resOf(n)) : undefined;
+        const bill = stored ?? billForNonChargeable(n);
         return {
           id: n.id,
           created_at: new Date(n.created_at),
@@ -853,6 +882,8 @@ function dispatch(q: string, params: unknown[]): unknown[] {
           waiter: order?.taken_by ?? null,
           bill_id: bill?.id ?? null,
           bill_no: bill?.bill_no ?? null,
+          // Only when the query selects it, as Postgres would answer.
+          ...(storedBill ? { scope: n.scope ?? "item" } : {}),
         };
       });
   }
