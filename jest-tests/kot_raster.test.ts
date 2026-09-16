@@ -28,6 +28,7 @@ import {
   planKotRaster,
   type KotDraw,
   type KotRasterPlan,
+  type KotRow,
   type ReceiptOptions,
 } from "../escpos";
 import { KOT_ATLAS } from "../kot_glyph_atlas";
@@ -70,6 +71,20 @@ const stress: ReceiptOptions = {
     { name: "Gaia Rose Cookies", quantity: 1, price: 0, note: "Hold Dessert, serve with the mains" },
     { name: "Paneer Tikka", quantity: 120, price: 0, variation: "Half" },
   ],
+};
+
+/** A banquet ticket: past item 99 the row number needs a third digit, and every
+ *  seventh line is a name that wraps, so the columns are under load together.
+ *  Kept out of `variants` on purpose — a 120-line raster is half a megabyte of
+ *  base64 and would drown the payload-cost test, which measures that separately. */
+const long: ReceiptOptions = {
+  ...docket,
+  kotNo: 907,
+  items: Array.from({ length: 120 }, (_, i) => ({
+    name: i % 7 === 0 ? "Chargrilled Tandoori Broccoli Malai with Burnt Garlic" : "Roti",
+    quantity: i % 11 === 0 ? 12 : 1,
+    price: 0,
+  })),
 };
 
 const variants: [string, ReceiptOptions][] = [
@@ -192,6 +207,77 @@ describe("the item table's columns", () => {
       expect(left).toContain("No.Item");
       expect(left).toContain("1");
       expect(left).toContain("Total Qty");
+    });
+  }
+});
+
+/**
+ * THE BANQUET TICKET, WHERE THE ROW NUMBER GROWS A THIRD DIGIT.
+ *
+ * A fixed No. column fits "99" and no more. From item 100 the third digit is
+ * drawn straight over the first letter of the dish name — no error, no
+ * clipping, just two glyphs merged into one shape — and a hundred-line ticket
+ * is exactly the one nobody proof-reads before the pass cooks from it. So the
+ * No. column is measured from the widest row number on the docket, the same way
+ * the quantity column is measured from the widest quantity.
+ */
+describe("a docket long enough to need three-digit row numbers", () => {
+  for (const cols of [48, 32]) {
+    const roll = cols === 48 ? "80mm" : "58mm";
+
+    test(`no row number is ever drawn into a dish name — ${roll}`, () => {
+      const p = plan(long, cols);
+      const numbered = p.ops
+        .map((op) => ({
+          num: op.draws.find((d) => d.x === p.geometry.numX),
+          name: op.draws.find((d) => d.x === p.geometry.nameX),
+        }))
+        .filter((r): r is { num: KotDraw; name: KotDraw } => r.num !== undefined && r.name !== undefined);
+      expect(numbered.length).toBeGreaterThan(100);
+      // The case this guards actually occurs on this docket.
+      expect(numbered.some((r) => r.num.text.length === 3)).toBe(true);
+      // Against the EARLIEST ink any name line starts at, not just the one
+      // beside it, so a wrapped continuation, a [Hold] and a [Note] are covered
+      // by the same assertion.
+      const nameInk = Math.min(...draws(p).filter((d) => d.x === p.geometry.nameX).map((d) => d.x0));
+      const over = numbered.filter((r) => r.num.x1 > nameInk);
+      expect(over.map((r) => `"${r.num.text}" ends ${r.num.x1}, names start ${nameInk}`)).toEqual([]);
+    });
+
+    test(`and nothing on it crosses the edge of the roll — ${roll}`, () => {
+      const p = plan(long, cols);
+      const outside = draws(p).filter((d) => d.x0 < 0 || d.x1 > p.widthDots);
+      expect(outside.map((d) => `${d.text} [${d.x0},${d.x1}) of ${p.widthDots}`)).toEqual([]);
+    });
+
+    test(`a ticket the reference's own size is not indented for it — ${roll}`, () => {
+      // The column GROWS from the reference's 1.45em and never shrinks below it,
+      // so the docket in the photograph — and every ticket of nine lines or
+      // fewer — is laid out exactly as it was.
+      const ref = plan(docket, cols).geometry;
+      expect(ref.nameX).toBe(Math.round(ref.ppem * 1.45));
+      const roti = (n: number) => ({ ...docket, items: Array.from({ length: n }, () => ({ name: "Roti", quantity: 1, price: 0 })) });
+      expect(plan(roti(9), cols).geometry.nameX).toBe(ref.nameX);
+      expect(plan(roti(10), cols).geometry.nameX).toBeGreaterThan(ref.nameX);
+      expect(plan(long, cols).geometry.nameX).toBeGreaterThan(plan(roti(10), cols).geometry.nameX);
+    });
+
+    test(`a nonsense row number cannot eat the dish name — ${roll}`, () => {
+      // The ceiling the quantity column has, for the same reason: a number wide
+      // enough to push the Item column off the roll is a number to clip the
+      // gutter for, not to sacrifice the dish name to.
+      const profile = kotProfile(cols * DOTS_PER_COL);
+      const rows: KotRow[] = [{
+        k: "cols",
+        cells: [
+          { text: "12345678901234567890", at: "num", bold: false },
+          { text: "Roti", at: "name", bold: true },
+          { text: "1", at: "qty", bold: false },
+        ],
+      }];
+      const p = planKotRaster(rows, KOT_ATLAS, profile.ppem, profile.widthDots);
+      expect(p.geometry.nameX).toBeLessThanOrEqual(Math.floor(p.widthDots / 3));
+      expect(draws(p).filter((d) => d.x0 < 0 || d.x1 > p.widthDots)).toEqual([]);
     });
   }
 });

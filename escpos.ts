@@ -829,7 +829,11 @@ export interface KotGeometry {
   margin: number;
   /** Left edge of the No. column, and of every left-aligned line. */
   numX: number;
-  /** Left edge of the Item column — where wrapped names, [Hold] and [Note] indent to. */
+  /**
+   * Left edge of the Item column — where wrapped names, [Hold] and [Note]
+   * indent to. Sized from the widest row number on THIS docket, so a three-digit
+   * number cannot be drawn over the first letter of a dish name.
+   */
   nameX: number;
   /** The widest a name line may be before it wraps. */
   nameMax: number;
@@ -961,8 +965,31 @@ function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, pp
   // only ever holds two or three digits.
   const margin = Math.round(ppem * 0.3);
   const numX = margin;
-  const nameX = Math.round(ppem * 1.45);
   const gutter = Math.round(ppem * 0.4);
+  // THE No. COLUMN IS SIZED FROM THE WIDEST ROW NUMBER ACTUALLY ON THIS DOCKET,
+  // for the same reason the quantity column below is sized from the widest
+  // quantity. 1.45em is the reference docket's own gap and holds two digits; on
+  // a ticket that reaches item 100 a fixed column draws the third digit straight
+  // over the first letter of the dish name — no error, no clipping, just two
+  // glyphs merged into one blob on the document the kitchen cooks from.
+  //
+  // Only a row carrying BOTH a number and a name can collide. "No.Item" and
+  // "Total Qty" are wider than any column and sit alone on their side of the
+  // paper, so measuring them would indent every dish name for nothing.
+  let numW = 0;
+  for (const row of rows) {
+    if (row.k !== "cols" || !row.cells.some((c) => c.at === "name")) { continue; }
+    for (const cell of row.cells) {
+      if (cell.at !== "num") { continue; }
+      const w = kotTextWidth(kotFace(atlas, cell.size === "banner" ? bannerPpem : ppem, cell.bold), cell.text);
+      if (w > numW) { numW = w; }
+    }
+  }
+  // Grows from the reference's gap, never shrinks below it, and stops at a third
+  // of the roll — the same ceiling the quantity column has, and for the same
+  // reason: past that the No. column would be eating the dish name to make room
+  // for a row number, and a name nobody can read is the worse trade.
+  const nameX = Math.max(Math.round(ppem * 1.45), Math.min(numX + numW + gutter, Math.floor(widthDots / 3)));
   const qtyRight = widthDots - margin;
   // THE QUANTITY COLUMN IS SIZED FROM THE WIDEST QUANTITY ACTUALLY ON THIS
   // DOCKET, never from a guess. A fixed column fits "12" and a four-digit qty
