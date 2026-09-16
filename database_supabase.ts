@@ -178,7 +178,9 @@ import {
 // and writes them.
 import {
   applyBillNonChargeable,
+  carryServerNonChargeable,
   describeNcSettlement,
+  ncFlagSignature,
   ncSettleRefusal,
   planBillNonChargeable,
   settlesAsNonChargeable,
@@ -13360,9 +13362,6 @@ export async function UpdateOrderItemsSplit(
   // guard's header for the callers that must not.
   await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
 
-  // build flattened items
-  const flattened = (items_split).flatMap((t) => Array.isArray(t[1]) ? t[1] : []);
-
   // fetch existing order to preserve other fields
   // `table_id` rides along for the write-off gate below, which judges the whole
   // TABLE rather than this one order — see the header.
@@ -13373,8 +13372,27 @@ export async function UpdateOrderItemsSplit(
   if (!existing[0]) {throw new Error('Order not found');}
 
   const payload = parseJsonObject(existing[0].food) ?? {};
+  const previousLines = (Array.isArray(payload.items) ? payload.items as unknown[] : [])
+    .map((r) => parseJsonObject(r) ?? r);
+
+  // THE NC FLAGS ARE SERVER-OWNED ON THIS PATH TOO (migration 034) — see
+  // carryServerNonChargeable. Every client nc key is removed and each stored
+  // comp is carried onto the line that is still that line, so a payload can
+  // neither comp a dish nor quietly re-charge one. A line that arrives as a JSON
+  // string is parsed first: left a string, its nc key would pass the strip and
+  // then be read as a real flag by the pricing below.
+  const carried = carryServerNonChargeable(
+    previousLines,
+    (items_split).map((t) => (Array.isArray(t) && Array.isArray(t[1])
+      ? [t[0], (t[1] as unknown[]).map((it) => parseJsonObject(it) ?? it), ...t.slice(2)]
+      : t)),
+  );
+  if (carried.refusal) {throw new Error(carried.refusal);}
+  const safeSplit = carried.split as any[];
+  // build flattened items
+  const flattened = safeSplit.flatMap((t) => Array.isArray(t?.[1]) ? t[1] : []);
   // determine order status: if any Preparing tuple contains one or more items -> Preparing, else Served
-  const hasPreparingItems = Array.isArray(items_split) && (items_split).some((t) => {
+  const hasPreparingItems = safeSplit.some((t) => {
     const label = String(t?.[0] ?? "").toLowerCase();
     const list = Array.isArray(t?.[1]) ? t[1] : [];
     return label.includes('prepar') && list.length > 0;
@@ -13385,14 +13403,18 @@ export async function UpdateOrderItemsSplit(
 
   // Re-price from the items that actually remain. Without this, adding an item
   // showed it on the bill but left subtotal/total untouched, so the guest was
-  // never charged for it (and removals never credited). Mirrors what
-  // removeItemFromTableOrders already does.
-  const repricedSubtotal = round2(
-    flattened.reduce((acc: number, it: unknown) => {
-      const item = parseJsonObject(it) ?? {};
-      return acc + parseNumeric(item.price) * Math.max(1, parseNumeric(item.quantity) || 1);
-    }, 0),
-  );
+  // never charged for it (and removals never credited).
+  //
+  // OVER THE CHARGEABLE LINES ONLY, as AddOrder and repriceOrderFood price. This
+  // summed every line, comped ones included, so a drag, a delete or an add on a
+  // table with a comped dish charged that dish again — and a Settle as NC on it
+  // was refused forever, its quote and its lines never agreeing. Same quantity
+  // rule as before (orderLineQuantity is Math.max(1, n || 1)), so an order with
+  // no comp stores exactly the figure it always did.
+  const moneyLines = flattened.map((r: unknown) =>
+    (parseJsonObject(r) ?? {}) as { price?: unknown; quantity?: unknown; nc?: unknown });
+  const repricedSubtotal = chargeableSubtotal(moneyLines);
+  const repricedNc = nonChargeableValue(moneyLines);
 
   // ==========================================================================
   // THE WRITE-OFF GATE. See this function's header for the rule and the reuse.
@@ -13404,7 +13426,6 @@ export async function UpdateOrderItemsSplit(
   const chargeableOf = (raw: unknown[]): number => chargeableSubtotal(
     raw.map((r) => (parseJsonObject(r) ?? {}) as { price?: unknown; quantity?: unknown; nc?: unknown }),
   );
-  const previousLines = Array.isArray(payload.items) ? payload.items as unknown[] : [];
   const previousChargeable = chargeableOf(previousLines);
   const nextChargeable = chargeableOf(flattened as unknown[]);
   // What THIS write hands back. Additions and pure re-labelling (drag a line from
@@ -13494,15 +13515,18 @@ export async function UpdateOrderItemsSplit(
   // counted no value. Moving a line between Served and Preparing, or adding one,
   // takes nothing off and stamps nothing. See linesTakenOff.
   const takenOff = linesTakenOff(previousLines, flattened as unknown[]);
+  const { nc_subtotal: _staleNc, ...payloadRest } = payload;
   const newPayload = stampLineRemoval(
     {
-      ...payload,
+      ...payloadRest,
       items: flattened,
-      items_split,
+      items_split: safeSplit,
       status: newStatus,
       subtotal: repricedSubtotal,
       // `total` is the PRE-TAX base the bill builds on (see sumOrderTotalsForTable).
       total: repricedSubtotal,
+      // Carried as repriceOrderFood carries it, and omitted with no comp.
+      ...(repricedNc > 0 ? { nc_subtotal: repricedNc } : {}),
     },
     takenOff,
     "remove",
@@ -13510,10 +13534,37 @@ export async function UpdateOrderItemsSplit(
     new Date().toISOString(),
   );
   // update both the JSON food column and the numeric status column
-  await runQuery(
-    `update "Orders" set food = $1::json, status = $2 where id = $3 and res_id = $4 and outlet_id = $5`,
-    [JSON.stringify(newPayload), toOrderStatusCode(newStatus), orderId, context.res_id, context.outlet_id],
+  //
+  // ONLY WHILE THE ORDER IS STILL THE ONE THIS WRITE WAS BUILT FROM. Nothing
+  // above holds a lock, and this writer replaces `food` whole, so a read taken
+  // before a concurrent settle or comp committed would otherwise land after it:
+  // a Settle as NC closed at 0.00 would have its flags wiped and its order put
+  // back to Preparing on a freed table, or a comp made a moment ago would drop
+  // off its line. So the write names the state it was built on — still owing,
+  // not awaiting payment approval, and carrying exactly the comps it carried
+  // (ncFlagSignature; the subquery computes the same string). A settle in
+  // flight holds the row lock, so this statement waits for it and then checks
+  // these conditions against the row that settle committed.
+  const written = await runQuery<{ id: string }>(
+    `update "Orders" set food = $1::json, status = $2
+      where id = $3 and res_id = $4 and outlet_id = $5
+        and ${stillOwesStatusSql()}
+        and coalesce(status::text, '1') <> '6'
+        and coalesce((
+              select string_agg(coalesce(x ->> 'nc_id', ''), ',' order by coalesce(x ->> 'nc_id', '') collate "C")
+                from jsonb_array_elements(
+                       case when jsonb_typeof(food::jsonb -> 'items') = 'array' then food::jsonb -> 'items' else '[]'::jsonb end
+                     ) as x
+               where x -> 'nc' = 'true'::jsonb
+            ), '') = $6
+      returning id`,
+    [JSON.stringify(newPayload), toOrderStatusCode(newStatus), orderId, context.res_id, context.outlet_id, ncFlagSignature(previousLines)],
   );
+  if (!written[0]) {
+    // Settled, cancelled or awaiting approval in the meantime: the house words.
+    await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
+    throw new Error("This order changed on another screen while it was being edited — a dish on it was comped, un-comped or settled. Refresh it and try again.");
+  }
 
   return true;
 }
@@ -14221,9 +14272,16 @@ async function removeItemFromTableOrders(
     if (Array.isArray(split)) {
       split = split.map((t: any) => Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter((it: any) => !matches(it))] : t);
     }
-    const subtotal = round2(keep.reduce((s, it) => s + (Number(it?.price) || 0) * Math.max(1, Math.round(Number(it?.quantity) || 1)), 0));
+    // OVER THE CHARGEABLE LINES (migration 034), as every other order writer
+    // prices: summing a comped dish here charged it again the moment any other
+    // dish came off the table. The quantity rule is unchanged.
+    const subtotal = round2(keep.reduce((s, it) => (isNonChargeableLine(it)
+      ? s
+      : s + (Number(it?.price) || 0) * Math.max(1, Math.round(Number(it?.quantity) || 1))), 0));
+    const ncLeft = nonChargeableValue(keep);
+    const { nc_subtotal: _staleNc, ...rest } = f;
     const newFood: Record<string, any> = stampLineRemoval(
-      { ...f, items: keep, subtotal, total: subtotal },
+      { ...rest, items: keep, subtotal, total: subtotal, ...(ncLeft > 0 ? { nc_subtotal: ncLeft } : {}) },
       items.filter((it) => matches(it)),
       mode,
       keep.length === 0,
@@ -16465,7 +16523,11 @@ export async function ReopenBill(
       },
       restored_orders: restored,
       window_min: windowMin,
-      ...(wasNc && ncReversed ? { nc_reversed: ncReversed } : {}),
+      // Only when a settle's comps were actually undone. A bill made 'NC' by the
+      // ₹0 hardening rule carries item comps alone, which a re-open leaves in
+      // place — reporting "0 line(s) back on the bill" there would file an NC
+      // settle undone that never happened.
+      ...(wasNc && ncReversed && ncReversed.lines > 0 ? { nc_reversed: ncReversed } : {}),
     };
   });
 }
@@ -37643,7 +37705,13 @@ export interface MisOrderDetail {
   table_name: string | null;
   customer: string | null;
   taken_by: string | null;
-  items: { name: string; quantity: number; price: number; line_total: number; note: string | null; station: string | null }[];
+  /**
+   * `nc` marks a comped line (migration 034) so both drill-downs can label it
+   * "<dish> (NC)", as the bill does. Its `line_total` stays the ticket value: a
+   * kitchen ticket is what was cooked (or voided), and the Void KOT row it
+   * opens from counts it that way.
+   */
+  items: { name: string; quantity: number; price: number; line_total: number; note: string | null; station: string | null; nc?: true }[];
   item_count: number;
   qty: number;
   value: number;
@@ -37701,6 +37769,7 @@ export async function GetMisOrderDetail(restaurantId: string, orderId: string): 
       line_total: round2(price * quantity),
       note: String(it.note ?? "").trim() || null,
       station: String(it.station ?? "").trim() || null,
+      ...(isNonChargeableLine(it) ? { nc: true as const } : {}),
     };
   });
 
@@ -38690,6 +38759,9 @@ export async function SettleBillAsNonChargeable(
       () => randomUUID(),
     );
     const refusal = ncSettleRefusal({
+      // The STORED figures, as the open bill the clients read reduces them — see
+      // NcSettleFacts.quoted_subtotal for why the lines cannot stand in for them.
+      quoted_subtotal: activeOrderSubtotal(owing).subtotal,
       payment_pending: Boolean(open?.waiter_confirmed_at) || owing.some((o) => Math.round(parseNumeric(o.status)) === 6),
       live_tender_count: tenderCount,
       live_tender_total: tenderTotal,
@@ -38731,12 +38803,27 @@ export async function SettleBillAsNonChargeable(
       }
     }
 
-    // 3. The comps.
+    // 3. The comps — and EVERY owing order re-priced, not only the ones with a
+    // line left to comp. An order whose lines were all comped earlier can still
+    // STORE a figure written over those lines (the items-split writer priced
+    // every line before it priced chargeable ones only), and left alone it would
+    // trip the invariant below on every attempt. Its lines are the truth; an
+    // order with NO lines keeps whatever it stores, so a figure nothing explains
+    // still refuses the settle rather than being zeroed here.
     const settleGroup = plan.to_comp.length > 0 ? randomUUID() : null;
     const written: NonChargeableRecord[] = [];
     for (const o of orders) {
       const mine = plan.to_comp.filter((p) => p.order_id === o.row.id);
-      if (mine.length === 0) {continue;}
+      if (mine.length === 0) {
+        if (o.lines.items.length > 0) {
+          await runQuery(
+            `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+            [o.row.id, context.res_id, context.outlet_id, repriceOrderFood(o.lines)],
+            client,
+          );
+        }
+        continue;
+      }
       const stamped: (typeof mine[number] & { nc_id: string; nc_kind: string })[] = [];
       for (const p of mine) {
         const ncId = randomUUID();

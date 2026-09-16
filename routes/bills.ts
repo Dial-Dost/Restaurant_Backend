@@ -2681,8 +2681,10 @@ app.post('/bills/:id/reopen', validate, async (req: Request, res: Response) => {
 		// A BILL SETTLED AS NC HAD ITS COMPS REVERSED BY THAT RE-OPEN. Said on
 		// the record under the comp permission's own id with the settle's
 		// `scope` flag, so the Bill Edit report files it as the NC settle undone
-		// (bill_non_chargeable_reversed) beside the settle it undid.
-		if (result.nc_reversed) {
+		// (bill_non_chargeable_reversed) beside the settle it undid. Only when
+		// comps were actually undone: a bill made 'NC' by the ₹0 hardening rule
+		// has none of its own, and "0 line(s) back" would be a settle nobody made.
+		if (result.nc_reversed && result.nc_reversed.lines > 0) {
 			try {
 				await log_audit(req, PERM_NON_CHARGEABLE, `Undid the non-chargeable settle of bill ${result.bill.bill_no ?? result.bill.id} by re-opening it (${String(result.nc_reversed.lines)} line(s), ₹${result.nc_reversed.value.toFixed(2)} back on the bill)`, Audit_log_category.Bill, {
 					scope: "bill", reversal: true, bill_id: result.bill.id, bill_no: result.bill.bill_no,

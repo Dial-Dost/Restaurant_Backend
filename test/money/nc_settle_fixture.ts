@@ -21,6 +21,13 @@
 //
 // WHAT IT DOES NOT MODEL: SQL. Each branch re-implements what its statement does
 // to these rows, and says which predicate it relies on with requireShape.
+//
+// ALSO DRIVEN THROUGH IT, because they meet an NC table: the items-split writer
+// (UpdateOrderItemsSplit — its guarded write is modelled predicate by
+// predicate), the admin remove-item path, and the settled-bill read
+// (GetClosedBill) of an NC bill with its settlement.
+
+import { ncFlagSignature } from "../../nc_settle";
 
 export const RES_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
 export const OUTLET_ID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
@@ -119,6 +126,13 @@ export interface NcFixtureState {
   leak_after_comp?: number;
   /** The payment_config the settle paths resolve modes against. */
   payment_config?: unknown;
+  /** Audit_logs rows the settled-bill read looks for (the settle's would-have-charged figure). */
+  audit?: { action_id: string; bill_id: string; scope: string; would_have_charged: number | null; created_at: string }[];
+  /**
+   * Runs once, right after the items-split writer has READ its order — the
+   * window in which a concurrent settle or comp can commit before it writes.
+   */
+  after_split_read?: (() => void) | null;
 }
 
 export function makeState(over: Partial<NcFixtureState> = {}): NcFixtureState {
@@ -288,6 +302,99 @@ export function fixtureQuery(sql: string, params: unknown[] = []): { rows: unkno
       return { food: f, status: o.status };
     }) };
   }
+  // --- the items-split writer (UpdateOrderItemsSplit) -------------------------
+  if (/^select food, table_id from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = s.orders.find((x) => x.id === params[0]);
+    const rows = o ? [{ food: clone(foodOf(o)), table_id: TABLE_ID }] : [];
+    const hook = s.after_split_read;
+    if (hook) { s.after_split_read = null; hook(); }
+    return { rows };
+  }
+  if (/^select column_name from information_schema\.columns where table_schema = 'public' and table_name = 'Orders' and column_name = 'barked_at'$/i.test(q)) {
+    return { rows: [{ column_name: "barked_at" }] };
+  }
+  if (/^select barked_at from "Orders" where id = \$1 and res_id = \$2 and outlet_id = \$3 limit 1$/i.test(q)) {
+    const o = s.orders.find((x) => x.id === params[0]);
+    return { rows: o ? [{ barked_at: new Date("2026-09-16T09:00:00Z") }] : [] };
+  }
+  if (/^update "Orders" set food = \$1::json, status = \$2 where id = \$3 and res_id = \$4 and outlet_id = \$5 /i.test(q)) {
+    // The guarded write: each predicate the statement names is applied here.
+    requireShape(q, "coalesce(status::text, '1') not in", "a settled or cancelled order is never rewritten");
+    requireShape(q, "coalesce(status::text, '1') <> '6'", "an order awaiting payment approval is frozen");
+    requireShape(q, "string_agg(coalesce(x ->> 'nc_id', ''), ',' order by coalesce(x ->> 'nc_id', '') collate \"C\")", "the comps it was built on are the comps still there");
+    requireShape(q, "where x -> 'nc' = 'true'::jsonb", "only a real boolean flag is a comp (isNonChargeableLine)");
+    requireShape(q, "returning id", "a write that matched nothing must be seen");
+    const o = s.orders.find((x) => x.id === params[2]);
+    if (!o || !STILL_OWES(o.status) || o.status === 6 || ncFlagSignature(o.items) !== params[5]) {return { rows: [] };}
+    const f = JSON.parse(String(params[0])) as Record<string, unknown>;
+    o.items = f.items as NcFixtureLine[];
+    o.items_split = (f.items_split as [string, NcFixtureLine[]][] | undefined) ?? undefined;
+    o.subtotal = Number(f.subtotal);
+    o.total = Number(f.total);
+    o.nc_subtotal = typeof f.nc_subtotal === "number" ? f.nc_subtotal : undefined;
+    o.status = Number(params[1]);
+    return { rows: [{ id: o.id }] };
+  }
+
+  // --- the admin remove-item path (RemoveBillItem) ---------------------------
+  if (/^select id from "Tables" where res_id = \$1 and outlet_id = \$2 and lower\(table_name\) = lower\(\$3\)/i.test(q)) {
+    return { rows: String(params[2]).toLowerCase() === s.table.name.toLowerCase() ? [{ id: TABLE_ID }] : [] };
+  }
+  if (/^select admin_approved_at from "Bills" where table_id = \$1 and res_id = \$2 and outlet_id = \$3 and closed_at is null/i.test(q)) {
+    const b = [...s.bills].filter((x) => x.closed_at === null).sort((a, z) => z.created_at.localeCompare(a.created_at))[0];
+    return { rows: b ? [{ admin_approved_at: b.admin_approved_at }] : [] };
+  }
+  if (/^select id, food from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and .* order by created_at asc$/i.test(q)) {
+    requireShape(q, "coalesce(status::text, '1') not in", "only the orders that still owe lose a line");
+    return { rows: s.orders.filter((o) => STILL_OWES(o.status)).map((o) => ({ id: o.id, food: clone(foodOf(o)) })) };
+  }
+  if (/^update "Bills" set total_amt = \$1, round_off = null where id = \$2 and res_id = \$3 and outlet_id = \$4$/i.test(q)) {
+    const b = s.bills.find((x) => x.id === params[1]);
+    if (b) { b.total_amt = Number(params[0]); b.round_off = null; }
+    return { rows: [] };
+  }
+
+  // --- the settled-bill read (GetClosedBill) ---------------------------------
+  if (/^select b\.id, b\.bill_no, b\.status, b\.reason, b\.table_id, t\.table_name,/i.test(q)) {
+    requireShape(q, "where b.id = $1", "the detail reads ONE bill");
+    const b = s.bills.find((x) => x.id === params[0]);
+    return { rows: b ? [{
+      id: b.id, bill_no: String(b.bill_no), status: b.status, reason: null, table_id: b.table_id, table_name: s.table.name,
+      total_amt: b.total_amt, tax_breakdown: b.tax_breakdown, round_off: b.round_off, payment_method: b.payment_method,
+      payment_splits: b.payment_splits, payment_proof_screenshot_url: b.payment_proof_screenshot_url,
+      discount_type: b.discount_type, discount_value: b.discount_value, discount_applied_at: null, coupon_code: b.coupon_code,
+      waiter_confirmed_at: b.waiter_confirmed_at ? new Date(b.waiter_confirmed_at) : null,
+      waiter_confirmed_by_username: b.waiter_confirmed_by_username,
+      admin_approved_at: b.admin_approved_at ? new Date(b.admin_approved_at) : null,
+      admin_approved_by_username: b.admin_approved_by_username,
+      closed_at: b.closed_at ? new Date(b.closed_at) : null, closed_by_username: b.closed_by_username,
+      refunded_at: null, refunded_by_username: null, refund_amount: 0, refund_reason: null, refund_ref: null,
+      created_at: new Date(b.created_at), created_by_fname: "Cashier", created_by_lname: "One",
+      session_covers: 4, seated_at: null, left_at: null,
+    }] : [] };
+  }
+  if (/^select id, created_at, status, food from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and coalesce\(status::text, '1'\) = any\(\$4::text\[\]\)/i.test(q)) {
+    // The session window is not modelled: the fixture holds one session.
+    const codes = (params[3] as string[]).map(String);
+    return { rows: s.orders.filter((o) => codes.includes(String(o.status)))
+      .map((o) => ({ id: o.id, created_at: new Date(o.created_at), status: String(o.status), food: clone(foodOf(o)) })) };
+  }
+  if (/from information_schema\.columns/i.test(q) && /'customer_gstin'/i.test(q)) {return { rows: [] };}
+  if (/^select nc_kind, authorised_by_username, marked_by_username, reason, value, scope from "OrderItemNonChargeable"/i.test(q)) {
+    requireShape(q, "reversed_at is null", "a reversed comp is not part of the settlement");
+    requireShape(q, "(bill_id = $2 or order_id = any($3::uuid[]))", "the bill's own rows AND its orders' item comps");
+    const ids = params[2] as string[];
+    return { rows: s.nc.filter((r) => r.reversed_at === null && (r.bill_id === params[1] || ids.includes(r.order_id)))
+      .map((r) => ({ ...ncRowOut(r), scope: r.scope })) };
+  }
+  if (/^select additional_details->>'would_have_charged' as v from "Audit_logs"/i.test(q)) {
+    requireShape(q, "additional_details->>'scope' = 'bill'", "only the settle's own line carries the figure");
+    const hit = (s.audit ?? [])
+      .filter((a) => a.action_id === params[1] && a.bill_id === params[2] && a.scope === "bill")
+      .sort((a, z) => z.created_at.localeCompare(a.created_at))[0];
+    return { rows: hit ? [{ v: hit.would_have_charged === null ? null : String(hit.would_have_charged) }] : [] };
+  }
+
   if (/^select count\(\*\)::int as n from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and /i.test(q)) {
     return { rows: [{ n: s.orders.filter((o) => STILL_OWES(o.status)).length }] };
   }
@@ -529,4 +636,4 @@ interface FixtureGlobal {
 }
 (globalThis as unknown as FixtureGlobal).__ncFixtureQuery = fixtureQuery;
 
-export { requireShape, foodOf, STILL_OWES, nowIso, ncRowOut };
+export { requireShape, foodOf, STILL_OWES, nowIso, ncRowOut, clone };

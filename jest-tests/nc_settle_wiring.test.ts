@@ -128,12 +128,56 @@ describe("the other paths that meet an NC bill are wired", () => {
     const reopen = chunk(DB, "ReopenBill");
     expect(reopen).toMatch(/await reverseBillScopeNonChargeables\(/);
     expect(BILLS).toMatch(/ReopenBill\(restaurantId, billId, extractEmployeeId\(req\), extractEmployeeUsername\(req\)\)/);
-    expect(BILLS).toMatch(/if \(result\.nc_reversed\) \{/);
+    // …and says so only when a settle's comps were actually undone.
+    expect(reopen).toMatch(/\.\.\.\(wasNc && ncReversed && ncReversed\.lines > 0 \? \{ nc_reversed: ncReversed \} : \{\}\)/);
+    expect(BILLS).toMatch(/if \(result\.nc_reversed && result\.nc_reversed\.lines > 0\) \{/);
   });
 
   test("the closed bill carries the NC flag per line and the settlement", () => {
     expect(chunk(DB, "aggregateClosedBillOrders")).toMatch(/\$\{nc \? "@@nc" : ""\}/);
     expect(chunk(DB, "GetClosedBill")).toMatch(/nc_settlement: ncSettlement/);
+  });
+
+  test("the ticket drill-down marks a comped line, as the bill drill-down does", () => {
+    expect(chunk(DB, "GetMisOrderDetail")).toMatch(/\.\.\.\(isNonChargeableLine\(it\) \? \{ nc: true as const \} : \{\}\)/);
+  });
+});
+
+describe("the writers that rewrite an order price chargeable lines, and keep the server's comps", () => {
+  const split = chunk(DB, "UpdateOrderItemsSplit");
+
+  test("the items-split writer strips and carries the comps BEFORE it prices or gates anything", () => {
+    const carry = split.indexOf("carryServerNonChargeable(");
+    expect(carry).toBeGreaterThan(-1);
+    expect(split).toMatch(/if \(carried\.refusal\) \{throw new Error\(carried\.refusal\);\}/);
+    expect(split).toMatch(/const flattened = safeSplit\.flatMap\(/);
+    // Nothing reads the client's payload once the carry has answered.
+    const after = split.indexOf("const safeSplit = carried.split");
+    expect(after).toBeGreaterThan(carry);
+    expect(split.slice(after)).not.toMatch(/\bitems_split\b(?!:)/);
+    expect(split.indexOf("const repricedSubtotal = chargeableSubtotal(moneyLines);")).toBeGreaterThan(carry);
+    expect(split.indexOf("const nextChargeable = chargeableOf(flattened as unknown[]);")).toBeGreaterThan(carry);
+    expect(split).toMatch(/items_split: safeSplit,/);
+    expect(split).toMatch(/\.\.\.\(repricedNc > 0 \? \{ nc_subtotal: repricedNc \} : \{\}\),/);
+  });
+
+  test("its write is guarded by the state it was built on, and a miss is said, never swallowed", () => {
+    expect(split).toMatch(/and \$\{stillOwesStatusSql\(\)\}\n\s+and coalesce\(status::text, '1'\) <> '6'/);
+    expect(split).toMatch(/\), ''\) = \$6\n\s+returning id`/);
+    expect(split).toMatch(/ncFlagSignature\(previousLines\)\],/);
+    expect(split).toMatch(/if \(!written\[0\]\) \{/);
+  });
+
+  test("the admin remove-item path skips comped lines when it prices", () => {
+    const remove = chunk(DB, "removeItemFromTableOrders");
+    expect(remove).toMatch(/keep\.reduce\(\(s, it\) => \(isNonChargeableLine\(it\)\n\s+\? s/);
+    expect(remove).toMatch(/const ncLeft = nonChargeableValue\(keep\);/);
+  });
+
+  test("the settle checks the till's STORED quote and re-prices every owing order that has lines", () => {
+    const settle = chunk(DB, "SettleBillAsNonChargeable");
+    expect(settle).toMatch(/quoted_subtotal: activeOrderSubtotal\(owing\)\.subtotal,/);
+    expect(settle).toMatch(/if \(mine\.length === 0\) \{\n\s+if \(o\.lines\.items\.length > 0\) \{/);
   });
 });
 

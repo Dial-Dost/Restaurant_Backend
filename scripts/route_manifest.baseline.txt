@@ -302,7 +302,7 @@ mw08 USE     *                                                      | <inline(re
 0280 POST    /print/bill/split                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | abe7b4e0
 0281 POST    /bills/merge                                           | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMerge) | 32bf4db8
 0282 POST    /bills/refund                                          | validateBody(sBillRefund)                      | d2089aa7
-0283 POST    /bills/:id/reopen                                      | validate                                       | 6fbeb423
+0283 POST    /bills/:id/reopen                                      | validate                                       | c25d6925
 0284 PUT     /restaurant/profile                                    | validateAction("60d14e9c-45cc-4dc2-b017-56058cc3ae33") | a752571b
 0285 GET     /outlets                                               | validate                                       | 4e4ae9d9
 0286 GET     /outlets/rollup                                        | validateAction(OUTLET_ADMIN_PERM)              | dc7026a0

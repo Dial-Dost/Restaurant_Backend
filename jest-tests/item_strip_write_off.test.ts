@@ -136,7 +136,8 @@ jest.mock("pg", () => {
     if (/^update "Orders" set food = \$1::json, status = \$2/i.test(q)) {
       const p = (params ?? []) as unknown[];
       fx.writes.push({ food: String(p[0]), status: Number(p[1]) });
-      return { rows: [] };
+      // The write is guarded and says whether it landed; this order is live.
+      return { rows: [{ id: p[2] }] };
     }
     return { rows: [] };
   };

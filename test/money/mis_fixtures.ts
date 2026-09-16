@@ -1259,15 +1259,18 @@ function dispatch(q: string, params: unknown[]): unknown[] {
     const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
     return o ? [{ barked_at: new Date(o.created_at) }] : [];
   }
-  if (/^update "Orders" set food = \$1::json, status = \$2 where id = \$3 and res_id = \$4 and outlet_id = \$5$/i.test(q)) {
+  // The write is GUARDED (it lands only on an order that still owes, is not
+  // awaiting approval, and carries the comps it was built from) and says whether
+  // it landed. These orders carry no comps, so the comp guard is the empty one.
+  if (/^update "Orders" set food = \$1::json, status = \$2 where id = \$3 and res_id = \$4 and outlet_id = \$5 and /i.test(q)) {
     const o = d.orders.find((x) => x.id === params[2] && resOf(x) === params[3] && outletOf(x) === params[4]);
-    if (!o) {return [];}
+    if (!o || [4, 5, 6, 7].includes(Number(o.status ?? 1)) || params[5] !== "") {return [];}
     const food = JSON.parse(String(params[0])) as Record<string, unknown>;
     o.items = Array.isArray(food.items) ? (food.items as FixtureOrderItem[]) : [];
     o.removed_items = Array.isArray(food.removed_items) ? (food.removed_items as FixtureOrderItem[]) : undefined;
     o.emptied_by = typeof food.emptied_by === "string" ? food.emptied_by : undefined;
     o.status = Number(params[1]);
-    return [];
+    return [{ id: o.id }];
   }
 
   // --- RunExceptionChecks: the void-streak alert ---

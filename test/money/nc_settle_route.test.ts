@@ -356,3 +356,48 @@ describe("a settled NC bill: the record and the paper", () => {
     expect(called("GetClosedBill")).toEqual([]);
   });
 });
+
+describe("the settled reprint reads the settlement back off the bill (POST /print/bill/settled passes no override)", () => {
+  const settings = { currency: "₹", bill_paper_width: "80mm", timezone: "Asia/Kolkata" } as never;
+  const profile = { outlet_name: "Gaia", outlet_add: null, outlet_phone: null } as never;
+  const reprint = async (patch: Record<string, unknown>, override?: { settlement: null }): Promise<string> => {
+    const { settledBillReceiptOptions } = await import("../../routes/bills");
+    const { buildReceiptBase64 } = await import("../../escpos");
+    const db = await import("../../database_supabase");
+    const bill = { ...(await db.GetClosedBill("res-1", BILL))!, ...patch };
+    const options = settledBillReceiptOptions(bill, { settings, profile, logo: null, reprint: true, ...(override ?? {}) });
+    return Buffer.from(buildReceiptBase64(options, 48), "base64").toString("latin1");
+  };
+  const settlement = {
+    kind: "complimentary", kind_label: "Complimentary", authorised_by: "manager01", marked_by: "cashier1",
+    reason: "Owner's family", lines: 2, value: 1400, would_have_charged: 1624,
+  };
+
+  test("an NC bill's reprint: the REPRINT banner, the dishes at 0.00, the settlement and who authorised it", async () => {
+    const paper = await reprint({ nc_settlement: settlement });
+    expect(paper).toContain("REPRINT");
+    expect(paper).toMatch(/Thali \(NC\)\s+3\s+400\.00\s+0\.00/);
+    expect(paper).toMatch(/Lassi \(NC\)\s+2\s+100\.00\s+0\.00/);
+    expect(paper).toMatch(/Grand Total\s+Rs 0\.00/);
+    expect(paper).toMatch(/NC value \(not charged\)\s+1400\.00/);
+    expect(paper).toContain("Settled: Non-chargeable - Complimentary");
+    expect(paper).toContain("Authorised by: manager01");
+    expect(paper).toMatch(/Would have been \(incl\. tax\)\s+1624\.00/);
+  });
+
+  test("an unknown would-have figure prints no line; a bill with no settlement prints no block", async () => {
+    const unknown = await reprint({ nc_settlement: { ...settlement, would_have_charged: null } });
+    expect(unknown).toContain("Settled: Non-chargeable - Complimentary");
+    expect(unknown).not.toContain("Would have been");
+    const paid = await reprint({ payment_method: "Cash", nc_settlement: null });
+    expect(paid).not.toContain("Settled: Non-chargeable");
+    expect(paid).not.toContain("Authorised by:");
+    // The comped lines still print as comps.
+    expect(paid).toMatch(/Thali \(NC\)\s+3\s+400\.00\s+0\.00/);
+  });
+
+  test("an explicit override wins over the bill's own settlement", async () => {
+    const paper = await reprint({ nc_settlement: settlement }, { settlement: null });
+    expect(paper).not.toContain("Settled: Non-chargeable");
+  });
+});

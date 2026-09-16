@@ -77,10 +77,12 @@ export interface NcPlan {
   /** Every line on the still-owing orders, comped or not. 0 = nothing on the table. */
   line_count: number;
   /**
-   * The chargeable pre-tax subtotal BEFORE the NC, per order exactly as
-   * repriceOrderFood stores it and summed. It is what the till was quoting, and
-   * it is what `expected_value` is checked against — never the sum of the rows,
-   * which can differ by a paisa on a weighed (fractional) line.
+   * The chargeable pre-tax subtotal BEFORE the NC, RE-DERIVED FROM THE LINES
+   * per order exactly as repriceOrderFood would store it, and summed — never the
+   * sum of the rows, which can differ by a paisa on a weighed (fractional) line.
+   * It prices the would-have-charged figure. It is NOT the quote the manager
+   * saw: that is the orders' STORED figure (NcSettleFacts.quoted_subtotal), and
+   * the two part company on an order a writer priced over its comped lines.
    */
   chargeable_subtotal: number;
   /** Σ value of the lines this NC will comp. */
@@ -176,7 +178,18 @@ export interface NcSettleFacts {
   discount_value: number;
   coupon_code: string | null;
   loyalty_redeemed: boolean;
-  plan: Pick<NcPlan, "held" | "negative" | "line_count" | "chargeable_subtotal">;
+  plan: Pick<NcPlan, "held" | "negative" | "line_count" | "value_to_comp" | "already_comped">;
+  /**
+   * What the till IS quoting now: the still-owing orders' STORED subtotals,
+   * reduced exactly as the open bill reduces them (activeOrderSubtotal). Both
+   * clients send the open bill's `subtotal` as `expected_value`, so this — and
+   * not a figure re-derived from the lines — is the one it can be compared
+   * with. An order whose stored figure was written over its comped lines (the
+   * items-split writer did that before it priced chargeable lines only) quotes
+   * more than its lines say; comparing against the lines refused that table on
+   * every attempt, with the dialog re-reading the same figure each time.
+   */
+  quoted_subtotal: number;
   /** What the till was quoting when the manager pressed the button. Absent = not checked. */
   expected_value: number | null;
 }
@@ -203,9 +216,13 @@ function nameList(lines: readonly { name: string }[]): string {
  *   3. course-held lines never fired — comping them records food that was never
  *      served as given away.
  *   4. a negative-priced line, which no comp can bring to zero.
- *   5. nothing on the table at all.
- *   6. the quote moved: the chargeable subtotal is not the one the manager saw,
- *      compared in whole paisa.
+ *   5. nothing given away at all: an empty table, or one whose only lines are
+ *      free (a ₹0 water). An NC bill with no NC value would still count as an
+ *      NC bill in every report, for nothing. A table whose every dish was
+ *      ALREADY comped is not this — something was given away, and it closes
+ *      here at 0.00.
+ *   6. the quote moved: the subtotal the till quotes now is not the one the
+ *      manager saw, compared in whole paisa.
  */
 export function ncSettleRefusal(f: NcSettleFacts): NcSettleRefusal | null {
   if (f.payment_pending) {
@@ -241,14 +258,15 @@ export function ncSettleRefusal(f: NcSettleFacts): NcSettleRefusal | null {
       error: `${nameList(f.plan.negative)} ${f.plan.negative.length === 1 ? "has" : "have"} a price below zero, which a comp cannot clear. Remove ${f.plan.negative.length === 1 ? "it" : "them"} first.`,
     };
   }
-  if (f.plan.line_count === 0) {
+  const givesNothing = Math.round(f.plan.value_to_comp * 100) === 0 && Math.round(f.plan.already_comped * 100) === 0;
+  if (f.plan.line_count === 0 || givesNothing) {
     return { status: 400, code: "nothing_to_settle", error: "There is nothing on this table to settle." };
   }
   if (f.expected_value !== null && Number.isFinite(f.expected_value)
-    && Math.round(f.expected_value * 100) !== Math.round(f.plan.chargeable_subtotal * 100)) {
+    && Math.round(f.expected_value * 100) !== Math.round(f.quoted_subtotal * 100)) {
     return {
       status: 400, code: "quote_moved",
-      error: `The bill changed while you were deciding: its food now comes to ${rupees(f.plan.chargeable_subtotal)}, not ${rupees(f.expected_value)}. Check it and settle again.`,
+      error: `The bill changed while you were deciding: its food now comes to ${rupees(f.quoted_subtotal)}, not ${rupees(f.expected_value)}. Check it and settle again.`,
     };
   }
   return null;
@@ -363,4 +381,140 @@ export function ncKindLabel(kind: unknown): string {
   if (NC_KIND_LABELS[k]) {return NC_KIND_LABELS[k];}
   const s = k.replace(/[_-]+/g, " ").trim();
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
+}
+
+// ============================================================================
+// THE NC FLAGS ACROSS AN EVERYDAY REWRITE (UpdateOrderItemsSplit)
+// ============================================================================
+//
+// The items-split writer — the web orders-page drag, DELETE
+// /orders/:id/items/:itemId and POST /orders/:id/items — stores a whole new line
+// list. It used to store the CLIENT's copy of every line, nc keys and all, and
+// price it over every line, comped ones included. Two things followed:
+//
+//   * the order's stored subtotal charged the comped dish again, so the table's
+//     bill (and the quote a Settle as NC is checked against) disagreed with its
+//     own lines;
+//   * the nc flag was whatever the payload said. A payload that dropped it
+//     re-charged a dish the ledger still says was given away, and one that
+//     ADDED it — once the writer prices chargeable lines only — would be a comp
+//     with no reason, no authoriser and no ledger row.
+//
+// So the flag is SERVER-OWNED on this path too, exactly as AddOrder treats it
+// (stripClientNonChargeable): every client key is removed, and a stored comp is
+// carried onto the line that is still that line.
+//
+//   1. BY ECHO. A line that carries the stored comp's own nc_id, and still has
+//      the comped line's id, price and quantity, gets the stored flag back. The
+//      nc_id is only a pointer here — the flag, the id and the kind written are
+//      the stored ones, and each stored comp is carried onto one line at most.
+//      A line that echoes a comp but has a different price or quantity is a
+//      change to a comped dish, and it is refused: keeping the flag would give
+//      away more (or less) than the ledger row says, and dropping it would
+//      charge for a dish the ledger says was free.
+//   2. BY PLACE, for a payload that echoes nothing (a stale tab, a client that
+//      never read the keys). When the payload still holds every line the order
+//      had under that id, the comped line is among them, so the comp goes onto
+//      the first un-flagged line with the same id, price and quantity — the same
+//      money whichever of two identical lines carries it. None matching is the
+//      same refusal as above.
+//   3. Otherwise the comped line was REMOVED (fewer lines under its id than the
+//      order had), and it leaves with its flag, as it always has.
+//
+// A comp is never created here: a line the order did not have comped cannot
+// come out of this function comped.
+
+/** The keys that decide whether a guest is charged for a line. Server-owned. */
+const NC_LINE_KEYS = ["nc", "nc_id", "nc_kind"] as const;
+
+type LineObject = Record<string, unknown>;
+
+const isLineObject = (v: unknown): v is LineObject => typeof v === "object" && v !== null && !Array.isArray(v);
+
+const lineIdOf = (line: LineObject): string => String(line.id ?? "").trim();
+
+const samePriceAndQuantity = (a: LineObject, b: LineObject): boolean =>
+  Math.round(orderLinePrice(a) * 100) === Math.round(orderLinePrice(b) * 100)
+  && Math.abs(orderLineQuantity(a) - orderLineQuantity(b)) < 1e-9;
+
+/**
+ * Carry the stored comps onto a client-supplied items_split. `stored` is the
+ * order's lines as they are in the database; `split` is the payload. Returns the
+ * split to store (client nc keys gone, stored comps re-applied) or the sentence
+ * that refuses the write. Non-mutating.
+ */
+export function carryServerNonChargeable(
+  stored: readonly unknown[],
+  split: readonly unknown[],
+): { split: unknown[]; refusal: string | null } {
+  // The payload, stripped. A tuple that is not [label, lines[]] passes through
+  // untouched, as AddOrder passes it: this path tolerates legacy shapes.
+  const lines: { line: LineObject; hint: string; flagged: boolean }[] = [];
+  const next = split.map((t) => {
+    if (!Array.isArray(t) || !Array.isArray(t[1])) {return t;}
+    const arr = (t[1] as unknown[]).map((raw) => {
+      if (!isLineObject(raw)) {return raw;}
+      const copy: LineObject = { ...raw };
+      for (const k of NC_LINE_KEYS) {delete copy[k];}
+      lines.push({ line: copy, hint: typeof raw.nc_id === "string" ? raw.nc_id.trim() : "", flagged: false });
+      return copy;
+    });
+    return [t[0], arr, ...t.slice(2)];
+  });
+
+  const storedLines = stored.filter(isLineObject);
+  const comps = storedLines
+    .filter((l) => isNonChargeableLine(l))
+    .map((l) => ({ line: l, nc_id: String(l.nc_id ?? "").trim(), id: lineIdOf(l), used: false }));
+  const carry = (target: { line: LineObject; flagged: boolean }, comp: (typeof comps)[number]): void => {
+    target.line.nc = true;
+    if (comp.line.nc_id !== undefined) {target.line.nc_id = comp.line.nc_id;}
+    if (comp.line.nc_kind !== undefined) {target.line.nc_kind = comp.line.nc_kind;}
+    target.flagged = true;
+    comp.used = true;
+  };
+  const changed = (comp: (typeof comps)[number]): string =>
+    `${String(comp.line.name ?? "A dish")} is comped as non-chargeable, and this change would alter it. Undo the comp first, or refresh the order and try again.`;
+
+  // 1. By echo.
+  for (const target of lines) {
+    if (!target.hint) {continue;}
+    const comp = comps.find((c) => !c.used && c.nc_id !== "" && c.nc_id === target.hint);
+    if (!comp) {continue;}
+    if (lineIdOf(target.line) !== comp.id || !samePriceAndQuantity(target.line, comp.line)) {
+      return { split: next, refusal: changed(comp) };
+    }
+    carry(target, comp);
+  }
+
+  // 2. By place, only where no line under that id was removed.
+  for (const comp of comps) {
+    if (comp.used || comp.id === "") {continue;}
+    const had = storedLines.filter((l) => lineIdOf(l) === comp.id).length;
+    const sameId = lines.filter((l) => lineIdOf(l.line) === comp.id);
+    if (sameId.length < had) {continue;} // 3. removed
+    const target = sameId.find((l) => !l.flagged && samePriceAndQuantity(l.line, comp.line));
+    if (!target) {return { split: next, refusal: changed(comp) };}
+    carry(target, comp);
+  }
+  return { split: next, refusal: null };
+}
+
+/**
+ * The set of live comps on a line list, as one comparable string: the nc_id of
+ * every comped line, sorted by code unit and joined with commas.
+ *
+ * UpdateOrderItemsSplit writes only while the stored order still has THIS
+ * signature — the comps it carried are the comps that are there. Its SQL
+ * computes the same string (`collate "C"` is the code-unit order), so a comp,
+ * a reversal or a Settle as NC committed between its read and its write makes
+ * the write match nothing instead of overwriting them.
+ */
+export function ncFlagSignature(lines: readonly unknown[]): string {
+  return lines
+    .filter(isLineObject)
+    .filter((l) => isNonChargeableLine(l))
+    .map((l) => (l.nc_id === undefined || l.nc_id === null ? "" : String(l.nc_id)))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    .join(",");
 }

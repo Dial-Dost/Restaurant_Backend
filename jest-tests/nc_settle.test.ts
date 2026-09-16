@@ -7,8 +7,10 @@ import {
   NC_BILL_METHOD,
   NC_WHOLE_BILL_ONLY,
   applyBillNonChargeable,
+  carryServerNonChargeable,
   describeNcSettlement,
   isNcBillMethod,
+  ncFlagSignature,
   ncKindLabel,
   ncSettleRefusal,
   planBillNonChargeable,
@@ -94,7 +96,8 @@ describe("ncSettleRefusal — the order is the control", () => {
   const ok: NcSettleFacts = {
     payment_pending: false, live_tender_count: 0, live_tender_total: 0,
     discount_value: 0, coupon_code: null, loyalty_redeemed: false,
-    plan: { held: [], negative: [], line_count: 2, chargeable_subtotal: 725.75 },
+    plan: { held: [], negative: [], line_count: 2, value_to_comp: 725.75, already_comped: 0 },
+    quoted_subtotal: 725.75,
     expected_value: 725.75,
   };
   const code = (over: Partial<NcSettleFacts>): string | null => ncSettleRefusal({ ...ok, ...over })?.code ?? null;
@@ -112,6 +115,31 @@ describe("ncSettleRefusal — the order is the control", () => {
     expect(code({ plan: { ...ok.plan, line_count: 0 }, expected_value: 1 })).toBe("nothing_to_settle");
     expect(code({ expected_value: 725.74 })).toBe("quote_moved");
     expect(code({ coupon_code: "   " })).toBeNull();
+  });
+
+  test("nothing given away is nothing to settle: an empty table, or only free lines", () => {
+    // A table holding only a ₹0 water: lines, but no value to comp and none comped.
+    const free = { ...ok.plan, line_count: 1, value_to_comp: 0 };
+    expect(code({ plan: free, quoted_subtotal: 0, expected_value: 0 })).toBe("nothing_to_settle");
+    expect(ncSettleRefusal({ ...ok, plan: free, quoted_subtotal: 0, expected_value: 0 })).toEqual({
+      status: 400, code: "nothing_to_settle", error: "There is nothing on this table to settle.",
+    });
+    expect(code({ plan: { ...free, value_to_comp: 0.004 }, quoted_subtotal: 0, expected_value: 0 })).toBe("nothing_to_settle");
+    // Every dish already comped one by one: something WAS given away — it settles.
+    expect(code({ plan: { ...free, already_comped: 240 }, quoted_subtotal: 0, expected_value: 0 })).toBeNull();
+    // A paisa to comp is something.
+    expect(code({ plan: { ...free, value_to_comp: 0.01 }, quoted_subtotal: 0.01, expected_value: 0.01 })).toBeNull();
+  });
+
+  test("the quote is checked against what the till QUOTES (the stored figures), not the lines", () => {
+    // An order stored at 590 over a comped 240 (the old items-split pricing):
+    // the till shows 590, the lines say 350. The till's figure is the one sent.
+    const stale: Partial<NcSettleFacts> = { plan: { ...ok.plan, value_to_comp: 350, already_comped: 240 }, quoted_subtotal: 590 };
+    expect(code({ ...stale, expected_value: 590 })).toBeNull();
+    expect(ncSettleRefusal({ ...ok, ...stale, expected_value: 350 })).toMatchObject({
+      code: "quote_moved",
+      error: "The bill changed while you were deciding: its food now comes to ₹590.00, not ₹350.00. Check it and settle again.",
+    });
   });
 
   test("the quote is compared in whole paisa, and an absent quote is not checked", () => {
@@ -156,6 +184,100 @@ describe("applyBillNonChargeable — flags by position, and the split by the id 
     expect(items[0]).toEqual({ id: "x", name: "Roti", price: 30, quantity: 2 });
     expect(chargeableSubtotal(next.items)).toBe(0);
     expect(nonChargeableValue(next.items)).toBe(80);
+  });
+});
+
+describe("carryServerNonChargeable — the items-split writer cannot comp, or un-comp, a dish", () => {
+  const paneer = { id: "p", name: "Paneer Tikka", price: 350, quantity: 1 };
+  const jamun = { id: "j", name: "Gulab Jamun", price: 120, quantity: 2, nc: true, nc_id: "nc-1", nc_kind: "complimentary" };
+  const bare = { id: "j", name: "Gulab Jamun", price: 120, quantity: 2 };
+  const stored = [paneer, jamun];
+  const lines = (out: { split: unknown[] }): Record<string, unknown>[] =>
+    out.split.flatMap((t) => (Array.isArray(t) && Array.isArray(t[1]) ? t[1] as Record<string, unknown>[] : []));
+
+  test("a drag that echoes the server's lines keeps the comp — the STORED flag, kind and id", () => {
+    const out = carryServerNonChargeable(stored, [
+      ["Served", [{ ...jamun, nc_kind: "promo" }]],
+      ["Preparing", [{ ...paneer, nc: false, nc_id: null, nc_kind: null }]],
+    ]);
+    expect(out.refusal).toBeNull();
+    expect(out.split).toEqual([
+      ["Served", [{ id: "j", name: "Gulab Jamun", price: 120, quantity: 2, nc: true, nc_id: "nc-1", nc_kind: "complimentary" }]],
+      ["Preparing", [{ id: "p", name: "Paneer Tikka", price: 350, quantity: 1 }]],
+    ]);
+    expect(chargeableSubtotal(lines(out))).toBe(350);
+    expect(nonChargeableValue(lines(out))).toBe(240);
+  });
+
+  test("a payload cannot comp a dish: a forged flag, or a forged pointer, is stripped", () => {
+    const forged = carryServerNonChargeable(stored, [["Served", [
+      { ...paneer, nc: true, nc_id: "forged", nc_kind: "complimentary" },
+      jamun,
+    ]]]);
+    expect(forged.refusal).toBeNull();
+    expect(lines(forged)[0]).toEqual(paneer);
+    // Pointing at the real comp from the wrong line changes a comped dish: refused.
+    const pointed = carryServerNonChargeable(stored, [["Served", [{ ...paneer, nc_id: "nc-1" }, jamun]]]);
+    expect(pointed.refusal).toBe("Gulab Jamun is comped as non-chargeable, and this change would alter it. Undo the comp first, or refresh the order and try again.");
+    // A comp that is not stored at all is never created, whatever the payload says.
+    const none = carryServerNonChargeable([paneer], [["Served", [{ ...paneer, nc: true, nc_id: "x" }]]]);
+    expect(lines(none)).toEqual([paneer]);
+    expect(chargeableSubtotal(lines(none))).toBe(350);
+  });
+
+  test("a stale payload (no nc keys) keeps the comp when every line under its id is still there", () => {
+    const out = carryServerNonChargeable(stored, [["Served", [paneer, bare]]]);
+    expect(out.refusal).toBeNull();
+    expect(lines(out)[1]).toEqual(jamun);
+    // Two identical lines under one id, one comped: the comp lands on one of them.
+    const pair = carryServerNonChargeable([jamun, bare], [["Served", [bare, bare]]]);
+    expect(lines(pair).filter((l) => l.nc === true)).toHaveLength(1);
+    expect(chargeableSubtotal(lines(pair))).toBe(240);
+  });
+
+  test("a comped line that was removed leaves with its flag (fewer lines under its id)", () => {
+    const out = carryServerNonChargeable([paneer, jamun, bare], [["Served", [paneer]], ["Preparing", [bare]]]);
+    expect(out.refusal).toBeNull();
+    expect(lines(out).some((l) => l.nc === true)).toBe(false);
+    expect(carryServerNonChargeable(stored, [["Served", [paneer]]]).refusal).toBeNull();
+  });
+
+  test("a comped line whose price or quantity changed is refused, echoed or not", () => {
+    expect(carryServerNonChargeable(stored, [["Served", [paneer, { ...jamun, quantity: 3 }]]]).refusal).toMatch(/^Gulab Jamun is comped/);
+    expect(carryServerNonChargeable(stored, [["Served", [paneer, { ...jamun, price: 100 }]]]).refusal).toMatch(/^Gulab Jamun is comped/);
+    expect(carryServerNonChargeable(stored, [["Served", [paneer, { ...bare, quantity: 1 }]]]).refusal).toMatch(/^Gulab Jamun is comped/);
+    // The same money in another spelling is the same line.
+    expect(carryServerNonChargeable(stored, [["Served", [paneer, { ...jamun, price: "120.00", quantity: "2" }]]]).refusal).toBeNull();
+  });
+
+  test("a reversed comp stays reversed: an old pointer is only a pointer", () => {
+    const out = carryServerNonChargeable([paneer, bare], [["Served", [paneer, jamun]]]);
+    expect(out.refusal).toBeNull();
+    expect(lines(out)[1]).toEqual(bare);
+  });
+
+  test("legacy shapes pass through; inputs are not touched", () => {
+    const payload: unknown[] = [["Served", [jamun, "not a line"]], "junk", ["Empty"]];
+    const before = JSON.stringify(payload);
+    const out = carryServerNonChargeable(stored, payload);
+    expect(out.split[1]).toBe("junk");
+    expect(out.split[2]).toEqual(["Empty"]);
+    expect((out.split[0] as unknown[])[1]).toEqual([jamun, "not a line"]);
+    expect(JSON.stringify(payload)).toBe(before);
+  });
+
+  test("ncFlagSignature: the comped lines' nc_ids, code-unit sorted — what the writer's SQL computes", () => {
+    expect(ncFlagSignature([])).toBe("");
+    expect(ncFlagSignature([paneer])).toBe("");
+    expect(ncFlagSignature([{ ...jamun, nc_id: "b-2" }, paneer, { ...jamun, nc_id: "B-1" }, { ...jamun, nc_id: "a-9" }]))
+      .toBe("B-1,a-9,b-2");
+    // A flag without a pointer still counts, as an empty entry; a string flag never does.
+    expect(ncFlagSignature([{ ...paneer, nc: true }, jamun, { ...paneer, nc: "true", nc_id: "z" }])).toBe(",nc-1");
+    expect(ncFlagSignature(["junk", null])).toBe("");
+    // The writer's SQL, run read-only on production Postgres over this exact
+    // list, answered ",B-1,b-2" — the same string, in the same order.
+    expect(ncFlagSignature([{ nc: true, nc_id: "b-2" }, { price: 1 }, { nc: true, nc_id: "B-1" }, { nc: "true", nc_id: "z" }, { nc: true }]))
+      .toBe(",B-1,b-2");
   });
 });
 
