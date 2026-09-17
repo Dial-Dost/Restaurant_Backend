@@ -576,7 +576,7 @@ export async function sendReportMessage(message: MailMessage, opts?: SendOptions
 		// Metadata only — never the body, never the address.
 		logger.info({
 			transport: "log",
-			to: addressTag(addr),
+			addr: addressTag(addr),
 			subjectChars: message.subject.length,
 			attachments: (message.attachments ?? []).map((a) => ({ filename: a.filename, bytes: Buffer.byteLength(a.content) })),
 			messageId: message.messageId ?? null,

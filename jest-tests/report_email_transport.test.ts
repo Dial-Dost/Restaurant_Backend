@@ -89,7 +89,8 @@ describe("MAIL_TRANSPORT picks exactly one transport, or says why none", () => {
   });
 
   test("the status says the NAME and whether it works — never a host, user, key or From", () => {
-    for (const e of [SMTP, RESEND, { MAIL_TRANSPORT: "log" }, {}]) {
+    const all: Record<string, string>[] = [SMTP, RESEND, { MAIL_TRANSPORT: "log" }, {}];
+    for (const e of all) {
       const status = mailTransportStatus(env(e));
       const json = JSON.stringify(status);
       for (const secret of ["smtp.example.test", "hunter2", "re_test_key", "reports@", "resend.invalid"]) {
