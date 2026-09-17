@@ -420,6 +420,7 @@ import { serviceClock, tableServiceClock, type ServiceClock } from "./service_cl
 export { serviceClock, tableServiceClock } from "./service_clock.js";
 export type { ServiceClock, ServiceClockInput } from "./service_clock.js";
 import { logger } from "./observability.js";
+import { GLANCE_FIGURE_KEYS, glanceDrill, glanceDrills, type GlanceDrill, type GlanceDrills } from "./glance_drill.js";
 import { normalizeRecipients } from "./mailer.js";
 
 /**
@@ -38858,6 +38859,34 @@ export interface HeadlineFigure {
   value: number;
   label: string;
   hint: string;
+  /**
+   * Where tapping it leads (client item 10) — glance_drill.ts. Additive: a 2.0.1
+   * client ignores it, and a newer client falls back to its own copy of the
+   * same table when an older backend leaves it out.
+   */
+  drill?: GlanceDrill;
+}
+
+/**
+ * TODAY'S LADDER, rung by rung — the Sales Summary's totals for today, from the
+ * same composeMisBills over the same bills, summed by the same addToLadder. What
+ * the net and gross sheets print between the two figures, so "net" and "gross"
+ * read as the steps that join them.
+ *
+ * NO COVERS, NO APC, NO ABV. This read nulls the seating (see the query), so a
+ * covers rung here would read 0 on a full restaurant and an APC would divide by
+ * it. Those live on the report the sheet jumps to.
+ */
+export interface HeadlineLadder {
+  bills: number;
+  item_total: number;
+  discount: number;
+  net: number;
+  service_charge: number;
+  tax: number;
+  round_off: number;
+  grand_total: number;
+  refund: number;
 }
 
 export interface OverviewHeadline {
@@ -38904,6 +38933,16 @@ export interface OverviewHeadline {
    * The Sales Summary's `nc_bills` / `nc_value` for today, by construction.
    */
   today_nc: HeadlineSection & { bills: number; value: number };
+  /** Today's rungs. net === today_net.value, grand_total === today_gross.value. */
+  today_ladder: HeadlineLadder;
+  /** How many of today's bills are behind the two Online figures. */
+  today_online_bills: number;
+  /**
+   * Where every other element of the box leads (glance_drill.ts): the header,
+   * the bill count, the three chips, the by-method label and each of its rows,
+   * the split note, the Unallocated warning, NC and the empty-day sentence.
+   */
+  drills: GlanceDrills;
 }
 
 /** A labelled group of rows on the headline card. */
@@ -38973,8 +39012,10 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   const composed = composeMisBills(rows, scPct, tz);
 
   let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0;
-  let todayBills = 0;
+  let todayBills = 0, onlineBills = 0;
   const todaySettled: SettlementBill[] = [];
+  // Today's rungs, on the Sales Summary's own accumulator (see HeadlineLadder).
+  const todayRungs = zeroLadder();
   for (let i = 0; i < composed.length; i += 1) {
     const b = composed[i];
     monthGross = round2(monthGross + b.money.grand_total);
@@ -38982,7 +39023,9 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     todayBills += 1;
     todayNet = round2(todayNet + b.money.net);
     todayGross = round2(todayGross + b.money.grand_total);
+    addToLadder(todayRungs, b.money);
     if (isOnlineChannel(rows[i].headline_channel)) {
+      onlineBills += 1;
       onlineNet = round2(onlineNet + b.money.net);
       onlineGross = round2(onlineGross + b.money.grand_total);
     }
@@ -39026,7 +39069,8 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   const labelOf = byMethod.rows.length > 0
     ? await paymentLabelsFor(context).catch(() => (m: string) => m)
     : (m: string) => m;
-  return {
+  const drillDay = { today, month_from: monthFrom };
+  const headline: OverviewHeadline = {
     today,
     month_from: monthFrom,
     timezone: tz,
@@ -39080,7 +39124,29 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
       bills: todayNcBills,
       value: todayNc.value,
     },
+    today_ladder: {
+      bills: todayRungs.bills,
+      item_total: todayRungs.item_total,
+      discount: todayRungs.discount,
+      net: todayRungs.net,
+      service_charge: todayRungs.service_charge,
+      tax: todayRungs.tax,
+      round_off: todayRungs.round_off,
+      grand_total: todayRungs.grand_total,
+      refund: todayRungs.refund,
+    },
+    today_online_bills: onlineBills,
+    // Filled in below, off the rows actually shipped.
+    drills: glanceDrills(drillDay, []),
   };
+  // WHERE EACH ELEMENT LEADS (client item 10). One row drill per mode the box
+  // actually shows, keyed by the stored id that row carries, and each figure
+  // carries its own so a client never maps a key it did not expect.
+  headline.drills = glanceDrills(drillDay, headline.today_by_method.map((r) => r.method));
+  for (const key of GLANCE_FIGURE_KEYS) {
+    headline[key] = { ...headline[key], drill: glanceDrill(key, drillDay) };
+  }
+  return headline;
 }
 
 // --- Drill-down --------------------------------------------------------------

@@ -350,6 +350,15 @@ describe("the headline figures define themselves", () => {
     expect(body).not.toMatch(/'dine_in','dinein'/);
   });
 
+  test("every element of the box ships where it leads (client item 10)", () => {
+    const body = fn();
+    expect(body).toMatch(/headline\.drills = glanceDrills\(drillDay, headline\.today_by_method\.map\(\(r\) => r\.method\)\)/);
+    expect(body).toMatch(/for \(const key of GLANCE_FIGURE_KEYS\) \{\s*headline\[key\] = \{ \.\.\.headline\[key\], drill: glanceDrill\(key, drillDay\) \};/);
+    // The ladder is the Sales Summary's own accumulator, over the same bills.
+    expect(body).toMatch(/addToLadder\(todayRungs, b\.money\)/);
+    expect(body).toContain("today_online_bills: onlineBills,");
+  });
+
   test("today_bills is carried, so an empty day is distinguishable from a zero one", () => {
     expect(fn()).toMatch(/today_bills/);
   });
