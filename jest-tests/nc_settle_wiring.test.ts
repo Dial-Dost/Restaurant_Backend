@@ -71,7 +71,10 @@ describe("migration 052's DDL: at boot and before the settle — never inside it
   test("the settle ensures the columns BEFORE its transaction opens", () => {
     const settle = chunk(DB, "SettleBillAsNonChargeable");
     const ensure = settle.indexOf("await ensureBillNcColumns()");
-    const tx = settle.indexOf("return withTransaction(");
+    // `return withTransaction(` or, once the settle tidies next-party seats after
+    // its commit, `const out = await withTransaction<…>(` — either way, the one
+    // transaction the settle opens.
+    const tx = settle.search(/withTransaction(<[^>]*>)?\(/);
     expect(ensure).toBeGreaterThan(-1);
     expect(tx).toBeGreaterThan(ensure);
     expect(settle.slice(tx)).not.toMatch(/ensureBillNcColumns\(/);

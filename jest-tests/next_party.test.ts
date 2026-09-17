@@ -37,6 +37,7 @@ import {
 } from "../next_party";
 import { billPrintFallbackPrefix, billPrintJobBelongsToSeating, seatingStartOf } from "../bill_print_state";
 import { buildReceiptBase64 } from "../escpos";
+import { kotPaper } from "./kot_raster_read";
 
 describe("the name", () => {
   test("'<root> #<n>', n from 2", () => {
@@ -340,14 +341,14 @@ describe("the seating start — the earlier of the bill row and the first owing 
 
 describe("the kitchen docket names the next party in full", () => {
   test("'Table No: 12 #2' in the big type, under 'Running Table'", () => {
-    const b64 = buildReceiptBase64({
+    const opts = {
       restaurantName: "GGV",
       currency: "₹",
       table: "12 #2",
       covers: 2,
       items: [{ name: "Thali", quantity: 2, price: 300 }],
       total: 600,
-      kind: "kot",
+      kind: "kot" as const,
       kotNo: 31,
       printedAt: "16/09/26 08:20",
       // kot_numbers.kotOrderContext(isVirtual=false) — a sibling is NOT virtual.
@@ -355,11 +356,18 @@ describe("the kitchen docket names the next party in full", () => {
       orderContext: "Running Table",
       serviceMode: "Dine In",
       section: "Garden",
-    });
-    const raw = Buffer.from(b64, "base64").toString("latin1");
-    expect(raw).toContain("Running Table");
-    expect(raw).toContain("Table No: 12 #2");
-    expect(raw).not.toMatch(/Table No: 12\s*\n/);
+    };
+    // Both dockets a restaurant can print: the reference raster (the default,
+    // read back off its bitmap) and the classic text docket.
+    const papers = [
+      kotPaper(buildReceiptBase64(opts)),
+      Buffer.from(buildReceiptBase64({ ...opts, kotPrintStyle: "classic" }), "base64").toString("latin1"),
+    ];
+    for (const raw of papers) {
+      expect(raw).toContain("Running Table");
+      expect(raw).toContain("Table No: 12 #2");
+      expect(raw).not.toMatch(/Table No: 12\s*\n/);
+    }
   });
 });
 
