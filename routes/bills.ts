@@ -252,6 +252,45 @@ function looksLikeImage(buf: Buffer): boolean {
 	return false;
 }
 
+/*
+	C4 — A SETTLED BILL IS NOTHING BUT MONEY, SO A WAITER-ONLY SESSION IS
+	REFUSED IT.
+
+	View Bill is in the core waiter role because it is how a waiter reads their
+	table's RUNNING bill, and that read is redacted (price_scope.ts). The two
+	settled-bill reads, GET /bills/closed and GET /bills/closed/:id, were not.
+	A waiter's own token therefore listed every settled bill with its
+	grand_total, taxable_base, service charge and tender — and, since client
+	item 8, who each one was for — and the detail added the priced lines, the tax
+	ladder, the refund and (client item 7) the guest's address. GetClosedBill
+	answers any bill by id, so an OPEN bill's unredacted total was one id away as
+	well.
+
+	REFUSED, NOT REDACTED like /bills/open beside them, for two reasons:
+	  * nothing a waiter works from needs them. The app hides History, Reports
+	    and Accounting from a waiter-only session (RoleScope.hiddenModules) and
+	    the web sends one back to Orders and Tables. The web print page does read
+	    the detail for an order's bill id, but it already falls back to the
+	    claim's priced bill when that read comes back empty, and a waiter's own
+	    print is served from the claim;
+	  * a settled bill with its amounts taken out is not a bill, and the detail
+	    carries money in a dozen keys and four nested lists. A deny-list over
+	    that is one new field away from leaking again.
+
+	Same predicate as every other C4 door (hidesPrices, which IS isWaiterOnly),
+	so a manager, cashier, captain or admin reads exactly what they read before.
+	Returns TRUE when it has already answered 403; the caller must return.
+*/
+function refuseWaiterSettledBillRead(req: Request, res: Response): boolean {
+	if (!hidesPrices(req.auth)) { return false; }
+	res.status(403).json({
+		error: "Forbidden",
+		details: `Settled bills are not shown to a waiter. One of these roles can look one up: ${ROLES_OUTRANKING_WAITER.join(", ")}.`,
+		allowed_roles: ROLES_OUTRANKING_WAITER,
+	});
+	return true;
+}
+
 export function registerBillRoutes(app: Express): void {
 
 app.post("/bills", validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f"), async (req: Request, res: Response) => {
@@ -338,8 +377,9 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 //
 // Both are gated by the existing "View Bill" action (98b10bde…) — the same
 // permission that already lets a role read a table's running bill. No new
-// permission to hand out, and waiters/captains (who now hold it) can look up a
-// bill they just settled.
+// permission to hand out, and a captain (who now holds it) can look up a bill
+// they just settled. A WAITER-ONLY session holds it too, and is refused both —
+// see refuseWaiterSettledBillRead.
 
 // Paged, date-filterable list, newest settled first. Query params:
 //   limit (1-200, default 50), offset, from, to (ISO or YYYY-MM-DD),
@@ -354,6 +394,7 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 app.get('/bills/closed', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
+	if (refuseWaiterSettledBillRead(req, res)) {return;}
 	const str = (v: unknown): string | undefined =>
 		typeof v === 'string' && v.trim().length > 0 ? v.trim().slice(0, 200) : undefined;
 	try {
@@ -413,6 +454,7 @@ app.get('/bills/closed/:id', validateAction("98b10bde-802d-4a5b-a726-53a826424f7
 	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
 	const billId = String(req.params.id ?? '').trim();
 	if (!billId) {return res.status(400).json({ error: 'Missing bill id' });}
+	if (refuseWaiterSettledBillRead(req, res)) {return;}
 	try {
 		const bill = await GetClosedBill(restaurantId, billId);
 		if (!bill) {return res.status(404).json({ error: 'Bill not found' });}
