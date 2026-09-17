@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitKotDocketSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -675,6 +675,18 @@ async function bootstrap(): Promise<void> {
 	// leave a waiter's floor with no next-party seat, exactly as before 2.0.1.
 	if (await InitTableNextPartySchema()) {
 		logger.info("✅ Next-party tables ready (migration 053)");
+	}
+
+	// "Restaurant".kot_print_style / kot_text_size (migration 050), ONCE, here,
+	// for the same reasons: until now only ensureBrandingColumns made them, on
+	// the first settings read of the process — possibly inside a transaction,
+	// which could lose them to a rollback and leave the Classic-docket save (the
+	// escape hatch for a kitchen printing blank tickets) failing until a
+	// restart. Only issues the ALTER when a column is missing, under a 2s lock
+	// timeout. Never throws; false means dockets print on the defaults and the
+	// setting cannot be saved yet.
+	if (await InitKotDocketSchema()) {
+		logger.info("✅ KOT docket style columns ready (migration 050)");
 	}
 
 	// Run the reporting path's lazy DDL ONCE here, outside any transaction, so the

@@ -131,6 +131,7 @@ import {
 	GetKotTextSize,
 	GetPrintDeviceTargets,
 	GetRestaurantProfile,
+	GetRestaurantSettings,
 	ListPrintDestinations,
 	ListPrintDevices,
 	ListPrintRoutes,
@@ -174,9 +175,21 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
  *  roll; past the cap the response says how many were skipped. */
 const MAX_TEST_ROLES = 12;
 
-/** Paper width for the test slip, in columns. Same two widths the bill path
- *  offers (58mm = 32, 80mm = 48). */
-const TEST_SLIP_COLS = 48;
+/**
+ * Paper width for the test slip, in columns — the restaurant's own roll, read
+ * the way every docket dispatcher reads it (58mm = 32, anything else = 48).
+ *
+ * NOT A CONSTANT. Since the slip is the reference RASTER docket, its width is
+ * its image's width in dots: 576 at 48 columns, 384 at 32. A 58mm head handed a
+ * 576-dot image drops or crops it, so a fixed 48 made the button report "blank"
+ * on a printer that prints every real docket fine — and send the owner to the
+ * Classic switch for nothing. A failed settings read is the 80mm the constant
+ * used to say.
+ */
+async function testSlipCols(restaurantId: string): Promise<number> {
+	const settings = await GetRestaurantSettings(restaurantId).catch(() => null);
+	return settings?.bill_paper_width === "58mm" ? 32 : 48;
+}
 
 /** Same 750ms outletDeviceSockets races the adapter with. A health screen that
  *  hangs on a wedged Redis adapter is worse than one that says "unknown". */
@@ -1143,6 +1156,8 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 		// And at the restaurant's own type size, for the same reason: an owner who
 		// has just picked "Small" presses this to see what the kitchen will get.
 		const kotTextSize = await GetKotTextSize(ctx.restaurantId);
+		// And on the restaurant's own roll: a raster's width IS the roll's.
+		const cols = await testSlipCols(ctx.restaurantId);
 		const stamp = new Date();
 		const results: Record<string, unknown>[] = [];
 		for (const role of roles) {
@@ -1166,7 +1181,7 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 				station,
 				kotPrintStyle,
 				kotTextSize,
-			}, TEST_SLIP_COLS)[0];
+			}, cols)[0];
 			if (!ticket) { continue; }
 			// bill_id is TEXT and is the handle a human uses to find this job in the
 			// queue afterwards. Stamped with the clock so two presses are two rows —

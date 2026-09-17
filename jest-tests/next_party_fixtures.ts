@@ -608,6 +608,61 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     return { rows: t ? [{ id: t.id, capacity: t.capacity, max_capacity: t.max_capacity, is_occupied: t.is_occupied }] : [] };
   }
 
+  // The KOT readers (GetKotTableContext by name, GetOrderKotContext by order).
+  // With 053 present they join the live root and print ITS zone; without it
+  // they read the row's own and name no 053 column (the check above throws if
+  // they do).
+  const kotZone = (t: TableFix): string | null => {
+    if (!s.includes("left join \"tables\" kp")) {return t.section;}
+    if (!s.includes("case when kp.id is not null then kp.section else t.section end as section")
+      || !s.includes("and coalesce(kp.is_deleted, false) = false")) {
+      throw new Error("next_party_fixtures: the KOT zone must be the LIVE root's, then the row's own");
+    }
+    const root = t.parent_table_id
+      ? store.tables.find((p) => p.id === t.parent_table_id && p.outlet_id === t.outlet_id && !p.is_deleted)
+      : undefined;
+    return root ? root.section : t.section;
+  };
+  if (s.startsWith("select t.id, t.table_name, ") && s.includes("as latest_food from \"tables\" t")) {
+    const t = byName();
+    const food = t
+      ? store.orders.filter((o) => o.table_id === t.id && isOwing(o.status)).sort((a, z) => (a.created_at < z.created_at ? 1 : -1))[0]?.food ?? null
+      : null;
+    return {
+      rows: t ? [{
+        id: t.id, table_name: t.table_name, section: kotZone(t), num_covers: t.num_covers,
+        is_virtual: t.is_virtual, latest_food: food ? JSON.stringify(food) : null,
+      }] : [],
+    };
+  }
+  if (s.startsWith("select o.id as order_id, o.outlet_id, o.status, o.food, o.table_id, t.table_name, ")) {
+    const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    const t = o ? store.tables.find((x) => x.id === o.table_id && x.outlet_id === o.outlet_id) : undefined;
+    return {
+      rows: o ? [{
+        order_id: o.id, outlet_id: o.outlet_id, status: o.status, food: JSON.stringify(o.food), table_id: o.table_id,
+        table_name: t?.table_name ?? null, section: t ? kotZone(t) : null, num_covers: t?.num_covers ?? 1,
+        is_virtual: t?.is_virtual ?? false,
+      }] : [],
+    };
+  }
+  // UpdateTable: the named live row, then that one row's seats and zone.
+  if (s.startsWith("select id, table_name, capacity, max_capacity, section from \"tables\"")) {
+    const t = byName();
+    return { rows: t ? [{ id: t.id, table_name: t.table_name, capacity: t.capacity, max_capacity: t.max_capacity, section: t.section }] : [] };
+  }
+  if (s.startsWith("update \"tables\" set capacity = $4, max_capacity = $5, section = $6 where id = $1")) {
+    const t = store.tables.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    if (t) {
+      updateTable(t, {
+        capacity: Number(params[3]),
+        max_capacity: params[4] === null ? null : Number(params[4]),
+        section: params[5] === null ? null : str(params[5]),
+      });
+    }
+    return { rows: [] };
+  }
+
   // By id.
   const byId = (idx: number, outletIdx: number): TableFix | undefined =>
     store.tables.find((t) => t.id === str(params[idx]) && inOutlet(t, params, outletIdx));

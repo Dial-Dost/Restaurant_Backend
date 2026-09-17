@@ -1053,6 +1053,21 @@ export function kotTextWidth(face: KotFace, text: string): number {
 }
 
 /**
+ * The units kotWrap moves whole: the whitespace-separated words, with every
+ * "#<digits>" token joined to the word before it by one space — the
+ * `<root> #<n>` shape of a next-party table (next_party.ts). Exported for the
+ * docket tests.
+ */
+export function kotWrapUnits(para: string): string[] {
+  const units: string[] = [];
+  for (const word of para.split(/\s+/).filter(Boolean)) {
+    if (/^#\d+$/.test(word) && units.length > 0) { units[units.length - 1] += ` ${word}`; }
+    else { units.push(word); }
+  }
+  return units;
+}
+
+/**
  * Word-wrap `text` to `maxDots`, BY MEASURED PIXEL WIDTH — the type is
  * proportional, so a character count means nothing here.
  *
@@ -1060,13 +1075,20 @@ export function kotTextWidth(face: KotFace, text: string): number {
  * to run off the roll: an unbroken 40-character dish name would otherwise print
  * over the quantity and past the paper edge, and a quantity the chef cannot
  * read is the one failure this column exists to prevent.
+ *
+ * A NEXT-PARTY NAME IS ONE WORD. "12 #2" has a space in it, and a break there
+ * left "12" alone at the end of a line with "#2" below it — on the table-move
+ * slip, "WAS 105" then "#2 ***", which names the ROOT's docket, the one the
+ * pass must not pull. So a "#<n>" token is measured and moved with the word
+ * before it (kotWrapUnits). A unit wider than the whole column still breaks
+ * mid-word, as any over-long word does.
  */
 export function kotWrap(face: KotFace, text: string, maxDots: number): string[] {
   const max16 = Math.max(1, maxDots) * 16;
   const out: string[] = [];
   const spaceW = kotGlyph(face, 32).a;
   for (const para of String(text ?? "").split(/\r?\n/)) {
-    const words = para.split(/\s+/).filter(Boolean);
+    const words = kotWrapUnits(para);
     let cur = "";
     let cur16 = 0;
     const flush = () => { if (cur) { out.push(cur); } cur = ""; cur16 = 0; };

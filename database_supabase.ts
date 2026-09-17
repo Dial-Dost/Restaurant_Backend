@@ -3795,6 +3795,30 @@ async function nextPartyReady(): Promise<boolean> {
   return present;
 }
 
+/**
+ * THE ZONE A TABLE'S KITCHEN DOCKET NAMES, for a reader of `"Tables" t`.
+ *
+ * A next-party seat sits in its ROOT's zone: GET /get-tables shows it there,
+ * because the seat's own `section` is only copied from the root when the seat
+ * is made or revived and goes stale the moment the root is dragged to another
+ * zone (UpdateTable writes the one row it was named by). A docket that printed
+ * the seat's own copy said "Dine In: Garden" in bold while the floor said
+ * Terrace, and the runner carries the food to the room the paper names. So the
+ * KOT readers join the live root and prefer its zone, exactly as the floor does.
+ *
+ * `withParty` is nextPartyReady(): with 053 absent the SQL is what it was, and
+ * names no column that is not there.
+ */
+function kotSectionSql(withParty: boolean): { select: string; join: string } {
+  if (!withParty) {return { select: "t.section", join: "" };}
+  return {
+    select: "case when kp.id is not null then kp.section else t.section end as section",
+    join: `left join "Tables" kp
+        on kp.id = t.parent_table_id and kp.res_id = t.res_id and kp.outlet_id = t.outlet_id
+       and coalesce(kp.is_deleted, false) = false`,
+  };
+}
+
 /** A read or write answered 42703 although the latch said present: believe the database. */
 function noteNextPartyColumnsMissing(err: unknown): void {
   if ((err as { code?: unknown } | null)?.code === "42703") {
@@ -25392,6 +25416,8 @@ export async function GetKotTableContext(
   await ensureTableOccupancyColumns();
   const normalized = String(tableName ?? "").trim();
   if (!normalized) {return null;}
+  // A next-party seat's docket names its root's zone (see kotSectionSql).
+  const zone = kotSectionSql(await nextPartyReady());
 
   const rows = await runQuery<{
     id: string;
@@ -25402,7 +25428,7 @@ export async function GetKotTableContext(
     latest_food: unknown;
   }>(
     `
-      select t.id, t.table_name, t.section,
+      select t.id, t.table_name, ${zone.select},
              coalesce(t.num_covers, 1) as num_covers,
              coalesce(t.is_virtual, false) as is_virtual,
              (select o.food from "Orders" o
@@ -25411,6 +25437,7 @@ export async function GetKotTableContext(
                order by o.created_at desc
                limit 1) as latest_food
       from "Tables" t
+      ${zone.join}
       where t.res_id = $1 and t.outlet_id = $2 and lower(t.table_name) = lower($3)
         and coalesce(t.is_deleted, false) = false
       limit 1
@@ -25499,6 +25526,8 @@ export async function GetOrderKotContext(
   await ensureTableOccupancyColumns();
   const id = String(orderId ?? "").trim();
   if (!id) {return null;}
+  // A next-party seat's docket names its root's zone (see kotSectionSql).
+  const zone = kotSectionSql(await nextPartyReady());
 
   const rows = await runQuery<{
     order_id: string;
@@ -25513,12 +25542,13 @@ export async function GetOrderKotContext(
   }>(
     `
       select o.id as order_id, o.outlet_id, o.status, o.food, o.table_id,
-             t.table_name, t.section,
+             t.table_name, ${zone.select},
              coalesce(t.num_covers, 1) as num_covers,
              coalesce(t.is_virtual, false) as is_virtual
       from "Orders" o
       left join "Tables" t
         on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+      ${zone.join}
       where o.id = $1 and o.res_id = $2 and o.outlet_id = $3
       limit 1
     `,
@@ -28461,6 +28491,18 @@ export async function GetRestaurantProfile(
 let brandingColsEnsured = false;
 async function ensureBrandingColumns(): Promise<void> {
   if (brandingColsEnsured) {return;}
+  // NEVER FROM INSIDE A TRANSACTION. DDL is transactional: a first run inside a
+  // request's transaction that later rolled back would take the columns with
+  // it while the flag below went on saying they exist — and "Restaurant".
+  // kot_print_style is the Classic-docket escape hatch, whose save would then
+  // fail with 42703 until a restart. The ALTERs also take ACCESS EXCLUSIVE on
+  // "Restaurant", which every request's context read joins, and inside a
+  // transaction they hold it until that transaction ends. So a caller already
+  // in one (the exception sweep, a guest pre-order confirm, a seating's OTP
+  // check, an audit undo) skips the ensure and does not set the flag: the boot
+  // step (InitKotDocketSchema) has made 050's columns, and the next autocommit
+  // caller runs the rest.
+  if ((tenantStorage.getStore()?.txnDepth ?? 0) > 0) {return;}
   await runQuery(`alter table "Restaurant" add column if not exists theme_color text`);
   await runQuery(`alter table "Restaurant" add column if not exists auto_push_orders boolean default true`);
   await runQuery(`alter table "Restaurant" add column if not exists currency text`);
@@ -28606,6 +28648,70 @@ async function ensureBrandingColumns(): Promise<void> {
   // NULL, a missing column and an unrecognised value.
   await runQuery(`alter table "Restaurant" add column if not exists kot_text_size text`);
   brandingColsEnsured = true;
+}
+
+/**
+ * Migration 050's two columns, ONCE, at boot — before the listener, outside any
+ * transaction, the step 048, 051, 052 and 053 already have.
+ *
+ * WHY 050 NEEDS ONE TOO. Its columns were only ever made by
+ * ensureBrandingColumns, whose boot run (WarmReportingSchema) is behind
+ * REPORT_SCHEDULER, which production does not set. So the first request that
+ * touched settings made them — possibly inside a transaction (see
+ * ensureBrandingColumns), and with no lock timeout on the hottest lookup table
+ * in the product.
+ *
+ * ONLY WHEN A COLUMN IS MISSING, because ADD COLUMN IF NOT EXISTS takes ACCESS
+ * EXCLUSIVE even when it has nothing to do; and under a 2-second LOCAL
+ * lock_timeout, inside the one statement, so a "Restaurant" row lock held by
+ * the process being replaced refuses this fast instead of queueing every
+ * context read behind it (the 2026-08-24 standstill's shape) — the lazy ensure
+ * retries on first use. The two ALTERs are the statements
+ * ensureBrandingColumns issues, in its order (kot_print_style_migration.test.ts
+ * holds both to the migration file).
+ *
+ * Never throws. False is loud: the print path still works on the defaults, but
+ * an owner cannot SAVE Classic until the column exists.
+ */
+export async function InitKotDocketSchema(): Promise<boolean> {
+  const present = async (): Promise<number> => {
+    const rows = await runQuery<{ n: number | string }>(
+      `select count(*)::int as n from information_schema.columns
+        where table_schema = 'public' and table_name = 'Restaurant'
+          and column_name in ('kot_print_style', 'kot_text_size')`,
+    );
+    return Number(rows[0]?.n ?? 0);
+  };
+  try {
+    if ((await present()) !== 2) {
+      await runQuery(
+        `do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'Restaurant'
+                             and column_name = 'kot_print_style') then
+             alter table "Restaurant" add column if not exists kot_print_style text;
+           end if;
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'Restaurant'
+                             and column_name = 'kot_text_size') then
+             alter table "Restaurant" add column if not exists kot_text_size text;
+           end if;
+         end $$`,
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, "kot_docket_columns_boot_ensure_failed — the lazy ensure will retry on first use");
+  }
+  try {
+    if ((await present()) === 2) {return true;}
+    logger.error("Restaurant.kot_print_style / kot_text_size are MISSING — dockets print on the defaults, but the KOT docket setting cannot be saved until migration 050 is applied");
+    return false;
+  } catch (err) {
+    logger.warn({ err }, "kot_docket_columns_probe_failed");
+    return false;
+  }
 }
 
 // The restaurant's own Razorpay keys (server-side only — used to create/verify

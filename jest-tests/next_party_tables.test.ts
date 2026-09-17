@@ -395,6 +395,31 @@ describe("4. the floor", () => {
     expect(next.qr_token).not.toBe(root.qr_token);
   });
 
+  test("THE KITCHEN DOCKET NAMES THE ZONE THE FLOOR SHOWS: a root dragged to another zone takes its seat's docket with it", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    const order = addOrder("12 #2", 600);
+    // The drag: PATCH /table/12 writes the ONE row it names.
+    await db.UpdateTable(SLUG, "12", { section: "Terrace" });
+    expect(liveTable("12 #2").section).toBe("Garden"); // the seat's own copy is stale
+    const floor = (await db.GetTables(SLUG))!;
+    expect(floor.find((r) => r.table_name === "12 #2")?.section).toBe("Terrace");
+    // Both KOT readers say what the floor says — the table-scoped docket and the bark docket.
+    expect((await db.GetKotTableContext(SLUG, "12 #2"))?.section).toBe("Terrace");
+    expect((await db.GetOrderKotContext(SLUG, order.id))?.section).toBe("Terrace");
+    // A root, and an ordinary table, read their own zone as before.
+    expect((await db.GetKotTableContext(SLUG, "12"))?.section).toBe("Terrace");
+    expect((await db.GetKotTableContext(SLUG, "15"))?.section).toBe("Garden");
+  });
+
+  test("a seat whose root has gone keeps its own zone on the docket rather than none", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    liveTable("12").is_deleted = true;
+    expect((await db.GetKotTableContext(SLUG, "12 #2"))?.section).toBe("Garden");
+  });
+
   test.each([
     ["booked (a reservation running now)", -10, "booked"],
     ["reserved (a reservation later today)", 60, "reserved"],
@@ -595,6 +620,17 @@ describe("6. migration 053 absent — exactly 2.0.0", () => {
     const named = statements().filter((q) => !/^(alter|create|do|comment|grant)\b/.test(q)
       && !q.includes("information_schema") && (q.includes("parent_table_id") || q.includes("party_seq")));
     expect(named).toEqual([]);
+  });
+
+  test("the KOT readers read the row's own zone and name no 053 column", async () => {
+    busyTwelve();
+    const order = addOrder("12", 200);
+    await db.UpdateTable(SLUG, "12", { section: "Terrace" });
+    expect((await db.GetKotTableContext(SLUG, "12"))?.section).toBe("Terrace");
+    expect((await db.GetOrderKotContext(SLUG, order.id))?.section).toBe("Terrace");
+    const kot = statements().filter((q) => q.includes("latest_food") || q.startsWith("select o.id as order_id"));
+    expect(kot).toHaveLength(2);
+    for (const q of kot) {expect(q).not.toMatch(/parent_table_id|"tables" kp/);}
   });
 
   test("the boot step reports OFF, and a later hand-apply is picked up within a minute", async () => {

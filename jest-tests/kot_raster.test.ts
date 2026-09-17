@@ -28,6 +28,7 @@ import {
   kotTextSizeOf,
   kotTextWidth,
   kotWrap,
+  kotWrapUnits,
   layoutKot,
   planKotRaster,
   type KotDraw,
@@ -518,6 +519,71 @@ describe("wrapping is measured in dots, because the type is proportional", () =>
   test("empty text is one empty line, never zero lines", () => {
     expect(kotWrap(face, "", 200)).toEqual([""]);
   });
+});
+
+describe("a next-party table's name is one word on the docket", () => {
+  // "12 #2" has a space in it. Broken there, the table-move slip read
+  // "... WAS 105" then "#2 ***" — the first line naming the ROOT's docket, the
+  // one the pass must NOT pull — and a 58mm "Table No:" line lost its "#2".
+  const face = KOT_ATLAS["28b"]!;
+
+  test("'#<n>' is measured and moved with the word before it", () => {
+    expect(kotWrapUnits("*** TABLE CHANGED - WAS 105 #2 ***")).toEqual(["***", "TABLE", "CHANGED", "-", "WAS", "105 #2", "***"]);
+    expect(kotWrapUnits("Table No: Patio 4 #13")).toEqual(["Table", "No:", "Patio", "4 #13"]);
+    // Only a whole "#<digits>" token, and never onto nothing.
+    expect(kotWrapUnits("#2 first")).toEqual(["#2", "first"]);
+    expect(kotWrapUnits("12 #x 12 #")).toEqual(["12", "#x", "12", "#"]);
+    expect(kotWrapUnits("  a \t b  ")).toEqual(["a", "b"]);
+  });
+
+  test("where the root fits and '<root> #<n>' does not, the whole name moves down", () => {
+    const head = "*** TABLE CHANGED - WAS 105";
+    const width = kotTextWidth(face, head) + 2;
+    expect(kotTextWidth(face, `${head} #2`)).toBeGreaterThan(width);
+    const lines = kotWrap(face, `${head} #2 ***`, width);
+    expect(lines[0]).toBe("*** TABLE CHANGED - WAS");
+    expect(lines[1]!.startsWith("105 #2")).toBe(true);
+    for (const l of lines) { expect(kotTextWidth(face, l)).toBeLessThanOrEqual(width); }
+  });
+
+  test("a name wider than the whole column still breaks rather than running off the roll", () => {
+    const lines = kotWrap(face, "SmokeTableA305017 #2", 120);
+    expect(lines.length).toBeGreaterThan(1);
+    for (const l of lines) { expect(kotTextWidth(face, l)).toBeLessThanOrEqual(120); }
+    expect(lines.join("")).toBe("SmokeTableA305017 #2");
+  });
+
+  // The root's LAST word and the party number, which must share a line.
+  const tail = (name: string) => name.toUpperCase().split(" ").slice(-2).join(" ");
+  for (const cols of ROLLS) {
+    for (const size of SIZES) {
+      test(`the table-move slip keeps the old seat's name whole — ${rollName(cols)}, ${size}`, () => {
+        for (const prev of ["105 #2", "Chaturya #2", "12 #2", "T1 #3", "Terrace Garden 12 #2"]) {
+          const opts: ReceiptOptions = {
+            ...docket, table: "15", kotTextSize: size,
+            // kot_move.ts's context line, verbatim in shape.
+            orderContext: `*** TABLE CHANGED - WAS ${prev.toUpperCase()} ***`,
+          };
+          const lines = kotPaper(buildReceiptBase64(opts, cols), cols, size).split("\n");
+          const top = lines.slice(0, lines.indexOf("KOT"));
+          expect({ prev, top, whole: top.some((l) => l.includes(tail(prev))) }).toMatchObject({ whole: true });
+          expect({ prev, top, orphan: top.some((l) => /^#\d/.test(l)) }).toMatchObject({ orphan: false });
+        }
+      });
+
+      test(`'Table No:' never loses the party number — ${rollName(cols)}, ${size}`, () => {
+        for (const table of ["12 #2", "Patio 4 #13", "SmokeTableA305017 #2"]) {
+          const lines = kotPaper(buildReceiptBase64({ ...docket, table, kotTextSize: size }, cols), cols, size).split("\n");
+          const at = lines.findIndex((l) => l.startsWith("Table No:"));
+          expect(at).toBeGreaterThan(-1);
+          const said = [lines[at]!, lines[at + 1] ?? ""].join("\n");
+          const unit = table.split(" ").slice(-2).join(" ");
+          expect({ table, said, whole: said.split("\n").some((l) => l.includes(unit)) }).toMatchObject({ whole: true });
+          expect({ table, said, orphan: /\n#\d/.test(said) }).toMatchObject({ orphan: false });
+        }
+      });
+    }
+  }
 });
 
 describe("the bytes", () => {
