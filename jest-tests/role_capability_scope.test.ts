@@ -110,6 +110,32 @@ describe("the capability block the clients obey", () => {
     expect(onlyDelete.delete_table).toBe(true);
     expect(onlyDelete.settle_bill).toBe(false);
     expect(onlyDelete.edit_table).toBe(false);
+    expect(onlyDelete.cancel_kot).toBe(false);
+  });
+
+  // CLIENT ITEM 3 — "On the waiter dashboard, Cancel KOT option should be
+  // removed." The one flag that follows the ROLE: a waiter-only login is false
+  // even with Void Orders granted, and everybody else holds it exactly when they
+  // hold one of the two cancel routes' gates.
+  test("cancel_kot: false for a waiter-only login, whatever it was granted", () => {
+    const waiter = CORE_ROLES.waiter as unknown as string[];
+    const VOID = "c1f83b26-5a97-4e40-b8d3-7e02a9c4f156";
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter"], actions: waiter }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter"], actions: [...waiter, VOID] }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter", "d2b1f0c4-0000-4000-8000-000000000001"], actions: waiter }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "employee", role_all: ["employee", "waiter"], actions: waiter }).cancel_kot).toBe(false);
+    // …and the void flag itself still says what was granted: the role rule is cancel_kot's alone.
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter"], actions: [...waiter, VOID] }).void_order).toBe(true);
+  });
+
+  test("cancel_kot: true for every senior role that can take a cancel route, false for one that cannot", () => {
+    for (const role of ["manager", "cashier", "captain"] as const) {
+      expect([role, sessionCapabilities({ role, role_all: [role], actions: CORE_ROLES[role] as unknown as string[] }).cancel_kot]).toEqual([role, true]);
+    }
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter", "captain"], actions: CORE_ROLES.waiter as unknown as string[] }).cancel_kot).toBe(true);
+    expect(sessionCapabilities({ role: "admin", role_all: ["admin"], actions: ["*"] }).cancel_kot).toBe(true);
+    expect(sessionCapabilities({ role: "valet", role_all: ["valet"], actions: [] }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "manager", role_all: ["manager"], actions: ["c1f83b26-5a97-4e40-b8d3-7e02a9c4f156"] }).cancel_kot).toBe(true);
   });
 });
 

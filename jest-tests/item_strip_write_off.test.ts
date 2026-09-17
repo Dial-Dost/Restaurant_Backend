@@ -46,7 +46,7 @@
 // failure this block risks most, so the ordinary one-line correction is pinned
 // as hard as the refusal is.
 
-import { describe, test, expect, beforeAll, beforeEach, jest } from "@jest/globals";
+import { describe, test, expect, beforeAll, beforeEach, afterEach, jest } from "@jest/globals";
 import { makeFakeApp, type FakeApp } from "./platform_fixtures";
 import {
   DEFAULT_FLOOR_DISCOUNT_CEILING,
@@ -233,6 +233,15 @@ beforeEach(() => {
 });
 
 /**
+ * The status code `seat()` gives the order. 1 (Preparing) everywhere except the
+ * route suites below, which run a WAITER against a PENDING (8) order: client
+ * item 3 (2026-09-17) refuses a waiter-only login any removal from a ticket the
+ * kitchen holds, so a never-ticketed order is the only one a waiter's write-off
+ * can still be judged on. The ticketed case has its own suite at the end.
+ */
+let seatStatus = 1;
+
+/**
  * Seat a table: the order's own lines, and what the REST of the table is worth.
  * Sets both the pool fixture (what the real gate reads) and the GetOrders stub
  * (what the route reads), so the two can never describe different tables.
@@ -242,7 +251,7 @@ function seat(items: ReturnType<typeof line>[], otherOrdersWorth = 0): ReturnTyp
   fx.order = {
     food: { items, items_split: splitOf(items), subtotal: own, total: own },
     table_id: TABLE_ID,
-    status: 1,
+    status: seatStatus,
   };
   fx.siblings = [
     { food: { subtotal: own, total: own }, status: 1 },
@@ -250,7 +259,7 @@ function seat(items: ReturnType<typeof line>[], otherOrdersWorth = 0): ReturnTyp
   ];
   GetOrders.mockResolvedValue([{
     id: ORDER_ID, table: "T7", items, items_split: splitOf(items),
-    subtotal: own, total: own, status: "Preparing",
+    subtotal: own, total: own, status: seatStatus === 8 ? "Pending" : "Preparing",
   }]);
   return items;
 }
@@ -604,7 +613,14 @@ const auditLines = (): string[] => AddAuditLogEntry.mock.calls.map((c) => String
 /** A 4,000 table whose i1 line alone is worth 3,000 — a write-off to strip. */
 const bigLineTable = () => seat([line("i1", "Whole Lamb", 1500, 2), line("i2", "Chai", 1000)]);
 
+// A waiter's route calls are made against a PENDING order — see seatStatus.
+const onPendingOrders = (): void => {
+  beforeEach(() => { seatStatus = 8; });
+  afterEach(() => { seatStatus = 1; });
+};
+
 describe("DELETE /orders/:id/items/:itemId — the door itself", () => {
+  onPendingOrders();
   test("a waiter takes ONE ordinary line off, and it is written", async () => {
     fourThousand();
     const r = await del(WAITER);
@@ -673,6 +689,7 @@ describe("DELETE /orders/:id/items/:itemId — the door itself", () => {
 });
 
 describe("a permitted removal is now traceable", () => {
+  onPendingOrders();
   test("it writes an item-scope \"OrderVoids\" row carrying the dish and the money", async () => {
     fourThousand();
     await del(WAITER);
@@ -742,6 +759,52 @@ describe("a permitted removal is now traceable", () => {
     expect(RecordOrderVoid).not.toHaveBeenCalled();
     expect(dispatchCancellationKot).not.toHaveBeenCalled();
     expect((r.body as Record<string, unknown>).value_removed).toBeUndefined();
+  });
+});
+
+// CLIENT ITEM 3 — "On the waiter dashboard, Cancel KOT option should be
+// removed." Taking a dish off a ticket the kitchen holds is the same act one
+// line wide, so a waiter-only login is refused it — with the sentence, before
+// anything is written, and on the record. A Pending order (never ticketed) is
+// still theirs to correct; the senior roles lose nothing (next suite).
+describe("client item 3 — a waiter never takes a dish off a ticket the kitchen holds", () => {
+  for (const [label, code, wire] of [["Preparing", 1, "Preparing"], ["Served", 2, "Served"]] as const) {
+    test(`${label}: 403 cancel_needs_senior, nothing written, no void row, no slip`, async () => {
+      fourThousand();
+      fx.order.status = code;
+      GetOrders.mockResolvedValue([{ id: ORDER_ID, table: "T7", items: [], status: wire }] as never);
+      const r = await del(WAITER);
+      expect(r.status).toBe(403);
+      expect(r.body).toMatchObject({ error: "Forbidden", code: "cancel_needs_senior", order_id: ORDER_ID });
+      expect(String((r.body as Record<string, unknown>).details)).toMatch(/has gone to the kitchen, so a dish cannot be taken off it here/);
+      expect(fx.writes).toEqual([]);
+      expect(RecordOrderVoid).not.toHaveBeenCalled();
+      expect(dispatchCancellationKot).not.toHaveBeenCalled();
+      expect(auditLines().some((l) => l.startsWith(`REFUSED removal of a dish from order ${ORDER_ID}`))).toBe(true);
+    });
+  }
+
+  test("a waiter granted Void Orders is refused all the same — the role, not the grant", async () => {
+    fourThousand();
+    const r = await del(identity([ADD_ORDERS, "c1f83b26-5a97-4e40-b8d3-7e02a9c4f156"]));
+    expect(r.status).toBe(403);
+    expect(fx.writes).toEqual([]);
+  });
+
+  test("a waiter who also holds a senior role is not a waiter-only login", async () => {
+    fourThousand();
+    const both = { ...identity([ADD_ORDERS, TABLE_OPS, VIEW_BILL]), role_all: ["waiter", "captain"] };
+    expect((await del(both)).status).toBe(200);
+    expect(fx.writes).toHaveLength(1);
+  });
+
+  test("a Pending order is still the waiter's to correct", async () => {
+    seatStatus = 8;
+    try {
+      fourThousand();
+      expect((await del(WAITER)).status).toBe(200);
+      expect(fx.writes).toHaveLength(1);
+    } finally { seatStatus = 1; }
   });
 });
 

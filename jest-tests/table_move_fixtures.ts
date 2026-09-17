@@ -62,6 +62,8 @@ export interface OrderFix {
   /** '1' new … '4' paid, '5' cancelled, '6' payment pending, '7' closed, '8' awaiting approval. */
   status: string;
   created_at: string;
+  /** When the kitchen was told (MoveBillItem carries it to the dish's new order). */
+  barked_at?: string | null;
 }
 
 export interface BillFix {
@@ -139,7 +141,7 @@ export function failNextStatementContaining(needle: string | null): void {
 function snapshot(): Omit<Store, "stack" | "failOn" | "log"> {
   return {
     tables: store.tables.map((r) => ({ ...r })),
-    orders: store.orders.map((r) => ({ ...r, food: { ...r.food } })),
+    orders: store.orders.map((r) => ({ ...r, food: JSON.parse(JSON.stringify(r.food)) as Record<string, unknown> })),
     bills: store.bills.map((r) => ({ ...r })),
     sessions: store.sessions.map((r) => ({ ...r })),
     assignments: store.assignments.map((r) => ({ ...r })),
@@ -399,6 +401,47 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     };
   }
 
+  // --- MoveBillItem (client item 4): the source orders WITH their stage and
+  //     bark time, the lines coming off them, and the destination's new order.
+  if (s.includes('select id, food, status, barked_at from "orders"')) {
+    const tableId = str(params[2]);
+    return {
+      rows: store.orders
+        .filter((o) => o.table_id === tableId && isActive(o.status))
+        .sort((a, b) => (a.created_at < b.created_at ? -1 : 1))
+        .map((o) => ({ id: o.id, food: JSON.stringify(o.food), status: o.status, barked_at: o.barked_at ?? null })),
+    };
+  }
+  if (s.startsWith('select id from "tables" where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)')) {
+    const name = str(params[2]).trim().toLowerCase();
+    const t = store.tables.find((x) => !x.is_deleted && x.table_name.trim().toLowerCase() === name);
+    return { rows: t ? [{ id: t.id }] : [] };
+  }
+  if (s.startsWith('update "orders" set food = $4::json, status = 5 where')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    if (o) { o.food = JSON.parse(str(params[3])) as Record<string, unknown>; o.status = "5"; }
+    return { rows: [] };
+  }
+  if (s.startsWith('update "orders" set food = $4::json where')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    if (o) { o.food = JSON.parse(str(params[3])) as Record<string, unknown>; }
+    return { rows: [] };
+  }
+  if (s.startsWith('insert into "orders" (id, created_at, res_id, outlet_id, food, table_id, status, barked_at)')) {
+    store.orders.push({
+      id: str(params[0]),
+      table_id: str(params[4]),
+      food: JSON.parse(str(params[3])) as Record<string, unknown>,
+      status: str(params[5]),
+      created_at: NOW,
+      barked_at: params[6] === null || params[6] === undefined ? null : str(params[6]),
+    });
+    return { rows: [] };
+  }
+  if (s.includes("from information_schema.columns") && s.includes("column_name = 'barked_at'")) {
+    return { rows: [{ column_name: "barked_at" }] };
+  }
+
   // --- one order, by id ----------------------------------------------------
   if (s.includes('select id, table_id, food, status from "orders"')) {
     const o = store.orders.find((r) => r.id === str(params[0]));
@@ -503,6 +546,9 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     } else if (s.includes("set is_occupied = true, num_covers = greatest(1, coalesce(num_covers, 1))")) {
       row.is_occupied = true;
       row.num_covers = Math.max(1, row.num_covers ?? 1);
+    } else if (s.startsWith('update "tables" set is_occupied = true where id = $1')) {
+      // MoveBillItem seats the destination and leaves its covers alone.
+      row.is_occupied = true;
     } else {
       throw new Error(`table_move_fixtures: unmodelled "Tables" update: ${sql.slice(0, 160)}`);
     }

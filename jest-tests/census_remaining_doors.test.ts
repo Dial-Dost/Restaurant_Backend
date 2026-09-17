@@ -219,17 +219,25 @@ describe("what the destination table gains is what the source table lost", () =>
   test("MoveBillItem builds its destination from every removed line, not a summary", () => {
     const src = readSource("database_supabase.ts");
     const fn = src.slice(src.indexOf("export async function MoveBillItem"));
-    const body = fn.slice(0, 4000);
-    expect(body).toMatch(/moved\.lines\.map/);
+    const body = fn.slice(0, 7000);
+    // Client item 4 (2026-09-17): the lines now arrive WHOLE, one destination
+    // order per source order — each built from that source's removed lines.
+    expect(body).toMatch(/for \(const source of moved\.sources\)/);
+    expect(body).toMatch(/lines: source\.lines,/);
     // The exact expression that lost the money. If it ever comes back, so does
     // the bug, and nothing else in this suite would notice.
     expect(body).not.toMatch(/round2\(moved\.price \* moved\.quantity\)/);
   });
 
-  test("and removeItemFromTableOrders returns those lines in the first place", () => {
+  test("and removeItemFromTableOrders returns those lines in the first place — the money and the whole line priced alike", () => {
     const src = readSource("database_supabase.ts");
     const fn = src.slice(src.indexOf("async function removeItemFromTableOrders"));
-    expect(fn.slice(0, 4000)).toMatch(/lines: RemovedBillLine\[\]/);
+    const body = fn.slice(0, 7000);
+    expect(body).toMatch(/lines: RemovedBillLine\[\]/);
+    // The summary the money is computed from and the whole line the destination
+    // is built from carry the SAME clamped price and quantity.
+    expect(body).toMatch(/removedLines\.push\(\{ name: lineName, price: safe\.price, quantity: lineQty \}\);/);
+    expect(body).toMatch(/wholeLines\.push\(carriedLine\(\(it \?\? \{\}\) as Record<string, unknown>, safe\.price, lineQty\)\);/);
   });
 });
 

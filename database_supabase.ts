@@ -118,6 +118,24 @@ import {
 // The write-off rule for a DISCOUNT. Pure, for the same reason
 // release_authority.ts is: it decides who may make a bill disappear.
 import { DiscountAuthorityError, mayDiscountBill } from "./discount_authority.js";
+// Client items 3 and 4 (2026-09-17): who may cancel a ticketed order, and what
+// a move stamps on the orders it touches. Both pure; see their headers.
+import { isWaiterOnly, mayCancelTicketed, PENDING_ORDER_STATUS_CODE, type RoleScopeInput } from "./role_scope.js";
+import { CancelNeedsSeniorError } from "./cancel_authority.js";
+import {
+  appendOrderMove,
+  carriedLine,
+  comppedMoveRefusal,
+  holdsComppedLine,
+  movedDestinationFood,
+  movedDish,
+  movedFromKotNos,
+  movedOrderStatusCode,
+  orderDishes,
+  orderMoveProvenance,
+  type MovedDish,
+  type OrderMoveProvenance,
+} from "./order_moves.js";
 // C3's print state. ONE rule, applied to BOTH payloads that answer "has this
 // bill been printed" — /bill-for-table and the /get-tables row the floor grid
 // renders. See its header for why the floor grid had nothing to read.
@@ -1246,6 +1264,14 @@ export interface OrderRecord {
    * it is never what the server prints from — see GetKotNumbersForOrders.
    */
   kot_nos?: number[];
+  /**
+   * CLIENT ITEM 4 — the move provenance (orderMoveProvenance, order_moves.ts).
+   * Each is ABSENT on an order that never moved, for the reason kot_nos is.
+   */
+  moved_from?: OrderMoveProvenance["moved_from"];
+  moved_at?: OrderMoveProvenance["moved_at"];
+  emptied_by?: OrderMoveProvenance["emptied_by"];
+  moved_items?: OrderMoveProvenance["moved_items"];
 }
 
 // A built-in id, 'Split', or a custom mode's own id (payment_methods.ts).
@@ -11889,6 +11915,9 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
   // never come back with durations that imply the response took a second to
   // build. It is also what `as_of` on each clock refers to.
   const clockNowMs = Date.now();
+  // A dish-move ticket's KOT number(s) as recorded on the ticket itself, for
+  // the rows no docket carried one for — see the KOT block below.
+  const movedKotNosById = new Map<string, number[]>();
 
   const result = rows.map((row) => {
     const payload = parseJsonObject(row.food) ?? {};
@@ -11994,7 +12023,18 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       // clock there would report a table as finished while the money is still
       // outstanding and the guests are still sitting there.
       service: serviceClock({ placed_at: row.created_at, settled_at: row.closed_at }, clockNowMs),
+      // CLIENT ITEM 4 — WHERE THIS TICKET CAME FROM, AND WHAT LEFT IT.
+      // `moved_from` / `moved_at` name the table a moved ticket (or a moved
+      // dish's new ticket) came from, so the table sheet can say "KOT 65 · from
+      // 12"; `emptied_by` and `moved_items` let a ticket a dish move emptied
+      // say "Moved to 31: 1 × NOT YOUR PUCHKA" instead of "Cancelled · 0 item(s)".
+      // ADDITIVE and absent on an order that never moved. Names, sizes and
+      // quantities only — no price leaves through here, so the waiter
+      // redaction (price_scope.ts) has nothing to add.
+      ...orderMoveProvenance(payload),
     };
+    const movedKots = movedFromKotNos(payload);
+    if (movedKots.length > 0) { movedKotNosById.set(row.id, movedKots); }
 
     // include flattened and split representations if available
     if (items_split) {
@@ -12041,6 +12081,13 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
         if (nos && nos.length > 0) { order.kot_nos = nos; }
       }
     }
+  }
+  // CLIENT ITEM 4 — a dish moved while dockets were off (or whose docket did
+  // not print) still reads under the number the kitchen cooked it as, rather
+  // than falling into "No KOT number". Printed numbers always win.
+  for (const order of visible) {
+    const moved = movedKotNosById.get(order.id);
+    if (moved && !(order.kot_nos && order.kot_nos.length > 0)) { order.kot_nos = moved; }
   }
 
   return visible;
@@ -14252,6 +14299,13 @@ export async function UpdateOrderItemsSplit(
      * bills off is not a stricter gate; it is a broken screen.
      */
     isAdmin?: boolean;
+    /**
+     * Who is asking, for client item 3: a waiter-only login may not take a
+     * line off an order the kitchen has been told about (DELETE
+     * /orders/:id/items/:itemId). Only a write that TAKES A LINE OFF is judged;
+     * moving a line between Served and Preparing, or adding one, is not.
+     */
+    actor?: RoleScopeInput | null;
   },
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
@@ -14317,6 +14371,18 @@ export async function UpdateOrderItemsSplit(
     (parseJsonObject(r) ?? {}) as { price?: unknown; quantity?: unknown; nc?: unknown });
   const repricedSubtotal = chargeableSubtotal(moneyLines);
   const repricedNc = nonChargeableValue(moneyLines);
+
+  // CLIENT ITEM 3 — A WAITER DOES NOT TAKE FOOD OFF A TICKET. Decided on what
+  // this write takes off (linesTakenOff, the same list stamped below) and the
+  // status the order holds now; the write further down is pinned to that
+  // status, so an approval landing in between refuses rather than slipping by.
+  const takenOff = linesTakenOff(previousLines, flattened as unknown[]);
+  const waiterStrip = takenOff.length > 0 && opts?.actor != null && isWaiterOnly(opts.actor);
+  // The status is read only for the one caller the rule applies to, so every
+  // other edit issues exactly the statements it always did.
+  if (waiterStrip && opts?.actor != null && !mayCancelTicketed(opts.actor, await readOrderStatusCode(context, orderId))) {
+    throw new CancelNeedsSeniorError(orderId, "remove_line");
+  }
 
   // ==========================================================================
   // THE WRITE-OFF GATE. See this function's header for the rule and the reuse.
@@ -14416,7 +14482,6 @@ export async function UpdateOrderItemsSplit(
   // release later cancels. Without the stamp its Void KOT row named no dish and
   // counted no value. Moving a line between Served and Preparing, or adding one,
   // takes nothing off and stamps nothing. See linesTakenOff.
-  const takenOff = linesTakenOff(previousLines, flattened as unknown[]);
   const { nc_subtotal: _staleNc, ...payloadRest } = payload;
   const newPayload = stampLineRemoval(
     {
@@ -14452,6 +14517,7 @@ export async function UpdateOrderItemsSplit(
       where id = $3 and res_id = $4 and outlet_id = $5
         and ${stillOwesStatusSql()}
         and coalesce(status::text, '1') <> '6'
+        and ($7::text is null or coalesce(status::text, '1') = $7::text)
         and coalesce((
               select string_agg(coalesce(x ->> 'nc_id', ''), ',' order by coalesce(x ->> 'nc_id', '') collate "C")
                 from jsonb_array_elements(
@@ -14460,8 +14526,14 @@ export async function UpdateOrderItemsSplit(
                where x -> 'nc' = 'true'::jsonb
             ), '') = $6
       returning id`,
-    [JSON.stringify(newPayload), toOrderStatusCode(newStatus), orderId, context.res_id, context.outlet_id, ncFlagSignature(previousLines)],
+    [JSON.stringify(newPayload), toOrderStatusCode(newStatus), orderId, context.res_id, context.outlet_id, ncFlagSignature(previousLines),
+      waiterStrip ? String(PENDING_ORDER_STATUS_CODE) : null],
   );
+  if (!written[0] && waiterStrip) {
+    // Accepted to the kitchen while this was being built: it is a ticket now.
+    await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
+    throw new CancelNeedsSeniorError(orderId, "remove_line");
+  }
   if (!written[0]) {
     // Settled, cancelled or awaiting approval in the meantime: the house words.
     await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
@@ -14533,6 +14605,17 @@ async function consumeInventory(restaurantId: string, context: RestaurantContext
 export async function AddOrder(
   restaurantId: string,
   order: Partial<OrderRecord>,
+  opts?: {
+    /**
+     * Who is asking, for client item 3. POST /orders is also the dashboard's
+     * upsert, and an upsert that names an existing order with status
+     * "Cancelled" is a cancel by another door — one that recorded no reason, no
+     * void row and no slip. A waiter-only login is refused it on a ticketed
+     * order exactly as the status route refuses it. Absent = no role rule (the
+     * guest page, the queue seat, every internal caller).
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<{ id: string }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
@@ -14581,9 +14664,9 @@ export async function AddOrder(
   }
 
   const id = isUuid(String(order.id ?? "")) ? String(order.id) : randomUUID();
-  const existingOrderRows = await runQuery<{ food: unknown; barked_at: Date | string | null }>(
+  const existingOrderRows = await runQuery<{ food: unknown; barked_at: Date | string | null; status: unknown }>(
     `
-      select food, barked_at
+      select food, barked_at, status
       from "Orders"
       where id = $1 and res_id = $2 and outlet_id = $3
       limit 1
@@ -14750,6 +14833,17 @@ export async function AddOrder(
     }
   }
 
+  // CLIENT ITEM 3 — THE UPSERT DOOR. Judged on the status this write will
+  // actually store (the merge above turns a resend that adds lines back into
+  // Preparing), against the status the order holds now, before anything is
+  // written.
+  if (!isNewOrder && statusCode === 5 && opts?.actor != null) {
+    const storedCode = Number(existingOrderRows[0]?.status ?? 1);
+    if (storedCode !== 5 && !mayCancelTicketed(opts.actor, storedCode)) {
+      throw new CancelNeedsSeniorError(id);
+    }
+  }
+
   // SECURITY: never bill a staff-entered line below its menu price, and never
   // trust the client's subtotal/total. A waiter posting {price: 390 x3, total: 1}
   // used to settle 1,170 of food for ₹1.16 while the bill still printed all three
@@ -14840,6 +14934,15 @@ export async function AddOrder(
         : (typeof existingPayload.delivery_address === "string" ? existingPayload.delivery_address : null),
   };
   if (itemsSplitForStore !== undefined) {payload.items_split = itemsSplitForStore;}
+  // CLIENT ITEM 4 — WHERE THIS TICKET CAME FROM SURVIVES AN EDIT. The payload
+  // above is rebuilt from scratch, so without this a status change or an edit
+  // resent through this upsert would wipe the move history MoveOrderToTable
+  // and MoveBillItem stamped, and the table sheet would stop saying "from 12".
+  // SERVER-OWNED: only ever carried from the stored row, never read off the
+  // request.
+  for (const key of ["moves", "moved_from", "moved_items", "emptied_by"] as const) {
+    if (existingPayload[key] !== undefined) {payload[key] = existingPayload[key];}
+  }
 
   await runQuery(
     `
@@ -15091,6 +15194,34 @@ export interface RemovedBillLine {
 }
 
 /**
+ * The bill line a name-and-price request means — ONE rule, for the removal and
+ * for the move pre-read (GetMovableLineSources) alike, so the route resolves
+ * the KOT numbers of exactly the orders the move will then take lines from.
+ */
+function billLineMatcher(itemName: string, itemPrice: number): (it: unknown) => boolean {
+  const wantName = itemName.trim().toLowerCase();
+  return (raw: unknown) => {
+    const it = (raw ?? {}) as { name?: unknown; price?: unknown };
+    return String(it.name ?? "").trim().toLowerCase() === wantName &&
+      (!Number.isFinite(itemPrice) || itemPrice <= 0 || Math.abs((Number(it.price) || 0) - itemPrice) < 0.005);
+  };
+}
+
+/** One source order a move took lines off, with those lines WHOLE. */
+interface MovedLineSource {
+  order_id: string;
+  /** The source order's status column before the move. */
+  status: unknown;
+  barked_at: Date | string | null;
+  /** The source order's food as it stood before the move. */
+  food: Record<string, unknown>;
+  /** Every line taken off it, every key kept, price and quantity clamped. */
+  lines: Record<string, unknown>[];
+  /** Line id -> the Served/Preparing tuple it sat in, when the order had a split. */
+  splitLabels: Map<string, string> | null;
+}
+
+/**
  * WHY THIS RETURNS EVERY LINE AND NOT A SUMMARY — the money hole it closes.
  *
  * This helper matches on NAME, and matches on price only when the caller gave
@@ -15132,30 +15263,49 @@ async function removeItemFromTableOrders(
   itemPrice: number,
   client: PoolClient,
   mode: LineRemovalMode,
-): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number } | null> {
-  const orders = await runQuery<{ id: string; food: unknown }>(
-    `select id, food from "Orders"
+  /**
+   * A MOVE only (client item 4): where the lines go, stamped on the source as
+   * MOVED_LINES_KEY. `orderIdFor` names the destination order made for each
+   * source order.
+   */
+  moveTo?: { to_table: string; orderIdFor: (sourceOrderId: string) => string } | null,
+): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number; sources: MovedLineSource[] } | null> {
+  const orders = await runQuery<{ id: string; food: unknown; status: unknown; barked_at: Date | string | null }>(
+    `select id, food, status, barked_at from "Orders"
        where res_id = $1 and outlet_id = $2 and table_id = $3
          and ${stillOwesStatusSql()}
      order by created_at asc`,
     [context.res_id, context.outlet_id, tableId],
     client,
   );
-  const wantName = itemName.trim().toLowerCase();
-  const matches = (it: any) =>
-    String(it?.name ?? "").trim().toLowerCase() === wantName &&
-    (!Number.isFinite(itemPrice) || itemPrice <= 0 || Math.abs((Number(it?.price) || 0) - itemPrice) < 0.005);
+  const matches = billLineMatcher(itemName, itemPrice);
+
+  // A COMPED DISH IS NOT MOVED (client decision, 2026-09-17) — refused before a
+  // single row is touched. See comppedMoveRefusal for why the comp is reversed
+  // first rather than carried.
+  if (mode === "move") {
+    for (const o of orders) {
+      const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
+      const items: any[] = Array.isArray(f.items) ? f.items : [];
+      const hit = items.filter((it) => matches(it));
+      if (holdsComppedLine(hit)) {
+        throw new Error(comppedMoveRefusal(String(hit[0]?.name ?? itemName).trim() || itemName, String(f.table ?? "").trim() || "this table"));
+      }
+    }
+  }
 
   let removedName = "";
   let removedPrice = 0;
   let removedQty = 0;
   const removedLines: RemovedBillLine[] = [];
+  const sources: MovedLineSource[] = [];
 
   for (const o of orders) {
     const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
     const items: any[] = Array.isArray(f.items) ? f.items : [];
     const keep = items.filter((it) => !matches(it));
     if (keep.length === items.length) {continue;} // nothing removed from this order
+    const wholeLines: Record<string, unknown>[] = [];
     for (const it of items) {
       if (!matches(it)) {continue;}
       const lineName = String(it?.name ?? "Item");
@@ -15164,6 +15314,10 @@ async function removeItemFromTableOrders(
       const safe = clampLineCharge(it as { price?: unknown; quantity?: unknown });
       const lineQty = Math.max(1, Math.round(safe.quantity));
       removedLines.push({ name: lineName, price: safe.price, quantity: lineQty });
+      // The WHOLE line, for a move: the destination gets the dish as it was
+      // ordered — size, note, hold, menu id — at the price and quantity the
+      // money above was computed from, so the two can never disagree.
+      wholeLines.push(carriedLine((it ?? {}) as Record<string, unknown>, safe.price, lineQty));
       // The summary the existing callers and the audit line read. `price` is the
       // FIRST match rather than the last, so the name and the price in the audit
       // sentence describe the same line; `lines` is what money is computed from.
@@ -15171,9 +15325,18 @@ async function removeItemFromTableOrders(
       removedQty += lineQty;
     }
     let split = f.items_split;
+    let splitLabels: Map<string, string> | null = null;
     if (Array.isArray(split)) {
+      splitLabels = new Map();
+      for (const t of split) {
+        if (!Array.isArray(t) || !Array.isArray(t[1])) {continue;}
+        for (const it of t[1]) {
+          if (matches(it) && it?.id != null) {splitLabels.set(String(it.id), String(t[0] ?? ""));}
+        }
+      }
       split = split.map((t: any) => Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter((it: any) => !matches(it))] : t);
     }
+    sources.push({ order_id: o.id, status: o.status, barked_at: o.barked_at, food: { ...f }, lines: wholeLines, splitLabels });
     // OVER THE CHARGEABLE LINES (migration 034), as every other order writer
     // prices: summing a comped dish here charged it again the moment any other
     // dish came off the table. The quantity rule is unchanged.
@@ -15188,6 +15351,7 @@ async function removeItemFromTableOrders(
       mode,
       keep.length === 0,
       new Date().toISOString(),
+      moveTo ? { to_table: moveTo.to_table, to_order_id: moveTo.orderIdFor(o.id) } : null,
     );
     if (split !== undefined) {newFood.items_split = split;}
     if (keep.length === 0) {
@@ -15212,7 +15376,44 @@ async function removeItemFromTableOrders(
       [consolidated, openBill[0].id, context.res_id, context.outlet_id], client);
   }
   const value = round2(removedLines.reduce((sum, l) => sum + l.price * l.quantity, 0));
-  return { name: removedName || itemName, price: removedPrice, quantity: removedQty, lines: removedLines, value };
+  return { name: removedName || itemName, price: removedPrice, quantity: removedQty, lines: removedLines, value, sources };
+}
+
+/**
+ * WHICH ORDERS A MOVE-ITEM WILL TAKE LINES FROM, read BEFORE the move.
+ *
+ * POST /bills/move-item prints a docket for the moved dish under the number the
+ * kitchen already knows it by, and that number is found by the order's ticket
+ * key — a fingerprint of its item set, which stops matching the moment a line
+ * leaves. So the route asks this first, resolves the numbers, and only then
+ * moves (the same trap DELETE /orders/:id/items/:itemId reads around).
+ * Same statement and the same matcher as the move itself; a read only.
+ */
+export async function GetMovableLineSources(
+  restaurantId: string,
+  fromTable: string,
+  itemName: string,
+  itemPrice: number,
+): Promise<{ order_id: string; lines: Record<string, unknown>[] }[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tableId = await tableIdByName(context, fromTable);
+  if (!tableId) {return [];}
+  const rows = await runQuery<{ id: string; food: unknown }>(
+    `select id, food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and ${stillOwesStatusSql()}
+        order by created_at asc`,
+    [context.res_id, context.outlet_id, tableId],
+  );
+  const matches = billLineMatcher(itemName, itemPrice);
+  const out: { order_id: string; lines: Record<string, unknown>[] }[] = [];
+  for (const r of rows) {
+    const f = (parseJsonObject(r.food) ?? {}) as Record<string, unknown>;
+    const hit = (Array.isArray(f.items) ? (f.items as unknown[]) : []).filter((it) => matches(it));
+    if (hit.length === 0) {continue;}
+    out.push({ order_id: r.id, lines: hit.map((it) => ({ ...((it ?? {}) as Record<string, unknown>) })) });
+  }
+  return out;
 }
 
 // Admin: remove a wrongly-added item (by name+price) from a table's bill.
@@ -15289,8 +15490,10 @@ export async function RemoveBillItem(
     const tableId = await tableIdByName(context, tableName, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
-    const removed = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove");
-    if (!removed) {throw new Error("Item not found on this table's bill");}
+    const found = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove");
+    if (!found) {throw new Error("Item not found on this table's bill");}
+    // The whole source orders are the move's business, not this answer's.
+    const { sources: _sources, ...removed } = found;
     return { success: true, removed };
   });
 }
@@ -15703,15 +15906,47 @@ export async function SetClosedBillCustomerDetails(
 }
 
 // Move a wrongly-placed item from one table to another: removes it from the
-// source bill and appends it as a fresh order on the destination (occupying it
-// if needed).
+// source bill and carries it, whole, to the destination (occupying it if
+// needed).
+//
+// CLIENT ITEM 4 — "IMPLEMENTED CORRECTLY". This used to rebuild each moved line
+// as a bare { id, name, price, quantity } on ONE new "Moved item" order, so the
+// size ("(Half)"), the kitchen note, the course hold, the menu id the docket
+// routes by, who took the order and — for a comped dish — the comp itself were
+// all lost, and the dish landed with no KOT number in the "not sent to the
+// kitchen" group while the source ticket read "Cancelled · 0 item(s)". Now:
+//
+//   * a comped line is REFUSED (removeItemFromTableOrders; comppedMoveRefusal);
+//   * each SOURCE order gets its own destination order, carrying its lines
+//     whole (carriedLine), its order-taker, channel and note, and `moved_from`
+//     naming the table, the order and the KOT number(s) it was cooked under;
+//   * the destination keeps the source's stage (Served stays Served, Pending
+//     stays Pending, anything else is Preparing) and the source's bark time;
+//   * the source records what left it and where (MOVED_LINES_KEY).
+//
+// `kotNosByOrder` is what the route resolved BEFORE the move (see
+// GetMovableLineSources): the number the kitchen knows each source ticket by.
+// The route prints the moved dish's docket under it once this has committed.
 export async function MoveBillItem(
   restaurantId: string,
   fromTable: string,
   toTable: string,
   itemName: string,
   itemPrice: number,
-): Promise<{ success: true; moved: { name: string; price: number; quantity: number } }> {
+  opts?: {
+    /** Who pressed it, recorded on the destination's `moved_from`. */
+    by?: string | null;
+    kotNosByOrder?: ReadonlyMap<string, readonly number[]> | null;
+  },
+): Promise<{
+  success: true;
+  /** The removal's summary, the shape this route has always answered with. */
+  moved: { name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number };
+  /** Every dish that moved: name, size, quantity. Never a price. */
+  items: MovedDish[];
+  /** One per source order: the order made on the destination for its lines. */
+  destinations: { order_id: string; source_order_id: string; kot_nos: number[]; items: MovedDish[] }[];
+}> {
   return withTransaction(async (client) => {
     await ensureTableOccupancyColumns(client);
     await ensureOrderBarkColumns();
@@ -15724,14 +15959,27 @@ export async function MoveBillItem(
     await assertBillEditable(context, fromId, client);
     await assertBillEditable(context, toId, client);
 
-    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client, "move");
+    // One destination order per source order, named before the removal so the
+    // source's record of where its lines went can carry the id.
+    const newIds = new Map<string, string>();
+    const orderIdFor = (sourceOrderId: string): string => {
+      const known = newIds.get(sourceOrderId);
+      if (known) {return known;}
+      const fresh = randomUUID();
+      newIds.set(sourceOrderId, fresh);
+      return fresh;
+    };
+    const at = new Date().toISOString();
+    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client, "move", {
+      to_table: toTable.trim(),
+      orderIdFor,
+    });
     if (!moved) {throw new Error("Item not found on the source table");}
 
     // Ensure the destination table is occupied so the order/bill attaches.
     await runQuery(`update "Tables" set is_occupied = true where id = $1 and res_id = $2 and outlet_id = $3`,
       [toId, context.res_id, context.outlet_id], client);
 
-    const newOrderId = randomUUID();
     // EVERY LINE THAT LEFT THE SOURCE, AT THE PRICE IT LEFT AT.
     //
     // This used to be a single line priced `moved.price x moved.quantity`, which
@@ -15741,28 +15989,49 @@ export async function MoveBillItem(
     // left the source at their real prices and arrived as two of the cheaper
     // one. See removeItemFromTableOrders' header for the money that went
     // missing. A move must CONSERVE: what the destination gains is exactly what
-    // the source lost, line for line.
-    const movedItems = moved.lines.map((l) => ({
-      id: randomUUID(), name: l.name, price: l.price, quantity: l.quantity,
-    }));
-    const lineTotal = round2(movedItems.reduce((sum, l) => sum + l.price * l.quantity, 0));
-    const food = {
-      id: newOrderId,
-      table: toTable.trim(),
-      customer: "Moved item",
-      items: movedItems,
-      subtotal: lineTotal,
-      total: lineTotal,
-      taxes: [],
-      applyServiceCharge: false,
-      status: "Preparing",
-    };
-    // A moved item was already barked/cooking on its source table — keep it so.
-    await runQuery(
-      `insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, barked_at) values ($1, now(), $2, $3, $4::json, $5, 1, now())`,
-      [newOrderId, context.res_id, context.outlet_id, JSON.stringify(food), toId],
-      client,
-    );
+    // the source lost, line for line — `source.lines` carry the same clamped
+    // price and quantity `moved.lines` summed.
+    const destinations: { order_id: string; source_order_id: string; kot_nos: number[]; items: MovedDish[] }[] = [];
+    for (const source of moved.sources) {
+      if (source.lines.length === 0) {continue;}
+      const newOrderId = orderIdFor(source.order_id);
+      const statusCode = movedOrderStatusCode(source.status);
+      const kotNos = [...(opts?.kotNosByOrder?.get(source.order_id) ?? [])];
+      const labels = source.splitLabels;
+      const food = movedDestinationFood({
+        orderId: newOrderId,
+        toTable: toTable.trim(),
+        lines: source.lines,
+        source: source.food,
+        statusLabel: fromOrderStatusCode(statusCode),
+        movedFrom: {
+          table: String(source.food.table ?? "").trim() || fromTable.trim(),
+          order_id: source.order_id,
+          kot_nos: kotNos,
+          at,
+          by: String(opts?.by ?? "").trim() || null,
+        },
+        splitLabelOf: labels ? (line) => labels.get(String(line.id ?? "")) ?? null : null,
+      });
+      // The source's bark time: the dish was already on the kitchen's clock (or
+      // was not), and moving it changes neither. A Served order with no bark
+      // time (written before the column existed) is stamped now, because an
+      // un-barked order may not stand past the kitchen queue.
+      const barkedAt = source.barked_at
+        ? new Date(source.barked_at).toISOString()
+        : (statusCode === 2 ? at : null);
+      await runQuery(
+        `insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, barked_at) values ($1, now(), $2, $3, $4::json, $5, $6, $7)`,
+        [newOrderId, context.res_id, context.outlet_id, JSON.stringify(food), toId, statusCode, barkedAt],
+        client,
+      );
+      destinations.push({
+        order_id: newOrderId,
+        source_order_id: source.order_id,
+        kot_nos: kotNos,
+        items: source.lines.map(movedDish),
+      });
+    }
 
     const toBill = await runQuery<{ id: string }>(
       `select id from "Bills" where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null order by created_at desc limit 1`,
@@ -15774,7 +16043,13 @@ export async function MoveBillItem(
       await runQuery(`update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4`,
         [consolidated, toBill[0].id, context.res_id, context.outlet_id], client);
     }
-    return { success: true, moved };
+    const { sources: _sources, ...summary } = moved;
+    return {
+      success: true,
+      moved: summary,
+      items: destinations.flatMap((d) => d.items),
+      destinations,
+    };
   });
 }
 
@@ -16671,6 +16946,10 @@ export async function MoveTableParty(
   moved_session: boolean;
   /** True when a waiter assignment travelled with the party. */
   moved_waiter: boolean;
+  /** The ids of the orders that travelled — for the route to name their KOTs. */
+  moved_order_ids: string[];
+  /** Their dishes (client item 4): name, size, quantity. Never a price. */
+  moved_items: MovedDish[];
 }> {
   const freed: FreedTable = { context: null, tableId: null };
   const out = await withTransaction(async (client) => {
@@ -16872,6 +17151,8 @@ export async function MoveTableParty(
       moved_bill: movedBill.length > 0,
       moved_session: movedSession,
       moved_waiter: movedWaiter.length > 0,
+      moved_order_ids: orders.map((o) => o.id),
+      moved_items: orders.flatMap((o) => orderDishes(parseJsonObject(o.food) ?? {})),
     };
   });
   // The party LEFT the source: tidy its family (client item 6). Moving the
@@ -16945,11 +17226,21 @@ async function moveSeatedBookingsBetweenTables(
  * about that is a printing decision. This returns the facts that decision needs
  * (both table names and ids, the outlet, the order's lines) and the route calls
  * the printer. See POST /tables/move-order.
+ *
+ * CLIENT ITEM 4 — THE DISHES, AND WHERE THE TICKET CAME FROM. The result names
+ * every dish on the ticket (never a price), so the route's audit line and both
+ * clients' confirmations can say what moved; and the move is appended to the
+ * order's own `food.moves` in the same update, so GET /orders can tell the
+ * table sheet "KOT 65 · from 12". A json key on the existing blob: no DDL.
  */
 export async function MoveOrderToTable(
   restaurantId: string,
   orderId: string,
   toTable: string,
+  opts?: {
+    /** Who pressed it, recorded on the move. */
+    by?: string | null;
+  },
 ): Promise<{
   success: true;
   order_id: string;
@@ -16966,8 +17257,12 @@ export async function MoveOrderToTable(
    *  is still seated - this is the "seated, nothing ordered" state, said out
    *  loud so the caller can tell staff rather than let them find it. */
   source_now_empty: boolean;
+  /** Every dish on the moved ticket: name, size, quantity. Never a price. */
+  items: MovedDish[];
+  /** The KOT number(s) printed for this order, read after the move. Empty when none. */
+  kot_nos: number[];
 }> {
-  return withTransaction(async (client) => {
+  const moved = await withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
     await ensureTableSessionsTable(client);
@@ -17020,8 +17315,13 @@ export async function MoveOrderToTable(
     await assertBillEditable(context, order.table_id, client);
     await assertBillEditable(context, dst.id, client);
 
-    const food = parseJsonObject(order.food) ?? {};
-    food.table = dst.table_name;
+    const stored = parseJsonObject(order.food) ?? {};
+    const food = appendOrderMove(stored, {
+      from_table: src?.table_name ?? "",
+      to_table: dst.table_name,
+      at: new Date().toISOString(),
+      by: String(opts?.by ?? "").trim() || null,
+    });
     await runQuery(
       `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
       [dst.id, JSON.stringify(food), order.id, context.res_id, context.outlet_id],
@@ -17068,8 +17368,16 @@ export async function MoveOrderToTable(
       seated_destination: seatedDestination,
       total_amt: total,
       source_now_empty: Number(remaining[0]?.n ?? 0) === 0,
+      items: orderDishes(stored),
     };
   });
+  // AFTER the transaction, so the read never holds a second pooled connection
+  // while the move's is open. Never fails the move: an unreadable number is no
+  // number.
+  const kotNos = await GetOrderKotNumbers(restaurantId, [moved.order_id])
+    .then((m) => m.get(moved.order_id) ?? [])
+    .catch(() => [] as number[]);
+  return { ...moved, kot_nos: kotNos };
 }
 
 /** Re-sum a table's open bill from its active orders, creating the bill row if
@@ -23175,6 +23483,14 @@ export async function SetOrderStatus(
   restaurantId: string,
   orderId: string,
   status: string,
+  opts?: {
+    /**
+     * Who is asking, for client item 3: a waiter-only login may not cancel an
+     * order the kitchen has been told about (mayCancelTicketed). Absent = no
+     * role rule, which is every caller that is not a route acting for a person.
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<SetOrderStatusResult> {
   const context = await requireRestaurantContext(restaurantId);
   const code = toOrderStatusCode(status);
@@ -23183,8 +23499,19 @@ export async function SetOrderStatus(
   // Re-cancelling an already-cancelled order is a clean idempotent NO-OP: the
   // order is already where the caller wants it, so there is nothing to refuse
   // and nothing to write (and no second undo envelope to record).
+  //
+  // BEFORE the waiter check below, deliberately: an offline outbox replay of a
+  // cancel that already landed must stay a harmless 200, not turn into a 403
+  // that parks a red chip for a write that succeeded.
   if (previousCode === 5 && code === 5) {
     return { ok: true, changed: false, previous_status: "Cancelled" };
+  }
+  // CLIENT ITEM 3 — THE CHECK LIVES HERE, beside the read it depends on, and
+  // before anything is written: a refusal flips no status, writes no void row
+  // and prints no slip (the route only reaches those after this returns).
+  const waiterCancel = code === 5 && opts?.actor != null && isWaiterOnly(opts.actor);
+  if (code === 5 && opts?.actor != null && !mayCancelTicketed(opts.actor, previousCode)) {
+    throw new CancelNeedsSeniorError(orderId);
   }
   // Cancelled is terminal; Paid/Closed are locked. Any other transition off a
   // cancelled order is refused here, which is what makes PATCH
@@ -23193,16 +23520,24 @@ export async function SetOrderStatus(
   // An un-barked order can be accepted (Preparing) or cancelled, but never
   // advanced past the kitchen queue — the bark is the step in between.
   if (code === 2 || code === 3) {await assertOrderBarked(context, orderId);}
+  // A waiter's decline is allowed ONLY because the order is still Pending, so
+  // the write says so: if the order was accepted to the kitchen between the
+  // read above and this statement, it matches nothing and is refused below
+  // rather than cancelling a ticket that has just printed.
   const rows = await runQuery<{ id: string }>(
     `
       update "Orders"
       set status = $1,
           food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
       where id = $3 and res_id = $4 and outlet_id = $5
+        and ($6::text is null or coalesce(status::text, '1') = $6::text)
       returning id
     `,
-    [code, status, orderId, context.res_id, context.outlet_id],
+    [code, status, orderId, context.res_id, context.outlet_id, waiterCancel ? String(PENDING_ORDER_STATUS_CODE) : null],
   );
+  if (rows.length === 0 && waiterCancel && (await readOrderStatusCode(context, orderId)) !== null) {
+    throw new CancelNeedsSeniorError(orderId);
+  }
   if (rows.length > 0) {
     try { await applyTimingForStatus(context, orderId, status); } catch (err) { logger.warn({ err }, "timing status hook failed"); }
   }
@@ -33987,6 +34322,17 @@ export async function GetKotNumbersForOrders(
 }
 
 /**
+ * The KOT numbers printed for some orders, for a caller that holds a restaurant
+ * id rather than a resolved context — the routes' refusal sentences and move
+ * audit lines. Same read, same degradation (an empty map), scoped to the
+ * caller's outlet.
+ */
+export async function GetOrderKotNumbers(restaurantId: string, orderIds: string[]): Promise<Map<string, number[]>> {
+  const context = await requireRestaurantContext(restaurantId);
+  return GetKotNumbersForOrders(context.res_id, isAllOutlets() ? null : context.outlet_id, orderIds);
+}
+
+/**
  * Every KOT number that fed one bill, in allocation order — the "Token No.: 214,
  * 218, 236, …" line the client photographed on a real printed GAIA bill.
  *
@@ -40714,13 +41060,37 @@ export type VoidOrderWithReasonResult =
 export async function VoidOrderWithReason(
   restaurantId: string,
   input: Omit<RecordOrderVoidInput, "scope" | "item_id" | "item_name">,
+  opts?: {
+    /**
+     * The SESSION making the void, for client item 3 — not the authoriser named
+     * in the body. A waiter-only login is refused a ticketed order here even
+     * with a manager's name and a "Void Orders With Reason" grant: the client
+     * asked for the waiter to lose Cancel KOT, and this is the route the app
+     * takes for it when the grant is held.
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<VoidOrderWithReasonResult> {
   const orderId = String(input.order_id ?? "").trim();
   if (!orderId) {throw new Error("order id is required");}
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
-    const previousCode = await readOrderStatusCode(context, orderId, client);
+    // `for update` when the role rule applies: the verdict rests on this read,
+    // so the row must not be accepted to the kitchen between it and the write.
+    const locked = opts?.actor != null && isWaiterOnly(opts.actor);
+    const previousCode = locked
+      ? await runQuery<{ status: number | string | null }>(
+        `select status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1 for update`,
+        [orderId, context.res_id, context.outlet_id],
+        client,
+      ).then((rows) => (rows[0] ? Number(rows[0].status ?? 0) : null))
+      : await readOrderStatusCode(context, orderId, client);
     if (previousCode === null) {return { ok: false };}
+    // CLIENT ITEM 3. Inside the transaction and before the ledger write, so a
+    // refusal rolls back to nothing: no void row, no status flip, no slip.
+    if (opts?.actor != null && previousCode !== 5 && !mayCancelTicketed(opts.actor, previousCode)) {
+      throw new CancelNeedsSeniorError(orderId);
+    }
     // Cancelled is terminal and Paid/Closed are locked — the same guard, and the
     // same messages, every other status edit refuses on.
     await assertOrderStatusEditable(context, orderId, client);

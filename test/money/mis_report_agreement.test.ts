@@ -1992,6 +1992,29 @@ describe("Void KOT: a ticket emptied from the bill", () => {
     expectRowsAddUp(voids);
   });
 
+  // CLIENT ITEM 4 — the dish now arrives WHOLE on its own order, and the source
+  // records what left it (moved_items). Neither may make the food count twice:
+  // Item Wise reads each order's `items`, and the source's list of moved lines
+  // is read by no report at all. (The move is dated inside the window, as a real
+  // one is on the day it happens — Item Wise buckets by when the order was made.)
+  test("Move item: Item Wise counts the moved dish once, at the same money, before and after", async () => {
+    useFixtureDb(floorDb());
+    const before = await db.GetItemWiseReport(RID, { ...W, limit: 500 });
+    jest.useFakeTimers({ doNotFake: ["nextTick", "setImmediate", "setTimeout", "setInterval", "queueMicrotask", "clearTimeout", "clearInterval", "clearImmediate"] });
+    jest.setSystemTime(new Date("2026-06-10T13:30:00.000Z"));
+    try {
+      await db.MoveBillItem(RID, "31A", "31", "Puchka", 200);
+    } finally {
+      jest.useRealTimers();
+    }
+    const after = await db.GetItemWiseReport(RID, { ...W, limit: 500 });
+    const puchka = (r: typeof before) => r.rows.find((x) => x.name === "Puchka");
+    expect(puchka(before)).toMatchObject({ qty: 1, gross_amount: 200 });
+    expect(puchka(after)).toMatchObject({ qty: puchka(before)?.qty, gross_amount: puchka(before)?.gross_amount });
+    expect(after.totals.gross_amount).toBe(before.totals.gross_amount);
+    expect(after.totals.qty).toBe(before.totals.qty);
+  });
+
   test("a ticket that lost one dish to Remove and its last to Move still reports the removed dish", async () => {
     useFixtureDb(floorDb());
     await db.RemoveBillItem(RID, "T14", "Dal", 400);

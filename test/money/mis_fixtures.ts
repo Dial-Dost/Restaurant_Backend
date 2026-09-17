@@ -1217,7 +1217,9 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   if (/^select (admin_approved_at|id) from "Bills" where table_id = \$1 and res_id = \$2 and outlet_id = \$3 and closed_at is null/i.test(q)) {
     return [];
   }
-  if (/^select id, food from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and /i.test(q)) {
+  // The bill-item writers read status and bark time too (client item 4: a moved
+  // dish keeps its stage and its kitchen clock); the move pre-read does not.
+  if (/^select id, food(, status, barked_at)? from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and /i.test(q)) {
     // The still-owes predicate, read out of the SQL rather than assumed: a
     // settled or cancelled order must never lose a line to a bill edit.
     const settled = (/coalesce\(status::text, '1'\) not in \(([^)]*)\)/i.exec(q)?.[1] ?? "")
@@ -1229,7 +1231,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
         && tableIdOf(o.table_name ?? "") === params[2]
         && !settled.includes(String(o.status)))
       .sort((a, z) => new Date(a.created_at).getTime() - new Date(z.created_at).getTime())
-      .map((o) => ({ id: o.id, food: foodOf(o) }));
+      .map((o) => ({ id: o.id, food: foodOf(o), status: o.status ?? 1, barked_at: new Date(o.created_at) }));
   }
   if (/^update "Orders" set food = \$4::json(, status = 5)? where id = \$1 and res_id = \$2 and outlet_id = \$3$/i.test(q)) {
     const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
@@ -1315,7 +1317,8 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       outlet_id: String(params[2]),
       table_name: tableName,
       created_at: new Date().toISOString(),
-      status: 1,
+      // The stage the writer chose (a moved dish keeps its source's).
+      status: Number(params[5] ?? 1),
       items: Array.isArray(food.items) ? (food.items as FixtureOrderItem[]) : [],
     });
     return [];

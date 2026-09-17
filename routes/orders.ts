@@ -5,6 +5,7 @@
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { AddOrder, AddTakeawayOrder, Audit_log_category, BARK_ORDER_ACTION_ID, BarkOrder, DeleteOrder, FIRE_COURSE_ACTION_ID, FireOrderItems, GetOrderKotContext, GetOrders, GetOrdersScope, IsOrderItemServed, OrderTimingAction, RecordOrderVoid, SetOrderStatus, UpdateOrderItemsSplit, applyMenuPriceFloor } from "../database_supabase.js";
+import { isCancelNeedsSeniorError } from "../cancel_authority.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
 import { autoPrintOrderKot, dispatchCancellationKot, type KotLine } from "../kot_print.js";
 import { idempotent } from "../idempotency.js";
@@ -13,7 +14,8 @@ import { logger } from "../observability.js";
 import { hidesPrices, redactOrderList } from "../price_scope.js";
 import { emitRestaurant } from "../realtime.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, refuseOrderOnPrintedBill, reprintNeededFields, validateAction } from "./_shared.js";
+import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, refuseOrderOnPrintedBill, refuseTicketedCancel, reprintNeededFields, validateAction } from "./_shared.js";
+import type { RoleScopeInput } from "../role_scope.js";
 
 
 // --- Order/item preparation timers (pause/resume, mark item served) ---------
@@ -83,6 +85,15 @@ async function handleTiming(req: Request, res: Response, action: "pause" | "resu
 		logger.error({ err }, "order_timing_failed");
 		res.status(400).json({ error: String(err?.message ?? "Unable to update timer") });
 	}
+}
+
+/**
+ * The session's role inputs, for the data layer's client-item-3 rule
+ * (mayCancelTicketed). Passed down rather than judged here because the verdict
+ * needs the order's status as the writer reads it — see cancel_authority.ts.
+ */
+function actorOf(req: Request): RoleScopeInput {
+	return { role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions };
 }
 
 export function registerOrderRoutes(app: Express): void {
@@ -159,6 +170,12 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 	// mobile before it becomes a CRM identity.
 	const orderPhone = optionalMobile10(res, orderBody.customer_phone);
 	if (!orderPhone.ok) {return;}
+	// THE SAME MONEY GATE AS PATCH /orders/:id/status. This route is also the
+	// dashboard's upsert, and AddOrder writes whatever status the body names —
+	// so "Paid" or "Closed" through here settled an order with no settle
+	// authority at all (found while closing client item 3's side door below).
+	const upsertStatus = typeof orderBody.status === "string" ? orderBody.status.trim().toLowerCase() : "";
+	if (["paid", "closed"].includes(upsertStatus) && !(await enforceSettleAuthority(req, res))) {return;}
 
 	try {
 		const body: Record<string, unknown> = { ...orderBody, ...(orderPhone.value ? { customer_phone: orderPhone.value } : {}) };
@@ -174,7 +191,9 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 			upsert: { orderId: typeof body.id === "string" ? body.id : null, items: body.items },
 		});
 		if (guard.refused) {return;}
-		const result = await AddOrder(restaurantId, body);
+		// CLIENT ITEM 3 — the upsert is a door to "Cancelled" too; AddOrder
+		// refuses a waiter-only login on a ticketed order before writing.
+		const result = await AddOrder(restaurantId, body, { actor: actorOf(req) });
 		// Best-effort guest registration: orders that carry a phone create/match a
 		// Customers row and get cust_id stamped (CRM visit tracking).
 		await linkOrderToCustomer(restaurantId, result.id, body.customer, orderPhone.value);
@@ -209,6 +228,7 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 			...reprintNeededFields(guard),
 		});
 	} catch (error: any) {
+		if (isCancelNeedsSeniorError(error)) { await refuseTicketedCancel(req, res, error); return; }
 		logger.error({ err: error }, "add_order_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to add order") });
 	}
@@ -308,7 +328,10 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 	const cancelReason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
 	const cancelKind = typeof req.body?.void_kind === "string" ? req.body.void_kind.trim() : "";
 	try {
-		const result = await SetOrderStatus(restaurantId, orderId, status);
+		// CLIENT ITEM 3 — the session's roles travel with the write, and
+		// SetOrderStatus refuses a waiter-only cancel of a ticketed order before
+		// it writes anything: no status flip, no void row, no slip.
+		const result = await SetOrderStatus(restaurantId, orderId, status, { actor: actorOf(req) });
 		if (!result.ok) { res.status(404).json({ error: "Order not found" }); return; }
 		// Re-cancelling an order that is already Cancelled is an idempotent no-op:
 		// nothing was written, so nothing is logged (and no second undo envelope
@@ -474,6 +497,7 @@ app.patch("/orders/:id/status", validateAction("4ad474d4-5230-449c-874f-6a238b83
 				: {}),
 		});
 	} catch (error: any) {
+		if (isCancelNeedsSeniorError(error)) { await refuseTicketedCancel(req, res, error); return; }
 		logger.error({ err: error }, "set_order_status_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to update order status") });
 	}
@@ -723,8 +747,13 @@ app.delete('/orders/:id/items/:itemId', validateAction("4ad474d4-5230-449c-874f-
 			await UpdateOrderItemsSplit(restaurantId, orderId, split as any[], {
 				actions: req.auth?.actions ?? [],
 				closeBillPermission: PERM_CLOSE_BILL,
+				// CLIENT ITEM 3 — a waiter-only login does not take a dish off a
+				// ticket the kitchen holds; refused before anything is written, so
+				// no void row and no CANCELLED slip follow.
+				actor: actorOf(req),
 			});
 		} catch (e: unknown) {
+			if (isCancelNeedsSeniorError(e)) { await refuseTicketedCancel(req, res, e); return; }
 			if (isDiscountAuthorityError(e)) {
 				// AUDITED EVEN THOUGH NOTHING HAPPENED, exactly as the refused release
 				// is. An attempt to walk a table's value off the bill is precisely the

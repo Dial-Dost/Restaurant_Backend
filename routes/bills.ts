@@ -6,13 +6,15 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState, ClosedBillDetail, OpenBillChargeConfig } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMovableLineSources, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type ReceiptOptions, type SplitReceiptPart } from "../escpos.js";
 import { ncSettlementPrintJobId } from "../bill_print_state.js";
 import { isNcSettleMethod } from "../payment_methods.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
+import { printKotItemMove, resolveMoveSourceKots, type KotMoveOutcome } from "../kot_move.js";
+import { moveItemAuditSentence } from "../order_moves.js";
 import { kotStamp } from "../kot_numbers.js";
 import { logger } from "../observability.js";
 import { hidesPrices, redactOpenBillPage } from "../price_scope.js";
@@ -22,7 +24,7 @@ import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
-import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, moveReprintFields, nextPartyAfterPrint, nextPartyPrintMessage, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -2057,7 +2059,27 @@ app.post('/bills/remove-item', validateBody(sBillRemoveItem), async (req: Reques
 	}
 });
 
-// Move a wrongly-placed item from one table to another (front-of-house fix).
+/*
+	Move a wrongly-placed item from one table to another (front-of-house fix).
+
+	CLIENT ITEM 4 — "IMPLEMENTED CORRECTLY", in four parts:
+
+	  * BOTH BILLS. The printed-bill rule is applied to the source as well as the
+	    destination before anything is written (write "move_off" / "move"): a
+	    waiter-only login is refused when either paper has been printed, a
+	    senior role is told which to reprint (moveReprintFields).
+	  * THE WHOLE DISH. MoveBillItem carries each line whole — size, note, hold,
+	    order-taker — and refuses a comped one ("reverse the comp first"),
+	    answered 400 with that sentence like every other refusal here.
+	  * THE KITCHEN. The number the pass knows each dish by is resolved BEFORE
+	    the move (the source ticket's key stops matching once a line leaves),
+	    and afterwards a docket for the moved dish prints on the new table under
+	    that number, headed "*** MOVED FROM 31A ***" (kot_move.ts). Never
+	    ticketed, nothing prints.
+	  * THE RECORD. The audit line names the dish, the quantity and the KOT:
+	    "Moved item NOT YOUR PUCHKA x1 from 31A (KOT-35) to 31" — keeping the
+	    "Moved item " prefix the Bill Edit report classifies on.
+*/
 app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), validateBody(sBillMoveItem), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -2074,10 +2096,42 @@ app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 		// the item belongs to somebody seated), a senior role is told to reprint.
 		const guard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: toTable, guest: false, write: "move" });
 		if (guard.refused) {return;}
-		const result = await MoveBillItem(restaurantId, fromTable, toTable, itemName, price);
+		const sourceGuard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: fromTable, guest: false, write: "move_off" });
+		if (sourceGuard.refused) {return;}
+		// READ BEFORE THE MOVE: which tickets the dish is on, and their numbers.
+		// Best-effort — an unreadable number costs the docket, never the move.
+		const sources = await GetMovableLineSources(restaurantId, fromTable, itemName, price).catch(() => []);
+		const kotNosByOrder = await resolveMoveSourceKots(restaurantId, sources);
+		const result = await MoveBillItem(restaurantId, fromTable, toTable, itemName, price, {
+			by: extractEmployeeUsername(req),
+			kotNosByOrder,
+		});
+		// The dish's docket on its new table, one per destination order. After the
+		// commit, and it never fails the move (printKotItemMove never throws).
+		const prints: (KotMoveOutcome & { order_id: string })[] = [];
+		for (const dest of result.destinations) {
+			const outcome = await printKotItemMove({
+				restaurantId, orderId: dest.order_id, previousTableName: fromTable, kotNo: dest.kot_nos[0] ?? null,
+			});
+			prints.push({ ...outcome, order_id: dest.order_id });
+		}
+		const kotNos = [...new Set(result.destinations.flatMap((d) => d.kot_nos))];
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
-		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Moved item ${result.moved.name} from ${fromTable} to ${toTable}`, Audit_log_category.Bill, { from: fromTable, to: toTable, item: itemName }); } catch {/* ignore */}
-		res.json({ ...result, ...reprintNeededFields(guard) });
+		try {
+			await log_audit(
+				req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				moveItemAuditSentence({ dishes: result.items, fallbackName: result.moved.name, fromTable, toTable, kotNos }),
+				Audit_log_category.Bill,
+				{
+					from: fromTable, to: toTable, item: itemName,
+					items: result.items, kot_nos: kotNos,
+					order_ids: result.destinations.map((d) => d.order_id),
+					source_order_ids: result.destinations.map((d) => d.source_order_id),
+					prints,
+				},
+			);
+		} catch {/* ignore */}
+		res.json({ ...result, prints, kot_nos: kotNos, ...moveReprintFields(guard, sourceGuard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'move_bill_item_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to move item') });
