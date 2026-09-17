@@ -884,6 +884,119 @@ async function main() {
   await ApproveBillPaymentByAdmin(RES_ID, uOrder.id, "admin");
   check("the bill part-paid in it still CLOSES from its ledger after the undo", await billClosed("T19"));
 
+  // ---- NC SETTLE (migration 052): a whole bill closed as non-chargeable -----
+  //
+  // What the fixture suites cannot prove: one REAL transaction, a real
+  // FOR UPDATE between two settles racing for the same table, the ledger's own
+  // GENERATED value, and a re-open that puts the money back. Its own tables
+  // (AddTable), so this section changes nothing any section above relies on.
+  console.log("\n[nc settle] a whole bill given away closes at 0.00 as NC, once");
+  const ncActor = { username: "manager1", authorised_by_username: "manager1" };
+  const billCount = async (): Promise<number> =>
+    Number((await raw.query(`select count(*)::int n from "Bills" where res_id=$1`, [RES_ID])).rows[0].n);
+  const ncRowsOf = async (orderId: string): Promise<any[]> => (await raw.query(
+    `select scope, bill_id, settle_group, value, reversed_at from "OrderItemNonChargeable"
+      where res_id=$1 and order_id=$2 order by item_name`,
+    [RES_ID, orderId],
+  )).rows;
+  for (const t of ["NC1", "NC2", "NC3"]) {await db.AddTable(RES_ID, t, 4);}
+
+  await OccupyTable(RES_ID, "NC1", 3, null, null);
+  const ncA = await AddOrder(RES_ID, {
+    table: "NC1", customer: "Owner guests", status: "Preparing",
+    items: [ITEM("a1", "Tea", 50), { id: "a2", name: "Cake", price: 80, quantity: 2 }], subtotal: 210, total: 210,
+  });
+  const ncQuote = await GetBillForTable(RES_ID, "NC1");
+  check("the table owes money before the NC settle", ncQuote.grand_total > 0 && ncQuote.subtotal === 210);
+
+  const billsBefore = await billCount();
+  let moved = false;
+  try {
+    await db.SettleBillAsNonChargeable(RES_ID, {
+      order_id: ncA.id, nc_kind: "complimentary", reason: "the owner's guests", actor: ncActor, expected_value: 200,
+    });
+  } catch (e: any) { moved = e?.code === "quote_moved"; }
+  check("a quote that moved is refused", moved);
+  check("...before anything was written: no bill number burnt, no comp recorded",
+    (await billCount()) === billsBefore && (await ncRowsOf(ncA.id)).length === 0);
+
+  const race = await Promise.allSettled([1, 2].map(() => db.SettleBillAsNonChargeable(RES_ID, {
+    order_id: ncA.id, nc_kind: "complimentary", reason: "the owner's guests", actor: ncActor, expected_value: 210,
+  })));
+  const raceSaid = race.map((r) => (r.status === "fulfilled"
+    ? (r.value.already === true ? "already" : "settled")
+    : `rejected: ${String(r.reason?.message ?? r.reason)}`)).join(" / ");
+  const won = race.filter((r): r is PromiseFulfilledResult<any> => r.status === "fulfilled" && r.value.already !== true);
+  const replayed = race.filter((r) => r.status === "fulfilled" && r.value.already === true);
+  check(`two settles racing for one table: exactly one settles, the other answers 'already' (${raceSaid})`,
+    won.length === 1 && replayed.length === 1);
+  const winner = won[0].value;
+  const ncBillRow = (await raw.query(
+    `select payment_method, total_amt, closed_at, admin_approved_at from "Bills" where id=$1`, [winner.bill_id],
+  )).rows[0];
+  check("the bill closed at 0.00 as NC, approved and closed in the same act",
+    ncBillRow.payment_method === "NC" && Number(ncBillRow.total_amt) === 0
+      && ncBillRow.closed_at !== null && ncBillRow.admin_approved_at !== null);
+  const ncRows = await ncRowsOf(ncA.id);
+  check("every line went into the ledger: scope 'bill', this bill, one settle group",
+    ncRows.length === 2 && ncRows.every((r) => r.scope === "bill" && r.bill_id === winner.bill_id
+      && !!r.settle_group && r.settle_group === ncRows[0].settle_group));
+  check("...at the pre-tax line value Postgres generated, which is what the settle reports",
+    ncRows.reduce((s, r) => s + Number(r.value), 0) === 210 && winner.nc_value === 210);
+  check("what the guest would have paid is the grand total the table was quoting",
+    Math.abs(winner.would_have_charged - ncQuote.grand_total) < 0.005);
+  check("the table is freed and none of its orders still owes",
+    !(await tableOccupied("NC1")) && (await orderCounts("NC1")).open === 0);
+
+  const reopened = await db.ReopenBill(RES_ID, winner.bill_id, null, "manager1");
+  check("re-opening an NC bill undoes the settle whole",
+    reopened.nc_reversed?.lines === 2 && reopened.bill.payment_method === null && reopened.bill.total_amt === 210);
+  const afterNcReopen = await GetBillForTable(RES_ID, "NC1");
+  check("...the dishes are chargeable again, at the old money", afterNcReopen.subtotal === 210 && afterNcReopen.nc_total === 0);
+  check("...and the ledger keeps both rows, stamped reversed",
+    (await ncRowsOf(ncA.id)).filter((r) => r.reversed_at !== null).length === 2);
+  await ConfirmBillPaymentByWaiter(RES_ID, ncA.id, "admin", "Cash");
+  await ApproveBillPaymentByAdmin(RES_ID, ncA.id, "admin");
+  const repaid = (await raw.query(`select payment_method, total_amt from "Bills" where id=$1`, [winner.bill_id])).rows[0];
+  check("...and it settles again as the money it now is, under Cash",
+    repaid.payment_method === "Cash" && Math.abs(Number(repaid.total_amt) - afterNcReopen.grand_total) < 0.005);
+
+  // Installed 2.0.0 tills: every line comped one by one, then a zero-rupee UPI settle.
+  await OccupyTable(RES_ID, "NC2", 2, null, null);
+  const ncB = await AddOrder(RES_ID, {
+    table: "NC2", customer: "Staff", status: "Preparing", items: [ITEM("b1", "Soup", 90)], subtotal: 90, total: 90,
+  });
+  await MarkOrderItemNonChargeable(RES_ID, {
+    order_id: ncB.id, item_id: "b1", nc_kind: "staff_meal", reason: "the chef's lunch", actor: ncActor,
+  });
+  const zero = await GetBillForTable(RES_ID, "NC2");
+  check("a fully comped table owes nothing", zero.grand_total === 0 && zero.nc_total === 90);
+  const confirmedZero = await ConfirmBillPaymentByWaiter(RES_ID, ncB.id, "admin", "Upi");
+  check("a zero-rupee UPI settle of it is stored as NC (decision 6)", confirmedZero.payment_method === "NC");
+  await ApproveBillPaymentByAdmin(RES_ID, ncB.id, "admin");
+  check("...and closes like any other", await billClosed("NC2"));
+
+  // The refusals, against real rows.
+  await OccupyTable(RES_ID, "NC3", 2, null, null);
+  const ncC = await AddOrder(RES_ID, {
+    table: "NC3", customer: "Guest", status: "Preparing", items: [ITEM("c1", "Dosa", 120)], subtotal: 120, total: 120,
+  });
+  const settleC = () => db.SettleBillAsNonChargeable(RES_ID, {
+    order_id: ncC.id, nc_kind: "promo", reason: "launch night", actor: ncActor,
+  });
+  await SetBillDiscount(RES_ID, "NC3", "flat", 10);
+  let discountRefused = false;
+  try { await settleC(); } catch (e: any) { discountRefused = e?.code === "discount_on_bill"; }
+  check("a discounted bill is refused, and nothing is comped", discountRefused && (await ncRowsOf(ncC.id)).length === 0);
+  await SetBillDiscount(RES_ID, "NC3", "flat", 0);
+  await RecordBillTenders(RES_ID, {
+    table_name: "NC3", settled_by_username: "cashier1", tenders: [{ method: "Cash", amount: 50 }],
+  });
+  let tenderRefused = false;
+  try { await settleC(); } catch (e: any) { tenderRefused = e?.code === "tenders_recorded"; }
+  check("money already taken on the bill is refused too, and nothing is comped",
+    tenderRefused && (await ncRowsOf(ncC.id)).length === 0 && (await tableOccupied("NC3")));
+
   console.log(`\n✓ ALL ${passed} integration assertions passed`);
 }
 

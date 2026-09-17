@@ -608,10 +608,51 @@ export function resolvePaymentMethod(raw: unknown, config: readonly PaymentMetho
   return custom ? { id: custom.id, entry: custom } : null;
 }
 
+// ============================================================================
+// NC — THE BILL MARKER THAT IS NOT A MODE
+// ============================================================================
+
+/**
+ * What "Bills".payment_method says on a bill SETTLED AS NON-CHARGEABLE
+ * (POST /bills/order/:orderId/settle-nc, migration 052).
+ *
+ * A RESERVED SYSTEM ID, like 'Split', and deliberately NOT a payment mode:
+ * resolvePaymentMethod keeps returning null for it, so no settle, tender or split
+ * can ever carry it, and reservedReason keeps refusing it as a custom mode. The
+ * only writers are the NC settle and the ₹0 hardening in
+ * ConfirmBillPaymentByWaiter, and both close the bill at ₹0 with every priced
+ * line comped — so every report that groups by method sees a row of NC bills
+ * worth ₹0, which is the truth.
+ */
+export const NC_SETTLE_METHOD = "NC";
+
+/** What every reader shows for that marker. Same words on the web and in the app. */
+export const NC_SETTLE_LABEL = "Non-chargeable (NC)";
+
+/** Is this stored method the NC marker? */
+export function isNcSettleMethod(raw: unknown): boolean {
+  return String(raw ?? "").trim().toLowerCase() === "nc";
+}
+
+/**
+ * The sentence a settle hears when it tries to PAY with a comp word.
+ *
+ * "NC", "Complimentary", "Staff meal" … are refused as payment modes for the
+ * reason at the top of this file, and the generic "not a payment mode" sentence
+ * sent the person at the till nowhere. This one sends them to the two things
+ * that do what they meant. Null for any word that is not a comp word.
+ */
+export function ncPaymentPointer(raw: unknown): string | null {
+  const shown = tidyPaymentName(raw);
+  if (!shown || notMoneyKind(shown) !== "comp") {return null;}
+  return `"${shown}" is not a way to pay — nothing is collected on a non-chargeable bill. Use "${NC_SETTLE_LABEL}" when settling, or comp dishes individually and take the rest.`;
+}
+
 /** The label to show for a stored method: the config's, else the string itself. */
 export function paymentMethodLabel(method: string | null | undefined, config: readonly PaymentMethodConfig[]): string {
   const s = String(method ?? "").trim();
   if (!s) {return "";}
+  if (isNcSettleMethod(s)) {return NC_SETTLE_LABEL;}
   const resolved = resolvePaymentMethod(s, config);
   return resolved?.entry?.label ?? s;
 }
@@ -673,6 +714,8 @@ export function paymentMethodRefusal(
 ): string | null {
   const resolved = resolvePaymentMethod(raw, config);
   if (!resolved) {
+    const pointer = ncPaymentPointer(raw);
+    if (pointer) {return pointer;}
     const shown = String(raw ?? "").trim();
     return shown
       ? `"${shown}" is not a payment mode this restaurant settles with.`

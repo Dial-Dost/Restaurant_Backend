@@ -17,6 +17,7 @@ Transform: AWS::Serverless-2016-10-31
 #   Dashboard     --> |  /print/*      -> ALB -> ECS Fargate (always-on)       |
 #   Guest QR      --> |  /publish/*    -> ALB -> ECS Fargate (always-on)       |
 #   Till / web    --> |  /bills/service-charge-waiver/print -> ALB -> Fargate  |
+#   Till / web    --> |  /bills/order/*/settle-nc           -> ALB -> Fargate  |
 #                     |  everything else -> HTTP API -> Lambda                 |
 #                     +-------------------------------------------------------+
 #                                        |
@@ -973,6 +974,24 @@ Resources:
           # jest-tests/bill_print_doors_always_on.test.ts fails when a route
           # that dispatches a bill print is not matched by one of these.
           - PathPattern: /bills/service-charge-waiver/print
+            TargetOriginId: realtimeAlb
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-36ac-47da-a4f8-3b0fe0ba1b9f
+
+          # --- The fourth bill-print door: Settle as NC ------------------------
+          # POST /bills/order/:orderId/settle-nc (routes/nc_settle.ts, client
+          # item 5) closes a bill as non-chargeable and then prints the NC bill
+          # through dispatchPrintJob — the original, with its settlement block.
+          # It sits beside the other settle routes under /bills/order/, which no
+          # pattern above matches; on Lambda the settle would commit and answer
+          # printed:true with the emit frozen in the container. `*` is one order
+          # id here (CloudFront's `*` also crosses '/', and no other route ends
+          # in /settle-nc), so no ordinary bill route is dragged onto the task.
+          - PathPattern: /bills/order/*/settle-nc
             TargetOriginId: realtimeAlb
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]

@@ -43,6 +43,19 @@ export interface ReceiptItem {
    */
   variation?: string | null;
   /**
+   * BILL ONLY: this line was comped (migration 034) — served, and not charged.
+   *
+   * It prints as "<dish> (NC)" with its unit price and an Amount of 0.00, so the
+   * Amount column adds up to the Sub Total the guest is charged. Before this
+   * flag reached the renderer an NC line printed at full price, and a bill with
+   * one comped dessert listed more money than its own Sub Total. The value given
+   * away is disclosed once, under the total, as "NC value (not charged)".
+   *
+   * Absent/false on every line of a bill with no comps, which is what keeps
+   * those bills byte-identical to the ones printed before it existed.
+   */
+  nc?: boolean;
+  /**
    * KOT ONLY: this line is on COURSE HOLD and must not be cooked yet.
    *
    * Hold-and-fire has worked in the app since it shipped — a held line is dimmed
@@ -340,6 +353,17 @@ export interface ReceiptOptions {
    * rule so no caller has to remember it.
    */
   splitPart?: { index: number; of: number; label?: string | null } | null;
+  /**
+   * BILL ONLY: this bill was SETTLED AS NON-CHARGEABLE (payment_method 'NC',
+   * migration 052). Printed under the total, which is 0.00, so the paper says
+   * why it is 0.00 and on whose say-so: "Settled: Non-chargeable — <kind>" and
+   * "Authorised by: <user>". `wouldHaveCharged` is what the guest would have
+   * paid, service charge and tax included — information only, printed when the
+   * caller knows it, never part of the ladder.
+   *
+   * Absent on every other bill. The reprint reads it back from the settled bill.
+   */
+  settlement?: { kind: string; authorisedBy: string; wouldHaveCharged?: number | null } | null;
   // When set (bill only), prints a "scan to rate" QR code linking to the
   // feedback form for the waiter who handled this table.
   feedbackUrl?: string | null;
@@ -1906,14 +1930,16 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       const price = Number(it.price) || 0;
       const qtyText = String(qty);
       const priceText = price.toFixed(2);
-      const amountText = (price * qty).toFixed(2);
+      // A COMPED LINE IS CHARGED NOTHING, and its Amount says so: the column adds
+      // up to the Sub Total below it only if the given-away dish reads 0.00.
+      const amountText = it.nc === true ? (0).toFixed(2) : (price * qty).toFixed(2);
       // EVERY FIGURE KEEPS A SPACE IN FRONT OF IT. `padL` neither separates nor
       // trims, so a figure as wide as its column used to butt against the one
       // before it: qty 1 at 1,50,000.00 printed "1150000.00", which reads as a
       // different price. When any figure fills its column the numbers move to
       // their own right-aligned line under the dish, with a space between each.
       const fits = qtyText.length < COL_QTY && priceText.length < COL_PRICE && amountText.length < COL_TOTAL;
-      const label = asciiSafe(itemLabel(it));
+      const label = asciiSafe(it.nc === true ? `${itemLabel(it)} (NC)` : itemLabel(it));
       if (fits) {
         const nameLines = wrapText(label, COL_ITEM - 1);
         line(
@@ -1975,6 +2001,19 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   const discountText = discountAmt > 0 ? `-${discountAmt.toFixed(2)}` : "";
   const scText = sc ? Number(sc.amount).toFixed(2) : "";
   const taxTexts = taxLines.map((t) => Number(t.amount).toFixed(2));
+  // WHAT WAS GIVEN AWAY, disclosed under the total and never added into it —
+  // the same quantity and price each NC line printed at, before tax. A bill
+  // with no comped line prints nothing here.
+  const ncValue = opts.items.reduce(
+    (s, it) => (it.nc === true ? s + (Number(it.price) || 0) * Math.max(1, Math.round(Number(it.quantity) || 1)) : s),
+    0,
+  );
+  const ncText = Math.round(ncValue * 100) > 0 ? ncValue.toFixed(2) : "";
+  const settlement = opts.settlement ?? null;
+  const wouldHave = Number(settlement?.wouldHaveCharged);
+  const wouldText = settlement && settlement.wouldHaveCharged != null && Number.isFinite(wouldHave) && Math.round(wouldHave * 100) > 0
+    ? wouldHave.toFixed(2)
+    : "";
 
   // THE GRAND TOTAL IS NOT COMPUTED HERE WHEN THE CALLER SUPPLIES ONE.
   //
@@ -2008,7 +2047,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     grandText = money(grand);
   }
 
-  const amtW = Math.max(AMT, ...[subtotalText, discountText, scText, ...taxTexts, roundOffText, grandText]
+  const amtW = Math.max(AMT, ...[subtotalText, discountText, scText, ...taxTexts, roundOffText, grandText, ncText, wouldText]
     .filter((v) => v.length > 0)
     .map((v) => v.length + 1));
   const labelW = Math.max(1, W - amtW);
@@ -2057,6 +2096,19 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   if (roundOffText) {ladder("Round off", roundOffText);}
   grandRow(grandText);
   rule();
+
+  // --- Beside the ladder, never in it: comps, and an NC settlement ----------
+  if (ncText) {ladder("NC value (not charged)", ncText);}
+  if (settlement) {
+    const kind = present(settlement.kind);
+    raw(ESC, 0x45, 0x01);
+    for (const l of wrapText(asciiSafe(`Settled: Non-chargeable${kind ? ` — ${kind}` : ""}`), W)) {line(l);}
+    raw(ESC, 0x45, 0x00);
+    const by = present(settlement.authorisedBy);
+    if (by) {for (const l of wrapText(asciiSafe(`Authorised by: ${by}`), W)) {line(l);}}
+    if (wouldText) {ladder("Would have been (incl. tax)", wouldText);}
+  }
+  if (ncText || settlement) {rule();}
 
   // --- Footer (centered): disclaimer, then the valet/feedback QR ------------
   //

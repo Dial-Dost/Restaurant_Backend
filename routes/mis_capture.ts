@@ -226,7 +226,7 @@ type ActorRefusal = "no_username" | "authoriser_missing" | "authoriser_not_found
  * A 500 from the authoriser lookup is a failure to decide, not a refusal, and is
  * not reported to it.
  */
-async function resolveActors(
+export async function resolveActors(
 	req: Request,
 	res: Response,
 	restaurantId: string,

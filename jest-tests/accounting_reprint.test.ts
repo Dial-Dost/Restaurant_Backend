@@ -50,14 +50,31 @@ function settledRoute(): string {
   return src.slice(at, end);
 }
 
+/**
+ * settledBillReceiptOptions — the receipt of a SETTLED bill, shared since the NC
+ * settle (routes/nc_settle.ts) prints the same document as its original. The
+ * route's figures now live here, so the "prints what was recorded" pins read
+ * this body; the banner stays pinned on the ROUTE's call, which is where a
+ * reprint is decided.
+ */
+function settledOptions(): string {
+  const src = readSource("routes/bills.ts");
+  const at = src.indexOf("export function settledBillReceiptOptions(");
+  expect(at).toBeGreaterThan(-1);
+  // Its closing brace at column 0, on either line ending.
+  const end = /\r?\n\}\r?\n/.exec(src.slice(at))?.index ?? -1;
+  expect(end).toBeGreaterThan(0);
+  return src.slice(at, at + end);
+}
+
 const decoded = (b64: string): string => Buffer.from(b64, "base64").toString("latin1");
 
-/** The buildReceiptBase64({ ... }) call inside the settled-bill route. */
+/** The settledBillReceiptOptions(bill, { ... }) call inside the settled-bill route. */
 function renderCall(): string {
   const body = settledRoute();
-  const at = body.indexOf("buildReceiptBase64({");
+  const at = body.indexOf("buildReceiptBase64(settledBillReceiptOptions(bill, {");
   expect(at).toBeGreaterThan(-1);
-  const end = body.indexOf("}, cols)", at);
+  const end = body.indexOf("}), cols)", at);
   expect(end).toBeGreaterThan(at);
   return body.slice(at, end);
 }
@@ -93,7 +110,14 @@ describe("a reprint says so, in the largest type the printer has", () => {
 });
 
 describe("the route prints the settled figures and derives none of them", () => {
-  const body = settledRoute();
+  const route = settledRoute();
+  const options = settledOptions();
+  // The route and the options builder it hands the settled bill to, read as one.
+  const body = `${route}\n${options}`;
+
+  test("the route hands the SETTLED bill to the shared options builder", () => {
+    expect(route).toMatch(/settledBillReceiptOptions\(bill, \{/);
+  });
 
   test("the grand total is the one recorded on the bill", () => {
     expect(body).toMatch(/grandTotal:\s*bill\.grand_total/);
@@ -132,6 +156,9 @@ describe("the route prints the settled figures and derives none of them", () => 
     const call = renderCall();
     expect(call).toMatch(/reprint:\s*true/);
     expect(call).not.toMatch(/reprint:\s*(?:false|body|req)\b/);
+    // And the builder takes the caller's word for it, nobody else's.
+    expect(options).toMatch(/reprint:\s*target\.reprint,/);
+    expect(options).not.toMatch(/reprint:\s*(?:false|true|body|req)\b/);
   });
 
   test("no feedback QR — a reprint is an accounting document, not a table-side courtesy", () => {
@@ -145,13 +172,13 @@ describe("the route prints the settled figures and derives none of them", () => 
   });
 
   test("it is gated on the ACCOUNTING permission, not the waiter's Add Orders", () => {
-    expect(body).toMatch(/validateAction\(ACCOUNTING_PERM\)/);
-    expect(body).not.toMatch(/4ad474d4-5230-449c-874f-6a238b833bca/);
+    expect(route).toMatch(/validateAction\(ACCOUNTING_PERM\)/);
+    expect(route).not.toMatch(/4ad474d4-5230-449c-874f-6a238b833bca/);
   });
 
   test("and the audit line names the bill and the money", () => {
-    expect(body).toMatch(/Reprinted settled bill/);
-    expect(body).toMatch(/bill\.grand_total\.toFixed\(2\)/);
+    expect(route).toMatch(/Reprinted settled bill/);
+    expect(route).toMatch(/bill\.grand_total\.toFixed\(2\)/);
   });
 });
 
