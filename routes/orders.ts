@@ -13,7 +13,7 @@ import { logger } from "../observability.js";
 import { hidesPrices, redactOrderList } from "../price_scope.js";
 import { emitRestaurant } from "../realtime.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, validateAction } from "./_shared.js";
+import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, refuseOrderOnPrintedBill, reprintNeededFields, validateAction } from "./_shared.js";
 
 
 // --- Order/item preparation timers (pause/resume, mark item served) ---------
@@ -162,6 +162,18 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 
 	try {
 		const body: Record<string, unknown> = { ...orderBody, ...(orderPhone.value ? { customer_phone: orderPhone.value } : {}) };
+		// CLIENT ITEM 6 — THE PRINTED BILL IS WHAT THE GUEST PAYS AGAINST. A waiter
+		// adding to it after the print makes the paper short and cannot reprint
+		// (C3), so they are refused and pointed at the next party's seat; a senior
+		// role is allowed and told to reprint. Before AddOrder, so a refusal writes
+		// nothing. This route is ALSO the dashboard's upsert (a status change, an
+		// edit), so the order the body names is passed along and only a resend
+		// that adds to the bill is judged. See refuseOrderOnPrintedBill.
+		const guard = await refuseOrderOnPrintedBill(req, res, {
+			restaurantId, tableName: typeof body.table === "string" ? body.table : "", guest: false,
+			upsert: { orderId: typeof body.id === "string" ? body.id : null, items: body.items },
+		});
+		if (guard.refused) {return;}
 		const result = await AddOrder(restaurantId, body);
 		// Best-effort guest registration: orders that carry a phone create/match a
 		// Customers row and get cust_id stamped (CRM visit tracking).
@@ -192,6 +204,9 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 			...result,
 			kot_printed: printed.printed, kot_no: printed.kot_no, kot_tickets: printed.tickets,
 			...(printed.reason ? { kot_skipped: printed.reason } : {}),
+			// The bill in the guest's hand no longer covers this order: the
+			// flag, the sentence and the table a Reprint action prints.
+			...reprintNeededFields(guard),
 		});
 	} catch (error: any) {
 		logger.error({ err: error }, "add_order_failed");
@@ -476,6 +491,12 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 		const existing = await GetOrders(restaurantId);
 		const order = existing.find(o => o.id === orderId);
 		if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
+		// CLIENT ITEM 6 — the same guard POST /orders applies, on the order's own
+		// table: a line added here lands on the same printed bill.
+		const guard = await refuseOrderOnPrintedBill(req, res, {
+			restaurantId, tableName: String(order.table ?? ""), guest: false,
+		});
+		if (guard.refused) {return;}
 
 		// build items_split if missing; clone to avoid mutating source
 		const rawSplit = Array.isArray((order as any).items_split)
@@ -582,6 +603,7 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			success: true, item: newItem,
 			kot_printed: printedItem.printed, kot_no: printedItem.kot_no, kot_tickets: printedItem.tickets,
 			...(printedItem.reason ? { kot_skipped: printedItem.reason } : {}),
+			...reprintNeededFields(guard),
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'add_order_item_failed');

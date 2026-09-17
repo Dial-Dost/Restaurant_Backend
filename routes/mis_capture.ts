@@ -140,6 +140,7 @@ import {
 	extractOutletId,
 	extractRestaurantId,
 	log_audit,
+	nextPartyPrintMessage,
 	validateAction,
 	validateBody,
 } from "./_shared.js";
@@ -988,7 +989,10 @@ app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449
 				// the charge and the audit line would say so — which is the truth.
 				askedWithoutServiceCharge: true,
 			});
-			paper = { billId: out.billId, jobId: out.jobId, destination: out.destination, device: out.device };
+			paper = {
+				billId: out.billId, jobId: out.jobId, destination: out.destination, device: out.device,
+				next_party_table: out.next_party_table, next_party_message: nextPartyPrintMessage(out.next_party_table),
+			};
 			serviceChargeRemoved = out.service_charge_removed;
 			grandTotalAfter = out.grand_total;
 		}

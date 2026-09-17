@@ -16,12 +16,14 @@ import { z } from "zod";
 import { destroyAllForEmployee } from "../auth/sessions.js";
 import { getStore } from "../auth/store.js";
 import type { CustomerDemographics } from "../database_supabase.js";
-import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
+import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, EnsureNextPartyTable, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetOrderingPrintGuard, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
 import { rasterizeBillLogo, type BillLogoRaster } from "../bill_logo.js";
 import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import type { ReportWindowQuery } from "../report_window.js";
 import { emitRestaurant } from "../realtime.js";
+import { BILL_PRINTED_STATUS, billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill, reprintNeededMessage, type BillPrintedWrite } from "../next_party.js";
+import { isWaiterOnly } from "../role_scope.js";
 
 
 // Python feedback service URL. Use container host (PY_SERVER_URL) when set,
@@ -1261,3 +1263,195 @@ export const ACCOUNTING_PERM = "df75119b-e5f1-4f38-aba5-78a1cf182f56";
 export const PLATFORM_RAZORPAY_KEY_ID = process.env.PLATFORM_RAZORPAY_KEY_ID || "";
 export const PLATFORM_RAZORPAY_KEY_SECRET = process.env.PLATFORM_RAZORPAY_KEY_SECRET || "";
 export const platformRazorpayReady = Boolean(PLATFORM_RAZORPAY_KEY_ID && PLATFORM_RAZORPAY_KEY_SECRET);
+
+
+// --- The next party at a printed table (client item 6) ----------------------
+// Two doors, used by every route that prints a bill or adds to one. They live
+// here, once, for the reason refuseWaiterBillReprint lives in one place: a
+// second copy of the rule is a rule that will drift between the till, the
+// dashboard and the guest page.
+
+/**
+ * The line a print's response carries beside `next_party_table`, so the till and
+ * the dashboard say the same words ("Seat the next party at 12 (next party).").
+ * Null when there is no seat.
+ */
+export function nextPartyPrintMessage(nextPartyTable: string | null): string | null {
+	return nextPartyAfterPrintMessage(nextPartyTable);
+}
+
+/** "Table Added" — the action a new table is filed under in the audit log. */
+const TABLE_ADDED_ACTION = "194ce6ee-b867-4be3-b5f0-48c28ce0a81b";
+
+/**
+ * AFTER A SUCCESSFUL BILL PRINT: make sure the next party at this number has a
+ * seat, and name it. Called by POST /print/bill, POST /print/bill/claim, POST
+ * /print/bill/split and the service-charge waiver print — every door that can
+ * put a bill in a guest's hand, whoever pressed it.
+ *
+ * The answer is `next_party_table` on the print's response: "12 #2" when a
+ * sibling is the free seat, "12" when the root itself is free again, null when
+ * there is none (a takeaway, or migration 053 is not applied). A row that has
+ * just appeared is announced as `table:added`, which the dashboard already
+ * reloads its floor on.
+ *
+ * NEVER THROWS AND NEVER FAILS THE PRINT: the paper is already out.
+ */
+export async function nextPartyAfterPrint(req: Request, restaurantId: string, tableName: string): Promise<string | null> {
+	try {
+		const seat = await EnsureNextPartyTable(restaurantId, tableName);
+		if (!seat) {return null;}
+		if (seat.created) {announceNextPartyTable(restaurantId, seat);}
+		if (seat.created) {
+			try {
+				await log_audit(req, TABLE_ADDED_ACTION,
+					`Opened ${seat.table_name} for the next party at ${seat.parent_table} (its bill was printed)`,
+					Audit_log_category.Tables,
+					{ table_name: seat.table_name, parent_table: seat.parent_table, party_no: seat.party_no, next_party: true });
+			} catch {/* a failed audit write must not fail a print */}
+		}
+		return seat.table_name;
+	} catch (err) {
+		logger.warn({ err, table: tableName }, "next_party_after_print_failed");
+		return null;
+	}
+}
+
+function announceNextPartyTable(
+	restaurantId: string,
+	seat: { table_name: string; parent_table: string; party_no: number | null },
+): void {
+	try {
+		emitRestaurant(restaurantId, "table:added", {
+			table_name: seat.table_name, parent_table: seat.parent_table, party_no: seat.party_no,
+		});
+	} catch (err) {
+		logger.warn({ err }, "emit table:added (next party) failed");
+	}
+}
+
+/**
+ * THE MONEY GUARD ON NEW ORDERS — an order added to a table whose CURRENT
+ * seating's bill has already been printed.
+ *
+ *   * a waiter-only login or a QR guest -> 423 { code: "bill_printed", table,
+ *     next_party_table } and NOTHING is written. The sentence says where the
+ *     new party's order goes, and that a same-party addition is a manager's
+ *     (who can add it and reprint). 423 and not 409: see BILL_PRINTED_STATUS
+ *     for what a 409 did to the till's offline queue;
+ *   * a senior role -> allowed; the caller spreads reprintNeededFields(guard)
+ *     into its answer (`reprint_needed: true` and the sentence both clients
+ *     show beside a Reprint action), because the paper in the guest's hand is
+ *     now short;
+ *   * no print, no print state, a takeaway, or migration 053 absent -> allowed,
+ *     exactly as before this guard existed.
+ *
+ * WHY THE GUEST IS REFUSED RATHER THAN REROUTED: the table card's QR is signed
+ * for "12", and whoever scans it after the print may be the next party. Their
+ * order must not land on the printed bill, and it cannot be moved to "12 #2"
+ * on the guess that they are the new guests.
+ *
+ * AN UPSERT IS JUDGED BY WHAT IT ADDS. POST /orders also carries the
+ * dashboard's status changes and its edit dialog, as a resend of an existing
+ * order; `upsert` names that order, and only a resend that AddOrder would grow
+ * (orderUpsertAddsToBill, line by line) is refused — "Served" on a printed
+ * table is not.
+ *
+ * THE OTHER DOORS INTO A PRINTED BILL. POST /bills/merge and POST
+ * /bills/move-item put food onto `to_table` just as an order does, and are
+ * gated by the same "Add Orders" permission a waiter holds. They pass
+ * `write: "merge" | "move"`: the same verdict, but no next-party seat is made
+ * or offered — that food belongs to somebody already seated — and the sentence
+ * says a manager merges or moves it and reprints.
+ *
+ * FAILS OPEN on a read error, in the direction bill_print_state.ts already
+ * chose: the order path itself is the one that has to work.
+ *
+ * `restaurantId` is what the data layer is asked with (a staff route's res id,
+ * or the QR route's slug); `emitRestaurantId` is the res UUID whose socket room
+ * the dashboard listens in, when that differs — the QR route passes it, because
+ * `restaurant:<slug>` is a room nobody joins.
+ *
+ * Returns `refused: true` when it has answered (the caller returns at once).
+ */
+export type PrintedBillGuard =
+	| { refused: true }
+	| { refused: false; reprintNeeded: boolean; table: string | null; parentTable: string | null };
+
+export async function refuseOrderOnPrintedBill(
+	req: Request,
+	res: Response,
+	target: {
+		restaurantId: string;
+		tableName: string;
+		guest: boolean;
+		/** POST /orders only: the order id the body names, and the lines it sends. */
+		upsert?: { orderId: string | null; items: unknown };
+		/** What is being put on the bill; an order unless said otherwise. */
+		write?: BillPrintedWrite;
+		/** The res UUID for the `table:added` emit, when restaurantId is a slug. */
+		emitRestaurantId?: string;
+	},
+): Promise<PrintedBillGuard> {
+	const { restaurantId, tableName, guest, upsert } = target;
+	const write = target.write ?? "order";
+	const allow = { refused: false as const, reprintNeeded: false, table: null, parentTable: null };
+	let state: Awaited<ReturnType<typeof GetOrderingPrintGuard>> = null;
+	try {
+		state = await GetOrderingPrintGuard(restaurantId, tableName, { orderId: upsert?.orderId ?? null });
+	} catch (err) {
+		logger.warn({ err, table: tableName }, "order_print_guard_read_failed (failing open)");
+		return allow;
+	}
+	if (!state) {return allow;}
+	const waiterOnly = !guest && isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions });
+	const addsToBill = upsert ? orderUpsertAddsToBill(upsert.items, state.existing_lines ?? null) : true;
+	const verdict = orderOnPrintedBillVerdict({ printCount: state.print_count, waiterOnly, guest, addsToBill });
+	if (verdict === "allow") {return allow;}
+	if (verdict === "reprint_needed") {
+		return { refused: false, reprintNeeded: true, table: state.table, parentTable: state.parent_table };
+	}
+
+	// The seat is made here too, not only at print time: a print whose seat
+	// could not be made (or a seat retired since) must not leave the refusal
+	// pointing nowhere. Only for an ORDER — a merge or a move is never pointed
+	// at a seat (see BillPrintedWrite).
+	const seat = write === "order" ? await EnsureNextPartyTable(restaurantId, state.table) : null;
+	if (seat?.created) {announceNextPartyTable(target.emitRestaurantId ?? restaurantId, seat);}
+	if (!guest) {
+		const what = write === "merge" ? "a merge into" : write === "move" ? "an item moved onto" : "an order on";
+		try {
+			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				`REFUSED ${what} table ${state.table} — its bill was already printed ${String(state.print_count)} time(s)`,
+				write === "order" ? Audit_log_category.Orders : Audit_log_category.Bill,
+				{ table: state.table, refused: true, code: "bill_printed", write, print_count: state.print_count, next_party_table: seat?.table_name ?? null });
+		} catch {/* a failed audit write must not turn a refusal into a 500 */}
+	}
+	res.status(BILL_PRINTED_STATUS).json(billPrintedRefusal({
+		table: state.table,
+		nextPartyTable: seat?.table_name ?? null,
+		printCount: state.print_count,
+		guest,
+		parentTable: state.parent_table,
+		write,
+	}));
+	return { refused: true };
+}
+
+/**
+ * What a route adds to its answer when a senior role has just put more on a
+ * printed bill: `reprint_needed` and the sentence both clients show beside a
+ * Reprint action (reprintNeededMessage). Nothing at all otherwise, so every
+ * other answer is byte-for-byte what it was.
+ */
+export function reprintNeededFields(
+	guard: PrintedBillGuard,
+): { reprint_needed?: true; reprint_message?: string; reprint_table?: string } {
+	if (guard.refused || !guard.reprintNeeded || !guard.table) {return {};}
+	return {
+		reprint_needed: true,
+		reprint_message: reprintNeededMessage(guard.table, guard.parentTable),
+		// The table whose paper is short: the one a Reprint action prints.
+		reprint_table: guard.table,
+	};
+}

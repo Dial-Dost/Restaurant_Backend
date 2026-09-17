@@ -20,7 +20,7 @@ import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
-import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -1067,6 +1067,12 @@ export interface OpenTableBillPrint {
 	service_charge_waiver_required: boolean;
 	/** The grand total on the paper — the drawer's, because the ladder is the settle paths'. */
 	grand_total: number;
+	/**
+	 * Client item 6: where the next party at this number sits now that this one
+	 * has its bill — "12 #2", or "12" once 12 is free — or null. See
+	 * nextPartyAfterPrint.
+	 */
+	next_party_table: string | null;
 }
 
 /**
@@ -1240,6 +1246,10 @@ export async function printOpenTableBill(
 			? " (asked WITHOUT the service charge; no waiver is recorded, so the charge is ON this bill)"
 			: "";
 	try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null }); } catch {/* ignore */}
+	// CLIENT ITEM 6 — AFTER the paper is dispatched, never before and never
+	// instead: the next party gets a seat because this one has its bill. Any
+	// print, by anyone, opens it; nextPartyAfterPrint never throws.
+	const nextPartyTable = await nextPartyAfterPrint(req, restaurantId, tableName);
 	return {
 		billId,
 		jobId: dispatched.jobId,
@@ -1248,6 +1258,7 @@ export async function printOpenTableBill(
 		service_charge_removed: chargeCfg.service_charge_removed,
 		service_charge_waiver_required: waiverRequired,
 		grand_total: charges.grand_total,
+		next_party_table: nextPartyTable,
 	};
 }
 
@@ -1304,6 +1315,11 @@ export async function claimClientRenderedBillPrint(
 		);
 	} catch {/* ignore */}
 
+	// Client item 6: a browser print is a print, and the next party at this
+	// number gets its seat exactly as it does after a thermal one — including on
+	// the unrecorded path, where the paper came out all the same.
+	const nextPartyTable = await nextPartyAfterPrint(req, restaurantId, tableName);
+
 	// ENOUGH FOR THE BUTTON TO GO GREY. `print_count` is what the dashboard
 	// tests to hide its own control on the next render, and `printed_at` is
 	// what it shows beside it — both taken from the row that was just
@@ -1324,6 +1340,9 @@ export async function claimClientRenderedBillPrint(
 		// single attempt, so it only moves when there was no earlier one.
 		bill_printed_at: bill.print_count === 0 ? (recorded?.created_at ?? bill.bill_printed_at) : bill.bill_printed_at,
 		printed_at: recorded?.created_at ?? bill.printed_at,
+		// Where the next party at this number sits — see nextPartyAfterPrint.
+		next_party_table: nextPartyTable,
+		next_party_message: nextPartyPrintMessage(nextPartyTable),
 		// THE PRICED BILL, BECAUSE THIS IS THE GUEST'S RECEIPT.
 		//
 		// THE BUG THIS CLOSES, found in a live browser pass: on the web
@@ -1650,6 +1669,10 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			device: printed.device,
 			service_charge_removed: printed.service_charge_removed,
 			service_charge_waiver_required: printed.service_charge_waiver_required,
+			// Client item 6, additive: the till names the next party's seat, in
+			// the words the dashboard uses too.
+			next_party_table: printed.next_party_table,
+			next_party_message: nextPartyPrintMessage(printed.next_party_table),
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');
@@ -2039,10 +2062,16 @@ app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 	const price = Number(body.price ?? 0) || 0;
 	if (!fromTable || !toTable || !itemName) { res.status(400).json({ error: "from_table, to_table and item_name are required" }); return; }
 	try {
+		// CLIENT ITEM 6 — AN ITEM MOVED ONTO A PRINTED TABLE GROWS ITS BILL, exactly
+		// as an order would, through a door every waiter holds ("Add Orders"). The
+		// same guard, told it is a move: a waiter is refused (no seat offered —
+		// the item belongs to somebody seated), a senior role is told to reprint.
+		const guard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: toTable, guest: false, write: "move" });
+		if (guard.refused) {return;}
 		const result = await MoveBillItem(restaurantId, fromTable, toTable, itemName, price);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Moved item ${result.moved.name} from ${fromTable} to ${toTable}`, Audit_log_category.Bill, { from: fromTable, to: toTable, item: itemName }); } catch {/* ignore */}
-		res.json(result);
+		res.json({ ...result, ...reprintNeededFields(guard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'move_bill_item_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to move item') });
@@ -2575,7 +2604,13 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 				{ table: tableName, mode, parts: receipts.length, totals: receipts.map((r) => r.grandTotal) });
 		} catch {/* a failed audit write must never fail the print */}
 
-		res.json({ success: true, mode, parts: receipts.length, jobs });
+		// A split print is a print of this bill: the next party gets its seat.
+		const nextPartyTable = await nextPartyAfterPrint(req, restaurantId, tableName);
+
+		res.json({
+			success: true, mode, parts: receipts.length, jobs,
+			next_party_table: nextPartyTable, next_party_message: nextPartyPrintMessage(nextPartyTable),
+		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_split_bill_failed');
 		res.status(400).json({ error: String(err?.message ?? 'Unable to print the split bills') });
@@ -2591,10 +2626,16 @@ app.post('/bills/merge', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"),
 	const toTable = typeof body.to_table === "string" ? body.to_table.trim() : "";
 	if (!fromTable || !toTable) { res.status(400).json({ error: "from_table and to_table are required" }); return; }
 	try {
+		// CLIENT ITEM 6 — MERGING INTO A PRINTED TABLE puts every one of the
+		// source's orders on a bill the guest is already holding. Merging "12 #2"
+		// into a printed 12 (the same guests, one more round) is a manager's, who
+		// then reprints; a waiter is refused. See refuseOrderOnPrintedBill.
+		const guard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: toTable, guest: false, write: "merge" });
+		if (guard.refused) {return;}
 		const result = await MergeTableBills(restaurantId, fromTable, toTable);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Merged table ${fromTable} into ${toTable} (${result.moved_orders} orders)`, Audit_log_category.Bill, { from: fromTable, to: toTable }); } catch {/* ignore */}
-		res.json(result);
+		res.json({ ...result, ...reprintNeededFields(guard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'merge_bill_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to merge bills') });

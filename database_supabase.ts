@@ -125,11 +125,29 @@ import {
   BILL_PRINT_JOB_KIND,
   COUNTED_PRINT_JOB_STATUSES,
   NO_BILL_PRINTS,
+  seatingStartOf,
   summarizeBillPrints,
   type BillPrintJobRow,
   type BillPrintSeating,
   type BillPrintState,
 } from "./bill_print_state.js";
+// Client item 6 — the next party at a printed table (migration 053). The rules
+// (the reserved name, which seat to hand out, which idle rows to retire) are
+// pure and live there; this file only reads and writes the rows.
+import {
+  RESERVED_TABLE_NAME_ERROR,
+  freeFamilySeat,
+  isReservedPartyName,
+  nextFreePartySeq,
+  nextPartyLabel,
+  nextPartyName,
+  parseNextPartyName,
+  planNextPartyRetirement,
+  storedOrderLines,
+  tableDisplayName,
+  type NextPartyFamilyMember,
+  type StoredOrderLine,
+} from "./next_party.js";
 // The floor-section ordering rules (migration 041). Kept out of SQL on purpose:
 // see that module's header for why the decision lives in a pure function and
 // the database is left holding a dumb renumber.
@@ -1248,6 +1266,13 @@ export interface OrderApcInsight {
   /** Bill (seating) this order belongs to; null while the table is still open. */
   bill_id?: string | null;
   table_name: string;
+  /**
+   * What a table-wise chart calls this seating: the ROOT's name for a
+   * next-party seating ("12" for "12 #2", client item 6), else table_name.
+   * A label only — the row is still its own seating with its own money and
+   * covers.
+   */
+  table_label?: string;
   created_at: string;
   total: number;
   people_count: number;
@@ -2734,6 +2759,14 @@ export async function UpdateCustomerDemographics(
   );
 }
 
+/** A table name only the server may create — see next_party.ts. */
+export class ReservedTableNameError extends Error {
+  constructor() {
+    super(RESERVED_TABLE_NAME_ERROR);
+    this.name = "ReservedTableNameError";
+  }
+}
+
 export async function AddTable(
   restaurantId: string,
   table_name: string,
@@ -2749,12 +2782,23 @@ export async function AddTable(
   // reject (the caller is told the stored value in the response).
   const maxCap = Math.max(cap, Math.round(Number(max_capacity ?? cap)) || cap);
   const zone = normalizeTableSection(section);
+  // "12 #2" is the server's to make (client item 6). The route answers this
+  // first with the sentence; this is the data layer not trusting that every
+  // future caller will.
+  if (isReservedPartyName(normalized)) {
+    throw new ReservedTableNameError();
+  }
 
+  // The revive below brings back a same-named ROOM table. A retired next-party
+  // row is never one — its name is reserved, so it cannot match — and the
+  // predicate says so rather than leaving it to that coincidence.
+  const onlyRooms = await roomTableOnlySql();
   const existing = await runQuery<{ id: string; is_deleted: boolean }>(
     `
       select id, coalesce(is_deleted, false) as is_deleted
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+        ${onlyRooms}
       limit 1
     `,
     [context.res_id, context.outlet_id, normalized],
@@ -3037,6 +3081,9 @@ async function readSectionBirthByKey(context: { res_id: string; outlet_id: strin
   if (sectionBirthReadable === false) {return out;}
   if (sectionBirthReadable === null && inTxn) {return out;}
   try {
+    // A next-party sibling was born minutes ago in its root's zone; it must not
+    // date the zone (see physicalTableSql).
+    const physical = await physicalTableSql();
     const rows = await runQuery<{ name: string; at: Date | string | null }>(
       `
         select key as name, min(at) as at
@@ -3049,7 +3096,7 @@ async function readSectionBirthByKey(context: { res_id: string; outlet_id: strin
               from "Tables"
              where res_id = $1 and outlet_id = $2
                and coalesce(is_deleted, false) = false
-               and coalesce(is_virtual, false) = false
+               and ${physical}
                and nullif(btrim(coalesce(section, '')), '') is not null
           ) u
          group by key
@@ -3083,6 +3130,9 @@ export async function GetTableSections(
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureTableSectionOrderColumn();
+  // "Patio, 6 tables, 24 seats" counts the ROOM: a next-party sibling is a
+  // second name for a table already counted.
+  const physical = await physicalTableSql();
   const rows = await runQuery<{ section: string | null; tables: number; seats: number }>(
     `
       -- Group case-INSENSITIVELY so this matches how rename/delete resolve a
@@ -3096,7 +3146,7 @@ export async function GetTableSections(
       from "Tables"
       where res_id = $1 and outlet_id = $2
         and coalesce(is_deleted, false) = false
-        and coalesce(is_virtual, false) = false
+        and ${physical}
       group by lower(nullif(btrim(coalesce(section, '')), ''))
       order by 1 asc nulls first
     `,
@@ -3197,6 +3247,9 @@ export async function ReorderTableSections(
   // alphabetical tail of the remainder rather than being lost; planSectionOrder
   // still appends it, which is the invariant that matters.)
   const birthByKey = await readSectionBirthByKey(context);
+  // Resolved BEFORE the transaction: the latch may issue DDL, which must never
+  // run inside one.
+  const physical = await physicalTableSql("t");
 
   return withTransaction(async (client) => {
     await runQuery(
@@ -3216,7 +3269,7 @@ export async function ReorderTableSections(
         from "Tables" t
         where t.res_id = $1 and t.outlet_id = $2
           and coalesce(t.is_deleted, false) = false
-          and coalesce(t.is_virtual, false) = false
+          and ${physical}
           and nullif(btrim(coalesce(t.section, '')), '') is not null
         group by t.res_id, t.outlet_id, lower(btrim(t.section))
         on conflict do nothing
@@ -3370,6 +3423,48 @@ export type RemoveTableResult =
   | { status: "not_found" }
   | { status: "blocked"; message: string };
 
+/**
+ * RemoveTable's next-party half. `hasSiblings` = this root has EVER had one
+ * (so it cannot be hard-deleted); blocked = it is a sibling, or has a live one
+ * with a party on it. Feature off = no rows to have, nothing to block.
+ */
+async function nextPartyDeleteGuard(
+  context: RestaurantContext,
+  tableId: string,
+): Promise<{ status: "ok"; hasSiblings: boolean } | { status: "blocked"; message: string }> {
+  if (!(await nextPartyReady())) {return { status: "ok", hasSiblings: false };}
+  const self = await runQuery<{ parent_name: string | null; is_sibling: boolean }>(
+    `select p.table_name as parent_name, (t.parent_table_id is not null) as is_sibling
+       from "Tables" t
+       left join "Tables" p on p.id = t.parent_table_id and p.res_id = t.res_id and p.outlet_id = t.outlet_id
+      where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+      limit 1`,
+    [tableId, context.res_id, context.outlet_id],
+  );
+  if (self[0]?.is_sibling === true) {
+    const parent = String(self[0].parent_name ?? "").trim();
+    return {
+      status: "blocked",
+      message: `This is the next-party seat for ${parent || "a printed table"}. It is not part of the floor plan and closes by itself once it is free.`,
+    };
+  }
+  await retireIdleNextPartyTables(context, tableId);
+  const siblings = await runQuery<{ table_name: string; is_deleted: boolean }>(
+    `select table_name, coalesce(is_deleted, false) as is_deleted
+       from "Tables"
+      where parent_table_id = $1 and res_id = $2 and outlet_id = $3`,
+    [tableId, context.res_id, context.outlet_id],
+  );
+  const live = siblings.filter((r) => r.is_deleted !== true);
+  if (live.length > 0) {
+    return {
+      status: "blocked",
+      message: `${live.map((r) => r.table_name).join(", ")} is still open as this table's next party. Settle or release it first, then delete the table.`,
+    };
+  }
+  return { status: "ok", hasSiblings: siblings.length > 0 };
+}
+
 export async function RemoveTable(
   restaurantId: string,
   table_name: string,
@@ -3392,6 +3487,16 @@ export async function RemoveTable(
   const table = tableRows[0];
   if (!table) {
     return { status: "not_found" };
+  }
+
+  // CLIENT ITEM 6. A next-party row is not the floor plan's to delete: it goes
+  // by itself once it is idle. And a table cannot go while its next party is
+  // still sitting at "12 #2" — the sibling would be left naming a table that no
+  // longer exists. An idle sibling is tidied first, so the refusal is only ever
+  // about a real party.
+  const family = await nextPartyDeleteGuard(context, table.id);
+  if (family.status === "blocked") {
+    return family;
   }
 
   // Refuse while the table is still in active use: a seated party or an open
@@ -3417,11 +3522,17 @@ export async function RemoveTable(
   // A hard delete would violate the NOT NULL FKs on Orders.table_id /
   // Bills.table_id, so only hard-delete tables with no history at all. Tables
   // that carry closed history are soft-deleted to preserve those records.
+  // A root that ever had a next party is referenced by that row's foreign key
+  // (tables_parent_fk), retired or not, so it can only be soft-deleted.
+  const siblingHistory = family.hasSiblings
+    ? `or exists(select 1 from "Tables" where parent_table_id = $1 and res_id = $2 and outlet_id = $3)`
+    : "";
   const history = await runQuery<{ has_history: boolean }>(
     `
       select
         exists(select 1 from "Orders" where table_id = $1 and res_id = $2 and outlet_id = $3)
         or exists(select 1 from "Bills" where table_id = $1 and res_id = $2 and outlet_id = $3)
+        ${siblingHistory}
         as has_history
     `,
     [table.id, context.res_id, context.outlet_id],
@@ -3588,6 +3699,573 @@ function effectiveMaxCapacity(capacity: unknown, maxCapacity: unknown): number {
   return max >= cap ? max : cap;
 }
 
+// --- The next party at a printed table (client item 6, migration 053) --------
+//
+// A printed table's waiter loses it off their floor (C3), and with it the only
+// "12" they could order on. The next party gets a SIBLING row — a real,
+// non-virtual table called "12 #2" whose parent_table_id is 12 — created by the
+// server when a bill is printed and retired once it is idle again. next_party.ts
+// holds the rules and argues the design; everything below reads and writes rows.
+//
+// THE ONE RULE FOR EVERY READER: a sibling has its own table_id, and that is the
+// whole of why its party can never be settled with the printed one. Nothing on a
+// bill, settle or approval path may ever fold it into its root.
+
+/**
+ * Migration 053, statement for statement. The runtime issues the same DDL (the
+ * idiom 048 documents) because production connects as the table owner: by the
+ * time the file is applied by hand the columns already exist and the file only
+ * records them. Constraints go through pg_constraint checks so a second run —
+ * this process's, or the migration's after it — is a no-op.
+ *
+ * Exported for jest-tests/next_party.test.ts, which holds the migration file
+ * to the same statements.
+ */
+export const TABLE_NEXT_PARTY_DDL: readonly string[] = [
+  `alter table "Tables" add column if not exists parent_table_id uuid`,
+  `alter table "Tables" add column if not exists party_seq smallint`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tables_party_shape' AND conrelid = 'public."Tables"'::regclass) THEN
+       ALTER TABLE "Tables" ADD CONSTRAINT tables_party_shape
+         CHECK ((parent_table_id IS NULL AND party_seq IS NULL) OR (parent_table_id IS NOT NULL AND party_seq >= 2));
+     END IF;
+   END $$`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tables_parent_fk' AND conrelid = 'public."Tables"'::regclass) THEN
+       ALTER TABLE "Tables" ADD CONSTRAINT tables_parent_fk
+         FOREIGN KEY (parent_table_id, res_id, outlet_id) REFERENCES "Tables"(id, res_id, outlet_id) ON UPDATE CASCADE;
+     END IF;
+   END $$`,
+  `create unique index if not exists tables_one_live_party on "Tables" (outlet_id, parent_table_id, party_seq) where parent_table_id is not null and coalesce(is_deleted, false) = false`,
+];
+
+/**
+ * Issue TABLE_NEXT_PARTY_DDL once per process. NEVER from inside a
+ * transaction: DDL is transactional, and a first run inside a settle that
+ * later rolled back would take the columns with it while the memo went on
+ * saying they exist (see InitBillRoundOffSchema). The boot step runs it before
+ * the listener; nextPartyReady runs it lazily only on an autocommit connection.
+ */
+async function ensureTableNextPartyColumns(): Promise<void> {
+  await ensureLazyTable("Tables.next_party", async () => {
+    for (const sql of TABLE_NEXT_PARTY_DDL) {
+      await runQuery(sql);
+    }
+  });
+}
+
+// THE LATCH, in the shape billCustomerGstinColumnPresent uses: asked of
+// information_schema rather than by selecting the columns, because a 42703
+// inside an open transaction aborts the whole transaction. PRESENT is remembered
+// for good; ABSENT is re-asked after a minute, because 053 may be applied by
+// hand while this process runs.
+//
+// ABSENT MEANS "EXACTLY AS BEFORE THIS FEATURE": no sibling is created, none is
+// retired, no order is refused for a printed bill, and every reader issues the
+// SQL it issued before — none of them names a column that is not there.
+let tableNextPartyColumns: { present: boolean; checkedAt: number } | null = null;
+const TABLE_NEXT_PARTY_REPROBE_MS = 60_000;
+
+async function nextPartyReady(): Promise<boolean> {
+  const now = Date.now();
+  const known = tableNextPartyColumns;
+  if (known && (known.present || now - known.checkedAt < TABLE_NEXT_PARTY_REPROBE_MS)) {return known.present;}
+  if ((tenantStorage.getStore()?.txnDepth ?? 0) === 0) {
+    try {
+      await ensureTableNextPartyColumns();
+    } catch (err) {
+      logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "table_next_party_ensure_failed");
+    }
+  }
+  let present = false;
+  try {
+    const rows = await runQuery<{ n: unknown }>(
+      `select count(*)::int as n from information_schema.columns
+        where table_schema = 'public' and table_name = 'Tables'
+          and column_name in ('parent_table_id', 'party_seq')`,
+    );
+    present = Number(rows[0]?.n ?? 0) === 2;
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "table_next_party_probe_failed");
+  }
+  if (!present && known?.present !== false) {
+    logger.warn("Next-party tables are OFF — migration 053 is not applied here and this role could not add it. Printed tables leave a waiter's floor with no seat for the next party, exactly as before.");
+  }
+  tableNextPartyColumns = { present, checkedAt: now };
+  return present;
+}
+
+/** A read or write answered 42703 although the latch said present: believe the database. */
+function noteNextPartyColumnsMissing(err: unknown): void {
+  if ((err as { code?: unknown } | null)?.code === "42703") {
+    tableNextPartyColumns = { present: false, checkedAt: Date.now() };
+  }
+}
+
+/** Test seam (jest only): forget what the latch learned, and the backfill memo. */
+export function resetTableNextPartyCache(): void {
+  tableNextPartyColumns = null;
+  nextPartyBackfillTried.clear();
+}
+
+/**
+ * Boot-time half of the ensure — see ensureTableNextPartyColumns. Never throws;
+ * answers whether the feature is ON for this process.
+ */
+export async function InitTableNextPartySchema(): Promise<boolean> {
+  try {
+    await ensureTableNextPartyColumns();
+  } catch (err) {
+    logger.warn({ err }, "table_next_party_boot_ensure_failed — the lazy ensure will retry on first use");
+  }
+  tableNextPartyColumns = null;
+  try {
+    return await nextPartyReady();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * "IS THIS A TABLE A PARTY CAN BE SAT AT, IN THE ROOM?" — the ONE predicate for
+ * every layout, capacity and analytics denominator.
+ *
+ * A virtual row backs one takeaway; a next-party sibling is a second name for a
+ * table that is already in the room. Counting either would add seats nobody
+ * can sit in (RevPASH, the simulator's table count), offer "12 #2" to a
+ * booking, or put it in the floor-plan editor. Without migration 053 the
+ * column does not exist and the predicate is exactly what it was.
+ *
+ * NOT for money, covers or seatings: a sibling's bill and its party's covers
+ * are real and stay on its own row.
+ */
+async function physicalTableSql(alias?: string): Promise<string> {
+  const col = (c: string) => (alias ? `${alias}.${c}` : c);
+  const virtualOff = `coalesce(${col("is_virtual")}, false) = false`;
+  return (await nextPartyReady()) ? `${virtualOff} and ${col("parent_table_id")} is null` : virtualOff;
+}
+
+/**
+ * The same idea for a lookup BY NAME that must only ever find a room table
+ * (AddTable's revive, a booking's table): `and parent_table_id is null`, or
+ * nothing at all without migration 053. A leading `and`, so it drops into an
+ * existing where clause.
+ */
+async function roomTableOnlySql(alias?: string): Promise<string> {
+  return (await nextPartyReady()) ? `and ${alias ? `${alias}.` : ""}parent_table_id is null` : "";
+}
+
+interface NextPartyFamilyRow {
+  id: string;
+  table_name: string;
+  parent_table_id: string | null;
+  party_seq: number | null;
+  is_deleted: boolean;
+  is_occupied: boolean;
+  /** A still-owing order or an open bill on the row. */
+  has_money: boolean;
+  capacity: unknown;
+  max_capacity: unknown;
+  section: string | null;
+}
+
+/**
+ * The root and every sibling of it, retired ones included (so one can be
+ * revived). "Free" is decided from the ROW's money, not from is_occupied
+ * alone: a QR order can sit on a table nobody seated, and handing that table
+ * to a new party would put them on somebody's bill.
+ */
+async function readNextPartyFamily(
+  context: RestaurantContext,
+  rootId: string,
+  client: PoolClient,
+): Promise<NextPartyFamilyRow[]> {
+  const rows = await runQuery<NextPartyFamilyRow>(
+    `select t.id, t.table_name, t.parent_table_id, t.party_seq,
+            coalesce(t.is_deleted, false) as is_deleted,
+            coalesce(t.is_occupied, false) as is_occupied,
+            t.capacity, t.max_capacity, t.section,
+            (exists (select 1 from "Orders" o
+                      where o.res_id = t.res_id and o.outlet_id = t.outlet_id and o.table_id = t.id
+                        and ${stillOwesStatusSql("o.status")})
+             or exists (select 1 from "Bills" b
+                         where b.res_id = t.res_id and b.outlet_id = t.outlet_id and b.table_id = t.id
+                           and b.closed_at is null)) as has_money
+       from "Tables" t
+      where t.res_id = $1 and t.outlet_id = $2 and (t.id = $3 or t.parent_table_id = $3)
+      order by t.party_seq asc nulls first, t.created_at desc`,
+    [context.res_id, context.outlet_id, rootId],
+    client,
+  );
+  return rows.map((r) => ({
+    ...r,
+    party_seq: r.party_seq === null || r.party_seq === undefined ? null : Number(r.party_seq),
+    is_deleted: r.is_deleted === true,
+    is_occupied: r.is_occupied === true,
+    has_money: r.has_money === true,
+  }));
+}
+
+const familyMember = (r: NextPartyFamilyRow): NextPartyFamilyMember => ({
+  id: r.id,
+  table_name: r.table_name,
+  party_seq: r.parent_table_id ? r.party_seq : null,
+  free: !r.is_occupied && !r.has_money,
+});
+
+/** What a print answers with: where the next party at this number sits. */
+export interface NextPartyTable {
+  /** The name to order on — "12 #2", or "12" itself when the root is free. */
+  table_name: string;
+  /** The root's name. */
+  parent_table: string;
+  /** The party number, or null when the seat is the root. */
+  party_no: number | null;
+  /** True when this call made the row appear (inserted or revived). */
+  created: boolean;
+}
+
+/**
+ * GIVE THE NEXT PARTY AT THIS NUMBER A SEAT — called after every successful
+ * bill print, and on the refusal path of an order added to a printed bill.
+ *
+ * Idempotent: if any member of the family is free it is returned as it stands
+ * (the root first), so a second print, a reprint or two tills printing at once
+ * never makes a second "12 #2". The ROOT ROW IS LOCKED for the whole decision,
+ * which serialises every caller for one family; the unique partial index
+ * `tables_one_live_party` is the backstop, and a 23505 from it is answered by
+ * reading again.
+ *
+ * NEVER THROWS. A print that has already put paper in a guest's hand must not
+ * turn into a 500 because the seat for the NEXT guest could not be made. Null =
+ * no seat: the feature is off (053 absent), the table is a takeaway, or it is
+ * unknown.
+ */
+export async function EnsureNextPartyTable(restaurantId: string, tableName: string): Promise<NextPartyTable | null> {
+  const normalized = String(tableName ?? "").trim();
+  if (!normalized) {return null;}
+  try {
+    const context = await requireRestaurantContext(restaurantId);
+    await ensureTableOccupancyColumns();
+    if (!(await nextPartyReady())) {return null;}
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await ensureNextPartySeat(context, normalized);
+      } catch (err) {
+        if ((err as { code?: unknown } | null)?.code === "23505" && attempt === 0) {continue;}
+        throw err;
+      }
+    }
+    return null;
+  } catch (err) {
+    noteNextPartyColumnsMissing(err);
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err, table: normalized }, "next_party_table_failed");
+    return null;
+  }
+}
+
+async function ensureNextPartySeat(context: RestaurantContext, tableName: string): Promise<NextPartyTable | null> {
+  return withTransaction(async (client) => {
+    const hit = await runQuery<{ id: string; parent_table_id: string | null }>(
+      `select id, parent_table_id from "Tables"
+        where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+          and coalesce(is_deleted, false) = false
+        limit 1`,
+      [context.res_id, context.outlet_id, tableName],
+      client,
+    );
+    if (!hit[0]) {return null;}
+    const rootId = hit[0].parent_table_id ?? hit[0].id;
+
+    // THE LOCK. Every caller for this family queues here.
+    const rootRows = await runQuery<{
+      id: string; table_name: string; capacity: unknown; max_capacity: unknown; section: string | null;
+      is_virtual: boolean; is_deleted: boolean; parent_table_id: string | null;
+    }>(
+      `select id, table_name, capacity, max_capacity, section,
+              coalesce(is_virtual, false) as is_virtual,
+              coalesce(is_deleted, false) as is_deleted,
+              parent_table_id
+         from "Tables"
+        where id = $1 and res_id = $2 and outlet_id = $3
+        for update`,
+      [rootId, context.res_id, context.outlet_id],
+      client,
+    );
+    const root = rootRows[0];
+    // A takeaway's hidden row has no "next party"; a root that is itself a
+    // sibling or has been deleted is a family this call must not extend.
+    if (!root || root.is_virtual === true || root.is_deleted === true || root.parent_table_id) {return null;}
+
+    const family = await readNextPartyFamily(context, rootId, client);
+    const live = family.filter((r) => !r.is_deleted);
+    const seat = freeFamilySeat(live.map(familyMember));
+    if (seat) {
+      return { table_name: seat.table_name, parent_table: root.table_name, party_no: seat.party_seq, created: false };
+    }
+
+    // Every name already in use under this root's prefix, sibling or not — a
+    // grandfathered "12 #3" is a real table and two live rows may not share a name.
+    const taken = await runQuery<{ n: string }>(
+      `select lower(btrim(table_name)) as n from "Tables"
+        where res_id = $1 and outlet_id = $2 and coalesce(is_deleted, false) = false
+          and starts_with(lower(btrim(table_name)), lower($3) || ' #')`,
+      [context.res_id, context.outlet_id, root.table_name.trim()],
+      client,
+    );
+    const takenNames = new Set(taken.map((r) => r.n));
+    const seq = nextFreePartySeq(
+      live.filter((r) => r.parent_table_id && r.party_seq !== null).map((r) => Number(r.party_seq)),
+      (n) => takenNames.has(nextPartyName(root.table_name, n).toLowerCase()),
+    );
+    if (seq === null) {
+      logger.warn({ table: root.table_name }, "next_party_table_numbers_exhausted");
+      return null;
+    }
+    const name = nextPartyName(root.table_name, seq);
+
+    // A RETIRED "12 #2" IS BROUGHT BACK rather than a new row minted, so the
+    // number and its history stay on one id — the same reason AddTable revives
+    // a same-named deleted table. Only a clean one: retirement never touches a
+    // row with money on it, and this does not bet on that.
+    const retired = family.find((r) => r.is_deleted && r.parent_table_id && r.party_seq === seq && !r.has_money);
+    if (retired) {
+      await runQuery(
+        `update "Tables"
+            set is_deleted = false, is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null,
+                table_name = $4, capacity = $5, max_capacity = $6, section = $7
+          where id = $1 and res_id = $2 and outlet_id = $3`,
+        [retired.id, context.res_id, context.outlet_id, name, root.capacity, root.max_capacity ?? null, root.section ?? null],
+        client,
+      );
+      // A new party must never inherit the previous one's waiter.
+      await unassignTableById(context, retired.id, client);
+      return { table_name: name, parent_table: root.table_name, party_no: seq, created: true };
+    }
+
+    // A REAL TABLE: not virtual (the floor shows it, a party can be moved onto
+    // it, the KOT says "Running Table", live gross counts it), seated like any
+    // other, with the root's seats and zone.
+    await runQuery(
+      `insert into "Tables"
+         (id, created_at, res_id, outlet_id, table_name, capacity, max_capacity, section,
+          is_occupied, num_covers, is_virtual, is_deleted, parent_table_id, party_seq)
+       values ($1, now(), $2, $3, $4, $5, $6, $7, false, 1, false, false, $8, $9)`,
+      [randomUUID(), context.res_id, context.outlet_id, name, root.capacity, root.max_capacity ?? null,
+        root.section ?? null, rootId, seq],
+      client,
+    );
+    return { table_name: name, parent_table: root.table_name, party_no: seq, created: true };
+  });
+}
+
+/**
+ * RETIRE THE IDLE SEATS OF A TABLE'S FAMILY — at most one free seat per family,
+ * preferring the root (planNextPartyRetirement has the rule).
+ *
+ * Called by every path that can FREE a table: release, admin approval, close,
+ * online payment, merge-away and move-away. AFTER the caller's own transaction,
+ * never inside it: this is housekeeping, and a housekeeping failure must not
+ * roll back a settle. When the caller is itself nested in a transaction,
+ * withTransaction makes this a savepoint, and the catch below keeps a failure
+ * from reaching the caller.
+ *
+ * Idempotent and self-healing: a hook that was missed leaves one extra free
+ * "12 #2" on a manager's floor until the family's next release, and nothing
+ * worse. An occupied sibling, or one with an order or an open bill, is NEVER
+ * touched — the statement re-checks that as it writes.
+ *
+ * Returns the retired names so a route can announce them. Never throws.
+ */
+async function retireIdleNextPartyTables(context: RestaurantContext, tableId: string | null | undefined): Promise<string[]> {
+  if (!tableId) {return [];}
+  try {
+    if (!(await nextPartyReady())) {return [];}
+    return await withTransaction(async (client) => {
+      const hit = await runQuery<{ id: string; parent_table_id: string | null }>(
+        `select id, parent_table_id from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+        [tableId, context.res_id, context.outlet_id],
+        client,
+      );
+      if (!hit[0]) {return [];}
+      const rootId = hit[0].parent_table_id ?? hit[0].id;
+      await runQuery(
+        `select id from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 for update`,
+        [rootId, context.res_id, context.outlet_id],
+        client,
+      );
+      const live = (await readNextPartyFamily(context, rootId, client)).filter((r) => !r.is_deleted);
+      const ids = planNextPartyRetirement(live.map(familyMember));
+      if (ids.length === 0) {return [];}
+      const retired = await runQuery<{ id: string; table_name: string }>(
+        `update "Tables" t
+            set is_deleted = true, order_otp = null, linked_order_id = null
+          where t.res_id = $1 and t.outlet_id = $2 and t.id = any($3::uuid[])
+            and t.parent_table_id is not null
+            and coalesce(t.is_deleted, false) = false
+            and coalesce(t.is_occupied, false) = false
+            and not exists (select 1 from "Orders" o
+                             where o.res_id = t.res_id and o.outlet_id = t.outlet_id and o.table_id = t.id
+                               and ${stillOwesStatusSql("o.status")})
+            and not exists (select 1 from "Bills" b
+                             where b.res_id = t.res_id and b.outlet_id = t.outlet_id and b.table_id = t.id
+                               and b.closed_at is null)
+          returning t.id, t.table_name`,
+        [context.res_id, context.outlet_id, ids],
+        client,
+      );
+      for (const r of retired) {
+        await unassignTableById(context, r.id, client);
+      }
+      return retired.map((r) => r.table_name);
+    });
+  } catch (err) {
+    noteNextPartyColumnsMissing(err);
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err, table_id: tableId }, "next_party_retire_failed");
+    return [];
+  }
+}
+
+/**
+ * THE TABLE A SETTLE FREED, carried out of its transaction so the family can be
+ * tidied AFTER the commit (see retireIdleNextPartyTables for why not inside).
+ * A holder object rather than a `let`, so the write inside the closure is not
+ * narrowed away by the compiler.
+ */
+interface FreedTable {
+  context: RestaurantContext | null;
+  tableId: string | null;
+}
+
+async function afterTableFreed(freed: FreedTable): Promise<void> {
+  if (freed.context && freed.tableId) {
+    await retireIdleNextPartyTables(freed.context, freed.tableId);
+  }
+}
+
+/**
+ * GetTables' backfill memo: when each root last had a seat made for it (or
+ * tried), so a seat that cannot be made is not re-attempted on every poll.
+ * Per process, bounded; a restart simply tries once more.
+ */
+const NEXT_PARTY_BACKFILL_RETRY_MS = 5 * 60_000;
+const nextPartyBackfillTried = new Map<string, number>();
+
+function claimNextPartyBackfill(context: RestaurantContext, tableId: string): boolean {
+  const key = `${context.res_id}|${context.outlet_id}|${tableId}`;
+  const now = Date.now();
+  const last = nextPartyBackfillTried.get(key);
+  if (last !== undefined && now - last < NEXT_PARTY_BACKFILL_RETRY_MS) {return false;}
+  if (nextPartyBackfillTried.size > 5000) {nextPartyBackfillTried.clear();}
+  nextPartyBackfillTried.set(key, now);
+  return true;
+}
+
+/**
+ * The root's name when [tableName] is a live sibling, else null. For the refusal's
+ * sentence and the delete guard. Null when the feature is off.
+ */
+async function nextPartyParentName(context: RestaurantContext, tableId: string): Promise<string | null> {
+  if (!(await nextPartyReady())) {return null;}
+  try {
+    const rows = await runQuery<{ parent_name: string | null }>(
+      `select p.table_name as parent_name
+         from "Tables" t
+         join "Tables" p on p.id = t.parent_table_id and p.res_id = t.res_id and p.outlet_id = t.outlet_id
+        where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+        limit 1`,
+      [tableId, context.res_id, context.outlet_id],
+    );
+    return rows[0]?.parent_name ?? null;
+  } catch (err) {
+    noteNextPartyColumnsMissing(err);
+    return null;
+  }
+}
+
+/**
+ * THE PRINT STATE OF A TABLE'S CURRENT SEATING, and nothing else — what the
+ * money guard on new orders asks. GetBillForTable answers the same question on
+ * the way to pricing the whole bill; this is the cheap half, reduced through
+ * the SAME seating bound (seatingStartOf) and the SAME ledger read, so the
+ * guard and the Print button can never disagree about "printed".
+ *
+ * Null when the table is unknown, is a takeaway, or the feature is off — the
+ * guard then lets the order through exactly as before.
+ */
+export async function GetOrderingPrintGuard(
+  restaurantId: string,
+  tableName: string,
+  /**
+   * POST /orders is an upsert too. When the body names an order id, the
+   * stored order's lines are read the way AddOrder merges them
+   * (storedOrderLines) so the route can tell a status change from an
+   * addition — see orderUpsertAddsToBill.
+   */
+  opts: { orderId?: string | null } = {},
+): Promise<{
+  table: string;
+  table_id: string;
+  parent_table: string | null;
+  print_count: number;
+  /** The named order's lines, or null when there is no such order (a new one). */
+  existing_lines: StoredOrderLine[] | null;
+} | null> {
+  const normalized = String(tableName ?? "").trim();
+  if (!normalized) {return null;}
+  const context = await requireRestaurantContext(restaurantId);
+  if (!(await nextPartyReady())) {return null;}
+  const tableRows = await runQuery<{ id: string; table_name: string; is_virtual: boolean }>(
+    `select id, table_name, coalesce(is_virtual, false) as is_virtual
+       from "Tables"
+      where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
+        and coalesce(is_deleted, false) = false
+      limit 1`,
+    [context.res_id, context.outlet_id, normalized],
+  );
+  const table = tableRows[0];
+  if (!table || table.is_virtual === true) {return null;}
+  const billRows = await runQuery<{ id: string; created_at: Date | null }>(
+    `select id, created_at from "Bills"
+      where table_id = $1 and res_id = $2 and outlet_id = $3
+        and status != 3 and closed_at is null
+      order by created_at desc
+      limit 1`,
+    [table.id, context.res_id, context.outlet_id],
+  );
+  const firstOrder = await runQuery<{ first_at: Date | null }>(
+    `select min(created_at) as first_at from "Orders"
+      where res_id = $1 and outlet_id = $2 and table_id = $3
+        and ${stillOwesStatusSql()}`,
+    [context.res_id, context.outlet_id, table.id],
+  );
+  const start = seatingStartOf(billRows[0]?.created_at ?? null, firstOrder[0]?.first_at ?? null);
+  // Nothing on the table at all: nothing can have been printed for this party.
+  if (start === null && !billRows[0]) {
+    return { table: table.table_name, table_id: table.id, parent_table: null, print_count: 0, existing_lines: null };
+  }
+  const prints = await billPrintHistoryForTable(context, table.id, billRows[0]?.id ?? null, table.table_name, start);
+  let existingLines: StoredOrderLine[] | null = null;
+  const orderId = String(opts.orderId ?? "").trim();
+  if (prints.print_count > 0 && isUuid(orderId)) {
+    const orderRows = await runQuery<{ food: unknown }>(
+      `select food from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
+      [orderId, context.res_id, context.outlet_id],
+    );
+    if (orderRows[0]) {
+      // What AddOrder will merge the resend onto: the split when there is one.
+      existingLines = storedOrderLines(parseJsonObject(orderRows[0].food) ?? {});
+    }
+  }
+  return {
+    table: table.table_name,
+    table_id: table.id,
+    parent_table: prints.print_count > 0 ? await nextPartyParentName(context, table.id) : null,
+    print_count: prints.print_count,
+    existing_lines: existingLines,
+  };
+}
+
 // --- Table sessions (turnaround time) ----------------------------------------
 // One row per seating: seated_at when a table flips to occupied, left_at when it
 // flips back. Written by a DB trigger on "Tables" so EVERY occupy/release path
@@ -3745,6 +4423,68 @@ function assertCoversFitTable(
   }
 }
 
+/**
+ * Bring back a RETIRED next-party row by name, for OccupyTable. Only while its
+ * root is still a live table, only when no live row already has the name, and
+ * only a clean row (no owing order, no open bill). Null otherwise — including
+ * with the feature off.
+ */
+async function reviveRetiredNextPartyTable(
+  context: RestaurantContext,
+  tableName: string,
+): Promise<{ id: string; capacity: unknown; max_capacity: unknown; is_occupied: boolean } | null> {
+  if (!parseNextPartyName(tableName)) {return null;}
+  if (!(await nextPartyReady())) {return null;}
+  try {
+    return await withTransaction(async (client) => {
+      const hit = await runQuery<{ id: string; parent_table_id: string }>(
+        `select t.id, t.parent_table_id
+           from "Tables" t
+           join "Tables" p on p.id = t.parent_table_id and p.res_id = t.res_id and p.outlet_id = t.outlet_id
+          where t.res_id = $1 and t.outlet_id = $2 and lower(t.table_name) = lower($3)
+            and coalesce(t.is_deleted, false) = true and t.parent_table_id is not null
+            and coalesce(p.is_deleted, false) = false
+          order by t.created_at desc
+          limit 1`,
+        [context.res_id, context.outlet_id, tableName],
+        client,
+      );
+      if (!hit[0]) {return null;}
+      await runQuery(
+        `select id from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 for update`,
+        [hit[0].parent_table_id, context.res_id, context.outlet_id],
+        client,
+      );
+      const revived = await runQuery<{ id: string; capacity: unknown; max_capacity: unknown }>(
+        `update "Tables" t
+            set is_deleted = false, is_occupied = false, num_covers = 1, linked_order_id = null, order_otp = null
+          where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+            and not exists (select 1 from "Tables" x
+                             where x.res_id = t.res_id and x.outlet_id = t.outlet_id
+                               and coalesce(x.is_deleted, false) = false
+                               and (lower(x.table_name) = lower(t.table_name)
+                                    or (x.parent_table_id = t.parent_table_id and x.party_seq = t.party_seq)))
+            and not exists (select 1 from "Orders" o
+                             where o.res_id = t.res_id and o.outlet_id = t.outlet_id and o.table_id = t.id
+                               and ${stillOwesStatusSql("o.status")})
+            and not exists (select 1 from "Bills" b
+                             where b.res_id = t.res_id and b.outlet_id = t.outlet_id and b.table_id = t.id
+                               and b.closed_at is null)
+          returning t.id, t.capacity, t.max_capacity`,
+        [hit[0].id, context.res_id, context.outlet_id],
+        client,
+      );
+      if (!revived[0]) {return null;}
+      await unassignTableById(context, revived[0].id, client);
+      return { ...revived[0], is_occupied: false };
+    });
+  } catch (err) {
+    noteNextPartyColumnsMissing(err);
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err, table: tableName }, "next_party_revive_failed");
+    return null;
+  }
+}
+
 export async function OccupyTable(
   restaurantId: string,
   table_name: string,
@@ -3775,7 +4515,7 @@ export async function OccupyTable(
   // silently resets a table's covers back to 1.
   const coversParam = typeof num_covers === "number" && num_covers >= 1 ? Math.round(num_covers) : null;
 
-  const rows = await runQuery<{ id: string; capacity: unknown; max_capacity: unknown; is_occupied: boolean }>(
+  let rows = await runQuery<{ id: string; capacity: unknown; max_capacity: unknown; is_occupied: boolean }>(
     `
       select id, capacity, max_capacity, coalesce(is_occupied, false) as is_occupied
       from "Tables"
@@ -3785,6 +4525,14 @@ export async function OccupyTable(
     `,
     [context.res_id, context.outlet_id, normalized],
   );
+  // CLIENT ITEM 6, OFFLINE. A waiter seated "12 #2" with the line down; by the
+  // time the outbox replays, 12 was settled and the idle "12 #2" retired. The
+  // party is real and is sitting there, so the seat comes back rather than the
+  // replay parking as "Table not found" with their order queued behind it.
+  if (!rows[0]) {
+    const revived = await reviveRetiredNextPartyTable(context, normalized);
+    if (revived) {rows = [revived];}
+  }
   if (rows[0]) {
     assertCoversFitTable(normalized, coversParam, rows[0].capacity, rows[0].max_capacity);
   }
@@ -4229,6 +4977,11 @@ export async function ReleaseTable(
   // Takeaway/delivery (virtual) tables are one-shot — remove on release.
   await softDeleteIfVirtual(context, tableId);
 
+  // A free table needs no spare seat beside it (client item 6): if this was 12
+  // and "12 #2" is idle, "12 #2" goes; if this was "12 #2" and 12 is still
+  // printed, it stays as 12's one free seat. Never throws.
+  await retireIdleNextPartyTables(context, tableId);
+
   const result = updatedRows[0];
   return {
     table_id: tableId,
@@ -4672,10 +5425,12 @@ export async function GetBillForTable(
     tableId,
     bill?.id ?? null,
     normalized,
-    // The seating starts at the bill row when there is one and at the earliest
-    // still-active order when there is not. Both are "the current party", and
-    // anything printed before it belongs to the previous one.
-    bill?.created_at ?? (orderRows[0]?.created_at as Date | null) ?? null,
+    // The seating starts at the EARLIER of the bill row and the earliest
+    // still-owing order. Both are "the current party", and anything printed
+    // before it belongs to the previous one — but a bill row created by a
+    // discount, a waiver or a tender AFTER a waiter's print must not move the
+    // start past that print. See seatingStartOf.
+    seatingStartOf(bill?.created_at ?? null, orderRows[0]?.created_at ?? null),
   );
 
   return {
@@ -4990,6 +5745,8 @@ async function resolveCombinedTables(
     .filter((n) => n.length > 0);
   if (wanted.length === 0) {return { ids: [], names: [] };}
 
+  // Clubbing is for room tables only, as the primary is (AssignTableToBooking).
+  const onlyRooms = await roomTableOnlySql();
   const rows = await runQuery<{ id: string; table_name: string }>(
     `
       select id, table_name
@@ -4997,6 +5754,7 @@ async function resolveCombinedTables(
       where res_id = $1 and outlet_id = $2
         and coalesce(is_deleted, false) = false
         and lower(table_name) = any($3::text[])
+        ${onlyRooms}
     `,
     [context.res_id, context.outlet_id, wanted.map((n) => n.toLowerCase())],
   );
@@ -5087,12 +5845,18 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null }[] | null> {
+  /** Internal: false on the one re-read after a backfill made a seat. */
+  opts: { backfillNextParty?: boolean } = {},
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null; parent_table: string | null; party_no: number | null; display_name: string }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
+  // Migration 053's two columns, named ONLY when the latch says they exist: this
+  // is the most-polled endpoint in the product and a 42703 here is every floor
+  // in the building going blank.
+  const withParty = await nextPartyReady();
 
   const tableRows = await runQuery<{
     id: string;
@@ -5103,12 +5867,14 @@ export async function GetTables(
     is_occupied: boolean;
     num_covers: unknown;
     order_otp: string | null;
+    parent_table_id?: string | null;
+    party_seq?: unknown;
   }>(
     `
       select id, table_name, capacity, max_capacity, section,
              coalesce(is_occupied, false) as is_occupied,
              coalesce(num_covers, 1) as num_covers,
-             order_otp
+             order_otp${withParty ? ", parent_table_id, party_seq" : ""}
       from "Tables"
       where res_id = $1 and outlet_id = $2
         and coalesce(is_deleted, false) = false
@@ -5116,7 +5882,10 @@ export async function GetTables(
       order by table_name asc
     `,
     [context.res_id, context.outlet_id],
-  );
+  ).catch((err: unknown) => {
+    noteNextPartyColumnsMissing(err);
+    throw err;
+  });
 
   // Staff read the OTP off this grid, so make sure every occupied table has one
   // while the gate is ON — including tables that were already seated before the
@@ -5265,18 +6034,18 @@ export async function GetTables(
   // the defect C3 exists to remove. bill_print_state.ts holds the rule and BOTH
   // payloads reduce through it.
   //
-  // The seating bound is the open bill's created_at, or the earliest still-owing
-  // order when there is no bill row yet — exactly GetBillForTable's fallback.
-  // A table with neither has nothing to have printed, so it is left out of the
-  // read entirely rather than dropping the time bound for the whole floor.
+  // The seating bound is the EARLIER of the open bill's created_at and the
+  // earliest still-owing order — exactly GetBillForTable's, through the same
+  // seatingStartOf, so the grid and the sheet can never disagree about whether a
+  // print belongs to this party. A table with neither has nothing to have
+  // printed, so it is left out of the read entirely rather than dropping the
+  // time bound for the whole floor.
   const printSeatings: BillPrintSeating[] = [];
   for (const row of tableRows) {
     const bill = openBillByTable.get(row.id) ?? null;
-    const billAt = bill?.created_at ? new Date(bill.created_at).getTime() : null;
-    const orderAt = firstOrderAtByTable.get(row.id) ?? null;
-    const start = billAt !== null && Number.isFinite(billAt) ? billAt : orderAt;
+    const start = seatingStartOf(bill?.created_at ?? null, firstOrderAtByTable.get(row.id) ?? null);
     if (start === null) { continue; }
-    printSeatings.push({ open_bill_id: bill?.id ?? null, table_name: row.table_name, seating_start: new Date(start) });
+    printSeatings.push({ open_bill_id: bill?.id ?? null, table_name: row.table_name, seating_start: start });
   }
   // Never fails the floor plan: billPrintStateForSeatings already degrades to
   // "nothing printed" when migration 027 is not applied, and this catch covers
@@ -5307,32 +6076,104 @@ export async function GetTables(
   // who set it up sees creation order.
   const sectionBirth = await readSectionBirthByKey(context);
 
-  return tableRows.map((row) => {
+  // THE NEXT PARTY SITS BESIDE ITS TABLE (client item 6). Each live sibling is
+  // listed straight after its root, in party order, so "12" and "12 #2" are
+  // neighbours on every floor rather than wherever the alphabet puts "12 #2".
+  // A sibling whose root is not on this list (it cannot be deleted while one is
+  // live, but a row is not a promise) is left where it is, as an ordinary table.
+  const liveById = new Map(tableRows.map((r) => [r.id, r]));
+  const rootOf = (r: (typeof tableRows)[number]) =>
+    r.parent_table_id ? (liveById.get(r.parent_table_id) ?? null) : null;
+  const siblingsByRoot = new Map<string, (typeof tableRows)[number][]>();
+  for (const r of tableRows) {
+    const root = rootOf(r);
+    if (!root) {continue;}
+    const list = siblingsByRoot.get(root.id) ?? [];
+    list.push(r);
+    siblingsByRoot.set(root.id, list);
+  }
+
+  // THE SEAT A PRINT BEFORE 2.0.1 NEVER MADE. A seat is opened when a bill is
+  // printed, so a table printed before this deploy — and CSR Organics keeps a
+  // printed room open for a day and a half — would reach a waiter's floor with
+  // its number still missing until somebody reprinted it, which a waiter
+  // cannot. So the floor read makes it: a root table that is printed, still in
+  // use, and has no next-party row at all. After a print on 2.0.1 there always
+  // is one (retirement keeps one free seat while the root is busy), so this
+  // only ever fires for those tables, once each, and for a print whose seat
+  // could not be made at the time.
+  //
+  // NEVER FAILS THE FLOOR READ (EnsureNextPartyTable never throws), never runs
+  // inside a transaction (the seat takes its own, with the root row locked),
+  // is tried at most once per table per NEXT_PARTY_BACKFILL_RETRY_MS so a seat
+  // that cannot be made does not cost every poll a transaction, and — when it
+  // made one — the floor is read ONCE more so the new tile is in this answer.
+  if (withParty && opts.backfillNextParty !== false && (tenantStorage.getStore()?.txnDepth ?? 0) === 0) {
+    const inUse = (r: (typeof tableRows)[number]): boolean =>
+      r.is_occupied || orderedTables.has(r.id) || openBillByTable.has(r.id);
+    let made = false;
+    for (const r of tableRows) {
+      if (r.parent_table_id || siblingsByRoot.has(r.id) || !inUse(r)) {continue;}
+      if ((printStateByTable.get(r.table_name)?.print_count ?? 0) <= 0) {continue;}
+      if (!claimNextPartyBackfill(context, r.id)) {continue;}
+      const seat = await EnsureNextPartyTable(restaurantId, r.table_name);
+      if (seat?.created) {
+        made = true;
+        logger.info({ table: r.table_name, seat: seat.table_name }, "next_party_backfilled");
+      }
+    }
+    if (made) {
+      return GetTables(restaurantId, time, { backfillNextParty: false });
+    }
+  }
+  const ordered: (typeof tableRows)[number][] = [];
+  for (const r of tableRows) {
+    if (rootOf(r)) {continue;}
+    ordered.push(r);
+    const siblings = siblingsByRoot.get(r.id);
+    if (siblings) {
+      ordered.push(...siblings.sort((a, z) => parseNumeric(a.party_seq) - parseNumeric(z.party_seq)));
+    }
+  }
+
+  return ordered.map((row) => {
     const occupied = row.is_occupied;
     const tCovers = Math.max(1, parseNumeric(row.num_covers) ?? 1);
     const tTotal = totalByTable.get(row.id) ?? 0;
     const tApc = occupied && tTotal > 0 ? round2(tTotal / tCovers) : 0;
     const prints = printStateByTable.get(row.table_name) ?? NO_BILL_PRINTS;
+    // A sibling is a second seat at the SAME table: it sits in the root's zone
+    // and carries the root's booking state. Its occupancy, money, covers, OTP,
+    // QR and print state are its OWN — that is the entire point of the row.
+    const root = rootOf(row);
+    const place = root ?? row;
     return {
       table_name: row.table_name,
+      // Client item 6. `parent_table` is the root's name (null on every other
+      // table), `party_no` the party number, and `display_name` what a tile
+      // prints big — the root's number for a sibling. ADDITIVE: an app that has
+      // never heard of them shows "12 #2" as an ordinary table, which is safe.
+      parent_table: root?.table_name ?? null,
+      party_no: root ? (Math.round(parseNumeric(row.party_seq)) || null) : null,
+      display_name: tableDisplayName(row.table_name, root?.table_name ?? null),
       capacity: parseNumeric(row.capacity),
       // The most this table can seat with extra chairs (falls back to capacity).
       max_capacity: effectiveMaxCapacity(row.capacity, row.max_capacity),
       // Floor section/zone this table sits in; null = unassigned. Clients group
       // the grid by this and PATCH /table/:name to drag a table to another one.
-      section: normalizeTableSection(row.section),
+      section: normalizeTableSection(place.section),
       // Where that section sits in the outlet's chosen order; null = never
       // positioned, which clients render in the alphabetical tail. Null for
       // every table until somebody reorders, so this is inert on 1.8.5 data.
-      section_position: sectionOrder.get(sectionOrderKey(row.section ?? "")) ?? null,
+      section_position: sectionOrder.get(sectionOrderKey(place.section ?? "")) ?? null,
       // When that section first existed, ISO-8601; null when unknown. The tail
       // of the floor order (every zone nobody has positioned) sorts by this.
       section_created_at: (() => {
-        const at = sectionBirth.get(sectionOrderKey(row.section ?? ""));
+        const at = sectionBirth.get(sectionOrderKey(place.section ?? ""));
         return at === undefined ? null : new Date(at).toISOString();
       })(),
-      booked: bookedTables.has(row.id),
-      reserved: reservedTables.has(row.id),
+      booked: bookedTables.has(place.id),
+      reserved: reservedTables.has(place.id),
       // WHAT `occupied` MEANS HERE HAS NOT CHANGED, AND MUST NOT.
       //
       // It is "Tables".is_occupied - the SEATING - and every consumer built on
@@ -5428,6 +6269,10 @@ export async function GetAvailableTablesForInterval(
   const end = new Date(start.getTime() + durationMins * MINUTE_IN_MS);
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
+  // The reservation and waitlist auto-allocators pick from this list, so it is
+  // the room: a takeaway's hidden row or a next-party sibling is not somewhere
+  // a booking can be put.
+  const physical = await physicalTableSql();
 
   const tableRows = await runQuery<{
     id: string;
@@ -5440,6 +6285,7 @@ export async function GetAvailableTablesForInterval(
       from "Tables"
       where res_id = $1 and outlet_id = $2
         and coalesce(is_deleted, false) = false
+        and ${physical}
     `,
     [context.res_id, context.outlet_id],
   );
@@ -5550,6 +6396,9 @@ export async function GetSeatingSuggestion(
   const end = new Date(start.getTime() + duration * MINUTE_IN_MS);
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
+  // A booking is offered the ROOM's tables, never "12 #2", which exists only
+  // while 12 is printed and is retired the moment it is not.
+  const physical = await physicalTableSql();
 
   const tableRows = await runQuery<{
     id: string;
@@ -5564,7 +6413,7 @@ export async function GetSeatingSuggestion(
       from "Tables"
       where res_id = $1 and outlet_id = $2
         and coalesce(is_deleted, false) = false
-        and coalesce(is_virtual, false) = false
+        and ${physical}
       order by table_name asc
     `,
     [context.res_id, context.outlet_id],
@@ -6009,6 +6858,11 @@ export async function UpdateBookingStatus(
     } catch (err) {
       logger.warn({ err }, "release_table_on_unseat_failed");
     }
+    // The booking's tables are free again: an idle next-party seat beside one
+    // is no longer needed (client item 6). Never throws.
+    for (const releasedId of tableIds) {
+      await retireIdleNextPartyTables(context, releasedId);
+    }
   }
 
   return true;
@@ -6045,12 +6899,17 @@ export async function AssignTableToBooking(
     throw new Error("Table name cannot be null");
   }
 
+  // A booking is for a table in the ROOM. "12 #2" exists only while 12's bill
+  // is printed and is retired minutes later (client item 6), so a reservation
+  // pointed at it would be pointing at nothing by the time the guests arrive.
+  const onlyRooms = await roomTableOnlySql();
   const tableRows = await runQuery<{ id: string }>(
     `
       select id
       from "Tables"
       where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)
         and coalesce(is_deleted, false) = false
+        ${onlyRooms}
       limit 1
     `,
     [context.res_id, context.outlet_id, table_name.trim()],
@@ -15603,7 +16462,8 @@ export async function MergeTableBills(
   fromTable: string,
   toTable: string,
 ): Promise<{ success: true; total_amt: number; moved_orders: number }> {
-  return withTransaction(async (client) => {
+  const freed: FreedTable = { context: null, tableId: null };
+  const out = await withTransaction<{ success: true; total_amt: number; moved_orders: number }>(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
@@ -15694,9 +16554,16 @@ export async function MergeTableBills(
       client,
     );
     await unassignTableById(context, fromId, client);
+    freed.context = context;
+    freed.tableId = fromId;
 
-    return { success: true, total_amt: consolidated, moved_orders: orders.length };
+    return { success: true as const, total_amt: consolidated, moved_orders: orders.length };
   });
+  // The SOURCE was freed. Merging "12 #2" into 12 (the "same guests, one more
+  // round" case) leaves "12 #2" as 12's free seat; merging 12 away leaves 12
+  // free and its idle sibling goes.
+  await afterTableFreed(freed);
+  return out;
 }
 
 /**
@@ -15781,7 +16648,8 @@ export async function MoveTableParty(
   /** True when a waiter assignment travelled with the party. */
   moved_waiter: boolean;
 }> {
-  return withTransaction(async (client) => {
+  const freed: FreedTable = { context: null, tableId: null };
+  const out = await withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
     await ensureTableSessionsTable(client);
@@ -15968,6 +16836,8 @@ export async function MoveTableParty(
     await moveSeatedBookingsBetweenTables(context, src.id, dst.id, client);
 
     const total = await sumOrderTotalsForTable(context, dst.id, client);
+    freed.context = context;
+    freed.tableId = src.id;
     return {
       success: true as const,
       from_table: src.table_name,
@@ -15980,6 +16850,10 @@ export async function MoveTableParty(
       moved_waiter: movedWaiter.length > 0,
     };
   });
+  // The party LEFT the source: tidy its family (client item 6). Moving the
+  // printed party at 12 to 15 frees 12, and "12 #2" is no longer needed.
+  await afterTableFreed(freed);
+  return out;
 }
 
 /** Carry a SEATED reservation from one table to another. Only seated/arrived
@@ -16375,6 +17249,71 @@ export interface ReopenedBill {
   nc_reversed?: { lines: number; value: number; settle_group: string | null };
 }
 
+/**
+ * ReopenBill's next-party half: bring a RETIRED sibling back, seated, for the
+ * bill being re-opened on it. Only while its root is a live table, and only
+ * when no live row already answers to its name or holds its (root, party
+ * number) — otherwise two rows would share "12 #2" and a name-keyed settle
+ * would pick one. The root row is locked first, as every other writer of a
+ * family does. `not_sibling` = not a retired next-party row: the caller's
+ * ordinary path already said all there is to say.
+ */
+async function reviveNextPartySeatForReopen(
+  context: RestaurantContext,
+  tableId: string,
+  client: PoolClient,
+): Promise<{ status: "not_sibling" } | { status: "revived"; table_name: string } | { status: "blocked"; message: string }> {
+  const rows = await runQuery<{
+    table_name: string; parent_table_id: string | null; is_deleted: boolean;
+    parent_name: string | null; parent_deleted: boolean | null;
+  }>(
+    `select t.table_name, t.parent_table_id, coalesce(t.is_deleted, false) as is_deleted,
+            p.table_name as parent_name, coalesce(p.is_deleted, false) as parent_deleted
+       from "Tables" t
+       left join "Tables" p on p.id = t.parent_table_id and p.res_id = t.res_id and p.outlet_id = t.outlet_id
+      where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+      limit 1`,
+    [tableId, context.res_id, context.outlet_id],
+    client,
+  );
+  const row = rows[0];
+  if (!row || !row.parent_table_id || row.is_deleted !== true) {return { status: "not_sibling" };}
+  const root = String(row.parent_name ?? parseNextPartyName(row.table_name)?.root ?? "").trim();
+  const spoken = root ? nextPartyLabel(root) : row.table_name;
+  if (!row.parent_name || row.parent_deleted === true) {
+    return {
+      status: "blocked",
+      message: `This bill was for ${spoken}, and table ${root || "it belonged to"} has since been deleted, so there is no table to re-open it on.`,
+    };
+  }
+  await runQuery(
+    `select id from "Tables" where id = $1 and res_id = $2 and outlet_id = $3 for update`,
+    [row.parent_table_id, context.res_id, context.outlet_id],
+    client,
+  );
+  const revived = await runQuery<{ table_name: string }>(
+    `update "Tables" t
+        set is_deleted = false, is_occupied = true
+      where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+        and coalesce(t.is_deleted, false) = true
+        and not exists (select 1 from "Tables" x
+                         where x.res_id = t.res_id and x.outlet_id = t.outlet_id
+                           and coalesce(x.is_deleted, false) = false
+                           and (lower(x.table_name) = lower(t.table_name)
+                                or (x.parent_table_id = t.parent_table_id and x.party_seq = t.party_seq)))
+      returning t.table_name`,
+    [tableId, context.res_id, context.outlet_id],
+    client,
+  );
+  if (!revived[0]) {
+    return {
+      status: "blocked",
+      message: `This bill was for ${spoken}, and that seat ("${row.table_name}") is now another party's. Settle or release ${row.table_name} first, then re-open this bill.`,
+    };
+  }
+  return { status: "revived", table_name: revived[0].table_name };
+}
+
 // Re-open a CLOSED bill within the restaurant's configured window (admin only,
 // enforced at the route). The exact inverse of the approve/close finalization:
 // clears closed_* and the admin approval stamps (waiter confirmation + payment
@@ -16389,6 +17328,9 @@ export async function ReopenBill(
   // (034's reversal columns must name a person).
   byUsername?: string | null,
 ): Promise<ReopenedBill> {
+  // Resolved BEFORE the transaction: the 053 latch may issue DDL, which must
+  // never run inside one (see nextPartyReady).
+  const withNextParty = await nextPartyReady();
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
@@ -16498,6 +17440,20 @@ export async function ReopenBill(
         client,
       );
       tableName = t[0]?.table_name ?? null;
+
+      // CLIENT ITEM 6 — THE BILL WAS A NEXT PARTY'S, AND ITS SEAT HAS BEEN
+      // RETIRED. "12 #2" is soft-deleted once its party settles while 12 is free,
+      // so the update above matched nothing: the bill would be open again with
+      // no tile on any floor, "12 #2" would answer "Table not found" by name,
+      // and the next print of 12 would mint a second, live "12 #2" for every
+      // name-keyed read and settle to find instead. So the seat comes back with
+      // its bill — or, when that cannot be done cleanly, the re-open is refused
+      // in words and rolls back whole.
+      if (!tableName && withNextParty) {
+        const seat = await reviveNextPartySeatForReopen(context, bill.table_id, client);
+        if (seat.status === "blocked") {throw new Error(seat.message);}
+        if (seat.status === "revived") {tableName = seat.table_name;}
+      }
     }
 
     let ncReversed: ReopenedBill["nc_reversed"];
@@ -21342,7 +22298,8 @@ export async function ApproveBillPaymentByAdmin(
   orderId: string,
   adminEmployeeId: string,
 ): Promise<{ success: true }> {
-  return withTransaction(async (client) => {
+  const freed: FreedTable = { context: null, tableId: null };
+  const out = await withTransaction<{ success: true }>(async (client) => {
     await ensureBillWorkflowColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
     const admin = await resolveEmployeeByUsername(context, adminEmployeeId, client);
@@ -21510,8 +22467,13 @@ export async function ApproveBillPaymentByAdmin(
     // Loyalty earn on settle — best-effort, never fails the approval.
     try { await awardLoyaltyForSettledBill(context, tableId, client); } catch (err) { logger.warn({ err }, "loyalty_award_failed"); }
     await finalizeSettledTable(context, tableId, client);
-    return { success: true };
+    freed.context = context;
+    freed.tableId = tableId;
+    return { success: true } as const;
   });
+  // After the commit: the approval is booked whatever the tidy-up does.
+  await afterTableFreed(freed);
+  return out;
 }
 
 // Mark EVERY still-active order on a table as settled, so a freed/re-used table
@@ -21737,7 +22699,8 @@ export async function CloseBillByOrder(
   orderId: string,
   adminEmployeeId: string,
 ): Promise<{ success: true }> {
-  return withTransaction(async (client) => {
+  const freed: FreedTable = { context: null, tableId: null };
+  const out = await withTransaction<{ success: true }>(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
@@ -21856,11 +22819,15 @@ export async function CloseBillByOrder(
         // been missed.
         await unassignTableById(context, billTableId, client);
         await softDeleteIfVirtual(context, billTableId, client);
+        freed.context = context;
+        freed.tableId = billTableId;
       }
     }
 
-    return { success: true };
+    return { success: true } as const;
   });
+  await afterTableFreed(freed);
+  return out;
 }
 
 // Online payment (Razorpay) is gateway-verified, so it finalizes the table's
@@ -21871,7 +22838,8 @@ export async function FinalizeOnlinePayment(
   tableName: string,
   paymentRef: string,
 ): Promise<{ success: true; total_amt: number }> {
-  return withTransaction(async (client) => {
+  const freed: FreedTable = { context: null, tableId: null };
+  const out = await withTransaction<{ success: true; total_amt: number }>(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
     const context = await requireRestaurantContext(restaurantId, client);
@@ -21960,8 +22928,12 @@ export async function FinalizeOnlinePayment(
     );
     await unassignTableById(context, tableId, client);
     await softDeleteIfVirtual(context, tableId, client);
-    return { success: true, total_amt: total };
+    freed.context = context;
+    freed.tableId = tableId;
+    return { success: true as const, total_amt: total };
   });
+  await afterTableFreed(freed);
+  return out;
 }
 
 /**
@@ -25706,9 +26678,12 @@ export async function GetAdvancedAnalytics(
     `select coalesce(sum(total_amt),0)::float rev from "Bills" where res_id=$1 and (${og} or outlet_id=$2) and status <> 0 and created_at >= $3 and created_at < $4`,
     [rid, oid, win.fromIso, win.toIso],
   ))[0]?.rev ?? 0;
+  // RevPASH's seats are the room's: a next-party sibling would count 12's
+  // chairs twice for as long as its bill sat unpaid.
+  const physicalSeats = await physicalTableSql();
   const seats = (await runQuery<{ seats: number }>(
     `select coalesce(sum(greatest(capacity, 1)), 0)::int seats from "Tables"
-       where res_id=$1 and (${og} or outlet_id=$2) and coalesce(is_deleted,false)=false and coalesce(is_virtual,false)=false`,
+       where res_id=$1 and (${og} or outlet_id=$2) and coalesce(is_deleted,false)=false and ${physicalSeats}`,
     [rid, oid],
   ))[0]?.seats ?? 0;
   const revpash = seats > 0 && windowRev > 0 ? round2(windowRev / (seats * OPERATING_HOURS_PER_DAY * days)) : null;
@@ -25964,11 +26939,17 @@ export async function GetAdvancedAnalytics(
          and coalesce(t.is_virtual, false) = false`,
     [rid, oid, win.fromIso, win.toIso],
   ))[0] ?? { avg_min: null, median_min: null, n: 0 };
+  // TABLE-WISE, SO A NEXT-PARTY SEATING IS LABELLED WITH ITS TABLE. "12 #2"
+  // is the second party at 12, and the report reads "12" for both; each
+  // seating is still its own visit with its own duration, so nothing about the
+  // arithmetic moves. Without migration 053 there is no parent to join.
+  const foldToRoot = await nextPartyReady();
   const tatByTable = await runQuery<{ table_name: string; visits: number; avg_min: number }>(
-    `select coalesce(s.table_name, '?') table_name, count(*)::int visits,
+    `select coalesce(${foldToRoot ? "pt.table_name, " : ""}s.table_name, '?') table_name, count(*)::int visits,
             avg(extract(epoch from (s.left_at - s.seated_at))/60)::float avg_min
        from "TableSessions" s
-       left join "Tables" t on t.id = s.table_id and t.res_id = s.res_id
+       left join "Tables" t on t.id = s.table_id and t.res_id = s.res_id${foldToRoot ? `
+       left join "Tables" pt on pt.id = t.parent_table_id and pt.res_id = t.res_id` : ""}
        where s.res_id=$1 and (${og} or s.outlet_id=$2) and s.left_at is not null and s.seated_at >= $3 and s.seated_at < $4
          and s.left_at > s.seated_at and s.left_at - s.seated_at <= interval '6 hours'
          and coalesce(t.is_virtual, false) = false
@@ -26380,8 +27361,12 @@ export async function GetSimulationRawStats(restaurantId: string): Promise<Simul
     `select count(*)::int n from "Employees" where res_id=$1 and (${og} or outlet_id=$2)`,
     [rid, oid],
   );
+  // The simulator's table count is the room. This read has no is_deleted
+  // filter, so a sibling (retired within minutes, over and over) would pile up
+  // here without the physical predicate.
+  const physicalTables = await physicalTableSql();
   const tableRows = await runQuery<{ n: number }>(
-    `select count(*)::int n from "Tables" where res_id=$1 and (${og} or outlet_id=$2) and coalesce(is_virtual, false) = false`,
+    `select count(*)::int n from "Tables" where res_id=$1 and (${og} or outlet_id=$2) and ${physicalTables}`,
     [rid, oid],
   );
 
@@ -26462,12 +27447,16 @@ export async function GetMonthlyApcInsights(
 
   const employeeFilter = options.employeeId?.trim().toLowerCase() || null;
   const yellowBandPercent = 0.1;
+  // A next-party seating is labelled with its table (client item 6). Only the
+  // label: the grouping below stays on the row's own name and bill.
+  const foldLabel = await nextPartyReady();
 
   const orderRows = await runQuery<{
     id: string;
     created_at: Date | string;
     table_id: string;
     table_name: string | null;
+    parent_table_name?: string | null;
     num_covers: number;
     food: unknown;
     status: unknown;
@@ -26481,7 +27470,8 @@ export async function GetMonthlyApcInsights(
         o.id,
         o.created_at,
         o.table_id,
-        t.table_name,
+        t.table_name,${foldLabel ? `
+        pt.table_name as parent_table_name,` : ""}
         -- Covers AS OF THAT SEATING. "Tables".num_covers is the LIVE value and is
         -- reset to 1 when a table is released, so reading it here made every
         -- settled seating look like one cover — the month's cover count barely
@@ -26495,7 +27485,9 @@ export async function GetMonthlyApcInsights(
         b.waiter_confirmed_by_username
       from "Orders" o
       left join "Tables" t
-        on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id
+        on t.id = o.table_id and t.res_id = o.res_id and t.outlet_id = o.outlet_id${foldLabel ? `
+      left join "Tables" pt
+        on pt.id = t.parent_table_id and pt.res_id = t.res_id and pt.outlet_id = t.outlet_id` : ""}
       left join "Bills" b
         on (b.order_id = o.id or (b.table_id = o.table_id and b.closed_at is null))
         and b.res_id = o.res_id and b.outlet_id = o.outlet_id
@@ -26616,6 +27608,7 @@ export async function GetMonthlyApcInsights(
       // count, so settling another party at an already-used table added nothing).
       bill_id: row.bill_id ?? null,
       table_name: row.table_name ?? String(payload.table ?? ""),
+      table_label: row.parent_table_name || row.table_name || String(payload.table ?? ""),
       created_at: createdAt.toISOString(),
       total: round2(total),
       people_count: people,
@@ -26647,6 +27640,7 @@ export async function GetMonthlyApcInsights(
   // = its bill (sum of orders) / the number of people on it.
   interface TableAgg {
     table_name: string;
+    table_label: string;
     total: number;
     covers: number;
     created_at: string;
@@ -26664,6 +27658,7 @@ export async function GetMonthlyApcInsights(
     const key = o.bill_id ?? `open:${o.table_name || o.order_id}`;
     const agg = byTable.get(key) ?? {
       table_name: o.table_name,
+      table_label: o.table_label,
       total: 0,
       covers: 0,
       created_at: o.created_at,
@@ -26691,6 +27686,7 @@ export async function GetMonthlyApcInsights(
     return {
       order_id: t.table_name, // a table's consolidated bill is keyed by the table
       table_name: t.table_name,
+      table_label: t.table_label,
       created_at: t.created_at,
       total: t.total,
       people_count: t.covers,
@@ -38907,7 +39903,10 @@ export async function SettleBillAsNonChargeable(
     return m ? round2(parseNumeric(m.price)) : null;
   };
 
-  return withTransaction(async (client) => {
+  // The table this settle frees, tidied after the commit (next-party seats —
+  // see afterTableFreed), exactly as the approve path does.
+  const freed: FreedTable = { context: null, tableId: null };
+  const out = await withTransaction<SettleBillNonChargeableResult>(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const orderRows = await runQuery<{ table_id: string | null; status: number | string | null }>(
       `select table_id, status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1`,
@@ -39146,6 +40145,8 @@ export async function SettleBillAsNonChargeable(
     if (!closed[0]) {throw new Error("This bill could not be closed — refresh it and try again.");}
     await updateOrderWorkflowStatus(context, orderId, "Paid", client);
     await finalizeSettledTable(context, tableId, client);
+    freed.context = context;
+    freed.tableId = tableId;
 
     return {
       success: true,
@@ -39162,6 +40163,8 @@ export async function SettleBillAsNonChargeable(
       non_chargeables: written,
     };
   });
+  await afterTableFreed(freed);
+  return out;
 }
 
 /** How an NC-settled bill was settled, as the closed bill and its paper describe it. */
