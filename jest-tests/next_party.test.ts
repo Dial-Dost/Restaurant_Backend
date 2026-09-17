@@ -11,12 +11,15 @@ import { describe, test, expect } from "@jest/globals";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  ADD_TO_PRINTED_BILL_KEY,
   BILL_PRINTED_CODE,
   BILL_PRINTED_STATUS,
   FIRST_NEXT_PARTY_SEQ,
   MAX_NEXT_PARTY_SEQ,
   NEXT_PARTY_CHIP,
   RESERVED_TABLE_NAME_ERROR,
+  addToPrintedBillFlag,
+  addToPrintedBillLabel,
   billPrintedRefusal,
   freeFamilySeat,
   isReservedPartyName,
@@ -28,7 +31,10 @@ import {
   orderUpsertAddsToBill,
   parseNextPartyName,
   planNextPartyRetirement,
+  printedBillAdditionAudit,
   reprintNeededMessage,
+  sameFamilyMoveError,
+  sameTableFamily,
   storedOrderLines,
   tableDisplayName,
   tableSentenceName,
@@ -165,6 +171,47 @@ describe("who may add to a printed bill", () => {
     expect(orderOnPrintedBillVerdict({ printCount, waiterOnly, guest })).toBe(verdict);
   });
 
+  // CLIENT ITEMS 1 AND 2 (2.0.2): a waiter who CONFIRMED is treated as a senior
+  // is; nobody else's answer moves. The unconfirmed rows are the 2.0.1 matrix
+  // above, restated, because they are what every installed 2.0.0/2.0.1 till
+  // still gets.
+  test.each([
+    // printCount, waiterOnly, guest, confirmed, verdict
+    [1, true, false, true, "reprint_needed"],
+    [1, true, false, false, "refuse"],
+    [1, true, false, undefined, "refuse"],
+    [1, false, true, true, "refuse"],
+    [1, true, true, true, "refuse"],
+    [1, false, false, true, "reprint_needed"],
+    [1, false, false, false, "reprint_needed"],
+    [0, true, false, true, "allow"],
+  ] as const)("print_count %p, waiterOnly %p, guest %p, confirmed %p -> %p", (printCount, waiterOnly, guest, confirmedPrinted, verdict) => {
+    expect(orderOnPrintedBillVerdict({ printCount, waiterOnly, guest, confirmedPrinted })).toBe(verdict);
+  });
+
+  test("a confirmed write that adds nothing is still just allowed", () => {
+    expect(orderOnPrintedBillVerdict({ printCount: 1, waiterOnly: true, guest: false, addsToBill: false, confirmedPrinted: true })).toBe("allow");
+  });
+
+  test("the intent flag is a literal TRUE under its one key — nothing else counts", () => {
+    expect(ADD_TO_PRINTED_BILL_KEY).toBe("add_to_printed_bill");
+    expect(addToPrintedBillFlag({ add_to_printed_bill: true })).toBe(true);
+    for (const body of [
+      { add_to_printed_bill: "true" }, { add_to_printed_bill: 1 }, { add_to_printed_bill: false },
+      { addToPrintedBill: true }, {}, null, undefined, "add_to_printed_bill", [true],
+    ]) {
+      expect({ body, flag: addToPrintedBillFlag(body) }).toEqual({ body, flag: false });
+    }
+  });
+
+  test("the action's words, and the audit line an addition files", () => {
+    expect(addToPrintedBillLabel("12")).toBe("Add to 12's printed bill");
+    expect(addToPrintedBillLabel("12 #2", "12")).toBe("Add to 12 (next party)'s printed bill");
+    expect(printedBillAdditionAudit({ table: "12", printCount: 1 })).toBe("ADDED an order on the printed bill of table 12 (printed 1 time(s))");
+    expect(printedBillAdditionAudit({ table: "12", printCount: 2, write: "merge" })).toBe("ADDED a merge into the printed bill of table 12 (printed 2 time(s))");
+    expect(printedBillAdditionAudit({ table: " 12 ", printCount: Number.NaN, write: "move" })).toBe("ADDED an item moved onto the printed bill of table 12 (printed 0 time(s))");
+  });
+
   test("a write that adds nothing to the bill is never refused and never told to reprint", () => {
     for (const waiterOnly of [true, false]) {
       for (const guest of [true, false]) {
@@ -241,13 +288,21 @@ describe("who may add to a printed bill", () => {
   test("the staff refusal says where the new party goes AND what a same-party addition needs", () => {
     const body = billPrintedRefusal({ table: "12", nextPartyTable: "12 #2", printCount: 1, guest: false });
     expect(body).toEqual({
+      // The sentence is 2.0.1's, word for word: every installed 2.0.0/2.0.1 till
+      // shows it verbatim and still cannot add to printed paper itself.
       error: "12's bill has already been printed, so nothing more can be added to it. Take a new party's order on 12 (next party), shown as \"12 #2\" on older apps. If it is for the same guests, ask a manager to add it and reprint the bill.",
       code: BILL_PRINTED_CODE,
       table: "12",
       next_party_table: "12 #2",
       next_party_action: "Take it on 12 (next party)",
+      // 2.0.2 offers this beside it: resend with add_to_printed_bill.
+      add_to_printed_action: "Add to 12's printed bill",
+      // ...and shows THIS sentence instead of `error`, because "ask a manager
+      // to add it" is wrong above a button that adds it.
+      add_to_printed_message: "12's bill has already been printed. Take a new party's order on 12 (next party), or, if it is for the same guests, add it to 12's printed bill and print the updated bill.",
       print_count: 1,
     });
+    expect(body.add_to_printed_message).not.toMatch(/ask a manager/i);
   });
 
   test("with no seat to point at (or the root itself free again), it does not point at itself", () => {
@@ -255,6 +310,10 @@ describe("who may add to a printed bill", () => {
     expect(none.error).toBe("12's bill has already been printed, so nothing more can be added to it. Ask a manager to add it and reprint the bill.");
     expect(none.next_party_table).toBeNull();
     expect(none.next_party_action).toBeNull();
+    expect(none.add_to_printed_message).toBe("12's bill has already been printed. If it is for the same guests, add it to 12's printed bill and print the updated bill.");
+    // A next-party seat's refusal names it as a sentence does.
+    expect(billPrintedRefusal({ table: "12 #2", nextPartyTable: "12 #3", printCount: 1, guest: false, parentTable: "12" }).add_to_printed_message)
+      .toBe("12 (next party)'s bill has already been printed. Take a new party's order on 12 (next party), or, if it is for the same guests, add it to 12 (next party)'s printed bill and print the updated bill.");
     const self = billPrintedRefusal({ table: "12", nextPartyTable: "12", printCount: 1, guest: false });
     expect(self.error).not.toContain("Take a new party");
     expect(self.next_party_action).toBeNull();
@@ -266,6 +325,9 @@ describe("who may add to a printed bill", () => {
     expect(body.error).not.toContain("12");
     expect(body.code).toBe(BILL_PRINTED_CODE);
     expect(body.next_party_action).toBeNull();
+    // ...and never offered to add to somebody's printed bill.
+    expect(body.add_to_printed_action).toBeNull();
+    expect(body.add_to_printed_message).toBeNull();
   });
 
   test("a MERGE into, or an item MOVED onto, a printed table is a manager's — no seat is offered", () => {
@@ -276,6 +338,9 @@ describe("who may add to a printed bill", () => {
       table: "12",
       next_party_table: null,
       next_party_action: null,
+      // A merge or a moved item stays a manager's on every client.
+      add_to_printed_action: null,
+      add_to_printed_message: null,
       print_count: 1,
     });
     const move = billPrintedRefusal({ table: "12 #2", nextPartyTable: "12 #3", printCount: 2, guest: false, parentTable: "12", write: "move" });
@@ -413,5 +478,33 @@ describe("migration 053 says exactly what the runtime issues", () => {
       const loose = stmt.replace(/;/g, "");
       expect({ stmt: loose.slice(0, 80), inFile: sql.replace(/;/g, "").includes(loose) }).toEqual({ stmt: loose.slice(0, 80), inFile: true });
     }
+  });
+});
+
+describe("a move within the family (client items 1 and 2)", () => {
+  const root = { id: "r12" };
+  const sib = { id: "s2", parent_table_id: "r12" };
+  const sib3 = { id: "s3", parent_table_id: "r12" };
+  const other = { id: "r15" };
+  const otherSib = { id: "s15", parent_table_id: "r15" };
+
+  test("'12' and its '12 #2' (either way round), and two siblings of 12, are ONE table", () => {
+    expect(sameTableFamily(root, sib)).toBe(true);
+    expect(sameTableFamily(sib, root)).toBe(true);
+    expect(sameTableFamily(sib, sib3)).toBe(true);
+  });
+
+  test("another table, or another table's sibling, is a real destination", () => {
+    expect(sameTableFamily(root, other)).toBe(false);
+    expect(sameTableFamily(root, otherSib)).toBe(false);
+    expect(sameTableFamily(sib, otherSib)).toBe(false);
+    // A room table without 053's column read at all: no family, no refusal.
+    expect(sameTableFamily({ id: "a" }, { id: "b" })).toBe(false);
+    expect(sameTableFamily({ id: "" }, { id: "" })).toBe(false);
+  });
+
+  test("the refusal names both ends the way every sentence does", () => {
+    expect(sameFamilyMoveError("12", "12 #2")).toBe("12 (next party) is the same table as 12 — pick a different table to move to.");
+    expect(sameFamilyMoveError("12 #2", "12")).toBe("12 is the same table as 12 (next party) — pick a different table to move to.");
   });
 });

@@ -99,6 +99,22 @@ export interface BookingFix {
   created_at: string;
 }
 
+/**
+ * One "PrintJobs" row (migration 027), as far as a MOVE touches it: the move
+ * re-addresses the party's `<name>-<epoch>` prints to the destination (client
+ * items 1 and 2), inside its own transaction, and then reads the destination's
+ * print state back.
+ */
+export interface PrintJobFix {
+  id: string;
+  bill_id: string;
+  kind: string;
+  status: string;
+  created_at: string;
+  /** Migration 055's paper name; null = not recorded. */
+  table_name: string | null;
+}
+
 interface Store {
   tables: TableFix[];
   orders: OrderFix[];
@@ -106,13 +122,16 @@ interface Store {
   sessions: SessionFix[];
   assignments: AssignmentFix[];
   bookings: BookingFix[];
+  printJobs: PrintJobFix[];
+  /** False models a database without migration 027: every "PrintJobs" statement raises 42P01. */
+  printLedger: boolean;
   /** ticket_key -> kot_no, migration 029's memo. */
   kotTickets: Map<string, number>;
   billSeq: number;
   log: string[];
   nextId: number;
   /** Snapshots pushed by BEGIN / SAVEPOINT and popped by COMMIT / ROLLBACK. */
-  stack: Omit<Store, "stack" | "failOn" | "log">[];
+  stack: Omit<Store, "stack" | "failOn" | "log" | "printLedger">[];
   /** Make the next statement matching this substring throw. */
   failOn: string | null;
 }
@@ -122,8 +141,14 @@ let store: Store = freshStore();
 function freshStore(): Store {
   return {
     tables: [], orders: [], bills: [], sessions: [], assignments: [], bookings: [],
+    printJobs: [], printLedger: true,
     kotTickets: new Map(), billSeq: 100, log: [], nextId: 1, stack: [], failOn: null,
   };
+}
+
+/** Model a database whose print ledger (migration 027) is not there. */
+export function setPrintLedgerPresent(present: boolean): void {
+  store.printLedger = present;
 }
 
 export function resetStore(): void {
@@ -136,8 +161,9 @@ export function failNextStatementContaining(needle: string | null): void {
   store.failOn = needle;
 }
 
-function snapshot(): Omit<Store, "stack" | "failOn" | "log"> {
+function snapshot(): Omit<Store, "stack" | "failOn" | "log" | "printLedger"> {
   return {
+    printJobs: store.printJobs.map((r) => ({ ...r })),
     tables: store.tables.map((r) => ({ ...r })),
     orders: store.orders.map((r) => ({ ...r, food: { ...r.food } })),
     bills: store.bills.map((r) => ({ ...r })),
@@ -150,7 +176,8 @@ function snapshot(): Omit<Store, "stack" | "failOn" | "log"> {
   };
 }
 
-function restore(snap: Omit<Store, "stack" | "failOn" | "log">): void {
+function restore(snap: Omit<Store, "stack" | "failOn" | "log" | "printLedger">): void {
+  store.printJobs = snap.printJobs;
   store.tables = snap.tables;
   store.orders = snap.orders;
   store.bills = snap.bills;
@@ -221,6 +248,20 @@ export function addBill(b: Partial<BillFix> & { table_id: string }): BillFix {
   return row;
 }
 
+/** A bill print in the ledger, addressed as routes/bills.ts addresses it. */
+export function addPrintJob(j: Partial<PrintJobFix> & { bill_id: string }): PrintJobFix {
+  const row: PrintJobFix = {
+    id: `pj-${String(store.nextId++)}`,
+    kind: "bill",
+    status: "delivered",
+    created_at: "2026-09-09T12:30:00.000Z",
+    table_name: null,
+    ...j,
+  };
+  store.printJobs.push(row);
+  return row;
+}
+
 /** Strip a table's seating rows, modelling the one state the repair has to cope
  *  with: a table that was occupied before the table_session_track trigger
  *  existed, so there is no open session to carry across. */
@@ -248,6 +289,7 @@ export function addBooking(tableId: string, status: string): void {
 export const tables = (): TableFix[] => store.tables.map((r) => ({ ...r }));
 export const orders = (): OrderFix[] => store.orders.map((r) => ({ ...r, food: { ...r.food } }));
 export const bills = (): BillFix[] => store.bills.map((r) => ({ ...r }));
+export const printJobs = (): PrintJobFix[] => store.printJobs.map((r) => ({ ...r }));
 export const sessions = (): SessionFix[] => store.sessions.map((r) => ({ ...r }));
 export const assignments = (): AssignmentFix[] => store.assignments.map((r) => ({ ...r }));
 export const bookings = (): BookingFix[] => store.bookings.map((r) => ({ ...r }));
@@ -349,6 +391,89 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
 
   // --- context ------------------------------------------------------------
   if (s.includes('from "restaurant" r')) {return { rows: [contextRow()] };}
+
+  // --- the schema latches: 053 is not modelled here (no families), 055 is not
+  //     applied (no paper columns) — so neither feature's column is ever named.
+  if (s.includes("information_schema.columns")) {return { rows: [{ n: 0 }] };}
+
+  // --- the print ledger (027): the move's re-key and the read-back after it --
+  if (s.includes('"printjobs"') && !store.printLedger) {
+    throw Object.assign(new Error('relation "PrintJobs" does not exist'), { code: "42P01" });
+  }
+  if (s.startsWith("select (select min(o.created_at) from \"orders\" o")) {
+    const tableId = str(params[2]);
+    const owing = store.orders.filter((o) => o.table_id === tableId && isActive(o.status)).map((o) => o.created_at).sort();
+    const bill = store.bills
+      .filter((b) => b.table_id === tableId && b.closed_at === null)
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+    return {
+      rows: [{
+        first_order_at: owing[0] ? new Date(owing[0]) : null,
+        bill_created_at: bill ? new Date(bill.created_at) : null,
+      }],
+    };
+  }
+  if (s.startsWith('update "printjobs" set bill_id = $4 || bill_id where')) {
+    // The destination's previous party's prints: the same three bounds as the
+    // re-key below, and the old id kept whole behind the mark.
+    if (!s.includes("starts_with(bill_id, $3)") || !s.includes("~ '^([0-9]+|split-[0-9]+of[0-9]+)$'")
+      || !s.includes("created_at >= $6::timestamptz") || s.includes(" like ")) {
+      throw new Error("table_move_fixtures: the retirement must be bounded by the exact prefix, the suffix shape and the seating start");
+    }
+    const prefix = str(params[2]);
+    const mark = str(params[3]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.kind !== str(params[4]) || !j.bill_id.startsWith(prefix)) {continue;}
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(j.bill_id.slice(prefix.length))) {continue;}
+      if (Date.parse(j.created_at) < start) {continue;}
+      j.bill_id = `${mark}${j.bill_id}`;
+      out.push({ id: j.id });
+    }
+    return { rows: out };
+  }
+  if (s.startsWith('update "printjobs" set bill_id = $4 || substr(bill_id, length($3) + 1)')) {
+    // The statement's whole predicate, clause for clause: kind, the EXACT
+    // prefix (starts_with), the suffix shape, and the seating bound.
+    if (!s.includes("starts_with(bill_id, $3)") || !s.includes("~ '^([0-9]+|split-[0-9]+of[0-9]+)$'")
+      || !s.includes("created_at >= $6::timestamptz") || s.includes(" like ")) {
+      throw new Error("table_move_fixtures: the re-key must be bounded by the exact prefix, the suffix shape and the seating start");
+    }
+    const from = str(params[2]);
+    const to = str(params[3]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.kind !== str(params[4]) || !j.bill_id.startsWith(from)) {continue;}
+      const tail = j.bill_id.slice(from.length);
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(tail)) {continue;}
+      if (Date.parse(j.created_at) < start) {continue;}
+      j.bill_id = `${to}${tail}`;
+      out.push({ id: j.id });
+    }
+    return { rows: out };
+  }
+  if (s.startsWith('select id, created_at from "bills" where table_id = $1')) {
+    const open = store.bills
+      .filter((b) => b.table_id === str(params[0]) && b.closed_at === null)
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+    return { rows: open ? [{ id: open.id, created_at: new Date(open.created_at) }] : [] };
+  }
+  if (s.startsWith('select min(created_at) as first_at from "orders"')) {
+    const owing = store.orders.filter((o) => o.table_id === str(params[2]) && isActive(o.status)).map((o) => o.created_at).sort();
+    return { rows: [{ first_at: owing[0] ? new Date(owing[0]) : null }] };
+  }
+  if (s.startsWith('select bill_id, created_at from "printjobs"')) {
+    const statuses = (params[3] as string[]) ?? [];
+    const floor = params[4] ? Date.parse(str(params[4])) : null;
+    return {
+      rows: store.printJobs
+        .filter((j) => j.kind === str(params[2]) && statuses.includes(j.status))
+        .filter((j) => floor === null || Date.parse(j.created_at) >= floor)
+        .map((j) => ({ bill_id: j.bill_id, created_at: new Date(j.created_at) })),
+    };
+  }
 
   // --- MoveTableParty / MoveOrderToTable: the locked two-row read ----------
   if (s.includes('from "tables"') && s.includes("order by id") && s.includes("coalesce(is_virtual, false) as is_virtual")) {

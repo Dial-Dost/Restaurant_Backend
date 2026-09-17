@@ -875,7 +875,7 @@ app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449
 			res.status(400).json({ error: "Nothing to print for this table" });
 			return;
 		}
-		if (await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
+		if (await refuseWaiterBillReprint(req, res, tableName, bill, restaurantId)) { return; }
 		const cfg = await GetBillChargeConfigForTable(restaurantId, tableName);
 		waiver = cfg.waiver;
 		basis = cfg.basis;

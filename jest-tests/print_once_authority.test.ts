@@ -26,12 +26,17 @@ import { makeFakeApp, type FakeApp } from "./platform_fixtures";
 const GetBillForTable = jest.fn();
 const dispatchPrintJob = jest.fn();
 const dispatchKot = jest.fn();
+const buildReceiptBase64 = jest.fn((_opts: Record<string, unknown>, _cols: number) => "ZXNj");
+const RecordBillPrintPaper = jest.fn(async (..._a: unknown[]) => true);
+const RecordClientRenderedBillPrint = jest.fn(async (..._a: unknown[]) => ({ id: "claim-1", created_at: "2026-09-11T14:05:00.000Z" }));
 
 jest.mock("../database_supabase", () => ({
   __esModule: true,
   Audit_log_category: { Bill: "Bill", Orders: "Orders", Tables: "Tables" },
   BILL_SECTION_AXES: ["course", "seat"],
   GetBillForTable: (...a: unknown[]) => GetBillForTable(...a),
+  RecordBillPrintPaper: (...a: unknown[]) => RecordBillPrintPaper(...a),
+  RecordClientRenderedBillPrint: (...a: unknown[]) => RecordClientRenderedBillPrint(...a),
   GetRestaurantSettings: jest.fn(async () => ({ currency: "₹", bill_paper_width: "80mm", timezone: "Asia/Kolkata" })),
   GetRestaurantProfile: jest.fn(async () => ({ outlet_name: "Fixture", outlet_add: null, outlet_phone: null })),
   GetBillChargeConfigForTable: jest.fn(async () => ({
@@ -75,7 +80,10 @@ jest.mock("../kot_print", () => ({
   dispatchKot: (...a: unknown[]) => dispatchKot(...a),
   logKotDispatched: jest.fn(),
 }));
-jest.mock("../escpos", () => ({ __esModule: true, buildReceiptBase64: () => "ZXNj" }));
+jest.mock("../escpos", () => ({
+  __esModule: true,
+  buildReceiptBase64: (opts: Record<string, unknown>, cols: number) => buildReceiptBase64(opts, cols),
+}));
 jest.mock("../realtime", () => ({ __esModule: true, emitRestaurant: jest.fn(), emitOutlet: jest.fn() }));
 jest.mock("../print_jobs", () => ({ __esModule: true, ackPrintJob: jest.fn() }));
 jest.mock("../storage_bucket_supabase", () => ({ __esModule: true, uploadScreenshot: jest.fn() }));
@@ -134,6 +142,9 @@ beforeEach(() => {
   GetBillForTable.mockReset();
   dispatchPrintJob.mockReset();
   dispatchKot.mockReset();
+  buildReceiptBase64.mockClear();
+  RecordBillPrintPaper.mockClear();
+  RecordClientRenderedBillPrint.mockClear();
   dispatchPrintJob.mockResolvedValue({ jobId: "job-1", decision: { destinationName: "Front Till" }, assignedDeviceId: "dev-1" });
   dispatchKot.mockResolvedValue({ tickets: 1, stations: ["main"], kotNo: 7, businessDay: "2026-09-11", reprint: false });
 });
@@ -239,5 +250,118 @@ describe("the count is a SERVER fact, not a device's memory", () => {
     const r = await print(WAITER);
     expect(r.status).toBe(200);
     expect(dispatchPrintJob).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLIENT ITEMS 1 AND 2 (migration 055) — THE ONE REPRINT A WAITER MAY MAKE.
+//
+// A waiter may now add to a printed bill after confirming it, and the paper in
+// the guest's hand is then short. The rule above ("once") stays for the second
+// copy C3 exists to stop; what changes is that a print whose paper is OUT OF
+// DATE — the bill's fingerprint differs from the one filed with its latest
+// print — is let through, and says "** UPDATED BILL **" on the roll. Unknown
+// (a print from before 055) fails closed, exactly as before.
+// ---------------------------------------------------------------------------
+describe("a waiter may print again ONLY when the paper is out of date", () => {
+  /**
+   * The fingerprint of billWith(n) as printOpenTableBill prints it under this
+   * suite's mocked ladder — so "identical" really is identical.
+   */
+  const paperNow = async (): Promise<string> => {
+    const { billPaperDigest } = await import("../bill_paper_digest");
+    return billPaperDigest({
+      items: billWith(1).items,
+      charges: { subtotal: 4250, discount: 0, service_charge: 0, service_charge_percent: 0, taxes: [], grand_total: 4250 },
+      customerGstin: null,
+    });
+  };
+  const printedWith = (digest: string | null, printedTotal: number | null = 4250) => ({
+    ...billWith(1), last_paper_digest: digest, printed_total: printedTotal, customer_gstin: null,
+  });
+  const STALE = "0".repeat(64);
+  const receipt = (): Record<string, unknown> => buildReceiptBase64.mock.calls[0]![0];
+
+  test("IDENTICAL content: still refused, no paper, and the refusal says the paper is current", async () => {
+    GetBillForTable.mockResolvedValue(printedWith(await paperNow()));
+    const r = await print(WAITER);
+    expect(isReprintRefusal(r)).toBe(true);
+    expect((r.body as { paper_stale?: unknown }).paper_stale).toBe(false);
+    expect(dispatchPrintJob).not.toHaveBeenCalled();
+  });
+
+  test("UNKNOWN content (printed before 055): refused as on 2.0.1 — unknown fails closed", async () => {
+    GetBillForTable.mockResolvedValue(printedWith(null));
+    const r = await print(WAITER);
+    expect(isReprintRefusal(r)).toBe(true);
+    expect((r.body as { paper_stale?: unknown }).paper_stale).toBeNull();
+    expect(dispatchPrintJob).not.toHaveBeenCalled();
+  });
+
+  test("CHANGED since the print: the waiter prints, and the paper says UPDATED BILL and which print it replaces", async () => {
+    GetBillForTable.mockResolvedValue({ ...printedWith(STALE, 3730), printed_at: "2026-09-11T08:02:00.000Z" });
+    const r = await print(WAITER);
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ success: true, revised: true });
+    expect(dispatchPrintJob).toHaveBeenCalledTimes(1);
+    // 08:02Z is 13:32 in Kolkata — the clock GGV's paper printed.
+    expect(receipt().revisedNote).toMatch(/^Replaces the bill printed (\d\d\/\d\d )?13:32$/);
+    expect(receipt().reprint).toBe(true);
+  });
+
+  test("the updated print files what IT said, against its own job", async () => {
+    GetBillForTable.mockResolvedValue(printedWith(STALE));
+    await print(WAITER);
+    expect(RecordBillPrintPaper).toHaveBeenCalledTimes(1);
+    const [res, jobs, paper] = RecordBillPrintPaper.mock.calls[0]! as [string, string[], Record<string, unknown>];
+    expect(res).toBe(RES);
+    expect(jobs).toEqual(["job-1"]);
+    expect(paper).toMatchObject({ bill_digest: await paperNow(), bill_grand_total: 4250, table_name: "T7" });
+    expect(String(paper.lines_digest)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("a FIRST print files its paper too, and carries no banner at all", async () => {
+    GetBillForTable.mockResolvedValue({ ...billWith(0), last_paper_digest: null, printed_total: null });
+    const r = await print(WAITER);
+    expect(r.body).toMatchObject({ revised: false });
+    expect(receipt().revisedNote).toBeNull();
+    expect(receipt().reprint).toBe(false);
+    expect(RecordBillPrintPaper).toHaveBeenCalledTimes(1);
+  });
+
+  for (const [who, auth] of SENIORS) {
+    test(`${who}: an identical copy keeps REPRINT; a changed bill prints UPDATED`, async () => {
+      GetBillForTable.mockResolvedValue(printedWith(await paperNow()));
+      const same = await print(auth);
+      expect(same.body).toMatchObject({ revised: false });
+      expect(receipt().revisedNote).toBeNull();
+      expect(receipt().reprint).toBe(true);
+      buildReceiptBase64.mockClear();
+      GetBillForTable.mockResolvedValue(printedWith(STALE));
+      const changed = await print(auth);
+      expect(changed.body).toMatchObject({ revised: true });
+      expect(receipt().revisedNote).toMatch(/^Replaces the bill printed/);
+    });
+  }
+
+  test("the WEB claim follows the same rule: identical refused, changed allowed and told it is an updated bill", async () => {
+    const claim = (auth: unknown) => harness.call("POST", "/print/bill/claim", { body: { table_name: "T7" }, auth: auth as never });
+    GetBillForTable.mockResolvedValue(printedWith(await paperNow()));
+    expect(isReprintRefusal(await claim(WAITER))).toBe(true);
+    expect(RecordClientRenderedBillPrint).not.toHaveBeenCalled();
+
+    GetBillForTable.mockResolvedValue({ ...printedWith(STALE), printed_at: "2026-09-11T08:02:00.000Z" });
+    const r = await claim(WAITER);
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ success: true, recorded: true, revised: true });
+    expect((r.body as { revised_note: string }).revised_note).toMatch(/^Replaces the bill printed (\d\d\/\d\d )?13:32$/);
+    expect(RecordBillPrintPaper).toHaveBeenCalledWith(RES, ["claim-1"], expect.objectContaining({ bill_digest: await paperNow() }));
+  });
+
+  test("a KOT is still not a bill — a waiter's docket reprint never asks about paper", async () => {
+    GetBillForTable.mockResolvedValue(printedWith(await paperNow()));
+    const r = await print(WAITER, { table_name: "T7", kind: "kot" });
+    expect(r.status).toBe(200);
+    expect(RecordBillPrintPaper).not.toHaveBeenCalled();
   });
 });

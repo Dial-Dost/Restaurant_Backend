@@ -22,7 +22,7 @@ import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import type { ReportWindowQuery } from "../report_window.js";
 import { emitRestaurant } from "../realtime.js";
-import { BILL_PRINTED_STATUS, billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill, reprintNeededMessage, type BillPrintedWrite } from "../next_party.js";
+import { BILL_PRINTED_STATUS, addToPrintedBillFlag, billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill, printedBillAdditionAudit, reprintNeededMessage, type BillPrintedWrite } from "../next_party.js";
 import { isWaiterOnly } from "../role_scope.js";
 
 
@@ -471,6 +471,20 @@ export interface SessionCapabilities {
 	 * commonest action of a rush behind the rarest one of a quiet morning.
 	 */
 	edit_menu: boolean;
+	/**
+	 * POST /tables/move — "Move table" (client items 1 and 2). The occupancy
+	 * uuid the route is gated on, which the core waiter role has always held:
+	 * the server let a waiter move a party and the web offered it, while the
+	 * app hid it behind a senior-only scope. The app now asks this.
+	 */
+	move_table: boolean;
+	/**
+	 * POST /tables/move-order — "Move an order". The "Add Orders" uuid the route
+	 * is gated on, so a waiter holds it too; the clients still keep this control
+	 * off a waiter-only floor (the client asked for Move table only), and this
+	 * answer is what a role WITHOUT it is refused by.
+	 */
+	move_order: boolean;
 }
 
 export function sessionCapabilities(input: { actions?: unknown }): SessionCapabilities {
@@ -491,6 +505,8 @@ export function sessionCapabilities(input: { actions?: unknown }): SessionCapabi
 		view_roles: has("17ba6407-b703-4403-ab59-13235966053f"), // Get Roles
 		manage_roles: has("c0135d18-68b4-45e9-9b51-849158df6efd"), // Create/Update Role
 		edit_menu: has("ed800655-b937-44ba-a7ca-7458295886c9"), // Edit Menu
+		move_table: has("090ea8d4-e348-4e1b-9723-11131a73a085"), // Table Occupied (POST /tables/move)
+		move_order: has("4ad474d4-5230-449c-874f-6a238b833bca"), // Add Orders (POST /tables/move-order)
 	};
 }
 
@@ -1334,15 +1350,18 @@ function announceNextPartyTable(
  * THE MONEY GUARD ON NEW ORDERS — an order added to a table whose CURRENT
  * seating's bill has already been printed.
  *
- *   * a waiter-only login or a QR guest -> 423 { code: "bill_printed", table,
- *     next_party_table } and NOTHING is written. The sentence says where the
- *     new party's order goes, and that a same-party addition is a manager's
- *     (who can add it and reprint). 423 and not 409: see BILL_PRINTED_STATUS
- *     for what a 409 did to the till's offline queue;
- *   * a senior role -> allowed; the caller spreads reprintNeededFields(guard)
- *     into its answer (`reprint_needed: true` and the sentence both clients
- *     show beside a Reprint action), because the paper in the guest's hand is
- *     now short;
+ *   * a QR guest, or a waiter-only login whose write did NOT carry
+ *     `add_to_printed_bill: true` -> 423 { code: "bill_printed", table,
+ *     next_party_table, add_to_printed_action } and NOTHING is written. The
+ *     sentence says where the new party's order goes, and that a same-party
+ *     addition is a manager's (the words every 2.0.0/2.0.1 till shows, and
+ *     still true for them). 423 and not 409: see BILL_PRINTED_STATUS for what
+ *     a 409 did to the till's offline queue;
+ *   * a senior role, or a waiter who confirmed (2.0.2's "Add to printed bill")
+ *     -> allowed; the caller spreads reprintNeededFields(guard) into its answer
+ *     (`reprint_needed: true` and the sentence both clients show beside a
+ *     Reprint action), because the paper in the guest's hand is now short, and
+ *     files noteAdditionToPrintedBill once its write has landed;
  *   * no print, no print state, a takeaway, or migration 053 absent -> allowed,
  *     exactly as before this guard existed.
  *
@@ -1376,7 +1395,18 @@ function announceNextPartyTable(
  */
 export type PrintedBillGuard =
 	| { refused: true }
-	| { refused: false; reprintNeeded: boolean; table: string | null; parentTable: string | null };
+	| {
+		refused: false;
+		reprintNeeded: boolean;
+		table: string | null;
+		parentTable: string | null;
+		/** How many times the bill had been printed when this write was let through (0 = not printed). */
+		printCount?: number;
+		/** What was written: an order, a merge or a moved item. */
+		write?: BillPrintedWrite;
+		/** The write carried add_to_printed_bill: true. */
+		confirmed?: boolean;
+	};
 
 export async function refuseOrderOnPrintedBill(
 	req: Request,
@@ -1391,10 +1421,20 @@ export async function refuseOrderOnPrintedBill(
 		write?: BillPrintedWrite;
 		/** The res UUID for the `table:added` emit, when restaurantId is a slug. */
 		emitRestaurantId?: string;
+		/**
+		 * The write said `add_to_printed_bill: true`. Omitted, the staff route's
+		 * own body is read (addToPrintedBillFlag); a guest is refused whatever it
+		 * says, so the QR route never needs to pass it. Honoured for an ORDER
+		 * only: a merge or a moved item is a manager's act on every client (no
+		 * client offers the confirm for one), so a waiter's body that says so
+		 * anyway is still refused.
+		 */
+		confirmedPrinted?: boolean;
 	},
 ): Promise<PrintedBillGuard> {
 	const { restaurantId, tableName, guest, upsert } = target;
 	const write = target.write ?? "order";
+	const confirmedPrinted = write === "order" && (target.confirmedPrinted ?? addToPrintedBillFlag(req.body));
 	const allow = { refused: false as const, reprintNeeded: false, table: null, parentTable: null };
 	let state: Awaited<ReturnType<typeof GetOrderingPrintGuard>> = null;
 	try {
@@ -1406,10 +1446,13 @@ export async function refuseOrderOnPrintedBill(
 	if (!state) {return allow;}
 	const waiterOnly = !guest && isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions });
 	const addsToBill = upsert ? orderUpsertAddsToBill(upsert.items, state.existing_lines ?? null) : true;
-	const verdict = orderOnPrintedBillVerdict({ printCount: state.print_count, waiterOnly, guest, addsToBill });
+	const verdict = orderOnPrintedBillVerdict({ printCount: state.print_count, waiterOnly, guest, addsToBill, confirmedPrinted });
 	if (verdict === "allow") {return allow;}
 	if (verdict === "reprint_needed") {
-		return { refused: false, reprintNeeded: true, table: state.table, parentTable: state.parent_table };
+		return {
+			refused: false, reprintNeeded: true, table: state.table, parentTable: state.parent_table,
+			printCount: state.print_count, write, confirmed: confirmedPrinted,
+		};
 	}
 
 	// The seat is made here too, not only at print time: a print whose seat
@@ -1439,10 +1482,34 @@ export async function refuseOrderOnPrintedBill(
 }
 
 /**
- * What a route adds to its answer when a senior role has just put more on a
- * printed bill: `reprint_needed` and the sentence both clients show beside a
- * Reprint action (reprintNeededMessage). Nothing at all otherwise, so every
- * other answer is byte-for-byte what it was.
+ * THE AUDIT LINE FOR AN ADDITION THAT LANDED ON A PRINTED BILL — filed by every
+ * door refuseOrderOnPrintedBill guards, AFTER its write, so a line exists only
+ * for food that is really on the bill. The night cashier reads these to find
+ * the bills that grew after their paper was handed over; `confirmed` says
+ * whether the person pressed "Add to printed bill" (a waiter always has) or
+ * was a senior role adding as they always could. Nothing for any other write.
+ * Never throws: the write has committed.
+ */
+export async function noteAdditionToPrintedBill(req: Request, guard: PrintedBillGuard): Promise<void> {
+	if (guard.refused || !guard.reprintNeeded || !guard.table) {return;}
+	const write = guard.write ?? "order";
+	try {
+		await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
+			printedBillAdditionAudit({ table: guard.table, printCount: guard.printCount ?? 0, write }),
+			write === "order" ? Audit_log_category.Orders : Audit_log_category.Bill,
+			{
+				table: guard.table, after_print: true, write, print_count: guard.printCount ?? 0,
+				confirmed: guard.confirmed === true,
+				waiter_only: isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions }),
+			});
+	} catch {/* a failed audit write must not turn a landed order into a 500 */}
+}
+
+/**
+ * What a route adds to its answer when a senior role — or a waiter who
+ * confirmed — has just put more on a printed bill: `reprint_needed` and the
+ * sentence both clients show beside a Reprint action (reprintNeededMessage).
+ * Nothing at all otherwise, so every other answer is byte-for-byte what it was.
  */
 export function reprintNeededFields(
 	guard: PrintedBillGuard,

@@ -216,3 +216,45 @@ describe("POST /print/bill/settled — the accounting reprint", () => {
     expectReprintOnTop(sentBytes());
   });
 });
+
+// ---------------------------------------------------------------------------
+// CLIENT ITEMS 1 AND 2 (migration 055) — A PRINT THAT REPLACES OUT-OF-DATE PAPER.
+//
+// A copy of a bill that has since grown is not a copy. When the latest print's
+// fingerprint no longer matches the bill, the paper says "** UPDATED BILL **"
+// where REPRINT would be, with the replaced print's clock under it — and the
+// waiter who added the dish may make it. An identical senior copy keeps REPRINT.
+// ---------------------------------------------------------------------------
+describe("POST /print/bill — the UPDATED bill", () => {
+  const print = (auth: unknown) =>
+    harness.call("POST", "/print/bill", { body: { table_name: "T7" }, auth: auth as never });
+  // 08:02Z is 13:32 in Kolkata. The paper on record is not this bill's.
+  const stale = () => ({ ...openBill(1), printed_at: "2026-09-11T08:02:00.000Z", last_paper_digest: "0".repeat(64), printed_total: 3730, customer_gstin: null });
+
+  test("the banner is UPDATED BILL, bold and large, first; the replaced print's clock is under it; no REPRINT", async () => {
+    GetBillForTable.mockResolvedValue(stale());
+    const r = await print(WAITER);
+    expect(r.status).toBe(200);
+    const raw = sentBytes();
+    const lines = printedLines(raw);
+    expect(lines[0]).toBe("** UPDATED BILL **");
+    expect(lines[1]).toMatch(/^Replaces the bill printed (\d\d\/\d\d )?13:32$/);
+    expect(lines[2]).toBe("GAIA");
+    expect(raw).not.toContain("REPRINT");
+    // 18 characters double-width is 36 cells, inside the 44-cell text area of the 80mm roll.
+    expect(raw.startsWith("\x1b@\x1dL\x18\x00\x1dW\x10\x02\x1ba\x01\x1bE\x01\x1b!\x38** UPDATED BILL **\n")).toBe(true);
+  });
+
+  test("a manager's copy of the SAME paper stays a REPRINT", async () => {
+    const { billPaperDigest } = await import("../bill_paper_digest");
+    const current = billPaperDigest({
+      items: openBill(1).items,
+      charges: { subtotal: 4250, discount: 0, service_charge: 0, service_charge_percent: 0, taxes: [], grand_total: 4250 },
+      customerGstin: null,
+    });
+    GetBillForTable.mockResolvedValue({ ...stale(), last_paper_digest: current });
+    await print(MANAGER);
+    expectReprintOnTop(sentBytes());
+    expect(sentBytes()).not.toContain("UPDATED BILL");
+  });
+});

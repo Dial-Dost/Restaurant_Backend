@@ -8,11 +8,18 @@
  * should be a duplicate table showing same number for order taking for the
  * next round of guests."
  *
- * The disappearing is C3, and it stays: a waiter's printed party is finished
- * business for them and a manager settles it. What was missing is the NUMBER.
- * At Gaia Global Vegetarian a printed table sat unsettled for a median of 26
- * minutes, and the waiters, with no "12" left to order on, seated the next
- * guests on table 15 and had a manager move them back once 12 was paid.
+ * The disappearing was C3. What was missing was the NUMBER: at Gaia Global
+ * Vegetarian a printed table sat unsettled for a median of 26 minutes, and the
+ * waiters, with no "12" left to order on, seated the next guests on table 15
+ * and had a manager move them back once 12 was paid.
+ *
+ * 2.0.2 (client items 1 and 2) TAKES THE DISAPPEARING BACK. "If a bill is not
+ * settled, the table completely vanishes; bills are settled only at night."
+ * The printed 12 now STAYS on the waiter's floor, orange, beside its green
+ * "12 #2"; a waiter may add to it after saying so (orderOnPrintedBillVerdict)
+ * and print the updated bill (bill_paper_digest.ts), and may move it
+ * (sameTableFamily). The sibling below is unchanged: it is still the green
+ * seat for the next guests.
  *
  * ============================================================================
  * WHY A SECOND "Tables" ROW AND NOT A SECOND PARTY ON THE SAME ROW
@@ -202,6 +209,39 @@ export function planNextPartyRetirement(family: readonly NextPartyFamilyMember[]
 }
 
 // ---------------------------------------------------------------------------
+// Moving a party within its own family.
+// ---------------------------------------------------------------------------
+
+/** One end of a move, as MoveTableParty's locked read has it. */
+export interface MoveEnd {
+	id: string;
+	parent_table_id?: string | null;
+}
+
+/**
+ * ARE THESE TWO ROWS THE SAME PHYSICAL TABLE? "12" and "12 #2" are: the sibling
+ * is a second bill at the same table, not a second table.
+ *
+ * WHY A MOVE BETWEEN THEM IS REFUSED (client items 1 and 2, now that a waiter
+ * can move a printed party). Moving the printed 12 onto its own green "12 #2"
+ * swaps which ROW holds the printed bill and which is free, and then the free
+ * root is handed back as the next party's seat: the floor ends with an orange
+ * "12" drawn from "12 #2" and a green "12" — the same picture as before, with
+ * every print re-keyed and every KOT naming a different row. Nobody moved
+ * anywhere. The pickers leave the family out; this is the door behind them.
+ */
+export function sameTableFamily(a: MoveEnd, b: MoveEnd): boolean {
+	const root = (e: MoveEnd): string => String(e.parent_table_id ?? "").trim() || String(e.id ?? "").trim();
+	return root(a) !== "" && root(a) === root(b);
+}
+
+/** The refusal's sentence: "12 (next party) is the same table as 12 — pick a different table to move to." */
+export function sameFamilyMoveError(fromTable: string, toTable: string): string {
+	const named = (t: string): string => tableSentenceName(t, parseNextPartyName(t)?.root ?? null);
+	return `${named(toTable)} is the same table as ${named(fromTable)} — pick a different table to move to.`;
+}
+
+// ---------------------------------------------------------------------------
 // The money guard on new orders.
 // ---------------------------------------------------------------------------
 
@@ -211,16 +251,27 @@ export const BILL_PRINTED_CODE = "bill_printed";
 /**
  * MAY THIS CALLER ADD TO A TABLE WHOSE CURRENT BILL HAS BEEN PRINTED?
  *
- * The printed paper is what the guest pays against, and a waiter cannot
- * reprint (C3). So an order added after the print by a waiter makes the paper
- * disagree with the drawer, with nobody able to fix it but a manager who does
- * not know it happened. The QR guest is refused for a sharper reason: the table
- * card's QR is signed for "12", and whoever scans it after the print may be the
- * NEXT party, whose food would land on the old party's bill.
+ * The printed paper is what the guest pays against. The QR guest is refused
+ * outright: the table card's QR is signed for "12", and whoever scans it after
+ * the print may be the NEXT party, whose food would land on the old party's
+ * bill.
+ *
+ * A WAITER MAY, WITH EXPLICIT INTENT (client items 1 and 2, 2.0.2). Gaia
+ * Global Vegetarian settles at night, so a printed table is a pending bill for
+ * hours and its guests order dessert. The waiter says so — the orange tile's
+ * "Add to printed bill", a confirm that offers the green next-party seat
+ * instead, and `add_to_printed_bill: true` on the write — and is then treated
+ * as a senior is: allowed, and told to print the updated bill, which the print
+ * gate now lets them do because the paper is out of date
+ * (bill_paper_digest.ts). WITHOUT the flag a waiter is refused exactly as on
+ * 2.0.1, which is what every 2.0.0/2.0.1 till still sends: an installed app
+ * that never asked the question can never add to printed paper by accident,
+ * and an offline write queued before the print replays without it.
  *
  *   * "allow"          — nothing printed yet, or no print state to go on.
- *   * "reprint_needed" — a senior role: allowed, and told the paper is now stale.
- *   * "refuse"         — a waiter-only login or a QR guest.
+ *   * "reprint_needed" — a senior role, or a waiter who confirmed: allowed, and
+ *                        told the paper is now stale.
+ *   * "refuse"         — a QR guest, or a waiter-only login that did not confirm.
  */
 export type PrintedBillOrderVerdict = "allow" | "reprint_needed" | "refuse";
 
@@ -236,11 +287,35 @@ export function orderOnPrintedBillVerdict(input: {
 	 * paper right, so it is never refused and never told to reprint.
 	 */
 	addsToBill?: boolean;
+	/**
+	 * The write carried `add_to_printed_bill: true` (addToPrintedBillFlag) —
+	 * the caller confirmed these items belong on the printed bill. Only a
+	 * waiter-only login needs it; a guest is refused whatever it says.
+	 */
+	confirmedPrinted?: boolean;
 }): PrintedBillOrderVerdict {
 	if (!(Number(input.printCount) > 0)) { return "allow"; }
 	if (input.addsToBill === false) { return "allow"; }
-	if (input.guest || input.waiterOnly) { return "refuse"; }
+	if (input.guest) { return "refuse"; }
+	if (input.waiterOnly && input.confirmedPrinted !== true) { return "refuse"; }
 	return "reprint_needed";
+}
+
+/** The body key a 2.0.2 client sets after its confirm. See orderOnPrintedBillVerdict. */
+export const ADD_TO_PRINTED_BILL_KEY = "add_to_printed_bill";
+
+/** Did this write body say, explicitly, that it adds to a printed bill? Only a literal `true` counts. */
+export function addToPrintedBillFlag(body: unknown): boolean {
+	if (!body || typeof body !== "object" || Array.isArray(body)) { return false; }
+	return (body as Record<string, unknown>)[ADD_TO_PRINTED_BILL_KEY] === true;
+}
+
+/**
+ * The label of the action a 2.0.2 client offers beside a refusal, and on the
+ * orange tile: "Add to 12's printed bill". Both clients say it in these words.
+ */
+export function addToPrintedBillLabel(table: string, parentTable?: string | null): string {
+	return `Add to ${tableSentenceName(table, parentTable ?? null)}'s printed bill`;
 }
 
 /**
@@ -371,6 +446,19 @@ export interface BillPrintedRefusal {
 	table: string;
 	next_party_table: string | null;
 	next_party_action: string | null;
+	/**
+	 * 2.0.2: the label of "add it to the printed bill anyway" (resend with
+	 * add_to_printed_bill) — null for a guest, who may never, and for a merge or
+	 * a moved item. Additive: 2.0.0 and 2.0.1 ignore it and show `error`, whose
+	 * words are unchanged for them.
+	 */
+	add_to_printed_action: string | null;
+	/**
+	 * 2.0.2: the sentence a client that offers add_to_printed_action shows IN
+	 * PLACE OF `error`, whose "ask a manager to add it" is wrong beside a button
+	 * that adds it. Null exactly when add_to_printed_action is. Additive, like it.
+	 */
+	add_to_printed_message: string | null;
 	print_count: number;
 }
 
@@ -409,6 +497,9 @@ export function billPrintedRefusal(input: {
 		: elsewhere
 			? `${named}'s bill has already been printed, so nothing more can be added to it. Take a new party's order on ${nextWords}. If it is for the same guests, ask a manager to add it and reprint the bill.`
 			: `${named}'s bill has already been printed, so nothing more can be added to it. ${managerDoes}`;
+	// Offered on an ORDER only: a merge or a moved item is a manager's act on
+	// every client, and a guest may never add to printed paper.
+	const addToPrinted = !input.guest && write === "order";
 	return {
 		error,
 		code: BILL_PRINTED_CODE,
@@ -416,8 +507,24 @@ export function billPrintedRefusal(input: {
 		next_party_table: next || null,
 		// A guest is never handed a table to walk to.
 		next_party_action: elsewhere && !input.guest ? takeItOnNextPartyLabel(next) : null,
+		add_to_printed_action: input.guest || write !== "order" ? null : addToPrintedBillLabel(input.table, input.parentTable ?? null),
+		add_to_printed_message: addToPrinted ? addToPrintedBillRefusalMessage(named, elsewhere ? nextNamed : null) : null,
 		print_count: Math.max(0, Math.round(Number(input.printCount) || 0)),
 	};
+}
+
+/**
+ * THE REFUSAL AS A 2.0.2 CLIENT SAYS IT — beside "Add to 12's printed bill"
+ * (and "Take it on 12 (next party)" when there is a seat), so the sentence
+ * names the two choices the buttons are. The 2.0.0/2.0.1 `error` still sends a
+ * waiter to a manager, which is true for those tills: they cannot add it.
+ * [named] and [nextNamed] are the tables as a sentence names them.
+ */
+export function addToPrintedBillRefusalMessage(named: string, nextNamed: string | null): string {
+	const next = String(nextNamed ?? "").trim();
+	return next
+		? `${named}'s bill has already been printed. Take a new party's order on ${next}, or, if it is for the same guests, add it to ${named}'s printed bill and print the updated bill.`
+		: `${named}'s bill has already been printed. If it is for the same guests, add it to ${named}'s printed bill and print the updated bill.`;
 }
 
 /** The action both clients put beside the refusal's sentence. */
@@ -449,4 +556,15 @@ export function nextPartyAfterPrintMessage(nextPartyTable: string | null): strin
  */
 export function reprintNeededMessage(table: string, parentTable?: string | null): string {
 	return `${tableSentenceName(table, parentTable ?? null)}'s bill was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.`;
+}
+
+/**
+ * THE AUDIT LINE FOR AN ADDITION TO A PRINTED BILL — "ADDED to the printed
+ * bill of table 12 (printed 1 time(s))". Filed AFTER the write lands, by every
+ * door the guard covers, so the night cashier can see which bills grew after
+ * their paper was handed over, and who grew them.
+ */
+export function printedBillAdditionAudit(input: { table: string; printCount: number; write?: BillPrintedWrite }): string {
+	const what = input.write === "merge" ? "a merge into" : input.write === "move" ? "an item moved onto" : "an order on";
+	return `ADDED ${what} the printed bill of table ${String(input.table ?? "").trim()} (printed ${String(Math.max(0, Math.round(Number(input.printCount) || 0)))} time(s))`;
 }

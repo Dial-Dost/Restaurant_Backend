@@ -11,7 +11,9 @@ import { emitRestaurant } from "../realtime.js";
 import { hidesPrices, redactBillForTable, redactTableList } from "../price_scope.js";
 import { mayReleaseTable } from "../release_authority.js";
 import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
-import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
+import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, validateAction } from "./_shared.js";
+// Client items 1 and 2: one fingerprint of the paper, the one the print gate uses.
+import { billPaperStale } from "./bills.js";
 import { RESERVED_TABLE_NAME_ERROR, isReservedPartyName } from "../next_party.js";
 
 
@@ -854,6 +856,15 @@ app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"
 	The two acts are not interchangeable and the difference is money: a move keeps
 	one party on one bill, a merge puts two parties on one bill.
 
+	A PRINTED PARTY MOVES WITH ITS PAPER (client items 1 and 2 — a waiter moves
+	tables now, orange ones included). The print ledger follows them
+	(MoveTableParty re-addresses its `<name>-<epoch>` jobs), so the destination is
+	orange; and because the destination's number now holds a printed bill, the
+	next guests there get a green seat at once — the same nextPartyAfterPrint a
+	print calls — rather than on the floor read's backfill. `next_party_table`
+	names it. A move into the table's own family ("12" to "12 #2") is refused:
+	they are one table.
+
 	NO idempotent() AND NO OFFLINE QUEUE, deliberately, on both counts:
 
 	  * A REPLAY IS ALREADY SAFE. The precondition this write needs — the source
@@ -882,6 +893,9 @@ app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"),
 
 	try {
 		const result = await MoveTableParty(restaurantId, fromTable, toTable);
+		// The printed party's number needs its green seat (see the header). Never
+		// throws and never fails the move: the party has already moved.
+		const nextPartyTable = result.printed ? await nextPartyAfterPrint(req, restaurantId, result.to_table) : null;
 		// BOTH tables changed, so both floor plans have to. One event naming both
 		// ends rather than two, so a client cannot repaint half a move.
 		try {
@@ -896,12 +910,12 @@ app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"),
 			await log_audit(
 				req,
 				"090ea8d4-e348-4e1b-9723-11131a73a085",
-				`Moved the party at ${result.from_table} to ${result.to_table} (${String(result.covers)} covers, ${String(result.moved_orders)} order${result.moved_orders === 1 ? "" : "s"}, ${result.moved_bill ? "bill carried" : "no bill yet"})`,
+				`Moved the party at ${result.from_table} to ${result.to_table} (${String(result.covers)} covers, ${String(result.moved_orders)} order${result.moved_orders === 1 ? "" : "s"}, ${result.moved_bill ? "bill carried" : "no bill yet"}${result.printed ? `, printed bill carried${result.printed_as ? ` — the paper says ${result.printed_as}` : ""}` : ""})`,
 				Audit_log_category.Tables,
-				result,
+				{ ...result, next_party_table: nextPartyTable },
 			);
 		} catch (err) { logger.warn({ err }, "log_audit move-table failed"); }
-		res.json(result);
+		res.json({ ...result, next_party_table: nextPartyTable, next_party_message: nextPartyPrintMessage(nextPartyTable) });
 	} catch (error: any) {
 		logger.error({ err: error }, "move_table_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to move the table") });
@@ -1155,7 +1169,16 @@ app.get("/bill-for-table", validateAction("98b10bde-802d-4a5b-a726-53a826424f79"
 		//
 		// A manager, cashier, captain or admin takes the `result` branch and gets
 		// a byte-identical response to the one they got before this existed.
-		res.json(hidesPrices(req.auth) ? redactBillForTable(result as unknown as Record<string, unknown>) : result);
+		// CLIENT ITEMS 1 AND 2 — IS THE PAPER THE GUEST IS HOLDING STILL RIGHT?
+		// Asked through the SAME fingerprint the print files and the print gate
+		// compares (currentPaperDigest), and only for a printed table. `true` puts
+		// "Print updated bill" in front of a waiter and the stale-paper warning in
+		// front of whoever settles; null (nothing printed, or printed before 055)
+		// changes nothing. The digest itself is the data layer's and is not sent.
+		const { last_paper_digest: _lastPaperDigest, ...bill } = result;
+		void _lastPaperDigest;
+		const payload = { ...bill, paper_stale: await billPaperStale(restaurantId, tableName, result) };
+		res.json(hidesPrices(req.auth) ? redactBillForTable(payload as unknown as Record<string, unknown>) : payload);
 	} catch (error: any) {
 		logger.error({ err: error }, "get_bill_for_table_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to get bill for table") });

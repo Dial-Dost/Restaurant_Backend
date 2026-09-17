@@ -125,12 +125,18 @@ import {
   BILL_PRINT_JOB_KIND,
   COUNTED_PRINT_JOB_STATUSES,
   NO_BILL_PRINTS,
+  PREVIOUS_PARTY_PRINT_MARK,
+  billPrintFallbackPrefix,
+  latestBillPaper,
   seatingStartOf,
   summarizeBillPrints,
   type BillPrintJobRow,
   type BillPrintSeating,
   type BillPrintState,
 } from "./bill_print_state.js";
+// Client items 1 and 2 — what a printed bill SAID (migration 055), so a waiter's
+// second print can be told apart from the one that fixes out-of-date paper.
+import { billLinesDigest, paperStale, printedAsName, type BillPaperRecord, type PaperLine } from "./bill_paper_digest.js";
 // Client item 6 — the next party at a printed table (migration 053). The rules
 // (the reserved name, which seat to hand out, which idle rows to retire) are
 // pure and live there; this file only reads and writes the rows.
@@ -138,6 +144,8 @@ import {
   RESERVED_TABLE_NAME_ERROR,
   freeFamilySeat,
   isReservedPartyName,
+  sameFamilyMoveError,
+  sameTableFamily,
   nextFreePartySeq,
   nextPartyLabel,
   nextPartyName,
@@ -4249,26 +4257,8 @@ export async function GetOrderingPrintGuard(
   );
   const table = tableRows[0];
   if (!table || table.is_virtual === true) {return null;}
-  const billRows = await runQuery<{ id: string; created_at: Date | null }>(
-    `select id, created_at from "Bills"
-      where table_id = $1 and res_id = $2 and outlet_id = $3
-        and status != 3 and closed_at is null
-      order by created_at desc
-      limit 1`,
-    [table.id, context.res_id, context.outlet_id],
-  );
-  const firstOrder = await runQuery<{ first_at: Date | null }>(
-    `select min(created_at) as first_at from "Orders"
-      where res_id = $1 and outlet_id = $2 and table_id = $3
-        and ${stillOwesStatusSql()}`,
-    [context.res_id, context.outlet_id, table.id],
-  );
-  const start = seatingStartOf(billRows[0]?.created_at ?? null, firstOrder[0]?.first_at ?? null);
-  // Nothing on the table at all: nothing can have been printed for this party.
-  if (start === null && !billRows[0]) {
-    return { table: table.table_name, table_id: table.id, parent_table: null, print_count: 0, existing_lines: null };
-  }
-  const prints = await billPrintHistoryForTable(context, table.id, billRows[0]?.id ?? null, table.table_name, start);
+  // The seating's bounds and its print state — the same helper the move uses.
+  const { prints } = await currentSeatingPrintState(context, table);
   let existingLines: StoredOrderLine[] | null = null;
   const orderId = String(opts.orderId ?? "").trim();
   if (prints.print_count > 0 && isUuid(orderId)) {
@@ -5184,7 +5174,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; service_charge_basis: OpenBillChargeConfig["basis"]; service_charge_applied: boolean; taxes: BillTaxLine[]; tax_total: number; round_off: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; service_charge_basis: OpenBillChargeConfig["basis"]; service_charge_applied: boolean; taxes: BillTaxLine[]; tax_total: number; round_off: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null; last_paper_digest: string | null; printed_total: number | null; printed_as: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -5555,6 +5545,18 @@ export async function GetBillForTable(
     print_count: prints.print_count,
     bill_printed_at: prints.bill_printed_at,
     printed_at: prints.printed_at,
+    // CLIENT ITEMS 1 AND 2 (migration 055) — WHAT THE LATEST PAPER SAID. All
+    // three are null when nothing was printed, and when the print's content was
+    // never recorded (before 055). `last_paper_digest` is compared by
+    // routes/bills.ts's currentPaperDigest — the print gate and GET
+    // /bill-for-table's `paper_stale` — and never sent on as it stands.
+    // `printed_total` is the grand total the guest is holding: MONEY, so C4
+    // takes it off a waiter's payload (REDACTED_BILL_MONEY_KEYS). `printed_as`
+    // is the name on that paper when it is not this table's any more (a moved
+    // party).
+    last_paper_digest: prints.paper?.bill_digest ?? null,
+    printed_total: prints.paper?.bill_grand_total ?? null,
+    printed_as: printedAsName(prints.paper?.table_name, normalized),
   };
 }
 
@@ -5583,7 +5585,7 @@ async function billPrintHistoryForTable(
   openBillId: string | null,
   tableName: string,
   seatingStart: Date | string | null,
-): Promise<BillPrintState> {
+): Promise<SeatingPrintState> {
   // `tableId` is not in the predicate — bill_id already identifies the bill, and
   // the fallback shape is per-table-name. It is taken so callers cannot pass a
   // name and an id that disagree, and so this signature does not have to change
@@ -5591,8 +5593,16 @@ async function billPrintHistoryForTable(
   void tableId;
   const seatings = [{ open_bill_id: openBillId, table_name: tableName, seating_start: seatingStart }];
   const byName = await billPrintStateForSeatings(context, seatings);
-  return byName.get(tableName) ?? NO_BILL_PRINTS;
+  return byName.get(tableName) ?? NO_SEATING_PRINTS;
 }
+
+/**
+ * C3's three fields, plus WHAT THE LATEST PAPER SAID (migration 055; null when
+ * nothing was printed). The paper is the data layer's, never a payload's: each
+ * reader decides what of it to send (see GetBillForTable and GetTables).
+ */
+type SeatingPrintState = BillPrintState & { paper: BillPaperRecord | null };
+const NO_SEATING_PRINTS: SeatingPrintState = { ...NO_BILL_PRINTS, paper: null };
 
 /**
  * THE SAME QUESTION FOR MANY TABLES AT ONCE — what /get-tables needs.
@@ -5619,9 +5629,9 @@ async function billPrintHistoryForTable(
 async function billPrintStateForSeatings(
   context: RestaurantContext,
   seatings: readonly BillPrintSeating[],
-): Promise<Map<string, BillPrintState>> {
-  const out = new Map<string, BillPrintState>();
-  for (const s of seatings) { out.set(s.table_name, NO_BILL_PRINTS); }
+): Promise<Map<string, SeatingPrintState>> {
+  const out = new Map<string, SeatingPrintState>();
+  for (const s of seatings) { out.set(s.table_name, NO_SEATING_PRINTS); }
   if (seatings.length === 0) { return out; }
 
   // The lower bound is the EARLIEST seating asked about; each table's own bound
@@ -5636,20 +5646,258 @@ async function billPrintStateForSeatings(
     floor = floor === null ? t : Math.min(floor, t);
   }
 
-  const rows = await captureRead("PrintJobs", () => runQuery<BillPrintJobRow>(
-    `select bill_id, created_at from "PrintJobs"
-      where res_id = $1 and outlet_id = $2 and kind = $3
+  // Migration 055's four columns ride along ONLY when the latch says they are
+  // there. A 42703 is caught by captureRead as "nothing printed", which is the
+  // one answer this read must never give on a table that WAS printed: a waiter
+  // would get their print back. So an absent column is asked of the catalogue
+  // first, and a stale "present" that answers 42703 anyway falls back to the
+  // pre-055 statement rather than to empty (outside a transaction only — inside
+  // one the 42703 has already aborted it, and the caller must hear so).
+  const params = [
+    context.res_id, context.outlet_id, BILL_PRINT_JOB_KIND,
+    [...COUNTED_PRINT_JOB_STATUSES],
+    floor === null ? null : new Date(floor).toISOString(),
+  ];
+  const where = `where res_id = $1 and outlet_id = $2 and kind = $3
         and status = any($4::text[])
-        and ($5::timestamptz is null or created_at >= $5)`,
-    [
-      context.res_id, context.outlet_id, BILL_PRINT_JOB_KIND,
-      [...COUNTED_PRINT_JOB_STATUSES],
-      floor === null ? null : new Date(floor).toISOString(),
-    ],
-  ), [] as BillPrintJobRow[]);
+        and ($5::timestamptz is null or created_at >= $5)`;
+  const plain = (): Promise<BillPrintJobRow[]> => runQuery<BillPrintJobRow>(
+    `select bill_id, created_at from "PrintJobs"
+      ${where}`,
+    params,
+  );
+  const withPaper = await printJobPaperReady();
+  const rows = await captureRead("PrintJobs", async () => {
+    if (!withPaper) { return plain(); }
+    try {
+      return await runQuery<BillPrintJobRow>(
+        `select bill_id, created_at, bill_digest, lines_digest, bill_grand_total, table_name from "PrintJobs"
+      ${where}`,
+        params,
+      );
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code !== "42703" || (tenantStorage.getStore()?.txnDepth ?? 0) > 0) { throw err; }
+      notePrintJobPaperMissing();
+      return plain();
+    }
+  }, [] as BillPrintJobRow[]);
 
-  for (const s of seatings) { out.set(s.table_name, summarizeBillPrints(rows, s)); }
+  for (const s of seatings) {
+    out.set(s.table_name, { ...summarizeBillPrints(rows, s), paper: latestBillPaper(rows, s) });
+  }
   return out;
+}
+
+// --- What a printed bill SAID (migration 055, client items 1 and 2) -----------
+//
+// bill_paper_digest.ts argues the design. Everything below reads and writes the
+// four columns, and degrades — as 053 does — to "exactly as before this
+// feature" when they are not there: no digest is written, none is read, every
+// paper is "unknown", and a waiter's second print is a senior's, as on 2.0.1.
+
+/**
+ * Migration 055, statement for statement (print_job_paper_digest.test.ts holds
+ * the file to these). The runtime issues them itself because production
+ * connects as the table owner — see ensurePrintJobPaperColumns for how.
+ */
+export const PRINT_JOB_PAPER_DDL: readonly string[] = [
+  `alter table "PrintJobs" add column if not exists bill_digest text`,
+  `alter table "PrintJobs" add column if not exists lines_digest text`,
+  `alter table "PrintJobs" add column if not exists bill_grand_total numeric(12,2)`,
+  `alter table "PrintJobs" add column if not exists table_name text`,
+];
+
+const PRINT_JOB_PAPER_COLUMNS = ["bill_digest", "lines_digest", "bill_grand_total", "table_name"] as const;
+
+// THE LATCH, in nextPartyReady's shape: asked of information_schema, because a
+// 42703 inside an open transaction aborts it. PRESENT is remembered for good;
+// ABSENT is re-asked after a minute, because 055 may be applied by hand while
+// this process runs.
+let printJobPaperColumns: { present: boolean; checkedAt: number } | null = null;
+const PRINT_JOB_PAPER_REPROBE_MS = 60_000;
+
+async function countPrintJobPaperColumns(): Promise<number> {
+  const rows = await runQuery<{ n: unknown }>(
+    `select count(*)::int as n from information_schema.columns
+      where table_schema = 'public' and table_name = 'PrintJobs'
+        and column_name = any($1::text[])`,
+    [[...PRINT_JOB_PAPER_COLUMNS]],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
+/**
+ * Add whichever of the four is missing — ONLY those, and under a 2-second
+ * LOCAL lock timeout inside the one statement. "PrintJobs" is written by every
+ * docket and every ack, and ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE
+ * even when it has nothing to do, so a blanket re-run would queue the kitchen
+ * behind it (the 2026-08-24 standstill's shape). NEVER inside a transaction: a
+ * DDL rolled back with its caller would leave the latch believing it happened.
+ */
+async function ensurePrintJobPaperColumns(): Promise<void> {
+  if ((tenantStorage.getStore()?.txnDepth ?? 0) > 0) {return;}
+  const adds = PRINT_JOB_PAPER_DDL.map((sql, i) => `
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'PrintJobs'
+                             and column_name = '${PRINT_JOB_PAPER_COLUMNS[i]}') then
+             ${sql};
+           end if;`).join("");
+  await ensureLazyTable("PrintJobs.paper_digest", async () => {
+    await runQuery(`do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);${adds}
+         end $$`);
+  });
+}
+
+/** Are the four columns there? Adds them first when this is a connection that may. */
+async function printJobPaperReady(): Promise<boolean> {
+  const now = Date.now();
+  const known = printJobPaperColumns;
+  if (known && (known.present || now - known.checkedAt < PRINT_JOB_PAPER_REPROBE_MS)) {return known.present;}
+  let present = false;
+  try {
+    present = (await countPrintJobPaperColumns()) === PRINT_JOB_PAPER_COLUMNS.length;
+    if (!present && (tenantStorage.getStore()?.txnDepth ?? 0) === 0) {
+      try {
+        await ensurePrintJobPaperColumns();
+      } catch (err) {
+        logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_ensure_failed");
+      }
+      present = (await countPrintJobPaperColumns()) === PRINT_JOB_PAPER_COLUMNS.length;
+    }
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_probe_failed");
+  }
+  if (!present && known?.present !== false) {
+    logger.warn("Printed-bill fingerprints are OFF — migration 055 is not applied here and this role could not add it. A waiter's second print stays a senior's, exactly as before.");
+  }
+  printJobPaperColumns = { present, checkedAt: now };
+  return present;
+}
+
+/** A read or write answered 42703 although the latch said present: believe the database. */
+function notePrintJobPaperMissing(): void {
+  printJobPaperColumns = { present: false, checkedAt: Date.now() };
+}
+
+/** Test seam (jest only): forget what the latch learned. */
+export function resetPrintJobPaperCache(): void {
+  printJobPaperColumns = null;
+  ddlEnsured.delete("PrintJobs.paper_digest");
+}
+
+/**
+ * Boot-time half — before the listener, outside any transaction, the step
+ * 048 and 050-053 already have. Never throws; answers whether the feature is ON.
+ */
+export async function InitPrintJobPaperSchema(): Promise<boolean> {
+  printJobPaperColumns = null;
+  try {
+    return await printJobPaperReady();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * FILE WHAT A BILL PRINT SAID, beside the job(s) that printed it.
+ *
+ * A follow-up UPDATE by job id rather than four more columns on the insert:
+ * EnqueuePrintJob's statement shapes are the print router's, and the lease they
+ * write is the reason each is exactly what it is. The instant between the
+ * insert and this update reads as "unknown", which fails closed (a waiter's
+ * reprint is a senior's) — the direction C3 already chose.
+ *
+ * NEVER THROWS AND NEVER FAILS THE PRINT: the paper is already out. A missing
+ * ledger (027) or missing columns (055) write nothing and answer false.
+ */
+export async function RecordBillPrintPaper(
+  restaurantId: string,
+  jobIds: readonly (string | null | undefined)[],
+  paper: BillPaperRecord,
+): Promise<boolean> {
+  const ids = [...new Set(jobIds.map((id) => String(id ?? "").trim()).filter((id) => isUuid(id)))];
+  if (ids.length === 0) {return false;}
+  try {
+    const context = await requireRestaurantContext(restaurantId);
+    if (!(await printJobPaperReady())) {return false;}
+    await runQuery(
+      `update "PrintJobs"
+          set bill_digest = $3, lines_digest = $4, bill_grand_total = $5, table_name = $6
+        where res_id = $1 and id = any($2::uuid[])`,
+      [context.res_id, ids, paper.bill_digest, paper.lines_digest, paper.bill_grand_total, paper.table_name],
+    );
+    return true;
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === "42703") {notePrintJobPaperMissing();}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_record_failed");
+    return false;
+  }
+}
+
+/**
+ * THE SAME PAPER, SENT TO A THERMAL PRINTER TOO — the web print page's
+ * "Print ESC/POS" (POST /publish/bill) after its claim.
+ *
+ * The page renders its bytes from the claim's own `printable_bill`, so the
+ * publish is the claim's paper again. Its job is a counted print of the same
+ * bill id and the NEWER one, so without this it became "the paper" with nothing
+ * recorded: paper_stale went unknown and a waiter could never print the updated
+ * bill for that seating. The record is copied from the claim's job, never
+ * re-taken from the bill as it is now — the bytes are the claim's, and a bill
+ * that changed in between must still read stale.
+ *
+ * Only between two bill jobs of this tenant filed under the SAME bill_id: a
+ * job id from another bill (or another restaurant) copies nothing. Never
+ * throws, like RecordBillPrintPaper.
+ */
+export async function CopyBillPrintPaper(restaurantId: string, fromJobId: string, toJobId: string): Promise<boolean> {
+  const from = String(fromJobId ?? "").trim();
+  const to = String(toJobId ?? "").trim();
+  if (!isUuid(from) || !isUuid(to) || from === to) {return false;}
+  try {
+    const context = await requireRestaurantContext(restaurantId);
+    if (!(await printJobPaperReady())) {return false;}
+    const rows = await runQuery<{ id: string }>(
+      `update "PrintJobs" t
+          set bill_digest = f.bill_digest, lines_digest = f.lines_digest,
+              bill_grand_total = f.bill_grand_total, table_name = f.table_name
+         from "PrintJobs" f
+        where t.res_id = $1 and t.id = $3::uuid and t.kind = $4
+          and f.res_id = $1 and f.id = $2::uuid and f.kind = $4
+          and f.bill_id = t.bill_id
+        returning t.id`,
+      [context.res_id, from, to, BILL_PRINT_JOB_KIND],
+    );
+    return rows.length > 0;
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === "42703") {notePrintJobPaperMissing();}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_copy_failed");
+    return false;
+  }
+}
+
+/**
+ * The lines one stored order puts on its table's paper, in the shape
+ * bill_paper_digest.ts fingerprints — read EXACTLY as GetBillForTable reads
+ * them (the `items` list, the name fallback, the price, the whole-number
+ * quantity, the comp flag and the snapshotted variation), so the floor tile's
+ * lines digest and the print's are one function of the same lines.
+ */
+function paperLinesOfFood(food: unknown): PaperLine[] {
+  const f = parseJsonObject(food) ?? {};
+  const list = Array.isArray((f).items) ? (f as { items: unknown[] }).items : [];
+  return list.map((raw) => {
+    const it = (raw ?? {}) as Record<string, unknown>;
+    return {
+      name: String(it.name ?? "Item"),
+      price: parseNumeric(it.price),
+      quantity: Math.max(1, Math.round(parseNumeric(it.quantity) || 1)),
+      nc: isNonChargeableLine(it),
+      variation: String(it.variation_name ?? "").trim(),
+    };
+  });
 }
 
 export async function AddBooking(
@@ -5871,7 +6119,7 @@ export async function GetTables(
   time?: string | Date | null,
   /** Internal: false on the one re-read after a backfill made a seat. */
   opts: { backfillNextParty?: boolean } = {},
-): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null; parent_table: string | null; party_no: number | null; display_name: string }[] | null> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null; paper_stale: boolean | null; printed_as: string | null; parent_table: string | null; party_no: number | null; display_name: string }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
@@ -6034,9 +6282,16 @@ export async function GetTables(
   // rung as non-chargeable). "There is an order" and "the order is worth
   // something" are different questions and the floor plan asks the first one.
   const orderedTables = new Set<string>();
+  // The lines each table's paper would print now (migration 055), so a printed
+  // tile can say the paper is out of date. Collected from the rows already read;
+  // fingerprinted below only for tables that have been printed.
+  const paperLinesByTable = new Map<string, PaperLine[]>();
   for (const o of activeOrders) {
     if (!o.table_id) {continue;}
     orderedTables.add(o.table_id);
+    const lines = paperLinesByTable.get(o.table_id) ?? [];
+    lines.push(...paperLinesOfFood(o.food));
+    paperLinesByTable.set(o.table_id, lines);
     const p = parseJsonObject(o.food) ?? {};
     const t = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     totalByTable.set(o.table_id, (totalByTable.get(o.table_id) ?? 0) + t);
@@ -6076,7 +6331,7 @@ export async function GetTables(
   // everything else for the same reason — a grid that 500s is a worse outage
   // than a print flag that reads 0.
   const printStateByTable = await billPrintStateForSeatings(context, printSeatings)
-    .catch(() => new Map<string, BillPrintState>());
+    .catch(() => new Map<string, SeatingPrintState>());
 
   // The outlet's chosen section order (migration 041), so the floor plan groups
   // in the order the owner arranged rather than alphabetically.
@@ -6165,7 +6420,7 @@ export async function GetTables(
     const tCovers = Math.max(1, parseNumeric(row.num_covers) ?? 1);
     const tTotal = totalByTable.get(row.id) ?? 0;
     const tApc = occupied && tTotal > 0 ? round2(tTotal / tCovers) : 0;
-    const prints = printStateByTable.get(row.table_name) ?? NO_BILL_PRINTS;
+    const prints = printStateByTable.get(row.table_name) ?? NO_SEATING_PRINTS;
     // A sibling is a second seat at the SAME table: it sits in the root's zone
     // and carries the root's booking state. Its occupancy, money, covers, OTP,
     // QR and print state are its OWN — that is the entire point of the row.
@@ -6245,6 +6500,19 @@ export async function GetTables(
       print_count: prints.print_count,
       bill_printed_at: prints.bill_printed_at,
       printed_at: prints.printed_at,
+      // CLIENT ITEMS 1 AND 2 (migration 055). A printed table stays on a
+      // waiter's floor now, in orange, and more can be added to its bill — so
+      // the tile has to be able to say "the paper is out of date, print it
+      // again". Decided from the LINES alone (bill_paper_digest.ts says why the
+      // floor cannot price forty ladders); a discount or a waiver changed after
+      // the print shows on the bill sheet and at the print gate instead. Null
+      // when nothing was printed or the print's content is unknown. NOT money.
+      paper_stale: prints.print_count > 0
+        ? paperStale(billLinesDigest(paperLinesByTable.get(row.id) ?? []), prints.paper?.lines_digest)
+        : null,
+      // The name on that paper when it is not this table's (a moved party):
+      // "Printed as 12" on the tile at 20.
+      printed_as: prints.print_count > 0 ? printedAsName(prints.paper?.table_name, row.table_name) : null,
     };
   });
 }
@@ -16671,8 +16939,21 @@ export async function MoveTableParty(
   moved_session: boolean;
   /** True when a waiter assignment travelled with the party. */
   moved_waiter: boolean;
+  /**
+   * Client items 1 and 2: the moved party's bill has been printed (its paper
+   * came with them), so the route opens a green next-party seat at the
+   * destination. False on a database that cannot say.
+   */
+  printed: boolean;
+  /** The table name on that paper ("12" after 12 -> 20), or null when unknown / not printed. */
+  printed_as: string | null;
+  /** How many `<name>-<epoch>` print jobs were re-addressed to the destination. */
+  moved_prints: number;
 }> {
   const freed: FreedTable = { context: null, tableId: null };
+  // Asked BEFORE the transaction: the latch may add columns, which it never does
+  // inside one, and the family check below names 053's column only when it exists.
+  const withParty = await nextPartyReady();
   const out = await withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
@@ -16700,11 +16981,12 @@ export async function MoveTableParty(
       linked_order_id: string | null;
       order_otp: string | null;
       is_virtual: boolean;
+      parent_table_id?: string | null;
     }>(
       `select id, table_name, capacity, max_capacity,
               coalesce(is_occupied, false) as is_occupied,
               num_covers, linked_order_id, order_otp,
-              coalesce(is_virtual, false) as is_virtual
+              coalesce(is_virtual, false) as is_virtual${withParty ? ", parent_table_id" : ""}
          from "Tables"
         where res_id = $1 and outlet_id = $2
           and lower(btrim(table_name)) in (lower(btrim($3)), lower(btrim($4)))
@@ -16720,6 +17002,10 @@ export async function MoveTableParty(
     // A virtual row is the hidden table provisioned to back ONE takeaway or
     // delivery order. It is not somewhere a party can sit, in either direction.
     if (src.is_virtual || dst.is_virtual) {throw new Error("Takeaway and delivery orders are not seated at a table, so they cannot be moved this way");}
+    // "12" AND "12 #2" ARE ONE TABLE (client items 1 and 2). See sameTableFamily
+    // for what a move between them would do to the floor. Only asked with 053
+    // present: without it there are no families.
+    if (withParty && sameTableFamily(src, dst)) {throw new Error(sameFamilyMoveError(src.table_name, dst.table_name));}
     if (!src.is_occupied) {throw new Error(`${src.table_name} is not seated - there is no party to move.`);}
     if (dst.is_occupied) {
       throw new Error(
@@ -16752,6 +17038,10 @@ export async function MoveTableParty(
     if (Number(strayBill[0]?.n ?? 0) > 0) {
       throw new Error(`${dst.table_name} still has an open bill even though nobody is seated there. Release ${dst.table_name} first, then move.`);
     }
+
+    // 0. THE PAPER THIS PARTY WAS HANDED. Asked while the orders and the bill
+    //    are still on the source, because the seating that bounds it is the source's.
+    const movedPrints = await rekeyMovedPartyPrints(context, src, dst, client);
 
     // 1. THE ORDERS. table_id is what every reader joins on; `food.table` is the
     //    printed/displayed name and is carried in step with it so a KOT reprint,
@@ -16872,12 +17162,156 @@ export async function MoveTableParty(
       moved_bill: movedBill.length > 0,
       moved_session: movedSession,
       moved_waiter: movedWaiter.length > 0,
+      moved_prints: movedPrints,
+      dst_id: dst.id,
     };
   });
   // The party LEFT the source: tidy its family (client item 6). Moving the
   // printed party at 12 to 15 frees 12, and "12 #2" is no longer needed.
   await afterTableFreed(freed);
-  return out;
+  // WAS THEIR BILL PRINTED? Read after the commit, through the SAME seating rule
+  // the floor and the print gate use, so "the destination is orange" is decided
+  // exactly as the next /get-tables will decide it. A read that fails is "not
+  // printed": the move has happened, and a missing green seat is what the floor
+  // read's backfill repairs.
+  const { dst_id: dstId, ...moved } = out;
+  let printed = false;
+  let printedAs: string | null = null;
+  try {
+    if (freed.context) {
+      const state = await currentSeatingPrintState(freed.context, { id: dstId, table_name: moved.to_table });
+      printed = state.prints.print_count > 0;
+      printedAs = printed ? (state.prints.paper?.table_name ?? null) : null;
+    }
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err, table: moved.to_table }, "move_party_print_state_failed");
+  }
+  return { ...moved, printed, printed_as: printedAs };
+}
+
+/**
+ * CARRY A MOVED PARTY'S FALLBACK-ADDRESSED PRINTS TO THE DESTINATION — inside
+ * the move's own transaction, so a move that rolls back leaves them where they
+ * were.
+ *
+ * A print of a table with no "Bills" row yet is filed as `<table>-<epoch>` (or
+ * `<table>-split-<i>of<n>`), and the print state matches it by the table's NAME
+ * (bill_print_state.ts). Production GGV filed 23 of its last 30 bill prints that
+ * way. A move carries the bill row — and with it every print addressed to the
+ * bill's id — but left these behind: the printed party arrived at 20 reading
+ * "not printed", a print there was a first print with no REPRINT banner, and the
+ * orange tile went green under a guest already holding paper.
+ *
+ * BOUNDED TWICE, because the name is shared with every party that ever sat at
+ * the source: by the SEATING START (seatingStartOf over this party's bill and
+ * orders — the previous party's prints stay behind) and by the EXACT prefix and
+ * shape (`starts_with`, never LIKE, and only an epoch or a split suffix after
+ * it, so "12-A-…" is not 12's).
+ *
+ * THE DESTINATION'S HISTORY FIRST. The party keeps its orders' created_at, so
+ * its seating starts before the move, and at the destination that bound
+ * counted every `<dst>-<epoch>` print made after it — the bill of the party
+ * that sat there, paid and left in the meantime (4 of the last 12 production
+ * moves). The destination is free with no open bill (checked above), so those
+ * prints are nobody's now: they are re-filed as `previous-party:<id>`
+ * (previousPartyPrintJobId) under the same two bounds, and only THEN is the
+ * party's own paper carried in, so it can never be retired with them.
+ *
+ * IN A SAVEPOINT: a ledger that is not there (027 unapplied, or its grants
+ * missing) must not abort the move — it has no prints to carry. Any other
+ * failure does abort it: a printed party arriving unprinted is the defect.
+ */
+async function rekeyMovedPartyPrints(
+  context: RestaurantContext,
+  src: { id: string; table_name: string },
+  dst: { table_name: string },
+  client: PoolClient,
+): Promise<number> {
+  const startRows = await runQuery<{ first_order_at: Date | null; bill_created_at: Date | null }>(
+    `select (select min(o.created_at) from "Orders" o
+              where o.res_id = $1 and o.outlet_id = $2 and o.table_id = $3
+                and ${stillOwesStatusSql("o.status")}) as first_order_at,
+            (select b.created_at from "Bills" b
+              where b.res_id = $1 and b.outlet_id = $2 and b.table_id = $3
+                and b.status != 3 and b.closed_at is null
+              order by b.created_at desc limit 1) as bill_created_at`,
+    [context.res_id, context.outlet_id, src.id],
+    client,
+  );
+  const start = seatingStartOf(startRows[0]?.bill_created_at ?? null, startRows[0]?.first_order_at ?? null);
+  // Nothing on the table: nothing this party can have printed.
+  if (start === null) {return 0;}
+  const from = billPrintFallbackPrefix(src.table_name);
+  const to = billPrintFallbackPrefix(dst.table_name);
+  await runQuery("savepoint move_party_print_rekey", [], client);
+  try {
+    // $3 is the destination's prefix here; `$4 || bill_id` keeps the old id whole.
+    const retired = await runQuery<{ id: string }>(
+      `update "PrintJobs"
+          set bill_id = $4 || bill_id
+        where res_id = $1 and outlet_id = $2 and kind = $5
+          and starts_with(bill_id, $3)
+          and substr(bill_id, length($3) + 1) ~ '^([0-9]+|split-[0-9]+of[0-9]+)$'
+          and created_at >= $6::timestamptz
+        returning id`,
+      [context.res_id, context.outlet_id, to, PREVIOUS_PARTY_PRINT_MARK, BILL_PRINT_JOB_KIND, start.toISOString()],
+      client,
+    );
+    if (retired.length > 0) {
+      logger.info({ table: dst.table_name, retired: retired.length }, "move_party_destination_prints_retired");
+    }
+    const rows = await runQuery<{ id: string }>(
+      `update "PrintJobs"
+          set bill_id = $4 || substr(bill_id, length($3) + 1)
+        where res_id = $1 and outlet_id = $2 and kind = $5
+          and starts_with(bill_id, $3)
+          and substr(bill_id, length($3) + 1) ~ '^([0-9]+|split-[0-9]+of[0-9]+)$'
+          and created_at >= $6::timestamptz
+        returning id`,
+      [context.res_id, context.outlet_id, from, to, BILL_PRINT_JOB_KIND, start.toISOString()],
+      client,
+    );
+    await runQuery("release savepoint move_party_print_rekey", [], client);
+    return rows.length;
+  } catch (err) {
+    await runQuery("rollback to savepoint move_party_print_rekey", [], client);
+    if (!isCaptureTableMissing(err)) {throw err;}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "move_party_print_rekey_skipped (print ledger unavailable)");
+    return 0;
+  }
+}
+
+/**
+ * THE PRINT STATE OF A TABLE'S CURRENT SEATING — the bill and first-order read
+ * that bounds a seating, and the ledger read behind it. One helper, so the move
+ * and the order guard can never bound a seating differently.
+ */
+async function currentSeatingPrintState(
+  context: RestaurantContext,
+  table: { id: string; table_name: string },
+): Promise<{ openBillId: string | null; start: Date | null; prints: SeatingPrintState }> {
+  const billRows = await runQuery<{ id: string; created_at: Date | null }>(
+    `select id, created_at from "Bills"
+      where table_id = $1 and res_id = $2 and outlet_id = $3
+        and status != 3 and closed_at is null
+      order by created_at desc
+      limit 1`,
+    [table.id, context.res_id, context.outlet_id],
+  );
+  const firstOrder = await runQuery<{ first_at: Date | null }>(
+    `select min(created_at) as first_at from "Orders"
+      where res_id = $1 and outlet_id = $2 and table_id = $3
+        and ${stillOwesStatusSql()}`,
+    [context.res_id, context.outlet_id, table.id],
+  );
+  const openBillId = billRows[0]?.id ?? null;
+  const start = seatingStartOf(billRows[0]?.created_at ?? null, firstOrder[0]?.first_at ?? null);
+  // Nothing on the table at all: nothing can have been printed for this party.
+  if (start === null && !openBillId) {
+    return { openBillId, start, prints: NO_SEATING_PRINTS };
+  }
+  const prints = await billPrintHistoryForTable(context, table.id, openBillId, table.table_name, start);
+  return { openBillId, start, prints };
 }
 
 /** Carry a SEATED reservation from one table to another. Only seated/arrived

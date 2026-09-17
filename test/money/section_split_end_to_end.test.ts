@@ -98,6 +98,9 @@ function dispatch(q: string): unknown[] {
   // this fixture, and nothing here depends on it — the money this suite asserts
   // on must be identical whether the bill has been on paper or not.
   if (/from "PrintJobs"/i.test(q)) { return [{ n: "0", first_at: null, last_at: null }]; }
+  // Migration 055's latch (printed-bill fingerprints): modelled as applied, so
+  // the print read above is asked with its paper columns and nothing else runs.
+  if (/from information_schema\.columns/i.test(q) && /'PrintJobs'/.test(q)) { return [{ n: 4 }]; }
   // liveServiceChargeWaiver (migration 036), reached once a bill row exists: no
   // waiver is live on this fixture, so the charge stands.
   if (/waived_at/i.test(q)) { return []; }

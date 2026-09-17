@@ -52,10 +52,21 @@
  * one.
  */
 
+import type { BillPaperRecord } from "./bill_paper_digest.js";
+
 /** The "PrintJobs" columns this rule reads. Everything else is ignored. */
 export interface BillPrintJobRow {
 	bill_id: unknown;
 	created_at: unknown;
+	/**
+	 * Migration 055: what the paper said (bill_paper_digest.ts). Absent on a
+	 * database without 055 and null on every print made before it — both mean
+	 * "nobody recorded it", which latestBillPaper answers as unknown.
+	 */
+	bill_digest?: unknown;
+	lines_digest?: unknown;
+	bill_grand_total?: unknown;
+	table_name?: unknown;
 }
 
 /** Which seating a job has to belong to. */
@@ -171,6 +182,30 @@ export function ncSettlementPrintJobId(billId: string): string {
 	return `${billId.trim()}-nc`;
 }
 
+/**
+ * What a PREVIOUS party's fallback-addressed print is re-filed as when a moved
+ * party lands on its table (MoveTableParty): `previous-party:<old bill_id>`.
+ *
+ * THE DEFECT THIS ENDS. A moved party keeps its orders' created_at, so its
+ * seating starts BEFORE the move — and at the destination that start counted
+ * every `<dst>-<epoch>` print made after it, including the bill of the party
+ * that sat there, paid and left in the meantime. The moved party arrived
+ * "printed" (orange, a 423 on a plain order, a next-party seat, "Replaces the
+ * bill printed 12:01" on somebody else's paper). Production: 4 of the last 12
+ * party moves had that shape.
+ *
+ * The destination is free with no open bill when this is written, so those
+ * prints belong to nobody seated. The new id keeps the old one whole (the
+ * ledger still says what was printed) and no longer starts with
+ * `<table name>-`, so no seating counts it. Like `<id>-nc`, it is free text the
+ * tills only log.
+ */
+export const PREVIOUS_PARTY_PRINT_MARK = "previous-party:";
+
+export function previousPartyPrintJobId(billId: string): string {
+	return `${PREVIOUS_PARTY_PRINT_MARK}${String(billId ?? "").trim()}`;
+}
+
 /** Does this print job belong to this table's CURRENT seating? */
 export function billPrintJobBelongsToSeating(job: BillPrintJobRow, seating: BillPrintSeating): boolean {
 	const billId = String(job?.bill_id ?? "").trim();
@@ -216,5 +251,49 @@ export function summarizeBillPrints(
 		print_count: count,
 		bill_printed_at: first === null ? null : new Date(first).toISOString(),
 		printed_at: last === null ? null : new Date(last).toISOString(),
+	};
+}
+
+/**
+ * WHAT THE LATEST PAPER OF THIS SEATING SAID (migration 055) — the content the
+ * guest is holding, or null when nothing of this seating was printed.
+ *
+ * THE LATEST, NOT ANY. An updated print replaces the one before it; the guest
+ * pays against the newest paper, so that is the one the current bill is
+ * compared with. Counted by the same membership rule as summarizeBillPrints, so
+ * a failed or expired job — a print that never came out — is never "the paper".
+ * A job whose content was not recorded answers null digests: unknown, not
+ * "matches".
+ *
+ * Several parts of a split print share one instant and carry the WHOLE bill's
+ * digests (routes/bills.ts), so which of them wins a tie does not matter.
+ */
+export function latestBillPaper(
+	jobs: readonly BillPrintJobRow[] | null | undefined,
+	seating: BillPrintSeating,
+): BillPaperRecord | null {
+	let latest: BillPrintJobRow | null = null;
+	let latestAt = -Infinity;
+	for (const job of jobs ?? []) {
+		if (!billPrintJobBelongsToSeating(job, seating)) { continue; }
+		const at = asTime(job?.created_at) ?? -Infinity;
+		if (latest === null || at >= latestAt) {
+			latest = job;
+			latestAt = at;
+		}
+	}
+	if (latest === null) { return null; }
+	const str = (v: unknown): string | null => {
+		const s = String(v ?? "").trim();
+		return s === "" ? null : s;
+	};
+	const total = latest.bill_grand_total === null || latest.bill_grand_total === undefined || latest.bill_grand_total === ""
+		? null
+		: Number(latest.bill_grand_total);
+	return {
+		bill_digest: str(latest.bill_digest),
+		lines_digest: str(latest.lines_digest),
+		bill_grand_total: total !== null && Number.isFinite(total) ? total : null,
+		table_name: str(latest.table_name),
 	};
 }

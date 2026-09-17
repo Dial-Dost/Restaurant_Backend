@@ -104,11 +104,18 @@ export interface BookingFix {
 }
 
 export interface PrintJobFix {
+  /** Absent on rows seeded before 2.0.2's tests; addPrint gives one. */
+  id?: string;
   outlet_id: string;
   bill_id: string;
   created_at: string;
   kind: string;
   status: string;
+  /** Migration 055: what the paper said. Null = not recorded. */
+  bill_digest?: string | null;
+  lines_digest?: string | null;
+  bill_grand_total?: number | null;
+  table_name?: string | null;
 }
 
 /** One "OrderItemNonChargeable" row, as far as a settle-as-NC and its re-open use it. */
@@ -153,12 +160,14 @@ interface Store {
   /** The database's now(), advanced by tick(). */
   nowMs: number;
   columnsPresent: boolean;
+  /** Migration 055's four "PrintJobs" columns (client items 1 and 2). */
+  paperColumnsPresent: boolean;
   lockRows: boolean;
   failOn: string | null;
   log: string[];
 }
 
-type Snapshot = Omit<Store, "log" | "failOn" | "columnsPresent" | "lockRows">;
+type Snapshot = Omit<Store, "log" | "failOn" | "columnsPresent" | "paperColumnsPresent" | "lockRows">;
 
 let store: Store = freshStore();
 
@@ -172,6 +181,7 @@ function freshStore(): Store {
     nextId: 1,
     nowMs: Date.parse("2026-09-16T08:00:00.000Z"),
     columnsPresent: true,
+    paperColumnsPresent: true,
     lockRows: true,
     failOn: null,
     log: [],
@@ -185,6 +195,8 @@ export function resetStore(): void {
 }
 
 export function setColumnsPresent(present: boolean): void { store.columnsPresent = present; }
+/** Model a database without migration 055 (and a runtime that cannot add it). */
+export function setPaperColumnsPresent(present: boolean): void { store.paperColumnsPresent = present; }
 export function setRowLocking(on: boolean): void { store.lockRows = on; }
 export function setServiceChargePercent(pct: number): void { store.scPct = pct; }
 export function failNextStatementContaining(needle: string | null): void { store.failOn = needle; }
@@ -308,10 +320,12 @@ export function addBill(tableName: string, over: Partial<BillFix> = {}): BillFix
 
 /** A print in the ledger, addressed the way routes/bills.ts addresses it. */
 export function addPrint(billId: string, over: Partial<PrintJobFix> = {}): PrintJobFix {
-  const row: PrintJobFix = { outlet_id: OUTLET_ID, bill_id: billId, created_at: nowIso(), kind: "bill", status: "delivered", ...over };
+  const row: PrintJobFix = { id: nid("9a000000"), outlet_id: OUTLET_ID, bill_id: billId, created_at: nowIso(), kind: "bill", status: "delivered", ...over };
   store.printJobs.push(row);
   return row;
 }
+
+export const printJobs = (): PrintJobFix[] => store.printJobs.map((r) => ({ ...r }));
 
 /** Confirm a payment the way the waiter step leaves a bill: ready for approval. */
 export function markWaiterConfirmed(billId: string, method = "Cash"): void {
@@ -505,6 +519,10 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     if (names053 && !store.columnsPresent) {
       throw Object.assign(new Error("must be owner of table Tables"), { code: "42501" });
     }
+    const names055 = s.includes("bill_digest") || s.includes("lines_digest");
+    if (names055 && !store.paperColumnsPresent) {
+      throw Object.assign(new Error("must be owner of table PrintJobs"), { code: "42501" });
+    }
     return { rows: [] };
   }
   if (s.includes('insert into "actions"')) {return { rows: [] };}
@@ -514,6 +532,13 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   }
   if (!store.columnsPresent && (s.includes("parent_table_id") || s.includes("party_seq"))) {
     throw missingColumn();
+  }
+  // Migration 055's latch probe, and the rule every reader must obey without it.
+  if (s.includes("information_schema.columns") && s.includes("table_name = 'printjobs'")) {
+    return { rows: [{ n: store.paperColumnsPresent ? 4 : 0 }] };
+  }
+  if (!store.paperColumnsPresent && (s.includes("bill_digest") || s.includes("lines_digest") || s.includes("bill_grand_total"))) {
+    throw Object.assign(new Error("column \"bill_digest\" does not exist"), { code: "42703" });
   }
 
   // --- context and configuration -----------------------------------------
@@ -555,15 +580,89 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   if (s === "select now() as now" || s.startsWith("select now()")) {return { rows: [{ now: new Date(store.nowMs) }] };}
 
   // --- PrintJobs (billPrintStateForSeatings) -------------------------------
-  if (s.startsWith("select bill_id, created_at from \"printjobs\"")) {
+  if (s.startsWith("select bill_id, created_at") && s.includes("from \"printjobs\"")) {
     const statuses = (params[3] as string[]) ?? [];
     const floor = params[4] ? Date.parse(str(params[4])) : null;
+    const withPaper = s.includes("bill_digest");
     return {
       rows: store.printJobs
         .filter((j) => j.outlet_id === str(params[1]) && j.kind === str(params[2]) && statuses.includes(j.status))
         .filter((j) => floor === null || at(j.created_at) >= floor)
-        .map((j) => ({ bill_id: j.bill_id, created_at: new Date(j.created_at) })),
+        .map((j) => ({
+          bill_id: j.bill_id, created_at: new Date(j.created_at),
+          ...(withPaper ? {
+            bill_digest: j.bill_digest ?? null, lines_digest: j.lines_digest ?? null,
+            // numeric comes back from pg as text.
+            bill_grand_total: j.bill_grand_total === null || j.bill_grand_total === undefined ? null : Number(j.bill_grand_total).toFixed(2),
+            table_name: j.table_name ?? null,
+          } : {}),
+        })),
     };
+  }
+  // RecordBillPrintPaper.
+  if (s.startsWith("update \"printjobs\" set bill_digest = $3, lines_digest = $4, bill_grand_total = $5, table_name = $6")) {
+    const ids = ((params[1] as string[]) ?? []).map(String);
+    for (const j of store.printJobs) {
+      if (!j.id || !ids.includes(j.id)) {continue;}
+      Object.assign(j, {
+        bill_digest: params[2] === null ? null : str(params[2]),
+        lines_digest: params[3] === null ? null : str(params[3]),
+        bill_grand_total: params[4] === null ? null : Number(params[4]),
+        table_name: params[5] === null ? null : str(params[5]),
+      });
+    }
+    return { rows: [] };
+  }
+  // CopyBillPrintPaper: the claim's record onto the publish's job — this
+  // tenant, both bill jobs, the SAME bill_id, or nothing.
+  if (s.startsWith("update \"printjobs\" t set bill_digest = f.bill_digest, lines_digest = f.lines_digest, bill_grand_total = f.bill_grand_total, table_name = f.table_name from \"printjobs\" f")) {
+    if (!s.includes("f.bill_id = t.bill_id") || !s.includes("t.kind = $4") || !s.includes("f.kind = $4")) {
+      throw new Error("next_party_fixtures: the paper copy must be bounded by kind and by the same bill_id");
+    }
+    const kind = str(params[3]);
+    const from = store.printJobs.find((j) => j.id === str(params[1]) && j.kind === kind);
+    const to = store.printJobs.find((j) => j.id === str(params[2]) && j.kind === kind);
+    if (!from || !to || from.bill_id !== to.bill_id) {return { rows: [] };}
+    Object.assign(to, {
+      bill_digest: from.bill_digest ?? null, lines_digest: from.lines_digest ?? null,
+      bill_grand_total: from.bill_grand_total ?? null, table_name: from.table_name ?? null,
+    });
+    return { rows: [{ id: to.id }] };
+  }
+  // MoveTableParty's re-key of the moving party's `<name>-<epoch>` prints.
+  if (s.startsWith("select (select min(o.created_at) from \"orders\" o")) {
+    const tableId = str(params[2]);
+    const owing = store.orders.filter((o) => o.table_id === tableId && inOutlet(o, params, 1) && isOwing(o.status)).map((o) => o.created_at).sort();
+    const bill = openBillOf(tableId, (b) => b.status !== 3 && inOutlet(b, params, 1));
+    return { rows: [{ first_order_at: owing[0] ? new Date(owing[0]) : null, bill_created_at: bill ? new Date(bill.created_at) : null }] };
+  }
+  // ...and, before it, the retirement of the destination's previous party's prints.
+  if (s.startsWith("update \"printjobs\" set bill_id = $4 || bill_id where")) {
+    const prefix = str(params[2]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.outlet_id !== str(params[1]) || j.kind !== str(params[4]) || !j.bill_id.startsWith(prefix)) {continue;}
+      const tail = j.bill_id.slice(prefix.length);
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(tail) || at(j.created_at) < start) {continue;}
+      j.bill_id = `${str(params[3])}${j.bill_id}`;
+      out.push({ id: j.id ?? j.bill_id });
+    }
+    return { rows: out };
+  }
+  if (s.startsWith("update \"printjobs\" set bill_id = $4 || substr(bill_id, length($3) + 1)")) {
+    const from = str(params[2]);
+    const to = str(params[3]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.outlet_id !== str(params[1]) || j.kind !== str(params[4]) || !j.bill_id.startsWith(from)) {continue;}
+      const tail = j.bill_id.slice(from.length);
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(tail) || at(j.created_at) < start) {continue;}
+      j.bill_id = `${to}${tail}`;
+      out.push({ id: j.id ?? j.bill_id });
+    }
+    return { rows: out };
   }
 
   const nc = await ncDispatch(clientId, s, params);
@@ -933,6 +1032,7 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   if (s.includes('from "tables"') && s.includes("order by id") && s.includes("coalesce(is_virtual, false) as is_virtual")) {
     const a = str(params[2]).trim().toLowerCase();
     const b = str(params[3]).trim().toLowerCase();
+    const withParent = s.includes("parent_table_id");
     return {
       rows: store.tables
         .filter((t) => inOutlet(t, params, 1) && !t.is_deleted && [a, b].includes(t.table_name.trim().toLowerCase()))
@@ -941,6 +1041,7 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
           id: t.id, table_name: t.table_name, capacity: t.capacity, max_capacity: t.max_capacity,
           is_occupied: t.is_occupied, num_covers: t.num_covers, linked_order_id: t.linked_order_id,
           order_otp: t.order_otp, is_virtual: t.is_virtual,
+          ...(withParent ? { parent_table_id: t.parent_table_id } : {}),
         })),
     };
   }

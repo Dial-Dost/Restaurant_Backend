@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitKotDocketSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitKotDocketSchema, InitPrintJobPaperSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -675,6 +675,16 @@ async function bootstrap(): Promise<void> {
 	// leave a waiter's floor with no next-party seat, exactly as before 2.0.1.
 	if (await InitTableNextPartySchema()) {
 		logger.info("✅ Next-party tables ready (migration 053)");
+	}
+
+	// "PrintJobs".bill_digest / lines_digest / bill_grand_total / table_name
+	// (migration 055, client items 1 and 2), ONCE, here, outside any transaction,
+	// and only the columns that are missing, under a 2s lock timeout — every
+	// docket and ack writes "PrintJobs". False means they are not there and this
+	// role cannot add them: no print records what it said, every paper reads
+	// "unknown", and a waiter's second print stays a senior's, exactly as 2.0.1.
+	if (await InitPrintJobPaperSchema()) {
+		logger.info("✅ Printed-bill fingerprints ready (migration 055)");
 	}
 
 	// "Restaurant".kot_print_style / kot_text_size (migration 050), ONCE, here,
