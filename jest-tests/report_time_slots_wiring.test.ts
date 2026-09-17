@@ -211,8 +211,10 @@ describe("the HTTP surface passes it on", () => {
     expect(fn).toContain("time_to: req.query.time_to,");
   });
 
-  test("the CSV name carries the slot suffix", () => {
-    expect(functionChunks(ROUTES_SRC).get("misFilename")).toContain("${timeSlotFileSuffix(meta.time_slot)}.csv");
+  test("the CSV name carries the slot suffix (and, client item 9, the trading-day one after it)", () => {
+    const fn = functionChunks(ROUTES_SRC).get("misFilename") ?? "";
+    expect(fn).toContain("${timeSlotFileSuffix(meta.time_slot)}${close}.csv");
+    expect(fn).toContain("const close = meta.window.day_close ? tradingDayFileSuffix(parseDayClose(meta.window.day_close)) : \"\";");
   });
 
   test("the catalogue advertises the slot for every report it lists, and the four cuts", () => {
