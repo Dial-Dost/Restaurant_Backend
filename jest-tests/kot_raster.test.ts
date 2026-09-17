@@ -622,11 +622,18 @@ describe("a note is smaller and slanted; a hold is not", () => {
 
   test("a long note wraps short of the column by its own lean, and reads back whole", () => {
     const long = "no onion no garlic, extra spicy, serve with the mains and keep the raita on the side please";
-    for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
-      const p = plan({ ...docket, items: [{ name: "Roti", quantity: 1, price: 0, note: long }] }, cols, size);
-      const lines = draws(p).filter((d) => d.face.slant > 0);
-      expect(lines.length).toBeGreaterThan(1);
-      for (const d of lines) { expect(d.x1).toBeLessThanOrEqual(p.geometry.qtyLeft); }
+    // An unbroken run of a tall, narrow letter is hard-broken right up to the
+    // column edge, which is where a lean that was not allowed for shows: "f"
+    // ends 2 dots inside the column with the allowance and 3 outside without.
+    for (const note of [long, "f".repeat(300), "l".repeat(300)]) {
+      for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
+        const p = plan({ ...docket, items: [{ name: "Roti", quantity: 1, price: 0, note }] }, cols, size);
+        const lines = draws(p).filter((d) => d.face.slant > 0);
+        expect(lines.length).toBeGreaterThan(1);
+        const edge = p.geometry.nameX + p.geometry.nameMax;
+        const over = lines.filter((d) => d.x1 > edge).map((d) => `${note.slice(0, 8)} ${rollName(cols)} ${size}: ink to ${d.x1}, column ends ${edge}`);
+        expect(over).toEqual([]);
+      }
     }
     const paper = kotPaper(buildReceiptBase64({ ...docket, items: [{ name: "Roti", quantity: 1, price: 0, note: long }] }, 48), 48);
     expect(paper.replace(/\n/g, " ")).toContain(`[Note] ${long}`);
