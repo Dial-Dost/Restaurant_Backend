@@ -480,6 +480,39 @@ describe("Send now's rows: retried through the LEFT JOIN, kicked outside the req
     expect(deliveries()[0].status).toBe("delivered");
   });
 
+  test("Send now goes in ONCE: the same client_request_id is a replay of the same row, which the kick then delivers", async () => {
+    addRecipient("owner@gaia.test");
+    jest.setSystemTime(t(1));
+    const input = {
+      client_request_id: "3d6f0a51-8a7e-4c1b-9d2e-5f4a3b2c1d0e",
+      report_keys: ["sales"], formats: ["xlsx"], outlet_scope: "outlet" as const,
+      period_from: "2026-08-10", period_to: "2026-08-10", day_close: null,
+      window_start_at: "2026-08-09T18:30:00.000Z", window_end_at: "2026-08-10T18:30:00.000Z",
+      timezone: "Asia/Kolkata", recipients: ["owner@gaia.test"], requested_by: null,
+    };
+    const ctx = { res_id: RES_ID, outlet_id: OUTLET_ID, employeeId: "e", role: "admin" };
+    const first = await db.withTenant(ctx, () => db.InsertAdhocReportDelivery(RES_ID, input));
+    const again = await db.withTenant(ctx, () => db.InsertAdhocReportDelivery(RES_ID, input));
+    expect(first.replayed).toBe(false);
+    expect(again).toEqual({ id: first.id, replayed: true });
+    expect(deliveries()).toHaveLength(1);
+    expect(deliveries()[0]).toMatchObject({ kind: "adhoc", schedule_id: null, occurrence_key: `adhoc:${input.client_request_id}`, status: "claimed" });
+
+    await mod.kickReportDelivery(RES_ID, first.id);
+    expect(deliveries()[0].status).toBe("delivered");
+    expect(mailCalls().map((m) => m.to)).toEqual(["owner@gaia.test"]);
+  });
+
+  test("a kick on a process with no transport takes no attempt and sends nothing", async () => {
+    adhoc({ status: "claimed", attempts: 0, next_attempt_at: t(0) });
+    mailOff();
+    jest.setSystemTime(t(1));
+    await mod.kickReportDelivery(RES_ID, deliveries()[0].id);
+    expect(deliveries()[0]).toMatchObject({ status: "claimed", attempts: 0 });
+    expect(mailCalls()).toHaveLength(0);
+    expect(notifications()).toHaveLength(0);
+  });
+
   test("a test email (no reports) carries no attachment and no figure", async () => {
     adhoc({ report_keys: [], formats: ["csv"], status: "claimed", attempts: 0, next_attempt_at: t(0) });
     jest.setSystemTime(t(1));

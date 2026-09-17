@@ -564,6 +564,14 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
         && d.attempts < maxAttempts && d.next_attempt_at.getTime() <= now().getTime() && d.created_at.getTime() > since)
       .map((d) => ({ id: d.id, outlet_id: d.outlet_id }));
   }
+  // Send now's replay lookup: the row a client_request_id already made.
+  if (/^select id from "ReportDeliveries" where res_id = \$1 and schedule_id is null and occurrence_key = \$2/i.test(q)) {
+    const [resId, key] = params as [string, string];
+    return store.deliveries
+      .filter((d) => d.res_id === resId && d.schedule_id === null && d.occurrence_key === key)
+      .slice(0, 1)
+      .map((d) => ({ id: d.id }));
+  }
 
   // --- "Restaurant" reads ---
   if (/^select id from "Restaurant"$/i.test(q)) { return [{ id: RES_ID }]; }
