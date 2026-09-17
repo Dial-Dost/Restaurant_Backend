@@ -453,6 +453,7 @@ import { serviceClock, tableServiceClock, type ServiceClock } from "./service_cl
 export { serviceClock, tableServiceClock } from "./service_clock.js";
 export type { ServiceClock, ServiceClockInput } from "./service_clock.js";
 import { logger } from "./observability.js";
+import { GLANCE_FIGURE_KEYS, glanceDrill, glanceDrills, type GlanceDrill, type GlanceDrills } from "./glance_drill.js";
 import { isPlausibleEmail, normalizeRecipients } from "./mailer.js";
 // Client item 9: which reports can be emailed, and the runtime half of
 // migrations 056-058. Both pure, so their rules are proved without a pool.
@@ -41841,16 +41842,55 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
 // kind of thing that makes an overview page slow enough that people stop opening
 // it.
 //
-// The channel comes from a lateral over "Orders" rather than from a column,
+// The channel comes from a subquery over "Orders" rather than from a column,
 // because there is no column: order_type lives inside the food JSON blob, and
-// "Bills" has never carried it. EXISTS rather than a join, so a bill with four
-// online orders is still one bill.
+// "Bills" has never carried it.
+//
+// THE BILL'S OWN ORDER, AND ONLY THAT ONE. This read used to ask whether ANY
+// order on the bill's TABLE had ever been online — every order the table had
+// ever had, with no window — so one delivery ticket rung on a table in March
+// would have turned every later dine-in bill on it into online trade. It now
+// reads the order the bill was raised from ("Bills".order_id), which is the
+// rule the Sales Summary's order-type split already states ("counts the bill
+// against the order it was raised from"). So Online (gross) is the Sales
+// Summary's delivery and other channels for the same day, by construction, and
+// a bill whose order row is gone is in neither. The verdict is isOnlineChannel's,
+// in TypeScript, so there is one list of walk-in spellings and not a second copy
+// of it inside a SQL string.
 
 /** One figure and the sentence that says what it counts. */
 export interface HeadlineFigure {
   value: number;
   label: string;
   hint: string;
+  /**
+   * Where tapping it leads (client item 10) — glance_drill.ts. Additive: a 2.0.1
+   * client ignores it, and a newer client falls back to its own copy of the
+   * same table when an older backend leaves it out.
+   */
+  drill?: GlanceDrill;
+}
+
+/**
+ * TODAY'S LADDER, rung by rung — the Sales Summary's totals for today, from the
+ * same composeMisBills over the same bills, summed by the same addToLadder. What
+ * the net and gross sheets print between the two figures, so "net" and "gross"
+ * read as the steps that join them.
+ *
+ * NO COVERS, NO APC, NO ABV. This read nulls the seating (see the query), so a
+ * covers rung here would read 0 on a full restaurant and an APC would divide by
+ * it. Those live on the report the sheet jumps to.
+ */
+export interface HeadlineLadder {
+  bills: number;
+  item_total: number;
+  discount: number;
+  net: number;
+  service_charge: number;
+  tax: number;
+  round_off: number;
+  grand_total: number;
+  refund: number;
 }
 
 export interface OverviewHeadline {
@@ -41897,6 +41937,16 @@ export interface OverviewHeadline {
    * The Sales Summary's `nc_bills` / `nc_value` for today, by construction.
    */
   today_nc: HeadlineSection & { bills: number; value: number };
+  /** Today's rungs. net === today_net.value, grand_total === today_gross.value. */
+  today_ladder: HeadlineLadder;
+  /** How many of today's bills are behind the two Online figures. */
+  today_online_bills: number;
+  /**
+   * Where every other element of the box leads (glance_drill.ts): the header,
+   * the bill count, the three chips, the by-method label and each of its rows,
+   * the split note, the Unallocated warning, NC and the empty-day sentence.
+   */
+  drills: GlanceDrills;
 }
 
 /** A labelled group of rows on the headline card. */
@@ -41906,8 +41956,11 @@ export interface HeadlineSection {
 }
 
 interface HeadlineBillRow extends MisBillRow {
-  /** True when any order on this bill came through an online channel. */
-  is_online: boolean;
+  /**
+   * order_type off the order this bill was raised from, raw; null when the bill
+   * names no order or that order row is gone. isOnlineChannel decides.
+   */
+  headline_channel: string | null;
 }
 
 /**
@@ -41949,13 +42002,10 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
             b.discount_type, b.discount_value, b.coupon_code,
             coalesce(b.refund_amount, 0) as refund_amount,
             null::uuid as session_id, null::int as session_covers,
-            exists (
-              select 1 from "Orders" o
-               where o.res_id = b.res_id and o.outlet_id = b.outlet_id
-                 and o.table_id = b.table_id
-                 and coalesce(o.food->>'order_type', 'dine_in') not in
-                     ('dine_in','dinein','dine-in','takeaway','take_away','pickup')
-            ) as is_online
+            (select (o.food)::jsonb->>'order_type'
+               from "Orders" o
+              where o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
+            ) as headline_channel
        from "Bills" b
       where b.res_id = $1 and (${og} or b.outlet_id = $2)
         and ${misSettledPredicate(null)}
@@ -41966,8 +42016,10 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   const composed = composeMisBills(rows, scPct, tz);
 
   let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0;
-  let todayBills = 0;
+  let todayBills = 0, onlineBills = 0;
   const todaySettled: SettlementBill[] = [];
+  // Today's rungs, on the Sales Summary's own accumulator (see HeadlineLadder).
+  const todayRungs = zeroLadder();
   for (let i = 0; i < composed.length; i += 1) {
     const b = composed[i];
     monthGross = round2(monthGross + b.money.grand_total);
@@ -41975,7 +42027,9 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     todayBills += 1;
     todayNet = round2(todayNet + b.money.net);
     todayGross = round2(todayGross + b.money.grand_total);
-    if (rows[i].is_online === true) {
+    addToLadder(todayRungs, b.money);
+    if (isOnlineChannel(rows[i].headline_channel)) {
+      onlineBills += 1;
       onlineNet = round2(onlineNet + b.money.net);
       onlineGross = round2(onlineGross + b.money.grand_total);
     }
@@ -42019,7 +42073,8 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   const labelOf = byMethod.rows.length > 0
     ? await paymentLabelsFor(context).catch(() => (m: string) => m)
     : (m: string) => m;
-  return {
+  const drillDay = { today, month_from: monthFrom };
+  const headline: OverviewHeadline = {
     today,
     month_from: monthFrom,
     timezone: tz,
@@ -42073,7 +42128,29 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
       bills: todayNcBills,
       value: todayNc.value,
     },
+    today_ladder: {
+      bills: todayRungs.bills,
+      item_total: todayRungs.item_total,
+      discount: todayRungs.discount,
+      net: todayRungs.net,
+      service_charge: todayRungs.service_charge,
+      tax: todayRungs.tax,
+      round_off: todayRungs.round_off,
+      grand_total: todayRungs.grand_total,
+      refund: todayRungs.refund,
+    },
+    today_online_bills: onlineBills,
+    // Filled in below, off the rows actually shipped.
+    drills: glanceDrills(drillDay, []),
   };
+  // WHERE EACH ELEMENT LEADS (client item 10). One row drill per mode the box
+  // actually shows, keyed by the stored id that row carries, and each figure
+  // carries its own so a client never maps a key it did not expect.
+  headline.drills = glanceDrills(drillDay, headline.today_by_method.map((r) => r.method));
+  for (const key of GLANCE_FIGURE_KEYS) {
+    headline[key] = { ...headline[key], drill: glanceDrill(key, drillDay) };
+  }
+  return headline;
 }
 
 // --- Drill-down --------------------------------------------------------------

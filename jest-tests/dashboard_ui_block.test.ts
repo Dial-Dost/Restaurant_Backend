@@ -339,6 +339,26 @@ describe("the headline figures define themselves", () => {
     expect((body.match(/await runQuery</g) ?? []).length).toBe(1);
   });
 
+  test("online reads the bill's OWN order, never every order its table ever had", () => {
+    const body = fn();
+    // The subquery is bound to the order the bill was raised from — the rule
+    // the Sales Summary's order-type split states — and to nothing wider.
+    expect(body).toMatch(/where o\.id = b\.order_id and o\.res_id = b\.res_id and o\.outlet_id = b\.outlet_id\s*\) as headline_channel/);
+    expect(body).not.toMatch(/o\.table_id = b\.table_id/);
+    // One list of walk-in spellings: the verdict is isOnlineChannel's.
+    expect(body).toMatch(/if \(isOnlineChannel\(rows\[i\]\.headline_channel\)\) \{/);
+    expect(body).not.toMatch(/'dine_in','dinein'/);
+  });
+
+  test("every element of the box ships where it leads (client item 10)", () => {
+    const body = fn();
+    expect(body).toMatch(/headline\.drills = glanceDrills\(drillDay, headline\.today_by_method\.map\(\(r\) => r\.method\)\)/);
+    expect(body).toMatch(/for \(const key of GLANCE_FIGURE_KEYS\) \{\s*headline\[key\] = \{ \.\.\.headline\[key\], drill: glanceDrill\(key, drillDay\) \};/);
+    // The ladder is the Sales Summary's own accumulator, over the same bills.
+    expect(body).toMatch(/addToLadder\(todayRungs, b\.money\)/);
+    expect(body).toContain("today_online_bills: onlineBills,");
+  });
+
   test("today_bills is carried, so an empty day is distinguishable from a zero one", () => {
     expect(fn()).toMatch(/today_bills/);
   });

@@ -1202,18 +1202,37 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       return [...acc.entries()].map(([channel, v]) => ({ channel, bills: String(v.bills), total: v.total }));
     }
     // GetOverviewHeadline — the ladder read without the seating lateral, plus
-    // the online flag. The reader's EXISTS looks for any online order on the
-    // bill's TABLE; the fixture has no table ids, so it reads the bill's own
-    // order, which is the same answer for every bill these suites build.
-    if (/as is_online/i.test(q)) {
-      const walkIn = new Set(["dine_in", "dinein", "dine-in", "takeaway", "take_away", "pickup"]);
+    // the raw channel of the order behind each bill.
+    //
+    // MODELLED FROM THE SQL TEXT, both ways, so the rule is tested rather than
+    // assumed. Bound to the bill's own order (`o.id = b.order_id`), it answers
+    // that order's order_type — null when the bill names none or the row is
+    // gone, as the subquery does. Bound to the TABLE instead — the unbounded
+    // read this replaced — it answers the way that read did: any non-walk-in
+    // order ever rung on the bill's table makes the bill online. So a reader
+    // that slid back to the table fails on the numbers, not on a shape check.
+    if (/as headline_channel/i.test(q)) {
+      const walkIn = new Set(["", "dine_in", "dinein", "dine-in", "takeaway", "take_away", "pickup"]);
+      const ownOrder = /o\.id = b\.order_id/i.test(q);
+      const tableWide = /o\.table_id = b\.table_id/i.test(q);
+      if (ownOrder === tableWide) {
+        throw new Error(`mis fixture: the headline channel read must name exactly one binding\n  ${q.slice(0, 260)}`);
+      }
+      const channelOf = (b: FixtureBill): string | null => {
+        if (ownOrder) {return orderOf(b)?.order_type ?? (orderOf(b) ? "dine_in" : null);}
+        const table = (b.table_name ?? "").trim().toLowerCase();
+        const online = d.orders.find((o) => resOf(o) === resOf(b) && outletOf(o) === outletOf(b)
+          && table !== "" && (o.table_name ?? "").trim().toLowerCase() === table
+          && !walkIn.has((o.order_type ?? "dine_in").trim().toLowerCase()));
+        return online ? (online.order_type ?? null) : "dine_in";
+      };
       return [...rows]
         .sort((a, z) => new Date(a.settled_at).getTime() - new Date(z.settled_at).getTime())
         .map((b) => ({
           ...misBillRow(b, q),
           session_id: null,
           session_covers: null,
-          is_online: !walkIn.has(orderOf(b)?.order_type ?? "dine_in"),
+          headline_channel: channelOf(b),
         }));
     }
     // fetchMisBills — the shared ladder read.
