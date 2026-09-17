@@ -360,7 +360,7 @@ mw08 USE     *                                                      | <inline(re
 0338 POST    /posters                                               | validateAction(PERM_BRANDING)                  | de3ae86d
 0339 PATCH   /posters/:id                                           | validateAction(PERM_BRANDING)                  | 20ef0819
 0340 DELETE  /posters/:id                                           | validateAction(PERM_BRANDING)                  | 59525586
-0341 GET     /reports/mis                                           | validateAction(ACCOUNTING_PERM)                | 3350ed02
+0341 GET     /reports/mis                                           | validateAction(ACCOUNTING_PERM)                | e23d63c4
 0342 GET     /reports/mis/item-wise                                 | validateAction(ACCOUNTING_PERM)                | eb7f0b51
 0343 GET     /reports/mis/item-wise.csv                             | validateAction(ACCOUNTING_PERM)                | 3c69123c
 0344 GET     /reports/mis/discount                                  | validateAction(ACCOUNTING_PERM)                | 2264c896

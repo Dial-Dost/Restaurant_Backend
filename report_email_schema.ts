@@ -338,13 +338,13 @@ END $$`,
   purged_day   date
 )`,
   `INSERT INTO "ReportSweepLease" (id) VALUES (1) ON CONFLICT (id) DO NOTHING`,
+  // 002's default privileges would hand the runtime INSERT and DELETE too. The
+  // one row is made above; a runtime that could delete it would switch the
+  // scheduled sweep off for every restaurant without a trace.
   `DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
     GRANT SELECT, UPDATE ON "ReportSweepLease" TO app_runtime;
-    -- 002's default privileges would hand the runtime INSERT and DELETE too.
-    -- The one row is made here; a runtime that could delete it would switch
-    -- the scheduled sweep off for every restaurant without a trace.
     REVOKE INSERT, DELETE, TRUNCATE ON "ReportSweepLease" FROM app_runtime;
   END IF;
 END $$`,

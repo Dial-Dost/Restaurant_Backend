@@ -552,6 +552,7 @@ boot**, exactly like the wrong database role does.
 | `APP_LATEST_VERSION`, `APP_MIN_VERSION`, `APP_DOWNLOAD_WINDOWS`, `APP_DOWNLOAD_ANDROID`, `APP_DOWNLOAD_IOS`, `APP_UPDATE_NOTES` | the Windows/Android auto-updater manifest at `GET /app/version` | your release process |
 | `SAAS_AUTO_TRIAL`, `SAAS_TRIAL_DAYS`, `SAAS_GRACE_DAYS` | subscription policy | your product decisions |
 | `SUPABASE_IPV4_URL` | IPv4 fallback pool | not needed for IPv4 — the pooler host is dual-stack. Leave unset by default. It has a second, unrelated use as a cold-start safety net: see "What `PG_POOL_MAX=1` costs you" in [2.3](#23-problem-3--database-connections-and-redis). Unset, the fallback pool points at localhost and turns a slow first connect into a 503. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` (or `SMTP_URL`) — or `MAIL_TRANSPORT=resend` with `RESEND_API_KEY` and `MAIL_FROM`; optional `MAIL_FROM_NAME`, `MAIL_REPLY_TO`, `REPORT_EMAIL_*` caps | report email (client item 9): Send now, the test email, email schedules. Off without them — Send now answers 503. The order and the DNS are in [`vps/README.md` → Report email](./vps/README.md#report-email-client-item-9--switching-it-on) | your mail provider |
 | `PY_SERVER_URL` | the Python feedback-question service | **not deployed by this template** — see [section 11](#11-what-is-not-covered-and-what-is-genuinely-uncertain) |
 
 **Set by `template.yaml` — do NOT put these in the secret.** `NODE_ENV`, `PORT`,
@@ -1117,7 +1118,11 @@ the Fargate task duplicates the EventBridge work every 30 minutes. It is safe
 if (process.env.IN_PROCESS_SWEEPS !== "false") { /* setInterval(...) */ }
 ```
 
-**4. Decouple `WarmReportingSchema()` from `REPORT_SCHEDULER`.**
+**4. Decouple `WarmReportingSchema()` from `REPORT_SCHEDULER`.** *Done with
+client item 9:* `WARM_REPORTING_SCHEMA=true|false` now switches it on its own
+(unset keeps following `REPORT_SCHEDULER`), and the step is probe-first — it
+asks the catalogue and adds only missing columns, under a 2s lock timeout. The
+original note, for the record:
 `index.ts:538` gates the DDL warm-up on the same flag that arms the timer. That
 coupling is deliberate and well-reasoned for a single-process deploy, but it means
 an externally-driven report sweep must set `REPORT_SCHEDULER=true` and thereby arm

@@ -104,11 +104,14 @@ export function periodLabel(from: string, to: string): string {
 export function wallClock(iso: string, tz: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) {return iso;}
+  // Numeric parts only, with this module's own month names: ICU's short month
+  // for September changed from "Sep" to "Sept" between versions, and an email
+  // must not say a different thing on a different Node.
   const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz, day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    timeZone: tz, day: "numeric", month: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
   }).formatToParts(d);
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
-  return `${get("day")} ${get("month")} ${get("year")}, ${get("hour")}:${get("minute")}`;
+  return `${String(Number(get("day")))} ${MONTHS[Number(get("month")) - 1] ?? get("month")} ${get("year")}, ${get("hour")}:${get("minute")}`;
 }
 
 /** Money in the Indian grouping the rest of the product prints: ₹1,23,456.00. */

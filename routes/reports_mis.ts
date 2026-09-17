@@ -41,6 +41,10 @@
  *   ?slot=<preset id> | ?time_from=HH:mm&time_to=HH:mm
  *                                    the part of each day (report_window.ts);
  *                                    custom wins, all day when absent
+ *   ?day_close=HH:mm                 TRADING days that close at that minute
+ *                                    instead of calendar days (client item 9 —
+ *                                    what a daily report email reads); refused,
+ *                                    named, alongside a slot
  * Every payload carries `meta` (the window the SERVER used, with any clamp
  * NAMED), `columns` (which drives the client's column picker AND its totals row)
  * and `totals`. Add `.csv` to any of the nine for the same table as a sheet.
@@ -73,7 +77,7 @@ import {
 } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { renderMisCsv } from "../report_render.js";
-import { TIME_BUCKET_MODES, TimeSlotConfigError, timeSlotFileSuffix, timeSlotPresetWire, type TimeSlotPreset } from "../report_window.js";
+import { TIME_BUCKET_MODES, TimeSlotConfigError, parseDayClose, timeSlotFileSuffix, timeSlotPresetWire, tradingDayFileSuffix, type TimeSlotPreset } from "../report_window.js";
 import { ACCOUNTING_PERM, PERM_SETTINGS, callerHasPermission, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
 
 
@@ -101,6 +105,8 @@ function misQuery(req: Request): MisReportQuery {
 		slot: req.query.slot,
 		time_from: req.query.time_from,
 		time_to: req.query.time_to,
+		// The trading day's close, raw like the rest: misContext resolves it.
+		day_close: req.query.day_close,
 	};
 }
 
@@ -111,7 +117,10 @@ function misQuery(req: Request): MisReportQuery {
  */
 function misFilename(meta: MisReportMeta): string {
 	const scope = meta.outlet_scope === "all" ? "all-outlets" : (meta.outlet_name ?? "outlet").replace(/[^A-Za-z0-9._-]+/g, "-");
-	return `${meta.report}_${scope}_${meta.window.from}_to_${meta.window.to}${timeSlotFileSuffix(meta.time_slot)}.csv`;
+	// A trading-day sheet says so in its name, so it never overwrites the
+	// calendar one (the suffix an emailed CSV carries, report_bundle.ts).
+	const close = meta.window.day_close ? tradingDayFileSuffix(parseDayClose(meta.window.day_close)) : "";
+	return `${meta.report}_${scope}_${meta.window.from}_to_${meta.window.to}${timeSlotFileSuffix(meta.time_slot)}${close}.csv`;
 }
 
 /** The catalogue's report keys, in tab order. Every one of them honours the time slot. */
@@ -207,6 +216,9 @@ app.get("/reports/mis", validateAction(ACCOUNTING_PERM), (_req: Request, res: Re
 			// The part of each day. EVERY report takes it, each on its own clock
 			// (see `basis`); the presets live at presets_path.
 			time_slot: { params: ["slot", "time_from", "time_to"], presets_path: "/reports/mis/time-slots", applies_to: [...MIS_REPORT_KEYS] },
+			// A TRADING DAY: the window's days close at this minute instead of at
+			// midnight. Every report takes it; never together with a slot.
+			trading_day: { param: "day_close", applies_to: [...MIS_REPORT_KEYS], excludes: ["slot", "time_from", "time_to"] },
 			csv_suffix: ".csv",
 			// Which clock each report buckets on, so a client can label the toolbar
 			// honestly instead of implying that every tab answers the same question
