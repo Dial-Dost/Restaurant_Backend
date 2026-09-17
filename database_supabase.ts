@@ -38837,10 +38837,21 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
 // kind of thing that makes an overview page slow enough that people stop opening
 // it.
 //
-// The channel comes from a lateral over "Orders" rather than from a column,
+// The channel comes from a subquery over "Orders" rather than from a column,
 // because there is no column: order_type lives inside the food JSON blob, and
-// "Bills" has never carried it. EXISTS rather than a join, so a bill with four
-// online orders is still one bill.
+// "Bills" has never carried it.
+//
+// THE BILL'S OWN ORDER, AND ONLY THAT ONE. This read used to ask whether ANY
+// order on the bill's TABLE had ever been online — every order the table had
+// ever had, with no window — so one delivery ticket rung on a table in March
+// would have turned every later dine-in bill on it into online trade. It now
+// reads the order the bill was raised from ("Bills".order_id), which is the
+// rule the Sales Summary's order-type split already states ("counts the bill
+// against the order it was raised from"). So Online (gross) is the Sales
+// Summary's delivery and other channels for the same day, by construction, and
+// a bill whose order row is gone is in neither. The verdict is isOnlineChannel's,
+// in TypeScript, so there is one list of walk-in spellings and not a second copy
+// of it inside a SQL string.
 
 /** One figure and the sentence that says what it counts. */
 export interface HeadlineFigure {
@@ -38902,8 +38913,11 @@ export interface HeadlineSection {
 }
 
 interface HeadlineBillRow extends MisBillRow {
-  /** True when any order on this bill came through an online channel. */
-  is_online: boolean;
+  /**
+   * order_type off the order this bill was raised from, raw; null when the bill
+   * names no order or that order row is gone. isOnlineChannel decides.
+   */
+  headline_channel: string | null;
 }
 
 /**
@@ -38945,13 +38959,10 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
             b.discount_type, b.discount_value, b.coupon_code,
             coalesce(b.refund_amount, 0) as refund_amount,
             null::uuid as session_id, null::int as session_covers,
-            exists (
-              select 1 from "Orders" o
-               where o.res_id = b.res_id and o.outlet_id = b.outlet_id
-                 and o.table_id = b.table_id
-                 and coalesce(o.food->>'order_type', 'dine_in') not in
-                     ('dine_in','dinein','dine-in','takeaway','take_away','pickup')
-            ) as is_online
+            (select (o.food)::jsonb->>'order_type'
+               from "Orders" o
+              where o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
+            ) as headline_channel
        from "Bills" b
       where b.res_id = $1 and (${og} or b.outlet_id = $2)
         and ${misSettledPredicate(null)}
@@ -38971,7 +38982,7 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     todayBills += 1;
     todayNet = round2(todayNet + b.money.net);
     todayGross = round2(todayGross + b.money.grand_total);
-    if (rows[i].is_online === true) {
+    if (isOnlineChannel(rows[i].headline_channel)) {
       onlineNet = round2(onlineNet + b.money.net);
       onlineGross = round2(onlineGross + b.money.grand_total);
     }
