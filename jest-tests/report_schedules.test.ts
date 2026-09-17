@@ -59,6 +59,10 @@ beforeAll(async () => {
   // value is never dialled.
   process.env.SUPABASE_DIRECT_URL =
     process.env.SUPABASE_DIRECT_URL || "postgres://fixture:fixture@localhost:5432/fixture";
+  // The sweep runs only where it is armed AND permitted: production, or a
+  // database the operator has said is local. This suite is the latter.
+  process.env.REPORT_SCHEDULER = "true";
+  process.env.REPORT_SCHEDULER_ALLOW_NON_PROD = "true";
   mod = await import("../report_schedules");
 });
 
@@ -469,6 +473,81 @@ describe("\"Run now\" is deduplicated by the same partial index", () => {
     expect(await mod.queueReportScheduleRun(RES_ID, schedule, IST, fire)).not.toBeNull();
     expect(deliveries().map((d) => d.occurrence_key))
       .toEqual(["2026-08-11", "manual:2026-08-11T08:05"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("\"Run now\" reports a CLOSED period — never a trading day still in progress", () => {
+  // A trading day ends AT its close. Run now once took the business date from
+  // today's calendar key alone, so a 23:30 close run at 15:00 queued fifteen and
+  // a half hours of takings under "Daily reports — Thu 17 Sep".
+  const ist = (wall: string): Date => new Date(`${wall}+05:30`);
+  const tradingSchedule = (hour: number, minute: number) => addSchedule({
+    created_at: at("2026-08-10T04:00:00Z"),
+    hour_local: hour, minute_local: minute, window_mode: "trading_day",
+    report_key: "bundle", report_keys: ["sales_summary"], formats: ["xlsx"],
+  });
+
+  test.each([
+    // [close, now (IST wall clock), the business date it must report, that window's end]
+    ["23:30 run at 15:00 — the day closing tonight is still open", 23, 30, "2026-09-17T15:00:00", "2026-09-16", "2026-09-16T23:30:00"],
+    ["23:30 run at 23:45 — tonight's close has passed", 23, 30, "2026-09-17T23:45:00", "2026-09-17", "2026-09-17T23:30:00"],
+    ["23:30 run exactly at the close", 23, 30, "2026-09-17T23:30:00", "2026-09-17", "2026-09-17T23:30:00"],
+    ["01:00 run at 00:30 — half an hour still to go", 1, 0, "2026-09-17T00:30:00", "2026-09-15", "2026-09-16T01:00:00"],
+    ["01:00 run at 01:05", 1, 0, "2026-09-17T01:05:00", "2026-09-16", "2026-09-17T01:00:00"],
+  ])("%s", async (_label, hour, minute, nowWall, businessDate, endWall) => {
+    const now = ist(nowWall);
+    jest.setSystemTime(now);
+    const schedule = tradingSchedule(hour, minute);
+    expect(await mod.queueReportScheduleRun(RES_ID, schedule, IST, now)).not.toBeNull();
+    const d = deliveries()[0];
+    expect({ from: d.period_from, to: d.period_to }).toEqual({ from: businessDate, to: businessDate });
+    expect(new Date(String(d.window_end_at)).getTime()).toBe(ist(endWall).getTime());
+    expect(new Date(String(d.window_end_at)).getTime()).toBeLessThanOrEqual(now.getTime());
+    expect(new Date(String(d.window_start_at)).getTime()).toBe(ist(endWall).getTime() - 24 * 60 * MIN);
+  });
+
+  test("for EVERY close and every quarter hour of two days: the window has ended, and it is the latest one that has", async () => {
+    const db = await import("../database_supabase");
+    for (let close = 0; close < 1440; close += 30) {
+      const shape = { frequency: "daily", hour_local: Math.floor(close / 60), minute_local: close % 60, window_mode: "trading_day" };
+      for (let q = 0; q < 2 * 96; q += 1) {
+        const now = new Date(ist("2026-09-17T00:00:00").getTime() + q * 15 * MIN);
+        const period = mod.occurrencePeriod(shape, mod.lastClosedFireDay(shape, IST, now));
+        const w = db.reportEmailWindowIn(IST, period, 62, now);
+        const end = Date.parse(w.window_end_at);
+        expect({ close, q, ended: end <= now.getTime() }).toEqual({ close, q, ended: true });
+        // The NEXT business date has not closed — so this is the most recent one.
+        // (Read with a later `now`: the window reader pulls a future date back to today.)
+        const later = new Date(now.getTime() + 3 * 24 * 60 * MIN);
+        const next = db.reportEmailWindowIn(IST, { from: db.addDaysToKey(w.from, 1), to: db.addDaysToKey(w.to, 1), day_close: period.day_close }, 62, later);
+        expect(next.from).toBe(db.addDaysToKey(w.from, 1));
+        expect({ close, q, nextOpen: Date.parse(next.window_end_at) > now.getTime() }).toEqual({ close, q, nextOpen: true });
+      }
+    }
+  });
+
+  test("a calendar schedule still reports yesterday, whatever the time", () => {
+    const shape = { frequency: "daily", hour_local: 23, minute_local: 30, window_mode: "calendar" };
+    expect(mod.lastClosedFireDay(shape, IST, ist("2026-09-17T15:00:00"))).toBe("2026-09-17");
+    expect(mod.occurrencePeriod(shape, "2026-09-17")).toEqual({ from: "2026-09-16", to: "2026-09-16", day_close: null });
+  });
+
+  test("a business date asked for before it closes is REFUSED, with the day and the close named — nothing queued", async () => {
+    const now = ist("2026-09-17T15:00:00");
+    jest.setSystemTime(now);
+    const trading = tradingSchedule(23, 30);
+    const err = await mod.queueReportScheduleRun(RES_ID, trading, IST, now, { businessDate: "2026-09-17" }).then(() => null, (e: unknown) => e);
+    expect(mod.isReportPeriodOpenError(err)).toBe(true);
+    expect((err as Error).message).toBe("The trading day Thu 17 Sep 2026 has not closed yet — it closes at 23:30. Run it after that.");
+    // A calendar day has not ended until its midnight.
+    const calendar = addSchedule({ created_at: at("2026-08-10T04:00:00Z") });
+    const cal = await mod.queueReportScheduleRun(RES_ID, calendar, IST, now, { businessDate: "2026-09-17" }).then(() => null, (e: unknown) => e);
+    expect((cal as Error).message).toBe("Thu 17 Sep 2026 has not ended yet. Run it once the day is over.");
+    expect(deliveries()).toHaveLength(0);
+    // …while a closed one is queued as asked.
+    expect(await mod.queueReportScheduleRun(RES_ID, trading, IST, now, { businessDate: "2026-09-16" })).not.toBeNull();
+    expect(deliveries()[0].period_from).toBe("2026-09-16");
   });
 });
 

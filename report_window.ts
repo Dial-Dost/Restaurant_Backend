@@ -62,7 +62,12 @@ export type WindowClamp =
   /** `time_from` / `time_to` was not a readable HH:mm; the report is ALL DAY. */
   | "time_unparseable"
   /** The custom times start and end at the same minute; the report is ALL DAY. */
-  | "time_empty";
+  | "time_empty"
+  /** `day_close` was not a readable HH:mm; the report is on CALENDAR days. */
+  | "day_close_unparseable"
+  /** `day_close` came with a time slot. The two are not combined (v1): the
+   *  slot is kept and the days are calendar days. */
+  | "day_close_with_slot";
 
 export interface ReportWindowQuery {
   /** YYYY-MM-DD (or any ISO instant) — the FIRST day of the window, inclusive. */
@@ -558,7 +563,12 @@ export function slotDayBounds(
  * that stays inside one day, the calendar day is the answer — which is why the
  * day series of every all-day report is unchanged.
  */
-export function serviceDayKey(calendarDay: string, minute: number, slot: TimeSlot | null): string {
+export function serviceDayKey(calendarDay: string, minute: number, slot: TimeSlot | null, dayShiftMin = 0): string {
+  // A TRADING DAY moves the boundary of EVERY day, not just a slot's tail — see
+  // the trading-day section below. The two are never combined (misContext
+  // refuses the pair), so a shift is answered first and alone.
+  if (dayShiftMin > 0 && minute < dayShiftMin) {return addDaysToKey(calendarDay, -1);}
+  if (dayShiftMin < 0 && minute >= 1440 + dayShiftMin) {return addDaysToKey(calendarDay, 1);}
   if (slot && slot.crosses_midnight && minute < slot.end) {return addDaysToKey(calendarDay, -1);}
   return calendarDay;
 }
@@ -837,4 +847,111 @@ export function timeSlotNote(slot: TimeSlot, subject: string): string {
   const name = slot.source === "preset" ? `${slot.label} (${start}-${end})` : `${start}-${end}`;
   return `Time slot ${name}: only ${subject} from ${start} up to ${end} restaurant time on each day of the range are counted, and any figure here on another clock is cut by the same hours on that clock.`
     + (slot.crosses_midnight ? " This slot crosses midnight: its hours after midnight belong to the day it started on." : "");
+}
+
+// ============================================================================
+// TRADING DAYS — a day that closes at the owner's hour, not at midnight
+// ============================================================================
+//
+// "Send the reports at the end of each day, at a time I choose." A restaurant
+// whose service runs past midnight does not end its day at 00:00: in the 60
+// days before this was written, 81% of one tenant's money and 20% of another's
+// was settled between 00:00 and 04:00. A calendar-day email sent at 02:00 would
+// hand that night's after-midnight bills to TOMORROW's report and carry the
+// previous night's tail into today's — and disagree with the drawer counted at
+// close.
+//
+// THE CONTRACT, in the order a report applies it:
+//
+//  1. A TRADING DAY IS 24 HOURS ENDING AT THE CLOSE. The owner picks the minute
+//     their day closes (the send time of a daily email). A close at or before
+//     12:00 belongs to the NEXT calendar morning — close 02:00 means business
+//     date K runs [K 02:00, K+1 02:00). A close after 12:00 belongs to the same
+//     evening — close 23:30 means K runs [K-1 23:30, K 23:30). The shift is
+//     `close <= 12:00 ? close : close - 24:00` minutes, and business date K
+//     covers [K 00:00 + shift, K+1 00:00 + shift).
+//  2. HALF-OPEN, like every other window here: a bill settled at exactly 02:00
+//     under a 02:00 close belongs to the day that STARTS then.
+//  3. CONSECUTIVE TRADING DAYS TILE. Day K ends at the instant day K+1 starts,
+//     so seven daily emails add up to the seven-day read of the same close, and
+//     none of them holds a bill twice.
+//  4. A CLOSE OF 00:00 IS THE CALENDAR DAY. The shift is 0 and every figure,
+//     note and filename is exactly what it was.
+//  5. NOT COMBINED WITH A TIME SLOT (v1). A slot says which hours of each day
+//     count; a trading day moves where each day starts. Asking both is refused
+//     with the clamp NAMED (`day_close_with_slot`) and the slot is kept.
+//  6. BUCKETED THROUGH serviceDayKey, like a crossing slot: a bill at 01:30
+//     under a 02:00 close is the previous business day's. The printed bill
+//     keeps its calendar date — the notes say so.
+//
+// GST and P&L are statutory, month-based documents and stay on calendar days;
+// the schedule layer refuses to put them on a trading day.
+
+/** The largest shift either way: a close at 12:00 is +720, at 12:01 it is -719. */
+export const TRADING_DAY_MAX_SHIFT = 720;
+
+/**
+ * The close a `?day_close=` names, in minutes past midnight (0..1439), or null
+ * when it is not a readable HH:mm. "24:00" is midnight, i.e. 0.
+ */
+export function parseDayClose(value: unknown): number | null {
+  const m = parseClockMinutes(value, { allow24: true });
+  if (m === null) {return null;}
+  return m === 1440 ? 0 : m;
+}
+
+/** The day shift a close implies: see rule 1. */
+export function dayShiftForClose(closeMin: number): number {
+  const c = Math.max(0, Math.min(1439, Math.round(closeMin)));
+  return c <= TRADING_DAY_MAX_SHIFT ? c : c - 1440;
+}
+
+/** The close a shift came from — the inverse of dayShiftForClose. */
+export function dayCloseOfShift(shift: number): number {
+  const s = Math.round(shift);
+  return s >= 0 ? s % 1440 : 1440 + s;
+}
+
+/** A wall-clock (day, minute) with the minute kept inside 0..1439. */
+function shiftedWall(dayKey: string, shift: number): { key: string; min: number } {
+  return shift >= 0 ? { key: dayKey, min: shift } : { key: addDaysToKey(dayKey, -1), min: 1440 + shift };
+}
+
+/**
+ * The wall-clock bounds of business dates `from`..`to` (inclusive) under a
+ * shift: [from 00:00 + shift, to+1 00:00 + shift). A zero shift is exactly the
+ * calendar window's [from 00:00, to+1 00:00).
+ */
+export function tradingDayBounds(
+  w: { from: string; to: string },
+  shift: number,
+): { fromKey: string; fromMin: number; toKey: string; toMin: number } {
+  const lo = shiftedWall(w.from, shift);
+  const hi = shiftedWall(addDaysToKey(w.to, 1), shift);
+  return { fromKey: lo.key, fromMin: lo.min, toKey: hi.key, toMin: hi.min };
+}
+
+/**
+ * The business date a daily run SENT on `sendDayKey` at the close reports:
+ * the day before for a morning close (02:00 on the 18th reports the 17th),
+ * the same day for an evening one (23:30 on the 17th reports the 17th).
+ */
+export function tradingBusinessDate(sendDayKey: string, closeMin: number): string {
+  return dayShiftForClose(closeMin) >= 0 ? addDaysToKey(sendDayKey, -1) : sendDayKey;
+}
+
+/** The sentence every report adds to its notes on a trading day. */
+export function tradingDayNote(closeMin: number): string {
+  const shift = dayShiftForClose(closeMin);
+  const close = formatClock(dayCloseOfShift(shift));
+  if (shift === 0) {return "";}
+  return shift > 0
+    ? `Trading day closing at ${close}: each date runs for 24 hours up to ${close} restaurant time on the next calendar day, so bills settled after midnight and before ${close} count on the previous trading day. The printed bill keeps its calendar date.`
+    : `Trading day closing at ${close}: each date runs for 24 hours up to ${close} restaurant time on that date, so bills settled from ${close} onwards count on the next trading day. The printed bill keeps its calendar date.`;
+}
+
+/** `_close-0200` for a trading day, "" for calendar days — so the two files never overwrite each other. */
+export function tradingDayFileSuffix(closeMin: number | null | undefined): string {
+  if (closeMin === null || closeMin === undefined || dayShiftForClose(closeMin) === 0) {return "";}
+  return `_close-${formatClock(dayCloseOfShift(dayShiftForClose(closeMin))).replace(":", "")}`;
 }

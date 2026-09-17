@@ -23,6 +23,21 @@ export const logger = pino({
       "*.password",
       "*.token",
       "*.authorization",
+      // Report email (client item 9): recipient addresses never reach a log line.
+      // The worker logs a short address tag instead; these catch an error object
+      // or a transport result that carries the list anyway.
+      "to",
+      "recipients",
+      "accepted",
+      "rejected",
+      "envelope",
+      "*.to",
+      "*.recipients",
+      "*.accepted",
+      "*.rejected",
+      "*.envelope",
+      "RESEND_API_KEY",
+      "SMTP_PASS",
     ],
     censor: "[redacted]",
   },

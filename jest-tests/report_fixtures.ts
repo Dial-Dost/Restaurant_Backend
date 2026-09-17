@@ -35,6 +35,13 @@
 // Dispatch matches on a marker in the SQL and THROWS on anything unrecognised, so
 // a code path that starts issuing a new query fails loudly here rather than
 // silently receiving zero rows.
+//
+// SINCE ITEM 9 (report email, migrations 056-058) it also models the address
+// book, the per-address outcome columns, the attachment store and the sweep's
+// single-row lease — each guard statement's predicate re-implemented AND its
+// text checked, for the reason `requireShape` gives. `schema` says whether the
+// runtime's probe finds 056-058; the default is present, which is the path
+// production takes once they are applied.
 
 export const RES_ID = "33333333-3333-4333-8333-333333333333";
 /** The outlet every schedule below belongs to. Deliberately NOT the tenant's
@@ -59,6 +66,13 @@ export interface ScheduleRow {
   day_of_month: number | null;
   channel: string;
   format: string;
+  /** Migration 044. */
+  recipients: string[];
+  /** Migration 057. */
+  report_keys: string[];
+  formats: string[];
+  window_mode: string;
+  outlet_scope: string;
   enabled: boolean;
   archived_at: Date | null;
   last_occurrence_key: string | null;
@@ -72,7 +86,7 @@ export interface DeliveryRow {
   id: string;
   res_id: string;
   outlet_id: string;
-  schedule_id: string;
+  schedule_id: string | null;
   occurrence_key: string | null;
   fire_at: Date;
   period_from: string;
@@ -91,6 +105,57 @@ export interface DeliveryRow {
   error: string | null;
   delivered_at: Date | null;
   created_at: Date;
+  /** Migration 044 / 058. */
+  delivered_to: string[] | null;
+  kind: string;
+  report_keys: string[];
+  formats: string[];
+  outlet_scope: string;
+  day_close: string | null;
+  window_start_at: string | null;
+  window_end_at: string | null;
+  recipients: string[] | null;
+  rejected_to: string[] | null;
+  skipped_to: string[] | null;
+  provider: string | null;
+  requested_by: string | null;
+  sending_at: Date | null;
+  maybe_duplicate: boolean;
+  /** What the body is built from besides the files (058, parsed jsonb). */
+  message_meta: Record<string, unknown> | null;
+}
+
+export interface RecipientRow {
+  id: string;
+  res_id: string;
+  email: string;
+  status: "active" | "suppressed";
+  removed_at: Date | null;
+}
+
+export interface FileRow {
+  id: string;
+  res_id: string;
+  delivery_id: string;
+  report_key: string;
+  format: string;
+  filename: string;
+  mime: string;
+  bytes: number;
+  rows: number;
+  truncated: boolean;
+  body: Buffer | null;
+  created_at: Date;
+}
+
+export interface LeaseRow {
+  holder: string | null;
+  until: Date;
+  heartbeat_at: Date | null;
+  mail_ready: boolean;
+  sent_day: string | null;
+  sent_count: number;
+  purged_day: string | null;
 }
 
 export interface NotificationRow {
@@ -111,6 +176,13 @@ export interface BillsRead {
 interface Store {
   timezone: string;
   account_status: string;
+  /** What the runtime's probe finds for migrations 056, 057 and 058. */
+  schema: { m056: boolean; m057: boolean; m058: boolean };
+  recipients: RecipientRow[];
+  files: FileRow[];
+  lease: LeaseRow;
+  /** Statements issued, in order, for the ordering assertions (the send path). */
+  journalSql: string[];
   /** false models a "Restaurant" read that returns ZERO ROWS — what a pooled
    *  client carrying another tenant's app.res_id GUC does to the fail-open RLS
    *  policy (migrations/003_enable_rls.sql:53-61). */
@@ -136,6 +208,11 @@ function freshStore(): Store {
   return {
     timezone: "Asia/Kolkata",
     account_status: "active",
+    schema: { m056: true, m057: true, m058: true },
+    recipients: [],
+    files: [],
+    lease: { holder: null, until: new Date(0), heartbeat_at: null, mail_ready: false, sent_day: null, sent_count: 0, purged_day: null },
+    journalSql: [],
     restaurantRowReadable: true,
     schedules: [],
     deliveries: [],
@@ -149,7 +226,7 @@ function freshStore(): Store {
 }
 
 export function resetStore(
-  over: Partial<Pick<Store, "timezone" | "account_status" | "restaurantRowReadable">> = {},
+  over: Partial<Pick<Store, "timezone" | "account_status" | "restaurantRowReadable" | "schema">> = {},
 ): void {
   store = { ...freshStore(), ...over };
 }
@@ -168,6 +245,11 @@ export function addSchedule(over: Partial<ScheduleRow> = {}): ScheduleRow {
     day_of_month: null,
     channel: "inbox",
     format: "csv",
+    recipients: [],
+    report_keys: [],
+    formats: ["csv"],
+    window_mode: "calendar",
+    outlet_scope: "outlet",
     enabled: true,
     archived_at: null,
     last_occurrence_key: null,
@@ -183,7 +265,7 @@ export function addSchedule(over: Partial<ScheduleRow> = {}): ScheduleRow {
 
 /** Seed a delivery row directly — for the failure paths, which start from a row
  *  that already carries attempts (the reaper, attempt exhaustion, auto-disable). */
-export function addDelivery(over: Partial<DeliveryRow> & { schedule_id: string }): DeliveryRow {
+export function addDelivery(over: Partial<DeliveryRow> & { schedule_id: string | null }): DeliveryRow {
   const row: DeliveryRow = {
     id: `del-${String(store.nextId++)}`,
     res_id: RES_ID,
@@ -206,11 +288,47 @@ export function addDelivery(over: Partial<DeliveryRow> & { schedule_id: string }
     error: null,
     delivered_at: null,
     created_at: new Date("2026-08-11T02:30:00Z"),
+    delivered_to: null,
+    kind: "scheduled",
+    report_keys: [],
+    formats: ["csv"],
+    outlet_scope: "outlet",
+    day_close: null,
+    window_start_at: null,
+    window_end_at: null,
+    recipients: null,
+    rejected_to: null,
+    skipped_to: null,
+    provider: null,
+    requested_by: null,
+    sending_at: null,
+    maybe_duplicate: false,
+    message_meta: null,
     ...over,
   };
   store.deliveries.push(row);
   return row;
 }
+
+/** An address in the restaurant's book (migration 056). */
+export function addRecipient(email: string, over: Partial<RecipientRow> = {}): RecipientRow {
+  const row: RecipientRow = {
+    id: `rcp-${String(store.nextId++)}`,
+    res_id: RES_ID,
+    email,
+    status: "active",
+    removed_at: null,
+    ...over,
+  };
+  store.recipients.push(row);
+  return row;
+}
+
+export function recipients(): RecipientRow[] { return store.recipients; }
+export function files(): FileRow[] { return store.files; }
+export function lease(): LeaseRow { return store.lease; }
+export function sqlJournal(): string[] { return store.journalSql; }
+export function setLease(over: Partial<LeaseRow>): void { store.lease = { ...store.lease, ...over }; }
 
 export function deliveries(): DeliveryRow[] { return store.deliveries; }
 export function notifications(): NotificationRow[] { return store.notifications; }
@@ -299,8 +417,171 @@ interface FixtureGlobal {
 const DDL = /^(alter|create|drop|do|grant|revoke|comment|set|truncate)\b/i;
 
 async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void): Promise<unknown[]> {
+  if (!/^(begin|commit|rollback)$/i.test(q)) {store.journalSql.push(q.slice(0, 80));}
   if (DDL.test(q)) { return []; }
   if (/^select set_config\('app\.res_id'/i.test(q)) { return []; }
+  if (/^select set_config\('statement_timeout'/i.test(q)) { return []; }
+
+  // --- item 9: the runtime's schema probe (report_email_schema.ts) ---
+  if (/to_regclass\('"ReportEmailRecipients"'\) is not null as m056/i.test(q)) {
+    return [{ ...store.schema }];
+  }
+
+  // --- "ReportSweepLease" ---
+  if (/^update "ReportSweepLease" set holder = \$1/i.test(q)) {
+    requireShape(q, "where id = 1 and (until < now() or holder = $1)",
+      "the lease may be taken only when it has lapsed or is already ours; without it two processes sweep at once");
+    const [holder, , minutes, mailReady] = params as [string, string, number, boolean];
+    const l = store.lease;
+    if (!(l.until.getTime() < now().getTime() || l.holder === holder)) { return []; }
+    const before = { ...l };
+    journal(() => { store.lease = before; });
+    store.lease = { ...l, holder, until: new Date(now().getTime() + minutes * 60_000), heartbeat_at: now(), mail_ready: mailReady };
+    return [{ holder }];
+  }
+  if (/^update "ReportSweepLease" set purged_day = current_date/i.test(q)) {
+    const today = now().toISOString().slice(0, 10);
+    if (store.lease.purged_day === today) { return []; }
+    store.lease.purged_day = today;
+    return [{ id: 1 }];
+  }
+  if (/^update "ReportSweepLease" set sent_count/i.test(q)) {
+    const today = now().toISOString().slice(0, 10);
+    const n = Number(params[0]);
+    store.lease.sent_count = store.lease.sent_day === today ? store.lease.sent_count + n : n;
+    store.lease.sent_day = today;
+    return [{ n: store.lease.sent_count }];
+  }
+  if (/from "ReportSweepLease" where id = 1$/i.test(q) && /sent_count else 0 end as n/i.test(q) && !/holder/i.test(q)) {
+    const today = now().toISOString().slice(0, 10);
+    return [{ n: store.lease.sent_day === today ? store.lease.sent_count : 0 }];
+  }
+  if (/^select holder, heartbeat_at, until, mail_ready/i.test(q)) {
+    const today = now().toISOString().slice(0, 10);
+    const l = store.lease;
+    return [{ holder: l.holder, heartbeat_at: l.heartbeat_at, until: l.until, mail_ready: l.mail_ready, sent: l.sent_day === today ? l.sent_count : 0 }];
+  }
+
+  // --- "ReportEmailRecipients" (the send-time check) ---
+  if (/^select email_norm, status from "ReportEmailRecipients"/i.test(q)) {
+    requireShape(q, "removed_at is null", "a removed address must stop the next send");
+    return store.recipients
+      .filter((r) => r.res_id === params[0] && r.removed_at === null)
+      .map((r) => ({ email_norm: r.email.trim().toLowerCase(), status: r.status }));
+  }
+
+  // --- the restaurant as an email names it ---
+  if (/^select r\.res_name, r\.currency, r\.timezone, o\.outlet_name/i.test(q)) {
+    return [{ res_name: "ZZTEST Reports", currency: "INR", timezone: store.timezone, outlet_name: params[1] === OUTLET_ID ? "Main Street" : null }];
+  }
+
+  // --- the 24-hour count behind the per-restaurant cap ---
+  if (/^select coalesce\(sum\(coalesce\(cardinality\(delivered_to\)/i.test(q)) {
+    const since = now().getTime() - 24 * 3600_000;
+    const n = store.deliveries
+      .filter((d) => d.res_id === params[0] && d.channel === "email" && d.created_at.getTime() > since)
+      .reduce((acc, d) => acc + (d.delivered_to?.length ?? 0), 0);
+    return [{ n }];
+  }
+
+  // --- "Notifications": the once-a-day bell ---
+  if (/from "Notifications" where res_id = \$1 and type = 'report' and meta->>'kind' = \$2/i.test(q)) {
+    const [, kind, day] = params as [string, string, string];
+    return store.notifications.filter((n) => n.meta.kind === kind && n.meta.day === day).map(() => ({ id: "n" }));
+  }
+
+  // --- "ReportDeliveryFiles" ---
+  if (/^update "ReportDeliveries" set status = case when status = 'sending' then 'sending' else 'rendered' end, error = null/i.test(q)) {
+    requireShape(q, "attempts = $3", "a superseded worker's files must never replace the winner's");
+    requireShape(q, "message_meta = coalesce($4::jsonb, message_meta)",
+      "the body's inputs are stored WITH the files, or a retry sends a different message under the same key");
+    const [id, resId, attempts, meta] = params as [string, string, number, string | null];
+    const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
+    if (!d || d.attempts !== attempts || !["claimed", "rendered", "sending", "failed"].includes(d.status)) { return []; }
+    const before = { ...d };
+    journal(() => { Object.assign(d, before); });
+    d.status = d.status === "sending" ? "sending" : "rendered"; d.error = null;
+    if (meta !== null && meta !== undefined) { d.message_meta = JSON.parse(meta) as Record<string, unknown>; }
+    return [{ id: d.id }];
+  }
+  if (/^delete from "ReportDeliveryFiles" where res_id = \$1 and delivery_id = \$2/i.test(q)) {
+    const [resId, deliveryId] = params as [string, string];
+    const kept = store.files;
+    journal(() => { store.files = kept; });
+    store.files = store.files.filter((f) => !(f.res_id === resId && f.delivery_id === deliveryId));
+    return [];
+  }
+  if (/^insert into "ReportDeliveryFiles"/i.test(q)) {
+    const [resId, deliveryId, key, format, filename, mime, bytes, rows, truncated, body] =
+      params as [string, string, string, string, string, string, number, number, boolean, Buffer];
+    const row: FileRow = {
+      id: `file-${String(store.nextId++)}`, res_id: resId, delivery_id: deliveryId, report_key: key, format,
+      filename, mime, bytes, rows, truncated, body, created_at: now(),
+    };
+    store.files.push(row);
+    journal(() => { store.files = store.files.filter((f) => f !== row); });
+    return [];
+  }
+  if (/from "ReportDeliveryFiles" where res_id = \$1 and delivery_id = \$2 and body is not null/i.test(q)) {
+    return store.files
+      .filter((f) => f.res_id === params[0] && f.delivery_id === params[1] && f.body !== null)
+      .map((f) => ({ report_key: f.report_key, format: f.format, filename: f.filename, mime: f.mime, rows: f.rows, truncated: f.truncated, body: f.body }));
+  }
+  if (/^update "ReportDeliveryFiles" set body = null/i.test(q)) {
+    const [resId, days] = params as [string, number];
+    const cut = now().getTime() - days * 86_400_000;
+    const hit = store.files.filter((f) => f.res_id === resId && f.body !== null && f.created_at.getTime() < cut);
+    for (const f of hit) { f.body = null; }
+    return hit.map((f) => ({ id: f.id }));
+  }
+
+  // --- the send path (058) ---
+  if (/^update "ReportDeliveries" set status = 'sending'/i.test(q)) {
+    requireShape(q, "attempts = $3", "'sending' is committed under the same CAS as every other write");
+    requireShape(q, "message_meta = coalesce(message_meta, $5::jsonb)",
+      "the FIRST attempt's body inputs are kept; a later attempt must not replace them");
+    const [id, resId, attempts, provider, meta] = params as [string, string, number, string, string | null];
+    const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
+    if (!d || d.attempts !== attempts || !["claimed", "rendered", "sending", "failed"].includes(d.status)) { return []; }
+    const before = { ...d };
+    journal(() => { Object.assign(d, before); });
+    d.status = "sending"; d.sending_at = d.sending_at ?? now(); d.provider = provider; d.channel = "email";
+    if (d.message_meta === null && meta !== null && meta !== undefined) { d.message_meta = JSON.parse(meta) as Record<string, unknown>; }
+    return [{ delivered_to: d.delivered_to, rejected_to: d.rejected_to, skipped_to: d.skipped_to, message_meta: d.message_meta }];
+  }
+  {
+    const m = /^update "ReportDeliveries" set (delivered_to|rejected_to|skipped_to) = case/i.exec(q);
+    if (m) {
+      requireShape(q, "status = 'sending'", "an outcome is recorded only while the row is mid-send");
+      requireShape(q, "attempts = $3", "a superseded worker must not record outcomes on the winner's row");
+      const column = m[1] as "delivered_to" | "rejected_to" | "skipped_to";
+      const [id, resId, attempts, email] = params as [string, string, number, string];
+      const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
+      if (!d || d.attempts !== attempts || d.status !== "sending") { return []; }
+      const before = { ...d, [column]: d[column] ? [...(d[column] as string[])] : null };
+      journal(() => { Object.assign(d, before); });
+      const list = d[column] ?? [];
+      if (!list.includes(email)) { d[column] = [...list, email]; }
+      return [{ id: d.id }];
+    }
+  }
+  if (/from "ReportDeliveries" where res_id = \$1 and kind in \('adhoc','manual'\) and status in/i.test(q)) {
+    // No `next_attempt_at <= now()` on purpose: the caller waits out a live lease.
+    const [resId, maxAttempts, minutes] = params as [string, number, number];
+    const since = now().getTime() - minutes * 60_000;
+    return store.deliveries
+      .filter((d) => d.res_id === resId && (d.kind === "adhoc" || d.kind === "manual") && ["claimed", "rendered", "sending", "failed"].includes(d.status)
+        && d.attempts < maxAttempts && d.created_at.getTime() > since)
+      .map((d) => ({ id: d.id, outlet_id: d.outlet_id, next_attempt_at: d.next_attempt_at }));
+  }
+  // Send now's replay lookup: the row a client_request_id already made.
+  if (/^select id from "ReportDeliveries" where res_id = \$1 and schedule_id is null and occurrence_key = \$2/i.test(q)) {
+    const [resId, key] = params as [string, string];
+    return store.deliveries
+      .filter((d) => d.res_id === resId && d.schedule_id === null && d.occurrence_key === key)
+      .slice(0, 1)
+      .map((d) => ({ id: d.id }));
+  }
 
   // --- "Restaurant" reads ---
   if (/^select id from "Restaurant"$/i.test(q)) { return [{ id: RES_ID }]; }
@@ -398,11 +679,28 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
   }
 
   // --- "ReportDeliveries" ---
+  if (/^insert into "ReportDeliveries"/i.test(q) && /on conflict \(res_id, occurrence_key\)/i.test(q)) {
+    requireShape(q, "on conflict (res_id, occurrence_key) where schedule_id is null",
+      "report_deliveries_adhoc_uniq is PARTIAL; the ON CONFLICT must repeat its predicate or Postgres raises 42P10");
+    const [resId, outletId, occKey, from, to, tz, keys, formats, scope, dayClose, start, end, recips, by] =
+      params as [string, string, string, string, string, string, string[], string[], string, string | null, string, string, string[], string | null];
+    if (store.deliveries.some((d) => d.res_id === resId && d.schedule_id === null && d.occurrence_key === occKey)) { return []; }
+    const row = addDelivery({
+      schedule_id: null, res_id: resId, outlet_id: outletId, occurrence_key: occKey, fire_at: now(),
+      period_from: from, period_to: to, timezone: tz, claimed_by: "send-now", status: "claimed", channel: "email",
+      next_attempt_at: now(), created_at: now(), kind: "adhoc", report_keys: keys, formats, outlet_scope: scope,
+      day_close: dayClose, window_start_at: start, window_end_at: end, recipients: recips, requested_by: by,
+    });
+    journal(() => { store.deliveries = store.deliveries.filter((d) => d !== row); });
+    return [{ id: row.id }];
+  }
   if (/^insert into "ReportDeliveries"/i.test(q)) {
     requireShape(q, "on conflict (schedule_id, occurrence_key) where occurrence_key is not null",
       "Postgres cannot infer a PARTIAL index unless the ON CONFLICT clause repeats its predicate; omitting it raises 42P10 on every insert");
-    const [resId, outletId, scheduleId, occKey, fireAt, from, to, tz, claimedBy, status, channel, nextAt] =
-      params as [string, string, string, string | null, string, string, string, string, string, string, string, string];
+    const [resId, outletId, scheduleId, occKey, fireAt, from, to, tz, claimedBy, status, channel, nextAt, kind, keys, formats, scope, dayClose, start, end, by] =
+      params as [string, string, string, string | null, string, string, string, string, string, string, string, string,
+        string | undefined, string[] | undefined, string[] | undefined, string | undefined, string | null | undefined, string | undefined, string | undefined, string | null | undefined];
+    const bundle = /\bkind\b/i.test(q);
     // The PARTIAL unique index: rows with a null occurrence_key never collide.
     if (occKey !== null && store.deliveries.some((d) => d.schedule_id === scheduleId && d.occurrence_key === occKey)) {
       return [];
@@ -415,6 +713,17 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
       channel, artifact_name: null, artifact_mime: null, artifact_body: null,
       artifact_bytes: null, artifact_truncated: false, error: null, delivered_at: null,
       created_at: now(),
+      delivered_to: null,
+      kind: bundle ? String(kind) : "scheduled",
+      report_keys: bundle ? [...(keys ?? [])] : [],
+      formats: bundle ? [...(formats ?? ["csv"])] : ["csv"],
+      outlet_scope: bundle ? String(scope) : "outlet",
+      day_close: bundle ? (dayClose ?? null) : null,
+      window_start_at: bundle ? (start ?? null) : null,
+      window_end_at: bundle ? (end ?? null) : null,
+      recipients: null, rejected_to: null, skipped_to: null, provider: null,
+      requested_by: bundle ? (by ?? null) : null,
+      sending_at: null, maybe_duplicate: false, message_meta: null,
     };
     store.deliveries.push(row);
     journal(() => { store.deliveries = store.deliveries.filter((d) => d !== row); });
@@ -425,13 +734,17 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
     requireShape(q, "attempts = $3", "the attempt compare-and-swap is the only thing stopping two replicas taking the same attempt");
     const [id, resId, expected, nextAt, worker] = params as [string, string, number, string, string];
     const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
+    // 058's form also admits a row a dead process left mid-send, and flags it.
+    const v058 = /maybe_duplicate/i.test(q);
+    const allowed = v058 ? ["claimed", "rendered", "sending", "failed"] : ["claimed", "rendered", "failed"];
     // THE COMPARE-AND-SWAP. `attempts = $3` is the whole cross-replica guard.
-    if (!d || d.attempts !== expected || !["claimed", "rendered", "failed"].includes(d.status)) { return []; }
+    if (!d || d.attempts !== expected || !allowed.includes(d.status)) { return []; }
     const before = { ...d };
     journal(() => { Object.assign(d, before); });
     d.attempts += 1;
     d.next_attempt_at = new Date(nextAt);
     d.claimed_by = worker;
+    if (v058 && d.status === "sending") { d.maybe_duplicate = true; }
     if (d.status === "failed") { d.status = "claimed"; }
     return [{ attempts: d.attempts }];
   }
@@ -453,49 +766,116 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
   if (/^update "ReportDeliveries" set status = 'delivered'/i.test(q)) {
     requireShape(q, "attempts = $3", "the terminal write is a compare-and-swap; without it a superseded worker delivers a second time");
     requireShape(q, "returning id", "the caller must be able to detect zero rows and throw");
-    const [id, resId, attempts] = params as [string, string, number];
+    requireShape(q, "delivered_to = coalesce($5, delivered_to)",
+      "the per-address path commits delivered_to address by address; the terminal write must not wipe it");
+    const [id, resId, attempts, channel, deliveredTo] = params as [string, string, number, string | null, string[] | null];
     const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
     // The terminal CAS. Zero rows here is what makes a superseded worker throw.
     if (!d || d.attempts !== attempts || d.status === "delivered") { return []; }
     const before = { ...d };
     journal(() => { Object.assign(d, before); });
     d.status = "delivered"; d.delivered_at = now(); d.error = null;
+    d.channel = channel ?? d.channel;
+    d.delivered_to = deliveredTo ?? d.delivered_to;
     return [{ id: d.id }];
   }
 
   if (/^update "ReportDeliveries" set status = 'failed', error = \$5/i.test(q)) {
     requireShape(q, "attempts = $3", "a superseded worker's error must not land on a row another worker delivered");
-    const [id, resId, attempts, nextAt, error] = params as [string, string, number, string, string];
+    const [id, resId, attempts, nextAt, error, final, max] = params as [string, string, number, string, string, boolean, number];
     const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
     if (!d || d.attempts !== attempts || d.status === "delivered") { return []; }
     const before = { ...d };
     journal(() => { Object.assign(d, before); });
     d.status = "failed"; d.error = error; d.next_attempt_at = new Date(nextAt);
+    if (final) { d.attempts = Math.max(d.attempts, max); }
     return [];
   }
 
-  if (/^update "ReportDeliveries" set status = 'failed', error = coalesce/i.test(q)) {
-    const [resId, maxAttempts] = params as [string, number];
-    const hit = store.deliveries.filter((d) =>
-      d.res_id === resId && d.attempts >= maxAttempts &&
-      d.next_attempt_at.getTime() <= now().getTime() &&
-      ["claimed", "rendered"].includes(d.status));
+  if (/^with reaped as \( ?update "ReportDeliveries" d set status = 'failed'/i.test(q)) {
+    // THE REAPER. Its predicates are re-implemented here and their text
+    // checked, for requireShape's reason.
+    requireShape(q, "d.next_attempt_at <= now()", "a row whose worker still holds its lease is not dead yet");
+    requireShape(q, "attempts = greatest(d.attempts, $2)", "a reaped row is final: its attempts are spent");
+    requireShape(q, "d.status in ('claimed','rendered','sending'))",
+      "a worker that died on its last attempt - mid-send included - is failed, not left 'sending' forever");
+    requireShape(q, "d.kind in ('manual','adhoc') and d.attempts < $2", "only an on-demand run is dropped for its age");
+    requireShape(q, "d.created_at <= now() - make_interval(mins => $3::int)", "only an on-demand run OLDER than the catch-up window is dropped");
+    const [resId, maxAttempts, minutes, midSend, exhausted, late] = params as [string, number, number, string, string, string];
+    const due = (d: DeliveryRow) => d.next_attempt_at.getTime() <= now().getTime();
+    const hit = store.deliveries.filter((d) => d.res_id === resId && due(d) && (
+      (d.attempts >= maxAttempts && ["claimed", "rendered", "sending"].includes(d.status))
+      || ((d.kind === "manual" || d.kind === "adhoc") && d.attempts < maxAttempts
+        && ["claimed", "rendered", "sending", "failed"].includes(d.status)
+        && d.created_at.getTime() <= now().getTime() - minutes * 60_000)));
+    const out: Record<string, unknown>[] = [];
     for (const d of hit) {
       const before = { ...d };
       journal(() => { Object.assign(d, before); });
-      d.status = "failed"; d.error = d.error ?? "Retries exhausted";
+      d.error = d.attempts >= maxAttempts
+        ? d.error ?? (d.status === "sending" ? midSend : exhausted)
+        : `${late}${d.error ? ` Last problem: ${d.error}` : ""}`.slice(0, 800);
+      d.status = "failed";
+      d.attempts = Math.max(d.attempts, maxAttempts);
+      const s = d.schedule_id === null ? null : store.schedules.find((x) => x.id === d.schedule_id) ?? null;
+      out.push({
+        id: d.id, schedule_id: d.schedule_id, outlet_id: d.outlet_id, occurrence_key: d.occurrence_key,
+        period_from: d.period_from, period_to: d.period_to, timezone: d.timezone, attempts: d.attempts,
+        channel: d.channel, status: d.status, error: d.error,
+        name: s?.name ?? "Send now", report_key: s?.report_key ?? "bundle",
+        format: s?.format ?? d.formats[0] ?? "csv",
+        recipients: d.schedule_id === null ? d.recipients : s?.recipients,
+        kind: d.kind, outlet_scope: d.outlet_scope, day_close: d.day_close,
+        window_start_at: d.window_start_at, window_end_at: d.window_end_at, requested_by: d.requested_by,
+        report_keys: d.report_keys.length > 0 ? d.report_keys : s?.report_keys ?? [],
+        formats: d.kind === "scheduled" && d.report_keys.length === 0 ? s?.formats ?? ["csv"] : d.formats,
+      });
     }
-    return hit.map((d) => ({ id: d.id }));
+    return out;
   }
 
+  if (/from "ReportDeliveries" d left join "ReportSchedules" s/i.test(q)) {
+    requireShape(q, "(d.schedule_id is null or s.id is not null)",
+      "a Send now has no schedule; an inner join would leave every failed one unretried");
+    requireShape(q, "(d.kind = 'scheduled' or d.created_at > now() - make_interval(mins => $4::int))",
+      "a Run now or Send now is never retried past the catch-up window");
+    const [resId, maxAttempts, , maxAge] = params as [string, number, number, number];
+    return store.deliveries
+      .filter((d) =>
+        d.res_id === resId &&
+        ["claimed", "rendered", "sending", "failed"].includes(d.status) &&
+        d.attempts < maxAttempts &&
+        d.next_attempt_at.getTime() <= now().getTime() &&
+        (d.kind === "scheduled" || d.created_at.getTime() > now().getTime() - maxAge * 60_000))
+      .map((d) => {
+        const s = d.schedule_id === null ? null : store.schedules.find((x) => x.id === d.schedule_id) ?? null;
+        if (d.schedule_id !== null && !s) { return null; }
+        return {
+          id: d.id, schedule_id: d.schedule_id, outlet_id: d.outlet_id,
+          occurrence_key: d.occurrence_key, period_from: d.period_from,
+          period_to: d.period_to, timezone: d.timezone, attempts: d.attempts,
+          channel: d.channel, status: d.status,
+          name: s?.name ?? "Send now", report_key: s?.report_key ?? "bundle", format: s?.format ?? d.formats[0] ?? "csv",
+          recipients: d.schedule_id === null ? d.recipients : s?.recipients,
+          kind: d.kind, outlet_scope: d.outlet_scope, day_close: d.day_close,
+          window_start_at: d.window_start_at, window_end_at: d.window_end_at, requested_by: d.requested_by,
+          report_keys: d.report_keys.length > 0 ? d.report_keys : s?.report_keys ?? [],
+          formats: d.kind === "scheduled" && d.report_keys.length === 0 ? s?.formats ?? ["csv"] : d.formats,
+        };
+      })
+      .filter((r): r is NonNullable<typeof r> => r !== null);
+  }
   if (/from "ReportDeliveries" d join "ReportSchedules" s/i.test(q)) {
-    const [resId, maxAttempts] = params as [string, number];
+    requireShape(q, "or d.created_at > now() - make_interval(mins => $4::int)",
+      "a Run now is never retried past the catch-up window, on a 2.0.1 database too");
+    const [resId, maxAttempts, , maxAge] = params as [string, number, number, number];
     return store.deliveries
       .filter((d) =>
         d.res_id === resId &&
         ["claimed", "rendered", "failed"].includes(d.status) &&
         d.attempts < maxAttempts &&
-        d.next_attempt_at.getTime() <= now().getTime())
+        d.next_attempt_at.getTime() <= now().getTime() &&
+        (!(d.occurrence_key ?? "").startsWith("manual:") || d.created_at.getTime() > now().getTime() - maxAge * 60_000))
       .map((d) => {
         const s = store.schedules.find((x) => x.id === d.schedule_id);
         if (!s) { return null; }

@@ -1,0 +1,161 @@
+// THE WORKBOOK WRITER — read back, never trusted.
+//
+// xlsx_writer.ts exists so a report email does not need a spreadsheet
+// dependency. That trade is only worth making if the file it writes OPENS, so
+// every assertion below reads the bytes back two independent ways:
+//
+//   1. jest-tests/xlsx_reader.ts — a zip + SpreadsheetML reader written for this
+//      suite that shares no code with the writer, checks every CRC and every
+//      part the content types name;
+//   2. SheetJS, the spreadsheet library the WEB dashboard already ships, loaded
+//      from that repository's node_modules — a real third-party reader. It is
+//      read-only here and never becomes a backend dependency.
+
+import { describe, test, expect } from "@jest/globals";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { buildXlsx, columnLetters, crc32, sheetName, STYLE, xmlEscape, zip, type SheetSpec } from "../xlsx_writer";
+import { readXlsx, unzip } from "./xlsx_reader";
+
+const SHEETJS = join(__dirname, "..", "..", "Restaurant_Dashboard_UI", "node_modules", "xlsx");
+const withSheetJs = existsSync(join(SHEETJS, "package.json")) ? test : test.skip;
+
+const REPORT: SheetSpec = {
+  name: "Sales Summary",
+  freezeRows: 1,
+  widths: [14, 10, 14],
+  rows: [
+    [{ v: "Date", bold: true }, { v: "Bills", bold: true }, { v: "Gross", bold: true }],
+    ["2026-09-16", { v: 21, kind: "int" }, { v: 12345.5, kind: "money" }],
+    ["2026-09-17", { v: 3, kind: "int" }, { v: 0.1 + 0.2, kind: "money" }],
+    [{ v: "Total", bold: true }, { v: 24, kind: "int", bold: true }, { v: 12345.8, kind: "money", bold: true }],
+  ],
+};
+
+describe("the zip container", () => {
+  test("CRC-32 is the IEEE polynomial (the zip spec's own check value)", () => {
+    expect(crc32(Buffer.from("123456789", "ascii"))).toBe(0xCBF43926);
+    expect(crc32(Buffer.alloc(0))).toBe(0);
+  });
+
+  test("entries round-trip, stored or deflated, with their CRCs", () => {
+    const tiny = Buffer.from("x");
+    const big = Buffer.from("abc".repeat(5000));
+    const entries = unzip(zip([{ name: "a.txt", data: tiny }, { name: "dir/b.txt", data: big }]));
+    expect(entries.map((e) => e.name)).toEqual(["a.txt", "dir/b.txt"]);
+    expect(entries[0].data.equals(tiny)).toBe(true);
+    expect(entries[0].method).toBe(0);           // deflating one byte makes it bigger
+    expect(entries[1].data.equals(big)).toBe(true);
+    expect(entries[1].method).toBe(8);
+  });
+
+  test("the same input is the same bytes — a retry re-sends an identical file", () => {
+    expect(buildXlsx([REPORT]).equals(buildXlsx([REPORT]))).toBe(true);
+  });
+});
+
+describe("what the workbook carries", () => {
+  const wb = readXlsx(buildXlsx([REPORT, { name: "Notes", rows: [["Bills are counted on the day they were SETTLED."]] }]));
+
+  test("the sheets, in order, by name", () => {
+    expect(wb.sheetNames).toEqual(["Sales Summary", "Notes"]);
+  });
+
+  test("numbers are NUMBERS — an accountant's SUM works without converting text", () => {
+    const grid = wb.sheets["Sales Summary"];
+    expect(grid[1]).toEqual(["2026-09-16", 21, 12345.5]);
+    expect(typeof grid[2][2]).toBe("number");
+    expect(grid[3]).toEqual(["Total", 24, 12345.8]);
+  });
+
+  test("money carries #,##0.00, counts #,##0, and the header and total are bold", () => {
+    const cells = wb.cells["Sales Summary"];
+    const style = (ref: string) => cells.find((c) => c.ref === ref)?.style;
+    expect(style("A1")).toBe(STYLE.bold);
+    expect(style("B2")).toBe(STYLE.int);
+    expect(style("C2")).toBe(STYLE.money);
+    expect(style("C4")).toBe(STYLE.moneyBold);
+    const styles = wb.entries.find((e) => e.name === "xl/styles.xml")?.data.toString("utf8") ?? "";
+    const xfs = [...styles.slice(styles.indexOf("<cellXfs")).matchAll(/<xf numFmtId="(\d+)" fontId="(\d+)"/g)].map((m) => [Number(m[1]), Number(m[2])]);
+    expect(xfs[STYLE.money]).toEqual([4, 0]);
+    expect(xfs[STYLE.moneyBold]).toEqual([4, 1]);
+    expect(xfs[STYLE.int]).toEqual([3, 0]);
+    expect(xfs[STYLE.bold]).toEqual([0, 1]);
+  });
+
+  test("text is an inline string, so nothing a guest typed is ever a formula", () => {
+    const w = readXlsx(buildXlsx([{ name: "T", rows: [["=HYPERLINK(\"http://x\")", "+1", "@SUM(A1)"]] }]));
+    const cells = w.cells.T;
+    expect(cells.every((c) => c.type === "inlineStr")).toBe(true);
+    expect(w.sheets.T[0]).toEqual(["=HYPERLINK(\"http://x\")", "+1", "@SUM(A1)"]);
+  });
+
+  test("XML-special and control characters survive or are dropped, never break the file", () => {
+    const w = readXlsx(buildXlsx([{ name: "T", rows: [["Dal <Makhani> & \"Naan\"", "bell\u0007here", "₹1,234 · Café"]] }]));
+    expect(w.sheets.T[0]).toEqual(["Dal <Makhani> & \"Naan\"", "bellhere", "₹1,234 · Café"]);
+  });
+
+  test("blank, null, NaN and Infinity are empty cells, not the words", () => {
+    const w = readXlsx(buildXlsx([{ name: "T", rows: [["a", null, undefined, Number.NaN, Number.POSITIVE_INFINITY, "", "z"]] }]));
+    expect(w.sheets.T[0]).toEqual(["a", null, null, null, null, null, "z"]);
+  });
+
+  test("booleans are booleans", () => {
+    expect(readXlsx(buildXlsx([{ name: "T", rows: [[true, false]] }])).sheets.T[0]).toEqual([true, false]);
+  });
+
+  test("the header row is frozen and the widths are written", () => {
+    const xml = wb.entries.find((e) => e.name === "xl/worksheets/sheet1.xml")?.data.toString("utf8") ?? "";
+    expect(xml).toContain('<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>');
+    expect(xml).toContain('<col min="3" max="3" width="14.00" customWidth="1"/>');
+  });
+});
+
+describe("names Excel would refuse", () => {
+  test("sheet names lose []:*?/\\, are cut to 31 and made unique", () => {
+    const taken = new Set<string>();
+    expect(sheetName("Sales / Tax [Q1]*", taken)).toBe("Sales Tax Q1");
+    expect(sheetName("x".repeat(40), taken)).toHaveLength(31);
+    expect(sheetName("Sales Tax Q1", taken)).toBe("Sales Tax Q1 (2)");
+    expect(sheetName("   ", taken)).toBe("Sheet");
+  });
+
+  test("two reports with one title still open as two sheets", () => {
+    expect(readXlsx(buildXlsx([{ name: "A", rows: [[1]] }, { name: "A", rows: [[2]] }])).sheetNames).toEqual(["A", "A (2)"]);
+  });
+
+  test("column letters past Z", () => {
+    expect([0, 25, 26, 27, 51, 52, 701, 702].map(columnLetters)).toEqual(["A", "Z", "AA", "AB", "AZ", "BA", "ZZ", "AAA"]);
+  });
+
+  test("xmlEscape escapes the five and drops what XML cannot hold", () => {
+    expect(xmlEscape("<a href=\"x\">&</a>\u0000")).toBe("&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;");
+  });
+
+  test("an empty workbook is refused rather than written unreadable", () => {
+    expect(() => buildXlsx([])).toThrow(/at least one sheet/);
+  });
+});
+
+describe("a real spreadsheet reader opens it (SheetJS, from the web dashboard's node_modules)", () => {
+  withSheetJs("sheets, typed values and number formats read back", () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const XLSX = require(SHEETJS) as {
+      read: (b: Buffer, o: Record<string, unknown>) => { SheetNames: string[]; Sheets: Record<string, Record<string, { t: string; v: unknown; z?: string }>> };
+      utils: { sheet_to_json: (s: unknown, o: Record<string, unknown>) => unknown[][] };
+    };
+    const book = XLSX.read(buildXlsx([REPORT, { name: "Notes", rows: [["one"], ["two"]] }]), { type: "buffer", cellStyles: true, cellNF: true });
+    expect(book.SheetNames).toEqual(["Sales Summary", "Notes"]);
+    const sheet = book.Sheets["Sales Summary"];
+    expect(XLSX.utils.sheet_to_json(sheet, { header: 1 })).toEqual([
+      ["Date", "Bills", "Gross"],
+      ["2026-09-16", 21, 12345.5],
+      ["2026-09-17", 3, 0.1 + 0.2],
+      ["Total", 24, 12345.8],
+    ]);
+    expect(sheet.C2.t).toBe("n");
+    expect(sheet.C2.z).toBe("#,##0.00");
+    expect(sheet.B2.z).toBe("#,##0");
+    expect(XLSX.utils.sheet_to_json(book.Sheets.Notes, { header: 1 })).toEqual([["one"], ["two"]]);
+  });
+});

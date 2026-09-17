@@ -327,6 +327,7 @@ import {
   resolveReportWindow,
   type ReportWindowQuery,
   type ResolvedReportWindow,
+  type WindowClamp,
   DEFAULT_TIME_SLOTS,
   TimeSlotConfigError,
   fixedTimeBuckets,
@@ -344,6 +345,11 @@ import {
   timeSlotNote,
   timeSlotsForStorage,
   validateTimeSlotPresets,
+  dayCloseOfShift,
+  dayShiftForClose,
+  parseDayClose,
+  tradingDayBounds,
+  tradingDayNote,
   type TimeBucketMode,
   type TimeSlot,
   type TimeSlotMeta,
@@ -447,7 +453,27 @@ import { serviceClock, tableServiceClock, type ServiceClock } from "./service_cl
 export { serviceClock, tableServiceClock } from "./service_clock.js";
 export type { ServiceClock, ServiceClockInput } from "./service_clock.js";
 import { logger } from "./observability.js";
-import { normalizeRecipients } from "./mailer.js";
+import { isPlausibleEmail, normalizeRecipients } from "./mailer.js";
+// Client item 9: which reports can be emailed, and the runtime half of
+// migrations 056-058. Both pure, so their rules are proved without a pool.
+import {
+  MAX_ADDRESS_BOOK,
+  MAX_EMAIL_SCHEDULES_PER_OUTLET,
+  MAX_REPORT_RECIPIENTS,
+  CALENDAR_ONLY_KEYS,
+  isWindowMode,
+  legacyReportKey,
+  reportKeysOfRow,
+  validateReportFormats,
+  validateReportSelection,
+  type ReportWindowMode,
+} from "./report_catalogue.js";
+import {
+  REPORT_EMAIL_DDL_056,
+  REPORT_EMAIL_DDL_057,
+  REPORT_EMAIL_DDL_058,
+  REPORT_EMAIL_SCHEMA_PROBE,
+} from "./report_email_schema.js";
 
 /**
  * "Close Bill" (a953d044) — the ONE capability that means "may make money leave
@@ -20407,10 +20433,46 @@ export interface SalesReport {
   by_method: { method: string; label?: string; sales: number; bills: number }[];
 }
 
-export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<SalesReport> {
+/**
+ * How the accounting Sales report may be read besides its dates. Only the
+ * emailed report passes this; the /reports/sales routes never do, so every
+ * screen and every .csv they serve is exactly what it was.
+ */
+export interface SalesReportOptions {
+  /**
+   * A TRADING DAY's shift in minutes (report_window.ts). `from`/`to` are then
+   * business dates, the bills are those settled in [from 00:00 + shift,
+   * to+1 00:00 + shift), and by_day buckets each bill on its business date —
+   * the same instants and the same buckets as the MIS Sales Summary read with
+   * the same close, which test/money pins.
+   */
+  dayShiftMin?: number;
+}
+
+/** The business date an instant counts on under a trading-day shift. */
+function tradingDayKeyOf(value: Date | string, tz: string, shift: number): string {
+  const clock = zonedClockParts(value, tz);
+  return clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, null, shift) : "";
+}
+
+/** [fromIso, toIso) of business dates `from`..`to` under a shift. */
+function tradingRangeInstants(fromDate: string, toDate: string, tz: string, shift: number): { fromIso: string; toIso: string } {
+  const b = tradingDayBounds({ from: fromDate, to: toDate }, shift);
+  return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
+}
+
+/** A shift a caller asked for, kept inside what a trading day can be. */
+function boundedDayShift(raw: unknown): number {
+  const n = Math.round(Number(raw));
+  return Number.isFinite(n) && n >= -719 && n <= 720 ? n : 0;
+}
+
+export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string, opts: SalesReportOptions = {}): Promise<SalesReport> {
   const context = await requireRestaurantContext(restaurantId);
   const range = normalizeReportRange(fromIso, toIso, context.timezone);
-  const bills = await getSettledBills(context, range.fromIso, range.toIso);
+  const shift = boundedDayShift(opts.dayShiftMin);
+  const bounds = shift ? tradingRangeInstants(range.fromDate, range.toDate, context.timezone, shift) : range;
+  const bills = await getSettledBills(context, bounds.fromIso, bounds.toIso);
   const scPct = await getServiceChargePercent(context.res_id);
 
   let totalSales = 0, totalTax = 0, totalService = 0, totalRefund = 0, totalRefundedTax = 0;
@@ -20429,7 +20491,8 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     totalService = round2(totalService + service);
     totalRefund = round2(totalRefund + b.refund_amount);
     totalRefundedTax = round2(totalRefundedTax + refundedTaxOf(b, tax));
-    const day = dayKeyOf(b.settled_at, context.timezone);
+    // The business date on a trading day, the calendar day otherwise.
+    const day = shift ? tradingDayKeyOf(b.settled_at, context.timezone, shift) : dayKeyOf(b.settled_at, context.timezone);
     const dd = byDay.get(day) ?? { sales: 0, net: 0, tax: 0, service_charge: 0, refund: 0, bills: 0 };
     dd.sales = round2(dd.sales + gross); dd.tax = round2(dd.tax + tax);
     dd.net = round2(dd.net + charges.taxable_base);
@@ -21066,6 +21129,75 @@ export const REPORT_MAX_ATTEMPTS = 3;
 /** Consecutive failures after which a schedule disables itself. */
 export const REPORT_SCHEDULE_FAILURE_LIMIT = 5;
 
+/**
+ * The catch-up window, in minutes (REPORT_CATCHUP_MINUTES, default six hours):
+ * how late the sweep may still CLAIM a scheduled occurrence, and — since the
+ * item 9 review — how long a Run now or Send now may wait to be FINISHED. One
+ * reader, so the two can never disagree.
+ */
+export function reportCatchupMinutes(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.REPORT_CATCHUP_MINUTES);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 360;
+}
+
+/** The error a row gets when its last attempt's worker never came back. Unchanged since 026. */
+export const REPORT_RETRIES_EXHAUSTED = "Retries exhausted";
+/** …and when that worker died mid-send (058): some addresses may have it. */
+export const REPORT_STOPPED_MID_SEND =
+  "The server stopped while sending this report, and it has no retries left. The history shows which addresses had it.";
+
+/** A Run now or Send now nobody finished inside the catch-up window. */
+export function reportDroppedLateSentence(maxAgeMin: number): string {
+  const hours = maxAgeMin / 60;
+  const span = Number.isInteger(hours) ? `${String(hours)} hour${hours === 1 ? "" : "s"}` : `${String(maxAgeMin)} minutes`;
+  return `Not sent within ${span} of being asked for, so it was dropped rather than sent late. Ask for it again.`;
+}
+
+/**
+ * WHAT A DELIVERY ROW MEANS to the person reading it — which is not always
+ * what its status column says, and the difference is where the item 9 review
+ * found screens waiting forever.
+ *
+ *   * A row whose LAST attempt's worker died ('claimed', 'rendered' or
+ *     'sending', attempts spent, lease lapsed) will never move again. The
+ *     sweep's reaper marks it failed; until it runs (or on a server whose
+ *     sweep is off) the reading says so anyway.
+ *   * A Run now or Send now older than the catch-up window is dropped, not
+ *     sent late — the reaper again, and the same reading before it.
+ *   * `final` says whether anything more will happen without a person: a
+ *     'failed' row with attempts left is RETRIED by the sweep (its
+ *     next_attempt_at says when). A client that called every 'failed' final
+ *     told the owner "Couldn't send" for an email that went out five minutes
+ *     later — and invited a second send of it.
+ *
+ * Pure; `now` and the window are injected.
+ */
+export function deliveryReading(
+  r: {
+    status: string; attempts: number; kind: string; error: string | null;
+    next_attempt_at: Date | string | null; created_at: Date | string;
+  },
+  now: Date,
+  maxAgeMin: number,
+): { status: string; final: boolean; error: string | null } {
+  const at = (v: Date | string | null): number => (v === null ? Number.NaN : new Date(v).getTime());
+  const nextAt = at(r.next_attempt_at);
+  const due = Number.isNaN(nextAt) || nextAt <= now.getTime();
+  const spent = r.attempts >= REPORT_MAX_ATTEMPTS;
+  const open = r.status === "claimed" || r.status === "rendered" || r.status === "sending";
+  const onDemand = r.kind === "manual" || r.kind === "adhoc";
+  const stale = onDemand && at(r.created_at) <= now.getTime() - maxAgeMin * 60_000;
+  if (open && due && spent) {
+    return { status: "failed", final: true, error: r.error ?? (r.status === "sending" ? REPORT_STOPPED_MID_SEND : REPORT_RETRIES_EXHAUSTED) };
+  }
+  if ((open || r.status === "failed") && due && !spent && stale) {
+    const said = reportDroppedLateSentence(maxAgeMin);
+    return { status: "failed", final: true, error: (r.error ? `${said} Last problem: ${r.error}` : said).slice(0, 800) };
+  }
+  if (r.status === "failed") { return { status: "failed", final: spent, error: r.error }; }
+  return { status: r.status, final: r.status === "delivered" || r.status === "abandoned", error: r.error };
+}
+
 export interface ReportScheduleRecord {
   id: string;
   outlet_id: string;
@@ -21080,6 +21212,14 @@ export interface ReportScheduleRecord {
   /** Migration 044. Empty for 'inbox'; at least one address for 'email'. */
   recipients: string[];
   format: string;
+  /** Migration 057: the reports in the bundle — `[report_key]` on an older row. */
+  report_keys: string[];
+  /** Migration 057: 'xlsx' and/or 'csv'. `[format]` on an older row. */
+  formats: string[];
+  /** Migration 057: 'calendar' (every older row) or 'trading_day'. */
+  window_mode: string;
+  /** Migration 057: 'outlet' (every older row) or 'all'. */
+  outlet_scope: string;
   enabled: boolean;
   last_occurrence_key: string | null;
   last_status: string | null;
@@ -21106,14 +21246,21 @@ export interface DueReportSchedule {
   /** Migration 044. Empty for an inbox schedule, at least one for an email one. */
   recipients: string[];
   format: string;
+  /** Migration 057, with its pre-057 readings (see ReportScheduleRecord). */
+  report_keys: string[];
+  formats: string[];
+  window_mode: string;
+  outlet_scope: string;
   created_at: Date;
 }
 
 export interface RetryableReportDelivery {
   id: string;
-  schedule_id: string;
+  /** Null for a Send now (migration 058). */
+  schedule_id: string | null;
   outlet_id: string;
-  /** Migration 044. Read LIVE from the schedule — see the query's comment. */
+  /** Migration 044. Read LIVE from the schedule — see the query's comment. A
+   *  Send now carries its own snapshot instead: it has no schedule to read. */
   recipients: string[];
   occurrence_key: string | null;
   period_from: string;
@@ -21124,11 +21271,22 @@ export interface RetryableReportDelivery {
   name: string;
   report_key: string;
   format: string;
+  /** Migration 058, with their pre-058 readings. */
+  kind: "scheduled" | "manual" | "adhoc";
+  status: string;
+  report_keys: string[];
+  formats: string[];
+  outlet_scope: string;
+  day_close: string | null;
+  window_start_at: string | null;
+  window_end_at: string | null;
+  requested_by: string | null;
 }
 
 export interface ReportDeliveryRecord {
   id: string;
-  schedule_id: string;
+  /** Null for a Send now (migration 058). */
+  schedule_id: string | null;
   outlet_id: string;
   occurrence_key: string | null;
   fire_at: Date;
@@ -21144,14 +21302,41 @@ export interface ReportDeliveryRecord {
   error: string | null;
   delivered_at: Date | null;
   created_at: Date;
+  /** Migration 044: the addresses the provider ACCEPTED. It was stored and
+   *  never returned until item 9 — the web type already declared it. */
+  delivered_to: string[];
+  /** Migration 058 — defaults below on a database without it. */
+  kind: "scheduled" | "manual" | "adhoc";
+  report_keys: string[];
+  formats: string[];
+  outlet_scope: string;
+  day_close: string | null;
+  window_start_at: Date | null;
+  window_end_at: Date | null;
+  /** The addresses a Send now was addressed to. Null for a scheduled row. */
+  recipients: string[] | null;
+  rejected_to: string[];
+  skipped_to: string[];
+  provider: string | null;
+  requested_by: string | null;
+  sending_at: Date | null;
+  maybe_duplicate: boolean;
+  files: ReportDeliveryFileRecord[];
+  /** When the sweep next tries a 'failed' row with attempts left. */
+  next_attempt_at: Date | null;
+  /** Nothing more will happen to this row without a person (deliveryReading). */
+  final: boolean;
 }
 
-const SCHEDULE_COLS = `id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+const SCHEDULE_COLS =`id, outlet_id, name, report_key, frequency, hour_local, minute_local,
          weekday, day_of_month, channel, recipients, format, enabled, last_occurrence_key,
          last_status, last_error, last_run_at, consecutive_failures, created_at, updated_at`;
 
 /** The same list without migration 044's column. See scheduleRead. */
 const SCHEDULE_COLS_PRE_044 = SCHEDULE_COLS.replace(" recipients,", "");
+
+/** The list with migration 057's four columns. Read only once the latch says they exist. */
+const SCHEDULE_COLS_057 = `${SCHEDULE_COLS}, report_keys, formats, window_mode, outlet_scope`;
 
 /**
  * A READ OF "ReportSchedules" THAT SURVIVES AN UNAPPLIED MIGRATION 044.
@@ -21186,6 +21371,13 @@ async function scheduleRead<T extends QueryResultRow>(
   build: (cols: string) => string,
   params: unknown[],
 ): Promise<T[]> {
+  // Migration 057's columns only when the latch has SEEN them — never by
+  // trial and error, because a failed statement inside the sweep's transaction
+  // would abort it. Absent, the rows read as the single-report, CSV,
+  // calendar-day schedules they are (mapReportSchedule).
+  if (await reportEmailSchemaReady()) {
+    return runQuery<T>(build(SCHEDULE_COLS_057), params);
+  }
   try {
     return await runQuery<T>(build(SCHEDULE_COLS), params);
   } catch (err) {
@@ -21215,8 +21407,20 @@ function scheduleWriteError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
 
+/** Migration 057's four fields, read with their pre-057 meaning when absent. */
+function bundleFieldsOf(r: Record<string, any>): Pick<ReportScheduleRecord, "report_keys" | "formats" | "window_mode" | "outlet_scope"> {
+  const formats = Array.isArray(r.formats) ? r.formats.map((x: unknown) => String(x)).filter((f: string) => f === "csv" || f === "xlsx") : [];
+  return {
+    report_keys: reportKeysOfRow(r),
+    formats: formats.length > 0 ? formats : [String(r.format ?? "csv")],
+    window_mode: r.window_mode === "trading_day" ? "trading_day" : "calendar",
+    outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+  };
+}
+
 function mapReportSchedule(r: Record<string, any>): ReportScheduleRecord {
   return {
+    ...bundleFieldsOf(r),
     recipients: Array.isArray(r.recipients) ? r.recipients.map((x: unknown) => String(x)) : [],
     id: String(r.id),
     outlet_id: String(r.outlet_id),
@@ -21256,6 +21460,32 @@ function boundedInt(raw: unknown, lo: number, hi: number, label: string): number
   return n;
 }
 
+/**
+ * Does this payload ask for something a 2.0.1 schedule could not be? Any of
+ * migration 057's fields, a recipient picked from the address book, or the
+ * email channel — which since item 9 only ever addresses the book.
+ */
+function isBundlePayload(input: Record<string, unknown>): boolean {
+  return ["report_keys", "formats", "window_mode", "outlet_scope", "recipient_ids"].some((k) => input[k] !== undefined)
+    || String(input.channel ?? "").trim().toLowerCase() === "email"
+    || (input.report_key !== undefined && !(REPORT_SCHEDULE_KEYS as readonly string[]).includes(String(input.report_key).trim().toLowerCase()));
+}
+
+/** One of the three accounting reports, alone — the only selection a 2.0.1 form can show. */
+function isLegacyAccountingSelection(keys: readonly string[]): boolean {
+  return keys.length === 1 && (REPORT_SCHEDULE_KEYS as readonly string[]).includes(keys[0]);
+}
+
+/** Is this stored row something only the bundle path can write back? */
+function isBundleRow(r: ReportScheduleRecord): boolean {
+  return r.channel === "email"
+    || r.report_keys.length !== 1
+    || !(REPORT_SCHEDULE_KEYS as readonly string[]).includes(r.report_key)
+    || r.formats.length !== 1 || r.formats[0] !== "csv"
+    || r.window_mode !== "calendar"
+    || r.outlet_scope !== "outlet";
+}
+
 /** Validate the whole shape in one place so a bad payload is a 400 with a
  *  sentence in it, never a raw 23514 from one of migration 026's CHECKs. */
 function normalizeSchedulePayload(
@@ -21266,9 +21496,7 @@ function normalizeSchedulePayload(
   minute_local: number; weekday: number | null; day_of_month: number | null;
   channel: string; recipients: string[]; format: string; enabled: boolean;
 } {
-  const name = String(input.name ?? base?.name ?? "").trim();
-  if (!name) { throw new Error("name is required"); }
-  const frequency = oneOf(input.frequency ?? base?.frequency ?? "daily", REPORT_SCHEDULE_FREQUENCIES, "frequency");
+  const { name, frequency } = scheduleCoreOf(input, base);
   const channel = oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel");
   // Cleaned the way mailer.ts will read them — trimmed, de-duplicated
   // case-insensitively, implausible entries dropped, capped at ten — so what the
@@ -21285,9 +21513,167 @@ function normalizeSchedulePayload(
       + " Add one, or set this schedule to deliver to the in-app inbox instead.",
     );
   }
+  const core = scheduleCoreOf(input, base);
+  return {
+    ...core,
+    name,
+    report_key: oneOf(input.report_key ?? base?.report_key ?? "sales", REPORT_SCHEDULE_KEYS, "report_key"),
+    channel,
+    recipients,
+    format: oneOf(input.format ?? base?.format ?? "csv", REPORT_SCHEDULE_FORMATS, "format"),
+  };
+}
+
+
+interface BundleSchedulePayload {
+  name: string; report_key: string; frequency: string; hour_local: number;
+  minute_local: number; weekday: number | null; day_of_month: number | null;
+  channel: string; recipients: string[]; format: string; enabled: boolean;
+  report_keys: string[]; formats: string[]; window_mode: ReportWindowMode; outlet_scope: "outlet" | "all";
+}
+
+/** Refused out loud, as a 400 with a sentence (or a 403 for the scope). */
+function bundleError(message: string, status = 400): ReportEmailRequestError {
+  return new ReportEmailRequestError(message, status);
+}
+
+/**
+ * The bundle schedule a payload describes, checked against the catalogue, the
+ * address book and the caller's scope — one sentence per refusal.
+ *
+ * THREE RULES THAT PROTECT A SCHEDULE FROM AN OLDER CLIENT. A 2.0.1 app edits
+ * with {name, report_key, frequency, hour_local, minute_local} and knows only
+ * three report keys, resetting anything else to 'sales' in its form:
+ *   * a report_key alone never CHANGES what a schedule sends unless the row is
+ *     itself one of those three (all a 2.0.1 form can show). With report_keys
+ *     absent, any other row — two or more keys, or one MIS report such as
+ *     Item Wise — keeps its reports; otherwise that app's Edit turned an Item
+ *     Wise schedule into "Sales (accounting)" without anyone choosing it;
+ *   * omitted recipients, formats, scope and window keep the stored ones —
+ *     and the stored recipients are NOT re-checked against the book on such an
+ *     edit (the send-time check skips a removed address), so pausing a
+ *     schedule never fails because somebody left the book;
+ *   * moving a trading-day schedule off daily returns it to calendar days,
+ *     since a trading day exists only for a daily run.
+ */
+async function normalizeBundlePayload(
+  resId: string,
+  restaurantId: string,
+  input: Record<string, unknown>,
+  base: ReportScheduleRecord | undefined,
+  opts: { allowAllOutlets: boolean },
+): Promise<BundleSchedulePayload> {
+  const core = scheduleCoreOf(input, base);
+  const channel = oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel");
+
+  const legacyKey = input.report_key === undefined ? undefined : String(input.report_key).trim().toLowerCase();
+  // Only a row a 2.0.1 form can represent takes the key that form sends.
+  const legacyEditable = !base || isLegacyAccountingSelection(base.report_keys);
+  const rawKeys: unknown = input.report_keys !== undefined
+    ? input.report_keys
+    : legacyKey !== undefined && legacyKey !== "bundle" && legacyEditable
+      ? [legacyKey]
+      : base?.report_keys ?? ["sales"];
+  const askedKeys = (Array.isArray(rawKeys) ? rawKeys : [rawKeys]).map((k) => String(k ?? "").trim().toLowerCase());
+
+  let windowMode: ReportWindowMode;
+  if (input.window_mode !== undefined) {
+    if (!isWindowMode(input.window_mode)) {throw bundleError("window_mode must be calendar or trading_day");}
+    windowMode = input.window_mode;
+  } else if (base) {
+    windowMode = base.window_mode === "trading_day" && core.frequency === "daily" ? "trading_day" : "calendar";
+  } else {
+    // A NEW daily schedule closes its day at the send time unless it carries a
+    // report that may only be read on calendar days.
+    windowMode = core.frequency === "daily" && !askedKeys.some((k) => CALENDAR_ONLY_KEYS.includes(k)) ? "trading_day" : "calendar";
+  }
+  if (windowMode === "trading_day" && core.frequency !== "daily") {
+    throw bundleError("\"The day that just ended\" only applies to a daily schedule. Choose \"previous calendar day\" for a weekly or monthly one.");
+  }
+  const selection = validateReportSelection(askedKeys, windowMode);
+  if (!selection.ok) {throw bundleError(selection.error);}
+
+  const rawFormats: unknown = input.formats !== undefined
+    ? input.formats
+    : input.format !== undefined
+      ? [input.format]
+      : base?.formats;
+  const formats = validateReportFormats(rawFormats);
+  if (!formats.ok) {throw bundleError(formats.error);}
+
+  const scopeRaw = String(input.outlet_scope ?? base?.outlet_scope ?? "outlet").trim().toLowerCase();
+  if (scopeRaw !== "outlet" && scopeRaw !== "all") {throw bundleError("outlet_scope must be outlet or all");}
+  if (scopeRaw === "all" && base?.outlet_scope !== "all" && !opts.allowAllOutlets) {
+    throw bundleError("Only an admin or a manager can send reports for all outlets combined.", 403);
+  }
+
+  let recipients: string[] = [];
+  if (channel === "email") {
+    const asked = input.recipient_ids !== undefined || input.recipients !== undefined;
+    if (!asked && base) {
+      recipients = [...base.recipients];
+    } else if (input.recipient_ids !== undefined) {
+      const ids = Array.isArray(input.recipient_ids) ? input.recipient_ids.map((x) => String(x)) : [];
+      if (ids.length > MAX_REPORT_RECIPIENTS) {throw bundleError(`Choose at most ${String(MAX_REPORT_RECIPIENTS)} addresses.`);}
+      const found = await GetReportEmailRecipientsByIds(restaurantId, ids);
+      if (found.length !== new Set(ids).size) {
+        throw bundleError("One of the chosen addresses is no longer in the address book. Reload and choose again.");
+      }
+      recipients = found.map((r) => r.email);
+    } else {
+      const list = Array.isArray(input.recipients)
+        ? input.recipients.map((x) => String(x ?? "").trim()).filter(Boolean)
+        : typeof input.recipients === "string"
+          ? input.recipients.split(/[,;\n]/).map((x) => x.trim()).filter(Boolean)
+          : [];
+      const seen = new Set<string>();
+      const unique = list.filter((e) => { const k = normalizeEmailKey(e); if (seen.has(k)) {return false;} seen.add(k); return true; });
+      if (unique.length > MAX_REPORT_RECIPIENTS) {throw bundleError(`Choose at most ${String(MAX_REPORT_RECIPIENTS)} addresses.`);}
+      const book = await ReportEmailBookStatus(resId);
+      for (const e of unique) {
+        const status = book.get(normalizeEmailKey(e));
+        if (status !== "active") {
+          throw bundleError(status === "suppressed"
+            ? `${e} is paused in the address book and cannot receive reports.`
+            : `${e} is not in this restaurant's address book. Add it there first (Settings permission), then choose it.`);
+        }
+      }
+      recipients = unique;
+    }
+    if (recipients.length === 0) {
+      throw bundleError("An email schedule needs at least one address from the address book. Choose one, or deliver this schedule to the in-app inbox instead.");
+    }
+  }
+
+  return {
+    ...core,
+    channel,
+    recipients,
+    report_keys: selection.keys,
+    report_key: legacyReportKey(selection.keys),
+    formats: formats.formats,
+    format: formats.formats[0],
+    window_mode: windowMode,
+    outlet_scope: scopeRaw,
+  };
+}
+
+/**
+ * The half of a schedule every shape shares — name, cadence, clock, on/off —
+ * validated once for the 2.0.1 path and the bundle path alike.
+ */
+function scheduleCoreOf(
+  input: Record<string, unknown>,
+  base?: ReportScheduleRecord,
+): {
+  name: string; frequency: string; hour_local: number; minute_local: number;
+  weekday: number | null; day_of_month: number | null; enabled: boolean;
+} {
+  const name = String(input.name ?? base?.name ?? "").trim();
+  if (!name) { throw new Error("name is required"); }
+  const frequency = oneOf(input.frequency ?? base?.frequency ?? "daily", REPORT_SCHEDULE_FREQUENCIES, "frequency");
   return {
     name: name.slice(0, 120),
-    report_key: oneOf(input.report_key ?? base?.report_key ?? "sales", REPORT_SCHEDULE_KEYS, "report_key"),
     frequency,
     hour_local: boundedInt(input.hour_local ?? base?.hour_local ?? 8, 0, 23, "hour_local"),
     minute_local: boundedInt(input.minute_local ?? base?.minute_local ?? 0, 0, 59, "minute_local"),
@@ -21300,9 +21686,6 @@ function normalizeSchedulePayload(
     day_of_month: frequency === "monthly"
       ? boundedInt(input.day_of_month ?? base?.day_of_month ?? 1, 1, 28, "day_of_month")
       : null,
-    channel,
-    recipients,
-    format: oneOf(input.format ?? base?.format ?? "csv", REPORT_SCHEDULE_FORMATS, "format"),
     enabled: input.enabled === undefined ? (base?.enabled ?? true) : input.enabled !== false,
   };
 }
@@ -21338,8 +21721,37 @@ export async function CreateReportSchedule(
   restaurantId: string,
   input: Record<string, unknown>,
   createdBy?: string,
+  opts: { allowAllOutlets?: boolean } = {},
 ): Promise<ReportScheduleRecord> {
   const context = await requireRestaurantContext(restaurantId);
+  if (isBundlePayload(input)) {
+    if (!(await reportEmailSchemaReady())) {
+      // The older sentences first where they apply ("an email schedule needs a
+      // recipient"), then the honest one: this server's database is behind.
+      normalizeSchedulePayload({ ...input, report_key: "sales", format: "csv" });
+      throw new ReportEmailSchemaPendingError();
+    }
+    const b = await normalizeBundlePayload(context.res_id, restaurantId, input, undefined, { allowAllOutlets: opts.allowAllOutlets === true });
+    if (b.channel === "email" && (await CountEmailSchedules(context.res_id, context.outlet_id)) >= MAX_EMAIL_SCHEDULES_PER_OUTLET) {
+      throw bundleError(`An outlet can have at most ${String(MAX_EMAIL_SCHEDULES_PER_OUTLET)} email schedules. Remove one first.`);
+    }
+    const inserted = await runQuery<Record<string, any>>(
+      `insert into "ReportSchedules"
+         (res_id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+          weekday, day_of_month, channel, recipients, format, enabled, created_by, updated_by,
+          report_keys, formats, window_mode, outlet_scope)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15,$16,$17,$18)
+       returning ${SCHEDULE_COLS_057}`,
+      [
+        context.res_id, context.outlet_id, b.name, b.report_key, b.frequency,
+        b.hour_local, b.minute_local, b.weekday, b.day_of_month, b.channel,
+        b.recipients, b.format, b.enabled, (createdBy ?? "").trim() || null,
+        b.report_keys, b.formats, b.window_mode, b.outlet_scope,
+      ],
+    );
+    if (!inserted[0]) { throw new Error("Failed to create report schedule"); }
+    return mapReportSchedule(inserted[0]);
+  }
   const p = normalizeSchedulePayload(input);
   // The insert names migration 044's column, so an unapplied 044 raises 42703
   // here. scheduleWriteError turns that into a sentence an owner can act on —
@@ -21366,10 +21778,39 @@ export async function UpdateReportSchedule(
   scheduleId: string,
   input: Record<string, unknown>,
   updatedBy?: string,
+  opts: { allowAllOutlets?: boolean } = {},
 ): Promise<ReportScheduleRecord> {
   const context = await requireRestaurantContext(restaurantId);
   const existing = await GetReportSchedule(restaurantId, scheduleId);
   if (!existing) { throw new Error("Unknown report schedule"); }
+  if (isBundlePayload(input) || isBundleRow(existing)) {
+    if (!(await reportEmailSchemaReady())) {throw new ReportEmailSchemaPendingError();}
+    const b = await normalizeBundlePayload(context.res_id, restaurantId, input, existing, { allowAllOutlets: opts.allowAllOutlets === true });
+    if (b.channel === "email" && existing.channel !== "email"
+      && (await CountEmailSchedules(context.res_id, context.outlet_id)) >= MAX_EMAIL_SCHEDULES_PER_OUTLET) {
+      throw bundleError(`An outlet can have at most ${String(MAX_EMAIL_SCHEDULES_PER_OUTLET)} email schedules. Remove one first.`);
+    }
+    const reEnabled = b.enabled && !existing.enabled;
+    const changed = await runQuery<Record<string, any>>(
+      `update "ReportSchedules"
+          set name = $4, report_key = $5, frequency = $6, hour_local = $7,
+              minute_local = $8, weekday = $9, day_of_month = $10, channel = $11,
+              recipients = $12, format = $13, enabled = $14, updated_by = $15,
+              updated_at = now(),
+              consecutive_failures = case when $16 then 0 else consecutive_failures end,
+              report_keys = $17, formats = $18, window_mode = $19, outlet_scope = $20
+        where id = $3 and res_id = $1 and outlet_id = $2 and archived_at is null
+        returning ${SCHEDULE_COLS_057}`,
+      [
+        context.res_id, context.outlet_id, scheduleId, b.name, b.report_key,
+        b.frequency, b.hour_local, b.minute_local, b.weekday, b.day_of_month,
+        b.channel, b.recipients, b.format, b.enabled, (updatedBy ?? "").trim() || null, reEnabled,
+        b.report_keys, b.formats, b.window_mode, b.outlet_scope,
+      ],
+    );
+    if (!changed[0]) { throw new Error("Unknown report schedule"); }
+    return mapReportSchedule(changed[0]);
+  }
   const p = normalizeSchedulePayload(input, existing);
   // Re-enabling clears the failure streak: the owner has looked at it, and
   // otherwise the auto-disable in TouchReportScheduleOutcome would trip again on
@@ -21421,51 +21862,135 @@ export async function ArchiveReportSchedule(
   return rows.length > 0;
 }
 
-export async function GetReportDeliveries(
-  restaurantId: string,
-  opts: { schedule_id?: string; limit?: number } = {},
-): Promise<ReportDeliveryRecord[]> {
-  const context = await requireRestaurantContext(restaurantId);
-  const og = isAllOutlets() ? "true" : "false";
-  const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
-  const params: unknown[] = [context.res_id, context.outlet_id, limit];
-  let scheduleFilter = "";
-  if (opts.schedule_id) {
-    if (!isUuid(opts.schedule_id)) { return []; }
-    params.push(opts.schedule_id);
-    scheduleFilter = ` and schedule_id = $${String(params.length)}`;
-  }
-  const rows = await runQuery<Record<string, any>>(
-    `select id, schedule_id, outlet_id, occurrence_key, fire_at,
-            to_char(period_from, 'YYYY-MM-DD') as period_from,
-            to_char(period_to,   'YYYY-MM-DD') as period_to,
-            timezone, status, attempts, channel, artifact_name, artifact_bytes,
-            artifact_truncated, error, delivered_at, created_at
-       from "ReportDeliveries"
-      where res_id = $1 and (${og} or outlet_id = $2)${scheduleFilter}
-      order by created_at desc
-      limit $3`,
-    params,
+/** The delivery columns a 2.0.1 database has (044's delivered_to included). */
+const DELIVERY_COLS = `d.id, d.schedule_id, d.outlet_id, d.occurrence_key, d.fire_at,
+            to_char(d.period_from, 'YYYY-MM-DD') as period_from,
+            to_char(d.period_to,   'YYYY-MM-DD') as period_to,
+            d.timezone, d.status, d.attempts, d.channel, d.artifact_name, d.artifact_bytes,
+            d.artifact_truncated, d.error, d.delivered_at, d.created_at, d.delivered_to,
+            d.next_attempt_at`;
+
+/** …and migration 058's, with the files as one JSON list (never their bodies). */
+const DELIVERY_COLS_058 = `${DELIVERY_COLS},
+            d.kind, d.report_keys, d.formats, d.outlet_scope, d.day_close,
+            d.window_start_at, d.window_end_at, d.recipients, d.rejected_to, d.skipped_to,
+            d.provider, d.requested_by, d.sending_at, d.maybe_duplicate,
+            coalesce((
+              select json_agg(json_build_object(
+                       'id', f.id, 'report_key', f.report_key, 'format', f.format,
+                       'filename', f.filename, 'mime', f.mime, 'bytes', f.bytes,
+                       'rows', f.rows, 'truncated', f.truncated, 'purged', f.body is null)
+                     order by f.created_at, f.id)
+                from "ReportDeliveryFiles" f
+               where f.delivery_id = d.id and f.res_id = d.res_id
+            ), '[]'::json) as files`;
+
+function mapDelivery(r: Record<string, any>, now: Date = new Date()): ReportDeliveryRecord {
+  const files = Array.isArray(r.files) ? r.files : [];
+  const kind = r.kind === "adhoc" || r.kind === "manual" ? r.kind
+    : typeof r.occurrence_key === "string" && r.occurrence_key.startsWith("manual:") ? "manual" : "scheduled";
+  const attempts = Number(r.attempts) || 0;
+  // What the row MEANS, not only what its status column says — a dead last
+  // attempt reads as failed on a server whose reaper has not run.
+  const reading = deliveryReading(
+    { status: String(r.status), attempts, kind, error: r.error ?? null, next_attempt_at: r.next_attempt_at ?? null, created_at: r.created_at },
+    now,
+    reportCatchupMinutes(),
   );
-  return rows.map((r) => ({
+  return {
     id: String(r.id),
-    schedule_id: String(r.schedule_id),
+    schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
     outlet_id: String(r.outlet_id),
     occurrence_key: r.occurrence_key ?? null,
     fire_at: r.fire_at,
     period_from: String(r.period_from),
     period_to: String(r.period_to),
     timezone: String(r.timezone),
-    status: String(r.status),
-    attempts: Number(r.attempts) || 0,
+    status: reading.status,
+    attempts,
     channel: r.channel ?? null,
     artifact_name: r.artifact_name ?? null,
     artifact_bytes: r.artifact_bytes === null || r.artifact_bytes === undefined ? null : Number(r.artifact_bytes),
     artifact_truncated: r.artifact_truncated === true,
-    error: r.error ?? null,
+    error: reading.error,
     delivered_at: r.delivered_at ?? null,
     created_at: r.created_at,
-  }));
+    delivered_to: textArray(r.delivered_to),
+    kind,
+    report_keys: reportKeysOfRow(r),
+    formats: textArray(r.formats).length > 0 ? textArray(r.formats) : ["csv"],
+    outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+    day_close: r.day_close ?? null,
+    window_start_at: r.window_start_at ?? null,
+    window_end_at: r.window_end_at ?? null,
+    recipients: Array.isArray(r.recipients) ? textArray(r.recipients) : null,
+    rejected_to: textArray(r.rejected_to),
+    skipped_to: textArray(r.skipped_to),
+    provider: r.provider ?? null,
+    requested_by: r.requested_by ?? null,
+    sending_at: r.sending_at ?? null,
+    maybe_duplicate: r.maybe_duplicate === true,
+    files: files.map((f: Record<string, any>) => ({
+      id: String(f.id),
+      report_key: String(f.report_key),
+      format: String(f.format),
+      filename: String(f.filename),
+      mime: String(f.mime),
+      bytes: Number(f.bytes) || 0,
+      rows: Number(f.rows) || 0,
+      truncated: f.truncated === true,
+      purged: f.purged === true,
+    })),
+    next_attempt_at: reading.final || r.next_attempt_at === undefined ? null : r.next_attempt_at,
+    final: reading.final,
+  };
+}
+
+export async function GetReportDeliveries(
+  restaurantId: string,
+  opts: { schedule_id?: string; limit?: number; kind?: string } = {},
+): Promise<ReportDeliveryRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
+  const params: unknown[] = [context.res_id, context.outlet_id, limit];
+  const ready = await reportEmailSchemaReady();
+  let filter = "";
+  if (opts.schedule_id) {
+    if (!isUuid(opts.schedule_id)) { return []; }
+    params.push(opts.schedule_id);
+    filter += ` and d.schedule_id = $${String(params.length)}`;
+  }
+  if (opts.kind && ready && ["scheduled", "manual", "adhoc"].includes(opts.kind)) {
+    params.push(opts.kind);
+    filter += ` and d.kind = $${String(params.length)}`;
+  }
+  const rows = await runQuery<Record<string, any>>(
+    `select ${ready ? DELIVERY_COLS_058 : DELIVERY_COLS}
+       from "ReportDeliveries" d
+      where d.res_id = $1 and (${og} or d.outlet_id = $2)${filter}
+      order by d.created_at desc
+      limit $3`,
+    params,
+  );
+  const now = new Date();
+  return rows.map((r) => mapDelivery(r, now));
+}
+
+/** One delivery — what Send now's caller polls. Scoped like the list. */
+export async function GetReportDelivery(restaurantId: string, deliveryId: string): Promise<ReportDeliveryRecord | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(deliveryId)) { return null; }
+  const og = isAllOutlets() ? "true" : "false";
+  const ready = await reportEmailSchemaReady();
+  const rows = await runQuery<Record<string, any>>(
+    `select ${ready ? DELIVERY_COLS_058 : DELIVERY_COLS}
+       from "ReportDeliveries" d
+      where d.id = $3 and d.res_id = $1 and (${og} or d.outlet_id = $2)
+      limit 1`,
+    [context.res_id, context.outlet_id, deliveryId],
+  );
+  return rows[0] ? mapDelivery(rows[0]) : null;
 }
 
 /** Scoped by res_id AND outlet, never by id alone — the artifact is the tenant's
@@ -21512,7 +22037,8 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
   // list that only the email channel would have read.
   const rows = await scheduleRead<Record<string, any>>(
     (cols) => `select id, outlet_id, name, report_key, frequency, hour_local, minute_local,
-            weekday, day_of_month, channel, ${cols.includes("recipients") ? "recipients," : ""} format, created_at
+            weekday, day_of_month, channel, ${cols.includes("recipients") ? "recipients," : ""} format,
+            ${cols.includes("window_mode") ? "report_keys, formats, window_mode, outlet_scope," : ""} created_at
        from "ReportSchedules"
       where res_id = $1 and enabled = true and archived_at is null
       order by created_at asc
@@ -21532,6 +22058,7 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
     channel: String(r.channel),
     recipients: Array.isArray(r.recipients) ? r.recipients.map((x: unknown) => String(x)) : [],
     format: String(r.format),
+    ...bundleFieldsOf(r),
     created_at: r.created_at,
   }));
 }
@@ -21539,8 +22066,82 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
 /** Occurrences whose lease has expired and that still have attempts left. The
  *  schedule join is NOT filtered on `enabled`: a claimed occurrence is work that
  *  was already accepted, and dropping it on a toggle would leave a row stuck at
- *  'claimed' forever with nothing to explain it. */
-export async function ListRetryableReportDeliveries(resId: string, limit = 50): Promise<RetryableReportDelivery[]> {
+ *  'claimed' forever with nothing to explain it.
+ *
+ *  A RUN NOW OR SEND NOW IS NOT RETRIED PAST THE CATCH-UP WINDOW (`maxAgeMin`).
+ *  Without that bound, one claimed while this server had no mail transport
+ *  sat 'Queued' until some later deploy had one, and was then emailed —
+ *  days-old, to whoever was on it. The reaper fails it instead
+ *  (ReapExhaustedReportDeliveries). A scheduled occurrence keeps the bound it
+ *  always had: it is not claimed that late. */
+export async function ListRetryableReportDeliveries(
+  resId: string,
+  limit = 50,
+  maxAgeMin: number = reportCatchupMinutes(),
+): Promise<RetryableReportDelivery[]> {
+  const bounded = Math.max(1, Math.min(limit, 200));
+  const maxAge = Math.max(1, Math.round(maxAgeMin));
+  if (await reportEmailSchemaReady()) {
+    // A LEFT JOIN since migration 058: a Send now has no schedule, and an
+    // inner join would leave every failed one unretried forever. A scheduled
+    // row whose schedule row is missing is still skipped, as before.
+    //
+    // 'sending' is retryable once its lease has lapsed — that is a process that
+    // died mid-send, and the retry sends only to the addresses it had not
+    // finished (TakeReportDeliveryAttempt marks it maybe_duplicate).
+    const rows = await runQuery<Record<string, any>>(
+      `select d.id, d.schedule_id, d.outlet_id, d.occurrence_key,
+              to_char(d.period_from, 'YYYY-MM-DD') as period_from,
+              to_char(d.period_to,   'YYYY-MM-DD') as period_to,
+              d.timezone, d.attempts, d.channel, d.status,
+              coalesce(s.name, 'Send now') as name,
+              coalesce(s.report_key, 'bundle') as report_key,
+              coalesce(s.format, d.formats[1], 'csv') as format,
+              -- The schedule's CURRENT list for a scheduled row (044's decision,
+              -- see below); the snapshot a Send now was addressed to otherwise.
+              case when d.schedule_id is null then d.recipients else s.recipients end as recipients,
+              d.kind, d.outlet_scope, d.day_close, d.window_start_at, d.window_end_at, d.requested_by,
+              -- What the occurrence was CLAIMED as, like d.channel; a row written
+              -- before 058 carries empty lists and reads the schedule's.
+              case when cardinality(d.report_keys) > 0 then d.report_keys else s.report_keys end as report_keys,
+              case when d.kind = 'scheduled' and cardinality(d.report_keys) = 0 then s.formats else d.formats end as formats
+         from "ReportDeliveries" d
+         left join "ReportSchedules" s on s.id = d.schedule_id and s.res_id = d.res_id
+        where d.res_id = $1
+          and d.status in ('claimed','rendered','sending','failed')
+          and d.attempts < $2
+          and d.next_attempt_at <= now()
+          and (d.schedule_id is null or s.id is not null)
+          and (d.kind = 'scheduled' or d.created_at > now() - make_interval(mins => $4::int))
+        order by d.created_at asc
+        limit $3`,
+      [resId, REPORT_MAX_ATTEMPTS, bounded, maxAge],
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
+      outlet_id: String(r.outlet_id),
+      occurrence_key: r.occurrence_key ?? null,
+      period_from: String(r.period_from),
+      period_to: String(r.period_to),
+      timezone: String(r.timezone),
+      attempts: Number(r.attempts) || 0,
+      channel: r.channel ?? null,
+      recipients: textArray(r.recipients),
+      name: String(r.name ?? ""),
+      report_key: String(r.report_key),
+      format: String(r.format),
+      kind: r.kind === "adhoc" || r.kind === "manual" ? r.kind : "scheduled",
+      status: String(r.status),
+      report_keys: reportKeysOfRow(r),
+      formats: textArray(r.formats).length > 0 ? textArray(r.formats) : [String(r.format ?? "csv")],
+      outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+      day_close: r.day_close ?? null,
+      window_start_at: r.window_start_at ? new Date(r.window_start_at).toISOString() : null,
+      window_end_at: r.window_end_at ? new Date(r.window_end_at).toISOString() : null,
+      requested_by: r.requested_by ?? null,
+    }));
+  }
   const rows = await runQuery<Record<string, any>>(
     `select d.id, d.schedule_id, d.outlet_id, d.occurrence_key,
             to_char(d.period_from, 'YYYY-MM-DD') as period_from,
@@ -21563,9 +22164,11 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
         and d.status in ('claimed','rendered','failed')
         and d.attempts < $2
         and d.next_attempt_at <= now()
+        and (d.occurrence_key is null or d.occurrence_key not like 'manual:%'
+             or d.created_at > now() - make_interval(mins => $4::int))
       order by d.created_at asc
       limit $3`,
-    [resId, REPORT_MAX_ATTEMPTS, Math.max(1, Math.min(limit, 200))],
+    [resId, REPORT_MAX_ATTEMPTS, bounded, maxAge],
   );
   return rows.map((r) => ({
     id: String(r.id),
@@ -21581,22 +22184,117 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
     name: String(r.name ?? ""),
     report_key: String(r.report_key),
     format: String(r.format),
+    kind: typeof r.occurrence_key === "string" && r.occurrence_key.startsWith("manual:") ? "manual" : "scheduled",
+    status: "claimed",
+    report_keys: reportKeysOfRow(r),
+    formats: [String(r.format ?? "csv")],
+    outlet_scope: "outlet",
+    day_close: null,
+    window_start_at: null,
+    window_end_at: null,
+    requested_by: null,
   }));
 }
 
-/** Without this, a row that used up its attempts sits at 'claimed' forever and is
- *  excluded from the retry scan by `attempts < 3` — invisible rather than failed.
- *  A plain idempotent UPDATE, so two replicas running it concurrently is fine. */
-export async function ReapExhaustedReportDeliveries(resId: string): Promise<number> {
-  const rows = await runQuery<{ id: string }>(
-    `update "ReportDeliveries"
-        set status = 'failed', error = coalesce(error, 'Retries exhausted')
-      where res_id = $1 and attempts >= $2 and next_attempt_at <= now()
-        and status in ('claimed','rendered')
-      returning id`,
-    [resId, REPORT_MAX_ATTEMPTS],
-  );
-  return rows.length;
+/** One delivery shaped for a run — what a Send now or Run now kick works from. */
+export async function GetRunnableReportDelivery(resId: string, deliveryId: string): Promise<RetryableReportDelivery | null> {
+  // The id is only ever COMPARED with rows the retry scan returned — never bound.
+  const all = await ListRetryableReportDeliveries(resId, 200);
+  return all.find((d) => d.id === deliveryId) ?? null;
+}
+
+/** A row the reaper just failed for good, shaped like a retry row so the sweep
+ *  can tell the owner about it the way recordFailure does, with the error the
+ *  row now carries. */
+export interface ReapedReportDelivery extends RetryableReportDelivery {
+  error: string;
+}
+
+/**
+ * Without this, a row that used up its attempts sits at 'claimed' forever and is
+ * excluded from the retry scan by `attempts < 3` — invisible rather than failed.
+ * An idempotent UPDATE, so two replicas running it concurrently is fine: the
+ * second finds nothing left to fail, so the owner hears once.
+ *
+ * SINCE THE ITEM 9 REVIEW it fails two more kinds of row that nothing else
+ * would ever settle, and hands them back so the sweep rings the final-failure
+ * bell and marks the schedule card — a plain UPDATE left the owner staring at
+ * "Sending" (and the app polling) with no bell at all:
+ *   * 'sending' on its last attempt, the worker gone (a deploy recreate is
+ *     enough) — its per-address outcome is already on the row;
+ *   * a Run now or Send now older than the catch-up window that never
+ *     finished — dropped, not sent late (ListRetryableReportDeliveries no
+ *     longer offers it).
+ */
+export async function ReapExhaustedReportDeliveries(
+  resId: string,
+  maxAgeMin: number = reportCatchupMinutes(),
+): Promise<ReapedReportDelivery[]> {
+  const maxAge = Math.max(1, Math.round(maxAgeMin));
+  if (await reportEmailSchemaReady()) {
+    const rows = await runQuery<Record<string, any>>(
+      `with reaped as (
+         update "ReportDeliveries" d
+            set status = 'failed',
+                attempts = greatest(d.attempts, $2),
+                error = case
+                  when d.attempts >= $2 then coalesce(d.error, case when d.status = 'sending' then $4::text else $5::text end)
+                  else left($6::text || coalesce(' Last problem: ' || d.error, ''), 800)
+                end
+          where d.res_id = $1
+            and d.next_attempt_at <= now()
+            and ((d.attempts >= $2 and d.status in ('claimed','rendered','sending'))
+              or (d.kind in ('manual','adhoc') and d.attempts < $2
+                  and d.status in ('claimed','rendered','sending','failed')
+                  and d.created_at <= now() - make_interval(mins => $3::int)))
+          returning d.id, d.res_id, d.schedule_id, d.outlet_id, d.occurrence_key, d.period_from, d.period_to,
+                    d.timezone, d.attempts, d.channel, d.status, d.error, d.kind, d.report_keys, d.formats,
+                    d.outlet_scope, d.day_close, d.window_start_at, d.window_end_at, d.requested_by, d.recipients
+       )
+       select r.id, r.schedule_id, r.outlet_id, r.occurrence_key,
+              to_char(r.period_from, 'YYYY-MM-DD') as period_from,
+              to_char(r.period_to,   'YYYY-MM-DD') as period_to,
+              r.timezone, r.attempts, r.channel, r.status, r.error,
+              coalesce(s.name, 'Send now') as name,
+              coalesce(s.report_key, 'bundle') as report_key,
+              coalesce(s.format, r.formats[1], 'csv') as format,
+              case when r.schedule_id is null then r.recipients else s.recipients end as recipients,
+              r.kind, r.outlet_scope, r.day_close, r.window_start_at, r.window_end_at, r.requested_by,
+              case when cardinality(r.report_keys) > 0 then r.report_keys else s.report_keys end as report_keys,
+              case when r.kind = 'scheduled' and cardinality(r.report_keys) = 0 then s.formats else r.formats end as formats
+         from reaped r
+         left join "ReportSchedules" s on s.id = r.schedule_id and s.res_id = r.res_id`,
+      [resId, REPORT_MAX_ATTEMPTS, maxAge, REPORT_STOPPED_MID_SEND, REPORT_RETRIES_EXHAUSTED, reportDroppedLateSentence(maxAge)],
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
+      outlet_id: String(r.outlet_id),
+      occurrence_key: r.occurrence_key ?? null,
+      period_from: String(r.period_from),
+      period_to: String(r.period_to),
+      timezone: String(r.timezone),
+      attempts: Number(r.attempts) || 0,
+      channel: r.channel ?? null,
+      recipients: textArray(r.recipients),
+      name: String(r.name ?? ""),
+      report_key: String(r.report_key),
+      format: String(r.format),
+      kind: r.kind === "adhoc" || r.kind === "manual" ? r.kind : "scheduled",
+      status: String(r.status),
+      report_keys: reportKeysOfRow(r),
+      formats: textArray(r.formats).length > 0 ? textArray(r.formats) : [String(r.format ?? "csv")],
+      outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+      day_close: r.day_close ?? null,
+      window_start_at: r.window_start_at ? new Date(r.window_start_at).toISOString() : null,
+      window_end_at: r.window_end_at ? new Date(r.window_end_at).toISOString() : null,
+      requested_by: r.requested_by ?? null,
+      error: String(r.error ?? REPORT_RETRIES_EXHAUSTED),
+    }));
+  }
+  // The sweep, this function's only caller, does not run on a database without
+  // 058 (report_schedules.ts rule 6), and nothing else settles a row there.
+  return [];
 }
 
 /**
@@ -21676,10 +22374,155 @@ export async function WarmReportingSchema(): Promise<void> {
     try { await fn(); }
     catch (err) { logger.warn({ err, label }, "warm_reporting_schema_step_failed"); }
   };
-  await step("Bills.workflow_cols", () => ensureBillWorkflowColumns());
-  await step("Expenses", () => ensureExpensesTable());
-  await step("Notifications", () => ensureNotificationsTable());
-  await step("branding_columns", () => ensureBrandingColumns());
+  // PROBE FIRST (client item 9, before the scheduler may be switched on).
+  // `ADD COLUMN IF NOT EXISTS` takes ACCESS EXCLUSIVE before it looks, and the
+  // two groups below are ~17 ALTERs on "Bills" and ~40 on "Restaurant" — the
+  // two tables every request reads first. Issued blind at boot, with no lock
+  // timeout, they are the shape of the 2026-08-24 convoy. So the catalogue is
+  // asked, only the MISSING columns are added (under a 2s LOCAL lock timeout,
+  // the InitKotDocketSchema pattern), and when nothing is missing the lazy
+  // helpers are simply marked done — the same end state, with no lock taken.
+  await step("Bills.workflow_cols", () => warmColumns("Bills", BILL_WORKFLOW_COLUMN_DDL, () => {
+    ddlEnsured.add("Bills.round_off");
+    ddlEnsured.add("Bills.workflow_cols");
+  }));
+  await step("Bills.workflow_actions", () => seedBillWorkflowActions());
+  await step("Expenses", () => warmTable("Expenses", null, () => ensureExpensesTable(), () => { ddlEnsured.add("Expenses"); }));
+  await step("Notifications", () => warmTable("Notifications", "notifications_res_idx", () => ensureNotificationsTable(), () => { ddlEnsured.add("Notifications"); }));
+  await step("branding_columns", () => warmColumns("Restaurant", RESTAURANT_BRANDING_COLUMN_DDL, () => { brandingColsEnsured = true; }));
+}
+
+/**
+ * The "Bills" columns ensureBillWorkflowColumns issues (with 048's round_off),
+ * as [name, definition] — held to that function statement by statement by
+ * jest-tests/report_warm_schema.test.ts, so the probe can never ask about a
+ * different list from the one the lazy path creates.
+ */
+export const BILL_WORKFLOW_COLUMN_DDL: readonly (readonly [string, string])[] = [
+  ["round_off", "numeric(12,2)"],
+  ["payment_method", "text"],
+  ["waiter_confirmed_at", "timestamptz"],
+  ["waiter_confirmed_by_username", "text"],
+  ["payment_proof_screenshot_url", "text"],
+  ["admin_approved_at", "timestamptz"],
+  ["admin_approved_by_username", "text"],
+  ["closed_at", "timestamptz"],
+  ["closed_by_username", "text"],
+  ["discount_type", "text"],
+  ["discount_value", "numeric"],
+  ["coupon_code", "text"],
+  ["refunded_at", "timestamptz"],
+  ["refunded_by_username", "text"],
+  ["refund_amount", "numeric"],
+  ["refund_reason", "text"],
+  ["refund_ref", "text"],
+  ["payment_splits", "jsonb"],
+];
+
+/** The "Restaurant" columns ensureBrandingColumns issues, likewise held to it. */
+export const RESTAURANT_BRANDING_COLUMN_DDL: readonly (readonly [string, string])[] = [
+  ["theme_color", "text"],
+  ["auto_push_orders", "boolean default true"],
+  ["currency", "text"],
+  ["payment_config", "jsonb"],
+  ["razorpay_key_id", "text"],
+  ["razorpay_key_secret", "text"],
+  ["service_charge", "numeric default 0"],
+  ["feedback_config", "jsonb"],
+  ["bill_logo_svg", "text"],
+  ["bill_paper_width", "text"],
+  ["bill_legal_name", "text"],
+  ["bill_gstin", "text"],
+  ["bill_qr_note", "text"],
+  ["queue_show_menu", "boolean default true"],
+  ["queue_menu_config", "jsonb default null"],
+  ["discount_approval_threshold", "numeric default 0"],
+  ["bill_reopen_window_min", "integer default 240"],
+  ["alert_discount_pct", "numeric default 10"],
+  ["alert_void_count", "integer default 5"],
+  ["loyalty_earn_per_100", "numeric default 0"],
+  ["loyalty_point_value", "numeric default 1"],
+  ["aggregator_key", "text"],
+  ["booking_deposit_amount", "numeric default 0"],
+  ["booking_deposit_min_party", "integer default 0"],
+  ["booking_cancel_window_hours", "integer default 24"],
+  ["booking_min_spend", "numeric default 0"],
+  ["msg_provider", "text default 'none'"],
+  ["msg_sender", "text"],
+  ["msg_key_id", "text"],
+  ["msg_key_secret", "text"],
+  ["msg_reminder_hours", "integer default 2"],
+  ["msg_webhook_secret", "text"],
+  ["kitchen_sections", "jsonb"],
+  ["inventory_categories", "jsonb"],
+  ["timezone", "text default 'Asia/Kolkata'"],
+  ["require_table_otp", "boolean default false"],
+  ["kot_auto_print", "boolean default true"],
+  ["bill_show_qr", "boolean default true"],
+  ["brand_config", "jsonb default null"],
+  ["menu_badges", "jsonb default null"],
+  ["report_time_slots", "jsonb default null"],
+  ["kot_print_style", "text"],
+  ["kot_text_size", "text"],
+];
+
+async function existingColumns(table: string): Promise<Set<string>> {
+  const rows = await runQuery<{ column_name: string }>(
+    `select column_name from information_schema.columns where table_schema = 'public' and table_name = $1`,
+    [table],
+  );
+  return new Set(rows.map((r) => String(r.column_name)));
+}
+
+/**
+ * Ask which of `spec` are missing and add only those, in ONE DO block under a
+ * 2-second transaction-local lock timeout. `markDone` runs only when every
+ * column is there afterwards; otherwise the lazy path stays armed and retries.
+ * Table and column text are the constants above — never input.
+ */
+async function warmColumns(table: string, spec: readonly (readonly [string, string])[], markDone: () => void): Promise<void> {
+  const present = await existingColumns(table);
+  const missing = spec.filter(([name]) => !present.has(name));
+  if (missing.length > 0) {
+    await runQuery(
+      `do $$
+       begin
+         perform set_config('lock_timeout', '2s', true);
+         ${missing.map(([name, def]) => `alter table "${table}" add column if not exists ${name} ${def};`).join("\n         ")}
+       end $$`,
+    );
+    const after = await existingColumns(table);
+    const still = spec.filter(([name]) => !after.has(name)).map(([name]) => name);
+    if (still.length > 0) {
+      logger.warn({ table, missing: still }, "warm_reporting_schema_columns_missing");
+      return;
+    }
+  }
+  markDone();
+}
+
+/** A lazy table is warm when it exists with RLS forced (and its index, when it has one). */
+async function warmTable(table: string, index: string | null, ensure: () => Promise<void>, markDone: () => void): Promise<void> {
+  const probe = async () => {
+    const rows = await runQuery<{ ok: boolean }>(
+      `select exists (select 1 from pg_class where oid = to_regclass($1) and relrowsecurity and relforcerowsecurity)
+              and ($2::text is null or to_regclass($2::text) is not null) as ok`,
+      [`"${table}"`, index],
+    );
+    return rows[0]?.ok === true;
+  };
+  if (await probe()) { markDone(); return; }
+  await ensure();
+}
+
+/** The two audit labels ensureBillWorkflowColumns seeds — an INSERT, no DDL, no lock worth naming. */
+async function seedBillWorkflowActions(): Promise<void> {
+  await runQuery(
+    `insert into "Actions" (id, action_name, action_desc, "group")
+     values ('c4d2e6f8-1a3b-4c5d-8e7f-2b4a6c8d0e1f', 'Approve Discount', 'Review (approve/reject) staff bill-discount requests', 'Bills'::"Action_groups"),
+            ('d5e3f7a9-2b4c-4d6e-9f80-3c5b7d9e1f2a', 'Reopened bill', 'Re-open a closed bill within the allowed window', 'Bills'::"Action_groups")
+     on conflict (id) do nothing`,
+  ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
 }
 
 // --- Group 3: the occurrence lifecycle — the at-most-once machinery ----------
@@ -21698,8 +22541,37 @@ export async function ClaimReportOccurrence(
     fire_at: Date; period_from: string; period_to: string; timezone: string;
     claimed_by: string; status: "claimed" | "abandoned"; channel: string;
     next_attempt_at: Date;
+    /** Migration 058: what the occurrence is being claimed AS. */
+    bundle?: {
+      kind: "scheduled" | "manual";
+      report_keys: string[]; formats: string[]; outlet_scope: string;
+      day_close: string | null; window_start_at: string; window_end_at: string;
+      requested_by?: string | null;
+    };
   },
 ): Promise<string | null> {
+  if (claim.bundle && (await reportEmailSchemaReady())) {
+    const b = claim.bundle;
+    const claimed = await runQuery<{ id: string }>(
+      // The same partial-index ON CONFLICT as below, predicate repeated.
+      `insert into "ReportDeliveries"
+         (res_id, outlet_id, schedule_id, occurrence_key, fire_at,
+          period_from, period_to, timezone, claimed_by, status, channel, next_attempt_at,
+          kind, report_keys, formats, outlet_scope, day_close, window_start_at, window_end_at, requested_by)
+       values ($1,$2,$3,$4,$5,$6::date,$7::date,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+       on conflict (schedule_id, occurrence_key) where occurrence_key is not null
+         do nothing
+       returning id`,
+      [
+        resId, claim.outlet_id, claim.schedule_id, claim.occurrence_key,
+        claim.fire_at.toISOString(), claim.period_from, claim.period_to, claim.timezone,
+        claim.claimed_by, claim.status, claim.channel, claim.next_attempt_at.toISOString(),
+        b.kind, b.report_keys, b.formats, b.outlet_scope, b.day_close, b.window_start_at, b.window_end_at,
+        b.requested_by ?? null,
+      ],
+    );
+    return claimed[0]?.id ?? null;
+  }
   const rows = await runQuery<{ id: string }>(
     // report_deliveries_occurrence_uniq is PARTIAL (where occurrence_key is not
     // null). Postgres will NOT infer a partial index unless the ON CONFLICT
@@ -21744,8 +22616,22 @@ export async function TakeReportDeliveryAttempt(
   leaseUntil: Date,
   workerId: string,
 ): Promise<number | null> {
+  // Since 058 a row found mid-send ('sending', its lease lapsed) is a process
+  // that died between two messages. It is resumed — and flagged, because an
+  // address whose send completed but whose outcome was never committed will
+  // get the report again. The guarantee SMTP gives is "at least once".
   const rows = await runQuery<{ attempts: number }>(
-    `update "ReportDeliveries"
+    (await reportEmailSchemaReady())
+      ? `update "ReportDeliveries"
+        set attempts = attempts + 1,
+            next_attempt_at = $4,
+            claimed_by = $5,
+            maybe_duplicate = maybe_duplicate or status = 'sending',
+            status = case when status = 'failed' then 'claimed' else status end
+      where id = $1 and res_id = $2 and attempts = $3
+        and status in ('claimed','rendered','sending','failed')
+      returning attempts`
+      : `update "ReportDeliveries"
         set attempts = attempts + 1,
             next_attempt_at = $4,
             claimed_by = $5,
@@ -21829,13 +22715,18 @@ export async function MarkReportDelivered(
     deliveryId: string; attempts: number; scheduleId: string;
     occurrenceKey: string | null; title: string; body: string;
     channel?: string; deliveredTo?: readonly string[];
+    /** Where the bell sends the owner to read it (default Accounting, 026's). */
+    module?: string;
   },
 ): Promise<void> {
   const rows = await runQuery<{ id: string }>(
+    // delivered_to: the caller's list on the one-shot path (inbox, 044's
+    // email); on the per-address path (item 9) it is already on the row,
+    // committed address by address, and null here leaves it as it is.
     `update "ReportDeliveries"
         set status = 'delivered', delivered_at = now(), error = null,
             channel = coalesce($4, channel),
-            delivered_to = $5
+            delivered_to = coalesce($5, delivered_to)
       where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'
       returning id`,
     [
@@ -21854,7 +22745,7 @@ export async function MarkReportDelivered(
     meta: {
       // notificationEntityOf has no case for "report" and finds no id it knows,
       // so it returns a null module and AddNotification leaves this one alone.
-      module: "Accounting",
+      module: d.module ?? "Accounting",
       schedule_id: d.scheduleId,
       delivery_id: d.deliveryId,
       occurrence_key: d.occurrenceKey,
@@ -21880,14 +22771,20 @@ export async function RecordReportDeliveryFailure(
   attempts: number,
   nextAttemptAt: Date,
   error: string,
+  opts: { final?: boolean } = {},
 ): Promise<void> {
   await runQuery(
     // CAS on the same token: a superseded worker's error must never land on a row
     // another worker has already delivered.
+    //
+    // `final` is a failure no retry can fix (every address refused, nothing
+    // left to send): the row takes its last attempt now, so the retry scan and
+    // the reaper both see it as done.
     `update "ReportDeliveries"
-        set status = 'failed', error = $5, next_attempt_at = $4
+        set status = 'failed', error = $5, next_attempt_at = $4,
+            attempts = case when $6::boolean then greatest(attempts, $7::int) else attempts end
       where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'`,
-    [deliveryId, resId, attempts, nextAttemptAt.toISOString(), error.slice(0, 800)],
+    [deliveryId, resId, attempts, nextAttemptAt.toISOString(), error.slice(0, 800), opts.final === true, REPORT_MAX_ATTEMPTS],
   );
 }
 
@@ -21927,6 +22824,822 @@ export async function TouchReportScheduleOutcome(
   );
   const row = rows[0];
   return { auto_disabled: !ok && row?.enabled === false };
+}
+
+
+// --- Report email (client item 9; migrations 056-058) -------------------------
+//
+// The address book, the bundle schedule's extra columns, the delivery log's
+// per-address outcomes, the attachment store and the sweep's single-row lease.
+// report_schedules.ts orchestrates; report_bundle.ts renders; every statement
+// is here, for the reason the header of this section's 026 half gives.
+//
+// DEGRADATION. The backend ships before 056-058 are applied by hand, and issues
+// their statements itself at boot (InitReportEmailSchema). On a runtime that
+// cannot (app_runtime, no DDL), the latch below stays false and:
+//   * every read that would name a new column issues the SQL it issued on
+//     2.0.1 (and reads the new fields as their defaults);
+//   * every NEW write — the address book, Send now, a bundle or email
+//     schedule, a test email — throws ReportEmailSchemaPendingError, which the
+//     routes answer 503 with one sentence;
+//   * a 2.0.1-shaped inbox schedule (one accounting report, CSV, calendar day)
+//     can still be created and edited exactly as before;
+//   * but NOTHING SCHEDULED RUNS. The sweep's lease, the per-address log and
+//     the file store all live in 058, so the sweep waits for it (report_schedules.ts
+//     rule 6) — inbox schedules included — and Run now answers 503 rather than
+//     queue a run nothing will finish. The sentences below once promised
+//     "existing scheduled reports keep running"; they say what happens instead.
+
+/** A new report-email write on a database that has not got 056-058 yet. */
+export class ReportEmailSchemaPendingError extends Error {
+  readonly code = "REPORT_EMAIL_SCHEMA_PENDING";
+  constructor() {
+    super("Email reports need a database update (migrations 056-058) that has not been applied to this server yet. Until it is, no scheduled report is sent from this server; ask your administrator to apply it.");
+    this.name = "ReportEmailSchemaPendingError";
+  }
+}
+
+/** A refusal the person can act on: one sentence, and the status a route answers with. */
+export class ReportEmailRequestError extends Error {
+  readonly code = "REPORT_EMAIL_REQUEST";
+  constructor(message: string, readonly status = 400, readonly reason = "invalid") {
+    super(message);
+    this.name = "ReportEmailRequestError";
+  }
+}
+
+export function isReportEmailSchemaPending(e: unknown): e is ReportEmailSchemaPendingError {
+  return (e as { code?: unknown } | null)?.code === "REPORT_EMAIL_SCHEMA_PENDING";
+}
+export function isReportEmailRequestError(e: unknown): e is ReportEmailRequestError {
+  return (e as { code?: unknown } | null)?.code === "REPORT_EMAIL_REQUEST";
+}
+
+interface ReportEmailSchemaState { m056: boolean; m057: boolean; m058: boolean }
+
+// THE LATCH, in nextPartyReady's shape: PRESENT is remembered for good; ABSENT
+// is re-asked after a minute (056-058 may be applied by hand while this process
+// runs) — by a catalogue read only, never by DDL at request time.
+let reportEmailSchema: (ReportEmailSchemaState & { checkedAt: number }) | null = null;
+const REPORT_EMAIL_REPROBE_MS = 60_000;
+
+async function probeReportEmailSchema(): Promise<ReportEmailSchemaState> {
+  const rows = await runQuery<{ m056: boolean | null; m057: boolean | null; m058: boolean | null }>(REPORT_EMAIL_SCHEMA_PROBE);
+  const r = rows[0];
+  return { m056: r?.m056 === true, m057: r?.m057 === true, m058: r?.m058 === true };
+}
+
+const allReady = (s: ReportEmailSchemaState | null): boolean => !!s && s.m056 && s.m057 && s.m058;
+
+/** Is every part of 056-058 in place? Never throws: a failed probe is "no". */
+export async function reportEmailSchemaReady(): Promise<boolean> {
+  const now = Date.now();
+  const known = reportEmailSchema;
+  if (known && (allReady(known) || now - known.checkedAt < REPORT_EMAIL_REPROBE_MS)) {return allReady(known);}
+  try {
+    const state = await probeReportEmailSchema();
+    reportEmailSchema = { ...state, checkedAt: now };
+    return allReady(state);
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "report_email_schema_probe_failed");
+    reportEmailSchema = { m056: false, m057: false, m058: false, checkedAt: now };
+    return false;
+  }
+}
+
+async function requireReportEmailSchema(): Promise<void> {
+  if (!(await reportEmailSchemaReady())) {throw new ReportEmailSchemaPendingError();}
+}
+
+/** Test seam (jest only): forget what the latch learned. */
+export function resetReportEmailSchemaCache(): void {
+  reportEmailSchema = null;
+}
+
+/**
+ * Run `fn` with NO ambient tenant connection.
+ *
+ * A route that starts background work (Send now, Run now) must not let that
+ * work inherit the request's AsyncLocalStorage: withTenant is re-entrant, so
+ * the work would run on the REQUEST's connection — holding it across an SMTP
+ * round trip, and bound to the caller's outlet rather than the delivery's.
+ * `exit` gives the callback, and every continuation it schedules, an empty
+ * store, so each withTenant inside checks out its own short-lived client.
+ */
+export function runOutsideTenantContext<T>(fn: () => T): T {
+  return tenantStorage.exit(fn);
+}
+
+/** Bound every statement of the ambient transaction (a report read). LOCAL: it ends with the transaction. */
+export async function SetLocalStatementTimeout(ms: number): Promise<void> {
+  await runQuery(`select set_config('statement_timeout', $1, true)`, [`${String(Math.max(1000, Math.round(ms)))}ms`]);
+}
+
+/** What a report email says about where it came from. Read inside the delivery's own transaction. */
+export async function GetReportEmailIdentity(resId: string, outletId: string): Promise<{
+  restaurant_name: string; outlet_name: string | null; currency: string | null; timezone: string;
+}> {
+  const rows = await runQuery<{ res_name: string | null; currency: string | null; timezone: string | null; outlet_name: string | null }>(
+    `select r.res_name, r.currency, r.timezone, o.outlet_name
+       from "Restaurant" r
+       left join "Outlets" o on o.id = $2 and o.res_id = r.id
+      where r.id = $1
+      limit 1`,
+    [resId, isUuid(outletId) ? outletId : null],
+  );
+  const r = rows[0];
+  return {
+    restaurant_name: String(r?.res_name ?? "").trim() || "Your restaurant",
+    outlet_name: r?.outlet_name ?? null,
+    currency: r?.currency ?? null,
+    timezone: sanitizeTimezone(r?.timezone),
+  };
+}
+
+export interface ReportEmailWindow {
+  from: string;
+  to: string;
+  days: number;
+  clamped: WindowClamp[];
+  /** "HH:mm" on a trading day, null for calendar days (a 00:00 close is calendar days). */
+  day_close: string | null;
+  day_shift_min: number;
+  /** The first instant the reports count, and the first they do not. */
+  window_start_at: string;
+  window_end_at: string;
+  timezone: string;
+}
+
+/**
+ * The window a Send now or a schedule occurrence covers, as the MIS readers
+ * will read it: resolveReportWindow's days, then the trading day's instants
+ * through misWindowInstants — the SAME conversion misContext makes, so the
+ * instants on the delivery row are the instants the reports bound.
+ */
+export async function ResolveReportEmailWindow(
+  restaurantId: string,
+  q: { from?: unknown; to?: unknown; day_close?: unknown },
+  maxDays: number,
+): Promise<ReportEmailWindow> {
+  const context = await requireRestaurantContext(restaurantId);
+  return reportEmailWindowIn(context.timezone, q, maxDays);
+}
+
+/** ResolveReportEmailWindow for a zone already known (the sweep reads it directly). */
+export function reportEmailWindowIn(
+  tz: string,
+  q: { from?: unknown; to?: unknown; day_close?: unknown },
+  maxDays: number,
+  now?: Date,
+): ReportEmailWindow {
+  const w = resolveReportWindow({ from: q.from, to: q.to }, tz, { defaultDays: 1, maxDays, now });
+  const clamped: WindowClamp[] = [...w.clamped];
+  const raw = Array.isArray(q.day_close) ? q.day_close[0] : q.day_close;
+  let shift = 0;
+  if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
+    const close = parseDayClose(raw);
+    if (close === null) {clamped.push("day_close_unparseable");}
+    else {shift = dayShiftForClose(close);}
+  }
+  const instants = misWindowInstants(w, tz, null, shift);
+  return {
+    from: w.from,
+    to: w.to,
+    days: w.days,
+    clamped,
+    day_close: shift ? formatClock(dayCloseOfShift(shift)) : null,
+    day_shift_min: shift,
+    window_start_at: instants.fromIso,
+    window_end_at: instants.toIso,
+    timezone: tz,
+  };
+}
+
+/**
+ * Migrations 056-058, ONCE, at boot — before the listener, outside any request
+ * transaction: the step 048, 050, 051, 052 and 053 already have.
+ *
+ * PROBE FIRST. The statements are all catalogue-guarded, but even the guarded
+ * form costs a transaction per file, so a database that already has the
+ * schema is only asked, never altered. A missing part is made in ONE
+ * transaction per migration under a 2-second LOCAL lock_timeout — the file's
+ * own shape — so a lock held by the process being replaced refuses this fast
+ * instead of queueing readers behind it; the next boot tries again.
+ *
+ * Never throws. The answer is also the latch every route reads.
+ */
+export async function InitReportEmailSchema(): Promise<ReportEmailSchemaState> {
+  let state: ReportEmailSchemaState = { m056: false, m057: false, m058: false };
+  try {
+    state = await probeReportEmailSchema();
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "report_email_schema_probe_failed");
+  }
+  const groups: [keyof ReportEmailSchemaState, readonly string[]][] = [
+    ["m056", REPORT_EMAIL_DDL_056],
+    ["m057", REPORT_EMAIL_DDL_057],
+    ["m058", REPORT_EMAIL_DDL_058],
+  ];
+  for (const [key, statements] of groups) {
+    if (state[key]) {continue;}
+    try {
+      await withTransaction(async (client) => {
+        await runQuery(`set local lock_timeout = '2s'`, [], client);
+        for (const sql of statements) {await runQuery(sql, [], client);}
+      });
+    } catch (err) {
+      logger.warn({ err: (err as { message?: string } | null)?.message ?? err, migration: key.slice(1) }, "report_email_schema_boot_ensure_failed");
+    }
+  }
+  try {
+    state = await probeReportEmailSchema();
+  } catch {
+    state = { m056: false, m057: false, m058: false };
+  }
+  reportEmailSchema = { ...state, checkedAt: Date.now() };
+  if (!allReady(state)) {
+    logger.error({ ...state }, "Report email is OFF — migrations 056-058 are not all applied here and this role could not add them. The scheduled report sweep WAITS until they are: no scheduled report (in-app inbox ones included) is sent from this server.");
+  }
+  return state;
+}
+
+// --- The address book (056) --------------------------------------------------
+
+export interface ReportEmailRecipient {
+  id: string;
+  email: string;
+  label: string | null;
+  status: "active" | "suppressed";
+  suppressed_reason: string | null;
+  created_at: Date;
+  created_by: string | null;
+}
+
+const RECIPIENT_COLS = `id, email, label, status, suppressed_reason, created_at, created_by`;
+
+function mapRecipient(r: Record<string, any>): ReportEmailRecipient {
+  return {
+    id: String(r.id),
+    email: String(r.email),
+    label: r.label ?? null,
+    status: r.status === "suppressed" ? "suppressed" : "active",
+    suppressed_reason: r.suppressed_reason ?? null,
+    created_at: r.created_at,
+    created_by: r.created_by ?? null,
+  };
+}
+
+/** A label cleaned the way time-slot labels are: no control characters, one space, 60 characters. */
+function cleanRecipientLabel(raw: unknown): string | null {
+  if (typeof raw !== "string") {return null;}
+  let out = "";
+  for (const ch of raw) {
+    const code = ch.codePointAt(0) ?? 0;
+    out += code < 32 || code === 127 ? " " : ch;
+  }
+  const s = out.replace(/\s+/g, " ").trim();
+  return s ? [...s].slice(0, 60).join("") : null;
+}
+
+/** The restaurant's LIVE addresses (removed ones are history, not the book). Restaurant-wide. */
+export async function ListReportEmailRecipients(restaurantId: string): Promise<ReportEmailRecipient[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!(await reportEmailSchemaReady())) {return [];}
+  const rows = await runQuery<Record<string, any>>(
+    `select ${RECIPIENT_COLS} from "ReportEmailRecipients"
+      where res_id = $1 and removed_at is null
+      order by created_at asc, id asc`,
+    [context.res_id],
+  );
+  return rows.map(mapRecipient);
+}
+
+/**
+ * Add one address. REFUSED OUT LOUD: an implausible address, a 26th, or one
+ * already in the book. The address is trimmed before it is stored (the column
+ * refuses whitespace); its case is kept, and uniqueness ignores it.
+ */
+export async function AddReportEmailRecipient(
+  restaurantId: string,
+  input: { email?: unknown; label?: unknown },
+  createdBy?: string,
+): Promise<ReportEmailRecipient> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  const email = String(input.email ?? "").trim();
+  if (!isPlausibleEmail(email)) {
+    throw new ReportEmailRequestError("That does not look like an email address. Check for a missing @ or a typo.");
+  }
+  const label = cleanRecipientLabel(input.label);
+  return withTransaction(async (client) => {
+    // Serialise two editors on one restaurant, so the cap cannot be raced past.
+    await runQuery(`select pg_advisory_xact_lock(hashtext('report_email_book:' || $1::text))`, [context.res_id], client);
+    const counted = await runQuery<{ n: number }>(
+      `select count(*)::int as n from "ReportEmailRecipients" where res_id = $1 and removed_at is null`,
+      [context.res_id],
+      client,
+    );
+    if (Number(counted[0]?.n ?? 0) >= MAX_ADDRESS_BOOK) {
+      throw new ReportEmailRequestError(`The address book holds at most ${String(MAX_ADDRESS_BOOK)} addresses. Remove one before adding another.`);
+    }
+    const dup = await runQuery<{ id: string }>(
+      `select id from "ReportEmailRecipients"
+        where res_id = $1 and removed_at is null and email_norm = lower(btrim($2::text)) limit 1`,
+      [context.res_id, email],
+      client,
+    );
+    if (dup[0]) {throw new ReportEmailRequestError(`${email} is already in the address book.`, 409, "duplicate");}
+    const rows = await runQuery<Record<string, any>>(
+      `insert into "ReportEmailRecipients" (res_id, email, label, created_by)
+       values ($1, $2, $3, $4)
+       returning ${RECIPIENT_COLS}`,
+      [context.res_id, email, label, (createdBy ?? "").trim() || null],
+      client,
+    );
+    if (!rows[0]) {throw new Error("Failed to add the address");}
+    return mapRecipient(rows[0]);
+  });
+}
+
+/** Soft-delete one address. Null when there is no such live address. */
+export async function RemoveReportEmailRecipient(
+  restaurantId: string,
+  recipientId: string,
+  removedBy?: string,
+): Promise<ReportEmailRecipient | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  if (!isUuid(recipientId)) {return null;}
+  const rows = await runQuery<Record<string, any>>(
+    `update "ReportEmailRecipients"
+        set removed_at = now(), removed_by = $3
+      where id = $2 and res_id = $1 and removed_at is null
+      returning ${RECIPIENT_COLS}`,
+    [context.res_id, recipientId, (removedBy ?? "").trim() || null],
+  );
+  return rows[0] ? mapRecipient(rows[0]) : null;
+}
+
+/** Live book entries by id, in the order asked. Unknown or removed ids are simply absent. */
+export async function GetReportEmailRecipientsByIds(restaurantId: string, ids: readonly string[]): Promise<ReportEmailRecipient[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  const wanted = [...new Set(ids.filter((id) => isUuid(id)))];
+  if (wanted.length === 0) {return [];}
+  const rows = await runQuery<Record<string, any>>(
+    `select ${RECIPIENT_COLS} from "ReportEmailRecipients"
+      where res_id = $1 and removed_at is null and id = any($2::uuid[])`,
+    [context.res_id, wanted],
+  );
+  const byId = new Map(rows.map((r) => [String(r.id), mapRecipient(r)]));
+  return wanted.map((id) => byId.get(id)).filter((r): r is ReportEmailRecipient => !!r);
+}
+
+/**
+ * The status of each address in the book, keyed by its normalised form —
+ * res_id-scoped, for the sweep's SEND-TIME check. An address that is absent
+ * (never added, or removed) is not in the map.
+ */
+export async function ReportEmailBookStatus(resId: string): Promise<Map<string, "active" | "suppressed">> {
+  const rows = await runQuery<{ email_norm: string; status: string }>(
+    `select email_norm, status from "ReportEmailRecipients" where res_id = $1 and removed_at is null`,
+    [resId],
+  );
+  return new Map(rows.map((r) => [String(r.email_norm), r.status === "suppressed" ? "suppressed" : "active"]));
+}
+
+export const normalizeEmailKey = (email: string): string => String(email ?? "").trim().toLowerCase();
+
+// --- Ad hoc sends (Send now) -------------------------------------------------
+
+export interface AdhocDeliveryInput {
+  client_request_id: string;
+  report_keys: string[];
+  formats: string[];
+  outlet_scope: "outlet" | "all";
+  period_from: string;
+  period_to: string;
+  day_close: string | null;
+  window_start_at: string;
+  window_end_at: string;
+  timezone: string;
+  recipients: string[];
+  requested_by: string | null;
+}
+
+/**
+ * Insert one Send now, or find the one this client_request_id already made.
+ *
+ * `occurrence_key` is 'adhoc:<client_request_id>', and 058's
+ * report_deliveries_adhoc_uniq makes it unique per restaurant among rows with
+ * no schedule — so a request retried after a dropped response lands on the
+ * SAME row, and the client is told it is a replay rather than sent twice. The
+ * ON CONFLICT repeats the index predicate, or Postgres answers 42P10.
+ */
+export async function InsertAdhocReportDelivery(
+  restaurantId: string,
+  input: AdhocDeliveryInput,
+): Promise<{ id: string; replayed: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  const key = `adhoc:${input.client_request_id}`;
+  const inserted = await runQuery<{ id: string }>(
+    `insert into "ReportDeliveries"
+       (res_id, outlet_id, schedule_id, occurrence_key, fire_at, period_from, period_to, timezone,
+        claimed_by, status, channel, next_attempt_at, kind, report_keys, formats, outlet_scope,
+        day_close, window_start_at, window_end_at, recipients, requested_by)
+     values ($1, $2, null, $3, now(), $4::date, $5::date, $6,
+             'send-now', 'claimed', 'email', now(), 'adhoc', $7, $8, $9,
+             $10, $11, $12, $13, $14)
+     on conflict (res_id, occurrence_key) where schedule_id is null do nothing
+     returning id`,
+    [
+      context.res_id, context.outlet_id, key, input.period_from, input.period_to, input.timezone,
+      input.report_keys, input.formats, input.outlet_scope, input.day_close,
+      input.window_start_at, input.window_end_at, input.recipients, input.requested_by,
+    ],
+  );
+  if (inserted[0]) {return { id: String(inserted[0].id), replayed: false };}
+  const existing = await runQuery<{ id: string }>(
+    `select id from "ReportDeliveries" where res_id = $1 and schedule_id is null and occurrence_key = $2 limit 1`,
+    [context.res_id, key],
+  );
+  if (!existing[0]) {throw new Error("Send now could not be recorded");}
+  return { id: String(existing[0].id), replayed: true };
+}
+
+/**
+ * Messages this restaurant's reports were ACCEPTED for in the last 24 hours —
+ * the durable half of the per-restaurant daily cap. Counted from the delivery
+ * log itself, so a restart cannot reset it.
+ */
+export async function CountRecentReportEmails(resId: string): Promise<number> {
+  if (!(await reportEmailSchemaReady())) {return 0;}
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select coalesce(sum(coalesce(cardinality(delivered_to), 0)), 0)::int as n
+       from "ReportDeliveries"
+      where res_id = $1 and channel = 'email' and created_at > now() - interval '24 hours'`,
+    [resId],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/**
+ * Ad hoc sends ASKED FOR recently — the durable half of the Send now and test
+ * email limits (a restart does not reset them). `tests` counts only test
+ * emails (an ad hoc row with no reports), or only real sends when false.
+ */
+export async function CountRecentAdhocSends(resId: string, minutes: number, tests: boolean): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select count(*)::int as n from "ReportDeliveries"
+      where res_id = $1 and kind = 'adhoc' and created_at > now() - make_interval(mins => $2::int)
+        and (cardinality(report_keys) = 0) = $3::boolean`,
+    [resId, Math.max(1, Math.round(minutes)), tests],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/** The Send now a client_request_id already made, if any — so a replay skips the limits. */
+export async function FindAdhocDelivery(restaurantId: string, clientRequestId: string): Promise<string | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ id: string }>(
+    `select id from "ReportDeliveries" where res_id = $1 and schedule_id is null and occurrence_key = $2 limit 1`,
+    [context.res_id, `adhoc:${clientRequestId}`],
+  );
+  return rows[0] ? String(rows[0].id) : null;
+}
+
+/** Live email schedules on one outlet — for the per-outlet cap. */
+export async function CountEmailSchedules(resId: string, outletId: string): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select count(*)::int as n from "ReportSchedules"
+      where res_id = $1 and outlet_id = $2 and channel = 'email' and archived_at is null`,
+    [resId, outletId],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+// --- The attachment store (058) ------------------------------------------------
+
+export interface ReportDeliveryFileRecord {
+  id: string;
+  report_key: string;
+  format: string;
+  filename: string;
+  mime: string;
+  bytes: number;
+  rows: number;
+  truncated: boolean;
+  /** The body was purged after the retention window; the row stays as history. */
+  purged: boolean;
+}
+
+export interface RenderedReportFile {
+  report_key: string;
+  format: "csv" | "xlsx";
+  filename: string;
+  mime: string;
+  body: Buffer;
+  rows: number;
+  truncated: boolean;
+}
+
+/**
+ * Store a delivery's files and mark it rendered — one statement set, in the
+ * caller's transaction, behind the same attempts compare-and-swap as every
+ * other write on the row. A superseded worker's files never replace the
+ * winner's: zero rows from the CAS throws before anything is written.
+ *
+ * `meta` is what the email BODY is built from besides the files (the headline
+ * figures, the restaurant's name, the "Generated" time), stored with them so a
+ * retry sends the same message — see report_email_content.ts,
+ * ReportMessageMeta. Null keeps whatever the row has.
+ */
+export async function StoreReportDeliveryFiles(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  files: readonly RenderedReportFile[],
+  meta: unknown = null,
+): Promise<void> {
+  // A row found mid-send with nothing stored (only a hand-made or very old
+  // one) is re-rendered and STAYS 'sending', so the resume that follows is
+  // still recognised as one.
+  const cas = await runQuery<{ id: string }>(
+    `update "ReportDeliveries"
+        set status = case when status = 'sending' then 'sending' else 'rendered' end, error = null,
+            message_meta = coalesce($4::jsonb, message_meta)
+      where id = $1 and res_id = $2 and attempts = $3 and status in ('claimed','rendered','sending','failed')
+      returning id`,
+    [deliveryId, resId, attempts, meta === null || meta === undefined ? null : JSON.stringify(meta)],
+  );
+  if (!cas[0]) {throw new Error("Report delivery was superseded by another attempt");}
+  await runQuery(`delete from "ReportDeliveryFiles" where res_id = $1 and delivery_id = $2`, [resId, deliveryId]);
+  for (const f of files) {
+    await runQuery(
+      `insert into "ReportDeliveryFiles" (res_id, delivery_id, report_key, format, filename, mime, bytes, rows, truncated, body)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [resId, deliveryId, f.report_key, f.format, f.filename, f.mime, f.body.length, f.rows, f.truncated, f.body],
+    );
+  }
+}
+
+/** The stored files WITH their bodies, for a send or a resend. Purged bodies are absent. */
+export async function LoadReportDeliveryFiles(resId: string, deliveryId: string): Promise<RenderedReportFile[]> {
+  const rows = await runQuery<{ report_key: string; format: string; filename: string; mime: string; rows: number; truncated: boolean; body: Buffer | null }>(
+    `select report_key, format, filename, mime, rows, truncated, body
+       from "ReportDeliveryFiles"
+      where res_id = $1 and delivery_id = $2 and body is not null
+      order by created_at asc, id asc`,
+    [resId, deliveryId],
+  );
+  return rows.map((r) => ({
+    report_key: String(r.report_key),
+    format: r.format === "xlsx" ? "xlsx" : "csv",
+    filename: String(r.filename),
+    mime: String(r.mime),
+    body: Buffer.isBuffer(r.body) ? r.body : Buffer.from(r.body ?? ""),
+    rows: Number(r.rows) || 0,
+    truncated: r.truncated === true,
+  }));
+}
+
+/** One file for download — scoped by res_id AND the caller's outlet, never by id alone. */
+export async function GetReportDeliveryFile(
+  restaurantId: string,
+  deliveryId: string,
+  fileId: string,
+): Promise<{ filename: string; mime: string; body: Buffer } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(deliveryId) || !isUuid(fileId) || !(await reportEmailSchemaReady())) {return null;}
+  const og = isAllOutlets() ? "true" : "false";
+  const rows = await runQuery<{ filename: string; mime: string; body: Buffer | null }>(
+    `select f.filename, f.mime, f.body
+       from "ReportDeliveryFiles" f
+       join "ReportDeliveries" d on d.id = f.delivery_id and d.res_id = f.res_id
+      where f.id = $3 and f.delivery_id = $4 and f.res_id = $1 and (${og} or d.outlet_id = $2)
+      limit 1`,
+    [context.res_id, context.outlet_id, fileId, deliveryId],
+  );
+  const row = rows[0];
+  if (!row?.body) {return null;}
+  return { filename: row.filename, mime: row.mime, body: Buffer.isBuffer(row.body) ? row.body : Buffer.from(row.body) };
+}
+
+/** Nightly: drop file BODIES older than the retention window; the rows stay as history. */
+export async function PurgeReportDeliveryFileBodies(resId: string, days: number): Promise<number> {
+  const rows = await runQuery<{ id: string }>(
+    `update "ReportDeliveryFiles" set body = null, purged_at = now()
+      where res_id = $1 and body is not null and created_at < now() - make_interval(days => $2::int)
+      returning id`,
+    [resId, Math.max(1, Math.round(days))],
+  );
+  return rows.length;
+}
+
+// --- Sending, one address at a time (058) ------------------------------------
+
+export interface SendingState {
+  delivered_to: string[];
+  rejected_to: string[];
+  skipped_to: string[];
+  /** The body's inputs as the row keeps them — the FIRST attempt's, on a retry. */
+  message_meta: unknown;
+}
+
+const textArray = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => String(x)) : []);
+
+/**
+ * Commit 'sending' BEFORE the first message leaves, and hand back what has
+ * already been decided per address — a resumed send skips those.
+ *
+ * `meta` is this attempt's proposal for the body's inputs; the row keeps the
+ * FIRST one it was given (the render's, or a test email's first attempt) and
+ * hands that back, so every attempt builds the same message.
+ */
+export async function MarkReportDeliverySending(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  provider: string,
+  meta: unknown = null,
+): Promise<SendingState | null> {
+  const rows = await runQuery<{ delivered_to: unknown; rejected_to: unknown; skipped_to: unknown; message_meta: unknown }>(
+    `update "ReportDeliveries"
+        set status = 'sending', sending_at = coalesce(sending_at, now()), provider = $4, channel = 'email',
+            message_meta = coalesce(message_meta, $5::jsonb)
+      where id = $1 and res_id = $2 and attempts = $3 and status in ('claimed','rendered','sending','failed')
+      returning delivered_to, rejected_to, skipped_to, message_meta`,
+    [deliveryId, resId, attempts, provider, meta === null || meta === undefined ? null : JSON.stringify(meta)],
+  );
+  const r = rows[0];
+  if (!r) {return null;}
+  return {
+    delivered_to: textArray(r.delivered_to),
+    rejected_to: textArray(r.rejected_to),
+    skipped_to: textArray(r.skipped_to),
+    message_meta: r.message_meta ?? null,
+  };
+}
+
+/**
+ * Record ONE address's outcome, committed on its own, straight after its send.
+ * The column is chosen by name from a fixed set, never from input. Behind the
+ * attempts CAS, and idempotent: an address already recorded is not added twice.
+ */
+export async function RecordReportRecipientOutcome(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  email: string,
+  outcome: "delivered" | "rejected" | "skipped",
+): Promise<boolean> {
+  const column = outcome === "delivered" ? "delivered_to" : outcome === "rejected" ? "rejected_to" : "skipped_to";
+  const rows = await runQuery<{ id: string }>(
+    `update "ReportDeliveries"
+        set ${column} = case when $4 = any(coalesce(${column}, '{}')) then ${column}
+                             else array_append(coalesce(${column}, '{}'), $4::text) end
+      where id = $1 and res_id = $2 and attempts = $3 and status = 'sending'
+      returning id`,
+    [deliveryId, resId, attempts, email],
+  );
+  return rows.length > 0;
+}
+
+// --- The sweep's lease and the platform-wide cap (058) ------------------------
+//
+// "ReportSweepLease" has ONE row and no res_id: it is the platform's, not a
+// tenant's, and it is read and written on the raw pool. The statements below
+// are the whole of its protocol.
+
+/**
+ * Take (or renew) the sweep lease for `holder`. True means this process runs
+ * this tick; false means another holds it — skip, and hold no connection.
+ */
+export async function AcquireReportSweepLease(holder: string, host: string, mailReady: boolean, leaseMinutes: number): Promise<boolean> {
+  const rows = await runQuery<{ holder: string }>(
+    `update "ReportSweepLease"
+        set holder = $1, host = $2, until = now() + make_interval(mins => $3::int),
+            heartbeat_at = now(), mail_ready = $4
+      where id = 1 and (until < now() or holder = $1)
+      returning holder`,
+    [holder, host.slice(0, 120), Math.max(1, Math.round(leaseMinutes)), mailReady],
+  );
+  return rows.length > 0;
+}
+
+export interface ReportSweepStatus {
+  holder_is_me: boolean;
+  leader_seen_at: Date | null;
+  lease_until: Date | null;
+  mail_ready: boolean;
+  sent_today: number;
+}
+
+/** What GET /reports/email/config says about the scheduler. Null before 058. */
+export async function GetReportSweepStatus(holder: string): Promise<ReportSweepStatus | null> {
+  if (!(await reportEmailSchemaReady())) {return null;}
+  const rows = await runQuery<{ holder: string | null; heartbeat_at: Date | null; until: Date | null; mail_ready: boolean; sent: number | string | null }>(
+    `select holder, heartbeat_at, until, mail_ready,
+            case when sent_day = current_date then sent_count else 0 end as sent
+       from "ReportSweepLease" where id = 1`,
+  );
+  const r = rows[0];
+  if (!r) {return null;}
+  return {
+    holder_is_me: r.holder === holder,
+    leader_seen_at: r.heartbeat_at ?? null,
+    lease_until: r.until ?? null,
+    mail_ready: r.mail_ready === true,
+    sent_today: Number(r.sent ?? 0) || 0,
+  };
+}
+
+/** Today's platform-wide count of accepted report emails, without changing it. */
+export async function PeekPlatformReportEmails(): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select case when sent_day = current_date then sent_count else 0 end as n from "ReportSweepLease" where id = 1`,
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/** Count `n` more accepted messages against today. Returns today's total. */
+export async function AddPlatformReportEmails(n: number): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `update "ReportSweepLease"
+        set sent_count = case when sent_day = current_date then sent_count + $1 else $1 end,
+            sent_day = current_date
+      where id = 1
+      returning sent_count as n`,
+    [Math.max(0, Math.round(n))],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/** True exactly once per calendar day (server date), for the one process that should purge. */
+export async function ClaimReportPurgeDay(): Promise<boolean> {
+  const rows = await runQuery<{ id: number }>(
+    `update "ReportSweepLease" set purged_day = current_date
+      where id = 1 and purged_day is distinct from current_date
+      returning id`,
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Send nows and Run nows left unfinished by a process that died — recent ones
+ * only — with WHEN each may be tried again. A worker that died mid-attempt
+ * left its lease on the row (ten minutes), and a deploy's recreate is back
+ * well inside that: a scan that asked only for rows already due found none,
+ * and on a server whose sweep is off nothing else would ever come back for
+ * them. The caller waits out each lease instead.
+ */
+export async function ListOrphanAdhocDeliveries(
+  resId: string,
+  maxAgeMinutes: number,
+): Promise<{ id: string; outlet_id: string; next_attempt_at: Date }[]> {
+  const rows = await runQuery<{ id: string; outlet_id: string; next_attempt_at: Date | string }>(
+    `select id, outlet_id, next_attempt_at from "ReportDeliveries"
+      where res_id = $1 and kind in ('adhoc','manual')
+        and status in ('claimed','rendered','sending','failed')
+        and attempts < $2
+        and created_at > now() - make_interval(mins => $3::int)
+      order by created_at asc
+      limit 20`,
+    [resId, REPORT_MAX_ATTEMPTS, Math.max(1, Math.round(maxAgeMinutes))],
+  );
+  return rows.map((r) => ({ id: String(r.id), outlet_id: String(r.outlet_id), next_attempt_at: new Date(r.next_attempt_at) }));
+}
+
+/**
+ * Ring the bell ONCE for the day about something the owner must fix — today:
+ * "email is not set up on this server" while an email schedule is due.
+ * De-duplicated on the notification log itself, so a restart does not ring it
+ * again. Carries no figures and no addresses.
+ *
+ * `view: 'email'` is where it opens: this bell names no delivery and no
+ * schedule, and the app read only those to leave the report grid — so the owner
+ * told "scheduled email reports are waiting" landed on Item Wise.
+ */
+export async function NotifyReportOnce(
+  resId: string,
+  n: { kind: string; day: string; title: string; body: string },
+): Promise<boolean> {
+  await ensureNotificationsTable();
+  const seen = await runQuery<{ id: string }>(
+    `select id from "Notifications"
+      where res_id = $1 and type = 'report' and meta->>'kind' = $2 and meta->>'day' = $3
+      limit 1`,
+    [resId, n.kind, n.day],
+  );
+  if (seen[0]) {return false;}
+  await AddNotification(resId, {
+    type: "report",
+    title: n.title,
+    body: n.body,
+    meta: { module: "Reports", view: "email", kind: n.kind, day: n.day },
+  });
+  return true;
 }
 
 export async function AddBill(
@@ -31765,7 +33478,7 @@ export interface NotificationTarget {
 // Which module + entity a notification points at. Type wins (it is set by the
 // producer); meta ids disambiguate the overloaded `warning` type. Mirrors the
 // owner app's _moduleForType so both agree on the destination.
-function notificationEntityOf(
+export function notificationEntityOf(
   type: string,
   meta: Record<string, unknown>,
 ): { module: string | null; entity: { type: string; id: string } | null } {
@@ -31796,6 +33509,12 @@ function notificationEntityOf(
       // KPI/exception alerts are restaurant-wide numbers, not a row — Analytics
       // is the honest destination and there is nothing to focus.
       return { module: "Analytics", entity: null };
+    case "report":
+      // A report delivery (client item 9). Its history, files and per-address
+      // outcome live in Reports → Email reports; a 2.0.1 inbox schedule's bell
+      // still says Accounting, whose card now points there. Nothing row-shaped
+      // to focus — the delivery id rides in `meta` for the client that wants it.
+      return { module: s("module") === "Accounting" ? "Accounting" : "Reports", entity: null };
     default:
       break;
   }
@@ -37539,6 +39258,13 @@ export interface MisWindow extends ResolvedReportWindow {
   toIso: string;
   /** The part of each day the report is cut by. null = all day. */
   slot: TimeSlot | null;
+  /**
+   * The TRADING DAY's shift in minutes (report_window.ts): 0 for calendar
+   * days, +120 for a day that closes at 02:00, -30 for one that closes at
+   * 23:30. Never non-zero together with a slot. With a shift, `from`/`to` are
+   * BUSINESS dates and the instants above are shifted by it at both ends.
+   */
+  day_shift_min: number;
 }
 
 /** Everything the nine share: identity, zone, scope and the resolved window. */
@@ -37562,6 +39288,12 @@ export interface MisReportQuery extends ReportWindowQuery {
   offset?: unknown;
   /** The time-wise toggle: "day" (default), "hour", "hour_of_day" or "session". */
   bucket?: unknown;
+  /**
+   * HH:mm — read the window on TRADING days that close at this minute rather
+   * than on calendar days (report_window.ts). Refused, with the clamp named,
+   * alongside a time slot.
+   */
+  day_close?: unknown;
 }
 
 /** One column, so the client's column picker and TOTALS row are server-driven. */
@@ -37575,11 +39307,25 @@ export interface MisColumn {
   default_on?: boolean;
 }
 
+/**
+ * meta.window. A trading-day read ADDS three fields — the close and the two
+ * instants the SQL bound — and a calendar read has exactly the shape it always
+ * had, so every existing client and every stored CSV name is unchanged.
+ */
+export interface MisMetaWindow extends ResolvedReportWindow {
+  /** HH:mm the business day closes at; present only on a trading-day read. */
+  day_close?: string;
+  /** The first instant counted (inclusive), on a trading-day read. */
+  from_at?: string;
+  /** The first instant NOT counted, on a trading-day read. */
+  to_at?: string;
+}
+
 /** The envelope every one of the nine returns. */
 export interface MisReportMeta {
   report: string;
   title: string;
-  window: ResolvedReportWindow;
+  window: MisMetaWindow;
   /** The part of each day this payload was cut by; null = all day. */
   time_slot: TimeSlotMeta | null;
   timezone: string;
@@ -37651,19 +39397,41 @@ async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisC
     ? (await loadReportTimeSlots(context.res_id)).slots
     : [];
   const { slot, clamped } = resolveTimeSlot(q, presets);
+  // THE TRADING DAY (report_window.ts), resolved after the slot because the two
+  // are not combined: a close asked alongside a slot is dropped, NAMED, and the
+  // slot is kept. A close of 00:00 is a zero shift — the calendar read, byte
+  // for byte. An unreadable close is calendar days with its own clamp.
+  const dayClose = misDayClose(q);
+  const dayClamps: WindowClamp[] = [];
+  let shift = 0;
+  if (dayClose === false) {dayClamps.push("day_close_unparseable");}
+  else if (dayClose !== null) {
+    if (slot) {dayClamps.push("day_close_with_slot");}
+    else {shift = dayShiftForClose(dayClose);}
+  }
+  const allClamps = [...clamped, ...dayClamps];
   return {
     context,
     og: allOutlets ? "true" : "false",
     allOutlets,
     window: {
       ...resolved,
-      clamped: clamped.length > 0 ? [...resolved.clamped, ...clamped] : resolved.clamped,
-      ...slotWindowInstants(resolved, tz, slot),
+      clamped: allClamps.length > 0 ? [...resolved.clamped, ...allClamps] : resolved.clamped,
+      ...misWindowInstants(resolved, tz, slot, shift),
       slot,
+      day_shift_min: shift,
     },
     tz,
     presets,
   };
+}
+
+/** `?day_close=`: minutes, null when absent, false when unreadable. */
+function misDayClose(q: MisReportQuery): number | null | false {
+  const raw = Array.isArray(q.day_close) ? q.day_close[0] : q.day_close;
+  if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {return null;}
+  const m = parseDayClose(raw);
+  return m === null ? false : m;
 }
 
 // --- Time slots (report_window.ts) -------------------------------------------
@@ -37684,6 +39452,23 @@ async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisC
 function slotWindowInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot | null): { fromIso: string; toIso: string } {
   if (!slot) {return windowInstants(w, tz);}
   const b = slotBounds(w, slot);
+  return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
+}
+
+/**
+ * THE ONE PLACE a MIS window becomes instants: a slot's outer bounds, a
+ * trading day's shifted bounds, or — with neither — windowInstants itself.
+ *
+ * A shift moves BOTH ends by the same wall-clock minutes (tradingDayBounds), so
+ * business date K binds [K 00:00 + shift, K+1 00:00 + shift) and consecutive
+ * days tile. The conversion is slotWallInstant's, so a DST day follows the wall
+ * clock exactly as a slot does. A shift and a slot never arrive together
+ * (misContext refuses the pair); if one ever did, the slot would win, as it
+ * does there.
+ */
+function misWindowInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot | null, shift: number): { fromIso: string; toIso: string } {
+  if (slot || !shift) {return slotWindowInstants(w, tz, slot);}
+  const b = tradingDayBounds(w, shift);
   return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
 }
 
@@ -37872,10 +39657,15 @@ async function misMeta(mc: MisContext, report: string, title: string, notes: str
       outletName = rows[0]?.outlet_name ?? null;
     } catch { outletName = null; }
   }
+  const shift = mc.window.day_shift_min;
   return {
     report,
     title,
-    window: { from: mc.window.from, to: mc.window.to, days: mc.window.days, source: mc.window.source, clamped: mc.window.clamped },
+    window: {
+      from: mc.window.from, to: mc.window.to, days: mc.window.days, source: mc.window.source, clamped: mc.window.clamped,
+      // Only on a trading-day read, so a calendar payload is the shape it was.
+      ...(shift ? { day_close: formatClock(dayCloseOfShift(shift)), from_at: mc.window.fromIso, to_at: mc.window.toIso } : {}),
+    },
     time_slot: timeSlotMeta(mc.window.slot),
     timezone: mc.tz,
     outlet_scope: mc.allOutlets ? "all" : "outlet",
@@ -37890,7 +39680,11 @@ async function misMeta(mc: MisContext, report: string, title: string, notes: str
         timeSlotNote(mc.window.slot, MIS_SLOT_SUBJECT[report] ?? "rows"),
         ...(MIS_SLOT_EXTRA[report] ? [MIS_SLOT_EXTRA[report]] : []),
       ]
-      : notes,
+      // A trading day says where its days begin and end, on every report —
+      // the one caveat that explains why a 01:30 bill is on yesterday's line.
+      : shift
+        ? [...notes, tradingDayNote(dayCloseOfShift(shift))]
+        : notes,
   };
 }
 
@@ -38060,7 +39854,7 @@ function misNcByBucket(rows: readonly MisNcRow[], mc: MisContext, mode: TimeBuck
     // slot's after-midnight comp counts on the day its slot started.
     const minute = clock.hour * 60 + clock.minute;
     const key = timeBucketKey(mode, {
-      serviceDay: serviceDayKey(clock.key, minute, mc.window.slot), calendarDay: clock.key, minute,
+      serviceDay: serviceDayKey(clock.key, minute, mc.window.slot, mc.window.day_shift_min), calendarDay: clock.key, minute,
     }, mc.presets);
     const acc = out.get(key) ?? zeroNonChargeable();
     addNonChargeable(acc, r);
@@ -38206,7 +40000,7 @@ async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
 interface MisBill {
   row: MisBillRow;
   money: BillMoney;
-  /** The BUSINESS day: the calendar day, or under a crossing slot the day it started. */
+  /** The BUSINESS day: the calendar day, the day a crossing slot started, or the trading day. */
   day: string;
   hour: number;
   /** The local calendar day and minute of day the bill settled at. */
@@ -38222,7 +40016,7 @@ interface MisBill {
  * `scPct` is read once for the whole set, not per bill, so the service-charge
  * classification here is identical to the one the bill-detail screen shows.
  */
-function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: TimeSlot | null = null): MisBill[] {
+function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: TimeSlot | null = null, dayShift = 0): MisBill[] {
   return rows.map((row) => {
     const grand = round2(parseNumeric(row.total_amt));
     const charges = closedBillCharges(grand, parseTaxLines(row.tax_breakdown), scPct, parseNumeric(row.round_off));
@@ -38236,7 +40030,7 @@ function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: Ti
         discount_value: parseNumeric(row.discount_value),
         refund_amount: parseNumeric(row.refund_amount),
       }),
-      day: clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot) : "",
+      day: clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot, dayShift) : "",
       hour: clock?.hour ?? 0,
       calendar_day: clock?.key ?? "",
       minute: clock ? clock.hour * 60 + clock.minute : 0,
@@ -39303,7 +41097,7 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
   const mc = await misContext(restaurantId, q);
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
   // The slot moves a crossing slot's after-midnight bills onto the day it began.
-  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot);
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot, mc.window.day_shift_min);
   const bucket = misBucketMode(q);
   const ncRows = await fetchMisNonChargeables(mc);
   const nc = misNcTotals(ncRows);
@@ -39649,9 +41443,10 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
 
   const prev = previousWindow(mc.window.from, mc.window.to);
-  // The previous period is cut by the SAME slot: Lunch against last month's
-  // Lunch, never against last month's whole day.
-  const prevInstants = slotWindowInstants(prev, mc.tz, mc.window.slot);
+  // The previous period is cut by the SAME slot — Lunch against last month's
+  // Lunch, never against last month's whole day — and read on the SAME trading
+  // day, so a 02:00 close compares like with like.
+  const prevInstants = misWindowInstants(prev, mc.tz, mc.window.slot, mc.window.day_shift_min);
   const prevMc: MisContext = {
     ...mc,
     window: {
@@ -39659,6 +41454,7 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
       source: mc.window.source, clamped: [],
       ...prevInstants,
       slot: mc.window.slot,
+      day_shift_min: mc.window.day_shift_min,
     },
   };
 

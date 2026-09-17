@@ -4,12 +4,14 @@
  * scheduled report delivery.
  */
 import type { Express, Request, Response } from "express";
-import { AddExpense, ArchiveReportSchedule, Audit_log_category, BuildTallyXml, CloseCashSession, CreateReportSchedule, DeleteExpense, DeleteReconciliation, GetBalanceSheet, GetCashSessions, GetCurrentCashSession, GetDiscountsReport, GetExpenses, GetGstReport, GetProfitAndLoss, GetReconciliation, GetReportDeliveries, GetReportDeliveryArtifact, GetReportSchedule, GetSalesReport, GetTenantTimezone, ListReportSchedules, OpenCashSession, RECONCILE_ACTION_ID, SaveReconciliation, UpdateReportSchedule } from "../database_supabase.js";
+import { AddExpense, ArchiveReportSchedule, Audit_log_category, BuildTallyXml, CloseCashSession, CreateReportSchedule, DeleteExpense, DeleteReconciliation, GetBalanceSheet, GetCashSessions, GetCurrentCashSession, GetDiscountsReport, GetExpenses, GetGstReport, GetProfitAndLoss, GetReconciliation, GetReportDeliveries, GetReportDeliveryArtifact, GetReportSchedule, GetSalesReport, GetTenantTimezone, ListReportSchedules, OpenCashSession, RECONCILE_ACTION_ID, SaveReconciliation, UpdateReportSchedule, isReportEmailRequestError, isReportEmailSchemaPending, reportEmailSchemaReady, type ReportScheduleRecord } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { renderGstCsv, renderSalesCsv, toCsv } from "../report_render.js";
-import { queueReportScheduleRun } from "../report_schedules.js";
-import { mailerConfigured } from "../mailer.js";
-import { ACCOUNTING_PERM, counterIdFrom, extractEmployeeId, extractRestaurantId, log_audit, requireCounter, validateAction, windowQuery } from "./_shared.js";
+import { isReportPeriodOpenError, kickReportDelivery, nextOccurrence, queueReportScheduleRun } from "../report_schedules.js";
+import { mailerConfigured, mailTransportStatus } from "../mailer.js";
+import { MAIL_OFF_SENTENCE } from "./report_email.js";
+import { reportListPhrase } from "../report_catalogue.js";
+import { ACCOUNTING_PERM, callerMayUseAllOutlets, counterIdFrom, extractEmployeeId, extractRestaurantId, log_audit, requireCounter, validateAction, windowQuery } from "./_shared.js";
 
 
 // Audit LABEL for scheduled-report changes, minted by migration 026. NEVER a
@@ -17,6 +19,50 @@ import { ACCOUNTING_PERM, counterIdFrom, extractEmployeeId, extractRestaurantId,
 // every /reports/* route, so the feature works for every role that can already
 // read these reports. (Migration 025's rule.)
 const REPORT_SCHEDULE_ACTION_ID = "9e2f47a1-05b3-4c8d-8f6a-71d40b9c2e58";
+
+/**
+ * A schedule as the clients read it: the stored row plus WHEN it next runs and
+ * WHAT that run will cover, computed by the sweep's own rules
+ * (nextOccurrence) — so the card's "Next: Thu 02:00, covers Wed 02:00 to Thu
+ * 02:00" can never disagree with what the sweep then does.
+ */
+function scheduleWire(s: ReportScheduleRecord, tz: string, now: Date) {
+	const next = s.enabled
+		? nextOccurrence({ ...s, created_at: new Date(0) }, tz, now)
+		: null;
+	return {
+		...s,
+		next_run_at: next ? next.fire_at.toISOString() : null,
+		next_window: next
+			? { from: next.period_from, to: next.period_to, day_close: next.day_close, start_at: next.window_start_at, end_at: next.window_end_at }
+			: null,
+	};
+}
+
+/** The sentence an audit row carries for a schedule — what, when, where, to whom. */
+function scheduleAuditLine(verb: string, s: ReportScheduleRecord): string {
+	const at = `${String(s.hour_local).padStart(2, "0")}:${String(s.minute_local).padStart(2, "0")}`;
+	const what = s.report_keys.length > 0 ? reportListPhrase(s.report_keys) : s.report_key;
+	const day = s.window_mode === "trading_day" ? " (trading day)" : "";
+	const scope = s.outlet_scope === "all" ? " for all outlets" : "";
+	return `${verb} scheduled report "${s.name}" — ${what} ${s.frequency} at ${at}${day}${scope} via ${s.channel}${s.recipients.length > 0 ? ` to ${s.recipients.join(", ")}` : ""}`;
+}
+
+function scheduleAuditDetails(s: ReportScheduleRecord): Record<string, unknown> {
+	return {
+		schedule_id: s.id, report_key: s.report_key, report_keys: s.report_keys, formats: s.formats,
+		window_mode: s.window_mode, outlet_scope: s.outlet_scope, frequency: s.frequency,
+		hour_local: s.hour_local, minute_local: s.minute_local, channel: s.channel,
+		recipients: s.recipients, enabled: s.enabled,
+	};
+}
+
+/** A schedule write's refusal: 503 for a database that is behind, the error's own status otherwise. */
+function scheduleWriteRefusal(res: Response, e: any, fallback: string): void {
+	if (isReportEmailSchemaPending(e)) { res.status(503).json({ error: e.message, code: "schema_pending" }); return; }
+	if (isReportEmailRequestError(e)) { res.status(e.status).json({ error: e.message, code: e.reason }); return; }
+	res.status(400).json({ error: String(e?.message ?? fallback) });
+}
 
 // The date window every /reports/* route already spoke, unchanged on the wire:
 // `from`/`to` as INCLUSIVE YYYY-MM-DD days in the restaurant's timezone. What
@@ -324,8 +370,13 @@ app.get("/reports/schedules", validateAction(ACCOUNTING_PERM), async (req: Reque
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
+		const schedules = await ListReportSchedules(restaurantId);
+		// The zone read once for the list; a tenant with no zone column reads the
+		// same default every report does.
+		const tz = schedules.length > 0 ? await GetTenantTimezone(restaurantId).catch(() => "Asia/Kolkata") : "Asia/Kolkata";
+		const now = new Date();
 		res.json({
-			schedules: await ListReportSchedules(restaurantId),
+			schedules: schedules.map((s) => scheduleWire(s, tz, now)),
 			// WHETHER THIS DEPLOYMENT CAN SEND MAIL AT ALL, shipped with the list so
 			// the form can say so BEFORE somebody saves a daily 8am email schedule
 			// that will render a report every morning and fail to deliver it five
@@ -346,30 +397,26 @@ app.post("/reports/schedules", validateAction(ACCOUNTING_PERM), async (req: Requ
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
-		const created = await CreateReportSchedule(restaurantId, (req.body ?? {}) as Record<string, unknown>, extractEmployeeId(req) ?? undefined);
+		const created = await CreateReportSchedule(restaurantId, (req.body ?? {}) as Record<string, unknown>, extractEmployeeId(req) ?? undefined, { allowAllOutlets: callerMayUseAllOutlets(req) });
 		try {
-			await log_audit(req, REPORT_SCHEDULE_ACTION_ID,
-				`Created scheduled report "${created.name}" — ${created.report_key} ${created.frequency} at ${String(created.hour_local).padStart(2, "0")}:${String(created.minute_local).padStart(2, "0")} via ${created.channel}${created.recipients.length > 0 ? ` to ${created.recipients.join(", ")}` : ""}`,
-				Audit_log_category.General,
-				{ schedule_id: created.id, report_key: created.report_key, frequency: created.frequency, hour_local: created.hour_local, minute_local: created.minute_local, channel: created.channel, recipients: created.recipients, enabled: created.enabled });
+			await log_audit(req, REPORT_SCHEDULE_ACTION_ID, scheduleAuditLine("Created", created), Audit_log_category.General, scheduleAuditDetails(created));
 		} catch {/* ignore */}
-		res.json(created);
-	} catch (e: any) { logger.error({ err: e }, "create_report_schedule_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to create scheduled report") }); }
+		const tz = await GetTenantTimezone(restaurantId).catch(() => "Asia/Kolkata");
+		res.json(scheduleWire(created, tz, new Date()));
+	} catch (e: any) { logger.error({ err: e }, "create_report_schedule_failed"); scheduleWriteRefusal(res, e, "Unable to create scheduled report"); }
 });
 
 app.patch("/reports/schedules/:id", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
 	try {
-		const updated = await UpdateReportSchedule(restaurantId, req.params.id, (req.body ?? {}) as Record<string, unknown>, extractEmployeeId(req) ?? undefined);
+		const updated = await UpdateReportSchedule(restaurantId, req.params.id, (req.body ?? {}) as Record<string, unknown>, extractEmployeeId(req) ?? undefined, { allowAllOutlets: callerMayUseAllOutlets(req) });
 		try {
-			await log_audit(req, REPORT_SCHEDULE_ACTION_ID,
-				`${updated.enabled ? "Updated" : "Disabled"} scheduled report "${updated.name}" — ${updated.report_key} ${updated.frequency} at ${String(updated.hour_local).padStart(2, "0")}:${String(updated.minute_local).padStart(2, "0")} via ${updated.channel}${updated.recipients.length > 0 ? ` to ${updated.recipients.join(", ")}` : ""}`,
-				Audit_log_category.General,
-				{ schedule_id: updated.id, report_key: updated.report_key, frequency: updated.frequency, hour_local: updated.hour_local, minute_local: updated.minute_local, channel: updated.channel, recipients: updated.recipients, enabled: updated.enabled });
+			await log_audit(req, REPORT_SCHEDULE_ACTION_ID, scheduleAuditLine(updated.enabled ? "Updated" : "Disabled", updated), Audit_log_category.General, scheduleAuditDetails(updated));
 		} catch {/* ignore */}
-		res.json(updated);
-	} catch (e: any) { logger.error({ err: e }, "update_report_schedule_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to update scheduled report") }); }
+		const tz = await GetTenantTimezone(restaurantId).catch(() => "Asia/Kolkata");
+		res.json(scheduleWire(updated, tz, new Date()));
+	} catch (e: any) { logger.error({ err: e }, "update_report_schedule_failed"); scheduleWriteRefusal(res, e, "Unable to update scheduled report"); }
 });
 
 // Archives rather than deletes: "ReportDeliveries" holds the at-most-once guard
@@ -404,16 +451,43 @@ app.post("/reports/schedules/:id/run-now", validateAction(ACCOUNTING_PERM), asyn
 	try {
 		const schedule = await GetReportSchedule(restaurantId, req.params.id);
 		if (!schedule) { res.status(404).json({ error: "Unknown scheduled report" }); return; }
+		// NOTHING IS QUEUED THAT NOTHING WILL RUN (report_schedules.ts, rules 5
+		// and 6). Without 058 the sweep waits, so a queued row would sit as
+		// "Queued" with nothing promising to finish it — 2.0.1 queued it anyway.
+		// Without a transport an email run sat until some later deploy had one
+		// and was then mailed, days late. Installed 2.0.1 apps still show Run now
+		// on every schedule, so the server says why, in Send now's words.
+		if (!(await reportEmailSchemaReady())) {
+			res.status(503).json({ error: "Scheduled reports need a database update (migrations 056-058) that has not been applied to this server yet, so nothing scheduled can run here. Ask your administrator to apply it.", code: "schema_pending" });
+			return;
+		}
+		if (schedule.channel === "email" && !mailTransportStatus().available) {
+			res.status(503).json({ error: `${MAIL_OFF_SENTENCE}. Ask your administrator to set up the mail settings.`, code: "mail_not_configured" });
+			return;
+		}
 		const tz = await GetTenantTimezone(restaurantId);
-		const deliveryId = await queueReportScheduleRun(restaurantId, schedule, tz);
+		// An optional business date — how an owner re-sends a night the history
+		// shows as Missed. Daily schedules only; otherwise the run covers what the
+		// schedule would report now, as before.
+		const body = (req.body ?? {}) as { business_date?: unknown };
+		const businessDate = typeof body.business_date === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(body.business_date) ? body.business_date : null;
+		const deliveryId = await queueReportScheduleRun(restaurantId, schedule, tz, new Date(), { businessDate, requestedBy: extractEmployeeId(req) });
 		if (!deliveryId) { res.status(409).json({ error: "This report was just queued — try again in a minute" }); return; }
 		try {
-			await log_audit(req, REPORT_SCHEDULE_ACTION_ID, `Ran scheduled report "${schedule.name}" now — ${schedule.report_key} ${schedule.frequency}`,
+			await log_audit(req, REPORT_SCHEDULE_ACTION_ID, `Ran scheduled report "${schedule.name}" now — ${schedule.report_keys.length > 0 ? reportListPhrase(schedule.report_keys) : schedule.report_key} ${schedule.frequency}${businessDate ? ` for ${businessDate}` : ""}`,
 				Audit_log_category.General,
-				{ schedule_id: schedule.id, report_key: schedule.report_key, frequency: schedule.frequency, delivery_id: deliveryId });
+				{ schedule_id: schedule.id, report_key: schedule.report_key, report_keys: schedule.report_keys, frequency: schedule.frequency, delivery_id: deliveryId, business_date: businessDate });
 		} catch {/* ignore */}
-		res.json({ queued: true, delivery_id: deliveryId });
-	} catch (e: any) { logger.error({ err: e }, "run_report_schedule_now_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to queue this report") }); }
+		// SINCE ITEM 9 IT RUNS NOW rather than on a later sweep tick — outside this
+		// request's connection (kickReportDelivery).
+		const started = Boolean(req.auth);
+		if (req.auth) { void kickReportDelivery(req.auth.res_id, deliveryId); }
+		res.json({ queued: true, delivery_id: deliveryId, started });
+	} catch (e: any) {
+		if (isReportPeriodOpenError(e)) { res.status(400).json({ error: e.message, code: "period_open" }); return; }
+		logger.error({ err: e }, "run_report_schedule_now_failed");
+		res.status(400).json({ error: String(e?.message ?? "Unable to queue this report") });
+	}
 });
 
 app.get("/reports/deliveries", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {

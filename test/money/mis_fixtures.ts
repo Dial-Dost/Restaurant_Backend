@@ -35,8 +35,9 @@
 //   * a TIME SLOT is modelled from the SQL TEXT too: the time-of-day fragment
 //     misTimeSql appends is parsed back out (zone, start, end, crossing) and
 //     applied to each row's wall clock, on the column the fragment names. And it
-//     is REQUIRED whenever the bound instants are not local midnights — which is
-//     exactly when a reader resolved a slot — so a reader that bound a slot's
+//     is REQUIRED whenever the bound instants are not whole days (local
+//     midnights, or a trading day's close at both ends — isWholeDayBinding) —
+//     which is exactly when a reader resolved a slot — so a reader that bound a slot's
 //     outer bounds but forgot the fragment fails here instead of quietly
 //     counting every hour between them. Without this, every slot test would pass
 //     vacuously against the whole day;
@@ -416,6 +417,22 @@ function isLocalMidnight(value: unknown, tz: string): boolean {
   return w.minute === 0 && w.second === 0;
 }
 
+/**
+ * Does a binding cover WHOLE DAYS? Both bounds at local midnight (calendar
+ * days), or — since the trading day (client item 9) — both at the SAME
+ * wall-clock minute, a whole number of days apart: business dates that close
+ * at that minute. A slot's hull never has that shape (its two ends are the
+ * slot's start and end, which differ, or the slot is all day and resolves to
+ * none), so a slot that lost its time-of-day fragment is still refused.
+ */
+function isWholeDayBinding(from: unknown, to: unknown, tz: string): boolean {
+  if (isLocalMidnight(from, tz) && isLocalMidnight(to, tz)) {return true;}
+  if (typeof from !== "string" || typeof to !== "string") {return false;}
+  const a = wallMinute(from, tz), z = wallMinute(to, tz);
+  const span = new Date(to).getTime() - new Date(from).getTime();
+  return a.second === 0 && z.second === 0 && a.minute === z.minute && span > 0 && span % 86_400_000 === 0;
+}
+
 const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
@@ -431,7 +448,7 @@ function windowTest(q: string, params: unknown[], col: string, fromIdx = 2, toId
   const from = params[fromIdx], to = params[toIdx];
   const clock = `\\(\\(${escapeRe(col)}\\) at time zone '([^']+)'\\)::time`;
   const lower = new RegExp(`${clock} >= '(\\d{2}):(\\d{2})'::time`, "i").exec(q);
-  const midnights = isLocalMidnight(from, d.timezone) && isLocalMidnight(to, d.timezone);
+  const midnights = isWholeDayBinding(from, to, d.timezone);
   if (!lower) {
     if (/at time zone '[^']+'\)::time/i.test(q) || !midnights) {
       throw new Error(`mis fixture: the window is bound to a time slot but the time-of-day predicate on ${col} is missing — every hour between the outer bounds would be counted\n  ${q.slice(0, 260)}`);
@@ -500,7 +517,7 @@ function sessionSlotTest(q: string, params: unknown[]): (opened: number, closed:
   const tz = d.timezone;
   const from = params[1], to = params[2];
   const hasOverlap = SESSION_DAY_OVERLAP.test(q);
-  if (isLocalMidnight(from, tz) && isLocalMidnight(to, tz)) {
+  if (isWholeDayBinding(from, to, tz)) {
     if (hasOverlap || params.length > 3) {
       throw new Error(`mis fixture: a per-day session overlap on a whole-day binding — the hull lost the slot\n  ${q.slice(0, 260)}`);
     }
@@ -723,8 +740,17 @@ export async function fixtureQuery(sql: string, params: unknown[] = []): Promise
 function dispatch(q: string, params: unknown[]): unknown[] {
   if (DDL.test(q)) {return [];}
   if (/^select set_config\('app\.res_id'/i.test(q)) {return [];}
+  // A report email's per-read statement timeout (report_bundle.ts). Session state only.
+  if (/^select set_config\('statement_timeout'/i.test(q)) {return [];}
 
   const d = requireDb();
+
+  // What a report email names itself as (GetReportEmailIdentity).
+  if (/^select r\.res_name, r\.currency, r\.timezone, o\.outlet_name/i.test(q)) {
+    if (params[0] !== d.res_id) {return [];}
+    const outlet = d.outlets.find((o) => o.id === params[1]);
+    return [{ res_name: d.name, currency: "INR", timezone: d.timezone, outlet_name: outlet?.name ?? null }];
+  }
 
   // --- identity ---
   if (/from "Restaurant" r/i.test(q)) {
