@@ -20,9 +20,19 @@ const GS = 0x1d;
 // `ESC ! n` print-mode bits (Epson ESC/POS). One command sets ALL of them, so a
 // size change that leaves MODE_BOLD out also switches emphasis off — see `big`.
 // Bit 0 (Font B) is never set: every line here is Font A, the larger font.
+//
+// ON A KITCHEN DOCKET TALL AND WIDE ONLY EVER TRAVEL TOGETHER. A cell doubled
+// in one direction is a letter stretched out of shape — the classic docket's
+// double-height body text is exactly what the client sent back as "elongated
+// and stretched vertically". So every KOT size command is 1x1 or 2x2: 0x00,
+// MODE_BOLD, MODE_BIG, or MODE_BIG | MODE_BOLD. escpos.test.ts scans every
+// classic docket for anything else. (The bill keeps its tall bold Grand Total:
+// that is the client's own bill, not a KOT.)
 const MODE_BOLD = 0x08; // emphasized
 const MODE_TALL = 0x10; // double height
 const MODE_WIDE = 0x20; // double width
+/** Double width AND height — the only enlarged size a KOT uses. */
+const MODE_BIG = MODE_TALL | MODE_WIDE;
 
 export interface ReceiptItem {
   name: string;
@@ -1430,38 +1440,27 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // spec an `ESC ! 0x30` sent after `ESC E 1` quietly turned bold back OFF —
     // the "large and bold" REPRINT banner came out large and thin. 0x38 is
     // double width + height + emphasized, which holds either way.
-    if (fits) {raw(ESC, 0x21, MODE_WIDE | MODE_TALL | MODE_BOLD);}
+    if (fits) {raw(ESC, 0x21, MODE_BIG | MODE_BOLD);}
     line(t);
     if (fits) {raw(ESC, 0x21, 0x00);}
     raw(ESC, 0x45, 0x00);
   };
 
   /**
-   * KOT body text, one step taller than it used to be (item 3: "the font of
-   * other items on the KOT should also be increased slightly").
+   * KOT body text: Font A at the printer's NORMAL size, 12x24 dots a cell.
    *
-   * WHY DOUBLE HEIGHT, AND WHY NOTHING SMALLER. ESC/POS has no fractional type
-   * sizes: a line is Font A (12x24 dots) or Font B (9x17), times an integer
-   * width and height multiplier. This renderer already prints Font A — the
-   * larger font — so the smallest step up the printer has is ONE multiplier, and
-   * of the two, only height leaves the columns alone:
-   *
-   *   double height: 12x48 dots per cell, still 576/12 = 48 cells on 80mm and
-   *                  384/12 = 32 on 58mm. No. 4 + Item 36 + Qty 8 = 48, and
-   *                  No. 4 + Item 22 + Qty 6 = 32 — the qty column cannot move.
-   *   double width:  24x24, i.e. 24 cells on 80mm and 16 on 58mm. No. 4 + Qty 8
-   *                  would leave a 12-cell item column on 80mm and 6 on 58mm:
-   *                  "Paneer Tikka Masala" wraps on BOTH rolls.
-   *
-   * The cost is paper — each tall line is one 48-dot row instead of 24 — and it
-   * is the cost the client asked for. Rules (the dashed separators) stay at
-   * normal height: they carry no text, and a doubled rule is only a thicker gap.
+   * IT WAS DOUBLE HEIGHT (item 3, "the font of other items on the KOT should
+   * also be increased slightly"), and double height is the one step up ESC/POS
+   * has that keeps 48 columns — but a 12x48 cell is a letter pulled to twice its
+   * height, and the client sent the result back: "the font looks elongated and
+   * stretched vertically, which looks strange once printed ... reduce the font
+   * size as well" (item 5). Font A has no size between 1x1 and a distorted 1x2,
+   * so the classic docket prints 1x1 — capitals about 17 dots tall against the
+   * reference photograph's 20, the closest undistorted size the printer's own
+   * font has. The reference docket (the default) is where the photograph's
+   * exact type lives; this is the fallback for a printer that cannot draw it.
    */
-  const tall = (s = "") => {
-    raw(ESC, 0x21, MODE_TALL);
-    line(s);
-    raw(ESC, 0x21, 0x00);
-  };
+  const body = (s = "") => line(s);
 
   raw(ESC, 0x40); // initialize
   if (marginCols > 0) {
@@ -1503,10 +1502,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // length are WHICH TICKET this is and WHICH TABLE it feeds, and both were
     // printed in body text. The name stays (a shared printer serves more than one
     // outlet) but it prints bold at body size, and the big type is spent below.
-    // Body size on a docket is now double HEIGHT (item 3, see `tall`), with the
-    // bold bit carried inside the size command for the reason `big` gives.
+    // Body size and bold, with the bold bit carried inside the size command for
+    // the reason `big` gives (it was double height until item 5, see `body`).
     raw(ESC, 0x45, 0x01); // bold
-    raw(ESC, 0x21, MODE_TALL | MODE_BOLD);
+    raw(ESC, 0x21, MODE_BOLD);
     line(opts.restaurantName || "Receipt");
     raw(ESC, 0x21, 0x00);
     raw(ESC, 0x45, 0x00);
@@ -1533,7 +1532,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // on a 58mm roll.
     if (opts.cancelled === true) {
       big("** CANCELLED **", width);
-      tall("DO NOT COOK — THIS TICKET IS OFF");
+      body("DO NOT COOK — THIS TICKET IS OFF");
       line(sep);
     }
     // Context first, then the ticket's own identity — the order the reference
@@ -1541,7 +1540,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // of order this is, which ticket it is, when it was fired, and which station
     // it belongs to.
     const context = present(opts.orderContext);
-    if (context) {tall(context);}
+    if (context) {body(context);}
     // ONE IDENTITY LINE, IN THE BIGGEST TYPE ON THE DOCKET.
     //
     // This was two lines — a bold "KOT" and, under it, "KOT - 26" — which said
@@ -1555,8 +1554,8 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // Restaurant-zone stamp when the caller resolved one. The server-clock
     // fallback is what every ticket printed before kotStamp existed, kept so a
     // caller that has not been updated still prints a time rather than nothing.
-    tall(present(opts.printedAt) || new Date().toLocaleString());
-    if (opts.station?.trim()) {tall(`[ ${opts.station.trim().toUpperCase()} ]`);}
+    body(present(opts.printedAt) || new Date().toLocaleString());
+    if (opts.station?.trim()) {body(`[ ${opts.station.trim().toUpperCase()} ]`);}
   }
   if (!isKot) {
     // Legal entity, address, tax registration — EACH ONLY WHEN THE TENANT HAS
@@ -1646,22 +1645,22 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // configured the mode stands alone rather than repeating itself.
     const mode = present(opts.serviceMode) || "Dine In";
     const section = present(opts.section);
-    tall(section ? `${mode}: ${section}` : mode);
+    body(section ? `${mode}: ${section}` : mode);
     // Covers, counted ONCE PER TABLE ("Tables".num_covers) — the same number the
     // bill divides by for APC, so the kitchen and the till never disagree about
     // how many people are sitting there. Printed only when the table actually
     // records covers: defaulting an unknown count to 1 told the kitchen a
     // party size nobody had entered.
     const covers = Math.round(Number(opts.covers) || 0);
-    if (covers > 0) {tall(`Persons - ${covers}`);}
+    if (covers > 0) {body(`Persons - ${covers}`);}
     // WHO is looking after it. Each line only when that person is known; an
     // unassigned table prints neither, instead of two empty labels.
     const assignedTo = present(opts.assignedTo);
     const captain = present(opts.captain);
     if (assignedTo || captain) {
       line(sep);
-      if (assignedTo) {tall(`Assign to: ${assignedTo}`);}
-      if (captain) {tall(`Captain: ${captain}`);}
+      if (assignedTo) {body(`Assign to: ${assignedTo}`);}
+      if (captain) {body(`Captain: ${captain}`);}
     }
   } else {
     // The SAME restaurant-zone stamp the KOT uses. This used to be
@@ -1739,7 +1738,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   const orderNote = isKot ? present(opts.orderNote) : "";
   if (orderNote) {
     big("** NOTE **", width);
-    for (const l of wrapText(orderNote, width)) {tall(l);}
+    for (const l of wrapText(orderNote, width)) {body(l);}
     line(sep);
   }
 
@@ -1757,9 +1756,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // larger degrades to normal width inside the same column rather than
     // spilling into the dish name.
     //
-    // The column arithmetic is UNCHANGED by item 3's taller type: double height
-    // does not widen a cell, so No. 4 + Item 36 + Qty 8 = 48 and No. 4 + Item 22
-    // + Qty 6 = 32 exactly as before (see `tall`).
+    // No. 4 + Item 36 + Qty 8 = 48, and No. 4 + Item 22 + Qty 6 = 32.
     const COL_QTY = width >= 48 ? 8 : 6;
     const COL_ITEM = Math.max(8, width - COL_NO - COL_QTY);
     const pad = (s: string, n: number) => s.length >= n ? s : s + " ".repeat(n - s.length);
@@ -1782,25 +1779,24 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     const wideName = opts.reprint === true;
 
     /**
-     * THE DISH NAME, BOLD AND TALL (A4, item 3).
+     * THE DISH NAME, BOLD (A4) — and on a reprint, 2x2 as well (A7).
      *
-     * Bold costs no cells — a bold character is the same width — and double
-     * height costs none either, so the row keeps its exact column layout. The
-     * bold bit is set inside the `ESC !` size command as well as by `ESC E`,
-     * because `ESC !` rewrites emphasis along with size (see `big`): sending the
-     * size alone after `ESC E 1` would print the one word that had to be bold in
-     * ordinary weight.
+     * Bold costs no cells — a bold character is the same width — so the row
+     * keeps its exact column layout. The bold bit is set inside the `ESC !` size
+     * command as well as by `ESC E`, because `ESC !` rewrites emphasis along with
+     * size (see `big`): sending the size alone after `ESC E 1` would print the
+     * one word that had to be bold in ordinary weight.
      *
-     * The run returns to plain TALL, not to normal, because the rest of the row
-     * (leaders, quantity) is still on the same tall line. The leaders are
+     * It was bold AND double height (item 3) until item 5 took the height away
+     * (see `body`). The run returns to normal size before the leaders, which are
      * deliberately left OUTSIDE the bold run: a bold dot leader reads as part of
      * the name rather than as the gap it is bridging.
      */
     const dishName = (s: string) => {
       raw(ESC, 0x45, 0x01); // bold
-      raw(ESC, 0x21, MODE_TALL | MODE_BOLD | (wideName ? MODE_WIDE : 0));
+      raw(ESC, 0x21, MODE_BOLD | (wideName ? MODE_BIG : 0));
       text(s);
-      raw(ESC, 0x21, MODE_TALL);
+      raw(ESC, 0x21, 0x00);
       raw(ESC, 0x45, 0x00);
     };
 
@@ -1814,9 +1810,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
      *
      *   "x" prefix   — "x3" cannot be read as a line number, a table number or a
      *                  price; a lone "3" can be read as any of them.
-     *   double width — twice the stroke width of every other character on the
-     *                  row, so the eye finds it without reading the row. It is
-     *                  double HEIGHT as well now, only because the whole row is.
+     *   double size  — 2x2, twice the stroke of every other character on the
+     *                  row, so the eye finds it without reading the row. Double
+     *                  width AND height, never width alone: a letter doubled in
+     *                  one direction is a distorted letter (see `body`).
      *   dot leaders  — the row is anchored end to end, so the number cannot be
      *                  read against the neighbouring dish. Leaders are dropped
      *                  when the name wraps, because a leader run that ends where
@@ -1844,40 +1841,36 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       const leaders = single && gap >= 4
         ? ` ${".".repeat(gap - 2)} `
         : " ".repeat(Math.max(0, gap));
-      raw(ESC, 0x21, MODE_TALL);
       text(pad(no, COL_NO));
       dishName(first);
       text(leaders);
       raw(ESC, 0x45, 0x01); // bold
-      raw(ESC, 0x21, MODE_TALL | MODE_BOLD | (double ? MODE_WIDE : 0));
+      raw(ESC, 0x21, MODE_BOLD | (double ? MODE_BIG : 0));
       text(q);
-      raw(ESC, 0x21, MODE_TALL);
+      raw(ESC, 0x21, 0x00);
       raw(ESC, 0x45, 0x00);
       line();
-      raw(ESC, 0x21, 0x00);
       // Continuations, the hold and the note hang under the ITEM column, so the
       // No. and Qty columns stay a clean vertical run down the docket.
       const indent = " ".repeat(COL_NO);
       for (let i = 1; i < nameLines.length; i++) {
-        raw(ESC, 0x21, MODE_TALL);
         text(indent);
         dishName(nameLines[i] ?? "");
         line();
-        raw(ESC, 0x21, 0x00);
       }
       // THE HOLD, WHERE A NOTE GOES — directly under the dish it holds. The
       // "[Hold]" tag is the same shape as the "[Note]" tag beneath it, and it is
       // the whole line: the client asked for the marker alone (KOT_HOLD_LINE).
       // The wrap is kept so the line obeys the column however it is worded.
       if (it.held === true) {
-        for (const l of wrapText(KOT_HOLD_LINE, COL_ITEM - 1)) {tall(indent + l);}
+        for (const l of wrapText(KOT_HOLD_LINE, COL_ITEM - 1)) {body(indent + l);}
       }
       // Set apart by its "[Note]" tag and its indent and left out of the bold
       // run on purpose: a docket on which everything is emphasised emphasises
       // nothing.
       const note = String(it.note ?? "").trim();
       if (note) {
-        for (const l of wrapText(`[Note] ${note}`, COL_ITEM - 1)) {tall(indent + l);}
+        for (const l of wrapText(`[Note] ${note}`, COL_ITEM - 1)) {body(indent + l);}
       }
     };
 
@@ -1908,7 +1901,7 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
      */
     const qtyOf = (it: ReceiptItem) => Math.max(1, Math.round(Number(it.quantity) || 1));
 
-    tall(pad("No.", COL_NO) + pad("Item", COL_ITEM) + padL("Qty", COL_QTY));
+    body(pad("No.", COL_NO) + pad("Item", COL_ITEM) + padL("Qty", COL_QTY));
     line(sep);
     let totalQty = 0;
     let heldQty = 0;
@@ -1931,10 +1924,10 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // always prints the line exactly as it always has.
     line(sep);
     if (heldLines < opts.items.length || heldLines === 0) {
-      tall(twoCol("Total Qty", String(totalQty), width));
+      body(twoCol("Total Qty", String(totalQty), width));
     }
     if (heldLines > 0) {
-      tall(twoCol("Hold Qty", String(heldQty), width));
+      body(twoCol("Hold Qty", String(heldQty), width));
     }
     line(sep);
   } else {
