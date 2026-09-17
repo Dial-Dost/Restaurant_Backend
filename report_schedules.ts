@@ -34,7 +34,9 @@
 //     laptop pointed at the cloud database) must not burn the owner's retries.
 //  6) ONE SWEEPER. Each tick takes the single-row lease first; the sweep runs
 //     only in production (or where REPORT_SCHEDULER_ALLOW_NON_PROD says so), and
-//     only once migration 058 is in place.
+//     only once migration 058 is in place. Until then NOTHING scheduled runs —
+//     2.0.1-shaped inbox schedules included — and Run now refuses rather than
+//     queue a row nothing would finish (routes/accounting.ts).
 
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
@@ -82,8 +84,11 @@ import {
   ListOrphanAdhocDeliveries,
   NotifyReportOnce,
   GetReportEmailIdentity,
+  GetReportSweepStatus,
   normalizeEmailKey,
+  reportCatchupMinutes,
   type DueReportSchedule,
+  type ReapedReportDelivery,
   type RetryableReportDelivery,
   type RenderedReportFile,
   type SalesReport,
@@ -103,7 +108,7 @@ import {
   type SendOptions,
 } from "./mailer.js";
 import { renderReportBundle, type BundleIdentity } from "./report_bundle.js";
-import { buildReportEmail, buildTestEmail, dayLabel, sentBellBody, sentBellTitle, type ReportHeadline } from "./report_email_content.js";
+import { buildReportEmail, buildTestEmail, dayLabel, readMessageMeta, sentBellBody, sentBellTitle, type ReportMessageMeta } from "./report_email_content.js";
 import { REPORT_KEYS as CATALOGUE_KEYS, reportListPhrase } from "./report_catalogue.js";
 import { formatClock, tradingBusinessDate } from "./report_window.js";
 import { logger } from "./observability.js";
@@ -132,7 +137,7 @@ const LEASE_MS = (): number => envInt("REPORT_ATTEMPT_LEASE_MIN", 10) * 60_000;
 /** Past this much lateness an occurrence is recorded rather than run: a report
  *  that arrives half a day late with yesterday's numbers is worse than a visible
  *  "this one was missed". */
-const CATCHUP_MS = (): number => envInt("REPORT_CATCHUP_MINUTES", 360) * 60_000;
+const CATCHUP_MS = (): number => reportCatchupMinutes() * 60_000;
 const ARTIFACT_MAX_BYTES = (): number => envInt("REPORT_ARTIFACT_MAX_BYTES", 524_288);
 /** Every attachment of one email together, before encoding. */
 export const ATTACH_MAX_BYTES = (): number => envInt("REPORT_EMAIL_MAX_ATTACH_BYTES", 5_242_880);
@@ -144,8 +149,10 @@ export const PLATFORM_DAILY_CAP = (): number => envInt("REPORT_EMAIL_PLATFORM_DA
 const RETENTION_DAYS = (): number => envInt("REPORT_ARTIFACT_RETENTION_DAYS", 90);
 /** How long one sweep holds the leader lease (renewed every tick). */
 const SWEEP_LEASE_MIN = (): number => envInt("REPORT_SWEEP_LEASE_MIN", 4);
-/** How far back the boot scan looks for a Send now a dead process left behind. */
+/** How far back the boot scan looks for a Send now or Run now a dead process left behind. */
 const ORPHAN_MAX_AGE_MIN = 60;
+/** The sweep's tick (index.ts reads the same variable). */
+const SWEEP_INTERVAL_MIN = (): number => envInt("REPORT_SWEEP_INTERVAL_MIN", 5);
 
 /** REPORT_LABELS is keyed on the three report_keys migration 026 admits; a row
  *  carrying anything else falls back to the tenant's own name for the schedule. */
@@ -321,6 +328,44 @@ export function nextOccurrence(
   return null;
 }
 
+/**
+ * The fire day of the schedule's most recent occurrence that is already DUE at
+ * `now` — the period "Run now" reports.
+ *
+ * Calendar periods (periodFor) end at the midnight before their fire day, so
+ * today's key is always a closed period for them. A TRADING DAY ends at the
+ * send time itself: until today's close has passed, the trading day that
+ * closed most recently is the one that closed at yesterday's, and today's key
+ * would name 24 hours still in progress — a 23:30 close run at 15:00 once
+ * queued fifteen and a half hours of takings as the whole day, and a 01:00
+ * close run at 00:30 a day with half an hour still to go.
+ */
+export function lastClosedFireDay(
+  s: Pick<ScheduleShape, "frequency" | "hour_local" | "minute_local" | "window_mode">,
+  tz: string,
+  now: Date,
+): string {
+  const today = dayKeyOf(now, tz);
+  if (s.window_mode !== "trading_day" || s.frequency !== "daily") { return today; }
+  const close = fireInstant(today, s.hour_local, s.minute_local, tz);
+  return !Number.isNaN(close.getTime()) && now.getTime() < close.getTime() ? addDaysToKey(today, -1) : today;
+}
+
+/** A run asked for a period that has not ended yet. Answered 400, with the day named. */
+export class ReportPeriodOpenError extends Error {
+  readonly code = "REPORT_PERIOD_OPEN";
+  constructor(day: string, dayClose: string | null) {
+    super(dayClose
+      ? `The trading day ${dayLabel(day)} has not closed yet — it closes at ${dayClose}. Run it after that.`
+      : `${dayLabel(day)} has not ended yet. Run it once the day is over.`);
+    this.name = "ReportPeriodOpenError";
+  }
+}
+
+export function isReportPeriodOpenError(e: unknown): e is ReportPeriodOpenError {
+  return (e as { code?: unknown } | null)?.code === "REPORT_PERIOD_OPEN";
+}
+
 /** One occurrence this process is about to work on. `attempts` is the CAS token:
  *  the value the row is expected to still hold when the attempt is taken. */
 export interface PendingDelivery {
@@ -422,9 +467,11 @@ export async function runReportScheduleSweep(now: Date = new Date()): Promise<vo
   }
   // The lease, the per-address log and the files all live in 058. A sweep on a
   // database without them would run the one path it can no longer promise, so
-  // it waits — loudly, once — for the migration.
+  // it waits — loudly, once — for the migration. Every tenant waits with it,
+  // 2.0.1-shaped inbox schedules included (rule 6), and every sentence that
+  // describes this state says so.
   if (!(await reportEmailSchemaReady())) {
-    sayOnce("schema", () => { logger.error("Scheduled report sweep is WAITING — migrations 056-058 are not applied on this database."); });
+    sayOnce("schema", () => { logger.error("Scheduled report sweep is WAITING — migrations 056-058 are not applied on this database, so no scheduled report (in-app inbox ones included) is sent."); });
     return;
   }
   const mail = mailTransportStatus();
@@ -465,15 +512,25 @@ async function sweepTenant(resId: string, now: Date, tick: { mailAvailable: bool
   // database_supabase.ts) and RLS keys solely on app.res_id.
   let schedules: DueReportSchedule[] = [];
   let retryable: RetryableReportDelivery[] = [];
+  let reaped: ReapedReportDelivery[] = [];
+  const catchupMin = CATCHUP_MS() / 60_000;
   await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, async () => {
-    await ReapExhaustedReportDeliveries(resId);
+    reaped = await ReapExhaustedReportDeliveries(resId, catchupMin);
     schedules = await ListDueReportSchedules(resId);
-    retryable = await ListRetryableReportDeliveries(resId);
+    retryable = await ListRetryableReportDeliveries(resId, 50, catchupMin);
     if (tick.purge) {
       const purged = await PurgeReportDeliveryFileBodies(resId, RETENTION_DAYS());
       if (purged > 0) { logger.info({ resId, purged }, "report_file_bodies_purged"); }
     }
   });
+
+  // A reaped row is final: the owner hears about it the way a failed last
+  // attempt is heard about — once, bound to the row's own outlet, after pass A.
+  for (const r of reaped) {
+    const p = pendingOf(r);
+    logger.warn({ resId, deliveryId: p.delivery_id, kind: p.kind, err: scrubAddresses(r.error) }, "report_delivery_reaped");
+    await announceFinalFailure(resId, p, r.error);
+  }
 
   // PASS B — one transaction per schedule, bound to that schedule's real outlet.
   // NEVER nested inside pass A: see rule 2 in the file header.
@@ -645,7 +702,7 @@ export async function runOccurrence(resId: string, p: PendingDelivery, send?: Se
       outcome = await runBundle(resId, p, attempts, send);
     }
   } catch (err) {
-    await recordFailure(resId, p, attempts, err);
+    await recordFailure(resId, p, attempts, err, send);
     return;
   }
 
@@ -719,6 +776,23 @@ async function runLegacyInbox(resId: string, p: PendingDelivery, attempts: numbe
   }));
 }
 
+/** What the body is built from, in the shape the row keeps (report_email_content.ts). */
+function messageMetaOf(
+  id: BundleIdentity,
+  headline: ReportMessageMeta["headline"],
+  generatedAt: Date,
+): ReportMessageMeta {
+  return {
+    v: 1,
+    generated_at: generatedAt.toISOString(),
+    headline,
+    restaurant_name: id.restaurantName,
+    outlet_name: id.outletName,
+    currency: id.currency,
+    timezone: id.timezone,
+  };
+}
+
 /**
  * A bundle: render (or reuse what an earlier attempt stored), then deliver —
  * to the bell, or address by address.
@@ -740,14 +814,16 @@ async function runBundle(
 
   // TX3 — REUSE WHAT WAS ALREADY BUILT. A retry after a failed send re-sends
   // the SAME bytes (and the same Message-ID), not a re-render that may have
-  // moved; only a delivery with nothing stored renders.
+  // moved; only a delivery with nothing stored renders. What the body says
+  // besides the files is stored with them (ReportMessageMeta), so the retry's
+  // message is the first one, headline and "Generated" time included.
   let files: RenderedReportFile[] = [];
-  let headline: ReportHeadline | null = null;
-  let identity: BundleIdentity | null = null;
+  let rendered: ReportMessageMeta | null = null;
   const reports: { key: string; rows: number; truncated: boolean; filename: string; format: string }[] = [];
   if (!isTest) {
     files = await withTenant(ctx, () => LoadReportDeliveryFiles(resId, p.delivery_id));
     if (files.length === 0) {
+      const generatedAt = new Date();
       const bundle = await renderReportBundle({
         resId,
         outletId: p.outlet_id,
@@ -760,24 +836,19 @@ async function runBundle(
         windowStartAt: windowStart,
         windowEndAt: windowEnd,
         maxBytes: ATTACH_MAX_BYTES(),
+        generatedAt,
       }).catch((err: unknown) => {
         if (isPermanent(err)) { throw new FinalDeliveryError((err as Error).message); }
         throw err;
       });
-      await withTenant(ctx, () => StoreReportDeliveryFiles(resId, p.delivery_id, attempts, bundle.files));
+      rendered = messageMetaOf(bundle.identity, bundle.headline, generatedAt);
+      const meta = rendered;
+      await withTenant(ctx, () => StoreReportDeliveryFiles(resId, p.delivery_id, attempts, bundle.files, meta));
       files = bundle.files;
-      headline = bundle.headline;
-      identity = bundle.identity;
     }
     for (const f of files) {
       reports.push({ key: f.report_key, rows: f.rows, truncated: f.truncated, filename: f.filename, format: f.format });
     }
-  }
-  if (!identity) {
-    identity = await withTenant(ctx, async () => {
-      const i = await GetReportEmailIdentity(resId, p.outlet_id);
-      return { restaurantName: i.restaurant_name, outletName: i.outlet_name, currency: i.currency, timezone: i.timezone };
-    });
   }
 
   if (p.channel === "inbox") {
@@ -795,10 +866,18 @@ async function runBundle(
   }
 
   // THE EMAIL. 'sending' commits first (rule 4); what is already decided per
-  // address comes back with it and is not sent again.
+  // address comes back with it and is not sent again — and so do the body's
+  // inputs, the FIRST attempt's, whatever this one proposes.
   const transport = readMailTransport(send?.env);
-  const sending = await withTenant(ctx, () => MarkReportDeliverySending(resId, p.delivery_id, attempts, transport.kind));
+  const proposed = rendered ?? messageMetaOf(await withTenant(ctx, async () => {
+    const i = await GetReportEmailIdentity(resId, p.outlet_id);
+    return { restaurantName: i.restaurant_name, outletName: i.outlet_name, currency: i.currency, timezone: i.timezone };
+  }), null, new Date());
+  const sending = await withTenant(ctx, () => MarkReportDeliverySending(resId, p.delivery_id, attempts, transport.kind, proposed));
   if (!sending) { throw new Error("Report delivery was superseded by another attempt"); }
+  const meta = readMessageMeta(sending.message_meta) ?? proposed;
+  const identity: BundleIdentity = { restaurantName: meta.restaurant_name, outletName: meta.outlet_name, currency: meta.currency, timezone: meta.timezone };
+  const generatedAt = new Date(meta.generated_at);
   const decided = new Set([...sending.delivered_to, ...sending.rejected_to, ...sending.skipped_to].map(normalizeEmailKey));
   // The SEND-TIME check: an address removed from (or paused in) the book since
   // the schedule was saved gets nothing.
@@ -810,7 +889,6 @@ async function runBundle(
   const record = (addr: string, what: "delivered" | "rejected" | "skipped") =>
     withTenant(ctx, () => RecordReportRecipientOutcome(resId, p.delivery_id, attempts, addr, what));
 
-  const generatedAt = new Date();
   for (const addr of normalizeRecipients(p.recipients)) {
     const key = normalizeEmailKey(addr);
     if (decided.has(key)) { continue; }
@@ -848,7 +926,7 @@ async function runBundle(
         windowEndAt: windowEnd,
         timezone: identity.timezone,
         currency: identity.currency,
-        headline,
+        headline: meta.headline,
         files: reports.map((r) => ({ report_key: r.key, filename: r.filename, format: r.format, rows: r.rows, truncated: r.truncated })),
         recipient: addr,
         generatedAt,
@@ -931,12 +1009,40 @@ async function runReportFor(
   }
 }
 
-async function recordFailure(resId: string, p: PendingDelivery, attempts: number, err: unknown): Promise<void> {
+/**
+ * Will anything on this platform come back for a failed Run now or Send now?
+ *
+ * Only the sweep retries (ListRetryableReportDeliveries), and on a server
+ * whose sweep is off — the documented state while email is being set up — a
+ * row left 'failed' with attempts to spare sat there for good while the
+ * screen said it would be retried. So: this process sweeps, or another one
+ * has in the last few ticks (the lease row's heartbeat) — and, for an email,
+ * that sweeper can send mail (rule 5).
+ */
+async function retriesWillRun(p: PendingDelivery, send?: SendOptions): Promise<boolean> {
+  const needsMail = p.channel === "email";
+  if (sweepArmedHere && schedulerPermitted().ok && (!needsMail || mailTransportStatus(send?.env).available)) { return true; }
+  const lease = await GetReportSweepStatus(WORKER_ID).catch(() => null);
+  const seen = lease?.leader_seen_at ? new Date(lease.leader_seen_at).getTime() : Number.NaN;
+  if (Number.isNaN(seen) || Date.now() - seen > 3 * SWEEP_INTERVAL_MIN() * 60_000) { return false; }
+  return !needsMail || lease?.mail_ready === true;
+}
+
+/** The sentence a failure gets when nothing will retry it. */
+const NOTHING_RETRIES = "Nothing on this server retries it (scheduled reports are switched off here), so send it again once this is fixed.";
+
+async function recordFailure(resId: string, p: PendingDelivery, attempts: number, err: unknown, send?: SendOptions): Promise<void> {
   // The ROW keeps the provider's own words, behind the reports permission; the
   // LOG gets them with every address taken out.
-  const message = err instanceof Error ? err.message : String(err);
-  const permanent = isPermanent(err);
+  let message = err instanceof Error ? err.message : String(err);
+  let permanent = isPermanent(err);
   const backoffMs = BACKOFF_MIN[Math.min(attempts - 1, BACKOFF_MIN.length - 1)] * 60_000;
+  // A Run now or Send now with no sweeper to come back for it fails for good
+  // NOW, and says why — never 'failed, will retry' with nothing to retry it.
+  if (!permanent && attempts < REPORT_MAX_ATTEMPTS && p.kind !== "scheduled" && !(await retriesWillRun(p, send))) {
+    permanent = true;
+    message = `${message} ${NOTHING_RETRIES}`;
+  }
   const final = permanent || attempts >= REPORT_MAX_ATTEMPTS;
   const ctx = { res_id: resId, outlet_id: p.outlet_id, employeeId: "", role: "" };
 
@@ -948,9 +1054,17 @@ async function recordFailure(resId: string, p: PendingDelivery, attempts: number
   }
   logger.warn({ resId, deliveryId: p.delivery_id, attempts, final, err: scrubAddresses(message) }, "report_delivery_failed");
   if (!final) { return; }
+  await announceFinalFailure(resId, p, message);
+}
 
-  // Only the LAST failure reaches the owner. Pinging the bell on every transient
-  // retry is how a person learns to ignore the bell.
+/**
+ * Tell the owner an occurrence is not coming: the schedule card, and ONE bell.
+ * Only the LAST failure reaches the owner — pinging the bell on every transient
+ * retry is how a person learns to ignore the bell. Shared by a failed last
+ * attempt and by the reaper (a worker that never came back).
+ */
+async function announceFinalFailure(resId: string, p: PendingDelivery, message: string): Promise<void> {
+  const ctx = { res_id: resId, outlet_id: p.outlet_id, employeeId: "", role: "" };
   const scheduleId = p.schedule_id;
   const what = p.report_keys.length > 1 || p.kind === "adhoc" ? reportListPhrase(p.report_keys) || "Test email" : reportLabel(p.report_key, p.name);
   try {
@@ -1023,6 +1137,11 @@ export function manualOccurrenceKey(now: Date, tz: string): string {
  *
  * `businessDate` (a daily schedule only) asks for that date instead of the one
  * the schedule would report now — how an owner re-sends a Missed night.
+ *
+ * ALWAYS A CLOSED PERIOD. Without a date, a run covers what the schedule's
+ * MOST RECENT DUE occurrence covers (lastClosedFireDay). A window that has not
+ * ended yet — a date asked for too early — is refused, never emailed as a
+ * whole day.
  */
 export async function queueReportScheduleRun(
   resId: string,
@@ -1041,11 +1160,14 @@ export async function queueReportScheduleRun(
     minute_local: schedule.minute_local ?? 0,
     window_mode: schedule.window_mode,
   };
-  let period = occurrencePeriod(shape, dayKeyOf(now, tz));
+  let period = occurrencePeriod(shape, lastClosedFireDay(shape, tz, now));
   if (opts.businessDate && schedule.frequency === "daily" && DAY_KEY_RE.test(opts.businessDate)) {
     period = { ...period, from: opts.businessDate, to: opts.businessDate };
   }
   const w = reportEmailWindowIn(tz, { from: period.from, to: period.to, day_close: period.day_close }, 62, now);
+  if (!(Date.parse(w.window_end_at) <= now.getTime())) {
+    throw new ReportPeriodOpenError(w.from, period.day_close);
+  }
   return ClaimReportOccurrence(resId, {
     schedule_id: schedule.id,
     outlet_id: schedule.outlet_id,
@@ -1108,21 +1230,39 @@ export function kickReportDelivery(resId: string, deliveryId: string, send?: Sen
 }
 
 /**
- * At boot: a Send now whose process died before it finished is picked up
- * again — recent ones only (an hour), so a server that was down all night does
- * not mail yesterday's on-demand requests into the morning. Production only,
- * like the sweep, and only where mail can be sent.
+ * Kick a delivery once its lease has lapsed: now if it already has, else on
+ * an unref'd timer (a worker's lease is minutes, never days). The attempts CAS
+ * makes a kick that races the sweep harmless.
+ */
+function kickWhenDue(resId: string, deliveryId: string, due: Date): void {
+  const wait = due.getTime() - Date.now();
+  if (!(wait > 0)) { void kickReportDelivery(resId, deliveryId); return; }
+  const timer = setTimeout(() => { void kickReportDelivery(resId, deliveryId); }, Math.min(wait + 250, 2_147_483_647));
+  timer.unref?.();
+}
+
+/**
+ * At boot: a Send now or Run now whose process died before it finished is
+ * picked up again — recent ones only (an hour), so a server that was down all
+ * night does not mail yesterday's on-demand requests into the morning.
+ * Production only, like the sweep.
+ *
+ * WHEN ITS LEASE LAPSES, not at once: the dead worker's attempt holds the row
+ * for minutes, and a recreate is back well inside them — a scan for rows
+ * already due found nothing, and on a server whose sweep is off nothing else
+ * would come back. An email row still waits for a transport (rule 5, in
+ * runOccurrence).
  */
 export async function recoverOrphanReportSends(): Promise<number> {
   const prod = String(process.env.NODE_ENV ?? "").trim().toLowerCase() === "production";
   if (!prod && String(process.env.REPORT_SCHEDULER_ALLOW_NON_PROD ?? "").trim() !== "true") { return 0; }
-  if (!mailTransportStatus().available || !(await reportEmailSchemaReady())) { return 0; }
+  if (!(await reportEmailSchemaReady())) { return 0; }
   let n = 0;
   for (const resId of await ListRestaurantIds()) {
     try {
       const rows = await withTenant({ res_id: resId, outlet_id: "", employeeId: "", role: "" }, () =>
         ListOrphanAdhocDeliveries(resId, ORPHAN_MAX_AGE_MIN));
-      for (const r of rows) { void kickReportDelivery(resId, r.id); n += 1; }
+      for (const r of rows) { kickWhenDue(resId, r.id, r.next_attempt_at); n += 1; }
     } catch (err) {
       logger.warn({ err, resId }, "report_orphan_scan_failed");
     }

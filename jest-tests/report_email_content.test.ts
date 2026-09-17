@@ -15,6 +15,7 @@ import {
   escapeHtml,
   money,
   periodLabel,
+  readMessageMeta,
   reportEmailSubject,
   sentBellBody,
   sentBellTitle,
@@ -49,6 +50,36 @@ const base: ReportEmailInput = {
   generatedAt: new Date("2026-09-16T20:31:00.000Z"),
 };
 
+describe("what a retry builds its body from (readMessageMeta)", () => {
+  const stored = {
+    v: 1, generated_at: "2026-09-16T20:31:00.000Z", headline: base.headline,
+    restaurant_name: "Gaia Global Vegetarian", outlet_name: "Koramangala", currency: "INR", timezone: "Asia/Kolkata",
+  };
+
+  test("round-trips through JSON (jsonb), as an object or as text", () => {
+    expect(readMessageMeta(JSON.parse(JSON.stringify(stored)))).toEqual(stored);
+    expect(readMessageMeta(JSON.stringify(stored))).toEqual(stored);
+    // The same body, byte for byte, from what was stored.
+    const again = readMessageMeta(JSON.parse(JSON.stringify(stored)));
+    expect(buildReportEmail({ ...base, headline: again?.headline ?? null, generatedAt: new Date(String(again?.generated_at)) }))
+      .toEqual(buildReportEmail(base));
+  });
+
+  test("anything it cannot trust reads as nothing stored (the caller builds its own once)", () => {
+    for (const bad of [null, undefined, "", "not json", 7, [], { ...stored, v: 2 }, { ...stored, generated_at: "yesterday" },
+      { ...stored, restaurant_name: 5 }, { ...stored, timezone: "" }]) {
+      expect(readMessageMeta(bad)).toBeNull();
+    }
+  });
+
+  test("a headline with any part the body cannot print is dropped, not half-printed", () => {
+    expect(readMessageMeta({ ...stored, headline: { ...base.headline, gross: "12" } })?.headline).toBeNull();
+    expect(readMessageMeta({ ...stored, headline: { ...base.headline, payments: [{ label: "Cash", bills: 1 }] } })?.headline).toBeNull();
+    expect(readMessageMeta({ ...stored, headline: null })?.headline).toBeNull();
+    expect(readMessageMeta({ ...stored, outlet_name: null, currency: null })).toMatchObject({ outlet_name: null, currency: null });
+  });
+});
+
 describe("the words", () => {
   test("labels: a day, a range, a wall clock in the restaurant's zone", () => {
     expect(dayLabel("2026-09-17")).toBe("Thu 17 Sep 2026");
@@ -80,6 +111,15 @@ describe("the words", () => {
 
 describe("the body", () => {
   const mail = buildReportEmail(base);
+
+  test("opens with who, where, and every report by name — three of them read as a list", () => {
+    const lines = mail.text.split("\n");
+    expect(lines[0]).toBe("Gaia Global Vegetarian — Koramangala");
+    expect(lines[1]).toBe("Sales Summary, Settlement Summary and Void KOT for Wed 16 Sep 2026");
+    expect(mail.html).toContain("Sales Summary, Settlement Summary and Void KOT for <strong>Wed 16 Sep 2026</strong>");
+    const four = buildReportEmail({ ...base, reportKeys: ["item_wise", "discount", "void_kot", "bill_edit"] });
+    expect(four.text.split("\n")[1]).toBe("Item Wise, Discount, Void KOT and 1 more for Wed 16 Sep 2026");
+  });
 
   test("says the trading day with its exact instants and zone", () => {
     expect(mail.text).toContain("Trading day closing at 02:00: from 16 Sep 2026, 02:00 up to 17 Sep 2026, 02:00 (Asia/Kolkata).");

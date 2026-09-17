@@ -857,9 +857,10 @@ async function bootstrap(): Promise<void> {
 		logger.info({ reason: sweepPermit.reason }, "Scheduled report sweep disabled");
 	}
 
-	// A Send now whose process died mid-send is picked up again — recent ones
-	// only, production only, and only where mail can be sent. Independent of the
-	// sweep switch, like Send now itself. Fire-and-forget: never delays the boot.
+	// A Send now or Run now whose process died mid-flight is picked up again once
+	// its lease lapses — recent ones only, production only; an email one only
+	// where mail can be sent. Independent of the sweep switch, like Send now
+	// itself. Fire-and-forget: never delays the boot.
 	void recoverOrphanReportSends()
 		.then((n) => { if (n > 0) {logger.info({ n }, "report_orphan_sends_resumed");} })
 		.catch((err) => { logger.warn({ err }, "report_orphan_scan_failed"); });

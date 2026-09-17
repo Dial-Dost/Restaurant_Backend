@@ -86,8 +86,9 @@ describe("a click reaches an inbox", () => {
     const order = [
       "LoadReportDeliveryFiles(resId, p.delivery_id)",
       "await renderReportBundle({",
-      "StoreReportDeliveryFiles(resId, p.delivery_id, attempts, bundle.files)",
-      "MarkReportDeliverySending(resId, p.delivery_id, attempts, transport.kind)",
+      "StoreReportDeliveryFiles(resId, p.delivery_id, attempts, bundle.files, meta)",
+      "MarkReportDeliverySending(resId, p.delivery_id, attempts, transport.kind, proposed)",
+      "const meta = readMessageMeta(sending.message_meta) ?? proposed;",
       "ReportEmailBookStatus(resId)",
       "CountRecentReportEmails(resId)",
       "const one = await sendReportMessage({",
@@ -102,6 +103,10 @@ describe("a click reaches an inbox", () => {
       at = i;
     }
     expect(b).toContain("messageId: stableMessageId(p.delivery_id, addr, transport.fromAddress),");
+    // The body is built from the STORED inputs, never from a fresh clock or a
+    // fresh render's headline (a retry is the same message).
+    expect(b).toContain("headline: meta.headline,");
+    expect(b).toContain("const generatedAt = new Date(meta.generated_at);");
     expect(b).toContain("idempotencyKey: `rd-${p.delivery_id}-${addressTag(addr)}`,");
   });
 
@@ -134,6 +139,27 @@ describe("the sweep is guarded, and armed only where it may run", () => {
       at = i;
     }
     expect(fn(SWEEP, "schedulerPermitted")).toContain("REPORT_SCHEDULER_ALLOW_NON_PROD");
+  });
+
+  test("without 058 NOTHING scheduled runs, and Run now says so rather than queue", () => {
+    const s = fn(SWEEP, "runReportScheduleSweep");
+    const gate = s.indexOf("if (!(await reportEmailSchemaReady())) {");
+    expect(gate).toBeGreaterThan(-1);
+    expect(s.slice(gate, s.indexOf("\n  }", gate))).toMatch(/\n    return;$/);
+    expect(s.indexOf("ListRestaurantIds()")).toBeGreaterThan(gate);
+    const run = route(ACCOUNTING, "post", "/reports/schedules/:id/run-now");
+    const refuse = run.indexOf("if (!(await reportEmailSchemaReady())) {");
+    expect(refuse).toBeGreaterThan(-1);
+    expect(run.indexOf("queueReportScheduleRun(")).toBeGreaterThan(refuse);
+    expect(run).toContain("code: \"schema_pending\"");
+  });
+
+  test("the reaper's rows reach the owner, the way a failed last attempt does", () => {
+    const t = fn(SWEEP, "sweepTenant");
+    expect(t).toContain("reaped = await ReapExhaustedReportDeliveries(resId, catchupMin);");
+    expect(t).toContain("await announceFinalFailure(resId, p, r.error);");
+    expect(t).toContain("retryable = await ListRetryableReportDeliveries(resId, 50, catchupMin);");
+    expect(fn(SWEEP, "recordFailure")).toContain("await announceFinalFailure(resId, p, message);");
   });
 
   test("no email claim without a transport — the bell instead, once a day", () => {

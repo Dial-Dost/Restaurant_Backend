@@ -232,6 +232,9 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ReportDeliveries' AND column_name = 'maybe_duplicate') THEN
     ALTER TABLE "ReportDeliveries" ADD COLUMN IF NOT EXISTS maybe_duplicate boolean NOT NULL DEFAULT false;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ReportDeliveries' AND column_name = 'message_meta') THEN
+    ALTER TABLE "ReportDeliveries" ADD COLUMN IF NOT EXISTS message_meta jsonb;
+  END IF;
   IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ReportDeliveries' AND column_name = 'schedule_id' AND is_nullable = 'NO') THEN
     ALTER TABLE "ReportDeliveries" ALTER COLUMN schedule_id DROP NOT NULL;
   END IF;
@@ -338,14 +341,46 @@ END $$`,
   purged_day   date
 )`,
   `INSERT INTO "ReportSweepLease" (id) VALUES (1) ON CONFLICT (id) DO NOTHING`,
-  // 002's default privileges would hand the runtime INSERT and DELETE too. The
-  // one row is made above; a runtime that could delete it would switch the
-  // scheduled sweep off for every restaurant without a trace.
+  // ONE ROW, AND ONLY ITS OWNER AND THE RUNTIME MAY TOUCH IT. A role that
+  // could delete it would switch the scheduled sweep off for every restaurant
+  // without a trace, and one that could set `until` or `sent_count` would stop
+  // every sweep or trip the platform cap. Two sets of default privileges would
+  // hand exactly that out: 002's gives the runtime INSERT and DELETE, and
+  // Supabase's gives `anon`, `authenticated` and `service_role` everything —
+  // reachable through PostgREST by anyone holding a key, and RLS does not cover
+  // TRUNCATE. So the grants are taken back, and RLS is
+  // FORCED (the house rule for every public table) with a policy that only the
+  // table's owner — production's runtime connection — and app_runtime satisfy.
+  // The owner is read from the catalogue, not named, so an ownership change
+  // cannot lock the sweep out.
   `DO $$
 BEGIN
+  REVOKE ALL ON "ReportSweepLease" FROM PUBLIC;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE ALL ON "ReportSweepLease" FROM anon;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE ALL ON "ReportSweepLease" FROM authenticated;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    REVOKE ALL ON "ReportSweepLease" FROM service_role;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass('"ReportSweepLease"') AND relrowsecurity AND relforcerowsecurity) THEN
+    ALTER TABLE "ReportSweepLease" ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE "ReportSweepLease" FORCE ROW LEVEL SECURITY;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'ReportSweepLease' AND policyname = 'sweep_lease_owner') THEN
+    CREATE POLICY sweep_lease_owner ON "ReportSweepLease"
+      USING      (pg_has_role(current_user, (SELECT c.relowner FROM pg_class c WHERE c.oid = '"ReportSweepLease"'::regclass), 'USAGE'))
+      WITH CHECK (pg_has_role(current_user, (SELECT c.relowner FROM pg_class c WHERE c.oid = '"ReportSweepLease"'::regclass), 'USAGE'));
+  END IF;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
     GRANT SELECT, UPDATE ON "ReportSweepLease" TO app_runtime;
     REVOKE INSERT, DELETE, TRUNCATE ON "ReportSweepLease" FROM app_runtime;
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'ReportSweepLease' AND policyname = 'sweep_lease_runtime') THEN
+      CREATE POLICY sweep_lease_runtime ON "ReportSweepLease" TO app_runtime
+        USING (true) WITH CHECK (true);
+    END IF;
   END IF;
 END $$`,
 ];
@@ -359,5 +394,6 @@ export const REPORT_EMAIL_SCHEMA_PROBE = `select
   (to_regclass('"ReportDeliveryFiles"') is not null
    and to_regclass('"ReportSweepLease"') is not null
    and exists (select 1 from information_schema.columns
-                where table_schema = current_schema() and table_name = 'ReportDeliveries' and column_name = 'maybe_duplicate')
-   and exists (select 1 from pg_constraint where conname = 'ReportDeliveries_outlet_scope_check')) as m058`;
+                where table_schema = current_schema() and table_name = 'ReportDeliveries' and column_name = 'message_meta')
+   and exists (select 1 from pg_constraint where conname = 'ReportDeliveries_outlet_scope_check')
+   and exists (select 1 from pg_policies where tablename = 'ReportSweepLease' and policyname = 'sweep_lease_owner')) as m058`;

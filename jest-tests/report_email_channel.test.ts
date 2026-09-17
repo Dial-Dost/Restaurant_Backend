@@ -389,7 +389,7 @@ describe("the sweep sends before it marks delivered, and the form can reach it",
     // A row that says 'delivered' for mail that never left is the same defect as
     // a print job that acked paper nobody printed — and that one shipped here.
     const body = bundleBody();
-    const sending = body.indexOf("MarkReportDeliverySending(resId, p.delivery_id, attempts, transport.kind)");
+    const sending = body.indexOf("MarkReportDeliverySending(resId, p.delivery_id, attempts, transport.kind, proposed)");
     const send = body.indexOf("await sendReportMessage({");
     const recorded = body.indexOf("await record(addr, \"delivered\")");
     const mark = body.lastIndexOf("MarkReportDelivered(resId, {");

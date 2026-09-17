@@ -164,11 +164,22 @@ export function reportKeysOfRow(row: { report_keys?: unknown; report_key?: unkno
   return isReportKey(one) ? [one] : [];
 }
 
-/** "Sales Summary, Settlement Summary and 3 more" — for a subject line or a bell. */
+/**
+ * "Sales Summary, Settlement Summary and 3 more" — for a subject line or a bell.
+ * Up to `max` titles are all named, the last joined with "and": the email's
+ * own opening line asks for three, and joining three with nothing once printed
+ * "Item WiseDiscountVoid KOT".
+ */
 export function reportListPhrase(keys: readonly string[], max = 2): string {
   const titles = keys.map((k) => catalogueEntry(k)?.title ?? k);
   if (titles.length === REPORT_KEYS.length) {return "All reports";}
   if (titles.length === MIS_REPORT_KEYS.length && keys.every((k) => MIS_REPORT_KEYS.includes(k))) {return "All 15 MIS reports";}
-  if (titles.length <= max) {return titles.join(titles.length === 2 ? " and " : "");}
+  if (titles.length <= max) {return namedList(titles);}
   return `${titles.slice(0, max).join(", ")} and ${String(titles.length - max)} more`;
+}
+
+/** "A", "A and B", "A, B and C". */
+function namedList(titles: readonly string[]): string {
+  if (titles.length <= 1) {return titles[0] ?? "";}
+  return `${titles.slice(0, -1).join(", ")} and ${titles[titles.length - 1]}`;
 }

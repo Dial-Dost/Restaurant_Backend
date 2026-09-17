@@ -13,12 +13,15 @@ import {
   isMailNotConfiguredError,
   mailTransportStatus,
   mailerConfigured,
+  MailOperatorError,
   MailTimeoutError,
+  operatorMailProblem,
   readMailTransport,
   safeDisplayName,
   scrubAddresses,
   sendMail,
   sendReportMessage,
+  smtpRecipientRefusal,
   stableMessageId,
   withDisplayName,
   type FetchLike,
@@ -41,6 +44,15 @@ const fakeFetch = (status: number, reply: unknown, sink: Captured[] = []): Fetch
     text: async () => (typeof reply === "string" ? reply : JSON.stringify(reply)),
   };
 };
+
+/** An error shaped the way nodemailer's SMTP connection shapes one (_formatError). */
+function nodemailerError(message: string, code: string, response: string, command: string, rejected?: string[]): Error {
+  return Object.assign(new Error(`${message}: ${response}`), {
+    code, response, command,
+    responseCode: Number(/^\d+/.exec(response)?.[0]),
+    ...(rejected ? { rejected } : {}),
+  });
+}
 
 const smtpFactory = (behave: (msg: Record<string, unknown>) => Promise<unknown>, sink: Record<string, unknown>[] = []): TransportFactory => () => ({
   sendMail: (msg: Record<string, unknown>) => { sink.push(msg); return behave(msg); },
@@ -140,6 +152,24 @@ describe("the HTTPS transport", () => {
     await expect(sendReportMessage(msg, { env: env(RESEND), fetchImpl: fakeFetch(status, "busy") })).rejects.toThrow(String(status));
   });
 
+  test("a 409 is the idempotency key answering, never a refusal of the address", async () => {
+    // Still in flight under this key: transient.
+    await expect(sendReportMessage(msg, {
+      env: env(RESEND),
+      fetchImpl: fakeFetch(409, { name: "concurrent_idempotent_requests", message: "Same idempotency key used while original request is still in progress." }),
+    })).rejects.toThrow(/still processing/);
+    // Already used with a body that differs: that earlier request IS the
+    // message (a timed-out upload the service had taken) — not "Refused".
+    const sink: Captured[] = [];
+    const r = await sendReportMessage(msg, {
+      env: env(RESEND),
+      fetchImpl: fakeFetch(409, { name: "invalid_idempotent_request", message: "This idempotency key has already been used on a request that had a different payload." }, sink),
+    });
+    expect(r.status).toBe("accepted");
+    expect(r.messageId).toBe("<rd-abc-123@mail.gaia.test>");
+    expect(sink[0].headers["Idempotency-Key"]).toBe("rd-abc-123");
+  });
+
   test("a request that never answers is bounded and aborted", async () => {
     let aborted = false;
     const hang: FetchLike = (_url, init) => new Promise((_resolve, reject) => {
@@ -186,7 +216,7 @@ describe("one address, one message, one outcome — over SMTP", () => {
   test("a 550 is a REFUSAL, scrubbed", async () => {
     const r = await sendReportMessage({ to: ["gone@gaia.test"], subject: "s", text: "t" }, {
       env: env(SMTP),
-      factory: smtpFactory(async () => { throw Object.assign(new Error("550 5.1.1 <gone@gaia.test>: user unknown"), { responseCode: 550 }); }),
+      factory: smtpFactory(async () => { throw nodemailerError("Can't send mail - all recipients were rejected", "EENVELOPE", "550 5.1.1 <gone@gaia.test>: user unknown", "RCPT TO", ["gone@gaia.test"]); }),
     });
     expect(r.status).toBe("refused");
     expect(r.detail).toMatch(/550/);
@@ -196,9 +226,60 @@ describe("one address, one message, one outcome — over SMTP", () => {
   test("the server's own rejected list is a REFUSAL too", async () => {
     const r = await sendReportMessage({ to: ["gone@gaia.test"], subject: "s", text: "t" }, {
       env: env(SMTP),
-      factory: smtpFactory(async () => { throw Object.assign(new Error("Can't send mail - all recipients were rejected"), { code: "EENVELOPE", rejected: ["gone@gaia.test"] }); }),
+      factory: smtpFactory(async () => { throw Object.assign(new Error("Can't send mail - all recipients were rejected"), { code: "EENVELOPE", command: "RCPT TO", rejected: ["gone@gaia.test"] }); }),
     });
     expect(r.status).toBe("refused");
+  });
+
+  test("a 5xx for the MESSAGE (DATA) is this address's refusal — a full mailbox, a content rule", async () => {
+    const r = await sendReportMessage({ to: ["full@gaia.test"], subject: "s", text: "t" }, {
+      env: env(SMTP),
+      factory: smtpFactory(async () => { throw nodemailerError("Message failed", "EMESSAGE", "552 5.2.2 Mailbox full", "DATA"); }),
+    });
+    expect(r.status).toBe("refused");
+  });
+
+  // THE OPERATOR'S FAILURES THROW. Each of these once marked the owner's own
+  // address "Refused" and failed the delivery for good on its first attempt.
+  test.each([
+    ["a wrong or rotated password (535)", nodemailerError("Invalid login", "EAUTH", "535 5.7.8 Username and Password not accepted", "AUTH PLAIN"), /sign-in/],
+    ["authentication required (530 at MAIL FROM)", nodemailerError("Mail command failed", "EENVELOPE", "530 5.7.0 Authentication Required", "MAIL FROM"), /sign-in/],
+    ["authentication required only once a recipient is named (530 at RCPT)", nodemailerError("Can't send mail - all recipients were rejected", "EENVELOPE", "530 5.7.0 Must issue a STARTTLS command first", "RCPT TO", ["owner@gaia.test"]), /sign-in/],
+    ["relaying denied at RCPT (an unauthorised client)", nodemailerError("Can't send mail - all recipients were rejected", "EENVELOPE", "554 5.7.1 <owner@gaia.test>: Relay access denied", "RCPT TO", ["owner@gaia.test"]), /relaying denied/],
+    ["an unverified identity reported at RCPT (a provider sandbox)", nodemailerError("Can't send mail - all recipients were rejected", "EENVELOPE", "554 Message rejected: Email address is not verified.", "RCPT TO", ["owner@gaia.test"]), /sender address/],
+    ["missing credentials (EAUTH with no reply)", Object.assign(new Error("Missing credentials for \"PLAIN\""), { code: "EAUTH", command: "API", response: "" }), /sign-in/],
+    ["an unverified sender (554 at MAIL FROM, SES-style)", nodemailerError("Mail command failed", "EENVELOPE", "554 Message rejected: Email address is not verified.", "MAIL FROM"), /sender address/],
+    ["an unverified sender reported at DATA", nodemailerError("Message failed", "EMESSAGE", "554 Message rejected: Email address is not verified.", "DATA"), /sender address/],
+    ["a bad sender address at DATA (5.1.8)", nodemailerError("Message failed", "EMESSAGE", "553 5.1.8 Sender address rejected", "DATA"), /sender address/],
+    ["a refused connection (554 greeting)", nodemailerError("Greeting never received", "EPROTOCOL", "554 5.7.1 Service unavailable; client host blocked", "CONN"), /connection/],
+  ])("%s THROWS a sentence the owner can act on, and is not a refusal", async (_label, failure, sentence) => {
+    const err = await sendReportMessage({ to: ["owner@gaia.test"], subject: "s", text: "t" }, {
+      env: env(SMTP),
+      factory: smtpFactory(async () => { throw failure; }),
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(MailOperatorError);
+    expect((err as Error).message).toMatch(sentence);
+    expect((err as Error).message).toContain(String((failure as unknown as { message: string }).message));
+    expect(smtpRecipientRefusal(failure, "owner@gaia.test")).toBe(false);
+    expect(operatorMailProblem(failure)).not.toBeNull();
+  });
+
+  test("a 4xx at RCPT (greylisting) throws even with a rejected list — it may pass later", async () => {
+    const greylisted = nodemailerError("Can't send mail - all recipients were rejected", "EENVELOPE", "450 4.2.0 Greylisted, try again", "RCPT TO", ["a@gaia.test"]);
+    expect(smtpRecipientRefusal(greylisted, "a@gaia.test")).toBe(false);
+    expect(operatorMailProblem(greylisted)).toBeNull();
+    await expect(sendReportMessage({ to: ["a@gaia.test"], subject: "s", text: "t" }, {
+      env: env(SMTP),
+      factory: smtpFactory(async () => { throw greylisted; }),
+    })).rejects.toThrow(/450/);
+  });
+
+  test("a rejected list with no reply code counts only for the address it names", () => {
+    const e = { code: "EENVELOPE", command: "RCPT TO", rejected: ["Other@Gaia.test"] };
+    expect(smtpRecipientRefusal(e, "other@gaia.test")).toBe(true);
+    expect(smtpRecipientRefusal(e, "owner@gaia.test")).toBe(false);
+    // A bare 5xx that says nothing about where it happened is not the address's.
+    expect(smtpRecipientRefusal({ responseCode: 550 }, "owner@gaia.test")).toBe(false);
   });
 
   test("a 421 greylist and a timeout THROW — they may pass later", async () => {

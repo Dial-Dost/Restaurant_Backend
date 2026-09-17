@@ -83,9 +83,10 @@
  * accountant who have no business seeing each other's addresses, and a
  * refusal of one address must not look like a failure of the others. So the
  * report path sends each address its own message (sendReportMessage) and gets
- * back ACCEPTED, REFUSED (permanent — an SMTP 5xx, a provider 4xx), or a thrown
- * error (transient — retry later). sendMail keeps its original multi-address
- * shape for the callers and tests that already use it.
+ * back ACCEPTED, REFUSED (permanent — an SMTP 5xx at RCPT or DATA, a provider
+ * 4xx), or a thrown error (transient, or this server's own sign-in or sender —
+ * retry later). sendMail keeps its original multi-address shape for the
+ * callers and tests that already use it.
  */
 
 import { createHash } from "node:crypto";
@@ -107,6 +108,20 @@ export class MailTimeoutError extends Error {
 	constructor(ms: number) {
 		super(`The mail server did not complete the send within ${ms}ms.`);
 		this.name = "MailTimeoutError";
+	}
+}
+
+/**
+ * The mail server refused THIS SERVER (its sign-in, its sender), not the
+ * recipient. Retryable — the fix is a setting, and the next attempt after it
+ * delivers — and never recorded against an address.
+ */
+export class MailOperatorError extends Error {
+	readonly code = "MAIL_OPERATOR";
+	constructor(sentence: string, cause: unknown) {
+		const said = String((cause as { message?: unknown } | null)?.message ?? cause ?? "").trim();
+		super(said ? `${sentence} The mail server said: ${said}` : sentence);
+		this.name = "MailOperatorError";
 	}
 }
 
@@ -496,7 +511,7 @@ export interface OneSendResult {
 	status: "accepted" | "refused";
 	messageId: string | null;
 	provider: MailTransportKind;
-	/** Why it was refused, with every address scrubbed out. */
+	/** Why it was refused (or, rarely, a note on an acceptance), with every address scrubbed out. */
 	detail: string | null;
 }
 
@@ -548,12 +563,109 @@ export function stableMessageId(deliveryId: string, email: string, fromAddress: 
 	return `<rd-${safeId}-${addressTag(email)}@${domain}>`;
 }
 
-/** SMTP reply codes and nodemailer's shapes that mean "this address will never take it". */
-function smtpRefusal(err: unknown): boolean {
-	const e = err as { responseCode?: unknown; code?: unknown; rejected?: unknown } | null;
+interface SmtpFailure {
+	code?: unknown;
+	responseCode?: unknown;
+	command?: unknown;
+	response?: unknown;
+	message?: unknown;
+	rejected?: unknown;
+}
+
+/** Where in the session nodemailer says it failed: `err.command`. */
+function smtpStage(e: SmtpFailure | null): "rcpt" | "data" | "sender" | "other" {
+	const cmd = String(e?.command ?? "").trim().toUpperCase();
+	if (cmd.startsWith("RCPT")) { return "rcpt"; }
+	if (cmd === "DATA") { return "data"; }
+	if (cmd.startsWith("MAIL")) { return "sender"; }
+	return "other";
+}
+
+type OperatorSide = "sign-in" | "sender" | "relay";
+
+/**
+ * Which of THIS SERVER's settings a reply is about, whatever stage it came at —
+ * or null when it names nothing of ours. Some providers only check the sign-in
+ * or the From once a recipient (RCPT) or the message (DATA) arrives, so the
+ * stage alone cannot say:
+ *   sign-in  EAUTH; 530 (authentication or STARTTLS required); RFC 3463's
+ *            5.7.8 / 5.7.9 / 5.7.11 / 5.7.14; "authentication required";
+ *   sender   5.1.7 / 5.1.8 (bad sender address); an unverified sender (or, in
+ *            a provider's sandbox, an unverified recipient — still a setting);
+ *   relay    the server will not pass our mail on, which is what an
+ *            unauthenticated or wrongly-authorised client is told.
+ */
+function operatorSide(e: SmtpFailure | null): OperatorSide | null {
+	if (e?.code === "EAUTH") { return "sign-in"; }
+	const text = `${String(e?.response ?? "")} ${String(e?.message ?? "")}`;
+	if (Number(e?.responseCode) === 530 || /\b5\.7\.(?:8|9|11|14)\b/.test(text) || /\bauthentication (?:is )?required\b/i.test(text)) {
+		return "sign-in";
+	}
+	if (/\b5\.1\.[78]\b/.test(text) || /\b(?:not verified|unverified)\b/i.test(text)) { return "sender"; }
+	if (/\b(?:unable to relay|relay(?:ing)? (?:access )?(?:is )?(?:denied|not (?:permitted|allowed))|not (?:permitted|allowed) to relay)\b/i.test(text)) {
+		return "relay";
+	}
+	return null;
+}
+
+/**
+ * Is this SMTP failure the RECIPIENT's refusal — permanent, and about this one
+ * address?
+ *
+ * ONLY a 5xx at the recipient or message stage (RCPT TO, DATA) that names
+ * nothing of ours counts. Everything else is the OPERATOR's: 535 bad
+ * credentials (EAUTH), 530 authentication or STARTTLS required, a 55x on MAIL
+ * FROM for a sender the provider has not verified, "relaying denied", a 554
+ * greeting for a blocked IP. Recording those against the address marked the
+ * owner's own inbox "Refused" during the runbook's test email, failed the
+ * delivery for good on its first try, and pushed the schedule toward
+ * auto-disable — for a password somebody can fix in a minute. They THROW
+ * instead, so the retry after the fix delivers. A 4xx at any stage (a
+ * greylisted RCPT included, which nodemailer also reports with a `rejected`
+ * list) is transient by definition.
+ */
+export function smtpRecipientRefusal(err: unknown, addr: string): boolean {
+	const e = err as SmtpFailure | null;
+	const stage = smtpStage(e);
+	if (stage !== "rcpt" && stage !== "data") { return false; }
+	if (operatorSide(e) !== null) { return false; }
 	const code = Number(e?.responseCode);
-	if (Number.isFinite(code) && code >= 500 && code < 600) { return true; }
-	return e?.code === "EENVELOPE" && Array.isArray(e.rejected) && e.rejected.length > 0;
+	if (Number.isFinite(code) && code > 0) { return code >= 500 && code < 600; }
+	// No reply code at all: only nodemailer's own "all recipients were
+	// rejected", when it names this address, is a refusal.
+	return stage === "rcpt" && Array.isArray(e?.rejected)
+		&& e.rejected.some((a) => String(a).trim().toLowerCase() === addr.trim().toLowerCase());
+}
+
+/**
+ * The owner-readable sentence for a failure that is the OPERATOR's to fix — this
+ * server's sign-in, its sender, its relay permission, or its connection — or
+ * null for anything else (a transient failure keeps its own words). The
+ * delivery row keeps it (behind the reports permission), so the history says
+ * what to fix instead of a bare "535 5.7.8".
+ */
+export function operatorMailProblem(err: unknown): string | null {
+	const e = err as SmtpFailure | null;
+	const side = operatorSide(e);
+	const code = Number(e?.responseCode);
+	const permanent = Number.isFinite(code) && code >= 500 && code < 600;
+	// A sign-in failure is the operator's at any code: nodemailer raises EAUTH
+	// for missing credentials with no reply at all.
+	if (side === "sign-in" && (permanent || e?.code === "EAUTH")) {
+		return "The mail server did not accept this server's sign-in. Ask your administrator to check the mail settings.";
+	}
+	if (!permanent) { return null; }
+	const stage = smtpStage(e);
+	if (side === "sender" || (side === null && stage === "sender")) {
+		return "The mail server refused this server's sender address. Ask your administrator to check the From address and the sending domain.";
+	}
+	if (side === "relay") {
+		return "The mail server would not pass this server's mail on (relaying denied). Ask your administrator to check the mail settings.";
+	}
+	if (stage === "other") {
+		return "The mail server refused this server's connection. Ask your administrator to check the mail settings.";
+	}
+	return null;
 }
 
 /**
@@ -595,9 +707,13 @@ export async function sendReportMessage(message: MailMessage, opts?: SendOptions
 		}
 		return { status: "refused", messageId: null, provider: "smtp", detail: "The mail server did not accept this address." };
 	} catch (err) {
-		if (smtpRefusal(err)) {
+		if (smtpRecipientRefusal(err, addr)) {
 			return { status: "refused", messageId: null, provider: "smtp", detail: scrubAddresses((err as Error | null)?.message ?? err) };
 		}
+		// Transient, or the operator's: THROWN either way, so the address keeps
+		// its place for the retry. The operator's gets a sentence first.
+		const problem = operatorMailProblem(err);
+		if (problem) { throw new MailOperatorError(problem, err); }
 		throw err;
 	}
 }
@@ -644,7 +760,27 @@ async function sendViaResend(cfg: ResendConfig, addr: string, message: MailMessa
 			const j = (await res.json().catch(() => null)) as { id?: unknown } | null;
 			return { status: "accepted", messageId: message.messageId ?? (typeof j?.id === "string" ? j.id : null), provider: "resend", detail: null };
 		}
-		const detail = scrubAddresses(await res.text().catch(() => ""));
+		const raw = await res.text().catch(() => "");
+		const detail = scrubAddresses(raw);
+		// 409 IS THE IDEMPOTENCY KEY ANSWERING, never a refusal. The key is
+		// `rd-<delivery>-<address>`, used for this one message and nothing else,
+		// and a retry sends the same bytes under it (report_schedules.ts keeps
+		// the body's inputs with the files):
+		//   * concurrent_idempotent_requests — the first request with this key is
+		//     still being processed: transient, try again later;
+		//   * invalid_idempotent_request — a request with this key already
+		//     reached the service with a body that differs (an operator changed
+		//     the From name between attempts). That earlier request is the
+		//     message. Recording the address as refused — as this once did after
+		//     a timed-out upload the service had in fact accepted — failed a
+		//     delivery whose email had arrived.
+		if (res.status === 409) {
+			if (/concurrent_idempotent_requests/i.test(raw)) {
+				throw new Error(`The email service is still processing this message: ${detail || "409"}`);
+			}
+			logger.warn({ addr: addressTag(addr), detail }, "mail_resend_idempotent_replay");
+			return { status: "accepted", messageId: message.messageId ?? null, provider: "resend", detail: "Already accepted under this message's idempotency key." };
+		}
 		// 429 and 5xx pass on their own; 401/403 is the OPERATOR's key and must not
 		// be recorded as the recipient's fault. Every other 4xx is about this
 		// message or this address, and retrying it is five identical refusals.

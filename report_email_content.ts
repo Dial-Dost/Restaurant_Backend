@@ -67,6 +67,68 @@ export interface ReportEmailContent {
   html: string;
 }
 
+/**
+ * WHAT A BODY IS BUILT FROM besides the stored files — kept on the delivery row
+ * (058's message_meta) from the attempt that rendered them, so a RETRY SENDS
+ * THE SAME MESSAGE.
+ *
+ * It did not. A retry reused the attachments but rebuilt the rest: the
+ * headline figures (known only to the render) vanished from the body, and the
+ * "Generated" time moved — under the same Resend Idempotency-Key, which that
+ * provider answers with 409 when the body differs. A timed-out upload the
+ * provider had in fact accepted then came back "refused", and a delivered
+ * report was recorded as failed.
+ */
+export interface ReportMessageMeta {
+  v: 1;
+  /** The instant the files were built; the body and the workbook both say it. */
+  generated_at: string;
+  headline: ReportHeadline | null;
+  restaurant_name: string;
+  outlet_name: string | null;
+  currency: string | null;
+  timezone: string;
+}
+
+const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
+/** A stored headline, or null when any part of it is not what the body prints. */
+function readHeadline(raw: unknown): ReportHeadline | null {
+  if (!raw || typeof raw !== "object") {return null;}
+  const h = raw as Record<string, unknown>;
+  const money = ["gross", "net", "service_charge", "tax", "round_off", "bills", "covers", "nc_value"] as const;
+  if (!money.every((k) => finite(h[k]))) {return null;}
+  if (!(h.apc === null || finite(h.apc)) || !(h.voids === null || finite(h.voids)) || !Array.isArray(h.payments)) {return null;}
+  const payments: ReportHeadline["payments"] = [];
+  for (const p of h.payments as unknown[]) {
+    const r = (p ?? {}) as Record<string, unknown>;
+    if (typeof r.label !== "string" || !finite(r.bills) || !finite(r.amount)) {return null;}
+    payments.push({ label: r.label, bills: r.bills, amount: r.amount });
+  }
+  return {
+    gross: h.gross as number, net: h.net as number, service_charge: h.service_charge as number, tax: h.tax as number,
+    round_off: h.round_off as number, bills: h.bills as number, covers: h.covers as number,
+    apc: h.apc as number | null, nc_value: h.nc_value as number, voids: h.voids as number | null, payments,
+  };
+}
+
+/** The stored meta as the body can use it, or null (a row from before it was kept). */
+export function readMessageMeta(raw: unknown): ReportMessageMeta | null {
+  const r = (typeof raw === "string" ? (() => { try { return JSON.parse(raw) as unknown; } catch { return null; } })() : raw) as Record<string, unknown> | null;
+  if (!r || typeof r !== "object" || r.v !== 1) {return null;}
+  if (typeof r.generated_at !== "string" || Number.isNaN(Date.parse(r.generated_at))) {return null;}
+  if (typeof r.restaurant_name !== "string" || typeof r.timezone !== "string" || !r.timezone) {return null;}
+  return {
+    v: 1,
+    generated_at: new Date(r.generated_at).toISOString(),
+    headline: r.headline === null || r.headline === undefined ? null : readHeadline(r.headline),
+    restaurant_name: r.restaurant_name,
+    outlet_name: typeof r.outlet_name === "string" ? r.outlet_name : null,
+    currency: typeof r.currency === "string" ? r.currency : null,
+    timezone: r.timezone,
+  };
+}
+
 /** Restaurant-controlled text, made safe to place in a subject or a body. */
 export function cleanTenantText(raw: unknown, max = 60): string {
   let out = "";

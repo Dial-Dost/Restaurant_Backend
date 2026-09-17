@@ -7,8 +7,9 @@ import type { Express, Request, Response } from "express";
 import { AddExpense, ArchiveReportSchedule, Audit_log_category, BuildTallyXml, CloseCashSession, CreateReportSchedule, DeleteExpense, DeleteReconciliation, GetBalanceSheet, GetCashSessions, GetCurrentCashSession, GetDiscountsReport, GetExpenses, GetGstReport, GetProfitAndLoss, GetReconciliation, GetReportDeliveries, GetReportDeliveryArtifact, GetReportSchedule, GetSalesReport, GetTenantTimezone, ListReportSchedules, OpenCashSession, RECONCILE_ACTION_ID, SaveReconciliation, UpdateReportSchedule, isReportEmailRequestError, isReportEmailSchemaPending, reportEmailSchemaReady, type ReportScheduleRecord } from "../database_supabase.js";
 import { logger } from "../observability.js";
 import { renderGstCsv, renderSalesCsv, toCsv } from "../report_render.js";
-import { kickReportDelivery, nextOccurrence, queueReportScheduleRun } from "../report_schedules.js";
-import { mailerConfigured } from "../mailer.js";
+import { isReportPeriodOpenError, kickReportDelivery, nextOccurrence, queueReportScheduleRun } from "../report_schedules.js";
+import { mailerConfigured, mailTransportStatus } from "../mailer.js";
+import { MAIL_OFF_SENTENCE } from "./report_email.js";
 import { reportListPhrase } from "../report_catalogue.js";
 import { ACCOUNTING_PERM, callerMayUseAllOutlets, counterIdFrom, extractEmployeeId, extractRestaurantId, log_audit, requireCounter, validateAction, windowQuery } from "./_shared.js";
 
@@ -450,6 +451,20 @@ app.post("/reports/schedules/:id/run-now", validateAction(ACCOUNTING_PERM), asyn
 	try {
 		const schedule = await GetReportSchedule(restaurantId, req.params.id);
 		if (!schedule) { res.status(404).json({ error: "Unknown scheduled report" }); return; }
+		// NOTHING IS QUEUED THAT NOTHING WILL RUN (report_schedules.ts, rules 5
+		// and 6). Without 058 the sweep waits, so a queued row would sit as
+		// "Queued" with nothing promising to finish it — 2.0.1 queued it anyway.
+		// Without a transport an email run sat until some later deploy had one
+		// and was then mailed, days late. Installed 2.0.1 apps still show Run now
+		// on every schedule, so the server says why, in Send now's words.
+		if (!(await reportEmailSchemaReady())) {
+			res.status(503).json({ error: "Scheduled reports need a database update (migrations 056-058) that has not been applied to this server yet, so nothing scheduled can run here. Ask your administrator to apply it.", code: "schema_pending" });
+			return;
+		}
+		if (schedule.channel === "email" && !mailTransportStatus().available) {
+			res.status(503).json({ error: `${MAIL_OFF_SENTENCE}. Ask your administrator to set up the mail settings.`, code: "mail_not_configured" });
+			return;
+		}
 		const tz = await GetTenantTimezone(restaurantId);
 		// An optional business date — how an owner re-sends a night the history
 		// shows as Missed. Daily schedules only; otherwise the run covers what the
@@ -464,12 +479,15 @@ app.post("/reports/schedules/:id/run-now", validateAction(ACCOUNTING_PERM), asyn
 				{ schedule_id: schedule.id, report_key: schedule.report_key, report_keys: schedule.report_keys, frequency: schedule.frequency, delivery_id: deliveryId, business_date: businessDate });
 		} catch {/* ignore */}
 		// SINCE ITEM 9 IT RUNS NOW rather than on a later sweep tick — outside this
-		// request's connection (kickReportDelivery). On a database without 058 the
-		// 2.0.1 behaviour stands: it waits for the sweep.
-		const started = await reportEmailSchemaReady();
-		if (started && req.auth) { void kickReportDelivery(req.auth.res_id, deliveryId); }
+		// request's connection (kickReportDelivery).
+		const started = Boolean(req.auth);
+		if (req.auth) { void kickReportDelivery(req.auth.res_id, deliveryId); }
 		res.json({ queued: true, delivery_id: deliveryId, started });
-	} catch (e: any) { logger.error({ err: e }, "run_report_schedule_now_failed"); res.status(400).json({ error: String(e?.message ?? "Unable to queue this report") }); }
+	} catch (e: any) {
+		if (isReportPeriodOpenError(e)) { res.status(400).json({ error: e.message, code: "period_open" }); return; }
+		logger.error({ err: e }, "run_report_schedule_now_failed");
+		res.status(400).json({ error: String(e?.message ?? "Unable to queue this report") });
+	}
 });
 
 app.get("/reports/deliveries", validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {

@@ -41,6 +41,8 @@ const mockState = {
   delivery: null as unknown,
   file: null as unknown,
   createThrows: null as unknown,
+  queueThrows: null as unknown,
+  scheduleChannel: "email",
 };
 const record = (name: string, args: unknown[]) => { (mockCalls[name] ??= []).push(args); };
 
@@ -97,8 +99,9 @@ jest.mock("../database_supabase", () => {
     }),
     GetReportSchedule: wrap("GetReportSchedule", () => ({
       id: "f6f6f6f6-6666-4666-8666-f6f6f6f6f6f6", outlet_id: "o1", name: "Night", report_key: "bundle",
-      frequency: "daily", hour_local: 2, minute_local: 0, weekday: null, day_of_month: null, channel: "email",
-      recipients: ["owner@gaia.test"], format: "xlsx", report_keys: ["sales_summary", "settlement_summary"],
+      frequency: "daily", hour_local: 2, minute_local: 0, weekday: null, day_of_month: null, channel: mockState.scheduleChannel,
+      recipients: mockState.scheduleChannel === "email" ? ["owner@gaia.test"] : [], format: "xlsx",
+      report_keys: ["sales_summary", "settlement_summary"],
       formats: ["xlsx"], window_mode: "trading_day", outlet_scope: "outlet", enabled: true,
     })),
     GetTenantTimezone: wrap("GetTenantTimezone", () => "Asia/Kolkata"),
@@ -113,7 +116,10 @@ jest.mock("../report_schedules", () => {
     __esModule: true,
     ...actual,
     kickReportDelivery: (...args: unknown[]) => { record("kickReportDelivery", args); return Promise.resolve(); },
-    queueReportScheduleRun: (...args: unknown[]) => { record("queueReportScheduleRun", args); return Promise.resolve("a7a7a7a7-7777-4777-8777-a7a7a7a7a7a7"); },
+    queueReportScheduleRun: (...args: unknown[]) => {
+      record("queueReportScheduleRun", args);
+      return mockState.queueThrows ? Promise.reject(mockState.queueThrows) : Promise.resolve("a7a7a7a7-7777-4777-8777-a7a7a7a7a7a7");
+    },
   };
 });
 
@@ -186,6 +192,8 @@ beforeEach(() => {
   mockState.delivery = null;
   mockState.file = null;
   mockState.createThrows = null;
+  mockState.queueThrows = null;
+  mockState.scheduleChannel = "email";
   delete process.env.REPORT_SEND_NOW;
   mailOn();
 });
@@ -472,15 +480,56 @@ describe("the schedule routes, since item 9", () => {
     expect(forbidden.body.error).toMatch(/Only an admin or a manager/);
   });
 
-  test("Run now takes a business date, and starts at once on a migrated database", async () => {
-    const r = await call("POST", "/reports/schedules/:id/run-now", { params: { id: "f6f6f6f6-6666-4666-8666-f6f6f6f6f6f6" }, body: { business_date: "2026-09-15" } });
+  const RUN = { params: { id: "f6f6f6f6-6666-4666-8666-f6f6f6f6f6f6" } };
+
+  test("Run now takes a business date, and starts at once", async () => {
+    const r = await call("POST", "/reports/schedules/:id/run-now", { ...RUN, body: { business_date: "2026-09-15" } });
     expect(r.body).toEqual({ queued: true, delivery_id: "a7a7a7a7-7777-4777-8777-a7a7a7a7a7a7", started: true });
     expect((mockCalls.queueReportScheduleRun?.[0]?.[4] as { businessDate: string }).businessDate).toBe("2026-09-15");
     expect(mockCalls.kickReportDelivery?.[0]).toEqual([RID, "a7a7a7a7-7777-4777-8777-a7a7a7a7a7a7"]);
-    mockState.ready = false;
-    const old = await call("POST", "/reports/schedules/:id/run-now", { params: { id: "f6f6f6f6-6666-4666-8666-f6f6f6f6f6f6" }, body: { business_date: "15-09-2026" } });
-    expect(old.body.started).toBe(false);
+    const loose = await call("POST", "/reports/schedules/:id/run-now", { ...RUN, body: { business_date: "15-09-2026" } });
+    expect(loose.body.started).toBe(true);
     expect((mockCalls.queueReportScheduleRun?.[1]?.[4] as { businessDate: string | null }).businessDate).toBeNull();
-    expect(mockCalls.kickReportDelivery).toHaveLength(1);
+  });
+
+  test("Run now on a database without 056-058 queues NOTHING — the sweep waits, so nothing would finish it (a 2.0.1 inbox schedule included)", async () => {
+    mockState.ready = false;
+    mockState.scheduleChannel = "inbox";
+    const r = await call("POST", "/reports/schedules/:id/run-now", RUN);
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe("schema_pending");
+    expect(r.body.error).toBe("Scheduled reports need a database update (migrations 056-058) that has not been applied to this server yet, so nothing scheduled can run here. Ask your administrator to apply it.");
+    expect(mockCalls.queueReportScheduleRun).toBeUndefined();
+    expect(mockCalls.kickReportDelivery).toBeUndefined();
+  });
+
+  test("Run now of an EMAIL schedule with no transport: 503 in Send now's words, nothing claimed (an installed 2.0.1 app still shows the button)", async () => {
+    mailOff();
+    const r = await call("POST", "/reports/schedules/:id/run-now", RUN);
+    expect(r.status).toBe(503);
+    expect(r.body).toEqual({ error: "Email is not set up on this server. Ask your administrator to set up the mail settings.", code: "mail_not_configured" });
+    expect(mockCalls.queueReportScheduleRun).toBeUndefined();
+    // …while an inbox schedule still runs without one.
+    mockState.scheduleChannel = "inbox";
+    const inbox = await call("POST", "/reports/schedules/:id/run-now", RUN);
+    expect(inbox.body).toMatchObject({ queued: true, started: true });
+  });
+
+  test("Run now for a day that has not closed is a 400 that names the day, not a queued half-day", async () => {
+    const sched = await import("../report_schedules");
+    mockState.queueThrows = new sched.ReportPeriodOpenError("2026-09-17", "23:30");
+    const r = await call("POST", "/reports/schedules/:id/run-now", RUN);
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual({ error: "The trading day Thu 17 Sep 2026 has not closed yet — it closes at 23:30. Run it after that.", code: "period_open" });
+    expect(mockCalls.kickReportDelivery).toBeUndefined();
+  });
+});
+
+describe("the degradation contract says what actually happens", () => {
+  test("a database behind 056-058 is never described as still running schedules", async () => {
+    const db = await import("../database_supabase");
+    const msg = new db.ReportEmailSchemaPendingError().message;
+    expect(msg).not.toMatch(/keep running/i);
+    expect(msg).toMatch(/no scheduled report is sent from this server/);
   });
 });

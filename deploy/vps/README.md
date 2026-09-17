@@ -844,10 +844,21 @@ skipped or reordered.
    `✅ Report email schema ready (migrations 056-058)` and
    `✅ Report email transport ready` (with `"transport":"smtp"` or `"resend"`).
    A `Report email transport OFF` line names the setting that is missing.
+   A `Report email is OFF — migrations 056-058 are not all applied` line means
+   step 2 is not done: until it is, **nothing scheduled runs** (the 2.0.1
+   in-app inbox schedules included) and Run now answers `503 schema_pending`.
 6. **Send a test email**: web or app → Insights → Reports → **Email reports** →
    Address book → add your own address → **Send test email**. In Gmail, open it,
    *⋮ → Show original*, and check **SPF: PASS, DKIM: PASS, DMARC: PASS**. If it
    landed in spam, fix DNS before going further.
+   If the history shows the test as **failed**, its line names what to fix —
+   *this server's sign-in* (`SMTP_USER`/`SMTP_PASS`), *sender address*
+   (`SMTP_FROM`/`MAIL_FROM` and the verified domain), *relaying denied*, or
+   *connection* (host/port). Those are this server's settings, never the
+   address's fault: your address is **not** marked Refused. Fix `.env`,
+   recreate (step 4), and press **Send test email** again — with the sweep
+   still off (step 7) nothing retries a failed send by itself, and the history
+   says so.
 7. **Only now switch the schedule on**: add `REPORT_SCHEDULER=true` to `.env`
    (with `NODE_ENV=production`, which the box already has) and recreate the
    backend again. The log says `✅ Scheduled report sweep armed`.
@@ -897,6 +908,8 @@ REPORT_EMAIL_MAX_ATTACH_BYTES=5242880 # all attachments of one email, default 5 
 REPORT_EMAIL_TENANT_DAILY_CAP=200     # messages per restaurant per 24 h
 REPORT_EMAIL_PLATFORM_DAILY_CAP=2000  # messages for the whole platform per day
 REPORT_ARTIFACT_RETENTION_DAYS=90     # stored attachment bodies are purged after this
+REPORT_CATCHUP_MINUTES=360            # a missed schedule is still sent up to this late; a Run now or
+                                      # Send now not finished by then is dropped (and the owner told), never sent late
 REPORT_SEND_NOW=true                  # false switches Send now off without a deploy
 ```
 
@@ -962,7 +975,12 @@ if you roll back past this release, keep `REPORT_SCHEDULER` unset — a 2.0.1
 sweep would fail a bundle schedule's rows as "Unsupported report_key: bundle".
 Installed **2.0.1 apps** keep working: the schedule list only gained fields, and
 their create/edit bodies are stored as the single-report, calendar-day CSV
-schedules they always were.
+schedules they always were. Editing a schedule that app cannot show (several
+reports, or one MIS report such as Item Wise) changes only its name, time and
+frequency — the reports it sends are kept. Its **Run now** answers with a
+sentence rather than queue something that cannot finish: `503` for an email
+schedule while mail is off, and `400` for a trading day that has not closed yet
+(a run always covers the most recent CLOSED trading day).
 
 ---
 

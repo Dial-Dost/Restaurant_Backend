@@ -121,13 +121,44 @@ describe("what the three files say", () => {
     expect(f058).toContain("REVOKE INSERT, DELETE, TRUNCATE ON \"ReportSweepLease\" FROM app_runtime;");
   });
 
+  test("058: the lease is out of reach of every other role — Supabase's anon/authenticated included — and RLS-forced", () => {
+    // Supabase's default privileges grant anon and authenticated everything on
+    // a new public table (production's pg_default_acl, read 2026-09-17); a
+    // PostgREST caller could otherwise delete the row or set `until`, which
+    // stops every restaurant's sweep.
+    expect(f058).toContain("REVOKE ALL ON \"ReportSweepLease\" FROM PUBLIC;");
+    expect(f058).toContain("IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN REVOKE ALL ON \"ReportSweepLease\" FROM anon; END IF;");
+    expect(f058).toContain("IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN REVOKE ALL ON \"ReportSweepLease\" FROM authenticated; END IF;");
+    expect(f058).toContain("IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN REVOKE ALL ON \"ReportSweepLease\" FROM service_role; END IF;");
+    expect(f058).toContain("ALTER TABLE \"ReportSweepLease\" ENABLE ROW LEVEL SECURITY; ALTER TABLE \"ReportSweepLease\" FORCE ROW LEVEL SECURITY;");
+    // Only the owner (read from the catalogue, not named) and the runtime pass.
+    expect(f058).toContain("CREATE POLICY sweep_lease_owner ON \"ReportSweepLease\" USING (pg_has_role(current_user, (SELECT c.relowner FROM pg_class c WHERE c.oid = '\"ReportSweepLease\"'::regclass), 'USAGE'))");
+    expect(f058).toContain("CREATE POLICY sweep_lease_runtime ON \"ReportSweepLease\" TO app_runtime USING (true) WITH CHECK (true);");
+    // …made AFTER the one row is inserted, so the insert is not the policy's to judge.
+    expect(f058.indexOf("INSERT INTO \"ReportSweepLease\" (id) VALUES (1)")).toBeLessThan(f058.indexOf("FORCE ROW LEVEL SECURITY; END IF; IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'ReportSweepLease'"));
+    // No public table without RLS: every CREATE TABLE in 056-058 is followed by a FORCE for it.
+    for (const f of [f056, f057, f058]) {
+      for (const m of f.matchAll(/CREATE TABLE IF NOT EXISTS "([A-Za-z]+)"/g)) {
+        expect(f).toContain(`ALTER TABLE "${m[1]}" FORCE ROW LEVEL SECURITY;`);
+      }
+    }
+  });
+
+  test("058: a retry's email body is rebuilt from what was stored with the files", () => {
+    expect(f058).toContain("ALTER TABLE \"ReportDeliveries\" ADD COLUMN IF NOT EXISTS message_meta jsonb;");
+  });
+
   test("the runtime's probe looks for the LAST thing each file makes", () => {
     const probe = squash(REPORT_EMAIL_SCHEMA_PROBE);
     expect(probe).toContain("to_regclass('\"ReportEmailRecipients\"') is not null as m056");
     expect(probe).toContain("conname = 'ReportSchedules_recipients_cap'");
     expect(f057.lastIndexOf("ReportSchedules_recipients_cap")).toBeGreaterThan(f057.lastIndexOf("ReportSchedules_outlet_scope_check"));
     expect(probe).toContain("conname = 'ReportDeliveries_outlet_scope_check'");
-    expect(probe).toContain("column_name = 'maybe_duplicate'");
+    // 058's last column, and the last thing it makes: the lease's owner policy.
+    expect(probe).toContain("column_name = 'message_meta'");
+    expect(f058.lastIndexOf("message_meta")).toBeGreaterThan(f058.lastIndexOf("maybe_duplicate"));
     expect(probe).toContain("to_regclass('\"ReportSweepLease\"') is not null");
+    expect(probe).toContain("tablename = 'ReportSweepLease' and policyname = 'sweep_lease_owner'");
+    expect(f058.lastIndexOf("CREATE POLICY sweep_lease_owner")).toBeGreaterThan(f058.lastIndexOf("CREATE TABLE IF NOT EXISTS"));
   });
 });

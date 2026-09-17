@@ -246,7 +246,7 @@ mw08 USE     *                                                      | <inline(re
 0224 POST    /reports/schedules                                     | validateAction(ACCOUNTING_PERM)                | 004e8dc2
 0225 PATCH   /reports/schedules/:id                                 | validateAction(ACCOUNTING_PERM)                | fdbe61fb
 0226 DELETE  /reports/schedules/:id                                 | validateAction(ACCOUNTING_PERM)                | b07ba3a6
-0227 POST    /reports/schedules/:id/run-now                         | validateAction(ACCOUNTING_PERM)                | 8e4c4f1c
+0227 POST    /reports/schedules/:id/run-now                         | validateAction(ACCOUNTING_PERM)                | a9b9f45c
 0228 GET     /reports/deliveries                                    | validateAction(ACCOUNTING_PERM)                | 620019d8
 0229 GET     /reports/deliveries/:id/download                       | validateAction(ACCOUNTING_PERM)                | b01ef223
 0230 GET     /analytics/operations                                  | validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56") | 7d80f0b5

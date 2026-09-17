@@ -217,6 +217,13 @@ describe("the catalogue of emailable reports", () => {
     expect(reportListPhrase(["sales_summary"])).toBe("Sales Summary");
     expect(reportListPhrase(["sales_summary", "settlement_summary"])).toBe("Sales Summary and Settlement Summary");
     expect(reportListPhrase(["item_wise", "discount", "void_kot", "bill_edit"])).toBe("Item Wise, Discount and 2 more");
+    // Up to `max`, every title is named and the last joined with "and" — three
+    // under max=3 once ran together as "Item WiseDiscountVoid KOT".
+    expect(reportListPhrase(["item_wise", "discount", "void_kot"], 3)).toBe("Item Wise, Discount and Void KOT");
+    expect(reportListPhrase(["item_wise", "discount"], 3)).toBe("Item Wise and Discount");
+    expect(reportListPhrase(["item_wise"], 3)).toBe("Item Wise");
+    expect(reportListPhrase([], 3)).toBe("");
+    expect(reportListPhrase(["item_wise", "discount", "void_kot", "bill_edit"], 3)).toBe("Item Wise, Discount, Void KOT and 1 more");
     expect(reportListPhrase([...MIS_REPORT_KEYS])).toBe("All 15 MIS reports");
     expect(reportListPhrase([...REPORT_KEYS])).toBe("All reports");
   });

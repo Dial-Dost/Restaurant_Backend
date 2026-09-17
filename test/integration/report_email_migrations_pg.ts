@@ -17,7 +17,12 @@
 //   4. each CHECK refuses what it says, and the 026/044 writes still pass;
 //   5. both ON CONFLICT targets work with their predicates, and fail with
 //      42P10 without them;
-//   6. RLS isolates the two new tenant tables for app_runtime.
+//   6. RLS isolates the two new tenant tables for app_runtime;
+//   7. the sweep lease is out of every other role's reach — Supabase's `anon`,
+//      `authenticated` and `service_role` included, even with its default privileges
+//      handing them everything — while a NON-superuser owner (production's
+//      runtime connection; RLS is forced on it too) and app_runtime can still
+//      take and renew it.
 //
 // RUN IT (never against anything but a throwaway local server):
 //   REPORT_EMAIL_PG_URL=postgres://postgres@127.0.0.1:55439/postgres?sslmode=disable \
@@ -83,7 +88,17 @@ async function freshDb(admin: pg.Client, name: string): Promise<pg.Client> {
   await admin.query(`create database ${name}`);
   const c = new pg.Client({ connectionString: urlFor(name) });
   await c.connect();
+  // What a Supabase project has before any migration: the two PostgREST roles,
+  // and default privileges that hand them every new public table.
+  await c.query(`alter default privileges in schema public grant all on tables to anon, authenticated, service_role`);
   return c;
+}
+
+async function ensureClusterRoles(admin: pg.Client): Promise<void> {
+  for (const role of ["anon", "authenticated", "service_role"]) {
+    await admin.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} nologin; end if; end $$`);
+  }
+  await admin.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = 're_proof_owner') then create role re_proof_owner nologin nosuperuser nobypassrls; end if; end $$`);
 }
 
 async function applyFile(c: pg.Client, file: string): Promise<void> {
@@ -123,13 +138,16 @@ async function catalogue(c: pg.Client): Promise<string> {
   const rls = await c.query(`select relname, relrowsecurity, relforcerowsecurity from pg_class
      where relname in ('ReportSchedules','ReportDeliveries','ReportEmailRecipients','ReportDeliveryFiles','ReportSweepLease') order by 1`);
   const pol = await c.query(`select tablename, policyname, qual, with_check from pg_policies
-     where tablename in ('ReportEmailRecipients','ReportDeliveryFiles') order by 1, 2`);
-  return JSON.stringify({ cols: cols.rows, cons: cons.rows, idx: idx.rows, rls: rls.rows, pol: pol.rows });
+     where tablename in ('ReportEmailRecipients','ReportDeliveryFiles','ReportSweepLease') order by 1, 2`);
+  const grants = await c.query(`select table_name, grantee, privilege_type from information_schema.role_table_grants
+     where table_name in ('ReportSchedules','ReportDeliveries','ReportEmailRecipients','ReportDeliveryFiles','ReportSweepLease') order by 1, 2, 3`);
+  return JSON.stringify({ cols: cols.rows, cons: cons.rows, idx: idx.rows, rls: rls.rows, pol: pol.rows, grants: grants.rows });
 }
 
 async function main(): Promise<void> {
   const admin = new pg.Client({ connectionString: base });
   await admin.connect();
+  await ensureClusterRoles(admin);
   const files = (await readdir(MIGRATIONS)).filter((f) => f.endsWith(".sql")).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const upTo053 = files.filter((f) => f < "054");
 
@@ -153,6 +171,8 @@ async function main(): Promise<void> {
     try { await applyFile(fresh, f); } catch (err) { allApplied = false; console.log(`    ${(err as Error).message}`); }
   }
   check("056, 057 and 058 apply on top of 000-053", allApplied);
+  const meta = await fresh.query(`select data_type from information_schema.columns where table_name = 'ReportDeliveries' and column_name = 'message_meta'`);
+  check("058 adds message_meta as jsonb (a retry's body is built from it)", meta.rows[0]?.data_type === "jsonb", JSON.stringify(meta.rows));
   const probe = await fresh.query(REPORT_EMAIL_SCHEMA_PROBE);
   check("the runtime's probe reads all three as present", probe.rows[0].m056 === true && probe.rows[0].m057 === true && probe.rows[0].m058 === true, JSON.stringify(probe.rows[0]));
   const backfilled = await fresh.query(`select kind from "ReportDeliveries" where occurrence_key like 'manual:%'`);
@@ -330,7 +350,48 @@ async function main(): Promise<void> {
   check("the lease is readable by the runtime (not tenant data)", leaseRead.rowCount === 1);
   await refuses(c, "…but the runtime cannot insert lease rows", `insert into "ReportSweepLease" (id) values (1)`, [], "42501");
   await refuses(c, "…or delete the one there is", `delete from "ReportSweepLease"`, [], "42501");
+  const runtimeTake = await c.query(`update "ReportSweepLease" set holder = 'runtime', until = now() + interval '4 minutes', heartbeat_at = now() where id = 1 returning holder`);
+  check("…and can still take the lease with RLS forced (its own policy)", runtimeTake.rowCount === 1);
   await c.query("rollback");
+
+  console.log("7. the sweep lease is out of every other role's reach");
+  const grants = await c.query(`select grantee, string_agg(privilege_type, ',' order by privilege_type) as p
+      from information_schema.role_table_grants where table_name = 'ReportSweepLease' group by grantee order by grantee`);
+  const byRole = Object.fromEntries(grants.rows.map((r) => [r.grantee as string, r.p as string]));
+  check("Supabase's default privileges were live on this database (the other tables have them)",
+    ((await c.query(`select 1 from information_schema.role_table_grants where table_name = 'ReportEmailRecipients' and grantee = 'anon'`)).rowCount ?? 0) > 0);
+  check("anon, authenticated and service_role hold NOTHING on the lease; PUBLIC nothing; the runtime SELECT and UPDATE only",
+    byRole.anon === undefined && byRole.authenticated === undefined && byRole.service_role === undefined
+      && byRole.PUBLIC === undefined && byRole.app_runtime === "SELECT,UPDATE",
+    JSON.stringify(byRole));
+  const forced = await c.query(`select relrowsecurity, relforcerowsecurity from pg_class where oid = '"ReportSweepLease"'::regclass`);
+  check("RLS is enabled AND forced on the lease", forced.rows[0]?.relrowsecurity === true && forced.rows[0]?.relforcerowsecurity === true);
+  for (const role of ["anon", "authenticated", "service_role"]) {
+    await c.query("begin");
+    await c.query(`set local role ${role}`);
+    await refuses(c, `${role} cannot read the lease`, `select * from "ReportSweepLease"`, [], "42501");
+    await refuses(c, `${role} cannot delete it`, `delete from "ReportSweepLease"`, [], "42501");
+    await refuses(c, `${role} cannot move its deadline`, `update "ReportSweepLease" set until = '2099-01-01'`, [], "42501");
+    await refuses(c, `${role} cannot trip the platform cap`, `update "ReportSweepLease" set sent_count = 2000`, [], "42501");
+    await refuses(c, `${role} cannot truncate it`, `truncate "ReportSweepLease"`, [], "42501");
+    await c.query("rollback");
+  }
+  // A NON-superuser owner — production's runtime connection. FORCE applies to
+  // it, so only the owner policy lets it work; the policy reads the owner from
+  // the catalogue, so handing the table to a new owner keeps working.
+  await c.query("begin");
+  await c.query(`alter table "ReportSweepLease" owner to re_proof_owner`);
+  await c.query("set local role re_proof_owner");
+  const ownerTake = await c.query(`update "ReportSweepLease" set holder = 'owner', until = now() + interval '4 minutes', heartbeat_at = now() where id = 1 and (until < now() or holder = 'owner') returning holder`);
+  check("a non-superuser OWNER takes the lease with RLS forced", ownerTake.rowCount === 1);
+  const ownerRead = await c.query(`select holder from "ReportSweepLease"`);
+  check("…and reads it back", ownerRead.rows[0]?.holder === "owner");
+  await c.query("rollback");
+  // Re-applying 058 (the runtime's statements too) changes nothing now.
+  const beforeLease = await catalogue(c);
+  await applyFile(c, NEW_FILES[2]);
+  for (const stmt of REPORT_EMAIL_DDL_058) { await c.query(stmt); }
+  check("058 and its runtime statements re-run without changing the lease's grants or policies", beforeLease === (await catalogue(c)));
 
   await fresh.end();
   await viaRuntime.end();

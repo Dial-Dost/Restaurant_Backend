@@ -121,6 +121,8 @@ export interface DeliveryRow {
   requested_by: string | null;
   sending_at: Date | null;
   maybe_duplicate: boolean;
+  /** What the body is built from besides the files (058, parsed jsonb). */
+  message_meta: Record<string, unknown> | null;
 }
 
 export interface RecipientRow {
@@ -301,6 +303,7 @@ export function addDelivery(over: Partial<DeliveryRow> & { schedule_id: string |
     requested_by: null,
     sending_at: null,
     maybe_duplicate: false,
+    message_meta: null,
     ...over,
   };
   store.deliveries.push(row);
@@ -490,12 +493,15 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
   // --- "ReportDeliveryFiles" ---
   if (/^update "ReportDeliveries" set status = case when status = 'sending' then 'sending' else 'rendered' end, error = null/i.test(q)) {
     requireShape(q, "attempts = $3", "a superseded worker's files must never replace the winner's");
-    const [id, resId, attempts] = params as [string, string, number];
+    requireShape(q, "message_meta = coalesce($4::jsonb, message_meta)",
+      "the body's inputs are stored WITH the files, or a retry sends a different message under the same key");
+    const [id, resId, attempts, meta] = params as [string, string, number, string | null];
     const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
     if (!d || d.attempts !== attempts || !["claimed", "rendered", "sending", "failed"].includes(d.status)) { return []; }
     const before = { ...d };
     journal(() => { Object.assign(d, before); });
     d.status = d.status === "sending" ? "sending" : "rendered"; d.error = null;
+    if (meta !== null && meta !== undefined) { d.message_meta = JSON.parse(meta) as Record<string, unknown>; }
     return [{ id: d.id }];
   }
   if (/^delete from "ReportDeliveryFiles" where res_id = \$1 and delivery_id = \$2/i.test(q)) {
@@ -532,13 +538,16 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
   // --- the send path (058) ---
   if (/^update "ReportDeliveries" set status = 'sending'/i.test(q)) {
     requireShape(q, "attempts = $3", "'sending' is committed under the same CAS as every other write");
-    const [id, resId, attempts, provider] = params as [string, string, number, string];
+    requireShape(q, "message_meta = coalesce(message_meta, $5::jsonb)",
+      "the FIRST attempt's body inputs are kept; a later attempt must not replace them");
+    const [id, resId, attempts, provider, meta] = params as [string, string, number, string, string | null];
     const d = store.deliveries.find((x) => x.id === id && x.res_id === resId);
     if (!d || d.attempts !== attempts || !["claimed", "rendered", "sending", "failed"].includes(d.status)) { return []; }
     const before = { ...d };
     journal(() => { Object.assign(d, before); });
     d.status = "sending"; d.sending_at = d.sending_at ?? now(); d.provider = provider; d.channel = "email";
-    return [{ delivered_to: d.delivered_to, rejected_to: d.rejected_to, skipped_to: d.skipped_to }];
+    if (d.message_meta === null && meta !== null && meta !== undefined) { d.message_meta = JSON.parse(meta) as Record<string, unknown>; }
+    return [{ delivered_to: d.delivered_to, rejected_to: d.rejected_to, skipped_to: d.skipped_to, message_meta: d.message_meta }];
   }
   {
     const m = /^update "ReportDeliveries" set (delivered_to|rejected_to|skipped_to) = case/i.exec(q);
@@ -556,13 +565,14 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
       return [{ id: d.id }];
     }
   }
-  if (/from "ReportDeliveries" where res_id = \$1 and kind = 'adhoc' and status in/i.test(q)) {
+  if (/from "ReportDeliveries" where res_id = \$1 and kind in \('adhoc','manual'\) and status in/i.test(q)) {
+    // No `next_attempt_at <= now()` on purpose: the caller waits out a live lease.
     const [resId, maxAttempts, minutes] = params as [string, number, number];
     const since = now().getTime() - minutes * 60_000;
     return store.deliveries
-      .filter((d) => d.res_id === resId && d.kind === "adhoc" && ["claimed", "rendered", "sending", "failed"].includes(d.status)
-        && d.attempts < maxAttempts && d.next_attempt_at.getTime() <= now().getTime() && d.created_at.getTime() > since)
-      .map((d) => ({ id: d.id, outlet_id: d.outlet_id }));
+      .filter((d) => d.res_id === resId && (d.kind === "adhoc" || d.kind === "manual") && ["claimed", "rendered", "sending", "failed"].includes(d.status)
+        && d.attempts < maxAttempts && d.created_at.getTime() > since)
+      .map((d) => ({ id: d.id, outlet_id: d.outlet_id, next_attempt_at: d.next_attempt_at }));
   }
   // Send now's replay lookup: the row a client_request_id already made.
   if (/^select id from "ReportDeliveries" where res_id = \$1 and schedule_id is null and occurrence_key = \$2/i.test(q)) {
@@ -713,7 +723,7 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
       window_end_at: bundle ? (end ?? null) : null,
       recipients: null, rejected_to: null, skipped_to: null, provider: null,
       requested_by: bundle ? (by ?? null) : null,
-      sending_at: null, maybe_duplicate: false,
+      sending_at: null, maybe_duplicate: false, message_meta: null,
     };
     store.deliveries.push(row);
     journal(() => { store.deliveries = store.deliveries.filter((d) => d !== row); });
@@ -782,30 +792,61 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
     return [];
   }
 
-  if (/^update "ReportDeliveries" set status = 'failed', error = coalesce/i.test(q)) {
-    const [resId, maxAttempts] = params as [string, number];
-    const hit = store.deliveries.filter((d) =>
-      d.res_id === resId && d.attempts >= maxAttempts &&
-      d.next_attempt_at.getTime() <= now().getTime() &&
-      ["claimed", "rendered"].includes(d.status));
+  if (/^with reaped as \( ?update "ReportDeliveries" d set status = 'failed'/i.test(q)) {
+    // THE REAPER. Its predicates are re-implemented here and their text
+    // checked, for requireShape's reason.
+    requireShape(q, "d.next_attempt_at <= now()", "a row whose worker still holds its lease is not dead yet");
+    requireShape(q, "attempts = greatest(d.attempts, $2)", "a reaped row is final: its attempts are spent");
+    requireShape(q, "d.status in ('claimed','rendered','sending'))",
+      "a worker that died on its last attempt - mid-send included - is failed, not left 'sending' forever");
+    requireShape(q, "d.kind in ('manual','adhoc') and d.attempts < $2", "only an on-demand run is dropped for its age");
+    requireShape(q, "d.created_at <= now() - make_interval(mins => $3::int)", "only an on-demand run OLDER than the catch-up window is dropped");
+    const [resId, maxAttempts, minutes, midSend, exhausted, late] = params as [string, number, number, string, string, string];
+    const due = (d: DeliveryRow) => d.next_attempt_at.getTime() <= now().getTime();
+    const hit = store.deliveries.filter((d) => d.res_id === resId && due(d) && (
+      (d.attempts >= maxAttempts && ["claimed", "rendered", "sending"].includes(d.status))
+      || ((d.kind === "manual" || d.kind === "adhoc") && d.attempts < maxAttempts
+        && ["claimed", "rendered", "sending", "failed"].includes(d.status)
+        && d.created_at.getTime() <= now().getTime() - minutes * 60_000)));
+    const out: Record<string, unknown>[] = [];
     for (const d of hit) {
       const before = { ...d };
       journal(() => { Object.assign(d, before); });
-      d.status = "failed"; d.error = d.error ?? "Retries exhausted";
+      d.error = d.attempts >= maxAttempts
+        ? d.error ?? (d.status === "sending" ? midSend : exhausted)
+        : `${late}${d.error ? ` Last problem: ${d.error}` : ""}`.slice(0, 800);
+      d.status = "failed";
+      d.attempts = Math.max(d.attempts, maxAttempts);
+      const s = d.schedule_id === null ? null : store.schedules.find((x) => x.id === d.schedule_id) ?? null;
+      out.push({
+        id: d.id, schedule_id: d.schedule_id, outlet_id: d.outlet_id, occurrence_key: d.occurrence_key,
+        period_from: d.period_from, period_to: d.period_to, timezone: d.timezone, attempts: d.attempts,
+        channel: d.channel, status: d.status, error: d.error,
+        name: s?.name ?? "Send now", report_key: s?.report_key ?? "bundle",
+        format: s?.format ?? d.formats[0] ?? "csv",
+        recipients: d.schedule_id === null ? d.recipients : s?.recipients,
+        kind: d.kind, outlet_scope: d.outlet_scope, day_close: d.day_close,
+        window_start_at: d.window_start_at, window_end_at: d.window_end_at, requested_by: d.requested_by,
+        report_keys: d.report_keys.length > 0 ? d.report_keys : s?.report_keys ?? [],
+        formats: d.kind === "scheduled" && d.report_keys.length === 0 ? s?.formats ?? ["csv"] : d.formats,
+      });
     }
-    return hit.map((d) => ({ id: d.id }));
+    return out;
   }
 
   if (/from "ReportDeliveries" d left join "ReportSchedules" s/i.test(q)) {
     requireShape(q, "(d.schedule_id is null or s.id is not null)",
       "a Send now has no schedule; an inner join would leave every failed one unretried");
-    const [resId, maxAttempts] = params as [string, number];
+    requireShape(q, "(d.kind = 'scheduled' or d.created_at > now() - make_interval(mins => $4::int))",
+      "a Run now or Send now is never retried past the catch-up window");
+    const [resId, maxAttempts, , maxAge] = params as [string, number, number, number];
     return store.deliveries
       .filter((d) =>
         d.res_id === resId &&
         ["claimed", "rendered", "sending", "failed"].includes(d.status) &&
         d.attempts < maxAttempts &&
-        d.next_attempt_at.getTime() <= now().getTime())
+        d.next_attempt_at.getTime() <= now().getTime() &&
+        (d.kind === "scheduled" || d.created_at.getTime() > now().getTime() - maxAge * 60_000))
       .map((d) => {
         const s = d.schedule_id === null ? null : store.schedules.find((x) => x.id === d.schedule_id) ?? null;
         if (d.schedule_id !== null && !s) { return null; }
@@ -825,13 +866,16 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
       .filter((r): r is NonNullable<typeof r> => r !== null);
   }
   if (/from "ReportDeliveries" d join "ReportSchedules" s/i.test(q)) {
-    const [resId, maxAttempts] = params as [string, number];
+    requireShape(q, "or d.created_at > now() - make_interval(mins => $4::int)",
+      "a Run now is never retried past the catch-up window, on a 2.0.1 database too");
+    const [resId, maxAttempts, , maxAge] = params as [string, number, number, number];
     return store.deliveries
       .filter((d) =>
         d.res_id === resId &&
         ["claimed", "rendered", "failed"].includes(d.status) &&
         d.attempts < maxAttempts &&
-        d.next_attempt_at.getTime() <= now().getTime())
+        d.next_attempt_at.getTime() <= now().getTime() &&
+        (!(d.occurrence_key ?? "").startsWith("manual:") || d.created_at.getTime() > now().getTime() - maxAge * 60_000))
       .map((d) => {
         const s = store.schedules.find((x) => x.id === d.schedule_id);
         if (!s) { return null; }

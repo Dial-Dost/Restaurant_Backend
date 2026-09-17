@@ -33,10 +33,12 @@ import {
   files,
   lease,
   setLease,
+  schedules,
   billsReads,
   sqlJournal,
 } from "./report_fixtures";
 import { readXlsx } from "./xlsx_reader";
+import { wallClock } from "../report_email_content";
 
 interface FixtureGlobal {
   __reportFixtureConnect?: () => { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>; release: () => void };
@@ -85,6 +87,12 @@ const mailCalls = (): Record<string, unknown>[] => g.__mailScript?.calls ?? [];
 const acceptAll = async (msg: Record<string, unknown>) => ({ accepted: [String(msg.to)], messageId: String(msg.messageId ?? "") });
 function scriptMail(behave: (msg: Record<string, unknown>) => Promise<unknown>): void {
   g.__mailScript = { calls: [], behave };
+}
+/** The recipient's own refusal, shaped the way nodemailer's SMTP connection reports one. */
+function rcptRefusal(to: string): Error {
+  return Object.assign(new Error(`Can't send mail - all recipients were rejected: 550 5.1.1 <${to}>: user unknown`), {
+    code: "EENVELOPE", command: "RCPT TO", responseCode: 550, response: `550 5.1.1 <${to}>: user unknown`, rejected: [to],
+  });
 }
 
 type Sweep = typeof import("../report_schedules");
@@ -250,6 +258,9 @@ describe("no transport, no claim — and one bell a day", () => {
     expect(notifications()).toHaveLength(1);
     expect(notifications()[0].title).toBe("Scheduled email reports are waiting");
     expect(notifications()[0].body ?? "").toMatch(/Email is not set up on this server/);
+    // It names no delivery and no schedule, so it says which view to open.
+    expect(notifications()[0].meta).toMatchObject({ module: "Reports", view: "email", kind: "mail_not_configured", day: "2026-08-11" });
+    expect(notifications()[0].meta).not.toHaveProperty("delivery_id");
     expect(mailCalls()).toHaveLength(0);
 
     // …and the moment mail works, inside the catch-up window, it goes.
@@ -341,7 +352,7 @@ describe("per-address outcomes", () => {
     emailSchedule();
     scriptMail(async (msg) => {
       if (String(msg.to) === "owner@gaia.test") {
-        throw Object.assign(new Error("550 5.1.1 <owner@gaia.test> user unknown"), { responseCode: 550 });
+        throw rcptRefusal(String(msg.to));
       }
       return { accepted: [String(msg.to)], messageId: "x" };
     });
@@ -356,7 +367,7 @@ describe("per-address outcomes", () => {
 
   test("every address refused: a FINAL failure (no retries burnt on it), one bell", async () => {
     emailSchedule();
-    scriptMail(async () => { throw Object.assign(new Error("550 no such user"), { responseCode: 550 }); });
+    scriptMail(async (msg) => { throw rcptRefusal(String(msg.to)); });
     await sweep(t(1));
     const d = deliveries()[0];
     expect(d.status).toBe("failed");
@@ -373,7 +384,9 @@ describe("per-address outcomes", () => {
     let secondFails = true;
     scriptMail(async (msg) => {
       if (String(msg.to) === "Accounts@Firm.test" && secondFails) {
-        throw Object.assign(new Error("421 4.7.0 try again later"), { responseCode: 421 });
+        throw Object.assign(new Error("Can't send mail - all recipients were rejected: 421 4.7.0 try again later"), {
+          code: "EENVELOPE", command: "RCPT TO", responseCode: 421, response: "421 4.7.0 try again later", rejected: [String(msg.to)],
+        });
       }
       return { accepted: [String(msg.to)], messageId: "x" };
     });
@@ -396,6 +409,69 @@ describe("per-address outcomes", () => {
     expect((mailCalls()[2].attachments as { content: Buffer }[])[0].content.equals(firstBytes)).toBe(true);
     expect(d.delivered_to).toEqual(["owner@gaia.test", "Accounts@Firm.test"]);
     expect(d.maybe_duplicate).toBe(false);
+    // THE SAME MESSAGE, not only the same files: the body's inputs were stored
+    // with the files, so six minutes later it still says when it was generated
+    // and still carries the headline — a different body under the same HTTPS
+    // idempotency key is a 409 from the provider.
+    expect(d.message_meta).toMatchObject({ v: 1, generated_at: t(1).toISOString(), restaurant_name: "ZZTEST Reports" });
+    expect(d.message_meta).toHaveProperty("headline");
+    expect(String(mailCalls()[2].text)).toBe(String(mailCalls()[1].text));
+    expect(String(mailCalls()[2].html)).toBe(String(mailCalls()[1].html));
+    expect(String(mailCalls()[2].subject)).toBe(String(mailCalls()[1].subject));
+  });
+
+  test("a retry builds its body from what the FIRST attempt stored — headline, names and Generated time", async () => {
+    const s = emailSchedule();
+    const stored = {
+      v: 1, generated_at: t(-10).toISOString(),
+      headline: {
+        gross: 1234.5, net: 1000, service_charge: 100, tax: 134.5, round_off: 0, bills: 7, covers: 12,
+        apc: 142.86, nc_value: 0, voids: null, payments: [{ label: "Cash", bills: 7, amount: 1234.5 }],
+      },
+      restaurant_name: "Gaia Stored", outlet_name: "Stored Outlet", currency: "INR", timezone: "Asia/Kolkata",
+    };
+    addDelivery({
+      schedule_id: s.id, channel: "email", status: "failed", attempts: 1,
+      report_keys: ["sales"], formats: ["csv"], delivered_to: ["owner@gaia.test"],
+      next_attempt_at: t(-1), occurrence_key: "2026-08-11", message_meta: stored,
+      window_start_at: "2026-08-09T18:30:00.000Z", window_end_at: "2026-08-10T18:30:00.000Z",
+    });
+    files().push({
+      id: "f-kept", res_id: RES_ID, delivery_id: deliveries()[0].id, report_key: "sales", format: "csv", filename: "sales.csv",
+      mime: "text/csv", bytes: 3, rows: 1, truncated: false, body: Buffer.from("abc"), created_at: t(-10),
+    });
+    await sweep(t(1));
+    expect(deliveries()[0].status).toBe("delivered");
+    const m = mailCalls()[0];
+    expect(m.to).toBe("Accounts@Firm.test");
+    expect(String(m.subject)).toBe("Gaia Stored · Stored Outlet — Sales (accounting) — Mon 10 Aug 2026");
+    expect(String(m.from)).toContain("Gaia Stored via Experio Reports");
+    const text = String(m.text);
+    expect(text).toContain("Bills: 7");
+    expect(text).toContain("Collected by payment mode:");
+    expect(text).toContain(`Generated ${wallClock(t(-10).toISOString(), "Asia/Kolkata")} (Asia/Kolkata).`);
+    expect(String(m.html)).toContain("Gross (grand total)");
+    // The row keeps the first attempt's inputs, not this one's.
+    expect(deliveries()[0].message_meta).toEqual(stored);
+  });
+
+  test("a retry of a row stored before the body's inputs were kept still sends — it builds them once, and keeps those", async () => {
+    const s = emailSchedule();
+    addDelivery({
+      schedule_id: s.id, channel: "email", status: "failed", attempts: 1,
+      report_keys: ["sales"], formats: ["csv"], delivered_to: ["owner@gaia.test"],
+      next_attempt_at: t(-1), occurrence_key: "2026-08-11",
+      window_start_at: "2026-08-09T18:30:00.000Z", window_end_at: "2026-08-10T18:30:00.000Z",
+    });
+    files().push({
+      id: "f-old", res_id: RES_ID, delivery_id: deliveries()[0].id, report_key: "sales", format: "csv", filename: "sales.csv",
+      mime: "text/csv", bytes: 3, rows: 1, truncated: false, body: Buffer.from("abc"), created_at: t(-10),
+    });
+    await sweep(t(1));
+    const d = deliveries()[0];
+    expect(d.status).toBe("delivered");
+    expect(mailCalls().map((m) => m.to)).toEqual(["Accounts@Firm.test"]);
+    expect(d.message_meta).toMatchObject({ v: 1, generated_at: t(1).toISOString(), headline: null });
   });
 
   test("a process that died MID-SEND: the retry resumes, skips who had it, and says it may be a duplicate", async () => {
@@ -440,6 +516,221 @@ describe("per-address outcomes", () => {
     expect(mailCalls()).toHaveLength(1);
     expect(lease().sent_count).toBe(1);
     expect(deliveries()[0].skipped_to).toEqual(["Accounts@Firm.test"]);
+  });
+});
+
+describe("the operator's own failures are not the recipient's", () => {
+  test("a wrong SMTP password (535): nobody is marked Refused, the attempt is retried, and the fixed password delivers", async () => {
+    emailSchedule();
+    let broken = true;
+    scriptMail(async (msg) => {
+      if (broken) {
+        throw Object.assign(new Error("Invalid login: 535 5.7.8 Username and Password not accepted"), {
+          code: "EAUTH", command: "AUTH PLAIN", responseCode: 535, response: "535 5.7.8 Username and Password not accepted",
+        });
+      }
+      return { accepted: [String(msg.to)], messageId: "x" };
+    });
+    await sweep(t(1));
+    let d = deliveries()[0];
+    expect(d.status).toBe("failed");
+    expect(d.attempts).toBe(1);
+    expect(d.rejected_to).toBeNull();
+    expect(d.delivered_to).toBeNull();
+    expect(d.error).toMatch(/did not accept this server's sign-in/);
+    expect(d.next_attempt_at.getTime()).toBe(t(1 + 5).getTime());
+    // The first address threw, so the second was not even tried this attempt.
+    expect(mailCalls().map((m) => m.to)).toEqual(["owner@gaia.test"]);
+    expect(notifications()).toHaveLength(0);
+
+    broken = false;
+    await sweep(t(7));
+    d = deliveries()[0];
+    expect(d.status).toBe("delivered");
+    expect(d.delivered_to).toEqual(["owner@gaia.test", "Accounts@Firm.test"]);
+    expect(d.rejected_to).toBeNull();
+  });
+});
+
+describe("a row nothing will finish is failed, and the owner hears once", () => {
+  test("'sending' on its LAST attempt, its worker gone: reaped, one bell, the schedule card marked — never 'Sending' forever", async () => {
+    const s = emailSchedule();
+    addDelivery({
+      schedule_id: s.id, channel: "email", status: "sending", attempts: 3,
+      report_keys: ["sales"], formats: ["csv"], delivered_to: ["owner@gaia.test"],
+      next_attempt_at: t(-1), occurrence_key: "2026-08-11",
+    });
+    await sweep(t(1));
+    const d = deliveries()[0];
+    expect(deliveries()).toHaveLength(1);
+    expect(d.status).toBe("failed");
+    expect(d.error).toBe(db.REPORT_STOPPED_MID_SEND);
+    expect(d.delivered_to).toEqual(["owner@gaia.test"]);
+    expect(mailCalls()).toHaveLength(0);
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0].title).toMatch(/could not be delivered/);
+    expect(notifications()[0].meta).toMatchObject({ module: "Reports", delivery_id: d.id });
+    expect(schedules()[0].last_status).toBe("failed");
+    // Once: the next tick finds nothing left to fail.
+    await sweep(t(20));
+    expect(notifications()).toHaveLength(1);
+  });
+
+  test("a live lease is not a dead worker: a 'sending' row still inside its lease is left alone", async () => {
+    const s = emailSchedule();
+    addDelivery({
+      schedule_id: s.id, channel: "email", status: "sending", attempts: 3,
+      report_keys: ["sales"], formats: ["csv"], next_attempt_at: t(5), occurrence_key: "2026-08-11",
+    });
+    await sweep(t(1));
+    expect(deliveries()[0].status).toBe("sending");
+    expect(notifications()).toHaveLength(0);
+  });
+
+  test("a Run now older than the catch-up window is DROPPED, not mailed late; a recent one still goes", async () => {
+    const s = emailSchedule({ enabled: false });
+    addDelivery({
+      schedule_id: s.id, kind: "manual", channel: "email", status: "claimed", attempts: 0,
+      occurrence_key: "manual:2026-08-10T15:00", report_keys: ["sales"], formats: ["csv"],
+      created_at: t(-7 * 60), next_attempt_at: t(-7 * 60),
+    });
+    addDelivery({
+      schedule_id: s.id, kind: "manual", channel: "email", status: "claimed", attempts: 0,
+      occurrence_key: "manual:2026-08-11T07:30", report_keys: ["sales"], formats: ["csv"],
+      created_at: t(-30), next_attempt_at: t(-30),
+    });
+    await sweep(t(1));
+    const [old, recent] = deliveries();
+    expect(old.status).toBe("failed");
+    expect(old.attempts).toBe(3);
+    expect(old.error).toBe("Not sent within 6 hours of being asked for, so it was dropped rather than sent late. Ask for it again.");
+    expect(recent.status).toBe("delivered");
+    // Every message that went out was the recent run's.
+    expect(mailCalls()).toHaveLength(2);
+    for (const m of mailCalls()) { expect(String(m.messageId)).toContain(`rd-${recent.id}-`); }
+    expect(notifications().filter((n) => /could not be delivered/.test(n.title))).toHaveLength(1);
+  });
+
+  test("…and a Send now that failed once and was never retried is dropped with its last problem named", async () => {
+    addRecipient("owner@gaia.test");
+    addDelivery({
+      schedule_id: null, kind: "adhoc", channel: "email", occurrence_key: "adhoc:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+      report_keys: ["sales"], formats: ["xlsx"], recipients: ["owner@gaia.test"], status: "failed", attempts: 1,
+      error: "Greylisted", created_at: t(-400), next_attempt_at: t(-395),
+    });
+    await sweep(t(1));
+    expect(deliveries()[0]).toMatchObject({ status: "failed", attempts: 3 });
+    expect(deliveries()[0].error).toBe("Not sent within 6 hours of being asked for, so it was dropped rather than sent late. Ask for it again. Last problem: Greylisted");
+    expect(mailCalls()).toHaveLength(0);
+    expect(notifications()).toHaveLength(1);
+  });
+});
+
+describe("a failure says whether anything will come back for it", () => {
+  const transient = async (): Promise<never> => {
+    throw Object.assign(new Error("Can't send mail - all recipients were rejected: 421 4.7.0 try again later"), {
+      code: "EENVELOPE", command: "RCPT TO", responseCode: 421, response: "421 4.7.0 try again later", rejected: ["owner@gaia.test"],
+    });
+  };
+  function sendNow() {
+    addRecipient("owner@gaia.test");
+    return addDelivery({
+      schedule_id: null, kind: "adhoc", channel: "email", occurrence_key: "adhoc:0e0b7c1a-2b3c-4d5e-8f60-718293a4b5c6",
+      report_keys: ["sales"], formats: ["xlsx"], recipients: ["owner@gaia.test"], status: "claimed", attempts: 0,
+      period_from: "2026-08-10", period_to: "2026-08-10",
+      window_start_at: "2026-08-09T18:30:00.000Z", window_end_at: "2026-08-10T18:30:00.000Z",
+      next_attempt_at: t(0), created_at: t(0),
+    });
+  }
+
+  test("no sweeper anywhere (scheduled reports off here): a Send now's first transient failure is FINAL, and says why", async () => {
+    sendNow();
+    scriptMail(transient);
+    jest.setSystemTime(t(1));
+    await mod.kickReportDelivery(RES_ID, deliveries()[0].id);
+    const d = deliveries()[0];
+    expect(d).toMatchObject({ status: "failed", attempts: 3 });
+    expect(d.error).toContain("421 4.7.0 try again later");
+    expect(d.error?.endsWith("Nothing on this server retries it (scheduled reports are switched off here), so send it again once this is fixed.")).toBe(true);
+    expect(notifications()).toHaveLength(1);
+    expect(db.deliveryReading(d, t(1), 360).final).toBe(true);
+  });
+
+  test("a sweeper that can send mail was seen recently: the same failure waits for its retry", async () => {
+    sendNow();
+    setLease({ holder: "another-process", until: t(4), heartbeat_at: t(-1), mail_ready: true });
+    scriptMail(transient);
+    jest.setSystemTime(t(1));
+    await mod.kickReportDelivery(RES_ID, deliveries()[0].id);
+    const d = deliveries()[0];
+    expect(d).toMatchObject({ status: "failed", attempts: 1 });
+    expect(d.next_attempt_at.getTime()).toBe(t(1 + 5).getTime());
+    expect(notifications()).toHaveLength(0);
+    expect(db.deliveryReading(d, t(1), 360)).toEqual({ status: "failed", final: false, error: d.error });
+  });
+
+  test("…but not one that cannot send mail, nor one last seen long ago", async () => {
+    sendNow();
+    setLease({ holder: "another-process", until: t(4), heartbeat_at: t(-1), mail_ready: false });
+    scriptMail(transient);
+    jest.setSystemTime(t(1));
+    await mod.kickReportDelivery(RES_ID, deliveries()[0].id);
+    expect(deliveries()[0].attempts).toBe(3);
+
+    resetStore();
+    sendNow();
+    setLease({ holder: "another-process", until: t(-40), heartbeat_at: t(-45), mail_ready: true });
+    await mod.kickReportDelivery(RES_ID, deliveries()[0].id);
+    expect(deliveries()[0].attempts).toBe(3);
+  });
+
+  test("a SCHEDULED occurrence is always left for the sweep that claimed it", async () => {
+    emailSchedule();
+    scriptMail(transient);
+    await sweep(t(1));
+    expect(deliveries()[0]).toMatchObject({ status: "failed", attempts: 1 });
+    expect(notifications()).toHaveLength(0);
+  });
+});
+
+describe("what a row means to the person reading it (deliveryReading)", () => {
+  const now = t(0);
+  type Reading = Parameters<Db["deliveryReading"]>[0];
+  const row = (over: Partial<Reading>): Reading => ({
+    status: "failed", attempts: 1, kind: "scheduled", error: "Greylisted",
+    next_attempt_at: t(5), created_at: t(-10), ...over,
+  });
+
+  test("a failure with attempts left is not final, and keeps its words", () => {
+    expect(db.deliveryReading(row({}), now, 360)).toEqual({ status: "failed", final: false, error: "Greylisted" });
+    expect(db.deliveryReading(row({ attempts: 3 }), now, 360)).toEqual({ status: "failed", final: true, error: "Greylisted" });
+  });
+
+  test("a dead last attempt reads as failed before any reaper runs — mid-send says so", () => {
+    expect(db.deliveryReading(row({ status: "sending", attempts: 3, error: null, next_attempt_at: t(-1) }), now, 360))
+      .toEqual({ status: "failed", final: true, error: db.REPORT_STOPPED_MID_SEND });
+    expect(db.deliveryReading(row({ status: "claimed", attempts: 3, error: null, next_attempt_at: t(-1) }), now, 360))
+      .toEqual({ status: "failed", final: true, error: db.REPORT_RETRIES_EXHAUSTED });
+    // Still inside its lease: still working.
+    expect(db.deliveryReading(row({ status: "sending", attempts: 3, error: null, next_attempt_at: t(1) }), now, 360))
+      .toEqual({ status: "sending", final: false, error: null });
+  });
+
+  test("an on-demand run past the catch-up window reads as dropped; a scheduled one does not", () => {
+    const old = { status: "claimed", attempts: 0, error: null, created_at: t(-361), next_attempt_at: t(-361) };
+    expect(db.deliveryReading(row({ ...old, kind: "manual" }), now, 360)).toEqual({
+      status: "failed", final: true,
+      error: "Not sent within 6 hours of being asked for, so it was dropped rather than sent late. Ask for it again.",
+    });
+    expect(db.deliveryReading(row({ ...old, kind: "adhoc" }), now, 90).error).toMatch(/^Not sent within 90 minutes of being asked for/);
+    expect(db.deliveryReading(row({ ...old, kind: "scheduled" }), now, 360)).toEqual({ status: "claimed", final: false, error: null });
+  });
+
+  test("delivered and missed are final; claimed and rendered are not", () => {
+    expect(db.deliveryReading(row({ status: "delivered", error: null }), now, 360).final).toBe(true);
+    expect(db.deliveryReading(row({ status: "abandoned", error: null }), now, 360).final).toBe(true);
+    expect(db.deliveryReading(row({ status: "claimed", attempts: 0, error: null }), now, 360).final).toBe(false);
+    expect(db.deliveryReading(row({ status: "rendered", attempts: 1, error: null }), now, 360).final).toBe(false);
   });
 });
 
@@ -535,6 +826,28 @@ describe("Send now's rows: retried through the LEFT JOIN, kicked outside the req
     for (let i = 0; i < 50 && deliveries()[0].status !== "delivered"; i += 1) { await new Promise((r) => setImmediate(r)); }
     expect(deliveries()[0].status).toBe("delivered");
     expect(deliveries()[1].status).toBe("claimed");
+  });
+});
+
+describe("an on-demand run a dead process left behind", () => {
+  test("the boot scan waits out the dead worker's lease (a recreate is quicker than it), then finishes it — a Run now included", async () => {
+    const s = emailSchedule({ enabled: false });
+    addDelivery({
+      schedule_id: s.id, kind: "manual", channel: "email", status: "sending", attempts: 1,
+      occurrence_key: "manual:2026-08-11T07:59", report_keys: ["sales"], formats: ["csv"],
+      created_at: t(-5), next_attempt_at: new Date(t(1).getTime() + 300),
+      window_start_at: "2026-08-09T18:30:00.000Z", window_end_at: "2026-08-10T18:30:00.000Z",
+    });
+    jest.setSystemTime(t(1));
+    expect(await mod.recoverOrphanReportSends()).toBe(1);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(deliveries()[0]).toMatchObject({ status: "sending", attempts: 1 });
+    expect(mailCalls()).toHaveLength(0);
+    // The lease lapses; the timer the scan set runs the row without any sweep.
+    jest.setSystemTime(t(2));
+    for (let i = 0; i < 150 && deliveries()[0].status !== "delivered"; i += 1) { await new Promise((r) => setTimeout(r, 20)); }
+    expect(deliveries()[0].status).toBe("delivered");
+    expect(mailCalls().map((m) => m.to)).toEqual(["owner@gaia.test", "Accounts@Firm.test"]);
   });
 });
 

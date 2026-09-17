@@ -20044,6 +20044,75 @@ export const REPORT_MAX_ATTEMPTS = 3;
 /** Consecutive failures after which a schedule disables itself. */
 export const REPORT_SCHEDULE_FAILURE_LIMIT = 5;
 
+/**
+ * The catch-up window, in minutes (REPORT_CATCHUP_MINUTES, default six hours):
+ * how late the sweep may still CLAIM a scheduled occurrence, and — since the
+ * item 9 review — how long a Run now or Send now may wait to be FINISHED. One
+ * reader, so the two can never disagree.
+ */
+export function reportCatchupMinutes(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.REPORT_CATCHUP_MINUTES);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 360;
+}
+
+/** The error a row gets when its last attempt's worker never came back. Unchanged since 026. */
+export const REPORT_RETRIES_EXHAUSTED = "Retries exhausted";
+/** …and when that worker died mid-send (058): some addresses may have it. */
+export const REPORT_STOPPED_MID_SEND =
+  "The server stopped while sending this report, and it has no retries left. The history shows which addresses had it.";
+
+/** A Run now or Send now nobody finished inside the catch-up window. */
+export function reportDroppedLateSentence(maxAgeMin: number): string {
+  const hours = maxAgeMin / 60;
+  const span = Number.isInteger(hours) ? `${String(hours)} hour${hours === 1 ? "" : "s"}` : `${String(maxAgeMin)} minutes`;
+  return `Not sent within ${span} of being asked for, so it was dropped rather than sent late. Ask for it again.`;
+}
+
+/**
+ * WHAT A DELIVERY ROW MEANS to the person reading it — which is not always
+ * what its status column says, and the difference is where the item 9 review
+ * found screens waiting forever.
+ *
+ *   * A row whose LAST attempt's worker died ('claimed', 'rendered' or
+ *     'sending', attempts spent, lease lapsed) will never move again. The
+ *     sweep's reaper marks it failed; until it runs (or on a server whose
+ *     sweep is off) the reading says so anyway.
+ *   * A Run now or Send now older than the catch-up window is dropped, not
+ *     sent late — the reaper again, and the same reading before it.
+ *   * `final` says whether anything more will happen without a person: a
+ *     'failed' row with attempts left is RETRIED by the sweep (its
+ *     next_attempt_at says when). A client that called every 'failed' final
+ *     told the owner "Couldn't send" for an email that went out five minutes
+ *     later — and invited a second send of it.
+ *
+ * Pure; `now` and the window are injected.
+ */
+export function deliveryReading(
+  r: {
+    status: string; attempts: number; kind: string; error: string | null;
+    next_attempt_at: Date | string | null; created_at: Date | string;
+  },
+  now: Date,
+  maxAgeMin: number,
+): { status: string; final: boolean; error: string | null } {
+  const at = (v: Date | string | null): number => (v === null ? Number.NaN : new Date(v).getTime());
+  const nextAt = at(r.next_attempt_at);
+  const due = Number.isNaN(nextAt) || nextAt <= now.getTime();
+  const spent = r.attempts >= REPORT_MAX_ATTEMPTS;
+  const open = r.status === "claimed" || r.status === "rendered" || r.status === "sending";
+  const onDemand = r.kind === "manual" || r.kind === "adhoc";
+  const stale = onDemand && at(r.created_at) <= now.getTime() - maxAgeMin * 60_000;
+  if (open && due && spent) {
+    return { status: "failed", final: true, error: r.error ?? (r.status === "sending" ? REPORT_STOPPED_MID_SEND : REPORT_RETRIES_EXHAUSTED) };
+  }
+  if ((open || r.status === "failed") && due && !spent && stale) {
+    const said = reportDroppedLateSentence(maxAgeMin);
+    return { status: "failed", final: true, error: (r.error ? `${said} Last problem: ${r.error}` : said).slice(0, 800) };
+  }
+  if (r.status === "failed") { return { status: "failed", final: spent, error: r.error }; }
+  return { status: r.status, final: r.status === "delivered" || r.status === "abandoned", error: r.error };
+}
+
 export interface ReportScheduleRecord {
   id: string;
   outlet_id: string;
@@ -20168,9 +20237,13 @@ export interface ReportDeliveryRecord {
   sending_at: Date | null;
   maybe_duplicate: boolean;
   files: ReportDeliveryFileRecord[];
+  /** When the sweep next tries a 'failed' row with attempts left. */
+  next_attempt_at: Date | null;
+  /** Nothing more will happen to this row without a person (deliveryReading). */
+  final: boolean;
 }
 
-const SCHEDULE_COLS = `id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+const SCHEDULE_COLS =`id, outlet_id, name, report_key, frequency, hour_local, minute_local,
          weekday, day_of_month, channel, recipients, format, enabled, last_occurrence_key,
          last_status, last_error, last_run_at, consecutive_failures, created_at, updated_at`;
 
@@ -20313,6 +20386,11 @@ function isBundlePayload(input: Record<string, unknown>): boolean {
     || (input.report_key !== undefined && !(REPORT_SCHEDULE_KEYS as readonly string[]).includes(String(input.report_key).trim().toLowerCase()));
 }
 
+/** One of the three accounting reports, alone — the only selection a 2.0.1 form can show. */
+function isLegacyAccountingSelection(keys: readonly string[]): boolean {
+  return keys.length === 1 && (REPORT_SCHEDULE_KEYS as readonly string[]).includes(keys[0]);
+}
+
 /** Is this stored row something only the bundle path can write back? */
 function isBundleRow(r: ReportScheduleRecord): boolean {
   return r.channel === "email"
@@ -20381,8 +20459,11 @@ function bundleError(message: string, status = 400): ReportEmailRequestError {
  * THREE RULES THAT PROTECT A SCHEDULE FROM AN OLDER CLIENT. A 2.0.1 app edits
  * with {name, report_key, frequency, hour_local, minute_local} and knows only
  * three report keys, resetting anything else to 'sales' in its form:
- *   * a report_key alone never NARROWS a bundle: with report_keys absent, a
- *     row that already carries two or more keys keeps them;
+ *   * a report_key alone never CHANGES what a schedule sends unless the row is
+ *     itself one of those three (all a 2.0.1 form can show). With report_keys
+ *     absent, any other row — two or more keys, or one MIS report such as
+ *     Item Wise — keeps its reports; otherwise that app's Edit turned an Item
+ *     Wise schedule into "Sales (accounting)" without anyone choosing it;
  *   * omitted recipients, formats, scope and window keep the stored ones —
  *     and the stored recipients are NOT re-checked against the book on such an
  *     edit (the send-time check skips a removed address), so pausing a
@@ -20401,13 +20482,13 @@ async function normalizeBundlePayload(
   const channel = oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel");
 
   const legacyKey = input.report_key === undefined ? undefined : String(input.report_key).trim().toLowerCase();
+  // Only a row a 2.0.1 form can represent takes the key that form sends.
+  const legacyEditable = !base || isLegacyAccountingSelection(base.report_keys);
   const rawKeys: unknown = input.report_keys !== undefined
     ? input.report_keys
-    : base && base.report_keys.length > 1
-      ? base.report_keys
-      : legacyKey !== undefined && legacyKey !== "bundle"
-        ? [legacyKey]
-        : base?.report_keys ?? ["sales"];
+    : legacyKey !== undefined && legacyKey !== "bundle" && legacyEditable
+      ? [legacyKey]
+      : base?.report_keys ?? ["sales"];
   const askedKeys = (Array.isArray(rawKeys) ? rawKeys : [rawKeys]).map((k) => String(k ?? "").trim().toLowerCase());
 
   let windowMode: ReportWindowMode;
@@ -20701,7 +20782,8 @@ const DELIVERY_COLS = `d.id, d.schedule_id, d.outlet_id, d.occurrence_key, d.fir
             to_char(d.period_from, 'YYYY-MM-DD') as period_from,
             to_char(d.period_to,   'YYYY-MM-DD') as period_to,
             d.timezone, d.status, d.attempts, d.channel, d.artifact_name, d.artifact_bytes,
-            d.artifact_truncated, d.error, d.delivered_at, d.created_at, d.delivered_to`;
+            d.artifact_truncated, d.error, d.delivered_at, d.created_at, d.delivered_to,
+            d.next_attempt_at`;
 
 /** …and migration 058's, with the files as one JSON list (never their bodies). */
 const DELIVERY_COLS_058 = `${DELIVERY_COLS},
@@ -20718,10 +20800,18 @@ const DELIVERY_COLS_058 = `${DELIVERY_COLS},
                where f.delivery_id = d.id and f.res_id = d.res_id
             ), '[]'::json) as files`;
 
-function mapDelivery(r: Record<string, any>): ReportDeliveryRecord {
+function mapDelivery(r: Record<string, any>, now: Date = new Date()): ReportDeliveryRecord {
   const files = Array.isArray(r.files) ? r.files : [];
   const kind = r.kind === "adhoc" || r.kind === "manual" ? r.kind
     : typeof r.occurrence_key === "string" && r.occurrence_key.startsWith("manual:") ? "manual" : "scheduled";
+  const attempts = Number(r.attempts) || 0;
+  // What the row MEANS, not only what its status column says — a dead last
+  // attempt reads as failed on a server whose reaper has not run.
+  const reading = deliveryReading(
+    { status: String(r.status), attempts, kind, error: r.error ?? null, next_attempt_at: r.next_attempt_at ?? null, created_at: r.created_at },
+    now,
+    reportCatchupMinutes(),
+  );
   return {
     id: String(r.id),
     schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
@@ -20731,13 +20821,13 @@ function mapDelivery(r: Record<string, any>): ReportDeliveryRecord {
     period_from: String(r.period_from),
     period_to: String(r.period_to),
     timezone: String(r.timezone),
-    status: String(r.status),
-    attempts: Number(r.attempts) || 0,
+    status: reading.status,
+    attempts,
     channel: r.channel ?? null,
     artifact_name: r.artifact_name ?? null,
     artifact_bytes: r.artifact_bytes === null || r.artifact_bytes === undefined ? null : Number(r.artifact_bytes),
     artifact_truncated: r.artifact_truncated === true,
-    error: r.error ?? null,
+    error: reading.error,
     delivered_at: r.delivered_at ?? null,
     created_at: r.created_at,
     delivered_to: textArray(r.delivered_to),
@@ -20766,6 +20856,8 @@ function mapDelivery(r: Record<string, any>): ReportDeliveryRecord {
       truncated: f.truncated === true,
       purged: f.purged === true,
     })),
+    next_attempt_at: reading.final || r.next_attempt_at === undefined ? null : r.next_attempt_at,
+    final: reading.final,
   };
 }
 
@@ -20796,7 +20888,8 @@ export async function GetReportDeliveries(
       limit $3`,
     params,
   );
-  return rows.map(mapDelivery);
+  const now = new Date();
+  return rows.map((r) => mapDelivery(r, now));
 }
 
 /** One delivery — what Send now's caller polls. Scoped like the list. */
@@ -20888,9 +20981,21 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
 /** Occurrences whose lease has expired and that still have attempts left. The
  *  schedule join is NOT filtered on `enabled`: a claimed occurrence is work that
  *  was already accepted, and dropping it on a toggle would leave a row stuck at
- *  'claimed' forever with nothing to explain it. */
-export async function ListRetryableReportDeliveries(resId: string, limit = 50): Promise<RetryableReportDelivery[]> {
+ *  'claimed' forever with nothing to explain it.
+ *
+ *  A RUN NOW OR SEND NOW IS NOT RETRIED PAST THE CATCH-UP WINDOW (`maxAgeMin`).
+ *  Without that bound, one claimed while this server had no mail transport
+ *  sat 'Queued' until some later deploy had one, and was then emailed —
+ *  days-old, to whoever was on it. The reaper fails it instead
+ *  (ReapExhaustedReportDeliveries). A scheduled occurrence keeps the bound it
+ *  always had: it is not claimed that late. */
+export async function ListRetryableReportDeliveries(
+  resId: string,
+  limit = 50,
+  maxAgeMin: number = reportCatchupMinutes(),
+): Promise<RetryableReportDelivery[]> {
   const bounded = Math.max(1, Math.min(limit, 200));
+  const maxAge = Math.max(1, Math.round(maxAgeMin));
   if (await reportEmailSchemaReady()) {
     // A LEFT JOIN since migration 058: a Send now has no schedule, and an
     // inner join would leave every failed one unretried forever. A scheduled
@@ -20922,9 +21027,10 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
           and d.attempts < $2
           and d.next_attempt_at <= now()
           and (d.schedule_id is null or s.id is not null)
+          and (d.kind = 'scheduled' or d.created_at > now() - make_interval(mins => $4::int))
         order by d.created_at asc
         limit $3`,
-      [resId, REPORT_MAX_ATTEMPTS, bounded],
+      [resId, REPORT_MAX_ATTEMPTS, bounded, maxAge],
     );
     return rows.map((r) => ({
       id: String(r.id),
@@ -20973,9 +21079,11 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
         and d.status in ('claimed','rendered','failed')
         and d.attempts < $2
         and d.next_attempt_at <= now()
+        and (d.occurrence_key is null or d.occurrence_key not like 'manual:%'
+             or d.created_at > now() - make_interval(mins => $4::int))
       order by d.created_at asc
       limit $3`,
-    [resId, REPORT_MAX_ATTEMPTS, bounded],
+    [resId, REPORT_MAX_ATTEMPTS, bounded, maxAge],
   );
   return rows.map((r) => ({
     id: String(r.id),
@@ -21010,19 +21118,98 @@ export async function GetRunnableReportDelivery(resId: string, deliveryId: strin
   return all.find((d) => d.id === deliveryId) ?? null;
 }
 
-/** Without this, a row that used up its attempts sits at 'claimed' forever and is
- *  excluded from the retry scan by `attempts < 3` — invisible rather than failed.
- *  A plain idempotent UPDATE, so two replicas running it concurrently is fine. */
-export async function ReapExhaustedReportDeliveries(resId: string): Promise<number> {
-  const rows = await runQuery<{ id: string }>(
-    `update "ReportDeliveries"
-        set status = 'failed', error = coalesce(error, 'Retries exhausted')
-      where res_id = $1 and attempts >= $2 and next_attempt_at <= now()
-        and status in ('claimed','rendered')
-      returning id`,
-    [resId, REPORT_MAX_ATTEMPTS],
-  );
-  return rows.length;
+/** A row the reaper just failed for good, shaped like a retry row so the sweep
+ *  can tell the owner about it the way recordFailure does, with the error the
+ *  row now carries. */
+export interface ReapedReportDelivery extends RetryableReportDelivery {
+  error: string;
+}
+
+/**
+ * Without this, a row that used up its attempts sits at 'claimed' forever and is
+ * excluded from the retry scan by `attempts < 3` — invisible rather than failed.
+ * An idempotent UPDATE, so two replicas running it concurrently is fine: the
+ * second finds nothing left to fail, so the owner hears once.
+ *
+ * SINCE THE ITEM 9 REVIEW it fails two more kinds of row that nothing else
+ * would ever settle, and hands them back so the sweep rings the final-failure
+ * bell and marks the schedule card — a plain UPDATE left the owner staring at
+ * "Sending" (and the app polling) with no bell at all:
+ *   * 'sending' on its last attempt, the worker gone (a deploy recreate is
+ *     enough) — its per-address outcome is already on the row;
+ *   * a Run now or Send now older than the catch-up window that never
+ *     finished — dropped, not sent late (ListRetryableReportDeliveries no
+ *     longer offers it).
+ */
+export async function ReapExhaustedReportDeliveries(
+  resId: string,
+  maxAgeMin: number = reportCatchupMinutes(),
+): Promise<ReapedReportDelivery[]> {
+  const maxAge = Math.max(1, Math.round(maxAgeMin));
+  if (await reportEmailSchemaReady()) {
+    const rows = await runQuery<Record<string, any>>(
+      `with reaped as (
+         update "ReportDeliveries" d
+            set status = 'failed',
+                attempts = greatest(d.attempts, $2),
+                error = case
+                  when d.attempts >= $2 then coalesce(d.error, case when d.status = 'sending' then $4::text else $5::text end)
+                  else left($6::text || coalesce(' Last problem: ' || d.error, ''), 800)
+                end
+          where d.res_id = $1
+            and d.next_attempt_at <= now()
+            and ((d.attempts >= $2 and d.status in ('claimed','rendered','sending'))
+              or (d.kind in ('manual','adhoc') and d.attempts < $2
+                  and d.status in ('claimed','rendered','sending','failed')
+                  and d.created_at <= now() - make_interval(mins => $3::int)))
+          returning d.id, d.res_id, d.schedule_id, d.outlet_id, d.occurrence_key, d.period_from, d.period_to,
+                    d.timezone, d.attempts, d.channel, d.status, d.error, d.kind, d.report_keys, d.formats,
+                    d.outlet_scope, d.day_close, d.window_start_at, d.window_end_at, d.requested_by, d.recipients
+       )
+       select r.id, r.schedule_id, r.outlet_id, r.occurrence_key,
+              to_char(r.period_from, 'YYYY-MM-DD') as period_from,
+              to_char(r.period_to,   'YYYY-MM-DD') as period_to,
+              r.timezone, r.attempts, r.channel, r.status, r.error,
+              coalesce(s.name, 'Send now') as name,
+              coalesce(s.report_key, 'bundle') as report_key,
+              coalesce(s.format, r.formats[1], 'csv') as format,
+              case when r.schedule_id is null then r.recipients else s.recipients end as recipients,
+              r.kind, r.outlet_scope, r.day_close, r.window_start_at, r.window_end_at, r.requested_by,
+              case when cardinality(r.report_keys) > 0 then r.report_keys else s.report_keys end as report_keys,
+              case when r.kind = 'scheduled' and cardinality(r.report_keys) = 0 then s.formats else r.formats end as formats
+         from reaped r
+         left join "ReportSchedules" s on s.id = r.schedule_id and s.res_id = r.res_id`,
+      [resId, REPORT_MAX_ATTEMPTS, maxAge, REPORT_STOPPED_MID_SEND, REPORT_RETRIES_EXHAUSTED, reportDroppedLateSentence(maxAge)],
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
+      outlet_id: String(r.outlet_id),
+      occurrence_key: r.occurrence_key ?? null,
+      period_from: String(r.period_from),
+      period_to: String(r.period_to),
+      timezone: String(r.timezone),
+      attempts: Number(r.attempts) || 0,
+      channel: r.channel ?? null,
+      recipients: textArray(r.recipients),
+      name: String(r.name ?? ""),
+      report_key: String(r.report_key),
+      format: String(r.format),
+      kind: r.kind === "adhoc" || r.kind === "manual" ? r.kind : "scheduled",
+      status: String(r.status),
+      report_keys: reportKeysOfRow(r),
+      formats: textArray(r.formats).length > 0 ? textArray(r.formats) : [String(r.format ?? "csv")],
+      outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+      day_close: r.day_close ?? null,
+      window_start_at: r.window_start_at ? new Date(r.window_start_at).toISOString() : null,
+      window_end_at: r.window_end_at ? new Date(r.window_end_at).toISOString() : null,
+      requested_by: r.requested_by ?? null,
+      error: String(r.error ?? REPORT_RETRIES_EXHAUSTED),
+    }));
+  }
+  // The sweep, this function's only caller, does not run on a database without
+  // 058 (report_schedules.ts rule 6), and nothing else settles a row there.
+  return [];
 }
 
 /**
@@ -21571,13 +21758,18 @@ export async function TouchReportScheduleOutcome(
 //     schedule, a test email — throws ReportEmailSchemaPendingError, which the
 //     routes answer 503 with one sentence;
 //   * a 2.0.1-shaped inbox schedule (one accounting report, CSV, calendar day)
-//     is still created, edited and delivered exactly as before.
+//     can still be created and edited exactly as before;
+//   * but NOTHING SCHEDULED RUNS. The sweep's lease, the per-address log and
+//     the file store all live in 058, so the sweep waits for it (report_schedules.ts
+//     rule 6) — inbox schedules included — and Run now answers 503 rather than
+//     queue a run nothing will finish. The sentences below once promised
+//     "existing scheduled reports keep running"; they say what happens instead.
 
 /** A new report-email write on a database that has not got 056-058 yet. */
 export class ReportEmailSchemaPendingError extends Error {
   readonly code = "REPORT_EMAIL_SCHEMA_PENDING";
   constructor() {
-    super("Email reports need a database update (migrations 056-058) that has not been applied to this server yet. Existing scheduled reports keep running; ask your administrator to apply it.");
+    super("Email reports need a database update (migrations 056-058) that has not been applied to this server yet. Until it is, no scheduled report is sent from this server; ask your administrator to apply it.");
     this.name = "ReportEmailSchemaPendingError";
   }
 }
@@ -21781,7 +21973,7 @@ export async function InitReportEmailSchema(): Promise<ReportEmailSchemaState> {
   }
   reportEmailSchema = { ...state, checkedAt: Date.now() };
   if (!allReady(state)) {
-    logger.error({ ...state }, "Report email is OFF — migrations 056-058 are not all applied here and this role could not add them. Existing scheduled reports keep running.");
+    logger.error({ ...state }, "Report email is OFF — migrations 056-058 are not all applied here and this role could not add them. The scheduled report sweep WAITS until they are: no scheduled report (in-app inbox ones included) is sent from this server.");
   }
   return state;
 }
@@ -22072,22 +22264,29 @@ export interface RenderedReportFile {
  * caller's transaction, behind the same attempts compare-and-swap as every
  * other write on the row. A superseded worker's files never replace the
  * winner's: zero rows from the CAS throws before anything is written.
+ *
+ * `meta` is what the email BODY is built from besides the files (the headline
+ * figures, the restaurant's name, the "Generated" time), stored with them so a
+ * retry sends the same message — see report_email_content.ts,
+ * ReportMessageMeta. Null keeps whatever the row has.
  */
 export async function StoreReportDeliveryFiles(
   resId: string,
   deliveryId: string,
   attempts: number,
   files: readonly RenderedReportFile[],
+  meta: unknown = null,
 ): Promise<void> {
   // A row found mid-send with nothing stored (only a hand-made or very old
   // one) is re-rendered and STAYS 'sending', so the resume that follows is
   // still recognised as one.
   const cas = await runQuery<{ id: string }>(
     `update "ReportDeliveries"
-        set status = case when status = 'sending' then 'sending' else 'rendered' end, error = null
+        set status = case when status = 'sending' then 'sending' else 'rendered' end, error = null,
+            message_meta = coalesce($4::jsonb, message_meta)
       where id = $1 and res_id = $2 and attempts = $3 and status in ('claimed','rendered','sending','failed')
       returning id`,
-    [deliveryId, resId, attempts],
+    [deliveryId, resId, attempts, meta === null || meta === undefined ? null : JSON.stringify(meta)],
   );
   if (!cas[0]) {throw new Error("Report delivery was superseded by another attempt");}
   await runQuery(`delete from "ReportDeliveryFiles" where res_id = $1 and delivery_id = $2`, [resId, deliveryId]);
@@ -22159,6 +22358,8 @@ export interface SendingState {
   delivered_to: string[];
   rejected_to: string[];
   skipped_to: string[];
+  /** The body's inputs as the row keeps them — the FIRST attempt's, on a retry. */
+  message_meta: unknown;
 }
 
 const textArray = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => String(x)) : []);
@@ -22166,23 +22367,34 @@ const textArray = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => Str
 /**
  * Commit 'sending' BEFORE the first message leaves, and hand back what has
  * already been decided per address — a resumed send skips those.
+ *
+ * `meta` is this attempt's proposal for the body's inputs; the row keeps the
+ * FIRST one it was given (the render's, or a test email's first attempt) and
+ * hands that back, so every attempt builds the same message.
  */
 export async function MarkReportDeliverySending(
   resId: string,
   deliveryId: string,
   attempts: number,
   provider: string,
+  meta: unknown = null,
 ): Promise<SendingState | null> {
-  const rows = await runQuery<{ delivered_to: unknown; rejected_to: unknown; skipped_to: unknown }>(
+  const rows = await runQuery<{ delivered_to: unknown; rejected_to: unknown; skipped_to: unknown; message_meta: unknown }>(
     `update "ReportDeliveries"
-        set status = 'sending', sending_at = coalesce(sending_at, now()), provider = $4, channel = 'email'
+        set status = 'sending', sending_at = coalesce(sending_at, now()), provider = $4, channel = 'email',
+            message_meta = coalesce(message_meta, $5::jsonb)
       where id = $1 and res_id = $2 and attempts = $3 and status in ('claimed','rendered','sending','failed')
-      returning delivered_to, rejected_to, skipped_to`,
-    [deliveryId, resId, attempts, provider],
+      returning delivered_to, rejected_to, skipped_to, message_meta`,
+    [deliveryId, resId, attempts, provider, meta === null || meta === undefined ? null : JSON.stringify(meta)],
   );
   const r = rows[0];
   if (!r) {return null;}
-  return { delivered_to: textArray(r.delivered_to), rejected_to: textArray(r.rejected_to), skipped_to: textArray(r.skipped_to) };
+  return {
+    delivered_to: textArray(r.delivered_to),
+    rejected_to: textArray(r.rejected_to),
+    skipped_to: textArray(r.skipped_to),
+    message_meta: r.message_meta ?? null,
+  };
 }
 
 /**
@@ -22289,20 +22501,29 @@ export async function ClaimReportPurgeDay(): Promise<boolean> {
   return rows.length > 0;
 }
 
-/** Ad hoc sends left unfinished by a process that died — recent ones only. */
-export async function ListOrphanAdhocDeliveries(resId: string, maxAgeMinutes: number): Promise<{ id: string; outlet_id: string }[]> {
-  const rows = await runQuery<{ id: string; outlet_id: string }>(
-    `select id, outlet_id from "ReportDeliveries"
-      where res_id = $1 and kind = 'adhoc'
+/**
+ * Send nows and Run nows left unfinished by a process that died — recent ones
+ * only — with WHEN each may be tried again. A worker that died mid-attempt
+ * left its lease on the row (ten minutes), and a deploy's recreate is back
+ * well inside that: a scan that asked only for rows already due found none,
+ * and on a server whose sweep is off nothing else would ever come back for
+ * them. The caller waits out each lease instead.
+ */
+export async function ListOrphanAdhocDeliveries(
+  resId: string,
+  maxAgeMinutes: number,
+): Promise<{ id: string; outlet_id: string; next_attempt_at: Date }[]> {
+  const rows = await runQuery<{ id: string; outlet_id: string; next_attempt_at: Date | string }>(
+    `select id, outlet_id, next_attempt_at from "ReportDeliveries"
+      where res_id = $1 and kind in ('adhoc','manual')
         and status in ('claimed','rendered','sending','failed')
         and attempts < $2
-        and next_attempt_at <= now()
         and created_at > now() - make_interval(mins => $3::int)
       order by created_at asc
       limit 20`,
     [resId, REPORT_MAX_ATTEMPTS, Math.max(1, Math.round(maxAgeMinutes))],
   );
-  return rows.map((r) => ({ id: String(r.id), outlet_id: String(r.outlet_id) }));
+  return rows.map((r) => ({ id: String(r.id), outlet_id: String(r.outlet_id), next_attempt_at: new Date(r.next_attempt_at) }));
 }
 
 /**
@@ -22310,6 +22531,10 @@ export async function ListOrphanAdhocDeliveries(resId: string, maxAgeMinutes: nu
  * "email is not set up on this server" while an email schedule is due.
  * De-duplicated on the notification log itself, so a restart does not ring it
  * again. Carries no figures and no addresses.
+ *
+ * `view: 'email'` is where it opens: this bell names no delivery and no
+ * schedule, and the app read only those to leave the report grid — so the owner
+ * told "scheduled email reports are waiting" landed on Item Wise.
  */
 export async function NotifyReportOnce(
   resId: string,
@@ -22327,7 +22552,7 @@ export async function NotifyReportOnce(
     type: "report",
     title: n.title,
     body: n.body,
-    meta: { module: "Reports", kind: n.kind, day: n.day },
+    meta: { module: "Reports", view: "email", kind: n.kind, day: n.day },
   });
   return true;
 }
