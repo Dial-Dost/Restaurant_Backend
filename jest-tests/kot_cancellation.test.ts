@@ -44,6 +44,7 @@ import {
   seedMenu,
   tickets,
 } from "./kot_number_fixtures";
+import { kotPaper } from "./kot_raster_read";
 
 interface EnqueuedJob {
   outlet_id: string;
@@ -98,8 +99,21 @@ beforeAll(async () => {
 
 beforeEach(() => { resetStore(); enqueued.length = 0; });
 
-/** What the pass can read on a docket: the ESC/POS bytes as printable text. */
-const paper = (escBase64: string): string => Buffer.from(escBase64, "base64").toString("utf8");
+/**
+ * WHAT THE PASS CAN READ ON A DOCKET.
+ *
+ * It used to be `Buffer.from(b64,"base64").toString("utf8")`, which worked only
+ * while the docket was ESC/POS TEXT. The docket a restaurant prints by default
+ * is now the reference one — proportional type drawn as a GS v 0 raster — so
+ * this reads the words back off the bitmap by matching the committed glyph
+ * atlas (jest-tests/kot_raster_read.ts), and falls back to the plain decode for
+ * a restaurant on 'classic'.
+ *
+ * The assertions below are unchanged, and deliberately so: they are questions
+ * about the paper the kitchen is handed, and they are still asked of the paper
+ * the kitchen is actually handed rather than of a model of it.
+ */
+const paper = (escBase64: string): string => kotPaper(escBase64, 48);
 
 const TZ = "Asia/Kolkata";
 const FIRED = new Date("2026-08-25T06:30:00Z"); // 12:00 on the 25th, IST

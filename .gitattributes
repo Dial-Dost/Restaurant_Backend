@@ -1,0 +1,5 @@
+# The KOT glyph atlas is generated from these two files, and the drift test
+# rebuilds it and compares dot for dot. A checkout that line-ending-converted a
+# .ttf would produce a different atlas and a failure nobody could read. Git
+# already auto-detects them as binary; this says so, so it cannot stop.
+*.ttf binary

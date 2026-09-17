@@ -30,6 +30,16 @@ import { downloadFile } from "./storage_bucket_supabase.js";
 import { signTable, encodeTableToken } from "./qr_signing.js";
 import { MOBILE_10_ERROR, normalizeMobile10 } from "./phone_validation.js";
 import { CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "./customer_gstin.js";
+import {
+  KOT_PRINT_STYLE_DEFAULT,
+  KOT_TEXT_SIZE_DEFAULT,
+  type KotPrintStyle,
+  type KotTextSize,
+  normalizeKotPrintStyle,
+  normalizeKotTextSize,
+  parseKotPrintStyle,
+  parseKotTextSize,
+} from "./kot_print_style.js";
 // The renderer owns the QR-note default and its length cap, so the settings
 // layer serves the same two values every print path already obeys rather than
 // keeping a second copy that could drift.
@@ -8006,6 +8016,15 @@ const UNDO_SETTINGS_COLUMNS: Record<string, { column: string; cast: string; null
   require_table_otp: { column: "require_table_otp", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   kot_auto_print: { column: "kot_auto_print", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
   bill_show_qr: { column: "bill_show_qr", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
+  // The prior value is whatever GetRestaurantSettings REPORTED before the save,
+  // which is always one of the two styles (a NULL column reports 'reference'),
+  // so an undo writes that word explicitly rather than restoring a NULL. Same
+  // stored meaning, and it keeps the undo from depending on the difference
+  // between "never chosen" and "chose the default" — which nothing reads.
+  kot_print_style: { column: "kot_print_style", cast: "text", nullable: true, toDb: (v) => normalizeKotPrintStyle(v) },
+  // Same reasoning: the prior value is what the settings document REPORTED,
+  // always one of the three sizes (a NULL column reports 'standard').
+  kot_text_size: { column: "kot_text_size", cast: "text", nullable: true, toDb: (v) => normalizeKotTextSize(v) },
   queue_show_menu: { column: "queue_show_menu", cast: "boolean", nullable: true, toDb: (v) => (typeof v === "boolean" ? v : null) },
 };
 
@@ -27333,6 +27352,25 @@ async function ensureBrandingColumns(): Promise<void> {
   // means "never configured" and resolves to DEFAULT_TIME_SLOTS; the report
   // readers also survive this column being absent (42703 -> defaults).
   await runQuery(`alter table "Restaurant" add column if not exists report_time_slots jsonb default null`);
+  // WHICH KITCHEN DOCKET THIS RESTAURANT PRINTS (migration 050,
+  // kot_print_style.ts). NULL — every existing tenant — means "never chosen" and
+  // reads as 'reference', the docket the client asked for. The only other value
+  // is 'classic', the ESC/POS TEXT docket, and it is what an owner switches to
+  // when their kitchen printer answers the raster docket with blank paper.
+  //
+  // NO COLUMN DEFAULT, deliberately, unlike the booleans above: the default
+  // lives in code (KOT_PRINT_STYLE_DEFAULT) so it is the SAME answer for a NULL
+  // column, for a column this statement has not created yet, and for a value
+  // nobody recognises. A default here would be a second place for that answer to
+  // live, and the one that disagreed would be the one on the paper.
+  await runQuery(`alter table "Restaurant" add column if not exists kot_print_style text`);
+  // HOW LARGE THE REFERENCE DOCKET'S TYPE IS (migration 050's second statement,
+  // kot_print_style.ts). NULL means "never chosen" and reads as 'standard' —
+  // the client's reference ticket. 'small' and 'large' are the other two.
+  // NO COLUMN DEFAULT, for the reason kot_print_style has none: the default
+  // lives in code (KOT_TEXT_SIZE_DEFAULT) and has to be the same answer for a
+  // NULL, a missing column and an unrecognised value.
+  await runQuery(`alter table "Restaurant" add column if not exists kot_text_size text`);
   brandingColsEnsured = true;
 }
 
@@ -27778,6 +27816,19 @@ export interface RestaurantSettings {
   kot_auto_print: boolean;
   /** The customer bill prints the feedback/valet QR. Default (and NULL) = true. */
   bill_show_qr: boolean;
+  /**
+   * Which kitchen docket this restaurant prints — 'reference' (default, and what
+   * NULL / an unapplied migration 050 read as) or 'classic', the ESC/POS text
+   * docket. The owner's escape hatch from a printer that cannot draw a raster;
+   * see kot_print_style.ts for what happens on one that cannot.
+   */
+  kot_print_style: KotPrintStyle;
+  /**
+   * How large the reference docket's type is — 'small', 'standard' (default,
+   * and what NULL / an unapplied migration 050 read as) or 'large'. The classic
+   * text docket ignores it. See kot_print_style.ts.
+   */
+  kot_text_size: KotTextSize;
   // Rich customer-page branding (resolved with defaults — see resolveBrandConfig)
   // so the admin UI can prefill the editor.
   brand_config: BrandConfig;
@@ -27869,6 +27920,152 @@ function billHeaderSettings(
   };
 }
 
+/**
+ * Whether this process has already said "kot_print_style is missing".
+ *
+ * ONCE PER PROCESS, for the reason timeSlotsColumnMissingWarned documents: the
+ * 42703 is a fact about the SCHEMA, not about the docket. Every KOT in the
+ * window between a deploy and migration 050 being applied would otherwise file
+ * the same warn, and a busy service prints a lot of KOTs.
+ */
+let kotPrintStyleColumnMissingWarned = false;
+
+/**
+ * THE LAST ANSWER THIS PROCESS ACTUALLY GOT, per restaurant.
+ *
+ * NOT A CACHE — nothing is ever served from here while the database can be
+ * read, because an owner who flips this switch is usually standing at a printer
+ * that is producing blank tickets, and "the next KOT prints as text again" has
+ * to be literally true. It is a FAILURE fallback, and it exists because the
+ * alternative answer on a failed read is dangerous in one specific direction.
+ *
+ * If a restaurant has chosen 'classic' — which they only ever do BECAUSE their
+ * kitchen printer cannot draw a raster — then answering a transient read error
+ * with the default ('reference') hands that kitchen a docket it prints as blank
+ * paper, and an order nobody cooks. A dispatch can reach this point with the
+ * database unwell (withStations swallows its own settings failure and prints an
+ * unsplit docket), so that is not a hypothetical ordering of events.
+ *
+ * Remembering the last answer makes a blip harmless: the kitchen keeps printing
+ * what it was printing a minute ago. Bounded by the number of tenants this
+ * process has ever dispatched a KOT for, which is small and does not grow with
+ * traffic.
+ */
+const kotPrintStyleLastKnown = new Map<string, KotPrintStyle>();
+
+/**
+ * Which docket this restaurant prints. Never throws.
+ *
+ * DEFENSIVE IN THREE DIRECTIONS, because every one of them has to end in paper:
+ *   * the column is missing (42703 — migration 050 not applied and the runtime
+ *     cannot issue DDL): nobody can have chosen anything, so the default is the
+ *     truth. Warned once.
+ *   * the column is NULL or holds something unrecognised: normalizeKotPrintStyle
+ *     answers the default.
+ *   * the read itself failed: the last answer this process got for this
+ *     restaurant, and only then the default. See kotPrintStyleLastKnown.
+ *
+ * DELIBERATELY DOES NOT CALL ensureBrandingColumns. This runs on the KOT path,
+ * which must not depend on DDL — and a runtime repointed to app_runtime cannot
+ * issue any. Reading works on every database; SAVING needs the column, exactly
+ * as report_time_slots documents for its own presets.
+ */
+async function loadKotPrintStyle(resId: string): Promise<KotPrintStyle> {
+  try {
+    const rows = await runQuery<{ kot_print_style: string | null }>(
+      `select kot_print_style from "Restaurant" where id = $1 limit 1`,
+      [resId],
+    );
+    const style = normalizeKotPrintStyle(rows[0]?.kot_print_style ?? null);
+    kotPrintStyleLastKnown.set(resId, style);
+    return style;
+  } catch (err) {
+    if ((err as { code?: unknown })?.code === "42703") {
+      if (!kotPrintStyleColumnMissingWarned) {
+        kotPrintStyleColumnMissingWarned = true;
+        logger.warn({ what: "Restaurant.kot_print_style" }, "kot_print_style_column_missing");
+      }
+      return KOT_PRINT_STYLE_DEFAULT;
+    }
+    const remembered = kotPrintStyleLastKnown.get(resId) ?? null;
+    // WARN, NOT ERROR, and never a throw: the docket still prints. The style is
+    // in the line so an operator can see which docket the kitchen got while the
+    // read was failing.
+    logger.warn({ err, resId, style: remembered ?? KOT_PRINT_STYLE_DEFAULT, remembered: remembered !== null }, "kot_print_style_read_failed");
+    return remembered ?? KOT_PRINT_STYLE_DEFAULT;
+  }
+}
+
+/**
+ * The restaurant's KOT docket style, for the print path.
+ *
+ * SEPARATE FROM GetRestaurantSettings on purpose. That function issues DDL
+ * (ensureBrandingColumns), reads thirty-odd columns and resolves a brand
+ * palette; this one answers a single question that has to survive a database
+ * having a bad minute, and it is asked once per docket. See loadKotPrintStyle.
+ */
+export async function GetKotPrintStyle(restaurantId: string): Promise<KotPrintStyle> {
+  const context = await requireRestaurantContext(restaurantId);
+  return loadKotPrintStyle(context.res_id);
+}
+
+/** Whether this process has already said "kot_text_size is missing". Once, as above. */
+let kotTextSizeColumnMissingWarned = false;
+
+/**
+ * The last size this process actually read, per restaurant — a FAILURE
+ * fallback, never a cache, exactly as kotPrintStyleLastKnown is.
+ *
+ * The stakes are lower than the style's (a wrong size still prints), but the
+ * same rule reads best at the pass: a docket should not change size because the
+ * database had a bad second.
+ */
+const kotTextSizeLastKnown = new Map<string, KotTextSize>();
+
+/**
+ * How large this restaurant's reference docket is set. Never throws.
+ *
+ * The same three defences as loadKotPrintStyle, and its OWN statement rather
+ * than a second column in that one, deliberately: the escape hatch to the
+ * classic docket must never depend on this newer column existing. A database
+ * that has kot_print_style and not kot_text_size (the DDL is issued in that
+ * order, and the second statement can fail on its own) keeps printing whatever
+ * docket its owner chose, at the standard size.
+ *
+ * Does not call ensureBrandingColumns, for the reason loadKotPrintStyle gives.
+ */
+async function loadKotTextSize(resId: string): Promise<KotTextSize> {
+  try {
+    const rows = await runQuery<{ kot_text_size: string | null }>(
+      `select kot_text_size from "Restaurant" where id = $1 limit 1`,
+      [resId],
+    );
+    const size = normalizeKotTextSize(rows[0]?.kot_text_size ?? null);
+    kotTextSizeLastKnown.set(resId, size);
+    return size;
+  } catch (err) {
+    if ((err as { code?: unknown })?.code === "42703") {
+      if (!kotTextSizeColumnMissingWarned) {
+        kotTextSizeColumnMissingWarned = true;
+        logger.warn({ what: "Restaurant.kot_text_size" }, "kot_text_size_column_missing");
+      }
+      return KOT_TEXT_SIZE_DEFAULT;
+    }
+    const remembered = kotTextSizeLastKnown.get(resId) ?? null;
+    logger.warn({ err, resId, size: remembered ?? KOT_TEXT_SIZE_DEFAULT, remembered: remembered !== null }, "kot_text_size_read_failed");
+    return remembered ?? KOT_TEXT_SIZE_DEFAULT;
+  }
+}
+
+/**
+ * The restaurant's reference-docket type size, for the print path. Separate
+ * from GetRestaurantSettings for the reasons GetKotPrintStyle is.
+ */
+export async function GetKotTextSize(restaurantId: string): Promise<KotTextSize> {
+  const context = await requireRestaurantContext(restaurantId);
+  return loadKotTextSize(context.res_id);
+}
+
 export async function GetRestaurantSettings(
   restaurantId: string,
 ): Promise<RestaurantSettings> {
@@ -27927,6 +28124,14 @@ export async function GetRestaurantSettings(
     // NULL reads as ON, for the same reason: every bill before this column
     // carried the QR, and a tenant who has made no choice keeps what they had.
     bill_show_qr: rows[0]?.bill_show_qr !== false,
+    // READ THROUGH ITS OWN STATEMENT, not from `rows` above, and that is the
+    // point: this column may not exist yet (migration 050 is applied by hand on
+    // the VPS), and adding it to the select above would turn every settings read
+    // in that window into a 500. loadKotPrintStyle answers the default instead.
+    kot_print_style: await loadKotPrintStyle(context.res_id),
+    // The same, for the reference docket's type size (migration 050's second
+    // column). Its own statement, so a database missing it still reads.
+    kot_text_size: await loadKotTextSize(context.res_id),
     // Admin editor prefill: the stored customization resolved with defaults
     // (color_primary falls back to theme_color here — the logo-extracted palette
     // is only resolved on the public branding path to keep this admin read cheap)
@@ -27943,7 +28148,7 @@ export async function GetRestaurantSettings(
 
 export async function SetRestaurantSettings(
   restaurantId: string,
-  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; bill_legal_name?: unknown; bill_gstin?: unknown; bill_qr_note?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean; kot_auto_print?: boolean; bill_show_qr?: boolean },
+  opts: { auto_push_orders?: boolean; currency?: string; payment_methods?: unknown; taxes?: unknown; razorpay_key_id?: string; razorpay_key_secret?: string; service_charge?: number; discount_approval_threshold?: number; bill_reopen_window_min?: number; alert_discount_pct?: number; alert_void_count?: number; loyalty_earn_per_100?: number; loyalty_point_value?: number; booking_deposit_amount?: number; booking_deposit_min_party?: number; booking_cancel_window_hours?: number; booking_min_spend?: number; msg_provider?: string; msg_sender?: string; msg_key_id?: string; msg_key_secret?: string; msg_reminder_hours?: number; feedback_config?: unknown; bill_logo_svg?: unknown; bill_paper_width?: unknown; bill_legal_name?: unknown; bill_gstin?: unknown; bill_qr_note?: unknown; kitchen_sections?: unknown; inventory_categories?: unknown; timezone?: string; require_table_otp?: boolean; kot_auto_print?: boolean; bill_show_qr?: boolean; kot_print_style?: unknown; kot_text_size?: unknown },
 ): Promise<RestaurantSettings> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureBrandingColumns();
@@ -28053,6 +28258,14 @@ export async function SetRestaurantSettings(
   // Same shape: only an explicit boolean writes, so a client that has never
   // heard of the switch cannot turn the QR off by leaving it out.
   const billShowQr = typeof opts.bill_show_qr === "boolean" ? opts.bill_show_qr : null;
+  // Which kitchen docket this restaurant prints. null = "not in this request",
+  // and so is a value that is not one of the two styles — parseKotPrintStyle is
+  // strict on the write path, and the ROUTE turns that into a 400 before it gets
+  // here, so nothing that reaches this line can quietly write the wrong docket.
+  const kotPrintStyle = parseKotPrintStyle(opts.kot_print_style);
+  // The reference docket's type size, on the same terms: null = not in this
+  // request, and the route has already 400'd anything that is not a size.
+  const kotTextSize = parseKotTextSize(opts.kot_text_size);
   // Printed-bill header identity + the custom QR sentence. All three follow the
   // bill_logo_svg idiom exactly: only written when the key is PRESENT, and an
   // empty string CLEARS the column (nullif below) rather than storing a blank
@@ -28147,6 +28360,43 @@ export async function SetRestaurantSettings(
       if (!plan.ok) {throw new PaymentConfigError(plan.errors);}
       paymentConfig = JSON.stringify(plan.config);
     }
+    // THE KOT DOCKET STYLE GETS ITS OWN STATEMENT, and it is only issued when
+    // the owner actually sent a choice.
+    //
+    // WHY NOT A COLUMN IN updateSettingsRow, like every other settings column:
+    // "Restaurant".kot_print_style ships as runtime DDL first
+    // (ensureBrandingColumns) and migration 050 is applied by hand on the VPS, so
+    // there is a window in which the column may not exist. Naming it in that
+    // statement would make EVERY settings save in that window fail — a tenant
+    // unable to change their currency because of a printing switch they have
+    // never opened. Written this way, a save that does not touch the switch
+    // issues nothing and cannot be affected at all, and a save that DOES touch it
+    // fails loudly, which is the honest answer: the choice was not stored.
+    //
+    // Inside the transaction, and BEFORE the row update rather than after it, so
+    // the whole save stays all-or-nothing and updateSettingsRow remains this
+    // transaction's last statement — which test/money/payment_modes_routes.ts
+    // pins, because payment modes must be written in the same transaction as
+    // every other setting. Order does not matter here: the two statements touch
+    // different columns of the same row.
+    if (kotPrintStyle) {
+      await runQuery(
+        `update "Restaurant" set kot_print_style = $2 where id = $1`,
+        [context.res_id, kotPrintStyle],
+        client,
+      );
+    }
+    // THE TYPE SIZE, on exactly the same terms and for the same reasons: its
+    // own statement, issued only when the owner sent a size, inside the
+    // transaction and ahead of updateSettingsRow. A save that does not mention
+    // it cannot be broken by the column being missing.
+    if (kotTextSize) {
+      await runQuery(
+        `update "Restaurant" set kot_text_size = $2 where id = $1`,
+        [context.res_id, kotTextSize],
+        client,
+      );
+    }
     return updateSettingsRow(paymentConfig, client);
   });
   // First messaging save: mint the webhook secret (Meta hub.verify_token +
@@ -28211,6 +28461,13 @@ export async function SetRestaurantSettings(
     // NULL reads as ON, for the same reason: every bill before this column
     // carried the QR, and a tenant who has made no choice keeps what they had.
     bill_show_qr: rows[0]?.bill_show_qr !== false,
+    // Re-read rather than returned from the update above, for the same reason
+    // the getter reads it separately: the column is not in that statement, so a
+    // database still waiting for migration 050 can save every OTHER setting.
+    // This is the value the write just committed.
+    kot_print_style: await loadKotPrintStyle(context.res_id),
+    // Re-read for the same reason.
+    kot_text_size: await loadKotTextSize(context.res_id),
     // brand_config isn't written here (branding is set via SetBranding), but the
     // type requires it — echo the current stored value resolved with defaults.
     brand_config: resolveBrandConfig(rows[0]?.brand_config, null, rows[0]?.theme_color ?? null),

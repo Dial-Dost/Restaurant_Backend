@@ -312,7 +312,7 @@ describe("buildReceiptBase64 — bill", () => {
     // reader can act on it.
     const out = printed(buildReceiptBase64({
       ...baseBill,
-      kind: "kot",
+      kind: "kot", kotPrintStyle: "classic",
       items: [{ name: "Soup", quantity: 1, price: 30, note: "allergy: peanuts" }],
     }));
     expect(out).toContain("[Note] allergy: peanuts");
@@ -434,7 +434,7 @@ describe("buildReceiptBase64 — bill header", () => {
 
   test("a KOT's header fields obey the same rule", () => {
     const out = printed(buildReceiptBase64({
-      ...baseBill, kind: "kot", section: "null", assignedTo: "null", captain: "undefined", printedAt: "25/08/26 15:23",
+      ...baseBill, kind: "kot", kotPrintStyle: "classic", section: "null", assignedTo: "null", captain: "undefined", printedAt: "25/08/26 15:23",
     }));
     expect(out).not.toContain("Assign to:");
     expect(out).not.toContain("Captain:");
@@ -482,7 +482,7 @@ describe("buildReceiptBase64 — bill header", () => {
   });
 
   test("the header block is a BILL concern — a KOT carries none of it", () => {
-    const out = printed(buildReceiptBase64({ ...fullHeader, kind: "kot" }));
+    const out = printed(buildReceiptBase64({ ...fullHeader, kind: "kot", kotPrintStyle: "classic" }));
     // Anchored on the restaurant name so the negatives below cannot pass
     // vacuously on an empty render. Deliberately NOT anchored on the kitchen
     // ticket's own wording — that line is the KOT format's to define, and this
@@ -668,10 +668,26 @@ describe("buildReceiptBase64 — custom QR message", () => {
 // clock, no timezone and no counter — so these tests assert placement and
 // omission, and kot_numbering.test.ts asserts that the values themselves are
 // right.
+/**
+ * EVERY KOT FIXTURE BELOW PINS kotPrintStyle: "classic", AND THAT IS THE POINT.
+ *
+ * The docket a restaurant prints by default is now the REFERENCE docket — a
+ * raster, laid out by layoutKot and drawn by encodeKotRaster, whose content is
+ * asserted in kot_layout.test.ts and whose geometry and bytes are asserted in
+ * kot_raster.test.ts. What is left here is the ESC/POS TEXT docket, which is
+ * still live code: a kitchen printer that cannot take a GS v 0 raster prints a
+ * blank ticket from the new path, so 'classic' is the switch that keeps it
+ * printing, and a switch nobody exercises is a switch that has already broken.
+ *
+ * So these suites are not legacy. They are the classic docket's own tests,
+ * every assertion they always made, and the sha256 block at the foot of this
+ * file pins its bytes UNCHANGED — that is what proves the new default took
+ * nothing away from the restaurant that has to fall back to it.
+ */
 describe("buildReceiptBase64 — KOT", () => {
   const kotBase: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 26,
     printedAt: "25/08/26 15:23",
     orderContext: "Running Table",
@@ -893,10 +909,13 @@ describe("buildReceiptBase64 — KOT", () => {
 // own place in the list, and the line directly under it — the slot a "[Note]"
 // takes — reads "[Hold] ...". What still keeps it out of the pot is the totals:
 // Total Qty counts only the cook-now lines and the hold is totalled apart.
+//
+// And the line says "[Hold]" and nothing else. Client: "When an item is on hold,
+// on the KOT it must only say 'hold' and NOT 'hold do not cook until fired'."
 describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
   const kot: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 26,
     printedAt: "25/08/26 15:23",
     orderContext: "Running Table",
@@ -923,7 +942,7 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
   test("the held dish keeps its place and number, and [Hold] is the indented line directly under it", () => {
     const lines = printedLines(buildReceiptBase64(kot));
     const dish = at(lines, /^2 {3}Gulab Jamun \.+ x3$/);
-    expect(lines[dish + 1]).toBe("    [Hold] Do not cook until fired");
+    expect(lines[dish + 1]).toBe("    [Hold]");
     // In list order, between the dishes either side of it.
     expect(at(lines, /^1 {3}Paneer Tikka /)).toBeLessThan(dish);
     expect(at(lines, /^3 {3}Naan /)).toBeGreaterThan(dish);
@@ -936,6 +955,8 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
     const out = lines.join("\n");
     expect(out).not.toContain("** HOLD **");
     expect(out).not.toContain("DO NOT COOK UNTIL FIRED");
+    // The marker alone — no instruction after it, in any case.
+    expect(out).not.toMatch(/do not cook|until fired/i);
     expect(out).not.toMatch(/^H\d/m);
     // …and the dish row itself carries no trailing "hold" word either: the
     // requirement puts the hold on the NOTE line, not on the dish line.
@@ -947,7 +968,7 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
       ...kot, items: [{ name: "Souffle", quantity: 1, price: 300, held: true, note: "no sugar" }],
     });
     const raw = decode(b64);
-    expect(raw).toContain("\x1b!\x10    [Hold] Do not cook until fired\n\x1b!\x00");
+    expect(raw).toContain("\x1b!\x10    [Hold]\n\x1b!\x00");
     expect(raw).toContain("\x1b!\x10    [Note] no sugar\n\x1b!\x00");
     expect(raw).not.toMatch(/\x1bE\x01[^\n]*\[Hold\]/);
   });
@@ -961,7 +982,7 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
       ],
     }));
     const dish = at(lines, /^1 {3}Souffle \.+ x1$/);
-    expect(lines[dish + 1]).toBe("    [Hold] Do not cook until fired");
+    expect(lines[dish + 1]).toBe("    [Hold]");
     expect(lines[dish + 2]).toBe("    [Note] fire with dessert course");
     expect(lines[dish + 3]).toMatch(/^2 {3}Naan /);
   });
@@ -1021,7 +1042,8 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
   test("the hold line fits both rolls", () => {
     for (const cols of [48, 32]) {
       const b64 = buildReceiptBase64(kot, cols);
-      expect(printed(b64).replace(/\n\s*/g, " ")).toContain("[Hold] Do not cook until fired");
+      expect(printed(b64)).toMatch(/^ {4}\[Hold\]$/m);
+      expect(printed(b64)).not.toMatch(/until fired/i);
       for (const w of cellWidths(b64)) { expect(w).toBeLessThanOrEqual(cols); }
     }
   });
@@ -1071,7 +1093,7 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
 describe("buildReceiptBase64 — KOT, type size", () => {
   const kot: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 21,
     printedAt: "08/09/26 14:13",
     orderContext: "Running Table",
@@ -1173,7 +1195,7 @@ describe("buildReceiptBase64 — KOT, type size", () => {
 describe("buildKotBase64 — per-station split", () => {
   const mixed: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     items: [
       { name: "Paneer Tikka", quantity: 2, price: 200, station: "Tandoor" },
       { name: "Cold Coffee", quantity: 1, price: 120, station: "Beverages" },
@@ -1208,7 +1230,7 @@ describe("buildKotBase64 — per-station split", () => {
   });
 
   test("no items -> a single General ticket (never zero tickets)", () => {
-    const tickets = buildKotBase64({ ...baseBill, kind: "kot", items: [] });
+    const tickets = buildKotBase64({ ...baseBill, kind: "kot", kotPrintStyle: "classic", items: [] });
     expect(tickets.length).toBe(1);
     expect(tickets[0].station).toBe("General");
   });
@@ -1237,7 +1259,7 @@ describe("buildReceiptBase64 — widths", () => {
 describe("buildReceiptBase64 — the order-level note", () => {
   const kotWithNote: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 26,
     printedAt: "25/08/26 15:23",
     orderContext: "Running Table",
@@ -1316,7 +1338,7 @@ describe("buildReceiptBase64 — the order-level note", () => {
 describe("buildReceiptBase64 — KOT, bold dish names", () => {
   const kot: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 26,
     printedAt: "25/08/26 15:23",
     orderContext: "Running Table",
@@ -1417,7 +1439,7 @@ describe("buildReceiptBase64 — KOT, bold dish names", () => {
 describe("buildReceiptBase64 — reprints", () => {
   const kot: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 26,
     printedAt: "25/08/26 15:23",
     orderContext: "Running Table",
@@ -1604,7 +1626,7 @@ describe("buildReceiptBase64 — Token No.", () => {
   });
 
   test("the KOT carries no list — the docket IS one of those tickets", () => {
-    const kot: ReceiptOptions = { ...baseBill, kind: "kot", kotNo: 26, table: "12" };
+    const kot: ReceiptOptions = { ...baseBill, kind: "kot", kotPrintStyle: "classic", kotNo: 26, table: "12" };
     expect(buildReceiptBase64({ ...kot, kotNumbers: nine })).toBe(buildReceiptBase64(kot));
     expect(printed(buildReceiptBase64({ ...kot, kotNumbers: nine }))).not.toContain("Token No.");
   });
@@ -1622,7 +1644,7 @@ describe("buildReceiptBase64 — Token No.", () => {
 describe("buildReceiptBase64 — a cancelled docket", () => {
   const slip: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 26,
     table: "12",
     orderContext: "*** REASON: GUEST LEFT ***",
@@ -1799,7 +1821,7 @@ describe("the client's reference bill layout", () => {
     expect([...bytes(narrow).subarray(0, 5)]).toEqual([0x1b, 0x40, 0x1b, 0x61, 0x01]);
     expect(marginCmds(narrow)).toEqual([]);
     // The kitchen docket keeps the whole roll, bill fields or not.
-    expect(marginCmds(buildReceiptBase64({ ...gaia, kind: "kot" }, 48))).toEqual([]);
+    expect(marginCmds(buildReceiptBase64({ ...gaia, kind: "kot", kotPrintStyle: "classic" }, 48))).toEqual([]);
     // The exported helpers say the same thing as the bytes.
     expect(billMarginCols(48)).toBe(2);
     expect(billMarginCols(32)).toBe(0);
@@ -2132,11 +2154,18 @@ describe("the client's reference bill layout", () => {
 // Each is "<byte length>:<sha256>". When the docket is changed ON PURPOSE,
 // compare the printed output of the old and new renderer for these fixtures,
 // and only then re-pin the digests from the new one.
+//
+// RE-PINNED ONCE, for the hold line: "[Hold] Do not cook until fired" became
+// "[Hold]" at the client's request. The nine fixtures that carry a held dish
+// were rendered by the previous escpos.ts and by this one, and the ONLY byte
+// difference is that line (one ESC ! 0x10 envelope, the sentence gone); the
+// five with nothing held — the empty ticket, and the Tandoor and BAR station
+// dockets on both rolls — did not move and were not touched.
 // ---------------------------------------------------------------------------
-describe("buildReceiptBase64 — the KOT is byte-identical to the docket before the bill layout changed", () => {
+describe("buildReceiptBase64 — the CLASSIC docket is byte-identical to the one before the reference docket existed", () => {
   const docket: ReceiptOptions = {
     ...baseBill,
-    kind: "kot",
+    kind: "kot", kotPrintStyle: "classic",
     kotNo: 26,
     printedAt: "25/08/26 15:23",
     orderContext: "Running Table",
@@ -2190,20 +2219,20 @@ describe("buildReceiptBase64 — the KOT is byte-identical to the docket before 
   };
 
   const GOLDEN: Record<string, string> = {
-    "the ordinary docket, 80mm": "1157:17637d426f2b3cc1c2024e49034c98b119355593f7863a17418aa584a09ed7cd",
-    "the ordinary docket, 58mm": "1012:2884bcc98935a7fa3e7bc6a630824809423e68eb11161133d84703114088dc14",
-    "a reprint with an order note, 80mm": "1348:7b12d90862f7c1ea6f47a00a16f139bdd25ef1d6c70e1ea53b35155216e2bc2c",
-    "a reprint with an order note, 58mm": "1312:70cb3eb42ee058356b5ab565134fe463fd0ac8809d0c940e91f628bdc0b25c55",
-    "a cancellation slip for a takeaway table": "1131:0fcdad49884d4a6cca63a9ede91dc079ab2fe146e2eaa768dda2bc02ac80bdbf",
+    "the ordinary docket, 80mm": "1133:206366c3e5041d6f1c809ed66147054378fa57d45232625a35106a87817d630d",
+    "the ordinary docket, 58mm": "978:2f98f188b794814d14d6178a16a2a696d83d80dca28212462c75b0cbd5079106",
+    "a reprint with an order note, 80mm": "1324:3acef87ba9dc502a89d7bbf724b4877cfbd64c45c81c1946cf491efe2f02e11f",
+    "a reprint with an order note, 58mm": "1278:07a02242d5ae89f8e9c86d8342a5dad0f7e956dad81ff7819b685da706cc0a64",
+    "a cancellation slip for a takeaway table": "1097:6b7bfc3f0c851412969f55c511af04311be5c42815f10c7984551e495f21ac8c",
     "an unnumbered, unassigned, empty ticket with a logo": "518:1255fb20bd25735d1d3d50b69d4cd87d3742a1836a414bf18ccf2e9f53fb15e4",
-    "a docket carrying every bill-only field": "1157:17637d426f2b3cc1c2024e49034c98b119355593f7863a17418aa584a09ed7cd",
-    "a docket carrying every bill-only field, 58mm": "1204:5f1061a226a7c9dd86abf461f2354f863319b291632aa7e095ccbef645e7b96b",
+    "a docket carrying every bill-only field": "1133:206366c3e5041d6f1c809ed66147054378fa57d45232625a35106a87817d630d",
+    "a docket carrying every bill-only field, 58mm": "1170:dfbc0a56db8ae8c5908dd2b0bf1caca6bddf9c542cf2f5cd7b478c26af04360f",
     "per-station Tandoor, 48 columns": "710:5d0c567d42a6455ff9878d895ef2a767423c2ff45e5d8d68d521eed9cb5d9923",
     "per-station BAR, 48 columns": "706:076170af2362911dd3c3dae8a6b9dbee47fa3386114ce670c93246b0bcb3a85d",
-    "per-station Sweets, 48 columns": "750:5ba29a23495fff9cac1c875cebdc424906c281ff28ac5b5b6834686198cf93ca",
+    "per-station Sweets, 48 columns": "726:6e6bd83ec92c3e14701d6a61923fe2c64886ee9a4bd39a6677fd83a9537103f1",
     "per-station Tandoor, 32 columns": "566:6f626540f1fafe62ba940907e45d6fca00bf3d2f171380c8a6333f3e8e3d5e0a",
     "per-station BAR, 32 columns": "562:6d3413f4645b38dcc4334ea0ef3a5b60f1006494d77b848c206f12b877f5672e",
-    "per-station Sweets, 32 columns": "616:1127f6fc781d66130eb08c14f066dec303a2107c4bca640b091937cad7733436",
+    "per-station Sweets, 32 columns": "582:6a56037caa43054ef5972bc7dc5d4a5bc9bb08cca8e07be31966e9b525c4afbe",
   };
 
   const digest = (b64: string) => {
@@ -2211,7 +2240,7 @@ describe("buildReceiptBase64 — the KOT is byte-identical to the docket before 
     return `${buf.length}:${createHash("sha256").update(buf).digest("hex")}`;
   };
 
-  test("every docket variant matches the committed renderer's bytes", () => {
+  test("every classic docket variant matches the committed renderer's bytes", () => {
     const actual: Record<string, string> = {};
     for (const [name, opts, cols] of variants) { actual[name] = digest(buildReceiptBase64(opts, cols)); }
     for (const cols of [48, 32]) {
@@ -2219,6 +2248,16 @@ describe("buildReceiptBase64 — the KOT is byte-identical to the docket before 
     }
     // One object, so a failure names every variant that moved at once.
     expect(actual).toEqual(GOLDEN);
+  });
+
+  test("the restaurant's KOT text size never reaches the classic docket", () => {
+    // It sizes the reference docket's type. The classic docket is set in the
+    // printer's own font, and its bytes stay exactly the pinned ones.
+    for (const [name, opts, cols] of variants) {
+      for (const kotTextSize of ["small", "standard", "large"] as const) {
+        expect({ name, kotTextSize, b64: digest(buildReceiptBase64({ ...opts, kotTextSize }, cols)) }).toEqual({ name, kotTextSize, b64: GOLDEN[name] });
+      }
+    }
   });
 
   test("a docket reads no bill-only field, on either roll", () => {

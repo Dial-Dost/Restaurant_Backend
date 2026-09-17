@@ -34,6 +34,7 @@ import {
   seedMenu,
   tickets,
 } from "./kot_number_fixtures";
+import { kotPaper } from "./kot_raster_read";
 
 /**
  * The durable print queue, replaced by a recorder.
@@ -105,8 +106,21 @@ beforeAll(async () => {
 
 beforeEach(() => { resetStore(); enqueued.length = 0; });
 
-/** What the pass can read on a docket: the ESC/POS bytes as printable text. */
-const paper = (escBase64: string): string => Buffer.from(escBase64, "base64").toString("utf8");
+/**
+ * WHAT THE PASS CAN READ ON A DOCKET.
+ *
+ * It used to be `Buffer.from(b64,"base64").toString("utf8")`, which worked only
+ * while the docket was ESC/POS TEXT. The docket a restaurant prints by default
+ * is now the reference one — proportional type drawn as a GS v 0 raster — so
+ * this reads the words back off the bitmap by matching the committed glyph
+ * atlas (jest-tests/kot_raster_read.ts), and falls back to the plain decode for
+ * a restaurant on 'classic'.
+ *
+ * The assertions below are unchanged, and deliberately so: they are questions
+ * about the paper the kitchen is handed, and they are still asked of the paper
+ * the kitchen is actually handed rather than of a model of it.
+ */
+const paper = (escBase64: string): string => kotPaper(escBase64, 48);
 
 const TZ = "Asia/Kolkata";
 const FIRED = new Date("2026-08-25T06:30:00Z"); // 12:00 on the 25th, IST
@@ -309,6 +323,88 @@ const dispatch = (over: Partial<Parameters<KotPrint["dispatchKot"]>[0]> = {}) =>
   ...over,
 });
 
+/**
+ * THE SETTING HAS TO REACH THE PAPER, or it is a switch wired to nothing.
+ *
+ * The reference docket is a GS v 0 raster, and a kitchen printer that ignores
+ * GS v 0 prints a BLANK ticket from it — order loss, silently. 'classic' is the
+ * escape hatch, and an escape hatch that no test drives is one nobody finds out
+ * is broken until a kitchen stops getting paper.
+ */
+describe("dispatchKot — which docket the restaurant gets", () => {
+  const isRaster = (b64: string) => Buffer.from(b64, "base64").includes(Buffer.from([0x1d, 0x76, 0x30, 0x00]));
+
+  test("by default — no setting anywhere — the kitchen gets the reference docket", async () => {
+    await kp.dispatchKot(dispatch());
+    expect(isRaster(enqueued[0]!.esc_base64)).toBe(true);
+    expect(paper(enqueued[0]!.esc_base64)).toContain("Table No: 12");
+  });
+
+  // The style is the RESTAURANT's ("Restaurant".kot_print_style), read by
+  // dispatchKot itself — no caller passes it — so these tests set it where it
+  // lives, at the read, rather than on the dispatch input.
+  const onClassic = () => jest.spyOn(db, "GetKotPrintStyle").mockResolvedValue("classic");
+
+  test("'classic' reaches the renderer and puts the text docket on the roll", async () => {
+    const style = onClassic();
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { style.mockRestore(); }
+    expect(isRaster(enqueued[0]!.esc_base64)).toBe(false);
+    expect(Buffer.from(enqueued[0]!.esc_base64, "base64").toString("latin1")).toContain("Table No: 12");
+  });
+
+  // The type size, set where it lives too ("Restaurant".kot_text_size).
+  const atSize = (size: "small" | "large") => jest.spyOn(db, "GetKotTextSize").mockResolvedValue(size);
+
+  test("the restaurant's text size reaches the paper — a 'small' docket is set in small type", async () => {
+    await kp.dispatchKot(dispatch());
+    const standard = enqueued[0]!.esc_base64;
+    enqueued.length = 0;
+    resetStore();
+    const size = atSize("small");
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { size.mockRestore(); }
+    const small = enqueued[0]!.esc_base64;
+    expect(isRaster(small)).toBe(true);
+    // Same words, smaller type: it reads back in the small faces and not in the
+    // standard ones, and it is a shorter strip of paper.
+    expect(kotPaper(small, 48, "small")).toContain("Table No: 12");
+    expect(kotPaper(small, 48, "small")).toBe(kotPaper(standard, 48));
+    expect(Buffer.from(small, "base64").length).toBeLessThan(Buffer.from(standard, "base64").length);
+  });
+
+  test("a classic restaurant's docket is the same text whatever size it has chosen", async () => {
+    const style = onClassic();
+    const size = atSize("large");
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { size.mockRestore(); }
+    const large = enqueued[0]!.esc_base64;
+    enqueued.length = 0;
+    resetStore();
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { style.mockRestore(); }
+    expect(isRaster(large)).toBe(false);
+    expect(large).toBe(enqueued[0]!.esc_base64);
+  });
+
+  test("every station's docket of one press obeys the setting, not just the first", async () => {
+    seedMenu([
+      { id: "m1", name: "Paneer Tikka", station: "TANDOOR" },
+      { id: "m2", name: "Masala Papad", station: "COLD" },
+    ]);
+    const style = onClassic();
+    try {
+      await kp.dispatchKot(dispatch());
+    } finally { style.mockRestore(); }
+    expect(enqueued.length).toBeGreaterThan(1);
+    expect(enqueued.map((j) => isRaster(j.esc_base64))).toEqual(enqueued.map(() => false));
+  });
+});
+
 describe("dispatchKot — what the kitchen actually gets", () => {
   test("a second bark of an unchanged order reprints the SAME paper, and mints nothing", async () => {
     const first = await kp.dispatchKot(dispatch());
@@ -399,9 +495,12 @@ describe("dispatchKot — what the kitchen actually gets", () => {
     expect(hold).toBeGreaterThan(-1);
     expect(out).not.toContain("** HOLD **");
     expect(out.slice(0, hold).match(/Gulab Jamun/g)).toHaveLength(2);
-    // …and the totals say so on their own.
-    expect(out).toMatch(/Total Qty {2,}2/);
-    expect(out).toMatch(/Hold Qty {2,}1/);
+    // …and the totals say so on their own. (\s+ rather than a counted run of
+    // spaces: the reference docket sets these in proportional type, where the
+    // gap is dots and not columns. What is asserted is what was always meant —
+    // the figure stands apart from its label, in the quantity column.)
+    expect(out).toMatch(/Total Qty\s+2/);
+    expect(out).toMatch(/Hold Qty\s+1/);
   });
 
   test("a wholly held line never appears in the cook-now list", async () => {
@@ -416,8 +515,8 @@ describe("dispatchKot — what the kitchen actually gets", () => {
     expect(dish).toBeGreaterThan(-1);
     expect(hold).toBeGreaterThan(dish);
     expect(out.slice(dish, hold)).not.toMatch(/Paneer Tikka/);
-    expect(out).toMatch(/Total Qty {2,}2/);
-    expect(out).toMatch(/Hold Qty {2,}3/);
+    expect(out).toMatch(/Total Qty\s+2/);
+    expect(out).toMatch(/Hold Qty\s+3/);
   });
 
   test("holding a course does NOT mint a new KOT number", async () => {
@@ -446,7 +545,7 @@ describe("dispatchKot — what the kitchen actually gets", () => {
     await kp.dispatchKot(dispatch());
     const out = paper(enqueued[0]!.esc_base64);
     expect(out).not.toMatch(/hold/i);
-    expect(out).toMatch(/Total Qty {2,}3/); // 2 Paneer + 1 Papad
+    expect(out).toMatch(/Total Qty\s+3/); // 2 Paneer + 1 Papad
   });
 
   test("every docket of one press is grouped under the caller's bill id", async () => {

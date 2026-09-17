@@ -156,7 +156,7 @@ mw08 USE     *                                                      | <inline(re
 0134 POST    /restaurant/branding                                   | validate                                       | 4c39a341
 0135 GET     /restaurant/timezones                                  | validate                                       | 0e348d83
 0136 GET     /restaurant/settings                                   | validate                                       | 6b4af499
-0137 POST    /restaurant/settings                                   | validate                                       | dcc68707
+0137 POST    /restaurant/settings                                   | validate                                       | 9b58ff4e
 0138 GET     /messages                                              | validate                                       | 3e965d1e
 0139 POST    /messages/run-reminders                                | validate                                       | 5e6cd93a
 0140 GET     /notifications                                         | validate                                       | be9fe12c
@@ -282,7 +282,7 @@ mw08 USE     *                                                      | <inline(re
 0260 GET     /print/routes                                          | validateAction(PERM_PRINT)                     | 0c3ddeb9
 0261 PUT     /print/routes                                          | validate                                       | 84702b2b
 0262 GET     /print/health                                          | validateAction(PERM_PRINT)                     | 7f4f25f2
-0263 POST    /print/test                                            | validateAction(PERM_PRINT)                     | 4e640c11
+0263 POST    /print/test                                            | validateAction(PERM_PRINT)                     | 287d384f
 0264 GET     /discount-requests                                     | validate                                       | 9f7efb7f
 0265 POST    /discount-requests/:id/approve                         | validate                                       | bb523518
 0266 POST    /discount-requests/:id/reject                          | validate                                       | 37cdeb6e
