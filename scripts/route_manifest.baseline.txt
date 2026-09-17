@@ -1,6 +1,6 @@
 # route-manifest v1
 # entry: index.ts
-# routes: 399
+# routes: 407
 # middleware: 10
 #
 # Ordered EXACTLY as Express registers them. Express matches in registration
@@ -242,11 +242,11 @@ mw08 USE     *                                                      | <inline(re
 0220 GET     /reports/gst.csv                                       | validateAction(ACCOUNTING_PERM)                | 5e240f04
 0221 GET     /reports/tally.xml                                     | validateAction(ACCOUNTING_PERM)                | 53e8a4ad
 0222 GET     /expenses.csv                                          | validateAction(ACCOUNTING_PERM)                | 79e2185c
-0223 GET     /reports/schedules                                     | validateAction(ACCOUNTING_PERM)                | 91b0bbca
-0224 POST    /reports/schedules                                     | validateAction(ACCOUNTING_PERM)                | 03df93e6
-0225 PATCH   /reports/schedules/:id                                 | validateAction(ACCOUNTING_PERM)                | 1bea67ac
+0223 GET     /reports/schedules                                     | validateAction(ACCOUNTING_PERM)                | 7cc9fee1
+0224 POST    /reports/schedules                                     | validateAction(ACCOUNTING_PERM)                | 004e8dc2
+0225 PATCH   /reports/schedules/:id                                 | validateAction(ACCOUNTING_PERM)                | fdbe61fb
 0226 DELETE  /reports/schedules/:id                                 | validateAction(ACCOUNTING_PERM)                | b07ba3a6
-0227 POST    /reports/schedules/:id/run-now                         | validateAction(ACCOUNTING_PERM)                | 9bff3910
+0227 POST    /reports/schedules/:id/run-now                         | validateAction(ACCOUNTING_PERM)                | 8e4c4f1c
 0228 GET     /reports/deliveries                                    | validateAction(ACCOUNTING_PERM)                | 620019d8
 0229 GET     /reports/deliveries/:id/download                       | validateAction(ACCOUNTING_PERM)                | b01ef223
 0230 GET     /analytics/operations                                  | validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56") | 7d80f0b5
@@ -395,29 +395,37 @@ mw08 USE     *                                                      | <inline(re
 0373 PUT     /reports/mis/time-slots                                | validateAction(PERM_SETTINGS)                  | a18d6453
 0374 GET     /reports/mis/bill/:id                                  | validateAction(ACCOUNTING_PERM)                | bcb654ef
 0375 GET     /reports/mis/kot/:id                                   | validateAction(ACCOUNTING_PERM)                | e4bccbfc
-0376 POST    /orders/:id/items/:itemId/non-chargeable               | validateAction(PERM_NON_CHARGEABLE) -> validateBody(sMarkNonChargeable) | aeba7b3d
-0377 POST    /non-chargeables/:id/reverse                           | validateAction(PERM_NON_CHARGEABLE) -> validateBody(sReverse) | 6d25bcb2
-0378 GET     /orders/:id/non-chargeables                            | validateAction(PERM_NON_CHARGEABLE)            | cca11956
-0379 POST    /orders/:id/void                                       | validateAction(PERM_VOID_ORDER) -> validateBody(sVoidOrder) | ee42f764
-0380 POST    /bills/service-charge-waiver                           | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sWaiveServiceCharge) | b4045e33
-0381 POST    /bills/service-charge-waiver/:id/reverse               | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sReverse) | 38c3d7c2
-0382 POST    /bills/service-charge-waiver/print                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sRemoveServiceChargeAndPrint) | d9a80ac2
-0383 POST    /bills/order/:orderId/settle-nc                        | validateAction(PERM_NON_CHARGEABLE)            | 65e249fd
-0384 GET     /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 215c021d
-0385 POST    /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sBillTenders) | 64ca2a01
-0386 POST    /bills/tenders/:id/void                                | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sTenderVoid) | 2dec2c35
-0387 POST    /bills/counter                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sBillCounter) | 2ef00fce
-0388 GET     /billing-counters                                      | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 6437e2eb
-0389 POST    /billing-counters                                      | validateAction(PERM_SETTINGS) -> validateBody(sCounterUpsert) | 693763cc
-0390 GET     /tips                                                  | validateAction(ACCOUNTING_PERM)                | 12143b1e
-0391 GET     /menu-groups                                           | validateAction(PERM_VIEW_MENU)                 | 85815350
-0392 GET     /menu-group-assignments                                | validateAction(PERM_VIEW_MENU)                 | e214c939
-0393 POST    /menu-groups                                           | validateAction(PERM_EDIT_MENU)                 | 2c8f688c
-0394 PATCH   /menu-groups/:id                                       | validateAction(PERM_EDIT_MENU)                 | a66adfa0
-0395 POST    /menu-group-assignments                                | validateAction(PERM_EDIT_MENU)                 | 642886cc
-0396 GET     /menu-variations                                       | validateAction(PERM_VIEW_MENU)                 | b18edc78
-0397 POST    /menu-variations                                       | validateAction(PERM_EDIT_MENU)                 | 70736259
-0398 PATCH   /menu-variations/:id                                   | validateAction(PERM_EDIT_MENU)                 | 3aa4eeb8
-0399 GET     /me/scorecard                                          | validate                                       | 86bed186
+0376 GET     /reports/email/config                                  | validateAction(ACCOUNTING_PERM)                | 5ccdebe8
+0377 GET     /reports/email/recipients                              | validateAction(ACCOUNTING_PERM)                | 0e06be56
+0378 POST    /reports/email/recipients                              | validateAction(PERM_SETTINGS)                  | d5eceb5e
+0379 DELETE  /reports/email/recipients/:id                          | validateAction(PERM_SETTINGS)                  | 1dd91805
+0380 POST    /reports/email/test                                    | validateAction(PERM_SETTINGS)                  | 05a6f347
+0381 POST    /reports/email/send                                    | validateAction(ACCOUNTING_PERM)                | a48b9836
+0382 GET     /reports/deliveries/:id                                | validateAction(ACCOUNTING_PERM)                | 0b55ec35
+0383 GET     /reports/deliveries/:id/files/:fileId                  | validateAction(ACCOUNTING_PERM)                | b6264c73
+0384 POST    /orders/:id/items/:itemId/non-chargeable               | validateAction(PERM_NON_CHARGEABLE) -> validateBody(sMarkNonChargeable) | aeba7b3d
+0385 POST    /non-chargeables/:id/reverse                           | validateAction(PERM_NON_CHARGEABLE) -> validateBody(sReverse) | 6d25bcb2
+0386 GET     /orders/:id/non-chargeables                            | validateAction(PERM_NON_CHARGEABLE)            | cca11956
+0387 POST    /orders/:id/void                                       | validateAction(PERM_VOID_ORDER) -> validateBody(sVoidOrder) | ee42f764
+0388 POST    /bills/service-charge-waiver                           | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sWaiveServiceCharge) | b4045e33
+0389 POST    /bills/service-charge-waiver/:id/reverse               | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sReverse) | 38c3d7c2
+0390 POST    /bills/service-charge-waiver/print                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sRemoveServiceChargeAndPrint) | d9a80ac2
+0391 POST    /bills/order/:orderId/settle-nc                        | validateAction(PERM_NON_CHARGEABLE)            | 65e249fd
+0392 GET     /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 215c021d
+0393 POST    /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sBillTenders) | 64ca2a01
+0394 POST    /bills/tenders/:id/void                                | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sTenderVoid) | 2dec2c35
+0395 POST    /bills/counter                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sBillCounter) | 2ef00fce
+0396 GET     /billing-counters                                      | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 6437e2eb
+0397 POST    /billing-counters                                      | validateAction(PERM_SETTINGS) -> validateBody(sCounterUpsert) | 693763cc
+0398 GET     /tips                                                  | validateAction(ACCOUNTING_PERM)                | 12143b1e
+0399 GET     /menu-groups                                           | validateAction(PERM_VIEW_MENU)                 | 85815350
+0400 GET     /menu-group-assignments                                | validateAction(PERM_VIEW_MENU)                 | e214c939
+0401 POST    /menu-groups                                           | validateAction(PERM_EDIT_MENU)                 | 2c8f688c
+0402 PATCH   /menu-groups/:id                                       | validateAction(PERM_EDIT_MENU)                 | a66adfa0
+0403 POST    /menu-group-assignments                                | validateAction(PERM_EDIT_MENU)                 | 642886cc
+0404 GET     /menu-variations                                       | validateAction(PERM_VIEW_MENU)                 | b18edc78
+0405 POST    /menu-variations                                       | validateAction(PERM_EDIT_MENU)                 | 70736259
+0406 PATCH   /menu-variations/:id                                   | validateAction(PERM_EDIT_MENU)                 | 3aa4eeb8
+0407 GET     /me/scorecard                                          | validate                                       | 86bed186
 mw09 USE     *                                                      | <inline(err,req,res,next)>                     | 1687165a
 mw10 USE     *                                                      | <inline(err,req,res,_next)>                    | 3e5181dc

@@ -59,6 +59,10 @@ beforeAll(async () => {
   // value is never dialled.
   process.env.SUPABASE_DIRECT_URL =
     process.env.SUPABASE_DIRECT_URL || "postgres://fixture:fixture@localhost:5432/fixture";
+  // The sweep runs only where it is armed AND permitted: production, or a
+  // database the operator has said is local. This suite is the latter.
+  process.env.REPORT_SCHEDULER = "true";
+  process.env.REPORT_SCHEDULER_ALLOW_NON_PROD = "true";
   mod = await import("../report_schedules");
 });
 

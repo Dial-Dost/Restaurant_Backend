@@ -516,6 +516,32 @@ export function callerHasPermission(req: Request, actionId: string): boolean {
 	return actions.includes(actionId) || actions.includes("*");
 }
 
+// May this caller ask for the ALL-OUTLETS aggregate? The same roles the
+// X-Outlet-Id "all" sentinel is honoured for (rawRequestedOutletId): admin and
+// manager. Used where a WRITE stores that scope (a report schedule, a Send
+// now) — the sentinel itself is refused on writes, so the scope travels in the
+// body and is authorised here instead.
+export function callerMayUseAllOutlets(req: Request): boolean {
+	const auth = req.auth;
+	if (!auth) {return false;}
+	return [auth.role, ...(auth.role_all ?? [])].map((r) => String(r).toLowerCase()).some((r) => r === "admin" || r === "manager");
+}
+
+// A per-TENANT (or per-employee) limit on the shared session store, for a
+// route whose abuse is not an IP's: report email sends, test emails, address
+// book edits. Fails OPEN on a store error, like rateLimit — the durable limits
+// counted from the database still hold.
+export async function tenantRateLimited(key: string, maxPerWindow: number, windowSeconds: number): Promise<boolean> {
+	try {
+		const store = await getStore();
+		const count = await store.incr(`rl:${key}`, Math.max(1, Math.round(windowSeconds)));
+		return count > maxPerWindow;
+	} catch (err) {
+		logger.warn({ err: (err as any)?.message ?? err }, "tenant_rate_limit_store_error (failing open)");
+		return false;
+	}
+}
+
 // Non-responding admin check (for guards that decide their own error).
 export function callerIsAdmin(req: Request): boolean {
 	const auth = req.auth;
