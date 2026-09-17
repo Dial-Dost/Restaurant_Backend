@@ -155,3 +155,31 @@ describe("the test slip is as wide as the restaurant's roll", () => {
     expect(new Set(rules)).toEqual(new Set([32]));
   });
 });
+
+// A SLIP NOBODY PRINTED IS REPLAYED FOR A FEW MINUTES ONLY, and the button says
+// so. Replay recognises a test slip by its bill_id (print_jobs.ts testSlipRole),
+// so the route must write exactly that shape for every role it can press — and
+// it answers the window both Settings cards print under a broadcast slip.
+describe("the test slip is recognisable on replay, and the reply names the window", () => {
+  test.each(["kot", "bill", "kot:BAR", "kot:tandoor 2"])("a %s slip reads back as that role", async (role) => {
+    const { testSlipRole } = await import("../print_jobs");
+    const r = await pressTest({ role });
+    expect(r.status).toBe(200);
+    expect(mockJobs).toHaveLength(1);
+    const canonical = role.startsWith("kot:") ? `kot:${role.slice(4).toUpperCase()}` : role;
+    expect(testSlipRole(mockJobs[0]!)).toBe(canonical);
+    expect(mockJobs[0]!.bill_id).toMatch(/^print-test-\d{13}-/);
+  });
+
+  test("replayMinutes is the replay window, alongside the results", async () => {
+    const r = await pressTest({ role: "kot" });
+    expect(r.body).toMatchObject({ skipped: 0, replayMinutes: 5 });
+    expect(r.body.results).toHaveLength(1);
+    process.env.PRINT_JOB_TEST_REPLAY_MIN = "3";
+    try {
+      expect((await pressTest({ role: "kot" })).body.replayMinutes).toBe(3);
+    } finally {
+      delete process.env.PRINT_JOB_TEST_REPLAY_MIN;
+    }
+  });
+});

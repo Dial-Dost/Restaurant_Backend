@@ -53,8 +53,9 @@ const rows = (opts: Partial<ReceiptOptions> = {}, profile = P80): KotRow[] =>
 
 /**
  * One row as a single readable string: alignment, weight and size for a whole
- * line; column and weight per cell for an item row. A `*` marks bold and a `!`
- * a banner, so "is the dish name bold" and "is CANCELLED the big type" are
+ * line; column, weight and size per cell for an item row. A `*` marks bold, a
+ * `!` a banner and a `~` the smaller slanted note type, so "is the dish name
+ * bold", "is CANCELLED the big type" and "is the note set as a note" are
  * visible in the expected value rather than hidden behind a matcher.
  */
 function shape(row: KotRow): string {
@@ -62,7 +63,7 @@ function shape(row: KotRow): string {
   if (row.k === "line") {
     return `${row.align === "center" ? "C" : "L"}${row.bold ? "*" : " "}${row.size === "banner" ? "!" : " "} ${row.text}`;
   }
-  return row.cells.map((c) => `${c.at}${c.bold ? "*" : ""}=${c.text}`).join("  ");
+  return row.cells.map((c) => `${c.at}${c.bold ? "*" : ""}${c.size === "note" ? "~" : c.size === "banner" ? "!" : ""}=${c.text}`).join("  ");
 }
 const shapes = (r: KotRow[]) => r.map(shape);
 /** Just the words, for a "does the docket mention this at all" question. */
@@ -86,7 +87,7 @@ describe("layoutKot — the client's reference docket, line for line", () => {
     "num=1  name*=Subz Tehri  qty=1",
     "num=2  name*=Ghewar Berry Mousse  qty=1",
     "num=3  name*=Gaia Rose Cookies  qty=1",
-    "name=[Note] Hold Dessert",
+    "name~=[Note] Hold Dessert",
     "<RULE>",
     "num=Total Qty  qty=3",
     "<RULE>",
@@ -113,6 +114,11 @@ describe("layoutKot — the client's reference docket, line for line", () => {
 
   test("emphasis is WEIGHT, never size: the only non-body row on an ordinary docket is none", () => {
     expect(rows().filter((r) => r.k === "line" && r.size !== "body")).toEqual([]);
+  });
+
+  test("the one cell set smaller is the dish's note, as on the reference", () => {
+    const sized = rows().flatMap((r) => (r.k === "cols" ? r.cells : [])).filter((c) => c.size !== undefined);
+    expect(sized).toEqual([{ text: "[Note] Hold Dessert", at: "name", bold: false, size: "note" }]);
   });
 
   test("the model is pure — the same options lay out the same rows", () => {
@@ -233,10 +239,10 @@ describe("layoutKot — items", () => {
     expect(out).not.toContain("Grand");
   });
 
-  test("the item note hangs under its dish, indented to the name column and upright", () => {
+  test("the item note hangs under its dish, indented to the name column, in the note type", () => {
     const out = shapes(rows());
     const dish = out.indexOf("num=3  name*=Gaia Rose Cookies  qty=1");
-    expect(out[dish + 1]).toBe("name=[Note] Hold Dessert");
+    expect(out[dish + 1]).toBe("name~=[Note] Hold Dessert");
   });
 });
 
@@ -286,19 +292,21 @@ describe("layoutKot — a hold prints where a note does", () => {
     expect(out.slice(0, dish).join("\n")).not.toMatch(/hold/i);
   });
 
-  test("the [Hold] line is styled exactly like the [Note] line: same column, not bold", () => {
+  test("[Hold] sits where [Note] does, but stays upright body type: the note alone is set small and slanted", () => {
+    // Same column, neither bold. The reference sets its note a step smaller and
+    // slanted; a hold is an instruction the pass acts on and keeps body size.
     const out = heldRows({ items: [{ name: "Gulab Jamun", quantity: 3, price: 0, held: true, note: "fire with dessert" }] });
     const cells = out.flatMap((r) => (r.k === "cols" ? r.cells : [])).filter((c) => c.text.startsWith("["));
     expect(cells).toEqual([
       { text: KOT_HOLD_LINE, at: "name", bold: false },
-      { text: "[Note] fire with dessert", at: "name", bold: false },
+      { text: "[Note] fire with dessert", at: "name", bold: false, size: "note" },
     ]);
   });
 
   test("an item with a hold AND a note prints both under the dish, hold first", () => {
     const out = shapes(heldRows({ items: [{ name: "Gulab Jamun", quantity: 3, price: 0, held: true, note: "fire with dessert" }] }));
     const dish = out.indexOf("num=1  name*=Gulab Jamun  qty=3");
-    expect(out.slice(dish + 1, dish + 3)).toEqual([`name=${KOT_HOLD_LINE}`, "name=[Note] fire with dessert"]);
+    expect(out.slice(dish + 1, dish + 3)).toEqual([`name=${KOT_HOLD_LINE}`, "name~=[Note] fire with dessert"]);
   });
 
   test("Total Qty counts only what the kitchen may cook, and the hold is totalled apart", () => {

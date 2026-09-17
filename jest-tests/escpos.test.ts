@@ -681,8 +681,9 @@ describe("buildReceiptBase64 — custom QR message", () => {
  *
  * So these suites are not legacy. They are the classic docket's own tests,
  * every assertion they always made, and the sha256 block at the foot of this
- * file pins its bytes UNCHANGED — that is what proves the new default took
- * nothing away from the restaurant that has to fall back to it.
+ * file pins its bytes — that is what proves the new default took nothing away
+ * from the restaurant that has to fall back to it. The one deliberate change
+ * since is item 5's: no line of it is stretched to double height any more.
  */
 describe("buildReceiptBase64 — KOT", () => {
   const kotBase: ReceiptOptions = {
@@ -730,8 +731,8 @@ describe("buildReceiptBase64 — KOT", () => {
       for (const m of raw.matchAll(/\x1b!([\s\S])([^\x1b\x1d]*)/g)) {
         if ((m[1]!.charCodeAt(0) & 0x30) === 0x30) { out.push(m[2]!.trim()); }
       }
-      // A quantity ("x2") is also double width AND height now that the item row
-      // it sits on is tall (item 3) — it is the row's type, not a heading.
+      // A quantity ("x2") is doubled too (2x2) — it is the row's type, not a
+      // heading.
       return out.filter(Boolean).filter((t) => !/^x\d+$/.test(t));
     };
 
@@ -798,9 +799,10 @@ describe("buildReceiptBase64 — KOT", () => {
     // makes it findable without reading the row. `x2` as plain text would
     // satisfy the regex above and none of the point of the change.
     const raw = decode(b64);
-    // 0x38 = bold bit + double height (the row is tall) + double width.
-    expect(raw).toContain("\x1bE\x01\x1b!\x38x2\x1b!\x10\x1bE\x00");
-    expect(raw).toContain("\x1bE\x01\x1b!\x38x3\x1b!\x10\x1bE\x00");
+    // 0x38 = bold bit + double width + double height: 2x2, the letter's own
+    // shape. The row around it is normal size (0x00).
+    expect(raw).toContain("\x1bE\x01\x1b!\x38x2\x1b!\x00\x1bE\x00");
+    expect(raw).toContain("\x1bE\x01\x1b!\x38x3\x1b!\x00\x1bE\x00");
   });
 
   test("a quantity too wide to double stays inside its column instead of eating the dish name", () => {
@@ -968,8 +970,10 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
       ...kot, items: [{ name: "Souffle", quantity: 1, price: 300, held: true, note: "no sugar" }],
     });
     const raw = decode(b64);
-    expect(raw).toContain("\x1b!\x10    [Hold]\n\x1b!\x00");
-    expect(raw).toContain("\x1b!\x10    [Note] no sugar\n\x1b!\x00");
+    // Both plain body lines, in one run of normal-size, un-bold text.
+    const run = runs(b64).find((r) => r.text.includes("[Hold]"))!;
+    expect(run).toMatchObject({ mode: 0, bold: false });
+    expect(run.text).toContain("\n    [Hold]\n    [Note] no sugar\n");
     expect(raw).not.toMatch(/\x1bE\x01[^\n]*\[Hold\]/);
   });
 
@@ -1084,12 +1088,14 @@ describe("buildReceiptBase64 — KOT, a hold prints where a note does", () => {
   });
 });
 
-// --- Type size (item 3) ----------------------------------------------------
-// "Dish names should come in bold on KOT, and the font of other items on the
-// KOT should also be increased slightly." ESC/POS has no fractional sizes and
-// this renderer already uses Font A, so the smallest step up is double HEIGHT
-// (ESC ! 0x10), which leaves every cell exactly as wide as before — the column
-// arithmetic, and so the qty column, cannot move.
+// --- Type size (items 3 and 5) ---------------------------------------------
+// Item 3: "Dish names should come in bold on KOT, and the font of other items on
+// the KOT should also be increased slightly." ESC/POS has no fractional sizes,
+// so that became double HEIGHT (ESC ! 0x10) on every body line.
+// Item 5, having printed it: "the font looks elongated and stretched vertically
+// ... reduce the font size as well." A 12x48 cell is a stretched letter. So the
+// classic docket is back at Font A's own 1x1, and the only enlarged size a KOT
+// may use is 2x2 — width and height together, the letter's own shape.
 describe("buildReceiptBase64 — KOT, type size", () => {
   const kot: ReceiptOptions = {
     ...baseBill,
@@ -1117,45 +1123,108 @@ describe("buildReceiptBase64 — KOT, type size", () => {
     return r!;
   };
 
+  /** Every `ESC ! n` value in a stream, in order. */
+  const sizeCommands = (b64: string): number[] =>
+    pieces(b64).flatMap((p) => (p.kind === "cmd" && p.op === "ESC !" ? [p.n] : []));
+
+  /**
+   * THE MODE SCAN. Every classic KOT a restaurant can print — ordinary, reprint,
+   * cancelled, with an order note, with holds and notes, a wrapped name, a big
+   * quantity, a long table name, per station, a table-move slip, both rolls.
+   */
+  const heavyItems: ReceiptOptions["items"] = [
+    { name: "Slow Cooked Lamb Shank Rogan Josh With Saffron Pulao", quantity: 12, price: 500, note: "extra gravy on the side please" },
+    { name: "Roti", quantity: 120, price: 10, held: true },
+    { name: "Paneer Tikka Butter Masala", quantity: 3, price: 250, variation: "Half", station: "Tandoor" },
+    { name: "Virgin Mojito", quantity: 2, price: 180, station: "BAR", held: true, note: "no sugar" },
+  ];
+  const fixtures: [string, ReceiptOptions][] = [
+    ["ordinary", kot],
+    ["heavy", { ...kot, items: heavyItems }],
+    ["reprint", { ...kot, items: heavyItems, reprint: true }],
+    ["cancelled", { ...kot, items: heavyItems, cancelled: true, orderContext: "*** REASON: GUEST LEFT ***" }],
+    ["table move", { ...kot, orderContext: "*** TABLE CHANGED - WAS 105 #2 ***", table: "15" }],
+    ["long table, unnumbered, empty", { ...kot, table: "Swiggy-88214-Delivery", kotNo: null, items: [] }],
+    ["station", { ...kot, station: "Tandoor" }],
+  ];
+  const everyClassicKot = (): [string, string][] => {
+    const out: [string, string][] = [];
+    for (const cols of [48, 32]) {
+      for (const [name, opts] of fixtures) {
+        out.push([`${name} @${cols}`, buildReceiptBase64(opts, cols)]);
+        for (const t of buildKotBase64(opts, cols)) { out.push([`${name} / ${t.station} @${cols}`, t.escBase64]); }
+      }
+    }
+    return out;
+  };
+
+  test("NO classic KOT size command stretches a letter: every ESC ! is 1x1 or 2x2", () => {
+    const allowed = new Set([0x00, 0x08, 0x30, 0x38]);
+    const seen = new Set<number>();
+    for (const [name, b64] of everyClassicKot()) {
+      const cmds = sizeCommands(b64);
+      for (const n of cmds) { seen.add(n); }
+      expect({ name, stretched: cmds.filter((n) => (n & 0x30) === 0x10 || (n & 0x30) === 0x20) }).toEqual({ name, stretched: [] });
+      expect({ name, other: cmds.filter((n) => !allowed.has(n)) }).toEqual({ name, other: [] });
+    }
+    // The scan saw every size it allows, so it is not passing on an empty set.
+    expect([...seen].sort((a, b) => a - b)).toEqual([0x00, 0x08, 0x38]);
+  });
+
+  test("…and the BILL keeps its tall bold Grand Total, which is the client's own bill", () => {
+    expect(sizeCommands(buildReceiptBase64({ ...baseBill, grandTotal: 88 }))).toContain(0x18);
+  });
+
   test("every dish name is wrapped in bold AND the size command, with the bold bit inside it", () => {
     const raw = decode(buildReceiptBase64(kot));
     for (const name of ["Subz Tehri", "Ghewar Berry Mousse", "Gaia Rose Cookies"]) {
-      // ESC E 1, ESC ! (tall|bold), name, ESC ! tall, ESC E 0.
-      expect(raw).toContain(`\x1bE\x01\x1b!\x18${name}\x1b!\x10\x1bE\x00`);
+      // ESC E 1, ESC ! bold, name, ESC ! normal, ESC E 0.
+      expect(raw).toContain(`\x1bE\x01\x1b!\x08${name}\x1b!\x00\x1bE\x00`);
     }
   });
 
-  test("the other KOT lines print one step larger (double height), not in body size", () => {
+  test("the other KOT lines print at the printer's normal size — never double height, never double width", () => {
     const b64 = buildReceiptBase64(kot);
     for (const needle of [
       "Running Table", "08/09/26 14:13", "Dine In: DOME SECTION", "Persons - 4",
       "Assign to: yado", "Captain: TIYASHA", "birthday table", "No. Item", "[Note] Hold Dessert", "Total Qty",
     ]) {
-      const r = runOf(b64, needle);
-      expect({ needle, tall: (r.mode & 0x10) === 0x10 }).toEqual({ needle, tall: true });
-      // Never double WIDTH — that would halve the columns.
-      expect({ needle, wide: (r.mode & 0x20) === 0x20 }).toEqual({ needle, wide: false });
+      expect({ needle, mode: runOf(b64, needle).mode }).toEqual({ needle, mode: 0 });
     }
-    // The line number rides the same tall row as its dish.
-    expect(runOf(b64, "1   ").mode & 0x10).toBe(0x10);
+    // The line number sits on a normal-size row too.
+    expect(runOf(b64, "1   ").mode).toBe(0);
+    // The restaurant name is bold at body size — no longer tall.
+    expect(runOf(b64, "Cafe Nicoise").mode).toBe(0x08);
   });
 
-  test("quantities stay bold and double width, and are now double height to match the row", () => {
+  test("quantities stay bold and doubled — width AND height together, 2x2", () => {
     const r = runOf(buildReceiptBase64(kot), "x1");
     expect(r.bold).toBe(true);
     expect(r.mode).toBe(0x38);
   });
 
+  test("the only enlarged runs are the ticket number, the table, the NOTE banner and the quantities", () => {
+    // Everything else is Font A at 1x1 now, so the docket is about half the
+    // length of the stretched one it replaces.
+    const b64 = buildReceiptBase64(kot);
+    const big = runs(b64).filter((r) => (r.mode & 0x30) === 0x30 && r.text.trim()).map((r) => r.text.trim());
+    expect(big).toEqual(["KOT - 21", "Table No: 33", "** NOTE **", "x1", "x1", "x1"]);
+  });
+
   test("rules stay at normal height — a doubled rule is just a thicker gap", () => {
-    const rules = runs(buildReceiptBase64(kot)).filter((x) => /^-{10,}\n$/.test(x.text));
+    // A rule shares its run with the body lines around it now (none of them
+    // carries a size command), so each dashed LINE is checked against the mode
+    // of the run it is printed in.
+    const rules = runs(buildReceiptBase64(kot))
+      .flatMap((r) => r.text.split("\n").filter((l) => /^-{10,}$/.test(l)).map(() => r.mode));
     expect(rules.length).toBeGreaterThan(2);
-    for (const r of rules) { expect(r.mode & 0x10).toBe(0); }
+    for (const mode of rules) { expect(mode & 0x10).toBe(0); }
   });
 
   test("the GUEST's bill does not change size", () => {
-    // Item 3 is a kitchen change: a bill's lines and its ladder stay body size.
-    // (The one tall line a bill has is its Grand Total, which is the client's
-    // own layout and is pinned in "the client's reference bill layout".)
+    // Items 3 and 5 are kitchen changes: a bill's lines and its ladder stay body
+    // size. (The one tall line a bill has is its Grand Total, which is the
+    // client's own layout and is pinned in "the client's reference bill layout".)
     const b64 = buildReceiptBase64(baseBill);
     for (const needle of ["Tea - Earl Grey", "Sub Total", "Total Qty", "Round off"]) {
       expect(runOf(b64, needle).mode).toBe(0);
@@ -1356,18 +1425,18 @@ describe("buildReceiptBase64 — KOT, bold dish names", () => {
 
   /**
    * Every substring the renderer emitted inside a bold run, in order, with the
-   * `ESC ! n` size commands inside the run removed — a dish name's run is now
-   * `ESC ! 0x18 name ESC ! 0x10` (item 3), and those are not printed text.
+   * `ESC ! n` size commands inside the run removed — a dish name's run is
+   * `ESC ! 0x08 name ESC ! 0x00`, and those are not printed text.
    */
   const boldRuns = (b64: string): string[] =>
     [...decode(b64).matchAll(/\x1bE\x01([\s\S]*?)\x1bE\x00/g)].map((m) => m[1]!.replace(/\x1b![\s\S]/g, ""));
 
   test("every dish name is emitted bold", () => {
     const raw = decode(buildReceiptBase64(kot));
-    // ESC E 1, then the size command WITH the bold bit (0x18 = tall + bold),
-    // because `ESC !` rewrites emphasis — see `big` in escpos.ts.
-    expect(raw).toContain("\x1bE\x01\x1b!\x18Paneer Tikka\x1b!\x10\x1bE\x00");
-    expect(raw).toContain("\x1bE\x01\x1b!\x18Naan\x1b!\x10\x1bE\x00");
+    // ESC E 1, then the size command WITH the bold bit (0x08), because `ESC !`
+    // rewrites emphasis — see `big` in escpos.ts.
+    expect(raw).toContain("\x1bE\x01\x1b!\x08Paneer Tikka\x1b!\x00\x1bE\x00");
+    expect(raw).toContain("\x1bE\x01\x1b!\x08Naan\x1b!\x00\x1bE\x00");
   });
 
   test("bold costs no cells, so the row keeps the exact layout it always had", () => {
@@ -1405,7 +1474,7 @@ describe("buildReceiptBase64 — KOT, bold dish names", () => {
     const raw = decode(buildReceiptBase64({
       ...kot, items: [{ name: "Gulab Jamun", quantity: 3, price: 90, held: true }],
     }));
-    expect(raw).toContain("\x1bE\x01\x1b!\x18Gulab Jamun\x1b!\x10\x1bE\x00");
+    expect(raw).toContain("\x1bE\x01\x1b!\x08Gulab Jamun\x1b!\x00\x1bE\x00");
   });
 
   test("the kitchen note stays in body text — a docket that shouts everything shouts nothing", () => {
@@ -1465,8 +1534,8 @@ describe("buildReceiptBase64 — reprints", () => {
       .filter((m) => (m[1]!.charCodeAt(0) & 0x30) === 0x30)
       .map((m) => m[2]!.trim())
       .filter(Boolean)
-      // Quantities ride a tall row at double width, i.e. the same bits; they are
-      // row type, not headings, and a reprinted dish name is the same case.
+      // Quantities are 2x2 too, i.e. the same bits; they are row type, not
+      // headings, and a reprinted dish name is the same case.
       .filter((t) => !/^x\d+$/.test(t) && t !== "Paneer Tikka");
 
   test("G3: a reprinted bill says so before anything else on the roll", () => {
@@ -1494,7 +1563,7 @@ describe("buildReceiptBase64 — reprints", () => {
 
   test("A7: a reprinted docket enlarges the dish name — the one thing not already big", () => {
     const b64 = buildReceiptBase64({ ...kot, reprint: true });
-    expect(decode(b64)).toContain("\x1bE\x01\x1b!\x38Paneer Tikka\x1b!\x10\x1bE\x00");
+    expect(decode(b64)).toContain("\x1bE\x01\x1b!\x38Paneer Tikka\x1b!\x00\x1bE\x00");
     // All three of A7's fields, large, on the same ticket.
     expect(widened(b64)).toEqual(expect.arrayContaining(["KOT - 26", "Table No: 12", "Paneer Tikka"]));
   });
@@ -2161,8 +2230,16 @@ describe("the client's reference bill layout", () => {
 // difference is that line (one ESC ! 0x10 envelope, the sentence gone); the
 // five with nothing held — the empty ticket, and the Tandoor and BAR station
 // dockets on both rolls — did not move and were not touched.
+//
+// RE-PINNED AGAIN for item 5, the client's "elongated and stretched
+// vertically": the classic docket lost its double height (every body line's
+// ESC ! 0x10 envelope, and 0x18 -> 0x08 on the restaurant name and dish
+// names). All fourteen fixtures were rendered by 2.0.1's escpos.ts and by this
+// one; with every ESC ! command removed the two streams are byte-identical, so
+// the words, their order, the columns and the bold runs did not move — only the
+// size commands did — and the before/after renders were compared by eye.
 // ---------------------------------------------------------------------------
-describe("buildReceiptBase64 — the CLASSIC docket is byte-identical to the one before the reference docket existed", () => {
+describe("buildReceiptBase64 — the CLASSIC docket's bytes are pinned", () => {
   const docket: ReceiptOptions = {
     ...baseBill,
     kind: "kot", kotPrintStyle: "classic",
@@ -2219,20 +2296,20 @@ describe("buildReceiptBase64 — the CLASSIC docket is byte-identical to the one
   };
 
   const GOLDEN: Record<string, string> = {
-    "the ordinary docket, 80mm": "1133:206366c3e5041d6f1c809ed66147054378fa57d45232625a35106a87817d630d",
-    "the ordinary docket, 58mm": "978:2f98f188b794814d14d6178a16a2a696d83d80dca28212462c75b0cbd5079106",
-    "a reprint with an order note, 80mm": "1324:3acef87ba9dc502a89d7bbf724b4877cfbd64c45c81c1946cf491efe2f02e11f",
-    "a reprint with an order note, 58mm": "1278:07a02242d5ae89f8e9c86d8342a5dad0f7e956dad81ff7819b685da706cc0a64",
-    "a cancellation slip for a takeaway table": "1097:6b7bfc3f0c851412969f55c511af04311be5c42815f10c7984551e495f21ac8c",
-    "an unnumbered, unassigned, empty ticket with a logo": "518:1255fb20bd25735d1d3d50b69d4cd87d3742a1836a414bf18ccf2e9f53fb15e4",
-    "a docket carrying every bill-only field": "1133:206366c3e5041d6f1c809ed66147054378fa57d45232625a35106a87817d630d",
-    "a docket carrying every bill-only field, 58mm": "1170:dfbc0a56db8ae8c5908dd2b0bf1caca6bddf9c542cf2f5cd7b478c26af04360f",
-    "per-station Tandoor, 48 columns": "710:5d0c567d42a6455ff9878d895ef2a767423c2ff45e5d8d68d521eed9cb5d9923",
-    "per-station BAR, 48 columns": "706:076170af2362911dd3c3dae8a6b9dbee47fa3386114ce670c93246b0bcb3a85d",
-    "per-station Sweets, 48 columns": "726:6e6bd83ec92c3e14701d6a61923fe2c64886ee9a4bd39a6677fd83a9537103f1",
-    "per-station Tandoor, 32 columns": "566:6f626540f1fafe62ba940907e45d6fca00bf3d2f171380c8a6333f3e8e3d5e0a",
-    "per-station BAR, 32 columns": "562:6d3413f4645b38dcc4334ea0ef3a5b60f1006494d77b848c206f12b877f5672e",
-    "per-station Sweets, 32 columns": "582:6a56037caa43054ef5972bc7dc5d4a5bc9bb08cca8e07be31966e9b525c4afbe",
+    "the ordinary docket, 80mm": "1025:2febe8cf1d4137c859f6a85911a41f13458c8d5a8fdf550ee69ad8bdcd9c7e98",
+    "the ordinary docket, 58mm": "858:b01657c417340048b2b02d4607178becbae9aa736c0f85333cd69afec5edea35",
+    "a reprint with an order note, 80mm": "1192:4a0ac80abd24f5702a5c6b52ada3d5158514290265238139be5a345046f780ba",
+    "a reprint with an order note, 58mm": "1104:d8a3f85ef678bf23987691cdc0544d7a34d6212dcdee7d2868e76d47c66f175c",
+    "a cancellation slip for a takeaway table": "971:80ed5683d49bcba096f8de612e9a5687764ff707eeeb0572f7068c34b8fd8938",
+    "an unnumbered, unassigned, empty ticket with a logo": "482:956a8b40dbaea81238c0bd22d20709c5f4acf1dd1e21b74be47f9a90fb76a01f",
+    "a docket carrying every bill-only field": "1025:2febe8cf1d4137c859f6a85911a41f13458c8d5a8fdf550ee69ad8bdcd9c7e98",
+    "a docket carrying every bill-only field, 58mm": "1008:26fe278916dc7214c26ea18519efe8221b17aedf14dd44ef892a0a080c3a2890",
+    "per-station Tandoor, 48 columns": "650:3dbf2cb5ffe8a187f87dafbdd4ef66946f1dd2b0a7d67fcd7dd3b9caaf8143af",
+    "per-station BAR, 48 columns": "646:fcdeb710e22fb1580b07a387f3c33bd45f3c4e597bca7ba54cf6c169e3fb56e4",
+    "per-station Sweets, 48 columns": "660:23c06fdbd19723763c620de375c6525f3c9dbcd6cb7b1afa7defbc14dab3e112",
+    "per-station Tandoor, 32 columns": "506:b6e64fa40975879a9070ade3244bc290f01cf0aaef3454f6e7fbf72a77a75212",
+    "per-station BAR, 32 columns": "502:8a4999d4bd60b8e07faa39a1034a7ea72be96c1c2b4717ea4b637fdfb7dc7280",
+    "per-station Sweets, 32 columns": "516:22f0bc4b36072529c45e80ae1479cb31f26704e433e755b6bd51f9a237964c2a",
   };
 
   const digest = (b64: string) => {

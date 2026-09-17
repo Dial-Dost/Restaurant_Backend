@@ -318,6 +318,29 @@ async function dispatch(q: string, params: unknown[], journal: (u: Undo) => void
     return [{ id: j.id }];
   }
 
+  // --- ExpireClaimedPrintJobs --- (before ExpirePrintJobs: same opening words)
+  if (/^update "PrintJobs" set status = 'expired'.* id = any\(\$2::uuid\[\]\)/i.test(q)) {
+    requireShape(q, "returning id", "resume logs how many test slips it actually settled");
+    const [resId, ids, agentId] = params as [string, string[], string];
+    const pred = statusPredicate(q);
+    // THE FENCE, applied only when the statement carries it — so dropping it is
+    // visible as a claim settling a row another till now holds.
+    const fenced = /claimed_by = \$3/i.test(q);
+    const hit = store.jobs.filter((j) =>
+      j.res_id === resId &&
+      ids.includes(j.id) &&
+      statusAdmits(pred, j.status) &&
+      (!fenced || j.claimed_by === agentId));
+    for (const j of hit) {
+      const before = { ...j };
+      journal(() => { Object.assign(j, before); });
+      j.status = "expired";
+      j.settled_at = now();
+      if (/claimed_until = null/i.test(q)) { j.claimed_until = null; }
+    }
+    return hit.map((j) => ({ id: j.id }));
+  }
+
   // --- ExpirePrintJobs ---
   if (/^update "PrintJobs" set status = 'expired'/i.test(q)) {
     const [resId] = params as [string];

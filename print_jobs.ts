@@ -54,6 +54,7 @@ import {
   AckPrintJobRouted,
   ClaimPrintJobsForAgent,
   EnqueuePrintJob,
+  ExpireClaimedPrintJobs,
   ExpirePrintJobs,
   GetPrintJobAssignment,
   ListRestaurantIds,
@@ -145,6 +146,106 @@ export function ttlCutoffs(now: Date = new Date()): { kot: Date; bill: Date } {
     kot: new Date(now.getTime() - KOT_TTL_MIN() * MIN),
     bill: new Date(now.getTime() - BILL_TTL_MIN() * MIN),
   };
+}
+
+// --- test slips --------------------------------------------------------------
+
+/**
+ * POST /print/test's slips ride the same queue as a real docket, and that is
+ * deliberate: the answer the button gives is only worth having if the slip took
+ * the route a real ticket takes. But the queue's REPLAY is not something a test
+ * slip should inherit whole.
+ *
+ * A slip nobody printed — the kitchen PC was off, so it broadcast and no device
+ * took it — used to sit as an ordinary 'kot' job for the KOT TTL (thirty
+ * minutes), or as a 'bill' job for TWELVE HOURS, and print on whichever till
+ * joined the outlet next. Three presses at a dead printer became three "PRINTER
+ * TEST" dockets in the middle of service, rendered in whatever style and size
+ * the restaurant had at press time — which, after an owner has followed the
+ * advice to switch to the classic docket, is the one it just switched away from.
+ * A test slip that prints ten minutes later tests nothing, and a pile of them is
+ * noise on the pass.
+ *
+ * SO REPLAY HANDS A TILL AT MOST ONE TEST SLIP PER ROLE, AND ONLY A FRESH ONE:
+ *   * older than PRINT_JOB_TEST_REPLAY_MIN (five minutes — the time somebody
+ *     stands at a printer after pressing the button, and past the two-minute
+ *     lease, so a directed slip whose device flapped still gets its reconnect
+ *     door) — not handed over, and settled 'expired';
+ *   * of several fresh ones for the same role, only the newest — the rest
+ *     settled 'expired' the same way.
+ * The owner is told this window: POST /print/test answers `replayMinutes`, and
+ * both Settings cards say it under a slip that broadcast.
+ *
+ * THIS IS DONE AFTER THE CLAIM, IN TYPESCRIPT, AND NOT IN ITS SQL. The claim's
+ * statement is pinned (its latch-false text is what 027 shipped) and is the
+ * double-print guard for every receipt in the estate; a test-slip clause in it
+ * would put the rarest job on the hottest path. Here the extra statement runs
+ * only when a claim actually picked up a stale test slip.
+ *
+ * WHAT MAKES A ROW A TEST SLIP is its bill_id, which only testSlipBillId below
+ * writes — AND a role in it that agrees with the row's own kind and station.
+ * bill_id is free text (a real bill's fallback is `<table>-<epoch>`), so the
+ * prefix alone would let a table somebody named "print-test-…" lose its bill;
+ * with the agreement check a real job would need a station literally named after
+ * the epoch it was printed at.
+ */
+export const TEST_SLIP_REPLAY_MIN = (): number =>
+  Math.max(1, Math.round(envInt("PRINT_JOB_TEST_REPLAY_MIN", 5)));
+
+const TEST_SLIP_ID = /^print-test-(\d{13})-(.+)$/;
+
+/** A role as it appears inside a test slip's bill_id. */
+const testSlipRoleKey = (role: string): string => role.replace(/[^a-z0-9:]+/gi, "-");
+
+/**
+ * The bill_id of one test slip. Stamped with the clock so two presses are two
+ * rows — a test slip is deliberately not deduplicated at press time; replay is
+ * where the extras are dropped (above). The one writer: routes/printing.ts.
+ */
+export function testSlipBillId(stamp: Date, role: string): string {
+  return `print-test-${String(stamp.getTime())}-${testSlipRoleKey(role)}`;
+}
+
+/**
+ * The role a job was pressed for, or null when the job is not a test slip.
+ * POST /print/test dispatches role "bill" as kind 'bill', "kot" as kind 'kot'
+ * with no station, and "kot:<STATION>" as kind 'kot' with that station — so the
+ * row's own kind and station must spell the role its bill_id names.
+ */
+export function testSlipRole(job: { bill_id: string; kind: string; station: string | null }): string | null {
+  const m = TEST_SLIP_ID.exec(job.bill_id);
+  if (!m) { return null; }
+  const role = job.kind === "kot" ? (job.station ? `kot:${job.station}` : "kot") : "bill";
+  return testSlipRoleKey(role) === m[2] ? role : null;
+}
+
+/**
+ * Of the rows one claim returned, the ids of the test slips NOT to hand over:
+ * every one older than the replay window, and every fresh one but the newest per
+ * role. `rows` is the claim's own order (created_at, then seq), so of two slips
+ * stamped in the same millisecond the later row is the newer. Real jobs are
+ * never in the set.
+ */
+export function testSlipsNotToReplay(
+  rows: readonly { id: string; bill_id: string; kind: string; station: string | null; created_at: Date | string }[],
+  now: Date = new Date(),
+): Set<string> {
+  const cutoff = now.getTime() - TEST_SLIP_REPLAY_MIN() * MIN;
+  const drop = new Set<string>();
+  const newest = new Map<string, { id: string; at: number }>();
+  for (const r of rows) {
+    const role = testSlipRole(r);
+    if (role === null) { continue; }
+    const at = new Date(r.created_at).getTime();
+    // `!(at > cutoff)` rather than `at <= cutoff`: an unreadable timestamp is
+    // not fresh.
+    if (!(at > cutoff)) { drop.add(r.id); continue; }
+    const kept = newest.get(role);
+    if (kept && kept.at > at) { drop.add(r.id); continue; }
+    if (kept) { drop.add(kept.id); }
+    newest.set(role, { id: r.id, at });
+  }
+  return drop;
 }
 
 // --- migration-not-applied tolerance ----------------------------------------
@@ -404,6 +505,28 @@ export async function resumePrintJobsForAgent(req: ResumeRequest): Promise<numbe
     if (isSchemaMissing(err)) { warnSchemaMissing("resume", err); return 0; }
     logger.error({ err, resId: req.resId, outletId: req.outletId }, "print_resume_failed");
     return 0;
+  }
+
+  // STALE AND SURPLUS TEST SLIPS ARE NOT HANDED OVER (see "test slips" above).
+  // Settled in their OWN transaction, after the claim committed: a failure here
+  // must not undo the claim and cost the till its real dockets. If it does fail,
+  // the rows are simply leased to this till and not delivered — the next claim
+  // after the lease drops them again, and the reaper collects them at the TTL.
+  const notReplayed = testSlipsNotToReplay(rows);
+  if (notReplayed.size > 0) {
+    rows = rows.filter((r) => !notReplayed.has(r.id));
+    try {
+      const settled = await withTenant(
+        { res_id: req.resId, outlet_id: req.outletId, employeeId: req.employeeId, role: req.role },
+        () => ExpireClaimedPrintJobs(req.resId, [...notReplayed], req.agentId),
+      );
+      logger.info(
+        { resId: req.resId, outletId: req.outletId, agentId: req.agentId, jobs: notReplayed.size, settled },
+        "print_test_slips_not_replayed",
+      );
+    } catch (err) {
+      logger.warn({ err, resId: req.resId, outletId: req.outletId }, "print_test_slip_settle_failed");
+    }
   }
 
   for (const row of rows) {

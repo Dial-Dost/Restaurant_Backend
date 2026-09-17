@@ -35910,6 +35910,33 @@ export async function ExpirePrintJobs(resId: string, cutoffs: { kot: Date; bill:
 }
 
 /**
+ * Settle, as 'expired', jobs that ONE CLAIM just took and decided not to hand
+ * over — POST /print/test slips too old, or superseded by a newer press, to be
+ * worth printing (print_jobs.ts, "test slips"). Returns how many it settled.
+ *
+ * FENCED ON THE CLAIM THAT TOOK THEM: `claimed_by` is the claiming socket's
+ * agentId and `status in ('delivered')` is what that claim wrote, so a row some
+ * other till has since acked, or re-claimed after this till's lease lapsed, is
+ * not touched. The ids come from that claim's own RETURNING, never from a
+ * client. claimed_until is cleared as an ack clears it: a settled row holds no
+ * lease.
+ */
+export async function ExpireClaimedPrintJobs(resId: string, jobIds: string[], agentId: string): Promise<number> {
+  if (jobIds.length === 0) { return 0; }
+  const rows = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set status = 'expired', settled_at = now(), claimed_until = null
+      where res_id = $1
+        and id = any($2::uuid[])
+        and claimed_by = $3
+        and status in ('delivered')
+      returning id`,
+    [resId, jobIds, agentId],
+  );
+  return rows.length;
+}
+
+/**
  * Reaper, half two: delete settled rows past the retention window.
  *
  * Keyed on settled_at, NEVER on created_at. A job that sat pending for a

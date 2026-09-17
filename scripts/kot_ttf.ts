@@ -16,9 +16,10 @@
  * floating point is IEEE-754 +-*\/ and Math.floor/ceil/round, all of which are
  * exactly specified, so the same .ttf produces the same bitmap everywhere.
  *
- * Scope is deliberately the minimum Liberation Sans needs for ASCII 32..126:
- * `glyf`/`loca`/`hmtx`/`cmap` format 4, simple and composite glyphs. It is not a
- * general font library and should not grow into one.
+ * Scope is deliberately the minimum the docket's face (DejaVu Sans Condensed,
+ * and before it Liberation Sans) needs for ASCII 32..126: `glyf`/`loca`/`hmtx`/
+ * `cmap` format 4, simple and composite glyphs. It is not a general font
+ * library and should not grow into one.
  */
 import { readFileSync } from "node:fs";
 
@@ -202,8 +203,9 @@ export function parseTtf(path: string): ParsedFont {
       return out;
     }
     // Composite: a list of transformed component glyphs (é = e + acute). Point
-    // matching (ARGS_ARE_XY_VALUES clear) is not implemented — no Latin glyph
-    // in Liberation Sans uses it, and a silent wrong offset is worse than none.
+    // matching (ARGS_ARE_XY_VALUES clear) is not implemented — no ASCII glyph
+    // in either face this has read uses it, and a silent wrong offset is worse
+    // than none.
     const out: ContourPoint[][] = [];
     for (;;) {
       const flags = g.u16();
@@ -228,6 +230,28 @@ export function parseTtf(path: string): ParsedFont {
   }
 
   return { unitsPerEm, numGlyphs, adv, cmap, glyphContours };
+}
+
+/**
+ * The same font, SLANTED: every outline point moves right by `shear` times its
+ * height above the baseline (x' = x + shear * y), before anything is scaled.
+ *
+ * THIS IS HOW THE REFERENCE DOCKET'S "[Note]" LINE WAS SET. The client's
+ * photographed ticket prints its note in a smaller oblique — Tahoma has no
+ * italic, so the POS that printed it slanted the upright letters — and a
+ * sheared copy of the docket's own regular face reproduces exactly that, with
+ * no second font file to license, commit or keep in step. The advance widths
+ * are the upright ones on purpose: slanting a letter does not move the next.
+ *
+ * Pure arithmetic on the parsed points (IEEE-754 * and +), so the bitmaps are
+ * as deterministic as the upright ones.
+ */
+export function obliqueFont(font: ParsedFont, shear: number): ParsedFont {
+  return {
+    ...font,
+    glyphContours: (gid: number) =>
+      font.glyphContours(gid).map((c) => c.map((p) => ({ x: p.x + shear * p.y, y: p.y, on: p.on }))),
+  };
 }
 
 /** Quadratic subdivision steps. FIXED, never adaptive — adaptive is where two
