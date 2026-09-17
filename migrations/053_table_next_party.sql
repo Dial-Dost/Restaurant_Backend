@@ -72,6 +72,19 @@
 --
 -- Idempotent: safe to run twice, and safe after the runtime has run it.
 
+-- LOCK TIMEOUT, FIRST. An ALTER TABLE that adds a column "if not exists"
+-- takes ACCESS EXCLUSIVE on "Tables" BEFORE it looks, so it locks even when
+-- the runtime has already made every column here (and CREATE UNIQUE INDEX IF
+-- NOT EXISTS below takes SHARE before it looks, too). This file is applied by
+-- hand, possibly during service, and "Tables" is the most-polled table in the
+-- product — every floor read goes through it;
+-- one idle-in-transaction session would otherwise queue every one of those
+-- reads behind this ALTER (the 2026-08-24 standstill's shape). Five seconds,
+-- then it fails whole and can be re-run off-peak. LOCAL, because
+-- scripts/migrate.ts runs each file in its own begin/commit — as 051 does.
+
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE "Tables" ADD COLUMN IF NOT EXISTS parent_table_id uuid;
 ALTER TABLE "Tables" ADD COLUMN IF NOT EXISTS party_seq smallint;
 

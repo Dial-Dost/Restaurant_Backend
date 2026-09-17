@@ -84,6 +84,14 @@ describe("migration 050", () => {
     expect(text).toMatch(/classic text docket ignores it/i);
   });
 
+  test("waits at most 5s for its locks on \"Restaurant\" — the first thing it does", () => {
+    // Applied by hand, possibly during service, and every request's context
+    // read joins "Restaurant": the ALTER must refuse fast rather than queue them.
+    const code = read("migrations/050_kot_print_style.sql")
+      .split(/\r?\n/).filter((l) => !l.trim().startsWith("--")).join("\n").trim();
+    expect(code.startsWith("SET LOCAL lock_timeout = '5s';")).toBe(true);
+  });
+
   test("touches nothing but those two columns and their comments", () => {
     // Additive and nothing else: no backfill, no rewrite of any tenant's row.
     // Split on semicolons OUTSIDE string literals — both comments contain one.
@@ -98,7 +106,9 @@ describe("migration 050", () => {
       current += ch;
     }
     if (current.trim()) { statements.push(current.trim().toLowerCase()); }
-    expect(statements).toHaveLength(4);
+    // The lock timeout, the two columns and their two comments.
+    expect(statements).toHaveLength(5);
+    expect(statements[0]).toBe("set local lock_timeout = '5s'");
     expect(statements.filter((s) => s.startsWith("alter table"))).toHaveLength(2);
     expect(statements.filter((s) => s.startsWith("comment on column"))).toHaveLength(2);
   });

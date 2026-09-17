@@ -63,9 +63,11 @@
 --
 -- ORDER OF ROLLOUT
 -- ----------------
--- IDEMPOTENT, and mirrored by ensureBrandingColumns() in database_supabase.ts,
--- which issues the same two statements at runtime, in this order (the idiom 040
--- documents, outside any transaction and never inside a settle). The PRINT path
+-- IDEMPOTENT, and mirrored in database_supabase.ts, which issues the same two
+-- statements at runtime, in this order (the idiom 040 documents): once at boot,
+-- before the listener and under a 2s lock timeout, when either column is
+-- missing (InitKotDocketSchema), and lazily by ensureBrandingColumns(), which
+-- never runs inside a transaction. The PRINT path
 -- does not depend on this file at all: it reads each column through its own
 -- statement and a missing column (42703) reads as that column's default, warned
 -- once per process. So the backend can ship first; on a runtime that connects as
@@ -73,6 +75,18 @@
 -- file only records them in schema_migrations. A runtime repointed to
 -- app_runtime (no DDL) needs this applied before anyone can SAVE either setting
 -- — reading them works either way.
+
+-- LOCK TIMEOUT, FIRST. An ALTER TABLE that adds a column "if not exists"
+-- takes ACCESS EXCLUSIVE on "Restaurant" BEFORE it looks, so it locks even
+-- when the runtime has already made both columns. This file is applied by
+-- hand, possibly during service, and every request's restaurant-context read
+-- joins "Restaurant";
+-- one idle-in-transaction session would otherwise queue every one of those
+-- reads behind this ALTER (the 2026-08-24 standstill's shape). Five seconds,
+-- then it fails whole and can be re-run off-peak. LOCAL, because
+-- scripts/migrate.ts runs each file in its own begin/commit — as 051 does.
+
+SET LOCAL lock_timeout = '5s';
 
 alter table "Restaurant" add column if not exists kot_print_style text;
 

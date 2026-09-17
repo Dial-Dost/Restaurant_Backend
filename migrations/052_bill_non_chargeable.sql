@@ -49,6 +49,19 @@
 -- Additive only. Existing rows become scope 'item' through the column default,
 -- which is a metadata-only change on Postgres 11+ (no table rewrite).
 
+-- LOCK TIMEOUT, FIRST. An ALTER TABLE that adds a column "if not exists"
+-- takes ACCESS EXCLUSIVE on "OrderItemNonChargeable" BEFORE it looks, so it
+-- locks even when the runtime has already made every column here (and CREATE
+-- INDEX IF NOT EXISTS below takes SHARE before it looks, too). This file is
+-- applied by hand, possibly during service, and every open bill, comp and NC
+-- report reads that table;
+-- one idle-in-transaction session would otherwise queue every one of those
+-- reads behind this ALTER (the 2026-08-24 standstill's shape). Five seconds,
+-- then it fails whole and can be re-run off-peak. LOCAL, because
+-- scripts/migrate.ts runs each file in its own begin/commit — as 051 does.
+
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE "OrderItemNonChargeable"
   ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'item',
   ADD COLUMN IF NOT EXISTS bill_id uuid,
