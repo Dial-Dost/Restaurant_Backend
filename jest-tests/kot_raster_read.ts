@@ -263,6 +263,10 @@ export function readKotRaster(escBase64: string, widthDots: number, ppems: reado
   return lines;
 }
 
+/** The atlas key a face was baked under — "27b", "23o" — for assertions about which type a draw used. */
+export const kotFaceKey = (face: KotFace): string =>
+  `${face.ppem}${face.slant ? "o" : face.weight >= 700 ? "b" : "r"}`;
+
 /** Roll width in dots for a docket built at `cols` columns (48 = 80mm, 32 = 58mm). */
 export const rollDots = (cols: number): number => cols * 12;
 /**

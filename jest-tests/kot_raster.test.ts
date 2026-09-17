@@ -25,7 +25,6 @@ import {
   buildReceiptBase64,
   encodeKotRaster,
   kotAtlasFaces,
-  kotFaceKey,
   kotPrintStyleOf,
   kotProfile,
   kotTextSizeOf,
@@ -44,7 +43,7 @@ import { KOT_ATLAS } from "../kot_glyph_atlas";
 import { BILL_LOGO_MAX_HEIGHT } from "../bill_logo";
 import { KOT_ATLAS_FACES, KOT_FONT_FILES, KOT_NOTE_SHEAR, atlasToModule, buildKotGlyphAtlas } from "../scripts/kot_atlas_build";
 import { KOT_TEXT_SIZES } from "../kot_print_style";
-import { kotPaper, readKotRaster, rollPpems } from "./kot_raster_read";
+import { kotFaceKey, kotPaper, readKotRaster, rollPpems } from "./kot_raster_read";
 
 const REPO = join(__dirname, "..");
 

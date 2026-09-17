@@ -752,11 +752,6 @@ export function kotAtlasFaces(): string[] {
   return [...keys].sort((a, b) => parseInt(a, 10) - parseInt(b, 10) || order(a) - order(b));
 }
 
-/** The atlas key a face was baked under — "27b", "23o". */
-export function kotFaceKey(face: KotFace): string {
-  return `${face.ppem}${face.slant ? "o" : face.weight >= 700 ? "b" : "r"}`;
-}
-
 /**
  * Body text, a banner, or a note. There is no fourth size on a docket.
  *
