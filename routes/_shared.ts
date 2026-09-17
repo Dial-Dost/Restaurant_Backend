@@ -533,9 +533,10 @@ export function sessionCapabilities(input: RoleScopeInput): SessionCapabilities 
 /**
  * CLIENT ITEM 3 — ANSWER A REFUSED CANCEL. Every door that can cancel a
  * ticketed order (PATCH /orders/:id/status, POST /orders, POST
- * /orders/:id/void, DELETE /orders/:id/items/:itemId) turns the data layer's
- * CancelNeedsSeniorError into the same 403 through here, so a client cannot
- * tell which route refused it and a change to the words lands on all four.
+ * /orders/:id/void, DELETE /orders/:id/items/:itemId, DELETE /orders/:id)
+ * turns the data layer's CancelNeedsSeniorError into the same 403 through
+ * here, so a client cannot tell which route refused it and a change to the
+ * words lands on all five.
  * PATCH /orders/:id/status also answers a waiter's move of a ticket BACK to
  * Pending this way (act "rewind"): that move was the first half of a cancel.
  *
@@ -1580,9 +1581,21 @@ export async function refuseOrderOnPrintedBill(
  * was a senior role adding as they always could. Nothing for any other write.
  * Never throws: the write has committed.
  */
-export async function noteAdditionToPrintedBill(req: Request, guard: PrintedBillGuard): Promise<void> {
+export async function noteAdditionToPrintedBill(
+	req: Request,
+	guard: PrintedBillGuard,
+	/**
+	 * Which door and which order, for the Bill Edit report. `door: "new_order"`
+	 * (POST /orders) is the one addition no other audit line classifies — the
+	 * item, merge and move doors each file their own — so classifyBillEdit keys
+	 * on it. Absent keys are simply not written.
+	 */
+	extra?: { orderId?: string | null; door?: string | null },
+): Promise<void> {
 	if (guard.refused || !guard.reprintNeeded || !guard.table) {return;}
 	const write = guard.write ?? "order";
+	const orderId = String(extra?.orderId ?? "").trim();
+	const door = String(extra?.door ?? "").trim();
 	try {
 		await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
 			printedBillAdditionAudit({ table: guard.table, printCount: guard.printCount ?? 0, write }),
@@ -1591,6 +1604,8 @@ export async function noteAdditionToPrintedBill(req: Request, guard: PrintedBill
 				table: guard.table, after_print: true, write, print_count: guard.printCount ?? 0,
 				confirmed: guard.confirmed === true,
 				waiter_only: isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions }),
+				...(orderId ? { order_id: orderId } : {}),
+				...(door ? { door } : {}),
 			});
 	} catch {/* a failed audit write must not turn a landed order into a 500 */}
 }

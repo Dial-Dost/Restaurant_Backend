@@ -99,6 +99,12 @@ jest.mock("pg", () => {
     if (/^select bill_id, kot_no from "PrintJobs"/i.test(q)) {
       return { rows: fx.printed.map((n) => ({ bill_id: `order-${ORDER}`, kot_no: n })) };
     }
+    // DeleteOrder (the delete door): the row goes, and the id comes back.
+    if (/^delete from "Orders" where id = \$1/i.test(q)) {
+      if (!fx.exists) { return { rows: [] }; }
+      fx.exists = false;
+      return { rows: [{ id: params[0] }] };
+    }
     return { rows: [] };
   };
   class FakePool {
@@ -197,6 +203,9 @@ beforeEach(() => {
 });
 
 const statusWrites = () => fx.sql.filter((s) => /^update "Orders" set status = \$1/i.test(s.q));
+const orderDeletes = () => fx.sql.filter((s) => /^delete from "Orders"/i.test(s.q));
+const DELETE_ORDERS = "8c3f5b21-0e74-4a96-b2d8-6f1a9c4e7b53";
+const WAITER_WITH_DELETE = who("waiter", ["waiter"], [...WAITER_ACTIONS, DELETE_ORDERS]);
 const orderInserts = () => fx.sql.filter((s) => /^insert into "Orders"/i.test(s.q));
 const auditLines = (): string[] => mockAudit.mock.calls.map((c) => String(c[4]));
 const SENTENCE_KOT3 = "KOT-3 has gone to the kitchen. Only a manager, cashier, captain or admin can cancel it — ask one of them.";
@@ -584,6 +593,80 @@ describe("POST /orders — the upsert side door", () => {
     expect(JSON.stringify(stored)).not.toContain("forged");
   });
 
+  // INTEGRATION REVIEW (money-floor) — the upsert rebuilt the payload and wiped
+  // the guest's GSTIN and (2.0.2) address: the running bill then printed
+  // neither, and the paper read stale over nothing a guest had changed.
+  const ACME = { customer: "Acme Pvt Ltd", customer_gstin: "29ABCDE1234F1Z5", customer_address: "Tower B\nMG Road" };
+  const storedFood = (): Record<string, unknown> => JSON.parse(String(orderInserts()[0]!.params[3])) as Record<string, unknown>;
+
+  test.each([
+    ["a Served resend", "Served", [{ id: "l1", name: "HARA DHANIYA PULAO", price: 629, quantity: 1 }]],
+    ["an edit resend (a line added)", "Preparing", [{ id: "l1", name: "HARA DHANIYA PULAO", price: 629, quantity: 1 }, { id: "l2", name: "RAITA", price: 120, quantity: 1 }]],
+  ])("%s keeps the guest's GSTIN and address, and a copy in the body is ignored", async (_label, status, items) => {
+    fx.foodExtra = { ...ACME };
+    const r = await h.call("POST", "/orders", {
+      body: {
+        id: ORDER, table: "11", status, items,
+        customer: ACME.customer, customer_gstin: "27FORGED0000Z1Z", customer_address: "forged",
+      },
+      auth: SENIORS[0][1] as never,
+    });
+    expect(r.status).toBe(201);
+    const stored = storedFood();
+    expect(stored).toMatchObject(ACME);
+    expect(JSON.stringify(stored)).not.toContain("FORGED");
+    expect(JSON.stringify(stored)).not.toContain("forged");
+    // ...so what the paper fingerprints is what it was before the resend.
+    const { billPaperDigest } = await import("../bill_paper_digest");
+    const paper = (f: Record<string, unknown>) => billPaperDigest({
+      items: [], charges: {}, customerName: String(f.customer ?? ""),
+      customerGstin: String(f.customer_gstin ?? ""), customerAddress: String(f.customer_address ?? ""),
+    });
+    expect(paper(stored)).toBe(paper({ ...ACME }));
+  });
+
+  test("an order with no GSTIN or address gains none from a resend's body", async () => {
+    const r = await h.call("POST", "/orders", {
+      body: { id: ORDER, table: "11", status: "Served", items: [{ id: "l1", name: "HARA DHANIYA PULAO", price: 629, quantity: 1 }], customer_gstin: "29ABCDE1234F1Z5", customer_address: "x" },
+      auth: SENIORS[0][1] as never,
+    });
+    expect(r.status).toBe(201);
+    expect(storedFood()).not.toHaveProperty("customer_gstin");
+    expect(storedFood()).not.toHaveProperty("customer_address");
+  });
+
+  test("when the order ARRIVED on its table (table_since) survives a resend; a resend onto ANOTHER table arrives now", async () => {
+    fx.foodExtra = { table_since: "2026-09-14T16:32:00.123456+05:30" };
+    const same = await h.call("POST", "/orders", {
+      body: { id: ORDER, table: "11", status: "Served", items: [{ id: "l1", name: "HARA DHANIYA PULAO", price: 629, quantity: 1 }], table_since: "2020-01-01T00:00:00Z" },
+      auth: SENIORS[0][1] as never,
+    });
+    expect(same.status).toBe(201);
+    expect(storedFood().table_since).toBe("2026-09-14T16:32:00.123456+05:30");
+
+    fx.sql = [];
+    const before = Date.now();
+    const moved = await h.call("POST", "/orders", {
+      body: { id: ORDER, table: "12", status: "Served", items: [{ id: "l1", name: "HARA DHANIYA PULAO", price: 629, quantity: 1 }] },
+      auth: SENIORS[0][1] as never,
+    });
+    expect(moved.status).toBe(201);
+    const stamped = Date.parse(String(storedFood().table_since));
+    expect(stamped).toBeGreaterThanOrEqual(before);
+    expect(stamped).toBeLessThanOrEqual(Date.now());
+
+    // A brand-new order carries none: it arrived when it was created.
+    fx.sql = [];
+    fx.exists = false;
+    fx.foodExtra = {};
+    const fresh = await h.call("POST", "/orders", {
+      body: { table: "11", status: "Preparing", items: [{ id: "l9", name: "DAL", price: 200, quantity: 1 }], table_since: "2020-01-01T00:00:00Z" },
+      auth: SENIORS[0][1] as never,
+    });
+    expect(fresh.status).toBe(201);
+    expect(storedFood()).not.toHaveProperty("table_since");
+  });
+
   test("a senior role's upsert to 'Cancelled' is written as before", async () => {
     const r = await upsert(SENIORS[0][1], "Cancelled");
     expect(r.status).toBe(201);
@@ -607,6 +690,81 @@ describe("POST /orders — the upsert side door", () => {
     const ok = await upsert(SENIORS[1][1], "Paid");
     expect(ok.status).toBe(201);
     expect(orderInserts()[0]!.params[5]).toBe(4);
+  });
+});
+
+// ===========================================================================
+// INTEGRATION REVIEW (kot-reports-email) — DELETE /orders/:id deletes the order
+// AND prints a CANCELLED slip, and was the one door a waiter-only login a tenant
+// had granted "Delete Orders" could still use on a ticket.
+describe("DELETE /orders/:id — the delete door is closed to a waiter too", () => {
+  const del = (auth: unknown) => h.call("DELETE", "/orders/:id", { params: { id: ORDER }, auth: auth as never });
+
+  test("a waiter granted Delete Orders, deleting a Preparing order: 403, nothing deleted, no slip", async () => {
+    fx.status = 1;
+    const r = await del(WAITER_WITH_DELETE);
+    expect(r.status).toBe(403);
+    expect(r.body).toMatchObject({ code: "cancel_needs_senior", order_id: ORDER, details: SENTENCE_KOT3 });
+    expect(orderDeletes()).toEqual([]);
+    expect(mockCancelSlip).not.toHaveBeenCalled();
+    expect(fx.exists).toBe(true);
+    // Judged inside the transaction, on a locked read, and rolled back.
+    const qs = fx.sql.map((s) => s.q);
+    const locked = qs.findIndex((q) => /^select status from "Orders" where id = \$1 .* for update$/i.test(q));
+    expect(locked).toBeGreaterThan(qs.indexOf("BEGIN"));
+    expect(qs.lastIndexOf("ROLLBACK")).toBeGreaterThan(locked);
+    expect(auditLines().some((l) => l.startsWith(`REFUSED cancel of order ${ORDER}`))).toBe(true);
+  });
+
+  test.each([[2, "Served"], [3, "Bill Verification"], [6, "Payment Pending Approval"]])("…and a %s (%s) order the same", async (code) => {
+    fx.status = code;
+    const r = await del(WAITER_WITH_DELETE);
+    expect(r.status).toBe(403);
+    expect(orderDeletes()).toEqual([]);
+  });
+
+  test("the same waiter deleting a PENDING order (never ticketed) goes through: 204, deleted, slip asked", async () => {
+    fx.status = 8;
+    const r = await del(WAITER_WITH_DELETE);
+    expect(r.status).toBe(204);
+    expect(orderDeletes()).toHaveLength(1);
+    expect(mockCancelSlip).toHaveBeenCalledTimes(1);
+  });
+
+  test("a Pending order with a KOT number on paper is refused — the number read BEFORE the transaction opens", async () => {
+    db.__kotNumberLinkTestSeam.setSchemaReady(true);
+    fx.status = 8;
+    fx.printed = [3];
+    const r = await del(WAITER_WITH_DELETE);
+    expect(r.status).toBe(403);
+    expect(orderDeletes()).toEqual([]);
+    const qs = fx.sql.map((s) => s.q);
+    const printRead = qs.findIndex((q) => /from "PrintJobs"/i.test(q));
+    expect(printRead).toBeGreaterThan(-1);
+    expect(printRead).toBeLessThan(qs.indexOf("BEGIN"));
+  });
+
+  test("a manager deletes a ticketed order as before, with no locking read", async () => {
+    fx.status = 1;
+    const r = await del(who("manager", ["manager"], [ADD_ORDERS, DELETE_ORDERS]));
+    expect(r.status).toBe(204);
+    expect(orderDeletes()).toHaveLength(1);
+    expect(fx.sql.some((s) => /for update$/i.test(s.q))).toBe(false);
+  });
+
+  test("the stock waiter never gets past the permission", async () => {
+    const r = await del(WAITER);
+    expect(r.status).toBe(403);
+    expect(r.body).not.toMatchObject({ code: "cancel_needs_senior" });
+    expect(orderDeletes()).toEqual([]);
+  });
+
+  test("a cancelled order keeps the house words (the record stays), for a waiter too", async () => {
+    fx.status = 5;
+    const r = await del(WAITER_WITH_DELETE);
+    expect(r.status).toBe(400);
+    expect(String((r.body as { error?: unknown }).error)).toMatch(/kept permanently as a record/);
+    expect(orderDeletes()).toEqual([]);
   });
 });
 
@@ -696,6 +854,11 @@ describe("the wiring — nothing here is built and never called", () => {
     const del = handler(orders, "app.delete('/orders/:id/items/:itemId'");
     expect(del).toMatch(/actor: actorOf\(req\),/);
     expect(del).toMatch(/isCancelNeedsSeniorError\(e\)\) \{ await refuseTicketedCancel\(req, res, e\)/);
+    const delOrder = handler(orders, 'app.delete("/orders/:id"');
+    expect(delOrder).toMatch(/DeleteOrder\(restaurantId, orderId, \{ actor: actorOf\(req\) \}\)/);
+    expect(delOrder).toMatch(/isCancelNeedsSeniorError\(error\)\) \{ await refuseTicketedCancel\(req, res, error\)/);
+    // The refusal is answered before the generic 400.
+    expect(delOrder.indexOf("refuseTicketedCancel")).toBeLessThan(delOrder.indexOf('res.status(400).json({ error: String(error?.message ?? "Unable to delete order")'));
     const voidRoute = handler(read("routes/mis_capture.ts"), 'app.post("/orders/:id/void"');
     expect(voidRoute).toMatch(/\{ actor: \{ role: req\.auth\?\.role, role_all: req\.auth\?\.role_all, actions: req\.auth\?\.actions \} \}/);
     expect(voidRoute).toMatch(/isCancelNeedsSeniorError\(err\)\) \{ await refuseTicketedCancel\(req, res, err\)/);
@@ -710,8 +873,12 @@ describe("the wiring — nothing here is built and never called", () => {
 
   test("every writer's cancel check goes through waiterMayCancel (the PrintJobs half included)", () => {
     const src = read("database_supabase.ts");
-    // SetOrderStatus, AddOrder, UpdateOrderItemsSplit and VoidOrderWithReason.
-    expect(src.match(/await waiterMayCancel\(/g)?.length).toBe(4);
+    // SetOrderStatus, AddOrder, UpdateOrderItemsSplit, VoidOrderWithReason and DeleteOrder.
+    expect(src.match(/await waiterMayCancel\(/g)?.length).toBe(5);
+    const del = src.slice(src.indexOf("export async function DeleteOrder("), src.indexOf("// important: convert the whole proceess to atomic"));
+    expect(del).toMatch(/await waiterMayCancel\(context, opts!\.actor!, id, Number\(statusRows\[0\]\.status \?\? 0\), printedKotNos\)/);
+    // ...judged BEFORE the delete, inside the same transaction.
+    expect(del.indexOf("await waiterMayCancel(")).toBeLessThan(del.indexOf('delete from "Orders"'));
     // No writer judges the bare status any more: the one call is inside waiterMayCancel.
     expect(src.match(/mayCancelTicketed\(/g)?.length).toBe(1);
     expect(src).toMatch(/!mayPutBackToPending\(opts\.actor, previousCode\)/);

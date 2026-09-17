@@ -153,6 +153,54 @@ export function seatingStartOf(
 }
 
 /**
+ * WHEN THIS PARTY SAT DOWN — anchored on the table's open SEATING when it has
+ * one, which no order move can change.
+ *
+ * THE DEFECT THIS ENDS. seatingStartOf reads the earliest still-owing order,
+ * and "Move an order" changes which orders those are on both tables:
+ *
+ *   * the SOURCE loses its first ticket, so its seating "starts" after its own
+ *     print — the printed table read unprinted, the stale-paper warning
+ *     vanished while the guest's paper still charged for the food that left,
+ *     and a waiter could print again as a first print (a dish move that empties
+ *     the first ticket, or a senior's cancel of it, did the same);
+ *   * a ticket moved onto a FREE table kept its old created_at, so that table's
+ *     previous party's `<name>-<epoch>` print counted as the new seating's — the
+ *     table read printed, a waiter's order was refused 423, and "Replaces the
+ *     bill printed HH:MM" named somebody else's paper.
+ *
+ * WITH AN OPEN SEATING (the TableSessions row the trigger opens when the table
+ * is occupied, and which MoveTableParty carries with the party) the start is
+ * the EARLIEST of that seating, the open bill's created_at and the earliest
+ * still-owing order's ARRIVAL on this table (orderArrivedAt). The seating is a
+ * floor under which no order move reaches; the bill and the arrival keep a
+ * re-opened bill's paper counted (its re-open opened a fresh seating after the
+ * print, and its orders arrived before it). A moved ticket arrives at the move,
+ * so it no longer drags the start back into the previous party's service.
+ *
+ * WITHOUT ONE (a table occupied before the trigger existed, or a database
+ * without it) the rule is seatingStartOf, unchanged.
+ */
+export function seatingStartFor(input: {
+	/** seated_at of the table's open TableSessions row — only for an occupied table. */
+	sessionSeatedAt?: Date | string | number | null;
+	billCreatedAt?: Date | string | number | null;
+	/** min(created_at) of the still-owing orders. */
+	firstOrderAt?: Date | string | number | null;
+	/** min(arrival) of the still-owing orders (orderArrivedAt). */
+	firstArrivalAt?: Date | string | number | null;
+}): Date | null {
+	const session = asTime(input.sessionSeatedAt);
+	if (session === null) { return seatingStartOf(input.billCreatedAt, input.firstOrderAt); }
+	let start = session;
+	for (const v of [input.billCreatedAt, input.firstArrivalAt ?? input.firstOrderAt]) {
+		const t = asTime(v);
+		if (t !== null && t < start) { start = t; }
+	}
+	return new Date(start);
+}
+
+/**
  * The bill_id each part of a split print is filed under: `<bill id>-split-<i>of<n>`
  * when the table has a bill row (routes/bills.ts, POST /print/bill/split). The
  * no-row shape `<name>-split-…` is already covered by the fallback prefix.

@@ -200,6 +200,27 @@ describe("migration 054 (when present on this branch), applied by hand during se
     expect(boot).toContain('alter table "Bills" add column if not exists customer_address text;');
   });
 
+  // INTEGRATION REVIEW (kot-reports-email): on production the runtime has made
+  // the column before anyone applies this file, and an unguarded ADD COLUMN IF
+  // NOT EXISTS still took ACCESS EXCLUSIVE on "Bills" while it waited — every
+  // bill read queued behind it. The ALTER runs only when the catalogue says the
+  // column is missing, exactly as the boot step issues it.
+  test("the ALTER is inside the runtime's catalogue guard, so a re-apply takes no ACCESS EXCLUSIVE lock", () => {
+    if (!existsSync(file)) { return; }
+    const flat = code().replace(/\s+/g, " ");
+    expect(flat).toContain(
+      "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'Bills' AND column_name = 'customer_address') THEN ALTER TABLE \"Bills\" ADD COLUMN IF NOT EXISTS customer_address text; END IF; END $$;",
+    );
+    // No ALTER outside a guarded block.
+    const outside = flat.replace(/DO \$\$.*?END \$\$;/g, "");
+    expect(outside).not.toMatch(/ALTER TABLE/i);
+    // ...and the runtime's statement is the same guard, clause for clause.
+    const boot = src("database_supabase.ts").replace(/\s+/g, " ").toLowerCase();
+    expect(boot).toContain(
+      "if not exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'bills' and column_name = 'customer_address') then alter table \"bills\" add column if not exists customer_address text; end if;",
+    );
+  });
+
   test("says what it is (NOT money) and keeps the runtime role's grant", () => {
     if (!existsSync(file)) { return; }
     const sql = code();

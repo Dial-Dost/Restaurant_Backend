@@ -38,9 +38,10 @@
  * or not, quantity — merged, so the same dish ordered in two rounds reads the
  * same as one line of two), and every rung of the ladder (subtotal, discount,
  * service charge and its percent, each tax line, round-off, grand total), and
- * the customer GSTIN and address (a corporate guest's claim hangs on them;
- * client item 7 prints the address under the GSTIN, so an address added after
- * the print leaves the guest holding an invoice without it).
+ * the guest's name, customer GSTIN and address (a corporate guest's claim
+ * hangs on them; client item 7 prints the address under the GSTIN, so an
+ * address added after the print leaves the guest holding an invoice without
+ * it, and a name corrected after it leaves the old name on the invoice).
  *
  * OUT: the time, the cashier, the bill number, the logo and the QR. A second
  * print differs in all of those and says nothing new about what is owed.
@@ -147,9 +148,12 @@ export function billPaperDigest(input: {
 	customerGstin?: string | null;
 	/** The customer_address the paper prints (client item 7). */
 	customerAddress?: string | null;
+	/** The guest name the paper prints on its "Name:" line. */
+	customerName?: string | null;
 }): string {
 	const c = input.charges ?? {};
 	const address = paperAddress(input.customerAddress);
+	const name = paperName(input.customerName);
 	const taxes = (c.taxes ?? [])
 		.map((t) => [text(t?.name).toLowerCase(), money(t?.percentage), money(t?.amount)] as const)
 		.sort((a, b) => (a.join("|") < b.join("|") ? -1 : 1));
@@ -168,12 +172,28 @@ export function billPaperDigest(input: {
 		// Only when there is one, so every bill without an address keeps the
 		// fingerprint it had before the address slot existed.
 		...(address ? { customer_address: address } : {}),
+		// THE NAME, the third field of the same identity, edited in the same
+		// dialog. Without it a name corrected after the print left the paper
+		// "current": a waiter was refused the reprint and settle raised no warning
+		// while the guest's invoice carried the old name. Only when the paper
+		// prints one, so a walk-in or unnamed bill keeps the fingerprint it had.
+		...(name ? { customer_name: name } : {}),
 	});
 }
 
 /** The address as lines: each trimmed, blank ones dropped, CRLF read as LF. */
 function paperAddress(value: unknown): string {
 	return text(value).split(/\r\n?|\n/).map((l) => l.trim()).filter((l) => l.length > 0).join("\n");
+}
+
+/**
+ * The name as the paper prints it (escpos.ts's "Name:" line): trimmed, runs of
+ * whitespace read as one, and blank for the placeholders the ordering flows
+ * store for "nobody gave a name" ("Guest", "QR Guest"), which print nothing.
+ */
+function paperName(value: unknown): string {
+	const name = text(value).replace(/\s+/g, " ");
+	return /^(qr )?guest$/i.test(name) ? "" : name;
 }
 
 /**

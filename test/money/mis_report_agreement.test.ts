@@ -967,6 +967,28 @@ describe("Bill Edit", () => {
     expect(edits.totals.edits).toBe(2);
   });
 
+  test("an order added to a PRINTED bill (2.0.2) is one row; the other doors' addition lines and 'New order' are not", async () => {
+    const base = standardDb();
+    const at = "2026-06-05T08:10:00.000Z";
+    const printed = { table: "T1", after_print: true, print_count: 1, confirmed: true, waiter_only: true };
+    useFixtureDb(standardDb({
+      audits: [
+        ...base.audits,
+        { id: "p1", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "New order o7 on table T1", details: { order_id: "o7", table: "T1" }, fname: "Jim", lname: "Waiter" },
+        { id: "p2", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "ADDED an order on the printed bill of table T1 (printed 1 time(s))", details: { ...printed, write: "order", order_id: "o7", door: "new_order" }, fname: "Jim", lname: "Waiter" },
+        { id: "p3", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "ADDED an order on the printed bill of table T1 (printed 1 time(s))", details: { ...printed, write: "order" }, fname: "Jim", lname: "Waiter" },
+        { id: "p4", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "ADDED a merge into the printed bill of table T1 (printed 1 time(s))", details: { ...printed, write: "merge" }, fname: "Asha", lname: "Rao" },
+      ],
+    }));
+    const edits = await db.GetBillEditReport(RID, { ...W, limit: 500 });
+    const added = edits.rows.filter((r) => r.kind === "printed_bill_order_added");
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({ order_id: "o7", table_name: "T1", by: "Jim Waiter", action: "Order added after the bill was printed" });
+    // The two edits the standard fixture already reports, plus this one.
+    expect(edits.totals.edits).toBe(3);
+    expect(edits.totals.by_kind).toEqual(expect.arrayContaining([{ kind: "printed_bill_order_added", label: "Order added after the bill was printed", count: 1 }]));
+  });
+
   test("the actor and the item ride along, and no before/after amount is invented", async () => {
     const edits = await db.GetBillEditReport(RID, { ...W, limit: 500 });
     const removal = edits.rows.find((r) => r.kind === "item_removed");

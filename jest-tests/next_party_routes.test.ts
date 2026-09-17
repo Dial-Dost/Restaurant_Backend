@@ -589,6 +589,8 @@ describe("2e. a waiter who CONFIRMED 'Add to printed bill' (2.0.2)", () => {
     expect(line).toBe("ADDED an order on the printed bill of table 12 (printed 1 time(s))");
     const call = mockAudit.mock.calls.find((c) => String(c[4]).startsWith("ADDED"))!;
     expect(call[6]).toMatchObject({ table: "12", after_print: true, confirmed: true, waiter_only: true, print_count: 1 });
+    // The Bill Edit report's key: the door, and the order that landed.
+    expect(call[6]).toMatchObject({ door: "new_order", order_id: "order-new" });
     expect(mockAudit.mock.invocationCallOrder[mockAudit.mock.calls.indexOf(call)]).toBeGreaterThan(mockAddOrder.mock.invocationCallOrder[0]!);
   });
 
@@ -620,6 +622,9 @@ describe("2e. a waiter who CONFIRMED 'Add to printed bill' (2.0.2)", () => {
     expect(r.body).toMatchObject({ success: true, ...REPRINT_12 });
     expect(mockUpdateSplit).toHaveBeenCalledTimes(1);
     expect(audited()).toContain("ADDED an order on the printed bill of table 12 (printed 1 time(s))");
+    // No door: this route's own "Item added" line is what the Bill Edit report reads.
+    const call = mockAudit.mock.calls.find((c) => String(c[4]).startsWith("ADDED"))!;
+    expect(call[6]).not.toHaveProperty("door");
   });
 
   test.each([
@@ -754,6 +759,25 @@ describe("2g. GET /bill-for-table says whether the paper is out of date", () => 
   test("an address added since the print -> paper_stale true", async () => {
     mockGetBill.mockResolvedValue({ ...(await printedWith(await sameDigest())), customer_address: "12 MG Road\nBengaluru" });
     expect((await read(READ)).body).toMatchObject({ paper_stale: true });
+  });
+
+  // The name is on the same paper, edited in the same dialog: a correction
+  // after the print is a paper the guest does not hold. A placeholder is not.
+  test("a guest name corrected since the print -> paper_stale true; 'Guest' is no name", async () => {
+    mockGetBill.mockResolvedValue({ ...(await printedWith(await sameDigest())), customer: "Acme Pvt Ltd" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: true });
+    mockGetBill.mockResolvedValue({ ...(await printedWith(await sameDigest())), customer: "Guest" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: false });
+  });
+
+  test("the name the paper was printed with is the one it is compared with", async () => {
+    const { billPaperDigest } = await import("../bill_paper_digest");
+    const { computeBillCharges } = await import("../billing_math");
+    const printed = billPaperDigest({
+      items: bill(1).items, charges: computeBillCharges(1050, {}, 0, false, undefined), customerGstin: null, customerName: "Acme Pvt Ltd",
+    });
+    mockGetBill.mockResolvedValue({ ...(await printedWith(printed)), customer: "Acme Pvt Ltd" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: false });
   });
 
   test("changed since the print -> paper_stale true", async () => {
@@ -1017,13 +1041,34 @@ describe("4. the wiring — nothing here is built and never called", () => {
   });
 
   test("the seating start is the same helper on both payloads", () => {
-    expect(chunk(DB, "GetBillForTable")).toMatch(/seatingStartOf\(bill\?\.created_at \?\? null, orderRows\[0\]\?\.created_at \?\? null\)/);
-    expect(chunk(DB, "GetTables")).toMatch(/seatingStartOf\(bill\?\.created_at \?\? null, firstOrderAtByTable\.get\(row\.id\) \?\? null\)/);
+    // seatingStartFor, fed the SAME four facts everywhere: the open seating, the
+    // open bill's created_at, the first still-owing order and its arrival.
+    const four = (session: string, bill: string, first: string, arrival: string): RegExp => new RegExp(
+      `seatingStartFor\\(\\{\\s*sessionSeatedAt: ${session},\\s*billCreatedAt: ${bill},\\s*firstOrderAt: ${first},\\s*firstArrivalAt: ${arrival},\\s*\\}\\)`,
+    );
+    const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(chunk(DB, "GetBillForTable")).toMatch(four(
+      esc("await openSeatingStartOf(context, tableId)"), esc("bill?.created_at ?? null"),
+      esc("orderRows[0]?.created_at ?? null"), esc("firstArrivalOf(orderRows, normalized)"),
+    ));
+    expect(chunk(DB, "GetTables")).toMatch(four(
+      esc("row.is_occupied ? (seatingByTable.get(row.id) ?? null) : null"), esc("bill?.created_at ?? null"),
+      esc("firstOrderAtByTable.get(row.id) ?? null"), esc("firstArrivalByTable.get(row.id) ?? null"),
+    ));
+    expect(chunk(DB, "GetTables")).toMatch(/const seatingByTable = await openSeatingStarts\(context, null\);/);
     // The order guard and the move share ONE seating read, and it bounds with the helper.
     expect(chunk(DB, "GetOrderingPrintGuard")).toMatch(/await currentSeatingPrintState\(context, table\)/);
-    expect(chunk(DB, "currentSeatingPrintState")).toMatch(/seatingStartOf\(billRows\[0\]\?\.created_at \?\? null, firstOrder\[0\]\?\.first_at \?\? null\)/);
+    expect(chunk(DB, "currentSeatingPrintState")).toMatch(four(
+      esc("await openSeatingStartOf(context, table.id)"), esc("billRows[0]?.created_at ?? null"),
+      esc("firstOrder[0]?.first_at ?? null"), esc("firstOrder[0]?.first_arrival ?? null"),
+    ));
     expect(chunk(DB, "MoveTableParty")).toMatch(/await currentSeatingPrintState\(freed\.context, \{ id: dstId, table_name: moved\.to_table \}\)/);
-    expect(chunk(DB, "rekeyMovedPartyPrints")).toMatch(/seatingStartOf\(startRows\[0\]\?\.bill_created_at \?\? null, startRows\[0\]\?\.first_order_at \?\? null\)/);
+    expect(chunk(DB, "rekeyMovedPartyPrints")).toMatch(four(
+      esc("startRows[0]?.seated_at ?? null"), esc("startRows[0]?.bill_created_at ?? null"),
+      esc("startRows[0]?.first_order_at ?? null"), esc("startRows[0]?.first_arrival ?? null"),
+    ));
+    // Nothing bounds a seating with the old two-fact rule any more.
+    expect(DB).not.toMatch(/\bseatingStartOf\(/);
   });
 
   test.each([
@@ -1033,7 +1078,7 @@ describe("4. the wiring — nothing here is built and never called", () => {
     ["routes/bills.ts", "app.post('/bills/move-item'", "await MoveBillItem("],
   ])("%s %s files the printed-bill addition AFTER its write lands", (file, start, write) => {
     const body = handler(read(file), start);
-    const note = body.indexOf("await noteAdditionToPrintedBill(req, guard)");
+    const note = body.indexOf("await noteAdditionToPrintedBill(req, guard");
     expect(note).toBeGreaterThan(body.indexOf(write));
   });
 

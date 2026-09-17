@@ -333,3 +333,206 @@ export function movedFromKotNos(food: Readonly<Record<string, unknown>>): number
 	if (!Array.isArray(raw)) { return []; }
 	return [...new Set(raw.map(Number).filter((n) => Number.isFinite(n) && n > 0).map((n) => Math.round(n)))];
 }
+
+// ---------------------------------------------------------------------------
+// WHEN AN ORDER ARRIVED ON ITS TABLE — the settled-bill window's clock.
+// ---------------------------------------------------------------------------
+
+/**
+ * "Orders".food key: the instant this order landed on the table it is on now,
+ * stamped by the database (`now()`) by every door that changes an order's
+ * table_id: MoveTableParty, MoveOrderToTable and MergeTableBills. Absent on an
+ * order that never changed table, which arrived when it was created.
+ *
+ * THE DEFECT THIS ENDS. A settled bill's orders are found by time: everything
+ * settled on its table after the PREVIOUS bill there closed, up to this one's
+ * close (ReopenBill, GetClosedBill, the History list). The three doors change
+ * table_id and keep created_at, so an order placed at 15 before 14's party paid,
+ * then moved to 14, sat inside 14's PREVIOUS bill's window. Production GGV bill
+ * #3 (2120.58) reconstructed as 3891 with the moved party's 2055 on it, and the
+ * moved party's own #14 (3421.10) as 907. A re-open of #3 would have put an
+ * order the guest had already paid back on it. The window is therefore read on
+ * the arrival, not the creation.
+ *
+ * SERVER-OWNED, like the move history: AddOrder's upsert carries it from the
+ * stored row and never reads it off a request.
+ */
+export const ORDER_TABLE_SINCE_KEY = "table_since";
+
+/**
+ * The SQL that writes a food blob (a `json` parameter) with this instant
+ * stamped. `now()`: the database's clock, the one every closed_at is written
+ * with, so the window compares like with like.
+ */
+export function foodWithTableSinceSql(foodParam: string): string {
+	return `jsonb_set((${foodParam})::jsonb, '{${ORDER_TABLE_SINCE_KEY}}', to_jsonb(now()), true)::json`;
+}
+
+/** An ISO-looking instant the database can cast. Server-written values only reach here. */
+const INSTANT_SQL_SHAPE = "'^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[T ]([01][0-9]|2[0-3]):[0-5][0-9]'";
+const INSTANT_SHAPE = /^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[T ]([01][0-9]|2[0-3]):[0-5][0-9]/;
+
+/**
+ * THE ARRIVAL, IN SQL — `food.table_since`; else the latest whole-order move
+ * onto this table's name (MoveOrderToTable has stamped `food.moves` since
+ * before table_since existed, so a ticket moved then still reads right); else
+ * created_at. Never earlier than created_at for a server-written row.
+ *
+ * `tableName` is an SQL expression for the name of the table the order is on.
+ * COALESCE evaluates lazily, so the move history is only read for an order
+ * without the stamp.
+ */
+export function orderArrivalSql(input: { food: string; createdAt: string; tableName: string }): string {
+	const f = `(${input.food})::jsonb`;
+	return `coalesce(
+      case when (${f} ->> '${ORDER_TABLE_SINCE_KEY}') ~ ${INSTANT_SQL_SHAPE}
+           then (${f} ->> '${ORDER_TABLE_SINCE_KEY}')::timestamptz end,
+      (select max((mv ->> 'at')::timestamptz)
+         from jsonb_array_elements(case when jsonb_typeof(${f} -> '${ORDER_MOVES_KEY}') = 'array'
+                                        then ${f} -> '${ORDER_MOVES_KEY}' else '[]'::jsonb end) mv
+        where (mv ->> 'at') ~ ${INSTANT_SQL_SHAPE}
+          and lower(btrim(mv ->> 'to_table')) = lower(btrim(${input.tableName}))),
+      ${input.createdAt})`;
+}
+
+/**
+ * THE SETTLED-BILL WINDOW — "arrived on this table after the previous bill
+ * here closed, and no later than this bill's close" — for an order row `o`.
+ *
+ * The first two terms are a cheap, necessary pre-filter that keeps the JSON
+ * read off every order the table has ever had: an order arrives after it is
+ * created, and every update (the move, the settle) stamps updated_at
+ * (orders_touch_trg), so an order that arrived after `prevClosed` was updated
+ * after it too. A row with no updated_at has never been updated since that
+ * column existed — never moved — and arrived when it was created.
+ */
+export function settledWindowSql(input: { alias: string; tableName: string; prevClosed: string; closedAt: string }): string {
+	const o = input.alias;
+	const arrival = orderArrivalSql({ food: `${o}.food`, createdAt: `${o}.created_at`, tableName: input.tableName });
+	return `${o}.created_at <= ${input.closedAt}
+        and coalesce(${o}.updated_at, ${o}.created_at) > ${input.prevClosed}
+        and ${arrival} > ${input.prevClosed}
+        and ${arrival} <= ${input.closedAt}`;
+}
+
+const instantOf = (v: unknown): number | null => {
+	if (v === null || v === undefined || v === "") { return null; }
+	const t = v instanceof Date ? v.getTime() : typeof v === "number" ? v : new Date(String(v)).getTime();
+	return Number.isFinite(t) ? t : null;
+};
+
+/**
+ * THE ARRIVAL, IN TYPESCRIPT — orderArrivalSql's rule for a row already read
+ * (the running bill and the floor read hold the food anyway). Null only when
+ * nothing is known.
+ */
+export function orderArrivedAt(
+	food: Readonly<Record<string, unknown>>,
+	tableName: string,
+	createdAt: Date | string | number | null | undefined,
+): number | null {
+	const since = text(food[ORDER_TABLE_SINCE_KEY]);
+	if (INSTANT_SHAPE.test(since)) {
+		const t = instantOf(since);
+		if (t !== null) { return t; }
+	}
+	const name = String(tableName ?? "").trim().toLowerCase();
+	const moves = Array.isArray(food[ORDER_MOVES_KEY]) ? (food[ORDER_MOVES_KEY] as unknown[]) : [];
+	let latest: number | null = null;
+	for (const raw of moves) {
+		const m = asRecord(raw);
+		const at = text(m.at);
+		if (!INSTANT_SHAPE.test(at) || text(m.to_table).toLowerCase() !== name) { continue; }
+		const t = instantOf(at);
+		if (t !== null && (latest === null || t > latest)) { latest = t; }
+	}
+	return latest ?? instantOf(createdAt);
+}
+
+// ---------------------------------------------------------------------------
+// WHOSE BILL A MOVED TICKET IS ON — the guest identity after "Move an order".
+// ---------------------------------------------------------------------------
+
+/** The guest identity a seating's paper prints: first non-empty of each, in order. */
+export interface SeatingIdentity {
+	customer: string | null;
+	customer_gstin: string | null;
+	customer_address: string | null;
+}
+
+const identityText = (v: unknown): string => {
+	const s = typeof v === "string" ? v.trim() : "";
+	return s.toLowerCase() === "null" || s.toLowerCase() === "undefined" ? "" : s;
+};
+
+/**
+ * The identity GetBillForTable would print for these orders (oldest first):
+ * the first name that is not a placeholder, the first GSTIN and the first
+ * address — each on its own, exactly as that reader takes them.
+ */
+export function seatingIdentityOf(foods: readonly Readonly<Record<string, unknown>>[]): SeatingIdentity {
+	let customer = "";
+	let gstin = "";
+	let address = "";
+	for (const f of foods) {
+		if (!customer) {
+			// GetBillForTable's name rule, character for character.
+			const c = String(f.customer ?? "").trim();
+			if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") { customer = c; }
+		}
+		if (!gstin) { gstin = identityText(f.customer_gstin); }
+		if (!address) { address = identityText(f.customer_address); }
+	}
+	return { customer: customer || null, customer_gstin: gstin || null, customer_address: address || null };
+}
+
+/**
+ * A MOVED TICKET TAKES THE DESTINATION'S GUEST, not the source's.
+ *
+ * The name, GSTIN and address on an order are the SEATING's (SetBillCustomerName
+ * writes them onto every running order of the table), so a ticket moved from a
+ * named 12 carried 12's company, GSTIN and address onto 15, and 15's GST invoice
+ * printed them whenever the ticket was 15's oldest identified order. The ticket
+ * is re-stamped with the identity 15's paper already prints (none at all:
+ * "Guest", as a dish move writes), so the correction changes 15's paper by its
+ * lines alone.
+ */
+export function withSeatingIdentity(
+	food: Readonly<Record<string, unknown>>,
+	identity: SeatingIdentity,
+): Record<string, unknown> {
+	const out: Record<string, unknown> = { ...food, customer: identity.customer ?? "Guest" };
+	if (identity.customer_gstin) { out.customer_gstin = identity.customer_gstin; } else { delete out.customer_gstin; }
+	if (identity.customer_address) { out.customer_address = identity.customer_address; } else { delete out.customer_address; }
+	return out;
+}
+
+/**
+ * ...AND THE SOURCE KEEPS ITS GUEST. A seating named, then ordered on again,
+ * carries its name, GSTIN and address only on the orders that existed when it
+ * was named — so moving the first ticket away took 12's identity off 12's
+ * paper. The orders left behind are filled with the identity 12's paper printed
+ * before the move, field by field, where they carry none of their own; a value
+ * an order already carries is never overwritten. Null when nothing changes.
+ */
+export function withFilledSeatingIdentity(
+	food: Readonly<Record<string, unknown>>,
+	identity: SeatingIdentity,
+): Record<string, unknown> | null {
+	const out: Record<string, unknown> = { ...food };
+	let changed = false;
+	const name = String(food.customer ?? "").trim().toLowerCase();
+	if (identity.customer && (name === "" || name === "guest" || name === "qr guest")) {
+		out.customer = identity.customer;
+		changed = true;
+	}
+	if (identity.customer_gstin && !identityText(food.customer_gstin)) {
+		out.customer_gstin = identity.customer_gstin;
+		changed = true;
+	}
+	if (identity.customer_address && !identityText(food.customer_address)) {
+		out.customer_address = identity.customer_address;
+		changed = true;
+	}
+	return changed ? out : null;
+}

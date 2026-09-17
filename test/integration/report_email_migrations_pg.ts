@@ -1,4 +1,4 @@
-// MIGRATIONS 056-058 AGAINST A REAL POSTGRES — the proof a source test cannot give.
+// MIGRATIONS 054-058 AGAINST A REAL POSTGRES — the proof a source test cannot give.
 //
 // The CHECKs in these files are only worth anything if Postgres actually
 // refuses the rows they describe, and the cardinality-vs-array_length trap
@@ -8,12 +8,16 @@
 //
 //   1. every file 000..058 applies in order, as scripts/migrate.ts applies it;
 //   2. the runtime's own statements (report_email_schema.ts, what
-//      InitReportEmailSchema issues at boot) followed by the files is the same
-//      schema as the files alone — the production rollout order;
-//   3. re-applying 056/057/058 is a no-op that takes no ACCESS EXCLUSIVE lock:
+//      InitReportEmailSchema issues at boot, and the 054/055 boot steps
+//      InitBillCustomerAddressSchema and InitPrintJobPaperSchema) followed by the
+//      files is the same schema as the files alone — the production rollout
+//      order;
+//   3. re-applying 054-058 is a no-op that takes no ACCESS EXCLUSIVE lock:
 //      it succeeds under a 1s lock_timeout while another session holds a ROW
-//      EXCLUSIVE lock on both tables (a settle-shaped lock), and the catalogue
-//      is byte-identical before and after;
+//      EXCLUSIVE lock on every table they touch (a settle-shaped lock), 054
+//      also while a transaction holds an ordinary read on "Bills" (and a third
+//      session's read is not queued behind it), and the catalogue is
+//      byte-identical before and after;
 //   4. each CHECK refuses what it says, and the 026/044 writes still pass;
 //   5. both ON CONFLICT targets work with their predicates, and fail with
 //      42P10 without them;
@@ -38,8 +42,39 @@ import { fileURLToPath } from "node:url";
 import { REPORT_EMAIL_DDL_056, REPORT_EMAIL_DDL_057, REPORT_EMAIL_DDL_058, REPORT_EMAIL_SCHEMA_PROBE } from "../../report_email_schema.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const MIGRATIONS = join(__dirname, "..", "..", "migrations");
-const NEW_FILES = ["056_report_email_recipients.sql", "057_report_schedule_bundles.sql", "058_report_delivery_bundles.sql"];
+// The migration files ship on their own branch (chore/migrations-054-058);
+// REPORT_EMAIL_MIGRATIONS_DIR points this at that checkout's folder.
+const MIGRATIONS = process.env.REPORT_EMAIL_MIGRATIONS_DIR || join(__dirname, "..", "..", "migrations");
+const NEW_FILES = [
+  "054_bill_customer_address.sql", "055_print_job_paper_digest.sql",
+  "056_report_email_recipients.sql", "057_report_schedule_bundles.sql", "058_report_delivery_bundles.sql",
+];
+const REPORT_FILES = NEW_FILES.slice(2);
+
+// What the 054 and 055 boot steps issue, statement for statement
+// (InitBillCustomerAddressSchema; ensurePrintJobPaperColumns over
+// PRINT_JOB_PAPER_DDL). bill_customer_address_boot.test.ts and
+// print_job_paper_digest.test.ts hold the source and the files to these.
+const RUNTIME_054 = `do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'Bills'
+                             and column_name = 'customer_address') then
+             alter table "Bills" add column if not exists customer_address text;
+           end if;
+         end $$`;
+const RUNTIME_055 = `do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);${[
+             ["bill_digest", "text"], ["lines_digest", "text"], ["bill_grand_total", "numeric(12,2)"], ["table_name", "text"],
+           ].map(([c, t]) => `
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'PrintJobs'
+                             and column_name = '${c}') then
+             alter table "PrintJobs" add column if not exists ${c} ${t};
+           end if;`).join("")}
+         end $$`;
 
 const base = process.env.REPORT_EMAIL_PG_URL ?? "";
 if (!/^postgres(ql)?:\/\/[^@]*@(127\.0\.0\.1|localhost)(:\d+)?\//.test(base)) {
@@ -114,6 +149,9 @@ async function applyFile(c: pg.Client, file: string): Promise<void> {
 }
 
 async function applyRuntime(c: pg.Client): Promise<void> {
+  // The 054 and 055 boot steps: outside any transaction, one statement each.
+  await c.query(RUNTIME_054);
+  await c.query(RUNTIME_055);
   // What InitReportEmailSchema does: one transaction per migration, a LOCAL
   // lock timeout first, the statements in order.
   for (const list of [REPORT_EMAIL_DDL_056, REPORT_EMAIL_DDL_057, REPORT_EMAIL_DDL_058]) {
@@ -125,9 +163,10 @@ async function applyRuntime(c: pg.Client): Promise<void> {
 }
 
 async function catalogue(c: pg.Client): Promise<string> {
-  const cols = await c.query(`select table_name, column_name, data_type, is_nullable, column_default, is_generated, generation_expression
+  const cols = await c.query(`select table_name, column_name, data_type, is_nullable, column_default, is_generated, generation_expression,
+            numeric_precision, numeric_scale
       from information_schema.columns
-     where table_schema = 'public' and table_name in ('ReportSchedules','ReportDeliveries','ReportEmailRecipients','ReportDeliveryFiles','ReportSweepLease')
+     where table_schema = 'public' and table_name in ('ReportSchedules','ReportDeliveries','ReportEmailRecipients','ReportDeliveryFiles','ReportSweepLease','Bills','PrintJobs')
      order by 1, 2`);
   const cons = await c.query(`select rel.relname, con.conname, pg_get_constraintdef(con.oid) as def
       from pg_constraint con join pg_class rel on rel.oid = con.conrelid
@@ -170,7 +209,11 @@ async function main(): Promise<void> {
   for (const f of NEW_FILES) {
     try { await applyFile(fresh, f); } catch (err) { allApplied = false; console.log(`    ${(err as Error).message}`); }
   }
-  check("056, 057 and 058 apply on top of 000-053", allApplied);
+  check("054, 055, 056, 057 and 058 apply on top of 000-053", allApplied);
+  const addr = await fresh.query(`select data_type, is_nullable, column_default from information_schema.columns where table_name = 'Bills' and column_name = 'customer_address'`);
+  check("054 adds Bills.customer_address as nullable text with no default", JSON.stringify(addr.rows) === JSON.stringify([{ data_type: "text", is_nullable: "YES", column_default: null }]), JSON.stringify(addr.rows));
+  const paperCols = await fresh.query(`select column_name, data_type from information_schema.columns where table_name = 'PrintJobs' and column_name in ('bill_digest','lines_digest','bill_grand_total','table_name') order by 1`);
+  check("055 adds the four PrintJobs paper columns", paperCols.rowCount === 4, JSON.stringify(paperCols.rows));
   const meta = await fresh.query(`select data_type from information_schema.columns where table_name = 'ReportDeliveries' and column_name = 'message_meta'`);
   check("058 adds message_meta as jsonb (a retry's body is built from it)", meta.rows[0]?.data_type === "jsonb", JSON.stringify(meta.rows));
   const probe = await fresh.query(REPORT_EMAIL_SCHEMA_PROBE);
@@ -200,18 +243,63 @@ async function main(): Promise<void> {
   const holder = new pg.Client({ connectionString: urlFor("re_proof_fresh") });
   await holder.connect();
   await holder.query("begin");
-  await holder.query(`lock table "ReportSchedules", "ReportDeliveries", "ReportEmailRecipients", "ReportDeliveryFiles" in row exclusive mode`);
+  await holder.query(`lock table "ReportSchedules", "ReportDeliveries", "ReportEmailRecipients", "ReportDeliveryFiles", "Bills", "PrintJobs" in row exclusive mode`);
   const before = await catalogue(fresh);
   let rerunOk = true;
   for (const f of NEW_FILES) {
     const sql = (await readFile(join(MIGRATIONS, f), "utf8")).replace("SET LOCAL lock_timeout = '5s';", "SET LOCAL lock_timeout = '1s';");
+    const started = Date.now();
     await fresh.query("begin");
-    try { await fresh.query(sql); await fresh.query("commit"); }
+    try { await fresh.query(sql); await fresh.query("commit"); console.log(`    ${f}: ${String(Date.now() - started)} ms`); }
     catch (err) { rerunOk = false; await fresh.query("rollback"); console.log(`    ${f}: ${(err as Error).message}`); }
   }
-  check("056-058 re-run under a 1s lock_timeout while a row-exclusive lock is held", rerunOk);
+  check("054-058 re-run under a 1s lock_timeout while a row-exclusive lock is held on every table they touch", rerunOk);
   check("…and the catalogue is identical afterwards", before === (await catalogue(fresh)));
   await holder.query("rollback");
+
+  // 054 against an ORDINARY READ held open on "Bills", with a third session
+  // reading behind it: the file must neither wait nor make the reader wait.
+  await holder.query("begin");
+  await holder.query(`select count(*) from "Bills"`);
+  const third = new pg.Client({ connectionString: urlFor("re_proof_fresh") });
+  await third.connect();
+  const sql054 = (await readFile(join(MIGRATIONS, NEW_FILES[0]), "utf8")).replace("SET LOCAL lock_timeout = '5s';", "SET LOCAL lock_timeout = '3s';");
+  const t054 = Date.now();
+  await fresh.query("begin");
+  const applying = fresh.query(sql054).then(() => fresh.query("commit")).then(() => null, async (err: Error) => { await fresh.query("rollback"); return err; });
+  await new Promise((r) => setTimeout(r, 200));
+  const tRead = Date.now();
+  await third.query(`select count(*) from "Bills"`);
+  const readMs = Date.now() - tRead;
+  const applyErr = await applying;
+  const applyMs = Date.now() - t054;
+  check("054 re-applies while a transaction holds a read on \"Bills\"", applyErr === null && applyMs < 2500, `${applyErr ? applyErr.message : "ok"} after ${String(applyMs)} ms`);
+  check("…and a third session's read of \"Bills\" is not queued behind it", readMs < 1000, `${String(readMs)} ms`);
+  await holder.query("rollback");
+  await third.end();
+
+  // Both files against a database that still NEEDS them: they give up in
+  // bounded time rather than queue behind the holder.
+  const pending54 = await freshDb(admin, "re_proof_pending54");
+  for (const f of upTo053) { await applyFile(pending54, f); }
+  const holder54 = new pg.Client({ connectionString: urlFor("re_proof_pending54") });
+  await holder54.connect();
+  await holder54.query("begin");
+  await holder54.query(`lock table "Bills", "PrintJobs" in row exclusive mode`);
+  for (const f of NEW_FILES.slice(0, 2)) {
+    const started = Date.now();
+    let failCode: string | undefined;
+    try {
+      const sql = (await readFile(join(MIGRATIONS, f), "utf8")).replace("SET LOCAL lock_timeout = '5s';", "SET LOCAL lock_timeout = '1s';");
+      await pending54.query("begin");
+      await pending54.query(sql);
+      await pending54.query("commit");
+    } catch (err) { failCode = (err as { code?: string }).code; await pending54.query("rollback"); }
+    check(`a ${f.slice(0, 3)} that has work to do gives up with lock_not_available instead of queueing`, failCode === "55P03" && Date.now() - started < 4000, `code=${String(failCode)} after ${String(Date.now() - started)}ms`);
+  }
+  await holder54.query("rollback");
+  await holder54.end();
+  await pending54.end();
 
   // The same lock against a database that still NEEDS 057: the file must give
   // up in bounded time rather than queue behind the holder.
@@ -224,7 +312,7 @@ async function main(): Promise<void> {
   const started = Date.now();
   let code: string | undefined;
   try {
-    const sql = (await readFile(join(MIGRATIONS, NEW_FILES[1]), "utf8")).replace("SET LOCAL lock_timeout = '5s';", "SET LOCAL lock_timeout = '1s';");
+    const sql = (await readFile(join(MIGRATIONS, REPORT_FILES[1]), "utf8")).replace("SET LOCAL lock_timeout = '5s';", "SET LOCAL lock_timeout = '1s';");
     await pending.query("begin");
     await pending.query(sql);
     await pending.query("commit");
@@ -389,13 +477,13 @@ async function main(): Promise<void> {
   await c.query("rollback");
   // Re-applying 058 (the runtime's statements too) changes nothing now.
   const beforeLease = await catalogue(c);
-  await applyFile(c, NEW_FILES[2]);
+  await applyFile(c, REPORT_FILES[2]);
   for (const stmt of REPORT_EMAIL_DDL_058) { await c.query(stmt); }
   check("058 and its runtime statements re-run without changing the lease's grants or policies", beforeLease === (await catalogue(c)));
 
   await fresh.end();
   await viaRuntime.end();
-  for (const db of ["re_proof_fresh", "re_proof_runtime", "re_proof_pending"]) {
+  for (const db of ["re_proof_fresh", "re_proof_runtime", "re_proof_pending", "re_proof_pending54"]) {
     await admin.query(`drop database if exists ${db} with (force)`);
   }
   await admin.end();

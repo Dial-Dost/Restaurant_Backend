@@ -6,7 +6,7 @@
  * WHY A TAGGED ERROR AND NOT A ROUTE CHECK. The verdict needs the order's
  * status BEFORE the write, and the only place that status is read in step with
  * the write is the data layer (SetOrderStatus, AddOrder, VoidOrderWithReason,
- * UpdateOrderItemsSplit). A route that read the status first and then called
+ * UpdateOrderItemsSplit, DeleteOrder). A route that read the status first and then called
  * the writer would race the approval that turns a Pending order into a ticket.
  * So the writer throws this and the route turns it into the 403 — the same
  * shape, and for the same reasons, as discount_authority.ts's refusal.

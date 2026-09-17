@@ -688,7 +688,18 @@ export type BillEditKind =
   // are different acts, and a control reader looks for the second.
   | "bill_non_chargeable" | "bill_non_chargeable_reversed"
   | "order_voided"
-  | "service_charge_waived" | "service_charge_waiver_reversed";
+  | "service_charge_waived" | "service_charge_waiver_reversed"
+  // Client items 1-2 (2.0.2): a whole new order placed on a bill AFTER its
+  // paper was handed over (POST /orders on a printed table). Every other door
+  // into a printed bill already files its own classified line.
+  | "printed_bill_order_added";
+
+/**
+ * The `door` POST /orders files on its "ADDED an order on the printed bill"
+ * audit line (noteAdditionToPrintedBill), and what classifyBillEdit keys
+ * "printed_bill_order_added" on — the writer's own flag, not its prose.
+ */
+export const PRINTED_BILL_NEW_ORDER_DOOR = "new_order";
 
 export interface BillEditClassification {
   kind: BillEditKind;
@@ -849,6 +860,13 @@ export function classifyBillEdit(
 
   // 3. The catch-all id. Detail SHAPE first — a discount records type+value, a
   //    coupon records a code — then the reason for the ones that record neither.
+  //    A new order on a printed bill is flagged by its writer (after_print +
+  //    the POST /orders door); "New order …" itself stays dropped below, and the
+  //    item, merge and move doors' addition lines are not read here because
+  //    each of those writes already files its own classified line.
+  if (d.after_print === true && d.door === PRINTED_BILL_NEW_ORDER_DOOR) {
+    return hit("printed_bill_order_added", "Order added after the bill was printed");
+  }
   if (d.request_id !== undefined && d.type !== undefined) {return hit("discount_requested", "Discount requested");}
   if (d.type !== undefined && d.value !== undefined && /discount/i.test(r)) {
     return hit("discount_applied", "Discount applied");

@@ -826,16 +826,21 @@ skipped or reordered.
 
 ### The order
 
-1. **Deploy the backend** carrying migrations 056–058 (Gate B stops it — see
-   below). The backend creates the 056–058 schema itself at boot, because
-   production connects as the table owner; the files still have to be applied
-   so `schema_migrations` records them.
-2. **Apply 056, 057, 058 by hand**, exactly as in
+1. **Deploy the backend.** The 2.0.2 release branch carries **no** migration
+   files: 054–058 ship on their own branch (`chore/migrations-054-058`, one file
+   per commit, on top of the release) and are applied by hand, so Gate B has
+   nothing to stop. The backend creates the 054–058 schema itself at boot,
+   because production connects as the table owner; the files still have to be
+   applied so `schema_migrations` records them.
+2. **Apply 054, 055, 056, 057, 058 by hand, in that order**, exactly as in
    [*While the verb is NOT installed — by hand*](#while-the-verb-is-not-installed--by-hand).
-   Each file starts with `SET LOCAL lock_timeout = '5s'`, is idempotent, and
-   takes no ACCESS EXCLUSIVE lock when the runtime has already made its schema.
-   Then re-dispatch the deploy (Gate B runs **before** the git update, so a
-   same-push migration is invisible to it until the tree has moved).
+   Each file starts with `SET LOCAL lock_timeout = '5s'` and is idempotent.
+   054 and 055 issue their `ALTER TABLE` only for a column that is missing (the
+   runtime's own catalogue guard), and 056–058 were written that way from the
+   start, so once the runtime has made the schema none of the five takes an
+   ACCESS EXCLUSIVE lock: they can be applied during service without queueing a settle,
+   a bill read or a kitchen docket. If one does answer `lock_not_available`, the
+   schema was not there yet — re-run it off-peak.
 3. **Set the mail settings** in `/opt/restaurant-dash/.env` (next section).
 4. **Recreate the backend** so it reads them:
    `docker compose -f /opt/restaurant-dash/docker-compose.yml up -d --force-recreate backend`

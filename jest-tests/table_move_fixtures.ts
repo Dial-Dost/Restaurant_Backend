@@ -34,6 +34,8 @@
 // Dispatch THROWS on any unrecognised statement, so a code path that starts
 // issuing a new query fails loudly rather than silently receiving zero rows.
 
+import { orderArrivedAt } from "../order_moves";
+
 export const RES_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
 export const OUTLET_ID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
 export const RESTAURANT_SLUG = "gaia";
@@ -366,6 +368,23 @@ function fireSessionTrigger(before: TableFix, after: TableFix): void {
 /** The active-order status filter every money statement here carries. */
 const isActive = (status: string): boolean => !["4", "5", "7"].includes(str(status) || "1");
 
+/** min(orderArrivalSql) over these orders, on the named table — as the SQL computes it. */
+function firstArrival(rows: readonly OrderFix[], tableName: string): Date | null {
+  let first: number | null = null;
+  for (const o of rows) {
+    const t = orderArrivedAt(o.food, tableName, o.created_at);
+    if (t !== null && (first === null || t < first)) {first = t;}
+  }
+  return first === null ? null : new Date(first);
+}
+
+/** max(seated_at) of a table's OPEN seating rows, or null. */
+function newestOpenSeating(tableId: string): Date | null {
+  const open = store.sessions.filter((x) => x.table_id === tableId && x.left_at === null).map((x) => x.seated_at).sort();
+  const last = open[open.length - 1];
+  return last ? new Date(last) : null;
+}
+
 function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
   const sql = sqlRaw.replace(/\s+/g, " ").trim();
   const s = sql.toLowerCase();
@@ -404,14 +423,22 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
   }
   if (s.startsWith("select (select min(o.created_at) from \"orders\" o")) {
     const tableId = str(params[2]);
-    const owing = store.orders.filter((o) => o.table_id === tableId && isActive(o.status)).map((o) => o.created_at).sort();
+    const owingRows = store.orders.filter((o) => o.table_id === tableId && isActive(o.status));
+    const owing = owingRows.map((o) => o.created_at).sort();
     const bill = store.bills
       .filter((b) => b.table_id === tableId && b.closed_at === null)
       .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+    // The seating bound's two other terms (seatingStartFor): the earliest
+    // ARRIVAL on the named table, and the table's open seating.
+    if (!s.includes("as first_arrival") || !s.includes('from "tablesessions" s where s.table_id = $3 and s.left_at is null')) {
+      throw new Error("table_move_fixtures: the re-key's seating start must read the arrivals and the open seating");
+    }
     return {
       rows: [{
         first_order_at: owing[0] ? new Date(owing[0]) : null,
         bill_created_at: bill ? new Date(bill.created_at) : null,
+        first_arrival: firstArrival(owingRows, str(params[3])),
+        seated_at: newestOpenSeating(tableId),
       }],
     };
   }
@@ -462,9 +489,27 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
       .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
     return { rows: open ? [{ id: open.id, created_at: new Date(open.created_at) }] : [] };
   }
-  if (s.startsWith('select min(created_at) as first_at from "orders"')) {
-    const owing = store.orders.filter((o) => o.table_id === str(params[2]) && isActive(o.status)).map((o) => o.created_at).sort();
-    return { rows: [{ first_at: owing[0] ? new Date(owing[0]) : null }] };
+  if (s.startsWith('select min(created_at) as first_at, min(coalesce(')) {
+    const owingRows = store.orders.filter((o) => o.table_id === str(params[2]) && isActive(o.status));
+    const owing = owingRows.map((o) => o.created_at).sort();
+    return { rows: [{ first_at: owing[0] ? new Date(owing[0]) : null, first_arrival: firstArrival(owingRows, str(params[3])) }] };
+  }
+  // --- the open seating the print bound reads (openSeatingStarts) -----------
+  if (s.startsWith(`select to_regclass('public."tablesessions"') is not null as present`)) {
+    return { rows: [{ present: true }] };
+  }
+  if (s.startsWith('select s.table_id::text as table_id, max(s.seated_at) as seated_at from "tablesessions" s join "tables" t')) {
+    if (!s.includes("s.left_at is null") || !s.includes("coalesce(t.is_occupied, false) = true")) {
+      throw new Error("table_move_fixtures: only an OCCUPIED table's OPEN seating bounds its prints");
+    }
+    const ids = Array.isArray(params[2]) ? (params[2] as string[]) : null;
+    const out: { table_id: string; seated_at: Date }[] = [];
+    for (const t of store.tables) {
+      if (!t.is_occupied || (ids && !ids.includes(t.id))) {continue;}
+      const at = newestOpenSeating(t.id);
+      if (at) {out.push({ table_id: t.id, seated_at: at });}
+    }
+    return { rows: out };
   }
   if (s.startsWith('select bill_id, created_at from "printjobs"')) {
     const statuses = (params[3] as string[]) ?? [];
@@ -578,6 +623,22 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     return { rows: o ? [{ status: o.status, barked_at: o.barked_at ?? null, food: JSON.stringify(o.food) }] : [] };
   }
 
+  // --- MoveOrderToTable: the destination's running orders (its guest), and the
+  //     moved ticket's placing instant (the previous party's prints it retires).
+  if (s.startsWith('select food from "orders" where res_id = $1 and outlet_id = $2 and table_id = $3')) {
+    const tableId = str(params[2]);
+    return {
+      rows: store.orders
+        .filter((o) => o.table_id === tableId && isActive(o.status))
+        .sort((a, b) => (a.created_at < b.created_at ? -1 : 1))
+        .map((o) => ({ food: JSON.stringify(o.food) })),
+    };
+  }
+  if (s.startsWith('select created_at from "orders" where id = $1')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    return { rows: o ? [{ created_at: new Date(o.created_at) }] : [] };
+  }
+
   // --- one order, by id ----------------------------------------------------
   if (s.includes('select id, table_id, food, status from "orders"')) {
     const o = store.orders.find((r) => r.id === str(params[0]));
@@ -586,10 +647,15 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
 
   // --- move an order -------------------------------------------------------
   if (s.startsWith('update "orders" set table_id =')) {
+    // Every door that changes an order's table stamps when it arrived, by the
+    // database's clock (foodWithTableSinceSql).
+    if (!s.includes("jsonb_set(($2)::jsonb, '{table_since}', to_jsonb(now()), true)::json")) {
+      throw new Error("table_move_fixtures: a table change must stamp food.table_since with now()");
+    }
     const o = store.orders.find((r) => r.id === str(params[2]));
     if (o) {
       o.table_id = str(params[0]);
-      o.food = JSON.parse(str(params[1])) as Record<string, unknown>;
+      o.food = { ...(JSON.parse(str(params[1])) as Record<string, unknown>), table_since: NOW };
     }
     return { rows: [] };
   }
@@ -651,6 +717,14 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
   }
   if (s.startsWith('delete from "tablesessions"')) {
     store.sessions = store.sessions.filter((x) => x.id !== str(params[0]));
+    return { rows: [] };
+  }
+  if (s.startsWith('update "tablesessions" set seated_at = least(seated_at, $2::timestamptz) where table_id = $1 and left_at is null')) {
+    for (const x of store.sessions) {
+      if (x.table_id !== str(params[0]) || x.left_at !== null) {continue;}
+      const floor = new Date(str(params[1])).toISOString();
+      if (floor < x.seated_at) {x.seated_at = floor;}
+    }
     return { rows: [] };
   }
   if (s.startsWith('update "tablesessions" set table_id =')) {

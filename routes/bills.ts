@@ -1182,9 +1182,11 @@ export async function currentPaperDigest(restaurantId: string, tableName: string
 }
 
 function paperDigestOf(bill: OpenTableBill, charges: ReturnType<typeof computeBillCharges>): string {
-	// The GSTIN and address the paper prints (the renderer is handed the same fields).
+	// The name, GSTIN and address the paper prints (the renderer is handed the same fields).
 	const gstin = bill.customer_gstin;
-	return billPaperDigest({ items: bill.items, charges, customerGstin: gstin, customerAddress: bill.customer_address });
+	return billPaperDigest({
+		items: bill.items, charges, customerGstin: gstin, customerAddress: bill.customer_address, customerName: bill.customer,
+	});
 }
 
 /**

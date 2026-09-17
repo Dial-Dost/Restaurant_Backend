@@ -48,6 +48,7 @@ describe("the whole-paper fingerprint moves with the money, and only with the mo
     ["the grand total", { charges: { ...LADDER, grand_total: 2427 } }],
     ["the customer's GSTIN", { customerGstin: "29ABCDE1234F1Z5" }],
     ["the customer's address (client item 7 prints it)", { customerAddress: "12 MG Road\nBengaluru 560001" }],
+    ["the guest's name (the paper's 'Name:' line)", { customerName: "Acme Pvt Ltd" }],
   ])("%s changes it", (_label, over) => {
     expect(paper(over as never)).not.toBe(paper());
   });
@@ -79,6 +80,26 @@ describe("the whole-paper fingerprint moves with the money, and only with the mo
     // the fingerprint waiter-floor's module gave this bill before the merge.
     expect(paper()).toBe("7741b3376dfb054a2419bf51afb6d6b11265fa76e4f29fdcd30d7afbd372bd92");
     for (const none of [undefined, null, "", "  \n "]) { expect(paper({ customerAddress: none })).toBe(paper()); }
+  });
+
+  // INTEGRATION REVIEW (money-floor): the name is the third field of the same
+  // identity, edited in the same dialog. A name corrected after the print left
+  // the paper "current" — the waiter was refused the reprint and settle did not
+  // warn — while the guest's invoice carried the old name.
+  test("the name counts as the paper prints it: placeholders are no name, spacing is not a change, a new spelling is", () => {
+    const named = paper({ customerName: "Acme Pvt Ltd" });
+    expect(paper({ customerName: "  Acme   Pvt Ltd " })).toBe(named);
+    expect(paper({ customerName: "ACME PVT LTD" })).not.toBe(named);
+    expect(paper({ customerName: "Acme Private Ltd" })).not.toBe(named);
+    // What escpos.ts leaves blank on the "Name:" line is no name at all — the
+    // fingerprint every unnamed bill had before the name was folded in.
+    for (const none of [undefined, null, "", "   ", "Guest", "guest", " GUEST ", "QR Guest", "qr guest"]) {
+      expect({ none, digest: paper({ customerName: none }) }).toEqual({ none, digest: paper() });
+    }
+    expect(paper({ customerName: "Guest House Pvt Ltd" })).not.toBe(paper());
+    expect(paper()).toBe("7741b3376dfb054a2419bf51afb6d6b11265fa76e4f29fdcd30d7afbd372bd92");
+    // Name, GSTIN and address are three separate fields, not one string.
+    expect(paper({ customerName: "A", customerAddress: "B" })).not.toBe(paper({ customerName: "B", customerAddress: "A" }));
   });
 
   test("a percent with no charge beside it prints nothing, so it is not paper", () => {

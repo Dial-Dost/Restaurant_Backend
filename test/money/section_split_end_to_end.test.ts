@@ -104,6 +104,10 @@ function dispatch(q: string): unknown[] {
   // liveServiceChargeWaiver (migration 036), reached once a bill row exists: no
   // waiver is live on this fixture, so the charge stands.
   if (/waived_at/i.test(q)) { return []; }
+  // The open seating the print bound reads (openSeatingStarts): the relation is
+  // there and this table has no open row, so the bound is the orders'.
+  if (/^select to_regclass\('public\."TableSessions"'\) is not null as present/i.test(q)) { return [{ present: true }]; }
+  if (/from "TableSessions" s join "Tables" t/i.test(q)) { return []; }
 
   fixture.unknownSql.push(q);
   throw new Error(`section split fixture: unstubbed query — ${q.slice(0, 160)}`);

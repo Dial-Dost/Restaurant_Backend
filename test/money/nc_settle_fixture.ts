@@ -374,8 +374,10 @@ export function fixtureQuery(sql: string, params: unknown[] = []): { rows: unkno
       session_covers: 4, seated_at: null, left_at: null,
     }] : [] };
   }
-  if (/^select id, created_at, status, food from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and coalesce\(status::text, '1'\) = any\(\$4::text\[\]\)/i.test(q)) {
-    // The session window is not modelled: the fixture holds one session.
+  if (/^select id, created_at, status, food from "Orders" o where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and coalesce\(status::text, '1'\) = any\(\$4::text\[\]\)/i.test(q)) {
+    // The session window is not modelled: the fixture holds one session. Its
+    // shape is: the window is read on the order's ARRIVAL (settledWindowSql).
+    requireShape(q, "coalesce(o.updated_at, o.created_at) > $5::timestamptz", "the window is read on the arrival");
     const codes = (params[3] as string[]).map(String);
     return { rows: s.orders.filter((o) => codes.includes(String(o.status)))
       .map((o) => ({ id: o.id, created_at: new Date(o.created_at), status: String(o.status), food: clone(foodOf(o)) })) };

@@ -114,6 +114,24 @@ describe("1. the migration file is the runtime's DDL (when 055 is present on thi
     for (const sql of db.PRINT_JOB_PAPER_DDL) {expect(sql).toMatch(/add column if not exists/);}
   });
 
+  // INTEGRATION REVIEW (kot-reports-email): the runtime has made the four
+  // columns before the file is applied, and an unguarded ADD COLUMN IF NOT
+  // EXISTS still queued the kitchen behind its ACCESS EXCLUSIVE wait. Each ALTER
+  // runs only when the catalogue says its column is missing — the runtime's own
+  // guard (ensurePrintJobPaperColumns).
+  test("every ALTER is inside a catalogue guard for its own column, so a re-apply takes no ACCESS EXCLUSIVE lock", () => {
+    if (!present) { return; } // shipped in its own commit, applied by hand
+    const text = flat(code);
+    for (const sql of db.PRINT_JOB_PAPER_DDL) {
+      const column = /add column if not exists (\w+)/.exec(sql)![1];
+      expect(text).toContain(
+        `if not exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'printjobs' and column_name = '${column}') then ${flat(sql)}; end if;`,
+      );
+    }
+    const outside = text.replace(/do \$\$.*?end \$\$;/g, "");
+    expect(outside).not.toMatch(/alter table/);
+  });
+
   test("it is idempotent: every ALTER says IF NOT EXISTS, and the grant is guarded", () => {
     if (!present) { return; } // shipped in its own commit, applied by hand
     expect(code).not.toMatch(/ADD COLUMN (?!IF NOT EXISTS)/);

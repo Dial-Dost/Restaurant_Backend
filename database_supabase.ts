@@ -124,16 +124,24 @@ import { DiscountAuthorityError, mayDiscountBill } from "./discount_authority.js
 import { isWaiterOnly, mayCancelTicketed, mayPutBackToPending, PENDING_ORDER_STATUS_CODE, type RoleScopeInput } from "./role_scope.js";
 import { CancelNeedsSeniorError } from "./cancel_authority.js";
 import {
+  ORDER_TABLE_SINCE_KEY,
   appendOrderMove,
   carriedLine,
   comppedMoveRefusal,
+  foodWithTableSinceSql,
   holdsComppedLine,
   movedDestinationFood,
   movedDish,
   movedFromKotNos,
   movedOrderStatusCode,
+  orderArrivalSql,
+  orderArrivedAt,
   orderDishes,
   orderMoveProvenance,
+  seatingIdentityOf,
+  settledWindowSql,
+  withFilledSeatingIdentity,
+  withSeatingIdentity,
   type MovedDish,
   type OrderMoveProvenance,
 } from "./order_moves.js";
@@ -147,7 +155,7 @@ import {
   PREVIOUS_PARTY_PRINT_MARK,
   billPrintFallbackPrefix,
   latestBillPaper,
-  seatingStartOf,
+  seatingStartFor,
   summarizeBillPrints,
   type BillPrintJobRow,
   type BillPrintSeating,
@@ -2168,6 +2176,8 @@ export const __poolHygieneTestSeam = {
     ddlInFlight.clear();
     // Migration 052's catalogue answer is a schema memo too.
     billNcColumnsSeen = false;
+    // ...and so is "does TableSessions exist" (the print bound's seating read).
+    tableSessionsRelation = null;
   },
   ensureLazyTable,
   ensureOutletColumns: (client?: PoolClient): Promise<void> => ensureOutletColumns(client),
@@ -4273,7 +4283,7 @@ async function nextPartyParentName(context: RestaurantContext, tableId: string):
  * THE PRINT STATE OF A TABLE'S CURRENT SEATING, and nothing else — what the
  * money guard on new orders asks. GetBillForTable answers the same question on
  * the way to pricing the whole bill; this is the cheap half, reduced through
- * the SAME seating bound (seatingStartOf) and the SAME ledger read, so the
+ * the SAME seating bound (seatingStartFor) and the SAME ledger read, so the
  * guard and the Print button can never disagree about "printed".
  *
  * Null when the table is unknown, is a takeaway, or the feature is off — the
@@ -5497,12 +5507,18 @@ export async function GetBillForTable(
     tableId,
     bill?.id ?? null,
     normalized,
-    // The seating starts at the EARLIER of the bill row and the earliest
-    // still-owing order. Both are "the current party", and anything printed
-    // before it belongs to the previous one — but a bill row created by a
-    // discount, a waiver or a tender AFTER a waiter's print must not move the
-    // start past that print. See seatingStartOf.
-    seatingStartOf(bill?.created_at ?? null, orderRows[0]?.created_at ?? null),
+    // The seating starts at the open seating's seated_at, or earlier when the
+    // bill row or an order's ARRIVAL here is earlier; without an open seating,
+    // at the EARLIER of the bill row and the earliest still-owing order. A bill
+    // row created by a discount, a waiver or a tender AFTER a waiter's print
+    // must not move the start past that print, and neither may an order moving
+    // off or onto the table. See seatingStartFor.
+    seatingStartFor({
+      sessionSeatedAt: await openSeatingStartOf(context, tableId),
+      billCreatedAt: bill?.created_at ?? null,
+      firstOrderAt: orderRows[0]?.created_at ?? null,
+      firstArrivalAt: firstArrivalOf(orderRows, normalized),
+    }),
   );
 
   return {
@@ -6347,6 +6363,10 @@ export async function GetTables(
   // tile can say the paper is out of date. Collected from the rows already read;
   // fingerprinted below only for tables that have been printed.
   const paperLinesByTable = new Map<string, PaperLine[]>();
+  // ...and when each still-owing order ARRIVED on its table (orderArrivedAt), for
+  // the seating bound below: a moved ticket arrived at the move.
+  const firstArrivalByTable = new Map<string, number>();
+  const tableNameById = new Map(tableRows.map((r) => [r.id, r.table_name]));
   for (const o of activeOrders) {
     if (!o.table_id) {continue;}
     orderedTables.add(o.table_id);
@@ -6361,6 +6381,11 @@ export async function GetTables(
       const seen = firstOrderAtByTable.get(o.table_id);
       if (seen === undefined || placed < seen) { firstOrderAtByTable.set(o.table_id, placed); }
     }
+    const arrived = orderArrivedAt(p, tableNameById.get(o.table_id) ?? "", o.created_at);
+    if (arrived !== null) {
+      const seen = firstArrivalByTable.get(o.table_id);
+      if (seen === undefined || arrived < seen) { firstArrivalByTable.set(o.table_id, arrived); }
+    }
   }
 
   // C3 — THE PRINT STATE OF EVERY TABLE'S CURRENT BILL, in ONE query for the
@@ -6374,16 +6399,23 @@ export async function GetTables(
   // the defect C3 exists to remove. bill_print_state.ts holds the rule and BOTH
   // payloads reduce through it.
   //
-  // The seating bound is the EARLIER of the open bill's created_at and the
-  // earliest still-owing order — exactly GetBillForTable's, through the same
-  // seatingStartOf, so the grid and the sheet can never disagree about whether a
-  // print belongs to this party. A table with neither has nothing to have
-  // printed, so it is left out of the read entirely rather than dropping the
-  // time bound for the whole floor.
+  // The seating bound is exactly GetBillForTable's, through the same
+  // seatingStartFor: the open seating (one read for the whole floor), the open
+  // bill's created_at and the earliest still-owing order's arrival — so the grid
+  // and the sheet can never disagree about whether a print belongs to this
+  // party. A table with none of them has nothing to have printed, so it is left
+  // out of the read entirely rather than dropping the time bound for the whole
+  // floor.
+  const seatingByTable = await openSeatingStarts(context, null);
   const printSeatings: BillPrintSeating[] = [];
   for (const row of tableRows) {
     const bill = openBillByTable.get(row.id) ?? null;
-    const start = seatingStartOf(bill?.created_at ?? null, firstOrderAtByTable.get(row.id) ?? null);
+    const start = seatingStartFor({
+      sessionSeatedAt: row.is_occupied ? (seatingByTable.get(row.id) ?? null) : null,
+      billCreatedAt: bill?.created_at ?? null,
+      firstOrderAt: firstOrderAtByTable.get(row.id) ?? null,
+      firstArrivalAt: firstArrivalByTable.get(row.id) ?? null,
+    });
     if (start === null) { continue; }
     printSeatings.push({ open_bill_id: bill?.id ?? null, table_name: row.table_name, seating_start: start });
   }
@@ -15270,8 +15302,27 @@ export async function AddOrder(
   // and MoveBillItem stamped, and the table sheet would stop saying "from 12".
   // SERVER-OWNED: only ever carried from the stored row, never read off the
   // request.
-  for (const key of ["moves", "moved_from", "moved_items", "emptied_by"] as const) {
+  //
+  // THE GUEST'S GSTIN AND ADDRESS ARE THE SAME KIND OF KEY. Only
+  // SetBillCustomerName and SetClosedBillCustomerDetails write them; the web's
+  // "Update Order" and "Bill Verification" resend whole orders through this
+  // upsert, and rebuilding the payload wiped both — the running bill (which
+  // reads them off the orders) then printed neither, and the paper fingerprint
+  // turned stale, so a waiter's UPDATED BILL dropped the guest's address. A
+  // copy in the request body is ignored, exactly as before.
+  for (const key of ["moves", "moved_from", "moved_items", "emptied_by", "customer_gstin", "customer_address"] as const) {
     if (existingPayload[key] !== undefined) {payload[key] = existingPayload[key];}
+  }
+  // WHEN IT ARRIVED ON ITS TABLE (ORDER_TABLE_SINCE_KEY), which the settled-bill
+  // window reads. Kept while the resend names the table the order is on; a
+  // resend that puts it on ANOTHER table is itself a move, and arrives now.
+  if (!isNewOrder) {
+    const storedTable = String(existingPayload.table ?? "").trim().toLowerCase();
+    if (storedTable !== "" && storedTable !== tableName.toLowerCase()) {
+      payload[ORDER_TABLE_SINCE_KEY] = new Date().toISOString();
+    } else if (existingPayload[ORDER_TABLE_SINCE_KEY] !== undefined) {
+      payload[ORDER_TABLE_SINCE_KEY] = existingPayload[ORDER_TABLE_SINCE_KEY];
+    }
   }
 
   const upserted = await runQuery<{ id: string }>(
@@ -15384,15 +15435,47 @@ export async function SetOrderCustomerId(
 export async function DeleteOrder(
   restaurantId: string,
   orderId: string,
+  opts?: {
+    /**
+     * The SESSION deleting, for client item 3. Deleting an order is the most
+     * complete way food stops being cooked (a CANCELLED slip prints), so a
+     * waiter-only login is refused a ticketed order here exactly as on every
+     * other cancelling door — even when a tenant has granted it "Delete Orders"
+     * (8c3f5b21), because the rule names the waiter, not a permission. Absent =
+     * no role rule (internal callers).
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
+  const id = orderId.trim();
+  const locked = opts?.actor != null && isWaiterOnly(opts.actor);
+  // The printed KOT numbers the waiter rule also asks, read BEFORE the
+  // transaction so it never holds a second pooled connection while its own is
+  // open (VoidOrderWithReason's reasoning). Only for a waiter-only login.
+  const printedKotNos = locked
+    ? ((await GetKotNumbersForOrders(context.res_id, context.outlet_id, [id])).get(id) ?? [])
+    : [];
   // Must return (and await via return) the transaction — a floating promise here
   // ran the DELETE detached on the request's pooled client (racing connection
   // release) and the route always saw `false` → a spurious 404 on every delete.
   return withTransaction(async (client) => {
     // "Permanently cancelled" means the row stays: deleting it would erase the
     // very record the audit-log undo needs to reverse.
-    await assertOrderNotCancelled(context, orderId.trim(), ORDER_CANCELLED_DELETE_MESSAGE, client);
+    await assertOrderNotCancelled(context, id, ORDER_CANCELLED_DELETE_MESSAGE, client);
+    // CLIENT ITEM 3. Inside the transaction, before the DELETE, with the row
+    // locked so it cannot be accepted to the kitchen between the read and the
+    // write: a refusal deletes nothing, and the route prints no slip.
+    if (locked) {
+      const statusRows = await runQuery<{ status: number | string | null }>(
+        `select status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1 for update`,
+        [id, context.res_id, context.outlet_id],
+        client,
+      );
+      if (statusRows[0] && !(await waiterMayCancel(context, opts!.actor!, id, Number(statusRows[0].status ?? 0), printedKotNos))) {
+        throw new CancelNeedsSeniorError(id);
+      }
+    }
     const rows = await runQuery<{ id: string }>(
       `
         delete from "Orders"
@@ -16394,6 +16477,9 @@ export async function SetClosedBillCustomerDetails(
   if (address !== undefined && !(await billCustomerAddressColumnPresent())) {
     throw new CustomerAddressSchemaPendingError();
   }
+  // The settled-bill window reads "Orders".updated_at (settledWindowSql). Ensured
+  // BEFORE the transaction, so no DDL runs inside it.
+  await ensureRecordTimestampColumns();
   const written = await withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     await ensureBillWorkflowColumns(client);
@@ -17377,8 +17463,11 @@ export async function MergeTableBills(
     for (const o of orders) {
       const f = (parseJsonObject(o.food) ?? {});
       f.table = destName;
+      // Stamped with when it ARRIVED on the destination (ORDER_TABLE_SINCE_KEY),
+      // so the destination's settled-bill window places it on this bill and not
+      // on the one its previous party paid before the merge.
       await runQuery(
-        `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+        `update "Orders" set table_id = $1, food = ${foodWithTableSinceSql("$2")} where id = $3 and res_id = $4 and outlet_id = $5`,
         [toId, JSON.stringify(f), o.id, context.res_id, context.outlet_id],
         client,
       );
@@ -17641,11 +17730,14 @@ export async function MoveTableParty(
 
     // 0. THE PAPER THIS PARTY WAS HANDED. Asked while the orders and the bill
     //    are still on the source, because the seating that bounds it is the source's.
-    const movedPrints = await rekeyMovedPartyPrints(context, src, dst, client);
+    const { moved: movedPrints, start: partyStart } = await rekeyMovedPartyPrints(context, src, dst, client);
 
     // 1. THE ORDERS. table_id is what every reader joins on; `food.table` is the
     //    printed/displayed name and is carried in step with it so a KOT reprint,
-    //    the KDS card and the bill all say the same table.
+    //    the KDS card and the bill all say the same table. Each is stamped with
+    //    when it ARRIVED here (ORDER_TABLE_SINCE_KEY): the settled-bill window
+    //    reads that, not created_at, so these orders can never fall into the
+    //    bill of the party that sat here before.
     const orders = await runQuery<{ id: string; food: unknown }>(
       `select id, food from "Orders"
         where res_id = $1 and outlet_id = $2 and table_id = $3
@@ -17658,7 +17750,7 @@ export async function MoveTableParty(
       const f = parseJsonObject(o.food) ?? {};
       f.table = dst.table_name;
       await runQuery(
-        `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+        `update "Orders" set table_id = $1, food = ${foodWithTableSinceSql("$2")} where id = $3 and res_id = $4 and outlet_id = $5`,
         [dst.id, JSON.stringify(f), o.id, context.res_id, context.outlet_id],
         client,
       );
@@ -17722,6 +17814,18 @@ export async function MoveTableParty(
         client,
       );
       movedSession = true;
+    } else if (partyStart) {
+      // NO SEATING TO CARRY: the destination keeps the fresh row the trigger
+      // opened at the move — but the party sat down before that, and its paper
+      // (re-keyed above) was printed before it. Backdated to the start the
+      // retirement used, so the print bound the destination reads now is that
+      // one, and the party's own print still counts.
+      await runQuery(
+        `update "TableSessions" set seated_at = least(seated_at, $2::timestamptz)
+          where table_id = $1 and left_at is null`,
+        [dst.id, partyStart.toISOString()],
+        client,
+      );
     }
 
     // 4. THE WAITER. Re-pointed rather than re-assigned: assignTableById runs the
@@ -17805,19 +17909,23 @@ export async function MoveTableParty(
  * orange tile went green under a guest already holding paper.
  *
  * BOUNDED TWICE, because the name is shared with every party that ever sat at
- * the source: by the SEATING START (seatingStartOf over this party's bill and
- * orders — the previous party's prints stay behind) and by the EXACT prefix and
- * shape (`starts_with`, never LIKE, and only an epoch or a split suffix after
- * it, so "12-A-…" is not 12's).
+ * the source: by the SEATING START (seatingStartFor over this party's seating,
+ * bill and orders — the previous party's prints stay behind) and by the EXACT
+ * prefix and shape (`starts_with`, never LIKE, and only an epoch or a split
+ * suffix after it, so "12-A-…" is not 12's).
  *
- * THE DESTINATION'S HISTORY FIRST. The party keeps its orders' created_at, so
- * its seating starts before the move, and at the destination that bound
+ * THE DESTINATION'S HISTORY FIRST. The party keeps its seating and its bill
+ * row, so its seating starts before the move, and at the destination that bound
  * counted every `<dst>-<epoch>` print made after it — the bill of the party
  * that sat there, paid and left in the meantime (4 of the last 12 production
  * moves). The destination is free with no open bill (checked above), so those
  * prints are nobody's now: they are re-filed as `previous-party:<id>`
  * (previousPartyPrintJobId) under the same two bounds, and only THEN is the
  * party's own paper carried in, so it can never be retired with them.
+ *
+ * The start is returned: a party with no seating row to carry keeps its start
+ * on the fresh one the destination opens (MoveTableParty), so the bound the
+ * destination reads afterwards is the one the retirement used.
  *
  * IN A SAVEPOINT: a ledger that is not there (027 unapplied, or its grants
  * missing) must not abort the move — it has no prints to carry. Any other
@@ -17828,40 +17936,42 @@ async function rekeyMovedPartyPrints(
   src: { id: string; table_name: string },
   dst: { table_name: string },
   client: PoolClient,
-): Promise<number> {
-  const startRows = await runQuery<{ first_order_at: Date | null; bill_created_at: Date | null }>(
+): Promise<{ moved: number; start: Date | null }> {
+  // The source is occupied (MoveTableParty refuses otherwise) and
+  // "TableSessions" exists (ensured in the same transaction), so its open
+  // seating is read in the same statement.
+  const startRows = await runQuery<{
+    first_order_at: Date | null; bill_created_at: Date | null;
+    first_arrival?: Date | null; seated_at?: Date | null;
+  }>(
     `select (select min(o.created_at) from "Orders" o
               where o.res_id = $1 and o.outlet_id = $2 and o.table_id = $3
                 and ${stillOwesStatusSql("o.status")}) as first_order_at,
             (select b.created_at from "Bills" b
               where b.res_id = $1 and b.outlet_id = $2 and b.table_id = $3
                 and b.status != 3 and b.closed_at is null
-              order by b.created_at desc limit 1) as bill_created_at`,
-    [context.res_id, context.outlet_id, src.id],
+              order by b.created_at desc limit 1) as bill_created_at,
+            (select min(${orderArrivalSql({ food: "o.food", createdAt: "o.created_at", tableName: "$4" })}) from "Orders" o
+              where o.res_id = $1 and o.outlet_id = $2 and o.table_id = $3
+                and ${stillOwesStatusSql("o.status")}) as first_arrival,
+            (select max(s.seated_at) from "TableSessions" s
+              where s.table_id = $3 and s.left_at is null) as seated_at`,
+    [context.res_id, context.outlet_id, src.id, src.table_name],
     client,
   );
-  const start = seatingStartOf(startRows[0]?.bill_created_at ?? null, startRows[0]?.first_order_at ?? null);
+  const start = seatingStartFor({
+    sessionSeatedAt: startRows[0]?.seated_at ?? null,
+    billCreatedAt: startRows[0]?.bill_created_at ?? null,
+    firstOrderAt: startRows[0]?.first_order_at ?? null,
+    firstArrivalAt: startRows[0]?.first_arrival ?? null,
+  });
   // Nothing on the table: nothing this party can have printed.
-  if (start === null) {return 0;}
+  if (start === null) {return { moved: 0, start: null };}
   const from = billPrintFallbackPrefix(src.table_name);
   const to = billPrintFallbackPrefix(dst.table_name);
   await runQuery("savepoint move_party_print_rekey", [], client);
   try {
-    // $3 is the destination's prefix here; `$4 || bill_id` keeps the old id whole.
-    const retired = await runQuery<{ id: string }>(
-      `update "PrintJobs"
-          set bill_id = $4 || bill_id
-        where res_id = $1 and outlet_id = $2 and kind = $5
-          and starts_with(bill_id, $3)
-          and substr(bill_id, length($3) + 1) ~ '^([0-9]+|split-[0-9]+of[0-9]+)$'
-          and created_at >= $6::timestamptz
-        returning id`,
-      [context.res_id, context.outlet_id, to, PREVIOUS_PARTY_PRINT_MARK, BILL_PRINT_JOB_KIND, start.toISOString()],
-      client,
-    );
-    if (retired.length > 0) {
-      logger.info({ table: dst.table_name, retired: retired.length }, "move_party_destination_prints_retired");
-    }
+    await retirePreviousPartyPrints(context, dst.table_name, start, client);
     const rows = await runQuery<{ id: string }>(
       `update "PrintJobs"
           set bill_id = $4 || substr(bill_id, length($3) + 1)
@@ -17874,13 +17984,113 @@ async function rekeyMovedPartyPrints(
       client,
     );
     await runQuery("release savepoint move_party_print_rekey", [], client);
-    return rows.length;
+    return { moved: rows.length, start };
   } catch (err) {
     await runQuery("rollback to savepoint move_party_print_rekey", [], client);
     if (!isCaptureTableMissing(err)) {throw err;}
     logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "move_party_print_rekey_skipped (print ledger unavailable)");
-    return 0;
+    return { moved: 0, start };
   }
+}
+
+/**
+ * RE-FILE A FREE TABLE'S PREVIOUS PARTIES' FALLBACK PRINTS as
+ * `previous-party:<old id>` — every `<table>-<epoch>` / `<table>-split-NofM`
+ * bill job made at or after `since`. Run inside the caller's transaction (and
+ * savepoint): by MoveTableParty for the destination it lands on, and by
+ * MoveOrderToTable when a ticket seats a free table. A free table with no open
+ * bill has nobody seated, so those papers are nobody's; left under the table's
+ * name, the arriving seating could count them as its own.
+ */
+async function retirePreviousPartyPrints(
+  context: RestaurantContext,
+  tableName: string,
+  since: Date,
+  client: PoolClient,
+): Promise<number> {
+  // $3 is the table's prefix; `$4 || bill_id` keeps the old id whole.
+  const retired = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set bill_id = $4 || bill_id
+      where res_id = $1 and outlet_id = $2 and kind = $5
+        and starts_with(bill_id, $3)
+        and substr(bill_id, length($3) + 1) ~ '^([0-9]+|split-[0-9]+of[0-9]+)$'
+        and created_at >= $6::timestamptz
+      returning id`,
+    [context.res_id, context.outlet_id, billPrintFallbackPrefix(tableName), PREVIOUS_PARTY_PRINT_MARK, BILL_PRINT_JOB_KIND, since.toISOString()],
+    client,
+  );
+  if (retired.length > 0) {
+    logger.info({ table: tableName, retired: retired.length }, "previous_party_prints_retired");
+  }
+  return retired.length;
+}
+
+// THE OPEN SEATING, read for the print bound (seatingStartFor). "TableSessions"
+// is created lazily (ensureTableSessionsTable), so the readers below ask the
+// catalogue first — to_regclass never raises — rather than issue DDL on the
+// floor poll or let a missing relation fail a statement. PRESENT is remembered
+// for good; ABSENT is re-asked after a minute.
+let tableSessionsRelation: { present: boolean; checkedAt: number } | null = null;
+
+async function tableSessionsReadable(): Promise<boolean> {
+  const known = tableSessionsRelation;
+  const now = Date.now();
+  if (known && (known.present || now - known.checkedAt < 60_000)) {return known.present;}
+  let present = false;
+  try {
+    const rows = await runQuery<{ present: boolean }>(`select to_regclass('public."TableSessions"') is not null as present`);
+    present = rows[0]?.present === true;
+  } catch {
+    present = false;
+  }
+  tableSessionsRelation = { present, checkedAt: now };
+  return present;
+}
+
+/**
+ * seated_at of the open seating of each OCCUPIED table asked about (every
+ * table of the outlet when `tableIds` is null) — the newest open row, as the
+ * trigger closes it. A free table's leftover open row is not a seating. Never
+ * throws: no answer is "no seating", which is the rule as it was.
+ */
+async function openSeatingStarts(context: RestaurantContext, tableIds: string[] | null): Promise<Map<string, Date>> {
+  const out = new Map<string, Date>();
+  if (!(await tableSessionsReadable())) {return out;}
+  try {
+    const rows = await runQuery<{ table_id: string; seated_at: Date | string | null }>(
+      `select s.table_id::text as table_id, max(s.seated_at) as seated_at
+         from "TableSessions" s
+         join "Tables" t on t.id = s.table_id
+        where t.res_id = $1 and t.outlet_id = $2
+          and s.left_at is null
+          and coalesce(t.is_occupied, false) = true
+          and ($3::uuid[] is null or s.table_id = any($3::uuid[]))
+        group by s.table_id`,
+      [context.res_id, context.outlet_id, tableIds],
+    );
+    for (const r of rows) {
+      const at = r.seated_at ? new Date(r.seated_at) : null;
+      if (at && Number.isFinite(at.getTime())) {out.set(String(r.table_id), at);}
+    }
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "open_seating_read_failed (print bound falls back to the orders)");
+  }
+  return out;
+}
+
+async function openSeatingStartOf(context: RestaurantContext, tableId: string): Promise<Date | null> {
+  return (await openSeatingStarts(context, [tableId])).get(tableId) ?? null;
+}
+
+/** The earliest ARRIVAL on `tableName` of these still-owing orders (orderArrivedAt). */
+function firstArrivalOf(rows: readonly { food: unknown; created_at: Date | string | null }[], tableName: string): Date | null {
+  let first: number | null = null;
+  for (const r of rows) {
+    const t = orderArrivedAt(parseJsonObject(r.food) ?? {}, tableName, r.created_at);
+    if (t !== null && (first === null || t < first)) {first = t;}
+  }
+  return first === null ? null : new Date(first);
 }
 
 /**
@@ -17900,14 +18110,21 @@ async function currentSeatingPrintState(
       limit 1`,
     [table.id, context.res_id, context.outlet_id],
   );
-  const firstOrder = await runQuery<{ first_at: Date | null }>(
-    `select min(created_at) as first_at from "Orders"
+  const firstOrder = await runQuery<{ first_at: Date | null; first_arrival: Date | null }>(
+    `select min(created_at) as first_at,
+            min(${orderArrivalSql({ food: "food", createdAt: "created_at", tableName: "$4" })}) as first_arrival
+       from "Orders"
       where res_id = $1 and outlet_id = $2 and table_id = $3
         and ${stillOwesStatusSql()}`,
-    [context.res_id, context.outlet_id, table.id],
+    [context.res_id, context.outlet_id, table.id, table.table_name],
   );
   const openBillId = billRows[0]?.id ?? null;
-  const start = seatingStartOf(billRows[0]?.created_at ?? null, firstOrder[0]?.first_at ?? null);
+  const start = seatingStartFor({
+    sessionSeatedAt: await openSeatingStartOf(context, table.id),
+    billCreatedAt: billRows[0]?.created_at ?? null,
+    firstOrderAt: firstOrder[0]?.first_at ?? null,
+    firstArrivalAt: firstOrder[0]?.first_arrival ?? null,
+  });
   // Nothing on the table at all: nothing can have been printed for this party.
   if (start === null && !openBillId) {
     return { openBillId, start, prints: NO_SEATING_PRINTS };
@@ -18070,18 +18287,60 @@ export async function MoveOrderToTable(
     await assertBillEditable(context, order.table_id, client);
     await assertBillEditable(context, dst.id, client);
 
+    // THE GUEST ON THE TICKET IS THE DESTINATION'S. The name, GSTIN and address
+    // on an order belong to its seating (SetBillCustomerName writes them onto
+    // every running order of the table), so the ticket takes the identity the
+    // destination's paper already prints — "Guest" and nothing when it prints
+    // none, as a dish move writes — instead of carrying 12's company onto 15's
+    // GST invoice. Read in the destination's own order (created_at), exactly
+    // as GetBillForTable reads it.
+    const dstOrders = await runQuery<{ food: unknown }>(
+      `select food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and ${stillOwesStatusSql()}
+        order by created_at asc`,
+      [context.res_id, context.outlet_id, dst.id],
+      client,
+    );
+    const dstIdentity = seatingIdentityOf(dstOrders.map((r) => parseJsonObject(r.food) ?? {}));
+    // ...and the SOURCE's, as its paper prints it now (the ticket included), so
+    // the orders it keeps still name its guest once the ticket has gone.
+    const srcOrders = await runQuery<{ id: string; food: unknown }>(
+      `select id, food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and ${stillOwesStatusSql()}
+        order by created_at asc`,
+      [context.res_id, context.outlet_id, order.table_id],
+      client,
+    );
+    const srcIdentity = seatingIdentityOf(srcOrders.map((r) => parseJsonObject(r.food) ?? {}));
+
     const stored = parseJsonObject(order.food) ?? {};
-    const food = appendOrderMove(stored, {
+    const food = withSeatingIdentity(appendOrderMove(stored, {
       from_table: src?.table_name ?? "",
       to_table: dst.table_name,
       at: new Date().toISOString(),
       by: String(opts?.by ?? "").trim() || null,
-    });
+    }), dstIdentity);
+    // Stamped with when it ARRIVED (ORDER_TABLE_SINCE_KEY), by the database's
+    // clock: the settled-bill window reads that, not created_at.
     await runQuery(
-      `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+      `update "Orders" set table_id = $1, food = ${foodWithTableSinceSql("$2")} where id = $3 and res_id = $4 and outlet_id = $5`,
       [dst.id, JSON.stringify(food), order.id, context.res_id, context.outlet_id],
       client,
     );
+    // The source's remaining orders keep its guest (withFilledSeatingIdentity):
+    // filled where they carry none, never overwritten.
+    for (const o of srcOrders) {
+      if (o.id === order.id) {continue;}
+      const filled = withFilledSeatingIdentity(parseJsonObject(o.food) ?? {}, srcIdentity);
+      if (!filled) {continue;}
+      await runQuery(
+        `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+        [o.id, context.res_id, context.outlet_id, JSON.stringify(filled)],
+        client,
+      );
+    }
 
     // Seat the destination if it was not, exactly as placing the order there
     // would have. num_covers is left alone (coalesced to at least 1) so a table
@@ -18095,6 +18354,28 @@ export async function MoveOrderToTable(
         [dst.id, context.res_id, context.outlet_id],
         client,
       );
+      // THE PAPER OF WHOEVER SAT HERE BEFORE is nobody's now: the table was
+      // free. Its `<dst>-<epoch>` prints made since this ticket was placed are
+      // re-filed (retirePreviousPartyPrints), as MoveTableParty does for the
+      // table a party lands on, so the seating this move opens can never count
+      // them as its own. In a savepoint: a missing ledger has nothing to retire.
+      const placed = await runQuery<{ created_at: Date | null }>(
+        `select created_at from "Orders" where id = $1 and res_id = $2 and outlet_id = $3`,
+        [order.id, context.res_id, context.outlet_id],
+        client,
+      );
+      const since = placed[0]?.created_at ? new Date(placed[0].created_at) : null;
+      if (since && Number.isFinite(since.getTime())) {
+        await runQuery("savepoint move_order_print_retire", [], client);
+        try {
+          await retirePreviousPartyPrints(context, dst.table_name, since, client);
+          await runQuery("release savepoint move_order_print_retire", [], client);
+        } catch (err) {
+          await runQuery("rollback to savepoint move_order_print_retire", [], client);
+          if (!isCaptureTableMissing(err)) {throw err;}
+          logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "move_order_print_retire_skipped (print ledger unavailable)");
+        }
+      }
     }
 
     // Both ends' bills are re-summed from their orders. The source keeps its
@@ -18416,8 +18697,10 @@ export async function ReopenBill(
   byUsername?: string | null,
 ): Promise<ReopenedBill> {
   // Resolved BEFORE the transaction: the 053 latch may issue DDL, which must
-  // never run inside one (see nextPartyReady).
+  // never run inside one (see nextPartyReady). The same for "Orders".updated_at,
+  // which the restore's window reads (settledWindowSql).
   const withNextParty = await nextPartyReady();
+  await ensureRecordTimestampColumns();
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
@@ -18521,9 +18804,11 @@ export async function ReopenBill(
     // a guest has paid — there is none.
     const wasNc = isNcSettleMethod(bill.payment_method);
 
-    // Restore THIS session's settled orders (Paid/Closed between the previous
-    // bill's close and this bill's close) so the bill is actionable again. Older
-    // sessions' orders stay settled; Cancelled orders stay cancelled.
+    // Restore THIS session's settled orders (Paid/Closed, ARRIVED on the table
+    // between the previous bill's close and this bill's close — settledWindowSql,
+    // so an order moved here after the previous party paid is this bill's, and
+    // one moved away is not) so the bill is actionable again. Older sessions'
+    // orders stay settled; Cancelled orders stay cancelled.
     let restored = 0;
     let tableName: string | null = null;
     if (bill.table_id) {
@@ -18540,7 +18825,12 @@ export async function ReopenBill(
                 food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb('${wasNc ? "Served" : "Payment Pending Approval"}'::text), true)
           where res_id = $1 and outlet_id = $2 and table_id = $3
             and coalesce(status::text, '1') in ('4', '7')
-            and created_at > $4 and created_at <= $5
+            and ${settledWindowSql({
+              alias: `"Orders"`,
+              tableName: `(select tn.table_name from "Tables" tn where tn.id = "Orders".table_id)`,
+              prevClosed: "$4::timestamptz",
+              closedAt: "$5::timestamptz",
+            })}
           returning id`,
         [context.res_id, context.outlet_id, bill.table_id, prev[0]?.prev_closed ?? new Date(0), bill.closed_at],
         client,
@@ -19023,9 +19313,11 @@ function closedBillDiscount(
 }
 
 /**
- * The orders that made up a closed bill: everything settled on that table
- * between the PREVIOUS bill's close and this one's. Identical window to
- * ReopenBill, which is the proven inverse of settlement.
+ * The orders that made up a closed bill: everything settled on that table that
+ * ARRIVED there between the PREVIOUS bill's close and this one's
+ * (settledWindowSql — an order moved in keeps its created_at, and is placed by
+ * when it landed). Identical window to ReopenBill, which is the proven inverse
+ * of settlement.
  */
 async function ordersForClosedBill(
   context: RestaurantContext,
@@ -19052,10 +19344,15 @@ async function ordersForClosedBill(
   );
   return runQuery<{ id: string; created_at: Date; status: unknown; food: unknown }>(
     `select id, created_at, status, food
-       from "Orders"
+       from "Orders" o
       where res_id = $1 and outlet_id = $2 and table_id = $3
         and coalesce(status::text, '1') = any($4::text[])
-        and created_at > $5 and created_at <= $6
+        and ${settledWindowSql({
+          alias: "o",
+          tableName: `(select tn.table_name from "Tables" tn where tn.id = o.table_id)`,
+          prevClosed: "$5::timestamptz",
+          closedAt: "$6::timestamptz",
+        })}
       order by created_at asc`,
     [context.res_id, context.outlet_id, row.table_id, statusCodes, prev[0]?.prev_closed ?? new Date(0), row.closed_at],
   );
@@ -19367,17 +19664,19 @@ async function readClosedBillListIdentity(
   const ids = billIds.filter((id) => isUuid(id));
   if (ids.length === 0) {return out;}
   // One window, written once and used by both subqueries.
+  // The previous close on the bill's table is read ONCE per bill (the lateral
+  // `pc` below) and named by both bounds of the window.
   const inWindow = `o.res_id = b.res_id and o.outlet_id = b.outlet_id
                 and case
                       when b.table_id is null or b.closed_at is null then o.id = b.order_id
                       else o.table_id = b.table_id
                        and coalesce(o.status::text, '1') = any($3::text[])
-                       and o.created_at <= b.closed_at
-                       and o.created_at > coalesce((
-                             select max(p.closed_at) from "Bills" p
-                              where p.table_id = b.table_id and p.res_id = b.res_id and p.outlet_id = b.outlet_id
-                                and p.id <> b.id and p.closed_at is not null and p.closed_at <= b.closed_at
-                           ), 'epoch'::timestamptz)
+                       and ${settledWindowSql({
+                         alias: "o",
+                         tableName: "pc.table_name",
+                         prevClosed: "pc.prev_closed",
+                         closedAt: "b.closed_at",
+                       })}
                     end`;
   // Settled orders before cancelled ones, then oldest first: the detail read's
   // "picked set, then identity window" in one ORDER BY.
@@ -19396,6 +19695,13 @@ async function readClosedBillListIdentity(
                 and lower(coalesce(btrim(o.food::jsonb ->> 'customer'), '')) not in ('', 'guest', 'qr guest', 'null', 'undefined')
               ${firstFirst}) as food_customer
        from "Bills" b
+       cross join lateral (
+         select coalesce((select max(p.closed_at) from "Bills" p
+                           where p.table_id = b.table_id and p.res_id = b.res_id and p.outlet_id = b.outlet_id
+                             and p.id <> b.id and p.closed_at is not null and p.closed_at <= b.closed_at),
+                         'epoch'::timestamptz) as prev_closed,
+                (select tn.table_name from "Tables" tn where tn.id = b.table_id) as table_name
+       ) pc
       where b.res_id = $1 and b.id = any($2::uuid[])`,
     [context.res_id, ids, CLOSED_BILL_IDENTITY_STATUS_CODES],
   );
@@ -38154,33 +38460,66 @@ async function routingWrite<T>(where: string, run: () => Promise<T>): Promise<T>
  * ensureLazyTable wrapper bounds it to one run per process; running it off the
  * hot path is what makes that one run harmless.
  */
+export const PRINT_ROUTING_COLUMN_DDL: readonly (readonly [string, string])[] = [
+  // WHO the router picked, and WHERE on that machine. No foreign key on either:
+  // deleting a device must never cascade into settled receipt history (027/038's
+  // rule), so these stay plain uuids that may name a row that no longer exists.
+  ["assigned_device_id", "uuid"],
+  ["assigned_target", "text"],
+  ["destination_id", "uuid"],
+  // The assignment deadline AND the lease — see EnqueuePrintJob for why one
+  // clock rather than two.
+  ["assign_expires_at", "timestamptz"],
+  // The fence every reassignment compares against. Two replicas can both decide
+  // to escalate the same silent job; the generation is what makes exactly one
+  // of them win, with no leader lock.
+  ["assign_generation", "smallint not null default 0"],
+  // The accept beat's stamp: "a device is trying" is a different state from
+  // "a device was told", and only the first earns the long deadline.
+  ["assign_accepted_at", "timestamptz"],
+  // Every device that has already failed this job. This is what "never ask the
+  // same jammed printer twice" survives on once 'failed' stops being terminal
+  // for the job, and what makes the client's own ack retry a no-op.
+  ["failed_devices", "jsonb not null default '[]'::jsonb"],
+  // Receipt history: which machine actually produced the paper.
+  ["printed_by_device", "uuid"],
+  // The trace that answers "why did the bar docket print at the pass?". Without
+  // it the fallback rung is invisible and the feature quietly stops being one.
+  ["broadcast_at", "timestamptz"],
+];
+
+/**
+ * ASK FIRST. ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on "PrintJobs"
+ * BEFORE it looks, and the nine used to run on every boot with no lock timeout:
+ * one session still holding any lock on "PrintJobs" (a settle on the container
+ * being replaced) hung the boot indefinitely — ahead of every 2.0.2 step that
+ * was deliberately limited to 2 seconds, and ahead of the listener. Production
+ * has all nine (042), so the step reads the catalogue and does nothing; a box
+ * missing some adds ONLY those, in one statement under a 2-second LOCAL lock
+ * timeout (ensurePrintJobPaperColumns' shape). A timeout throws, the memo stays
+ * unset, and initPrintRoutingSchema's `limit 0` probe decides the latch.
+ */
 export async function ensurePrintRoutingColumns(): Promise<void> {
   await ensureLazyTable("PrintJobs.print_routing_cols", async () => {
-    // WHO the router picked, and WHERE on that machine. No foreign key on either:
-    // deleting a device must never cascade into settled receipt history (027/038's
-    // rule), so these stay plain uuids that may name a row that no longer exists.
-    await runQuery(`alter table "PrintJobs" add column if not exists assigned_device_id uuid`);
-    await runQuery(`alter table "PrintJobs" add column if not exists assigned_target text`);
-    await runQuery(`alter table "PrintJobs" add column if not exists destination_id uuid`);
-    // The assignment deadline AND the lease — see EnqueuePrintJob for why one
-    // clock rather than two.
-    await runQuery(`alter table "PrintJobs" add column if not exists assign_expires_at timestamptz`);
-    // The fence every reassignment compares against. Two replicas can both decide
-    // to escalate the same silent job; the generation is what makes exactly one
-    // of them win, with no leader lock.
-    await runQuery(`alter table "PrintJobs" add column if not exists assign_generation smallint not null default 0`);
-    // The accept beat's stamp: "a device is trying" is a different state from
-    // "a device was told", and only the first earns the long deadline.
-    await runQuery(`alter table "PrintJobs" add column if not exists assign_accepted_at timestamptz`);
-    // Every device that has already failed this job. This is what "never ask the
-    // same jammed printer twice" survives on once 'failed' stops being terminal
-    // for the job, and what makes the client's own ack retry a no-op.
-    await runQuery(`alter table "PrintJobs" add column if not exists failed_devices jsonb not null default '[]'::jsonb`);
-    // Receipt history: which machine actually produced the paper.
-    await runQuery(`alter table "PrintJobs" add column if not exists printed_by_device uuid`);
-    // The trace that answers "why did the bar docket print at the pass?". Without
-    // it the fallback rung is invisible and the feature quietly stops being one.
-    await runQuery(`alter table "PrintJobs" add column if not exists broadcast_at timestamptz`);
+    const rows = await runQuery<{ column_name: string }>(
+      `select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'PrintJobs'
+          and column_name = any($1::text[])`,
+      [PRINT_ROUTING_COLUMN_DDL.map(([name]) => name)],
+    );
+    const have = new Set(rows.map((r) => String(r.column_name)));
+    const missing = PRINT_ROUTING_COLUMN_DDL.filter(([name]) => !have.has(name));
+    if (missing.length === 0) {return;}
+    const adds = missing.map(([name, definition]) => `
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'PrintJobs'
+                             and column_name = '${name}') then
+             alter table "PrintJobs" add column if not exists ${name} ${definition};
+           end if;`).join("");
+    await runQuery(`do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);${adds}
+         end $$`);
   });
 }
 

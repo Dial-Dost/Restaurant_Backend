@@ -32,6 +32,8 @@
 // Dispatch THROWS on any unrecognised statement, so a path that starts issuing
 // a new query fails loudly rather than silently receiving zero rows.
 
+import { orderArrivedAt } from "../order_moves";
+
 export const RES_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
 export const OUTLET_ID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
 export const OTHER_OUTLET_ID = "cccccccc-3333-4333-8333-cccccccccccc";
@@ -327,6 +329,20 @@ export function addPrint(billId: string, over: Partial<PrintJobFix> = {}): Print
 
 export const printJobs = (): PrintJobFix[] => store.printJobs.map((r) => ({ ...r }));
 
+/** A status written by another screen (a senior's cancel, a settle elsewhere). */
+export function setOrderStatus(id: string, status: string): void {
+  const o = store.orders.find((x) => x.id === id);
+  if (!o) {throw new Error(`next_party_fixtures: no order ${id}`);}
+  o.status = status;
+}
+
+/** An order's food rewritten in place (a guest named on it, as SetBillCustomerName writes). */
+export function setOrderFood(id: string, food: Record<string, unknown>): void {
+  const o = store.orders.find((x) => x.id === id);
+  if (!o) {throw new Error(`next_party_fixtures: no order ${id}`);}
+  o.food = JSON.parse(JSON.stringify(food)) as Record<string, unknown>;
+}
+
 /** Confirm a payment the way the waiter step leaves a bill: ready for approval. */
 export function markWaiterConfirmed(billId: string, method = "Cash"): void {
   const b = store.bills.find((x) => x.id === billId);
@@ -387,6 +403,43 @@ const isOwing = (status: string): boolean => !OWING_EXCLUDED.includes(str(status
 const releaseVoidable = (status: string): boolean => !["4", "5", "7", "6"].includes(str(status) || "1");
 const at = (iso: string | null | undefined): number => (iso ? Date.parse(iso) : NaN);
 const inOutlet = (row: { outlet_id: string }, params: unknown[], idx: number): boolean => row.outlet_id === str(params[idx]);
+
+/** A table's name by id, deleted rows included (a settled bill's seat may be retired). */
+const tableNameOf = (tableId: string): string => store.tables.find((t) => t.id === tableId)?.table_name ?? "";
+
+/** min(orderArrivalSql) over these orders, on the named table — as the SQL computes it. */
+function firstArrival(rows: readonly OrderFix[], tableName: string): Date | null {
+  let first: number | null = null;
+  for (const o of rows) {
+    const t = orderArrivedAt(o.food, tableName, o.created_at);
+    if (t !== null && (first === null || t < first)) {first = t;}
+  }
+  return first === null ? null : new Date(first);
+}
+
+/** max(seated_at) of a table's OPEN seating rows, or null. */
+function newestOpenSeating(tableId: string): Date | null {
+  const open = store.sessions.filter((x) => x.table_id === tableId && x.left_at === null).map((x) => x.seated_at).sort();
+  const last = open[open.length - 1];
+  return last ? new Date(last) : null;
+}
+
+/**
+ * settledWindowSql, as the re-open issues it: the order ARRIVED on its table
+ * after the previous close and no later than this one. (The updated_at
+ * pre-filter is implied by the arrival and is not modelled.)
+ */
+function inSettledWindow(o: OrderFix, after: number, upTo: number): boolean {
+  const arrived = orderArrivedAt(o.food, tableNameOf(o.table_id), o.created_at);
+  return arrived !== null && at(o.created_at) <= upTo && arrived > after && arrived <= upTo;
+}
+
+function assertSettledWindow(s: string): void {
+  if (!s.includes("coalesce(\"orders\".updated_at, \"orders\".created_at) > $4::timestamptz")
+    || !s.includes("'table_since'") || s.includes("and created_at > $4 and created_at <= $5")) {
+    throw new Error("next_party_fixtures: the re-open's window must be read on the arrival (settledWindowSql)");
+  }
+}
 
 function contextRow(): Record<string, unknown> {
   return {
@@ -632,9 +685,20 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   // MoveTableParty's re-key of the moving party's `<name>-<epoch>` prints.
   if (s.startsWith("select (select min(o.created_at) from \"orders\" o")) {
     const tableId = str(params[2]);
-    const owing = store.orders.filter((o) => o.table_id === tableId && inOutlet(o, params, 1) && isOwing(o.status)).map((o) => o.created_at).sort();
+    const owingRows = store.orders.filter((o) => o.table_id === tableId && inOutlet(o, params, 1) && isOwing(o.status));
+    const owing = owingRows.map((o) => o.created_at).sort();
     const bill = openBillOf(tableId, (b) => b.status !== 3 && inOutlet(b, params, 1));
-    return { rows: [{ first_order_at: owing[0] ? new Date(owing[0]) : null, bill_created_at: bill ? new Date(bill.created_at) : null }] };
+    if (!s.includes("as first_arrival") || !s.includes('from "tablesessions" s where s.table_id = $3 and s.left_at is null')) {
+      throw new Error("next_party_fixtures: the re-key's seating start must read the arrivals and the open seating");
+    }
+    return {
+      rows: [{
+        first_order_at: owing[0] ? new Date(owing[0]) : null,
+        bill_created_at: bill ? new Date(bill.created_at) : null,
+        first_arrival: firstArrival(owingRows, str(params[3])),
+        seated_at: newestOpenSeating(tableId),
+      }],
+    };
   }
   // ...and, before it, the retirement of the destination's previous party's prints.
   if (s.startsWith("update \"printjobs\" set bill_id = $4 || bill_id where")) {
@@ -1028,14 +1092,48 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     return { rows: [] };
   }
 
+  // --- MoveOrderToTable (client items 3-4; money-floor review of 2.0.2) --------
+  if (s.startsWith('select id, table_id, food, status from "orders" where id = $1 and res_id = $2 and outlet_id = $3')) {
+    const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    return { rows: o ? [{ id: o.id, table_id: o.table_id, food: JSON.stringify(o.food), status: o.status }] : [] };
+  }
+  if (s.startsWith('select food from "orders" where res_id = $1 and outlet_id = $2 and table_id = $3')) {
+    if (!s.includes("coalesce(status::text, '1') not in ('4','5','7')") || !s.includes("order by created_at asc")) {
+      throw new Error("next_party_fixtures: the destination's guest is read off its running orders, oldest first");
+    }
+    return {
+      rows: store.orders
+        .filter((o) => inOutlet(o, params, 1) && o.table_id === str(params[2]) && isOwing(o.status))
+        .sort((a, z) => (a.created_at < z.created_at ? -1 : 1))
+        .map((o) => ({ food: JSON.stringify(o.food) })),
+    };
+  }
+  if (s.startsWith('select created_at from "orders" where id = $1 and res_id = $2 and outlet_id = $3')) {
+    const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    return { rows: o ? [{ created_at: new Date(o.created_at) }] : [] };
+  }
+  if (s.startsWith('update "tables" set is_occupied = true, num_covers = greatest(1, coalesce(num_covers, 1)) where id = $1')) {
+    const t = byId(0, 2);
+    if (t) {updateTable(t, { is_occupied: true, num_covers: Math.max(1, t.num_covers || 1) });}
+    return { rows: [] };
+  }
+  if (s.startsWith('select count(*)::text as n from "orders" where res_id = $1 and outlet_id = $2 and table_id = $3')) {
+    const n = store.orders.filter((o) => inOutlet(o, params, 1) && o.table_id === str(params[2]) && isOwing(o.status)).length;
+    return { rows: [{ n: String(n) }] };
+  }
+
   // --- MoveTableParty (the statements table_move_fixtures models) -------------
   if (s.includes('from "tables"') && s.includes("order by id") && s.includes("coalesce(is_virtual, false) as is_virtual")) {
     const a = str(params[2]).trim().toLowerCase();
     const b = str(params[3]).trim().toLowerCase();
     const withParent = s.includes("parent_table_id");
+    // MoveOrderToTable asks by the source's ID or the destination's NAME.
+    const byIdOrName = s.includes("(id = $3 or lower(btrim(table_name)) = lower(btrim($4)))");
     return {
       rows: store.tables
-        .filter((t) => inOutlet(t, params, 1) && !t.is_deleted && [a, b].includes(t.table_name.trim().toLowerCase()))
+        .filter((t) => inOutlet(t, params, 1) && !t.is_deleted && (byIdOrName
+          ? (t.id === str(params[2]) || t.table_name.trim().toLowerCase() === b)
+          : [a, b].includes(t.table_name.trim().toLowerCase())))
         .sort((x, y) => (x.id < y.id ? -1 : 1))
         .map((t) => ({
           id: t.id, table_name: t.table_name, capacity: t.capacity, max_capacity: t.max_capacity,
@@ -1053,6 +1151,29 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     const moved = store.bills.filter((b) => b.table_id === str(params[3]) && b.closed_at === null);
     for (const b of moved) {b.table_id = str(params[0]);}
     return { rows: moved.map((b) => ({ id: b.id })) };
+  }
+  if (s.startsWith(`select to_regclass('public."tablesessions"') is not null as present`)) {
+    return { rows: [{ present: true }] };
+  }
+  if (s.startsWith('select s.table_id::text as table_id, max(s.seated_at) as seated_at from "tablesessions" s join "tables" t')) {
+    if (!s.includes("s.left_at is null") || !s.includes("coalesce(t.is_occupied, false) = true")) {
+      throw new Error("next_party_fixtures: only an OCCUPIED table's OPEN seating bounds its prints");
+    }
+    const ids = Array.isArray(params[2]) ? (params[2] as string[]) : null;
+    const out: { table_id: string; seated_at: Date }[] = [];
+    for (const t of store.tables) {
+      if (t.outlet_id !== str(params[1]) || !t.is_occupied || (ids && !ids.includes(t.id))) {continue;}
+      const seatedAt = newestOpenSeating(t.id);
+      if (seatedAt) {out.push({ table_id: t.id, seated_at: seatedAt });}
+    }
+    return { rows: out };
+  }
+  if (s.startsWith('update "tablesessions" set seated_at = least(seated_at, $2::timestamptz) where table_id = $1 and left_at is null')) {
+    const floor = new Date(str(params[1])).toISOString();
+    for (const x of store.sessions) {
+      if (x.table_id === str(params[0]) && x.left_at === null && floor < x.seated_at) {x.seated_at = floor;}
+    }
+    return { rows: [] };
   }
   if (s.startsWith("select id from \"tablesessions\" where table_id = $1 and left_at is null")) {
     const open = store.sessions.filter((x) => x.table_id === str(params[0]) && x.left_at === null)
@@ -1109,10 +1230,10 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
         .map((o) => ({ table_id: o.table_id, food: JSON.stringify(o.food), created_at: new Date(o.created_at) })),
     };
   }
-  if (s.startsWith("select min(created_at) as first_at from \"orders\"")) {
+  if (s.startsWith("select min(created_at) as first_at, min(coalesce(")) {
     const owing = store.orders.filter((o) => inOutlet(o, params, 1) && tableIs(o, 2) && isOwing(o.status));
     const first = owing.map((o) => o.created_at).sort()[0];
-    return { rows: [{ first_at: first ? new Date(first) : null }] };
+    return { rows: [{ first_at: first ? new Date(first) : null, first_arrival: firstArrival(owing, str(params[3])) }] };
   }
   if (s.startsWith("select food from \"orders\" where id = $1 and res_id = $2 and outlet_id = $3")) {
     const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
@@ -1149,13 +1270,13 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   }
   // ReopenBill: this session's settled orders back to "Payment Pending Approval".
   if (s.startsWith("update \"orders\" set status = 6, food = jsonb_set(")) {
+    assertSettledWindow(s);
     const after = at(new Date(params[3] as string | Date).toISOString());
     const upTo = at(new Date(params[4] as string | Date).toISOString());
     const out: { id: string }[] = [];
     for (const o of store.orders) {
       if (!inOutlet(o, params, 1) || !tableIs(o, 2) || !["4", "7"].includes(str(o.status) || "1")) {continue;}
-      const placed = at(o.created_at);
-      if (!(placed > after && placed <= upTo)) {continue;}
+      if (!inSettledWindow(o, after, upTo)) {continue;}
       o.status = "6";
       o.food = { ...o.food, status: "Payment Pending Approval" };
       out.push({ id: o.id });
@@ -1168,6 +1289,14 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
         o.status = str(params[0]);
         o.food = { ...o.food, status: str(params[1]) };
       }
+    }
+    return { rows: [] };
+  }
+  if (s.startsWith("update \"orders\" set table_id = $1, food = jsonb_set(($2)::jsonb, '{table_since}', to_jsonb(now()), true)::json where id = $3")) {
+    const o = store.orders.find((x) => x.id === str(params[2]) && inOutlet(x, params, 4));
+    if (o) {
+      o.table_id = str(params[0]);
+      o.food = { ...(JSON.parse(str(params[1])) as Record<string, unknown>), table_since: nowIso() };
     }
     return { rows: [] };
   }
@@ -1483,13 +1612,13 @@ async function ncDispatch(clientId: number, s: string, params: unknown[]): Promi
   }
   // ...its orders back to Served (a paid bill's go to Payment Pending Approval)...
   if (s.startsWith('update "orders" set status = 2, food = jsonb_set(')) {
+    assertSettledWindow(s);
     const after = at(new Date(params[3] as string | Date).toISOString());
     const upTo = at(new Date(params[4] as string | Date).toISOString());
     const out: { id: string }[] = [];
     for (const o of store.orders) {
       if (!inOutlet(o, params, 1) || o.table_id !== str(params[2]) || !["4", "7"].includes(str(o.status) || "1")) {continue;}
-      const placed = at(o.created_at);
-      if (!(placed > after && placed <= upTo)) {continue;}
+      if (!inSettledWindow(o, after, upTo)) {continue;}
       o.status = "2";
       o.food = { ...o.food, status: "Served" };
       out.push({ id: o.id });

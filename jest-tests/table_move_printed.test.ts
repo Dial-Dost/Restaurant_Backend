@@ -31,6 +31,7 @@ import {
   addOrder,
   addPrintJob,
   addTable,
+  dropSessionsFor,
   failNextStatementContaining,
   orders,
   printJobs,
@@ -150,12 +151,26 @@ describe("a printed party's paper moves with it", () => {
     expect(res).toMatchObject({ moved_prints: 0, printed: false, printed_as: null });
   });
 
-  test("a seated party with no order and no bill has nothing to re-key — no ledger statement is issued", async () => {
+  test("a seated party with no order, no bill and no seating row has nothing to re-key — no ledger statement is issued", async () => {
     addTable({ table_name: "T1", capacity: 4, is_occupied: true, num_covers: 2 });
     addTable({ table_name: "T2", capacity: 4 });
+    dropSessionsFor(tableByName("T1")!.id);
     const res = await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
     expect(res.moved_prints).toBe(0);
     expect(statements().filter((q) => q.startsWith('update "printjobs"'))).toEqual([]);
+  });
+
+  test("a seated party with no order and no bill is still a SEATING: its prints are bounded by when it sat down", async () => {
+    // Seated at 12:00 (the fixture's seating row). A print of T1 at 11:00 was the
+    // previous party's; one at 12:30 is this party's paper and moves with it.
+    addTable({ table_name: "T1", capacity: 4, is_occupied: true, num_covers: 2 });
+    addTable({ table_name: "T2", capacity: 4 });
+    const before = addPrintJob({ bill_id: "T1-1789500000000", created_at: "2026-09-09T11:00:00.000Z" });
+    const mine = addPrintJob({ bill_id: "T1-1789545000000", created_at: "2026-09-09T12:30:00.000Z" });
+    const res = await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
+    expect(res.moved_prints).toBe(1);
+    expect(printJobs().find((j) => j.id === mine.id)?.bill_id).toBe("T2-1789545000000");
+    expect(printJobs().find((j) => j.id === before.id)?.bill_id).toBe("T1-1789500000000");
   });
 });
 

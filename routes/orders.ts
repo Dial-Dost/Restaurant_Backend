@@ -9,6 +9,7 @@ import { isCancelNeedsSeniorError } from "../cancel_authority.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
 import { autoPrintOrderKot, dispatchCancellationKot, type KotLine } from "../kot_print.js";
 import { idempotent } from "../idempotency.js";
+import { PRINTED_BILL_NEW_ORDER_DOOR } from "../mis_report_math.js";
 import { resolveServeIntent } from "../order_intent.js";
 import { logger } from "../observability.js";
 import { hidesPrices, redactOrderList } from "../price_scope.js";
@@ -218,7 +219,8 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 		} catch (err) { logger.warn({ err }, "log_audit order-create failed"); }
 		emitOrderCreated(restaurantId, created);
 		// The order is on a printed bill: say so in the audit log, now it has landed.
-		await noteAdditionToPrintedBill(req, guard);
+		// The door and the order id are what the Bill Edit report reads.
+		await noteAdditionToPrintedBill(req, guard, { orderId: created.orderId, door: PRINTED_BILL_NEW_ORDER_DOOR });
 		// THE KITCHEN DOCKET, at the moment the order is placed. Never throws and
 		// never fails the order: the row is committed and the guest has been told
 		// it was taken, so a printer problem is reported, not raised.
@@ -941,7 +943,11 @@ app.delete("/orders/:id", validateAction(PERM_ORDER_DELETE), idempotent(), async
 		// the moment DeleteOrder returns, so the slip is built from facts captured
 		// here. Best-effort — an unreadable order costs the slip, not the delete.
 		const kotContext = await GetOrderKotContext(restaurantId, orderId).catch(() => null);
-		const deleted = await DeleteOrder(restaurantId, orderId);
+		// CLIENT ITEM 3 — this door deletes the order AND prints a CANCELLED slip,
+		// so a waiter-only login is refused a ticketed order here as on the other
+		// three, even holding "Delete Orders". DeleteOrder judges it inside its
+		// transaction and throws before deleting anything.
+		const deleted = await DeleteOrder(restaurantId, orderId, { actor: actorOf(req) });
 		if (!deleted) {
 			res.status(404).json({ error: "Order not found" });
 			return;
@@ -967,6 +973,7 @@ app.delete("/orders/:id", validateAction(PERM_ORDER_DELETE), idempotent(), async
 		});
 		res.status(204).send();
 	} catch (error: any) {
+		if (isCancelNeedsSeniorError(error)) { await refuseTicketedCancel(req, res, error); return; }
 		logger.error({ err: error }, "delete_order_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to delete order") });
 	}

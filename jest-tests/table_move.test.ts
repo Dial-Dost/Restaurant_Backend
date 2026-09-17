@@ -150,9 +150,22 @@ describe("MoveTableParty — the whole party arrives together", () => {
     const open = openSessions();
     expect(open).toHaveLength(1);
     expect(open[0]).toMatchObject({ table_id: t2, covers: 4 });
-    // Seated NOW, because this genuinely is the first seating anything has
-    // recorded for this party — an honest degradation, not a fabricated history.
-    expect(open[0].seated_at).toBe("2026-09-09T13:00:00.000Z");
+    // The trigger opened it at the move (13:00), and the move then took it back
+    // to the party's OWN start — its first order at 12:05, the bound the print
+    // re-key used — so the destination's print bound (seatingStartFor) is the
+    // party's and its paper still counts. Never earlier than anything the party
+    // did: no history is invented.
+    expect(open[0].seated_at).toBe("2026-09-09T12:05:00.000Z");
+    expect(statements()).toContain('update "tablesessions" set seated_at = least(seated_at, $2::timestamptz) where table_id = $1 and left_at is null');
+  });
+
+  test("…and a party with nothing on it (no order, no bill, no seating) keeps the row the trigger opened", async () => {
+    addTable({ table_name: "T1", capacity: 4, is_occupied: true, num_covers: 2 });
+    addTable({ table_name: "T2", capacity: 4 });
+    dropSessionsFor(tableByName("T1")!.id);
+    await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
+    expect(openSessions()).toMatchObject([{ table_id: tableByName("T2")!.id, seated_at: "2026-09-09T13:00:00.000Z" }]);
+    expect(statements().some((q) => q.startsWith('update "tablesessions" set seated_at'))).toBe(false);
   });
 
   test("a seated reservation follows the party to the new table", async () => {
