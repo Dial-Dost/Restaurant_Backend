@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "2.0.0";
+const LATEST = "2.0.1";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,13 +118,12 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"Reports now say Gross for the full bill value, including service charge, tax and round off, and Net "+
-		"for the menu value after discounts; the old pre-discount figure is called Item total. Every report "+
-		"can be cut to a session: Lunch (12pm-5pm), Dinner (6pm-12am) or your own times, and Sales Summary "+
-		"can show sales by hour of the day or by session. The Void KOT export now lists the dishes that were "+
-		"voided, and exported dates read in your restaurant's time. When taking an order, View order lets "+
-		"you read it back to the guest before sending it to the kitchen. Removing the service charge and "+
-		"printing the bill is now one step: Remove service charge & print.",
+		"The kitchen ticket now looks like your reference KOT, in its own typeface, and you can choose Small, "+
+		"Standard or Large text in Settings (or switch back to the old text ticket if a kitchen printer prints it "+
+		"blank). A held dish now just says [Hold]. When a bill has been printed, the waiter sees the same table "+
+		"number marked Next party for the next guests. Settle as NC is now a way to close a bill, and NC bills "+
+		"show in reports. The reason is optional when removing a service charge, and the clear button in the "+
+		"order search now clears the text.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
