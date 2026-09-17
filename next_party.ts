@@ -390,6 +390,14 @@ export function billPrintedRefusal(input: {
 	const next = write === "order" ? String(input.nextPartyTable ?? "").trim() : "";
 	const nextParent = parseNextPartyName(next)?.root ?? null;
 	const nextNamed = next ? tableSentenceName(next, nextParent) : "";
+	// THE SEAT'S HANDLE TOO, when the words differ from it. "12 (next party)" is
+	// drawn only by 2.0.1 clients; an installed 2.0.0 app lists the same seat as
+	// an ordinary "12 #2" tile, shows this sentence verbatim (on the order pad
+	// and on a parked outbox chip), and has no "12 (next party)" anywhere to go
+	// to. next_party_table carries the handle for the clients that act on it.
+	const nextWords = nextNamed !== "" && nextNamed !== next
+		? `${nextNamed}, shown as "${next}" on older apps`
+		: nextNamed;
 	const elsewhere = next !== "" && next.toLowerCase() !== String(input.table ?? "").trim().toLowerCase();
 	const managerDoes = write === "merge"
 		? "Ask a manager to merge it and reprint the bill."
@@ -399,7 +407,7 @@ export function billPrintedRefusal(input: {
 	const error = input.guest
 		? "This table's bill has already been printed, so nothing more can be ordered on it here. Please ask a member of staff."
 		: elsewhere
-			? `${named}'s bill has already been printed, so nothing more can be added to it. Take a new party's order on ${nextNamed}. If it is for the same guests, ask a manager to add it and reprint the bill.`
+			? `${named}'s bill has already been printed, so nothing more can be added to it. Take a new party's order on ${nextWords}. If it is for the same guests, ask a manager to add it and reprint the bill.`
 			: `${named}'s bill has already been printed, so nothing more can be added to it. ${managerDoes}`;
 	return {
 		error,

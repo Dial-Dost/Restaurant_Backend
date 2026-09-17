@@ -132,6 +132,18 @@ describe("migration 052's DDL: at boot and before the settle — never inside it
   });
 });
 
+describe("migration 052, applied by hand during service", () => {
+  test("waits at most 5s for its locks — the first thing the file does", () => {
+    // ADD COLUMN IF NOT EXISTS and CREATE INDEX IF NOT EXISTS lock before they
+    // look. migrate.ts runs each file in its own transaction; LOCAL ends with it.
+    const file = join(ROOT, "migrations", "052_bill_non_chargeable.sql");
+    if (!existsSync(file)) { return; } // shipped in its own commit, applied by hand
+    const code = read("migrations/052_bill_non_chargeable.sql").split("\n")
+      .filter((l) => !l.trim().startsWith("--")).join("\n").trim();
+    expect(code.startsWith("SET LOCAL lock_timeout = '5s';")).toBe(true);
+  });
+});
+
 describe("the other paths that meet an NC bill are wired", () => {
   test("the ordinary settle stores a fully comped ₹0 bill as NC", () => {
     const confirm = chunk(DB, "ConfirmBillPaymentByWaiter");

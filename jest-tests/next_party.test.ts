@@ -241,7 +241,7 @@ describe("who may add to a printed bill", () => {
   test("the staff refusal says where the new party goes AND what a same-party addition needs", () => {
     const body = billPrintedRefusal({ table: "12", nextPartyTable: "12 #2", printCount: 1, guest: false });
     expect(body).toEqual({
-      error: "12's bill has already been printed, so nothing more can be added to it. Take a new party's order on 12 (next party). If it is for the same guests, ask a manager to add it and reprint the bill.",
+      error: "12's bill has already been printed, so nothing more can be added to it. Take a new party's order on 12 (next party), shown as \"12 #2\" on older apps. If it is for the same guests, ask a manager to add it and reprint the bill.",
       code: BILL_PRINTED_CODE,
       table: "12",
       next_party_table: "12 #2",
@@ -308,7 +308,20 @@ describe("who may add to a printed bill", () => {
   test("a printed SIBLING is named in its root's words", () => {
     const body = billPrintedRefusal({ table: "12 #2", nextPartyTable: "12 #3", printCount: 1, guest: false, parentTable: "12" });
     expect(body.error.startsWith("12 (next party)'s bill has already been printed")).toBe(true);
-    expect(body.error).toContain("Take a new party's order on 12 (next party).");
+    expect(body.error).toContain("Take a new party's order on 12 (next party), shown as \"12 #3\" on older apps.");
+  });
+
+  test("an app that has never heard of the label is told the seat's own name", () => {
+    // 2.0.0 lists the seat as a plain "12 #2" tile and shows this sentence as it
+    // stands; "12 (next party)" alone names nothing on its floor.
+    const body = billPrintedRefusal({ table: "12", nextPartyTable: "12 #2", printCount: 1, guest: false });
+    expect(body.error).toContain('"12 #2"');
+    expect(body.next_party_table).toBe("12 #2");
+    // A grandfathered room table whose name is already what the sentence says
+    // is named once.
+    const plain = billPrintedRefusal({ table: "12", nextPartyTable: "Patio", printCount: 1, guest: false });
+    expect(plain.error).toContain("Take a new party's order on Patio. If it is for the same guests");
+    expect(plain.error).not.toContain("older apps");
   });
 });
 
@@ -374,6 +387,18 @@ describe("the kitchen docket names the next party in full", () => {
 describe("migration 053 says exactly what the runtime issues", () => {
   const norm = (s: string) => s.replace(/--[^\n]*/g, "").replace(/\s+/g, " ")
     .replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").trim().toLowerCase();
+
+  test("the file (when present) waits at most 5s for its locks — the first thing it does", () => {
+    // Applied BY HAND, during service, on "Tables" — the most-polled table in
+    // the product. ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE before it
+    // looks, and one idle-in-transaction session would otherwise queue every
+    // floor read behind it (the 2026-08-24 standstill). migrate.ts runs each
+    // file in its own transaction, so LOCAL ends with it. 051 does the same.
+    const file = join(__dirname, "..", "migrations", "053_table_next_party.sql");
+    if (!existsSync(file)) { return; } // shipped in its own commit, applied by hand
+    const code = readFileSync(file, "utf8").split(/\r?\n/).filter((l) => !l.trim().startsWith("--")).join("\n").trim();
+    expect(code.startsWith("SET LOCAL lock_timeout = '5s';")).toBe(true);
+  });
 
   test("every runtime statement is in the file, word for word", () => {
     const file = join(__dirname, "..", "migrations", "053_table_next_party.sql");

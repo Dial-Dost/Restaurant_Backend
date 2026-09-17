@@ -266,7 +266,7 @@ describe("2a. POST /orders on a printed bill", () => {
     expect(r.status).toBe(423);
     expect(r.status).toBe(BILL_PRINTED_STATUS);
     expect(r.body).toEqual({
-      error: "12's bill has already been printed, so nothing more can be added to it. Take a new party's order on 12 (next party). If it is for the same guests, ask a manager to add it and reprint the bill.",
+      error: "12's bill has already been printed, so nothing more can be added to it. Take a new party's order on 12 (next party), shown as \"12 #2\" on older apps. If it is for the same guests, ask a manager to add it and reprint the bill.",
       code: BILL_PRINTED_CODE,
       table: "12",
       next_party_table: "12 #2",
