@@ -538,6 +538,24 @@ describe("Send now's rows: retried through the LEFT JOIN, kicked outside the req
   });
 });
 
+describe("the bell opens where the history is", () => {
+  test("a report bell resolves to Reports (a 2.0.1 inbox one to Accounting), with nothing to focus", () => {
+    expect(db.notificationEntityOf("report", { module: "Reports", delivery_id: "d1", schedule_id: "s1" }))
+      .toEqual({ module: "Reports", entity: null });
+    expect(db.notificationEntityOf("report", { module: "Accounting", delivery_id: "d1" }))
+      .toEqual({ module: "Accounting", entity: null });
+    expect(db.notificationEntityOf("report", { kind: "mail_not_configured" }))
+      .toEqual({ module: "Reports", entity: null });
+  });
+
+  test("every report bell this sweep rings names its module", async () => {
+    emailSchedule();
+    await sweep(t(1));
+    expect(notifications()[0].meta.module).toBe("Reports");
+    expect(db.notificationEntityOf("report", notifications()[0].meta as Record<string, unknown>).module).toBe("Reports");
+  });
+});
+
 describe("housekeeping", () => {
   test("file bodies past the retention window are purged once a day; the rows stay", async () => {
     addSchedule({ created_at: at("2026-08-10T04:00:00Z"), enabled: false });

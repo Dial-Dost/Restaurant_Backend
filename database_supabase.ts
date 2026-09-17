@@ -32083,7 +32083,7 @@ export interface NotificationTarget {
 // Which module + entity a notification points at. Type wins (it is set by the
 // producer); meta ids disambiguate the overloaded `warning` type. Mirrors the
 // owner app's _moduleForType so both agree on the destination.
-function notificationEntityOf(
+export function notificationEntityOf(
   type: string,
   meta: Record<string, unknown>,
 ): { module: string | null; entity: { type: string; id: string } | null } {
@@ -32114,6 +32114,12 @@ function notificationEntityOf(
       // KPI/exception alerts are restaurant-wide numbers, not a row — Analytics
       // is the honest destination and there is nothing to focus.
       return { module: "Analytics", entity: null };
+    case "report":
+      // A report delivery (client item 9). Its history, files and per-address
+      // outcome live in Reports → Email reports; a 2.0.1 inbox schedule's bell
+      // still says Accounting, whose card now points there. Nothing row-shaped
+      // to focus — the delivery id rides in `meta` for the client that wants it.
+      return { module: s("module") === "Accounting" ? "Accounting" : "Reports", entity: null };
     default:
       break;
   }
