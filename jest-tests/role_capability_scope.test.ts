@@ -25,6 +25,8 @@
 //   differently-permissioned endpoint, and must never quietly shorten.
 
 import { describe, test, expect, beforeAll } from "@jest/globals";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { makeFakeApp, type FakeApp } from "./platform_fixtures";
 
 jest.mock("pg", () => {
@@ -94,6 +96,28 @@ describe("the capability block the clients obey", () => {
     expect(caps.waive_service_charge).toBe(false);
     expect(caps.view_roles).toBe(false);
     expect(caps.manage_roles).toBe(false);
+  });
+
+  test("client items 1 and 2: a waiter may MOVE A TABLE — the flag answers the uuid POST /tables/move is gated on", () => {
+    const waiter = sessionCapabilities({ actions: CORE_ROLES.waiter as unknown as string[] });
+    expect(waiter.move_table).toBe(true);
+    // Move an order's route is gated on Add Orders, which a waiter holds too; the
+    // clients keep that control senior-only by their own floor scope.
+    expect(waiter.move_order).toBe(true);
+    const onlyOccupancy = sessionCapabilities({ actions: ["090ea8d4-e348-4e1b-9723-11131a73a085"] });
+    expect([onlyOccupancy.move_table, onlyOccupancy.move_order]).toEqual([true, false]);
+    const onlyOrders = sessionCapabilities({ actions: ["4ad474d4-5230-449c-874f-6a238b833bca"] });
+    expect([onlyOrders.move_table, onlyOrders.move_order]).toEqual([false, true]);
+    expect([sessionCapabilities({}).move_table, sessionCapabilities({}).move_order]).toEqual([false, false]);
+  });
+
+  test("the move flags name the SAME uuids the move routes are registered with", () => {
+    const tables = readFileSync(join(__dirname, "..", "routes", "tables.ts"), "utf8");
+    expect(tables).toMatch(/app\.post\("\/tables\/move", validateAction\("090ea8d4-e348-4e1b-9723-11131a73a085"\)/);
+    expect(tables).toMatch(/app\.post\("\/tables\/move-order", validateAction\("4ad474d4-5230-449c-874f-6a238b833bca"\)/);
+    const shared = readFileSync(join(__dirname, "..", "routes", "_shared.ts"), "utf8");
+    expect(shared).toMatch(/move_table: has\("090ea8d4-e348-4e1b-9723-11131a73a085"\)/);
+    expect(shared).toMatch(/move_order: has\("4ad474d4-5230-449c-874f-6a238b833bca"\)/);
   });
 
   test("a missing or malformed action list denies rather than throwing", () => {

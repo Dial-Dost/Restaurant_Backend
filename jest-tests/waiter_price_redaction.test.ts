@@ -172,7 +172,24 @@ const BILL = () => ({
   print_count: 1,
   bill_printed_at: "2026-09-11T13:40:00.000Z",
   printed_at: "2026-09-11T13:40:00.000Z",
+  // Migration 055 (client items 1 and 2): what the latest paper said. The
+  // digest is the data layer's and never leaves the route; the printed total
+  // is money.
+  last_paper_digest: null as string | null,
+  printed_total: 4600 as number | null,
+  printed_as: null as string | null,
 });
+
+/**
+ * What GET /bill-for-table answers a senior with: the bill as the data layer
+ * read it, less the paper fingerprint it keeps to itself, plus `paper_stale`
+ * (null here: this print's content was never recorded).
+ */
+const SENIOR_BILL = () => {
+  const { last_paper_digest: _digest, ...rest } = BILL();
+  void _digest;
+  return { ...rest, paper_stale: null };
+};
 
 const TABLE_ROWS = () => [
   {
@@ -320,7 +337,7 @@ describe("nobody senior loses a figure they have today", () => {
       expect(r.status).toBe(200);
       // The strongest form of "a manager response must be byte-identical": the
       // whole object, not a spot check of the fields this change touched.
-      expect(r.body).toEqual(BILL());
+      expect(r.body).toEqual(SENIOR_BILL());
     });
 
     test(`${who} still sees the floor grid's totals and the orders feed's`, async () => {

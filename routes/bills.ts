@@ -6,9 +6,10 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState, ClosedBillDetail, OpenBillChargeConfig } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable, RecordBillPrintPaper } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type ReceiptOptions, type SplitReceiptPart } from "../escpos.js";
 import { ncSettlementPrintJobId } from "../bill_print_state.js";
+import { billLinesDigest, billPaperDigest, billPrintedClock, paperStale, replacesBillLine, type BillPaperRecord } from "../bill_paper_digest.js";
 import { isNcSettleMethod } from "../payment_methods.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
@@ -22,7 +23,7 @@ import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
-import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, noteAdditionToPrintedBill, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -742,8 +743,15 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
 		} catch {
 			// ignore realtime failures
 		}
+		// CLIENT ITEMS 1 AND 2 — "SETTLE ANYWAY". The till warned that the paper
+		// the guest is holding is older than the bill and the cashier settled
+		// regardless. Never refused (the drawer books the CURRENT total either
+		// way); recorded, so the night's settle log shows which bills were paid
+		// against paper that did not match them.
+		const staleNote = settledWithStalePaper(req.body);
+		if (staleNote) { extraAudit.settled_with_stale_paper = true; }
 		try {
-			await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", `Waiter confirmed payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, waiter: waiterEmployeeId, payment_method: result.payment_method, ...extraAudit });
+			await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", `Waiter confirmed payment for order ${orderId}${staleNote}`, Audit_log_category.Bill, { order_id: orderId, waiter: waiterEmployeeId, payment_method: result.payment_method, ...extraAudit });
 		} catch (err) {
 			logger.warn({ err }, 'log_audit waiter-confirm-payment failed');
 		}
@@ -783,8 +791,9 @@ app.post('/bills/order/:orderId/admin-approve-payment', validateAction("fc57d407
 		} catch {
 			// ignore realtime failures
 		}
+		const staleNote = settledWithStalePaper(req.body);
 		try {
-			await log_audit(req, "fc57d407-4bba-442c-97a2-9e6f3c57f288", `Admin approved payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, admin: adminEmployeeId });
+			await log_audit(req, "fc57d407-4bba-442c-97a2-9e6f3c57f288", `Admin approved payment for order ${orderId}${staleNote}`, Audit_log_category.Bill, { order_id: orderId, admin: adminEmployeeId, ...(staleNote ? { settled_with_stale_paper: true } : {}) });
 		} catch (err) {
 			logger.warn({ err }, 'log_audit admin-approve-payment failed');
 		}
@@ -902,18 +911,29 @@ export async function refuseWaiterBillReprint(
 	req: Request,
 	res: Response,
 	tableName: string,
-	bill: { print_count: number; bill_printed_at: string | null; printed_at: string | null },
+	bill: OpenTableBill,
+	/**
+	 * CLIENT ITEMS 1 AND 2 — the tenant, so the rule can ask whether the paper is
+	 * out of date. A waiter may now add to a printed bill (after saying so), and
+	 * the paper they handed over is then short; the ONE reprint a waiter may make
+	 * is the one that fixes it. Identical content — the second copy C3 exists to
+	 * stop — or content nobody recorded (a print from before migration 055) is
+	 * still a senior's. Omitted, the answer is "unknown": refused, as on 2.0.1.
+	 */
+	restaurantId?: string,
 ): Promise<boolean> {
 	if (!(bill.print_count > 0)) { return false; }
 	if (!isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions })) {
 		return false;
 	}
+	const stale = restaurantId ? await billPaperStale(restaurantId, tableName, bill) : null;
+	if (stale === true) { return false; }
 	try {
 		await log_audit(
 			req, "4ad474d4-5230-449c-874f-6a238b833bca",
 			`REFUSED reprint of table ${tableName}'s bill — already printed ${String(bill.print_count)} time(s); reprints need a senior role`,
 			Audit_log_category.Bill,
-			{ table: tableName, kind: "bill", refused: true, print_count: bill.print_count, first_printed_at: bill.bill_printed_at },
+			{ table: tableName, kind: "bill", refused: true, print_count: bill.print_count, first_printed_at: bill.bill_printed_at, paper_stale: stale },
 		);
 	} catch {/* a failed audit write must not turn a 403 into a 500 */}
 	// THE REFUSAL SAYS WHO CAN DO IT INSTEAD. A waiter handed a blank space
@@ -928,8 +948,20 @@ export async function refuseWaiterBillReprint(
 		bill_printed_at: bill.bill_printed_at,
 		printed_at: bill.printed_at,
 		allowed_roles: ROLES_OUTRANKING_WAITER,
+		// false: the paper still matches the bill. null: nobody can say.
+		paper_stale: stale,
 	});
 	return true;
+}
+
+/**
+ * The audit suffix for a settle the cashier made against out-of-date paper —
+ * "" unless the body said `settled_with_stale_paper: true` (the clients' "Settle
+ * anyway"). Only a literal true counts.
+ */
+function settledWithStalePaper(body: unknown): string {
+	const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+	return b.settled_with_stale_paper === true ? " — settled against an out-of-date printed bill (Settle anyway)" : "";
 }
 
 
@@ -1059,6 +1091,65 @@ async function openTableBillCharges(
 	return { chargeCfg, waiverRequired, charges };
 }
 
+/**
+ * WHAT THIS BILL'S PAPER WOULD SAY NOW — the fingerprint of the paper
+ * printOpenTableBill would print for it (bill_paper_digest.ts), from the SAME
+ * ladder (openTableBillCharges) and the same lines.
+ *
+ * ONE FUNCTION FOR THE PAPER, THE GATE AND THE SHEET. The print files this
+ * fingerprint beside its job; refuseWaiterBillReprint and GET /bill-for-table's
+ * `paper_stale` compare the one filed against this one. Three callers building
+ * it three ways is how "the gate says stale, the paper says nothing changed"
+ * would happen, and the waiter caught between them is the person the rule is for.
+ */
+export async function currentPaperDigest(restaurantId: string, tableName: string, bill: OpenTableBill): Promise<string> {
+	const { charges } = await openTableBillCharges(restaurantId, tableName, bill, false);
+	return paperDigestOf(bill, charges);
+}
+
+function paperDigestOf(bill: OpenTableBill, charges: ReturnType<typeof computeBillCharges>): string {
+	// The GSTIN the paper prints (the renderer is handed the same field).
+	const gstin = bill.customer_gstin;
+	return billPaperDigest({ items: bill.items, charges, customerGstin: gstin });
+}
+
+/**
+ * IS THE PAPER THIS SEATING WAS HANDED STILL RIGHT? true / false, or null when
+ * nothing was printed or the print's content was never recorded. Never throws:
+ * a ladder that cannot be priced is "unknown", which every caller treats as the
+ * 2.0.1 rule.
+ */
+export async function billPaperStale(restaurantId: string, tableName: string, bill: OpenTableBill): Promise<boolean | null> {
+	if (!(bill.print_count > 0) || !bill.last_paper_digest) { return null; }
+	try {
+		return paperStale(await currentPaperDigest(restaurantId, tableName, bill), bill.last_paper_digest);
+	} catch (err) {
+		logger.warn({ err, table: tableName }, "bill_paper_stale_failed (answering unknown)");
+		return null;
+	}
+}
+
+/**
+ * File what a print said beside its job(s). Never throws — RecordBillPrintPaper
+ * does not, and this guards the call itself, because the paper is already out.
+ */
+async function recordPaper(restaurantId: string, jobIds: readonly (string | null | undefined)[], paper: BillPaperRecord): Promise<void> {
+	try {
+		await RecordBillPrintPaper(restaurantId, jobIds, paper);
+	} catch (err) {
+		logger.warn({ err }, "record_bill_print_paper_failed");
+	}
+}
+
+/** The restaurant's zone for a printed clock; the fleet default when it cannot be read. */
+async function restaurantTimezone(restaurantId: string): Promise<string> {
+	try {
+		return (await GetRestaurantSettings(restaurantId))?.timezone || "Asia/Kolkata";
+	} catch {
+		return "Asia/Kolkata";
+	}
+}
+
 /** What printOpenTableBill put on a printer, in the words its callers answer with. */
 export interface OpenTableBillPrint {
 	billId: string;
@@ -1075,6 +1166,11 @@ export interface OpenTableBillPrint {
 	 * nextPartyAfterPrint.
 	 */
 	next_party_table: string | null;
+	/**
+	 * Client items 1 and 2: this print REPLACES an earlier one because the bill
+	 * changed since — the paper carries "** UPDATED BILL **".
+	 */
+	revised: boolean;
 }
 
 /**
@@ -1113,6 +1209,15 @@ export async function printOpenTableBill(
 	const { restaurantId, outletId, tableName, bill, settings, profile, askedWithoutServiceCharge } = target;
 	const kind = "bill" as const;
 	const { chargeCfg, waiverRequired, charges } = await openTableBillCharges(restaurantId, tableName, bill, askedWithoutServiceCharge);
+	// CLIENT ITEMS 1 AND 2 — WHAT THIS PAPER SAYS, and whether it replaces a
+	// paper that said something else. The fingerprint is taken from THIS ladder
+	// (currentPaperDigest builds it the same way), so the gate that let this
+	// print through and the record of what it printed cannot disagree.
+	const paperDigest = paperDigestOf(bill, charges);
+	const revised = bill.print_count > 0 && paperStale(paperDigest, bill.last_paper_digest) === true;
+	const revisedNote = revised
+		? replacesBillLine(billPrintedClock(bill.printed_at, settings.timezone || "Asia/Kolkata"))
+		: null;
 	// Column layout + logo raster width follow the configured paper size
 	// (58mm = 32 cols / 384 dots, 80mm = 48 cols / 576 dots).
 	const is58 = settings.bill_paper_width === "58mm";
@@ -1212,6 +1317,12 @@ export async function printOpenTableBill(
 		// of this seating's bill prints BEFORE this one — the same number C3
 		// just refused a waiter on — so a first print (0) never carries it.
 		reprint: bill.print_count > 0,
+		// ...UNLESS THE BILL CHANGED SINCE (client items 1 and 2). A copy of a
+		// bill that has grown is a different document: "** UPDATED BILL **" and
+		// "Replaces the bill printed 13:32" take the banner's place, so a guest
+		// holding two papers pays the right one. A senior's identical copy keeps
+		// "** REPRINT **".
+		revisedNote,
 		// THE DISCLAIMER FOLLOWS THE CHARGE, NOT ONE LEG OF IT (G2; F2 root
 		// cause 3). This predicate was `charges.service_charge > 0` — the
 		// restaurant_percent leg alone — so a tenant charging through a tax
@@ -1237,6 +1348,13 @@ export async function printOpenTableBill(
 	const dispatched = await dispatchPrintJob(restaurantId, {
 		outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
 	});
+	// What this paper said, beside its job (migration 055).
+	await recordPaper(restaurantId, [dispatched.jobId], {
+		bill_digest: paperDigest,
+		lines_digest: billLinesDigest(bill.items),
+		bill_grand_total: charges.grand_total,
+		table_name: tableName,
+	});
 	// THE AUDIT LINE SAYS WHAT THE PAPER ACTUALLY SAYS. It used to read "(no
 	// service charge)" off the REQUEST, which is how a print that reduced a
 	// total nobody authorised left a trail claiming it was fine. It now
@@ -1247,7 +1365,12 @@ export async function printOpenTableBill(
 		: waiverRequired
 			? " (asked WITHOUT the service charge; no waiver is recorded, so the charge is ON this bill)"
 			: "";
-	try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null }); } catch {/* ignore */}
+	// An UPDATED bill says so, with the total the guest was holding and the one
+	// they hold now — the pair the night cashier needs.
+	const revisedNoteAudit = revised
+		? ` — UPDATED bill (was ${bill.printed_total === null || bill.printed_total === undefined ? "unknown" : Number(bill.printed_total).toFixed(2)}, now ${charges.grand_total.toFixed(2)})`
+		: "";
+	try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${revisedNoteAudit}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null, ...(revised ? { revised: true, printed_total_before: bill.printed_total ?? null, grand_total: charges.grand_total } : {}) }); } catch {/* ignore */}
 	// CLIENT ITEM 6 — AFTER the paper is dispatched, never before and never
 	// instead: the next party gets a seat because this one has its bill. Any
 	// print, by anyone, opens it; nextPartyAfterPrint never throws.
@@ -1261,6 +1384,7 @@ export async function printOpenTableBill(
 		service_charge_waiver_required: waiverRequired,
 		grand_total: charges.grand_total,
 		next_party_table: nextPartyTable,
+		revised,
 	};
 }
 
@@ -1279,6 +1403,19 @@ export async function claimClientRenderedBillPrint(
 	target: { restaurantId: string; outletId: string; tableName: string; bill: OpenTableBill },
 ) {
 	const { restaurantId, outletId, tableName, bill } = target;
+	// CLIENT ITEMS 1 AND 2: the browser's paper is this bill (`printable_bill`
+	// below), so its fingerprint is this bill's — built as the thermal print
+	// builds it. A fingerprint that cannot be taken files nothing ("unknown").
+	let paper: BillPaperRecord | null = null;
+	let revised = false;
+	try {
+		const { charges } = await openTableBillCharges(restaurantId, tableName, bill, false);
+		const digest = paperDigestOf(bill, charges);
+		paper = { bill_digest: digest, lines_digest: billLinesDigest(bill.items), bill_grand_total: charges.grand_total, table_name: tableName };
+		revised = bill.print_count > 0 && paperStale(digest, bill.last_paper_digest) === true;
+	} catch (err) {
+		logger.warn({ err, table: tableName }, "claim_paper_digest_failed");
+	}
 	// The SAME bill_id shape /print/bill writes, including the
 	// `<table>-<epoch>` fallback for a table with no "Bills" row yet.
 	// bill_print_state.ts matches BOTH shapes and matches the fallback as a
@@ -1302,6 +1439,7 @@ export async function claimClientRenderedBillPrint(
 		if (!isSchemaMissing(err)) { throw err; }
 		warnSchemaMissing("print_bill_claim", err);
 	}
+	if (recorded && paper) { await recordPaper(restaurantId, [recorded.id], paper); }
 
 	// THE AUDIT LINE IS THE ONE /print/bill FILES, under the same Action id
 	// and the same category, worded so a manager scanning the log can see
@@ -1311,9 +1449,9 @@ export async function claimClientRenderedBillPrint(
 	try {
 		await log_audit(
 			req, "4ad474d4-5230-449c-874f-6a238b833bca",
-			`Printed bill for table ${tableName} from the web dashboard (browser print — no thermal copy)`,
+			`Printed bill for table ${tableName} from the web dashboard (browser print — no thermal copy)${revised ? " — UPDATED bill" : ""}`,
 			Audit_log_category.Bill,
-			{ table: tableName, kind: "bill", source: "web_dashboard", claim: true, recorded: recorded !== null, job_id: recorded?.id ?? null },
+			{ table: tableName, kind: "bill", source: "web_dashboard", claim: true, recorded: recorded !== null, job_id: recorded?.id ?? null, ...(revised ? { revised: true, printed_total_before: bill.printed_total ?? null } : {}) },
 		);
 	} catch {/* ignore */}
 
@@ -1345,6 +1483,12 @@ export async function claimClientRenderedBillPrint(
 		// Where the next party at this number sits — see nextPartyAfterPrint.
 		next_party_table: nextPartyTable,
 		next_party_message: nextPartyPrintMessage(nextPartyTable),
+		// Client items 1 and 2: the browser's paper replaces an out-of-date one,
+		// and says so in these words (the thermal print's banner and line).
+		revised,
+		revised_note: revised
+			? replacesBillLine(billPrintedClock(bill.printed_at, await restaurantTimezone(restaurantId)))
+			: null,
 		// THE PRICED BILL, BECAUSE THIS IS THE GUEST'S RECEIPT.
 		//
 		// THE BUG THIS CLOSES, found in a live browser pass: on the web
@@ -1572,7 +1716,7 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		// KOT IS UNTOUCHED, and the test is here rather than inside the helper:
 		// `kind === "kot"` is a kitchen docket, not a bill, and a waiter reprints
 		// a lost ticket all shift and always could.
-		if (kind === "bill" && await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
+		if (kind === "bill" && await refuseWaiterBillReprint(req, res, tableName, bill, restaurantId)) { return; }
 		// Column layout + logo raster width follow the configured paper size
 		// (58mm = 32 cols / 384 dots, 80mm = 48 cols / 576 dots).
 		const is58 = settings.bill_paper_width === "58mm";
@@ -1675,6 +1819,8 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			// the words the dashboard uses too.
 			next_party_table: printed.next_party_table,
 			next_party_message: nextPartyPrintMessage(printed.next_party_table),
+			// Client items 1 and 2: this paper replaced an out-of-date one.
+			revised: printed.revised,
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');
@@ -1772,7 +1918,7 @@ app.post('/print/bill/claim', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			res.status(400).json({ error: 'Nothing to print for this table' });
 			return;
 		}
-		if (await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
+		if (await refuseWaiterBillReprint(req, res, tableName, bill, restaurantId)) { return; }
 
 		// The ledger row, the audit line and the priced bill are
 		// claimClientRenderedBillPrint's, which the composite waiver-and-print
@@ -2077,6 +2223,7 @@ app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 		const result = await MoveBillItem(restaurantId, fromTable, toTable, itemName, price);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Moved item ${result.moved.name} from ${fromTable} to ${toTable}`, Audit_log_category.Bill, { from: fromTable, to: toTable, item: itemName }); } catch {/* ignore */}
+		await noteAdditionToPrintedBill(req, guard);
 		res.json({ ...result, ...reprintNeededFields(guard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'move_bill_item_failed');
@@ -2610,6 +2757,16 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 				{ table: tableName, mode, parts: receipts.length, totals: receipts.map((r) => r.grandTotal) });
 		} catch {/* a failed audit write must never fail the print */}
 
+		// What the paper said (migration 055). EVERY part carries the WHOLE bill's
+		// fingerprint: the parts together are this bill, and the latest counted
+		// job — whichever part that is — must say what the guests were handed.
+		try {
+			const digest = await currentPaperDigest(restaurantId, tableName, bill);
+			await recordPaper(restaurantId, jobs.map((j) => j.jobId), {
+				bill_digest: digest, lines_digest: billLinesDigest(bill.items), bill_grand_total: bill.grand_total, table_name: tableName,
+			});
+		} catch (err) { logger.warn({ err, table: tableName }, "split_paper_digest_failed"); }
+
 		// A split print is a print of this bill: the next party gets its seat.
 		const nextPartyTable = await nextPartyAfterPrint(req, restaurantId, tableName);
 
@@ -2641,6 +2798,7 @@ app.post('/bills/merge', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"),
 		const result = await MergeTableBills(restaurantId, fromTable, toTable);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Merged table ${fromTable} into ${toTable} (${result.moved_orders} orders)`, Audit_log_category.Bill, { from: fromTable, to: toTable }); } catch {/* ignore */}
+		await noteAdditionToPrintedBill(req, guard);
 		res.json({ ...result, ...reprintNeededFields(guard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'merge_bill_failed');

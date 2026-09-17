@@ -93,11 +93,11 @@ mw08 USE     *                                                      | <inline(re
 0071 DELETE  /table/:name                                           | validateAction("5777c4aa-29df-4ea1-9c45-c1038d25f746") | 39d35022
 0072 POST    /occupy-table                                          | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") -> idempotent() | bc7147f1
 0073 PATCH   /table-covers                                          | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") -> idempotent() | c6460a4d
-0074 POST    /tables/move                                           | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | bd97b596
+0074 POST    /tables/move                                           | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | 105b13e2
 0075 POST    /tables/move-order                                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 4ec9f188
 0076 POST    /release-table                                         | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") -> idempotent() | 9836f1b8
 0077 GET     /table-status                                          | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | f9dc6d2b
-0078 GET     /bill-for-table                                        | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 6fd48811
+0078 GET     /bill-for-table                                        | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | df2d271a
 0079 POST    /add-booking                                           | validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104") | 50dd87aa
 0080 GET     /get-tables                                            | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | d82e728f
 0081 GET     /get-bookings                                          | validate                                       | 6b4f0227
@@ -114,8 +114,8 @@ mw08 USE     *                                                      | <inline(re
 0092 GET     /restaurant/logo/bill                                  | validate                                       | ec5d9078
 0093 PATCH   /bills/order/:orderId/status                           | validateAction("07e364cc-f40d-46f3-b691-0f719dd38e0f") | d6ebd261
 0094 POST    /billing/upload-payment-proof                          | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 152073bc
-0095 POST    /bills/order/:orderId/waiter-confirm-payment           | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 23664ce5
-0096 POST    /bills/order/:orderId/admin-approve-payment            | validateAction("fc57d407-4bba-442c-97a2-9e6f3c57f288") | 0bd1650e
+0095 POST    /bills/order/:orderId/waiter-confirm-payment           | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 71483303
+0096 POST    /bills/order/:orderId/admin-approve-payment            | validateAction("fc57d407-4bba-442c-97a2-9e6f3c57f288") | c97c7a42
 0097 POST    /bills/order/:orderId/close                            | validateAction("a953d044-31ba-4e31-b96f-99304fe43dfa") | fb6e3fb7
 0098 PATCH   /booking/:id/table                                     | validateAction("c7699d46-0e2f-4448-b325-8ca490a5296b") | b62f3fba
 0099 DELETE  /booking/:id                                           | validateAction("1f176202-d5e7-4bb0-802c-275a42425394") | 2b047f1a
@@ -177,10 +177,10 @@ mw08 USE     *                                                      | <inline(re
 0155 POST    /inventory-categories/rename                           | validateAction(INV_MANAGE)                     | 235071b5
 0156 GET     /orders                                                | validateAction("b7f78d0f-323d-4622-8d05-aa2f82d54b2e") | 322c581d
 0157 GET     /orders/scope                                          | validateAction("b7f78d0f-323d-4622-8d05-aa2f82d54b2e") | b5337be9
-0158 POST    /orders                                                | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> idempotent() | fe20a848
+0158 POST    /orders                                                | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> idempotent() | 26d51976
 0159 POST    /orders/takeaway                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> idempotent() | 8ead5a1b
 0160 PATCH   /orders/:id/status                                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> idempotent() | 0d420eaf
-0161 POST    /orders/:id/items                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> idempotent() | 32e7891c
+0161 POST    /orders/:id/items                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> idempotent() | ea3d246b
 0162 DELETE  /orders/:id/items/:itemId                              | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> idempotent() | 71c915a4
 0163 DELETE  /orders/:id                                            | validateAction(PERM_ORDER_DELETE) -> idempotent() | 7f15a764
 0164 GET     /orders/apc                                            | validateAction("df75119b-e5f1-4f38-aba5-78a1cf182f56") | 71f67274
@@ -263,13 +263,13 @@ mw08 USE     *                                                      | <inline(re
 0241 GET     /restaurant/profile                                    | validate                                       | 83660ec9
 0242 GET     /auth/restaurant-login                                 | validate                                       | eb6d239a
 0243 POST    /publish/bill                                          | validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9") | c9bc6a64
-0244 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 6132547c
-0245 POST    /print/bill/claim                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | bd383548
+0244 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 5a6e5925
+0245 POST    /print/bill/claim                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 55390e40
 0246 POST    /print/bill/settled                                    | validateAction(ACCOUNTING_PERM)                | 87b9be68
 0247 POST    /print/ack                                             | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sPrintAck) | 07728a6e
 0248 POST    /print/kot/order/:id                                   | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 754ac87a
 0249 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428
-0250 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | f78c334e
+0250 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | 3dd2671f
 0251 POST    /bills/discount                                        | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillDiscount) | b2f8567d
 0252 POST    /print/devices/register                                | validateAction(PERM_PRINT)                     | 6e17326c
 0253 GET     /print/devices                                         | validateAction(PERM_PRINT)                     | f9a58e78
@@ -299,8 +299,8 @@ mw08 USE     *                                                      | <inline(re
 0277 POST    /bills/:billId/customer-details                        | validateAction(ACCOUNTING_PERM)                | 1d1d516c
 0278 POST    /bills/item-note                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillItemNote) | 1716a034
 0279 POST    /bills/split                                           | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") -> validateBody(sBillSplit) | 25132b86
-0280 POST    /print/bill/split                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 153da968
-0281 POST    /bills/merge                                           | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMerge) | c8d83dc5
+0280 POST    /print/bill/split                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 85171df5
+0281 POST    /bills/merge                                           | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMerge) | 1f7823b0
 0282 POST    /bills/refund                                          | validateBody(sBillRefund)                      | d2089aa7
 0283 POST    /bills/:id/reopen                                      | validate                                       | c25d6925
 0284 PUT     /restaurant/profile                                    | validateAction("60d14e9c-45cc-4dc2-b017-56058cc3ae33") | a752571b
@@ -401,7 +401,7 @@ mw08 USE     *                                                      | <inline(re
 0379 POST    /orders/:id/void                                       | validateAction(PERM_VOID_ORDER) -> validateBody(sVoidOrder) | ee42f764
 0380 POST    /bills/service-charge-waiver                           | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sWaiveServiceCharge) | b4045e33
 0381 POST    /bills/service-charge-waiver/:id/reverse               | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sReverse) | 38c3d7c2
-0382 POST    /bills/service-charge-waiver/print                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sRemoveServiceChargeAndPrint) | d9a80ac2
+0382 POST    /bills/service-charge-waiver/print                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sRemoveServiceChargeAndPrint) | 9c2fe24a
 0383 POST    /bills/order/:orderId/settle-nc                        | validateAction(PERM_NON_CHARGEABLE)            | 65e249fd
 0384 GET     /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 215c021d
 0385 POST    /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sBillTenders) | 64ca2a01

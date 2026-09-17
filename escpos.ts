@@ -13,6 +13,8 @@
  * renderer must not be able to reach a database, a request or a clock.
  */
 import { KOT_ATLAS, type KotFace, type KotGlyph } from "./kot_glyph_atlas.js";
+// The banner a bill that REPLACES an out-of-date paper carries (client items 1 and 2).
+import { UPDATED_BILL_MARKER } from "./bill_paper_digest.js";
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -257,6 +259,18 @@ export interface ReceiptOptions {
    * existed, down to the byte.
    */
   reprint?: boolean;
+  /**
+   * THIS BILL REPLACES AN EARLIER PAPER THAT SAID SOMETHING ELSE (client items
+   * 1 and 2, migration 055) — the pre-resolved line under the banner,
+   * "Replaces the bill printed 13:32" (bill_paper_digest.ts replacesBillLine).
+   *
+   * A copy of a bill that has since grown is not a copy, and "** REPRINT **"
+   * on it would tell a guest holding two papers that they are the same. So set,
+   * it takes the REPRINT banner's place with "** UPDATED BILL **" and this line
+   * under it. A BILL ONLY: a kitchen docket ignores it. Absent, null or "" is
+   * byte-identical to a bill printed before the field existed.
+   */
+  revisedNote?: string | null;
 
   // --- KOT header (all optional; each line is omitted when unknown) ---------
   //
@@ -1487,7 +1501,11 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   //
   // It goes on the kitchen docket too, for the harder version of the same
   // failure: an unmarked second copy of a ticket is cooked twice.
-  if (opts.reprint) {
+  const revisedNote = isKot ? "" : String(opts.revisedNote ?? "").trim();
+  if (revisedNote) {
+    big(UPDATED_BILL_MARKER, W);
+    for (const l of wrapText(asciiSafe(revisedNote), W)) { line(l); }
+  } else if (opts.reprint) {
     big("** REPRINT **", isKot ? width : W);
   }
   if (opts.logo && opts.logo.length > 0) {

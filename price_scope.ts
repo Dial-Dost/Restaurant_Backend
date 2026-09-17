@@ -191,6 +191,11 @@ export const REDACTED_BILL_MONEY_KEYS: readonly string[] = [
 	// Migration 048. Under half a rupee, but still an amount: with tax_total and
 	// the tax rates it narrows the grand total to a rupee, so it goes with them.
 	"round_off",
+	// Migration 055: the grand total on the paper the guest is holding. It is the
+	// bill's total as of the print, so it is money exactly as grand_total is.
+	// `paper_stale` (a boolean) stays: "print the updated bill" says nothing of
+	// what the table is worth.
+	"printed_total",
 ];
 
 /**

@@ -13,7 +13,7 @@ import { logger } from "../observability.js";
 import { hidesPrices, redactOrderList } from "../price_scope.js";
 import { emitRestaurant } from "../realtime.js";
 import type { CreatedOrderInfo } from "./_shared.js";
-import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, notifyOrderCreated, optionalMobile10, refuseOrderOnPrintedBill, reprintNeededFields, validateAction } from "./_shared.js";
+import { PERM_CLOSE_BILL, PERM_ORDER_DELETE, emitOrderCreated, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, linkOrderToCustomer, log_audit, noteAdditionToPrintedBill, notifyOrderCreated, optionalMobile10, refuseOrderOnPrintedBill, reprintNeededFields, validateAction } from "./_shared.js";
 
 
 // --- Order/item preparation timers (pause/resume, mark item served) ---------
@@ -163,12 +163,14 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 	try {
 		const body: Record<string, unknown> = { ...orderBody, ...(orderPhone.value ? { customer_phone: orderPhone.value } : {}) };
 		// CLIENT ITEM 6 — THE PRINTED BILL IS WHAT THE GUEST PAYS AGAINST. A waiter
-		// adding to it after the print makes the paper short and cannot reprint
-		// (C3), so they are refused and pointed at the next party's seat; a senior
-		// role is allowed and told to reprint. Before AddOrder, so a refusal writes
-		// nothing. This route is ALSO the dashboard's upsert (a status change, an
-		// edit), so the order the body names is passed along and only a resend
-		// that adds to the bill is judged. See refuseOrderOnPrintedBill.
+		// adding to it after the print makes the paper short, so without
+		// `add_to_printed_bill: true` (2.0.2's confirm) they are refused and
+		// pointed at the next party's seat; with it, and for a senior role, the
+		// order is allowed and the answer says to print the updated bill. Before
+		// AddOrder, so a refusal writes nothing. This route is ALSO the
+		// dashboard's upsert (a status change, an edit), so the order the body
+		// names is passed along and only a resend that adds to the bill is
+		// judged. See refuseOrderOnPrintedBill.
 		const guard = await refuseOrderOnPrintedBill(req, res, {
 			restaurantId, tableName: typeof body.table === "string" ? body.table : "", guest: false,
 			upsert: { orderId: typeof body.id === "string" ? body.id : null, items: body.items },
@@ -196,6 +198,8 @@ app.post("/orders", validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), idem
 				Audit_log_category.Orders, { order_id: created.orderId, table: created.table ?? null });
 		} catch (err) { logger.warn({ err }, "log_audit order-create failed"); }
 		emitOrderCreated(restaurantId, created);
+		// The order is on a printed bill: say so in the audit log, now it has landed.
+		await noteAdditionToPrintedBill(req, guard);
 		// THE KITCHEN DOCKET, at the moment the order is placed. Never throws and
 		// never fails the order: the row is committed and the guest has been told
 		// it was taken, so a printer problem is reported, not raised.
@@ -599,6 +603,7 @@ app.post('/orders/:id/items', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			skipIfTicketed: false,
 		});
 
+		await noteAdditionToPrintedBill(req, guard);
 		res.status(201).json({
 			success: true, item: newItem,
 			kot_printed: printedItem.printed, kot_no: printedItem.kot_no, kot_tickets: printedItem.tickets,
