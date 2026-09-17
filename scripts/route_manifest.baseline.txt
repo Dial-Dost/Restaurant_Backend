@@ -282,7 +282,7 @@ mw08 USE     *                                                      | <inline(re
 0260 GET     /print/routes                                          | validateAction(PERM_PRINT)                     | 0c3ddeb9
 0261 PUT     /print/routes                                          | validate                                       | 84702b2b
 0262 GET     /print/health                                          | validateAction(PERM_PRINT)                     | 7f4f25f2
-0263 POST    /print/test                                            | validateAction(PERM_PRINT)                     | 5983fb09
+0263 POST    /print/test                                            | validateAction(PERM_PRINT)                     | 88bca036
 0264 GET     /discount-requests                                     | validate                                       | 9f7efb7f
 0265 POST    /discount-requests/:id/approve                         | validate                                       | bb523518
 0266 POST    /discount-requests/:id/reject                          | validate                                       | 37cdeb6e
