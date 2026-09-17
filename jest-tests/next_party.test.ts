@@ -297,8 +297,12 @@ describe("who may add to a printed bill", () => {
       next_party_action: "Take it on 12 (next party)",
       // 2.0.2 offers this beside it: resend with add_to_printed_bill.
       add_to_printed_action: "Add to 12's printed bill",
+      // ...and shows THIS sentence instead of `error`, because "ask a manager
+      // to add it" is wrong above a button that adds it.
+      add_to_printed_message: "12's bill has already been printed. Take a new party's order on 12 (next party), or, if it is for the same guests, add it to 12's printed bill and print the updated bill.",
       print_count: 1,
     });
+    expect(body.add_to_printed_message).not.toMatch(/ask a manager/i);
   });
 
   test("with no seat to point at (or the root itself free again), it does not point at itself", () => {
@@ -306,6 +310,10 @@ describe("who may add to a printed bill", () => {
     expect(none.error).toBe("12's bill has already been printed, so nothing more can be added to it. Ask a manager to add it and reprint the bill.");
     expect(none.next_party_table).toBeNull();
     expect(none.next_party_action).toBeNull();
+    expect(none.add_to_printed_message).toBe("12's bill has already been printed. If it is for the same guests, add it to 12's printed bill and print the updated bill.");
+    // A next-party seat's refusal names it as a sentence does.
+    expect(billPrintedRefusal({ table: "12 #2", nextPartyTable: "12 #3", printCount: 1, guest: false, parentTable: "12" }).add_to_printed_message)
+      .toBe("12 (next party)'s bill has already been printed. Take a new party's order on 12 (next party), or, if it is for the same guests, add it to 12 (next party)'s printed bill and print the updated bill.");
     const self = billPrintedRefusal({ table: "12", nextPartyTable: "12", printCount: 1, guest: false });
     expect(self.error).not.toContain("Take a new party");
     expect(self.next_party_action).toBeNull();
@@ -319,6 +327,7 @@ describe("who may add to a printed bill", () => {
     expect(body.next_party_action).toBeNull();
     // ...and never offered to add to somebody's printed bill.
     expect(body.add_to_printed_action).toBeNull();
+    expect(body.add_to_printed_message).toBeNull();
   });
 
   test("a MERGE into, or an item MOVED onto, a printed table is a manager's — no seat is offered", () => {
@@ -331,6 +340,7 @@ describe("who may add to a printed bill", () => {
       next_party_action: null,
       // A merge or a moved item stays a manager's on every client.
       add_to_printed_action: null,
+      add_to_printed_message: null,
       print_count: 1,
     });
     const move = billPrintedRefusal({ table: "12 #2", nextPartyTable: "12 #3", printCount: 2, guest: false, parentTable: "12", write: "move" });

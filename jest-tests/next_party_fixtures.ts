@@ -613,12 +613,42 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     }
     return { rows: [] };
   }
+  // CopyBillPrintPaper: the claim's record onto the publish's job — this
+  // tenant, both bill jobs, the SAME bill_id, or nothing.
+  if (s.startsWith("update \"printjobs\" t set bill_digest = f.bill_digest, lines_digest = f.lines_digest, bill_grand_total = f.bill_grand_total, table_name = f.table_name from \"printjobs\" f")) {
+    if (!s.includes("f.bill_id = t.bill_id") || !s.includes("t.kind = $4") || !s.includes("f.kind = $4")) {
+      throw new Error("next_party_fixtures: the paper copy must be bounded by kind and by the same bill_id");
+    }
+    const kind = str(params[3]);
+    const from = store.printJobs.find((j) => j.id === str(params[1]) && j.kind === kind);
+    const to = store.printJobs.find((j) => j.id === str(params[2]) && j.kind === kind);
+    if (!from || !to || from.bill_id !== to.bill_id) {return { rows: [] };}
+    Object.assign(to, {
+      bill_digest: from.bill_digest ?? null, lines_digest: from.lines_digest ?? null,
+      bill_grand_total: from.bill_grand_total ?? null, table_name: from.table_name ?? null,
+    });
+    return { rows: [{ id: to.id }] };
+  }
   // MoveTableParty's re-key of the moving party's `<name>-<epoch>` prints.
   if (s.startsWith("select (select min(o.created_at) from \"orders\" o")) {
     const tableId = str(params[2]);
     const owing = store.orders.filter((o) => o.table_id === tableId && inOutlet(o, params, 1) && isOwing(o.status)).map((o) => o.created_at).sort();
     const bill = openBillOf(tableId, (b) => b.status !== 3 && inOutlet(b, params, 1));
     return { rows: [{ first_order_at: owing[0] ? new Date(owing[0]) : null, bill_created_at: bill ? new Date(bill.created_at) : null }] };
+  }
+  // ...and, before it, the retirement of the destination's previous party's prints.
+  if (s.startsWith("update \"printjobs\" set bill_id = $4 || bill_id where")) {
+    const prefix = str(params[2]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.outlet_id !== str(params[1]) || j.kind !== str(params[4]) || !j.bill_id.startsWith(prefix)) {continue;}
+      const tail = j.bill_id.slice(prefix.length);
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(tail) || at(j.created_at) < start) {continue;}
+      j.bill_id = `${str(params[3])}${j.bill_id}`;
+      out.push({ id: j.id ?? j.bill_id });
+    }
+    return { rows: out };
   }
   if (s.startsWith("update \"printjobs\" set bill_id = $4 || substr(bill_id, length($3) + 1)")) {
     const from = str(params[2]);

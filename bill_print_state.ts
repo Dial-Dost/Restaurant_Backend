@@ -182,6 +182,30 @@ export function ncSettlementPrintJobId(billId: string): string {
 	return `${billId.trim()}-nc`;
 }
 
+/**
+ * What a PREVIOUS party's fallback-addressed print is re-filed as when a moved
+ * party lands on its table (MoveTableParty): `previous-party:<old bill_id>`.
+ *
+ * THE DEFECT THIS ENDS. A moved party keeps its orders' created_at, so its
+ * seating starts BEFORE the move — and at the destination that start counted
+ * every `<dst>-<epoch>` print made after it, including the bill of the party
+ * that sat there, paid and left in the meantime. The moved party arrived
+ * "printed" (orange, a 423 on a plain order, a next-party seat, "Replaces the
+ * bill printed 12:01" on somebody else's paper). Production: 4 of the last 12
+ * party moves had that shape.
+ *
+ * The destination is free with no open bill when this is written, so those
+ * prints belong to nobody seated. The new id keeps the old one whole (the
+ * ledger still says what was printed) and no longer starts with
+ * `<table name>-`, so no seating counts it. Like `<id>-nc`, it is free text the
+ * tills only log.
+ */
+export const PREVIOUS_PARTY_PRINT_MARK = "previous-party:";
+
+export function previousPartyPrintJobId(billId: string): string {
+	return `${PREVIOUS_PARTY_PRINT_MARK}${String(billId ?? "").trim()}`;
+}
+
 /** Does this print job belong to this table's CURRENT seating? */
 export function billPrintJobBelongsToSeating(job: BillPrintJobRow, seating: BillPrintSeating): boolean {
 	const billId = String(job?.bill_id ?? "").trim();

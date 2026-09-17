@@ -453,6 +453,12 @@ export interface BillPrintedRefusal {
 	 * words are unchanged for them.
 	 */
 	add_to_printed_action: string | null;
+	/**
+	 * 2.0.2: the sentence a client that offers add_to_printed_action shows IN
+	 * PLACE OF `error`, whose "ask a manager to add it" is wrong beside a button
+	 * that adds it. Null exactly when add_to_printed_action is. Additive, like it.
+	 */
+	add_to_printed_message: string | null;
 	print_count: number;
 }
 
@@ -491,6 +497,9 @@ export function billPrintedRefusal(input: {
 		: elsewhere
 			? `${named}'s bill has already been printed, so nothing more can be added to it. Take a new party's order on ${nextWords}. If it is for the same guests, ask a manager to add it and reprint the bill.`
 			: `${named}'s bill has already been printed, so nothing more can be added to it. ${managerDoes}`;
+	// Offered on an ORDER only: a merge or a moved item is a manager's act on
+	// every client, and a guest may never add to printed paper.
+	const addToPrinted = !input.guest && write === "order";
 	return {
 		error,
 		code: BILL_PRINTED_CODE,
@@ -498,11 +507,24 @@ export function billPrintedRefusal(input: {
 		next_party_table: next || null,
 		// A guest is never handed a table to walk to.
 		next_party_action: elsewhere && !input.guest ? takeItOnNextPartyLabel(next) : null,
-		// Offered on an ORDER only: a merge or a moved item is a manager's act on
-		// every client, and a guest may never add to printed paper.
 		add_to_printed_action: input.guest || write !== "order" ? null : addToPrintedBillLabel(input.table, input.parentTable ?? null),
+		add_to_printed_message: addToPrinted ? addToPrintedBillRefusalMessage(named, elsewhere ? nextNamed : null) : null,
 		print_count: Math.max(0, Math.round(Number(input.printCount) || 0)),
 	};
+}
+
+/**
+ * THE REFUSAL AS A 2.0.2 CLIENT SAYS IT — beside "Add to 12's printed bill"
+ * (and "Take it on 12 (next party)" when there is a seat), so the sentence
+ * names the two choices the buttons are. The 2.0.0/2.0.1 `error` still sends a
+ * waiter to a manager, which is true for those tills: they cannot add it.
+ * [named] and [nextNamed] are the tables as a sentence names them.
+ */
+export function addToPrintedBillRefusalMessage(named: string, nextNamed: string | null): string {
+	const next = String(nextNamed ?? "").trim();
+	return next
+		? `${named}'s bill has already been printed. Take a new party's order on ${next}, or, if it is for the same guests, add it to ${named}'s printed bill and print the updated bill.`
+		: `${named}'s bill has already been printed. If it is for the same guests, add it to ${named}'s printed bill and print the updated bill.`;
 }
 
 /** The action both clients put beside the refusal's sentence. */

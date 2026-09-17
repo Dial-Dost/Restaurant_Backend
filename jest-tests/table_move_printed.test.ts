@@ -19,9 +19,12 @@
 //   4. prints addressed to the bill's id need nothing — the bill row moved;
 //   5. the answer says the party was printed;
 //   6. the re-key is INSIDE the move's transaction — a later failure undoes it;
-//   7. a database with no print ledger still moves the party.
+//   7. a database with no print ledger still moves the party;
+//   8. the DESTINATION's previous party's prints are not the moved party's —
+//      even when that party printed after the moved one sat down.
 
 import { describe, test, expect, beforeAll, beforeEach, jest } from "@jest/globals";
+import { billPrintJobBelongsToSeating, previousPartyPrintJobId } from "../bill_print_state";
 import {
   RESTAURANT_SLUG,
   addBill,
@@ -118,11 +121,14 @@ describe("a printed party's paper moves with it", () => {
     addPrintJob({ bill_id: "T1-1789545775000", kind: "kot", created_at: "2026-09-09T12:40:00.000Z" }); // a docket
     await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
     expect(ids()).toEqual(["T1-1789545774999-nc", "T1-1789545775000", "T1-A-1789545774999", "T10-1789545774999", "T2-1789545774907"]);
-    // And the statement itself is the exact-prefix one, never a LIKE.
+    // And both statements (the destination's retirement, then the party's
+    // re-key) are the exact-prefix kind, never a LIKE.
     const rekey = statements().filter((q) => q.startsWith('update "printjobs"'));
-    expect(rekey).toHaveLength(1);
-    expect(rekey[0]).toContain("starts_with(bill_id, $3)");
-    expect(rekey[0]).not.toMatch(/\blike\b/);
+    expect(rekey).toHaveLength(2);
+    for (const q of rekey) {
+      expect(q).toContain("starts_with(bill_id, $3)");
+      expect(q).not.toMatch(/\blike\b/);
+    }
   });
 
   test("prints addressed to the BILL'S ID need no re-key: the bill row itself moved", async () => {
@@ -150,6 +156,73 @@ describe("a printed party's paper moves with it", () => {
     const res = await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
     expect(res.moved_prints).toBe(0);
     expect(statements().filter((q) => q.startsWith('update "printjobs"'))).toEqual([]);
+  });
+});
+
+// THE DESTINATION'S HISTORY (review of 2.0.2). The moved party's orders keep
+// their created_at, so its seating starts EARLIER than the move. At the
+// destination that start used to count every `<dst>-<epoch>` print made after
+// it — including the bill of the party that sat there, paid and left in the
+// meantime. Production: 4 of the last 12 party moves had that shape (GGV
+// 2026-09-10 32A -> 11, 2026-09-14 15 -> 12, 15 -> 14 and 41 -> 15).
+describe("the destination's previous party keeps its own prints", () => {
+  /** T2's previous party printed at 12:30 — after T1's party ordered at 12:05. */
+  function destinationPrintedAfterPartySat(): void {
+    addPrintJob({ bill_id: "T2-1789545774907", created_at: "2026-09-09T12:30:00.000Z" });
+  }
+
+  test("an UNPRINTED party moved there arrives unprinted — no orange tile, no next-party seat", async () => {
+    const t1 = addTable({ table_name: "T1", capacity: 4, is_occupied: true, num_covers: 2 });
+    addTable({ table_name: "T2", capacity: 4 });
+    addOrder({ table_id: t1.id, created_at: "2026-09-09T12:05:00.000Z" });
+    destinationPrintedAfterPartySat();
+    const res = await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
+    // printed:false is what keeps POST /tables/move from opening "T2 #2".
+    expect(res).toMatchObject({ to_table: "T2", moved_prints: 0, printed: false, printed_as: null });
+    expect(ids()).toEqual([previousPartyPrintJobId("T2-1789545774907")]);
+    // ...and the retired id is no seating's print, T2's included.
+    const seating = { open_bill_id: null, table_name: "T2", seating_start: "2026-09-09T12:05:00.000Z" };
+    expect(billPrintJobBelongsToSeating({ bill_id: ids()[0], created_at: "2026-09-09T12:30:00.000Z" }, seating)).toBe(false);
+  });
+
+  test("a PRINTED party moved there counts only its own paper", async () => {
+    printedWithoutBillRow(); // T1-… at 12:30
+    addPrintJob({ bill_id: "T2-1789546000000", created_at: "2026-09-09T12:40:00.000Z" }); // T2's previous party
+    const res = await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
+    expect(res).toMatchObject({ moved_prints: 1, printed: true });
+    expect(ids()).toEqual([previousPartyPrintJobId("T2-1789546000000"), "T2-1789545774907"].sort());
+  });
+
+  test("the retirement runs BEFORE the re-key, so the party's own prints are never retired with it", async () => {
+    printedWithoutBillRow();
+    destinationPrintedAfterPartySat();
+    await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
+    const updates = statements().filter((q) => q.startsWith('update "printjobs"'));
+    expect(updates[0]).toMatch(/^update "printjobs" set bill_id = \$4 \|\| bill_id /);
+    expect(updates[1]).toMatch(/^update "printjobs" set bill_id = \$4 \|\| substr\(bill_id/);
+    expect(ids()).toContain("T2-1789545774907");
+  });
+
+  test("the destination's OLDER prints, its lookalikes and its other kinds are left exactly as they were", async () => {
+    printedWithoutBillRow();
+    addTable({ table_name: "T2-A", capacity: 4 });
+    addPrintJob({ bill_id: "T2-1789400000000", created_at: "2026-09-09T09:00:00.000Z" }); // before the party sat
+    addPrintJob({ bill_id: "T2-A-1789546000000", created_at: "2026-09-09T12:40:00.000Z" }); // table "T2-A"
+    addPrintJob({ bill_id: "T2-1789546000001", kind: "kot", created_at: "2026-09-09T12:40:00.000Z" }); // a docket
+    addPrintJob({ bill_id: "T2-split-1of2", created_at: "2026-09-09T12:41:00.000Z" }); // previous party's split: retired
+    await db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2");
+    expect(ids()).toEqual([
+      previousPartyPrintJobId("T2-split-1of2"),
+      "T2-1789400000000", "T2-1789545774907", "T2-1789546000001", "T2-A-1789546000000",
+    ].sort());
+  });
+
+  test("a move that fails later puts the destination's prints back too", async () => {
+    printedWithoutBillRow();
+    destinationPrintedAfterPartySat();
+    failNextStatementContaining("set is_occupied = false");
+    await expect(db.MoveTableParty(RESTAURANT_SLUG, "T1", "T2")).rejects.toThrow();
+    expect(ids()).toEqual(["T1-1789545774907", "T2-1789545774907"]);
   });
 });
 

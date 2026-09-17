@@ -6,7 +6,7 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState, ClosedBillDetail, OpenBillChargeConfig } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable, RecordBillPrintPaper } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable, RecordBillPrintPaper, CopyBillPrintPaper } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type ReceiptOptions, type SplitReceiptPart } from "../escpos.js";
 import { ncSettlementPrintJobId } from "../bill_print_state.js";
 import { billLinesDigest, billPaperDigest, billPrintedClock, paperStale, replacesBillLine, type BillPaperRecord } from "../bill_paper_digest.js";
@@ -1522,8 +1522,23 @@ export async function claimClientRenderedBillPrint(
 		// authorises a print; the ledger is bookkeeping. Withholding the bill
 		// there would leave a waiter unable to produce paper on exactly the
 		// database where nothing else is stopping them.
-		printable_bill: bill,
+		printable_bill: printableBillOf(bill),
 	};
+}
+
+/**
+ * THE BILL A CLAIM HANDS THE BROWSER TO PRINT — the open bill without the
+ * record of the paper that came before it (migration 055). `last_paper_digest`
+ * never leaves the data layer (GET /bill-for-table strips it too), and
+ * `printed_total` is the total on the OLD paper: it is on nobody's receipt, so
+ * C4's exception above (the figures being printed, at the moment they are
+ * printed) does not reach it. The print page reads neither.
+ */
+function printableBillOf(bill: OpenTableBill): Omit<OpenTableBill, "last_paper_digest" | "printed_total"> {
+	const { last_paper_digest: _lastPaperDigest, printed_total: _printedTotal, ...printable } = bill;
+	void _lastPaperDigest;
+	void _printedTotal;
+	return printable;
 }
 
 /**
@@ -1627,6 +1642,8 @@ app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9")
 	const outletId = extractOutletId(req);
 	const billId = typeof body.billId === 'string' ? body.billId.trim() : '';
 	const escBase64 = typeof body.escBase64 === 'string' ? body.escBase64 : (typeof body.esc === 'string' ? body.esc : null);
+	// Optional: the print claim these bytes came from (see CopyBillPrintPaper).
+	const paperJobId = typeof body.paperJobId === 'string' ? body.paperJobId.trim() : '';
 
 	if (!restaurantId || !outletId || !billId || !escBase64) {
 		res.status(400).json({ error: 'restaurantId, outletId, billId and escBase64 are required' });
@@ -1668,6 +1685,13 @@ app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9")
 		const dispatched = await dispatchPrintJob(restaurantId, {
 			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
 		});
+		// CLIENT ITEMS 1 AND 2: the web print page sends the bytes of the paper its
+		// claim just recorded, and names that claim's job. This job is the newer
+		// counted print of the same bill, so it takes the claim's record (never
+		// one re-taken now) or the seating's paper would read unknown from here on.
+		if (paperJobId && dispatched.jobId) {
+			await CopyBillPrintPaper(restaurantId, paperJobId, dispatched.jobId);
+		}
 		// `jobId` keeps its exact meaning and position; `destination`/`device` are
 		// ADDITIVE and are null for every unrouted outlet, so a till written against
 		// this route before routing existed reads the same body it always did. They

@@ -413,6 +413,26 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
       }],
     };
   }
+  if (s.startsWith('update "printjobs" set bill_id = $4 || bill_id where')) {
+    // The destination's previous party's prints: the same three bounds as the
+    // re-key below, and the old id kept whole behind the mark.
+    if (!s.includes("starts_with(bill_id, $3)") || !s.includes("~ '^([0-9]+|split-[0-9]+of[0-9]+)$'")
+      || !s.includes("created_at >= $6::timestamptz") || s.includes(" like ")) {
+      throw new Error("table_move_fixtures: the retirement must be bounded by the exact prefix, the suffix shape and the seating start");
+    }
+    const prefix = str(params[2]);
+    const mark = str(params[3]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.kind !== str(params[4]) || !j.bill_id.startsWith(prefix)) {continue;}
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(j.bill_id.slice(prefix.length))) {continue;}
+      if (Date.parse(j.created_at) < start) {continue;}
+      j.bill_id = `${mark}${j.bill_id}`;
+      out.push({ id: j.id });
+    }
+    return { rows: out };
+  }
   if (s.startsWith('update "printjobs" set bill_id = $4 || substr(bill_id, length($3) + 1)')) {
     // The statement's whole predicate, clause for clause: kind, the EXACT
     // prefix (starts_with), the suffix shape, and the seating bound.

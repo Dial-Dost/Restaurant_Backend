@@ -125,6 +125,7 @@ import {
   BILL_PRINT_JOB_KIND,
   COUNTED_PRINT_JOB_STATUSES,
   NO_BILL_PRINTS,
+  PREVIOUS_PARTY_PRINT_MARK,
   billPrintFallbackPrefix,
   latestBillPaper,
   seatingStartOf,
@@ -5831,6 +5832,48 @@ export async function RecordBillPrintPaper(
   } catch (err) {
     if ((err as { code?: unknown } | null)?.code === "42703") {notePrintJobPaperMissing();}
     logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_record_failed");
+    return false;
+  }
+}
+
+/**
+ * THE SAME PAPER, SENT TO A THERMAL PRINTER TOO — the web print page's
+ * "Print ESC/POS" (POST /publish/bill) after its claim.
+ *
+ * The page renders its bytes from the claim's own `printable_bill`, so the
+ * publish is the claim's paper again. Its job is a counted print of the same
+ * bill id and the NEWER one, so without this it became "the paper" with nothing
+ * recorded: paper_stale went unknown and a waiter could never print the updated
+ * bill for that seating. The record is copied from the claim's job, never
+ * re-taken from the bill as it is now — the bytes are the claim's, and a bill
+ * that changed in between must still read stale.
+ *
+ * Only between two bill jobs of this tenant filed under the SAME bill_id: a
+ * job id from another bill (or another restaurant) copies nothing. Never
+ * throws, like RecordBillPrintPaper.
+ */
+export async function CopyBillPrintPaper(restaurantId: string, fromJobId: string, toJobId: string): Promise<boolean> {
+  const from = String(fromJobId ?? "").trim();
+  const to = String(toJobId ?? "").trim();
+  if (!isUuid(from) || !isUuid(to) || from === to) {return false;}
+  try {
+    const context = await requireRestaurantContext(restaurantId);
+    if (!(await printJobPaperReady())) {return false;}
+    const rows = await runQuery<{ id: string }>(
+      `update "PrintJobs" t
+          set bill_digest = f.bill_digest, lines_digest = f.lines_digest,
+              bill_grand_total = f.bill_grand_total, table_name = f.table_name
+         from "PrintJobs" f
+        where t.res_id = $1 and t.id = $3::uuid and t.kind = $4
+          and f.res_id = $1 and f.id = $2::uuid and f.kind = $4
+          and f.bill_id = t.bill_id
+        returning t.id`,
+      [context.res_id, from, to, BILL_PRINT_JOB_KIND],
+    );
+    return rows.length > 0;
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === "42703") {notePrintJobPaperMissing();}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_copy_failed");
     return false;
   }
 }
@@ -17165,6 +17208,15 @@ export async function MoveTableParty(
  * shape (`starts_with`, never LIKE, and only an epoch or a split suffix after
  * it, so "12-A-…" is not 12's).
  *
+ * THE DESTINATION'S HISTORY FIRST. The party keeps its orders' created_at, so
+ * its seating starts before the move, and at the destination that bound
+ * counted every `<dst>-<epoch>` print made after it — the bill of the party
+ * that sat there, paid and left in the meantime (4 of the last 12 production
+ * moves). The destination is free with no open bill (checked above), so those
+ * prints are nobody's now: they are re-filed as `previous-party:<id>`
+ * (previousPartyPrintJobId) under the same two bounds, and only THEN is the
+ * party's own paper carried in, so it can never be retired with them.
+ *
  * IN A SAVEPOINT: a ledger that is not there (027 unapplied, or its grants
  * missing) must not abort the move — it has no prints to carry. Any other
  * failure does abort it: a printed party arriving unprinted is the defect.
@@ -17193,6 +17245,21 @@ async function rekeyMovedPartyPrints(
   const to = billPrintFallbackPrefix(dst.table_name);
   await runQuery("savepoint move_party_print_rekey", [], client);
   try {
+    // $3 is the destination's prefix here; `$4 || bill_id` keeps the old id whole.
+    const retired = await runQuery<{ id: string }>(
+      `update "PrintJobs"
+          set bill_id = $4 || bill_id
+        where res_id = $1 and outlet_id = $2 and kind = $5
+          and starts_with(bill_id, $3)
+          and substr(bill_id, length($3) + 1) ~ '^([0-9]+|split-[0-9]+of[0-9]+)$'
+          and created_at >= $6::timestamptz
+        returning id`,
+      [context.res_id, context.outlet_id, to, PREVIOUS_PARTY_PRINT_MARK, BILL_PRINT_JOB_KIND, start.toISOString()],
+      client,
+    );
+    if (retired.length > 0) {
+      logger.info({ table: dst.table_name, retired: retired.length }, "move_party_destination_prints_retired");
+    }
     const rows = await runQuery<{ id: string }>(
       `update "PrintJobs"
           set bill_id = $4 || substr(bill_id, length($3) + 1)

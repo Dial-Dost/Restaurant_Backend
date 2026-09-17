@@ -1424,14 +1424,17 @@ export async function refuseOrderOnPrintedBill(
 		/**
 		 * The write said `add_to_printed_bill: true`. Omitted, the staff route's
 		 * own body is read (addToPrintedBillFlag); a guest is refused whatever it
-		 * says, so the QR route never needs to pass it.
+		 * says, so the QR route never needs to pass it. Honoured for an ORDER
+		 * only: a merge or a moved item is a manager's act on every client (no
+		 * client offers the confirm for one), so a waiter's body that says so
+		 * anyway is still refused.
 		 */
 		confirmedPrinted?: boolean;
 	},
 ): Promise<PrintedBillGuard> {
 	const { restaurantId, tableName, guest, upsert } = target;
 	const write = target.write ?? "order";
-	const confirmedPrinted = target.confirmedPrinted ?? addToPrintedBillFlag(req.body);
+	const confirmedPrinted = write === "order" && (target.confirmedPrinted ?? addToPrintedBillFlag(req.body));
 	const allow = { refused: false as const, reprintNeeded: false, table: null, parentTable: null };
 	let state: Awaited<ReturnType<typeof GetOrderingPrintGuard>> = null;
 	try {

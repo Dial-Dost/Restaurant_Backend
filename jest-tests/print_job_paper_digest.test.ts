@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   SLUG,
+  addBill,
   addOrder,
   addPrint,
   addTable,
@@ -161,6 +162,63 @@ describe("2. what a print said, filed and read back", () => {
     expect(await db.GetBillForTable(SLUG, "12")).toMatchObject({ last_paper_digest: null, printed_total: null });
   });
 
+  // Review of 2.0.2: the web print page's "Print ESC/POS" (POST /publish/bill)
+  // files a NEWER counted job under the claim's bill id. Without the claim's
+  // record on it, that job became "the paper" with nothing recorded.
+  describe("the web claim, then its ESC/POS publish of the same paper", () => {
+    const claimThenPublish = async () => {
+      addTable({ table_name: "12", capacity: 4 });
+      seat("12", 2);
+      addOrder("12", 1000);
+      const bill = addBill("12");
+      tick(4);
+      const claim = addPrint(bill.id);
+      await db.RecordBillPrintPaper(SLUG, [claim.id], PAPER(billLinesDigest([{ name: "Dish on 12", price: 1000, quantity: 1 }])));
+      tick(1);
+      const publish = addPrint(bill.id, { status: "pending" });
+      return { bill, claim, publish };
+    };
+
+    test("without the copy the publish shadows the claim: the paper reads UNKNOWN (the defect)", async () => {
+      await claimThenPublish();
+      expect(await rowOf("12")).toMatchObject({ print_count: 2, paper_stale: null });
+      expect(await db.GetBillForTable(SLUG, "12")).toMatchObject({ last_paper_digest: null, printed_total: null });
+    });
+
+    test("CopyBillPrintPaper puts the claim's record on the publish: the paper stays KNOWN, and a later addition reads stale", async () => {
+      const { claim, publish } = await claimThenPublish();
+      await expect(db.CopyBillPrintPaper(SLUG, claim.id!, publish.id!)).resolves.toBe(true);
+      expect(printJobs().find((j) => j.id === publish.id)).toMatchObject({
+        bill_digest: "b".repeat(64), bill_grand_total: 1050, table_name: "12",
+        lines_digest: billLinesDigest([{ name: "Dish on 12", price: 1000, quantity: 1 }]),
+      });
+      expect(await rowOf("12")).toMatchObject({ print_count: 2, paper_stale: false });
+      expect(await db.GetBillForTable(SLUG, "12")).toMatchObject({ last_paper_digest: "b".repeat(64), printed_total: 1050 });
+      tick(5);
+      addOrder("12", 200);
+      expect(await rowOf("12")).toMatchObject({ paper_stale: true });
+    });
+
+    test("a job of ANOTHER bill (or the same job, or no uuid) copies nothing", async () => {
+      const { claim, publish } = await claimThenPublish();
+      addTable({ table_name: "15", capacity: 4 });
+      const other = addPrint(addBill("15").id);
+      await expect(db.CopyBillPrintPaper(SLUG, claim.id!, other.id!)).resolves.toBe(false);
+      expect(printJobs().find((j) => j.id === other.id)?.bill_digest ?? null).toBeNull();
+      await expect(db.CopyBillPrintPaper(SLUG, publish.id!, publish.id!)).resolves.toBe(false);
+      await expect(db.CopyBillPrintPaper(SLUG, "job-1", publish.id!)).resolves.toBe(false);
+      expect(await rowOf("12")).toMatchObject({ paper_stale: null });
+    });
+
+    test("055 absent: nothing is named, nothing is copied, nothing throws", async () => {
+      const { claim, publish } = await claimThenPublish();
+      setPaperColumnsPresent(false);
+      db.resetPrintJobPaperCache();
+      await expect(db.CopyBillPrintPaper(SLUG, claim.id!, publish.id!)).resolves.toBe(false);
+      expect(statements().filter((q) => q.includes("set bill_digest = f.bill_digest"))).toEqual([]);
+    });
+  });
+
   test("no job id, or no uuid, writes nothing", async () => {
     printedTwelve();
     await expect(db.RecordBillPrintPaper(SLUG, [null, undefined, "", "job-1"], PAPER("l"))).resolves.toBe(false);
@@ -222,6 +280,38 @@ describe("4. moving a printed party", () => {
     expect(await rowOf("12")).toMatchObject({ print_count: 0, occupied: false });
     // The order and its printed name follow the party.
     expect((await db.GetBillForTable(SLUG, "20"))).toMatchObject({ print_count: 1, printed_as: "12", subtotal: 1000 });
+  });
+
+  // Review of 2.0.2: 20's previous party printed AFTER 12's party sat down (its
+  // paper is the newer one), paid and left. The moved party's latest paper has
+  // to be its own — not "Replaces the bill printed 08:10" on 20's old bill.
+  test("12 -> 20 where 20's PREVIOUS party printed later: the paper that counts is 12's, and 20's is retired", async () => {
+    const { jobId } = printedTwelve(); // 12's paper at 08:04
+    const lines12 = billLinesDigest([{ name: "Dish on 12", price: 1000, quantity: 1 }]);
+    await db.RecordBillPrintPaper(SLUG, [jobId], PAPER(lines12));
+    tick(6);
+    const previous = addPrint(`20-${String(PRINTED_AT + 6 * 60_000)}`, {
+      bill_digest: "c".repeat(64), lines_digest: "someone else's lines", bill_grand_total: 4200, table_name: "20",
+    });
+
+    const out = await db.MoveTableParty(SLUG, "12", "20");
+    expect(out).toMatchObject({ to_table: "20", printed: true, printed_as: "12", moved_prints: 1 });
+    expect(printJobs().find((j) => j.id === previous.id)?.bill_id).toBe(`previous-party:20-${String(PRINTED_AT + 6 * 60_000)}`);
+    expect(await rowOf("20")).toMatchObject({ print_count: 1, printed_as: "12", paper_stale: false });
+    expect(await db.GetBillForTable(SLUG, "20")).toMatchObject({ print_count: 1, printed_total: 1050, printed_as: "12" });
+  });
+
+  test("an UNPRINTED party moved onto that table arrives unprinted: green, no stale paper, no printed name", async () => {
+    addTable({ table_name: "12", capacity: 4 });
+    addTable({ table_name: "20", capacity: 6 });
+    seat("12", 2);
+    addOrder("12", 600);
+    tick(30);
+    addPrint(`20-${String(PRINTED_AT + 26 * 60_000)}`, { lines_digest: "someone else's lines", bill_grand_total: 4200, table_name: "20" });
+    const out = await db.MoveTableParty(SLUG, "12", "20");
+    expect(out).toMatchObject({ to_table: "20", printed: false, printed_as: null, moved_prints: 0 });
+    expect(await rowOf("20")).toMatchObject({ print_count: 0, paper_stale: null, printed_as: null, occupied: true });
+    expect(await db.GetBillForTable(SLUG, "20")).toMatchObject({ print_count: 0, printed_total: null });
   });
 
   test("a move into the table's OWN family is refused in words, and nothing moves", async () => {
