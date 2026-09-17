@@ -925,8 +925,12 @@ function cancellationBanner(reason: string | null | undefined, cols: number): st
  * are already grouped under bill_id `order-<id>`, so the distinct kot_no across
  * them is a direct, edit-proof answer and becomes candidate 0. Nothing else in
  * this function needs to change.
+ *
+ * EXPORTED for kot_move.ts (client item 4): a dish moved to another table is
+ * re-docketed under the number already on the paper for it, and "which number
+ * is on the paper for these lines" is exactly the question answered here.
  */
-async function resolveCancelledKotNumber(
+export async function resolveCancelledKotNumber(
   restaurantId: string,
   order: OrderKotContext,
   opts: { cancelledLines: KotLine[]; itemId?: string | null; firedAt: Date; tz: string },

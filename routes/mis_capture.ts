@@ -125,6 +125,7 @@ import {
 	WaiveServiceCharge,
 	resolveServiceChargeWaiverReasonOptional,
 } from "../database_supabase.js";
+import { isCancelNeedsSeniorError } from "../cancel_authority.js";
 import { dispatchCancellationKot } from "../kot_print.js";
 import { NON_CHARGEABLE_KINDS, SERVICE_CHARGE_WAIVER_KINDS, VOID_KINDS } from "../mis_capture.js";
 import { logger } from "../observability.js";
@@ -141,6 +142,7 @@ import {
 	extractRestaurantId,
 	log_audit,
 	nextPartyPrintMessage,
+	refuseTicketedCancel,
 	validateAction,
 	validateBody,
 } from "./_shared.js";
@@ -581,6 +583,14 @@ app.get("/orders/:id/non-chargeables", validateAction(PERM_NON_CHARGEABLE), asyn
 	would derive the stage from the table's state NOW about a void that happened
 	THEN, which is a fabricated fraud signal pointing at a named employee. A
 	missing order is a 404.
+
+	CLIENT ITEM 3 — A WAITER-ONLY LOGIN IS REFUSED A TICKETED ORDER HERE TOO,
+	with `cancel_needs_senior`, even when a tenant has granted it this route's
+	permission and even with a manager's name in `authorised_by`: the client
+	asked for the waiter to lose Cancel KOT, and this is the route the app takes
+	for it when the grant is held. The check runs inside the void's transaction
+	(VoidOrderWithReason), so a refusal writes no row and prints no slip. A
+	Pending order — never ticketed — can still be declined.
 */
 app.post("/orders/:id/void", validateAction(PERM_VOID_ORDER), validateBody(sVoidOrder), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -603,7 +613,7 @@ app.post("/orders/:id/void", validateAction(PERM_VOID_ORDER), validateBody(sVoid
 				authorised_by_employee_id: who.authorised_by_employee_id,
 				authorised_by_username: who.authorised_by_username,
 			},
-		});
+		}, { actor: { role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions } });
 		if (!result.ok) { res.status(404).json({ error: "Order not found" }); return; }
 		const rec = result.record;
 		const tableName = await GetTableNameById(restaurantId, rec.table_id).catch(() => null);
@@ -649,6 +659,7 @@ app.post("/orders/:id/void", validateAction(PERM_VOID_ORDER), validateBody(sVoid
 			...(cancelPrint.reason ? { cancel_kot_skipped: cancelPrint.reason } : {}),
 		});
 	} catch (err) {
+		if (isCancelNeedsSeniorError(err)) { await refuseTicketedCancel(req, res, err); return; }
 		failCapture(res, err, "void_order_failed", "That order has already been voided.");
 	}
 });

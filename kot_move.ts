@@ -58,10 +58,11 @@
  * see POST /tables/move-order.
  */
 
-import { buildKotTicketKey, dispatchKot, type KotLine } from "./kot_print.js";
+import { buildKotTicketKey, dispatchKot, resolveCancelledKotNumber, type KotLine } from "./kot_print.js";
 import { logger } from "./observability.js";
 import {
   GetOrderKotContext,
+  GetOrderKotNumbers,
   GetRestaurantProfile,
   GetRestaurantSettings,
   GetTableFeedbackContext,
@@ -179,5 +180,172 @@ export async function printKotTableChange(opts: {
   } catch (err) {
     logger.error({ err, orderId, restaurantId }, "kot_table_change_print_failed");
     return { printed: false, kot_no: null, tickets: 0, reason: "print_failed" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ONE DISH MOVED TO ANOTHER TABLE (POST /bills/move-item) — client item 4.
+// ---------------------------------------------------------------------------
+//
+// THE SAME PROBLEM AS A WHOLE-ORDER MOVE, ONE DISH WIDE. The pass holds a
+// docket that says 31A for a dish now going to 31. The move used to print
+// nothing and attach no number, so the dish sat on the destination in the "No
+// KOT number" group and showed on the kitchen board as a fresh, unnumbered
+// ticket — to the kitchen, a second order for food it was already cooking.
+//
+// So, exactly as above: the number the kitchen knows the dish by is RESOLVED
+// (never minted) BEFORE the move, because the source ticket's key is a
+// fingerprint of its item set and stops matching the moment a line leaves; and
+// after the move a docket prints for the moved dish alone, under that number,
+// on the new table, headed "*** MOVED FROM 31A ***". It is grouped under the
+// NEW order's `order-<id>`, so migration 043 attributes the number to it and
+// the dish lands in a numbered block on both clients. Never ticketed = no paper
+// to correct = nothing prints.
+
+/** One source order a dish move will take lines from, as read before the move. */
+export interface MoveItemSource {
+  order_id: string;
+  /** The matched lines, whole, as they stand on the source order. */
+  lines: Record<string, unknown>[];
+}
+
+const lineText = (v: unknown): string => (typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "");
+
+/** A stored line as the add-item docket keyed it (see DELETE /orders/:id/items/:itemId). */
+function kotLineOf(raw: Readonly<Record<string, unknown>>): KotLine {
+  const note = lineText(raw.note);
+  const variation = lineText(raw.variation_name);
+  const menuId = lineText(raw.menu_id);
+  return {
+    name: typeof raw.name === "string" ? raw.name : "Item",
+    quantity: Number(raw.quantity ?? 1),
+    price: Number(raw.price ?? 0),
+    ...(note ? { note } : {}),
+    ...(variation ? { variation } : {}),
+    ...(menuId ? { menu_id: menuId } : {}),
+  };
+}
+
+/**
+ * The KOT number the kitchen knows each source ticket by — a PURE READ, made
+ * before the move. Per source order:
+ *
+ *   1. the ticket key (resolveCancelledKotNumber: the added-line docket for a
+ *      single moved line, then the whole-order docket), which names the exact
+ *      paper the dish is on;
+ *   2. failing that, the first number PrintJobs attributes to the order
+ *      (migration 043) — edit-proof, and the placement docket, which is where
+ *      a dish that was not added later sits.
+ *
+ * An order with neither maps to []: it was never ticketed. Never throws.
+ */
+export async function resolveMoveSourceKots(
+  restaurantId: string,
+  sources: readonly MoveItemSource[],
+): Promise<Map<string, number[]>> {
+  const out = new Map<string, number[]>();
+  if (sources.length === 0) {return out;}
+  let printed = new Map<string, number[]>();
+  try {
+    printed = await GetOrderKotNumbers(restaurantId, sources.map((s) => s.order_id));
+  } catch (err) {
+    logger.warn({ err, restaurantId }, "kot_move_item_printed_numbers_failed");
+  }
+  let tz = "Asia/Kolkata";
+  try {
+    tz = (await GetRestaurantSettings(restaurantId)).timezone || tz;
+  } catch {/* the tenant zone only moves the business day of the key */}
+  for (const source of sources) {
+    let kotNo: number | null = null;
+    let pending = false;
+    try {
+      const order = await GetOrderKotContext(restaurantId, source.order_id);
+      pending = order?.awaiting_approval === true;
+      if (order && !pending) {
+        const single = source.lines.length === 1 ? lineText(source.lines[0]?.id) : "";
+        kotNo = await resolveCancelledKotNumber(restaurantId, order, {
+          cancelledLines: source.lines.map(kotLineOf),
+          itemId: single || null,
+          firedAt: new Date(),
+          tz,
+        });
+      }
+    } catch (err) {
+      logger.warn({ err, orderId: source.order_id }, "kot_move_item_number_lookup_failed");
+    }
+    const fromPrintJobs = pending ? [] : (printed.get(source.order_id) ?? []);
+    out.set(source.order_id, kotNo !== null ? [kotNo] : fromPrintJobs.slice(0, 1));
+  }
+  return out;
+}
+
+/**
+ * Print the moved dish's docket on its new table, under the number the kitchen
+ * already has for it. `orderId` is the order the move CREATED on the
+ * destination — its lines are exactly the dishes that moved.
+ */
+export async function printKotItemMove(opts: {
+  restaurantId: string;
+  orderId: string;
+  previousTableName: string;
+  kotNo: number | null;
+}): Promise<KotMoveOutcome> {
+  const { restaurantId, orderId } = opts;
+  const kotNo = typeof opts.kotNo === "number" && opts.kotNo > 0 ? opts.kotNo : null;
+  try {
+    if (kotNo === null) {
+      return { printed: false, kot_no: null, tickets: 0, reason: "never_ticketed" };
+    }
+    const settings = await GetRestaurantSettings(restaurantId);
+    // The same switch that governs every automatic docket (migration 040).
+    if (settings.kot_auto_print === false) {return { printed: false, kot_no: kotNo, tickets: 0, reason: "disabled" };}
+    const order = await GetOrderKotContext(restaurantId, orderId);
+    if (!order) {return { printed: false, kot_no: kotNo, tickets: 0, reason: "order_not_found" };}
+    if (!order.outlet_id) {return { printed: false, kot_no: kotNo, tickets: 0, reason: "no_outlet" };}
+    if (order.items.length === 0) {return { printed: false, kot_no: kotNo, tickets: 0, reason: "no_items" };}
+    // A Pending source was never ticketed; resolveMoveSourceKots already says
+    // so, and this is the belt to that brace.
+    if (order.awaiting_approval) {return { printed: false, kot_no: null, tickets: 0, reason: "never_ticketed" };}
+
+    const tz = settings.timezone || "Asia/Kolkata";
+    const [profile, waiterCtx] = await Promise.all([
+      GetRestaurantProfile(restaurantId).catch(() => null),
+      order.table_name ? GetTableFeedbackContext(restaurantId, order.table_name).catch(() => null) : Promise.resolve(null),
+    ]);
+    const waiterName = (waiterCtx?.employee_name ?? "").trim();
+    const waiterRole = (waiterCtx?.employee_role ?? "").trim().toLowerCase();
+    const dispatched = await dispatchKot({
+      restaurantId,
+      outletId: order.outlet_id,
+      // The NEW table, in the docket's biggest type.
+      tableName: order.table_name,
+      tableId: order.table_id,
+      section: order.section,
+      covers: order.covers,
+      isVirtual: order.is_virtual,
+      orderType: order.order_type,
+      // Only the dishes that moved: the destination order holds nothing else.
+      items: order.items,
+      assignedTo: waiterName || null,
+      captain: waiterName && (waiterRole === "captain" || waiterRole === "manager") ? waiterName : null,
+      orderNote: order.order_note,
+      billId: `order-${order.order_id}`,
+      restaurantName: profile?.outlet_name || profile?.restaurant_name || "Receipt",
+      currency: settings.currency ?? "₹",
+      cols: settings.bill_paper_width === "58mm" ? 32 : 48,
+      tz,
+      firedAt: new Date(),
+      pinnedKotNo: kotNo,
+      contextLine: `*** MOVED FROM ${opts.previousTableName.toUpperCase()} ***`,
+      skipIfTicketed: false,
+    });
+    logger.info(
+      { res_id: restaurantId, order_id: orderId, kot_no: kotNo, tickets: dispatched.tickets, from: opts.previousTableName, to: order.table_name },
+      "kot_item_move_printed",
+    );
+    return { printed: dispatched.tickets > 0, kot_no: kotNo, tickets: dispatched.tickets };
+  } catch (err) {
+    logger.error({ err, orderId, restaurantId }, "kot_item_move_print_failed");
+    return { printed: false, kot_no: kotNo, tickets: 0, reason: "print_failed" };
   }
 }

@@ -16,14 +16,15 @@ import { z } from "zod";
 import { destroyAllForEmployee } from "../auth/sessions.js";
 import { getStore } from "../auth/store.js";
 import type { CustomerDemographics } from "../database_supabase.js";
-import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, EnsureNextPartyTable, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetOrderingPrintGuard, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
+import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, EnsureNextPartyTable, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetOrderKotNumbers, GetOrderingPrintGuard, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
 import { rasterizeBillLogo, type BillLogoRaster } from "../bill_logo.js";
 import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import type { ReportWindowQuery } from "../report_window.js";
 import { emitRestaurant } from "../realtime.js";
 import { BILL_PRINTED_STATUS, addToPrintedBillFlag, billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill, printedBillAdditionAudit, reprintNeededMessage, type BillPrintedWrite } from "../next_party.js";
-import { isWaiterOnly } from "../role_scope.js";
+import { isWaiterOnly, mayCancelKot, type RoleScopeInput } from "../role_scope.js";
+import { cancelNeedsSeniorBody, type CancelNeedsSeniorError } from "../cancel_authority.js";
 
 
 // Python feedback service URL. Use container host (PY_SERVER_URL) when set,
@@ -485,9 +486,27 @@ export interface SessionCapabilities {
 	 * answer is what a role WITHOUT it is refused by.
 	 */
 	move_order: boolean;
+	/**
+	 * "Cancel KOT" on the table sheet and the kitchen board, and "Cancelled" on
+	 * the app's stage sheet — cancelling food the kitchen has been told about.
+	 * PATCH /orders/:id/status -> Cancelled, POST /orders/:id/void, the POST
+	 * /orders upsert and DELETE /orders/:id/items/:itemId all refuse a
+	 * waiter-only login with `cancel_needs_senior` (client item 3; see
+	 * mayCancelTicketed in role_scope.ts).
+	 *
+	 * THE ONE FLAG THAT READS THE ROLE, and it is why this function now takes
+	 * `role` and `role_all`: the client asked for the WAITER to lose it, so a
+	 * waiter-only login is false even when a tenant has granted it "Void Orders
+	 * With Reason". Everyone else holds it exactly when they hold one of the two
+	 * cancel routes' gates.
+	 *
+	 * A Pending order's "Decline" does NOT read this flag: that order was never
+	 * ticketed, and the server lets a waiter decline it.
+	 */
+	cancel_kot: boolean;
 }
 
-export function sessionCapabilities(input: { actions?: unknown }): SessionCapabilities {
+export function sessionCapabilities(input: RoleScopeInput): SessionCapabilities {
 	const actions = Array.isArray(input.actions) ? input.actions.map((a) => String(a).trim()) : [];
 	const set = new Set(actions);
 	const has = (id: string): boolean => set.has("*") || set.has(id);
@@ -507,7 +526,52 @@ export function sessionCapabilities(input: { actions?: unknown }): SessionCapabi
 		edit_menu: has("ed800655-b937-44ba-a7ca-7458295886c9"), // Edit Menu
 		move_table: has("090ea8d4-e348-4e1b-9723-11131a73a085"), // Table Occupied (POST /tables/move)
 		move_order: has("4ad474d4-5230-449c-874f-6a238b833bca"), // Add Orders (POST /tables/move-order)
+		cancel_kot: mayCancelKot(input) && (has(PERM_VOID_ORDER) || has("4ad474d4-5230-449c-874f-6a238b833bca")), // Add Orders
 	};
+}
+
+/**
+ * CLIENT ITEM 3 — ANSWER A REFUSED CANCEL. Every door that can cancel a
+ * ticketed order (PATCH /orders/:id/status, POST /orders, POST
+ * /orders/:id/void, DELETE /orders/:id/items/:itemId) turns the data layer's
+ * CancelNeedsSeniorError into the same 403 through here, so a client cannot
+ * tell which route refused it and a change to the words lands on all four.
+ * PATCH /orders/:id/status also answers a waiter's move of a ticket BACK to
+ * Pending this way (act "rewind"): that move was the first half of a cancel.
+ *
+ * AUDITED EVEN THOUGH NOTHING HAPPENED, as the refused release and the refused
+ * reprint are: a waiter trying to cancel a docket is exactly the event a
+ * manager wants to see at the end of a service. The sentence starts "REFUSED",
+ * so neither classifyBillEdit nor the Void KOT join reads it as a cancel.
+ *
+ * The KOT number is read here, after the refusal and outside any transaction,
+ * because it is only for the sentence: an unreadable one says "This order".
+ * Best-effort throughout — a failed audit or read never turns the 403 into a 500.
+ */
+export async function refuseTicketedCancel(req: Request, res: Response, err: CancelNeedsSeniorError): Promise<void> {
+	const restaurantId = extractRestaurantId(req);
+	let kotNos: number[] = [];
+	if (restaurantId) {
+		try {
+			kotNos = (await GetOrderKotNumbers(restaurantId, [err.order_id])).get(err.order_id) ?? [];
+		} catch {/* the sentence degrades to "This order" */}
+	}
+	const handle = kotNos.length > 0 ? ` (${kotNos.map((n) => `KOT-${String(n)}`).join(", ")})` : "";
+	// A rewind to Pending is named for what it is: not a cancel, but the step
+	// that would have let the next request pass as a decline.
+	const what = err.act === "remove_line"
+		? "removal of a dish from order"
+		: err.act === "rewind" ? "move back to Pending of order" : "cancel of order";
+	const cannot = err.act === "rewind" ? "put it back to Pending" : "cancel it";
+	try {
+		await log_audit(
+			req, "4ad474d4-5230-449c-874f-6a238b833bca",
+			`REFUSED ${what} ${err.order_id}${handle} — it has gone to the kitchen and a waiter cannot ${cannot}`,
+			Audit_log_category.Orders,
+			{ order_id: err.order_id, refused: true, code: err.code, act: err.act, kot_nos: kotNos },
+		);
+	} catch {/* a failed audit write must not turn a 403 into a 500 */}
+	res.status(err.status).json(cancelNeedsSeniorBody(err, kotNos));
 }
 
 // Revoke every live session of an employee. Must run whenever the identity or
@@ -1462,7 +1526,7 @@ export async function refuseOrderOnPrintedBill(
 	const seat = write === "order" ? await EnsureNextPartyTable(restaurantId, state.table) : null;
 	if (seat?.created) {announceNextPartyTable(target.emitRestaurantId ?? restaurantId, seat);}
 	if (!guest) {
-		const what = write === "merge" ? "a merge into" : write === "move" ? "an item moved onto" : "an order on";
+		const what = write === "merge" ? "a merge into" : write === "move" ? "a move onto" : write === "move_off" ? "a move off" : "an order on";
 		try {
 			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
 				`REFUSED ${what} table ${state.table} — its bill was already printed ${String(state.print_count)} time(s)`,
@@ -1520,5 +1584,32 @@ export function reprintNeededFields(
 		reprint_message: reprintNeededMessage(guard.table, guard.parentTable),
 		// The table whose paper is short: the one a Reprint action prints.
 		reprint_table: guard.table,
+	};
+}
+
+/**
+ * CLIENT ITEM 4 — A MOVE CHANGES TWO BILLS. A senior role moving an order or a
+ * dish between two printed tables leaves BOTH papers wrong: the source's
+ * charges for food that has left, the destination's is short. The first table
+ * that needs a reprint rides in the ordinary `reprint_*` fields (so an
+ * installed app that reads only those still offers one), and when both do, the
+ * second rides in `also_reprint_*` with the same shape. Nothing at all when
+ * neither paper was printed.
+ */
+export function moveReprintFields(
+	destination: PrintedBillGuard,
+	source: PrintedBillGuard,
+): {
+	reprint_needed?: true; reprint_message?: string; reprint_table?: string;
+	also_reprint_needed?: true; also_reprint_message?: string; also_reprint_table?: string;
+} {
+	const needs = [reprintNeededFields(destination), reprintNeededFields(source)].filter((f) => f.reprint_needed === true);
+	const first = needs[0];
+	const second = needs[1];
+	return {
+		...(first ?? {}),
+		...(second
+			? { also_reprint_needed: true as const, also_reprint_message: second.reprint_message, also_reprint_table: second.reprint_table }
+			: {}),
 	};
 }

@@ -384,3 +384,38 @@ export function redactOrderList(orders: unknown): unknown {
 		? redactOrderRecord(o as Record<string, unknown>)
 		: o));
 }
+
+/**
+ * The money keys on a MOVE's answer (client item 4): POST /tables/move-order
+ * answers the destination's running bill as `total_amt`, and POST
+ * /bills/move-item answers the removal summary as `moved` — the dish's
+ * `price`, the `value` that left and each matched line's price.
+ *
+ * Nobody draws any of them: both clients build their sentences from `items`
+ * (name, size, quantity) and the print block. But a web waiter keeps "Move
+ * table" by decision, the dashboard hands this body from its server action to
+ * the browser, and a table's running total in a waiter's payload is the leak
+ * this module exists to close.
+ */
+export const REDACTED_MOVE_MONEY_KEYS: readonly string[] = ["total_amt"];
+export const REDACTED_MOVED_SUMMARY_MONEY_KEYS: readonly string[] = ["price", "value"];
+
+/**
+ * A move's answer, as a waiter-only session is told it. The dishes, the KOT
+ * numbers, the print outcome and the reprint prompts all survive; the amounts
+ * go. Non-objects pass through.
+ */
+export function redactMoveAnswer<T>(answer: T): T {
+	if (answer === null || typeof answer !== "object" || Array.isArray(answer)) { return answer; }
+	const src = answer as unknown as Record<string, unknown>;
+	const out = without(src, REDACTED_MOVE_MONEY_KEYS);
+	const moved = src.moved;
+	if (moved !== null && typeof moved === "object" && !Array.isArray(moved)) {
+		const summary = without(moved as Record<string, unknown>, REDACTED_MOVED_SUMMARY_MONEY_KEYS);
+		if (Array.isArray((moved as Record<string, unknown>).lines)) {
+			summary.lines = ((moved as Record<string, unknown>).lines as unknown[]).map(redactItem);
+		}
+		out.moved = summary;
+	}
+	return out as unknown as T;
+}

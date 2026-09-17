@@ -190,12 +190,18 @@ beforeEach(() => {
   mockMoveParty.mockResolvedValue({
     success: true, from_table: "12", to_table: "20", covers: 4, moved_orders: 2, total_amt: 1050,
     moved_bill: false, moved_session: true, moved_waiter: false, moved_prints: 1, printed: true, printed_as: "12",
+    moved_order_ids: ["order-12"], moved_items: [{ name: "Gulab Jamun", variation: null, quantity: 1 }],
   });
   mockGuard.mockResolvedValue({ table: "12", table_id: "t-12", parent_table: null, print_count: 0 });
   mockEnsure.mockResolvedValue(SEAT);
   mockAddOrder.mockResolvedValue({ id: "order-new" });
   mockMerge.mockResolvedValue({ success: true, total_amt: 1650, moved_orders: 1 });
-  mockMoveItem.mockResolvedValue({ success: true, moved: { name: "Gulab Jamun" } });
+  mockMoveItem.mockResolvedValue({
+    success: true,
+    moved: { name: "Gulab Jamun", price: 120, quantity: 1, lines: [], value: 120 },
+    items: [{ name: "Gulab Jamun", variation: null, quantity: 1 }],
+    destinations: [],
+  });
   mockUpdateSplit.mockResolvedValue(undefined);
   mockGetBill.mockResolvedValue(bill());
   mockAddTable.mockResolvedValue({ _id: "t-new", table_name: "16", capacity: 4, max_capacity: 4, section: null });
@@ -521,6 +527,50 @@ describe("2d. the two doors that move food ONTO a printed table", () => {
     expect(mockGuard).toHaveBeenCalledWith(RES, "15", { orderId: null });
     expect(write()).toHaveBeenCalledTimes(1);
   });
+
+  // CLIENT ITEM 4 — A MOVE CHANGES TWO BILLS. The SOURCE of a moved dish is held
+  // to the same rule: its paper would go on charging for food that has left.
+  const sourcePrinted = (): void => {
+    mockGuard.mockImplementation(async (_r: unknown, table: unknown) => (String(table) === "15"
+      ? { table: "15", table_id: "t-15", parent_table: null, print_count: 2 }
+      : { table: String(table), table_id: "t-x", parent_table: null, print_count: 0 }));
+  };
+
+  test("POST /bills/move-item: a waiter is refused 423 when the SOURCE's bill is printed, and nothing is written", async () => {
+    sourcePrinted();
+    const r = await moveItem(WAITER, "12");
+    expect(r.status).toBe(423);
+    expect(r.body).toEqual({
+      error: "15's bill has already been printed, so nothing can be moved off it. Ask a manager to move it and reprint the bill.",
+      code: BILL_PRINTED_CODE,
+      table: "15",
+      next_party_table: null,
+      next_party_action: null,
+      add_to_printed_action: null,
+      add_to_printed_message: null,
+      print_count: 2,
+    });
+    expect(mockGuard).toHaveBeenCalledWith(RES, "15", { orderId: null });
+    expect(mockMoveItem).not.toHaveBeenCalled();
+    expect(mockEnsure).not.toHaveBeenCalled();
+  });
+
+  test("POST /bills/move-item: a manager moves it off a printed source and is told to reprint THAT table", async () => {
+    sourcePrinted();
+    const r = await moveItem(SENIORS[0][1], "12");
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ success: true, reprint_needed: true, reprint_table: "15" });
+    expect(r.body).not.toHaveProperty("also_reprint_needed");
+    expect(mockMoveItem).toHaveBeenCalledTimes(1);
+  });
+
+  test("POST /bills/move-item: both papers printed — the destination first, the source as also_reprint", async () => {
+    mockGuard.mockImplementation(async (_r: unknown, table: unknown) => ({ table: String(table), table_id: `t-${String(table)}`, parent_table: null, print_count: 1 }));
+    const r = await moveItem(SENIORS[1][1], "12");
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ reprint_needed: true, reprint_table: "12", also_reprint_needed: true, also_reprint_table: "15" });
+    expect(String((r.body as Record<string, unknown>).also_reprint_message)).toMatch(/^15's bill was already printed/);
+  });
 });
 
 // ===========================================================================
@@ -574,7 +624,7 @@ describe("2e. a waiter who CONFIRMED 'Add to printed bill' (2.0.2)", () => {
 
   test.each([
     ["POST /bills/merge", "/bills/merge", { from_table: "12 #2", to_table: "12" }, () => mockMerge, "a merge into"],
-    ["POST /bills/move-item", "/bills/move-item", { from_table: "15", to_table: "12", item_name: "Gulab Jamun", price: 120 }, () => mockMoveItem, "an item moved onto"],
+    ["POST /bills/move-item", "/bills/move-item", { from_table: "15", to_table: "12", item_name: "Gulab Jamun", price: 120 }, () => mockMoveItem, "a move onto"],
   ] as const)("%s with the flag is STILL refused for a waiter: a merge or a moved item stays a manager's act", async (_l, path, body, write, what) => {
     mockGuard.mockResolvedValue(PRINTED);
     const r = await harness.call("POST", path, { body: { ...body, add_to_printed_bill: true }, auth: WAITER as never });
@@ -588,7 +638,7 @@ describe("2e. a waiter who CONFIRMED 'Add to printed bill' (2.0.2)", () => {
 
   test.each([
     ["POST /bills/merge", "/bills/merge", { from_table: "12 #2", to_table: "12" }, () => mockMerge, "a merge into"],
-    ["POST /bills/move-item", "/bills/move-item", { from_table: "15", to_table: "12", item_name: "Gulab Jamun", price: 120 }, () => mockMoveItem, "an item moved onto"],
+    ["POST /bills/move-item", "/bills/move-item", { from_table: "15", to_table: "12", item_name: "Gulab Jamun", price: 120 }, () => mockMoveItem, "a move onto"],
   ] as const)("%s by a SENIOR lands as before, flag or not, and is audited as not confirmed", async (_l, path, body, write, what) => {
     mockGuard.mockResolvedValue(PRINTED);
     const r = await harness.call("POST", path, { body: { ...body, add_to_printed_bill: true }, auth: SENIORS[0][1] as never });
@@ -653,6 +703,7 @@ describe("2f. moving a PRINTED party opens the green seat at the destination", (
     mockMoveParty.mockResolvedValue({
       success: true, from_table: "12", to_table: "20", covers: 2, moved_orders: 1, total_amt: 300,
       moved_bill: true, moved_session: true, moved_waiter: true, moved_prints: 0, printed: false, printed_as: null,
+      moved_order_ids: ["order-12"], moved_items: [{ name: "Gulab Jamun", variation: null, quantity: 1 }],
     });
     const r = await move();
     expect(r.status).toBe(200);
@@ -892,9 +943,15 @@ describe("4. the wiring — nothing here is built and never called", () => {
     const bills = read("routes/bills.ts");
     expect(handler(bills, "app.post('/bills/merge'")).toMatch(/tableName: toTable, guest: false, write: "merge"/);
     expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/tableName: toTable, guest: false, write: "move"/);
-    for (const start of ["app.post('/bills/merge'", "app.post('/bills/move-item'"]) {
-      expect(handler(bills, start)).toMatch(/res\.json\(\{ \.\.\.result, \.\.\.reprintNeededFields\(guard\) \}\)/);
-    }
+    // Client item 4: a move is judged on its SOURCE too, and answers both reprints.
+    expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/tableName: fromTable, guest: false, write: "move_off"/);
+    expect(handler(bills, "app.post('/bills/merge'")).toMatch(/res\.json\(\{ \.\.\.result, \.\.\.reprintNeededFields\(guard\) \}\)/);
+    // The answer is built once and redacted for a waiter-only session before it is sent.
+    expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/const answer = \{ \.\.\.result, prints, kot_nos: kotNos, \.\.\.moveReprintFields\(guard, sourceGuard\) \};\s*res\.json\(hidesPrices\(req\.auth\) \? redactMoveAnswer\(answer\) : answer\);/);
+    const tablesRoutes = read("routes/tables.ts");
+    expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/tableName: toTable, guest: false, write: "move"/);
+    expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/tableName: sourceTable, guest: false, write: "move_off"/);
+    expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/\.\.\.moveReprintFields\(destinationGuard, sourceGuard\)/);
     for (const start of ['app.post("/orders",', "app.post('/orders/:id/items'"]) {
       expect(handler(read("routes/orders.ts"), start)).toMatch(/\.\.\.reprintNeededFields\(guard\),/);
     }

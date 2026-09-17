@@ -209,7 +209,7 @@ describe("who may add to a printed bill", () => {
     expect(addToPrintedBillLabel("12 #2", "12")).toBe("Add to 12 (next party)'s printed bill");
     expect(printedBillAdditionAudit({ table: "12", printCount: 1 })).toBe("ADDED an order on the printed bill of table 12 (printed 1 time(s))");
     expect(printedBillAdditionAudit({ table: "12", printCount: 2, write: "merge" })).toBe("ADDED a merge into the printed bill of table 12 (printed 2 time(s))");
-    expect(printedBillAdditionAudit({ table: " 12 ", printCount: Number.NaN, write: "move" })).toBe("ADDED an item moved onto the printed bill of table 12 (printed 0 time(s))");
+    expect(printedBillAdditionAudit({ table: " 12 ", printCount: Number.NaN, write: "move" })).toBe("ADDED a move onto the printed bill of table 12 (printed 0 time(s))");
   });
 
   test("a write that adds nothing to the bill is never refused and never told to reprint", () => {

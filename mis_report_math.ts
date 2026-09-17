@@ -671,6 +671,10 @@ export function growthPct(current: number, previous: number): number | null {
  */
 export type BillEditKind =
   | "item_added" | "item_removed" | "item_moved" | "item_note"
+  // A whole ticket moved to another table (POST /tables/move-order). It changes
+  // two bills at once — one loses the ticket's value, the other gains it — and
+  // it used to be dropped from this report because its sentence named no dish.
+  | "order_moved"
   | "discount_applied" | "discount_requested" | "discount_decision" | "coupon_applied"
   | "tables_merged" | "bill_reopened" | "bill_refunded" | "bill_replaced"
   | "bill_status_changed" | "order_cancelled" | "order_deleted"
@@ -852,6 +856,10 @@ export function classifyBillEdit(
   if (str(d.code) && /^applied coupon/i.test(r)) {return hit("coupon_applied", "Coupon applied");}
   if (/^removed item /i.test(r)) {return hit("item_removed", "Item removed");}
   if (/^moved item /i.test(r)) {return hit("item_moved", "Item moved");}
+  // "Moved KOT-65 (…) from 12 to 15 …" / "Moved order (…) from …", and the
+  // pre-2.0.2 "Moved order <uuid> from 12 to 15 …". Not "Moved the party …",
+  // which is a seating move filed under the occupancy action, not a bill edit.
+  if (/^moved (kot|order)\b/i.test(r)) {return hit("order_moved", "Order moved to another table");}
   if (/^merged table /i.test(r)) {return hit("tables_merged", "Tables merged");}
   if (/note on /i.test(r)) {return hit("item_note", "Item note changed");}
   if (isOrderCancelSentence(r)) {return hit("order_cancelled", "Order cancelled");}
@@ -1035,8 +1043,10 @@ export function formatMethodSplit(parts: readonly SettlementPart[]): string {
  * So the writer records two facts on the order, in the SAME update that filters
  * the lines and flips the status:
  *   * REMOVED_LINES_KEY holds every line a REMOVAL took off, exactly as it stood,
- *     plus the moment. A move records none, because a moved dish is still on a
- *     bill, at the destination table.
+ *     plus the moment. A move records none there, because a moved dish is still
+ *     on a bill, at the destination table.
+ *   * MOVED_LINES_KEY (client item 4) holds every line a MOVE took off, with
+ *     where it went — a list no void reader ever reads.
  *   * EMPTIED_BY_KEY names which of the two emptied the order.
  *
  * WHY ON THE ORDER AND NOT AS "OrderVoids" ROWS. The void ledger is the other
@@ -1060,6 +1070,20 @@ export function formatMethodSplit(parts: readonly SettlementPart[]): string {
 export const REMOVED_LINES_KEY = "removed_items";
 export const EMPTIED_BY_KEY = "emptied_by";
 
+/**
+ * CLIENT ITEM 4 — THE DISHES A MOVE TOOK OFF, AND WHERE EACH WENT.
+ *
+ * A move used to record nothing on the source, so the ticket it emptied read
+ * "Cancelled · 0 item(s)" on every screen and nobody could say what had left
+ * it. MOVED_LINES_KEY holds each moved line as it stood, plus the moment and
+ * the destination table and order. It is a DIFFERENT key from
+ * REMOVED_LINES_KEY on purpose: VOID_KOT_LINES_JSON and voidKotLines read
+ * only the removal list, so a moved dish is still never counted as a void —
+ * its money is on the destination's bill, and counting it here as well would
+ * list it twice.
+ */
+export const MOVED_LINES_KEY = "moved_items";
+
 /** Which bill-item writer took the lines off. */
 export type LineRemovalMode = "remove" | "move";
 
@@ -1076,6 +1100,8 @@ export function stampLineRemoval(
   mode: LineRemovalMode,
   emptied: boolean,
   at: string,
+  /** A move only: where the lines went. Absent = nothing recorded, as before. */
+  movedTo?: { to_table: string; to_order_id: string | null } | null,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...food };
   if (mode === "remove" && removed.length > 0) {
@@ -1083,6 +1109,15 @@ export function stampLineRemoval(
     out[REMOVED_LINES_KEY] = [
       ...(Array.isArray(prior) ? prior : []),
       ...removed.map((line) => (line !== null && typeof line === "object" ? { ...line, removed_at: at } : line)),
+    ];
+  }
+  if (mode === "move" && removed.length > 0 && movedTo) {
+    const prior = food[MOVED_LINES_KEY];
+    out[MOVED_LINES_KEY] = [
+      ...(Array.isArray(prior) ? prior : []),
+      ...removed.map((line) => (line !== null && typeof line === "object"
+        ? { ...line, moved_at: at, to_table: movedTo.to_table, to_order_id: movedTo.to_order_id }
+        : line)),
     ];
   }
   if (emptied) {out[EMPTIED_BY_KEY] = mode;}

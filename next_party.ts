@@ -431,8 +431,14 @@ export const BILL_PRINTED_STATUS = 423;
  * MERGE into, or an item MOVED onto, a printed table is food that already
  * belongs to somebody seated, so it is only ever a manager's (add it,
  * reprint) and no seat is offered.
+ *
+ * "move_off" (client item 4) is the other end of a move: an order or a dish
+ * taken OFF a printed table. The paper in that guest's hand now charges for
+ * food that has left, which is the same disagreement between paper and drawer
+ * in the other direction — a manager moves it and reprints, and no seat is
+ * offered either.
  */
-export type BillPrintedWrite = "order" | "merge" | "move";
+export type BillPrintedWrite = "order" | "merge" | "move" | "move_off";
 
 /**
  * The refusal's body, sent with BILL_PRINTED_STATUS. `error` is a sentence
@@ -469,7 +475,7 @@ export function billPrintedRefusal(input: {
 	guest: boolean;
 	/** The root's name when [table] is itself a sibling, so the sentence says "12". */
 	parentTable?: string | null;
-	/** An order (the default), or a merge into / an item moved onto [table]. */
+	/** An order (the default), or a merge into / a move onto [table]. */
 	write?: BillPrintedWrite;
 }): BillPrintedRefusal {
 	const named = tableSentenceName(input.table, input.parentTable ?? null);
@@ -489,12 +495,14 @@ export function billPrintedRefusal(input: {
 	const elsewhere = next !== "" && next.toLowerCase() !== String(input.table ?? "").trim().toLowerCase();
 	const managerDoes = write === "merge"
 		? "Ask a manager to merge it and reprint the bill."
-		: write === "move"
+		: write === "move" || write === "move_off"
 			? "Ask a manager to move it and reprint the bill."
 			: "Ask a manager to add it and reprint the bill.";
 	const error = input.guest
 		? "This table's bill has already been printed, so nothing more can be ordered on it here. Please ask a member of staff."
-		: elsewhere
+		: write === "move_off"
+			? `${named}'s bill has already been printed, so nothing can be moved off it. ${managerDoes}`
+			: elsewhere
 			? `${named}'s bill has already been printed, so nothing more can be added to it. Take a new party's order on ${nextWords}. If it is for the same guests, ask a manager to add it and reprint the bill.`
 			: `${named}'s bill has already been printed, so nothing more can be added to it. ${managerDoes}`;
 	// Offered on an ORDER only: a merge or a moved item is a manager's act on
@@ -565,6 +573,6 @@ export function reprintNeededMessage(table: string, parentTable?: string | null)
  * their paper was handed over, and who grew them.
  */
 export function printedBillAdditionAudit(input: { table: string; printCount: number; write?: BillPrintedWrite }): string {
-	const what = input.write === "merge" ? "a merge into" : input.write === "move" ? "an item moved onto" : "an order on";
+	const what = input.write === "merge" ? "a merge into" : input.write === "move" ? "a move onto" : "an order on";
 	return `ADDED ${what} the printed bill of table ${String(input.table ?? "").trim()} (printed ${String(Math.max(0, Math.round(Number(input.printCount) || 0)))} time(s))`;
 }

@@ -345,9 +345,9 @@ export function fixtureQuery(sql: string, params: unknown[] = []): { rows: unkno
     const b = [...s.bills].filter((x) => x.closed_at === null).sort((a, z) => z.created_at.localeCompare(a.created_at))[0];
     return { rows: b ? [{ admin_approved_at: b.admin_approved_at }] : [] };
   }
-  if (/^select id, food from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and .* order by created_at asc$/i.test(q)) {
+  if (/^select id, food(, status, barked_at)? from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and .* order by created_at asc$/i.test(q)) {
     requireShape(q, "coalesce(status::text, '1') not in", "only the orders that still owe lose a line");
-    return { rows: s.orders.filter((o) => STILL_OWES(o.status)).map((o) => ({ id: o.id, food: clone(foodOf(o)) })) };
+    return { rows: s.orders.filter((o) => STILL_OWES(o.status)).map((o) => ({ id: o.id, food: clone(foodOf(o)), status: o.status, barked_at: null })) };
   }
   if (/^update "Bills" set total_amt = \$1, round_off = null where id = \$2 and res_id = \$3 and outlet_id = \$4$/i.test(q)) {
     const b = s.bills.find((x) => x.id === params[1]);

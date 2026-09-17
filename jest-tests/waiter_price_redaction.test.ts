@@ -36,6 +36,8 @@
 // Redacting any two of those and leaving the third is redacting nothing.
 
 import { describe, test, expect, beforeAll, beforeEach } from "@jest/globals";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { makeFakeApp, type FakeApp } from "./platform_fixtures";
 import {
   REDACTED_BILL_MONEY_KEYS,
@@ -44,6 +46,7 @@ import {
   REDACTED_TABLE_ROW_MONEY_KEYS,
   hidesPrices,
   redactBillForTable,
+  redactMoveAnswer,
 } from "../price_scope";
 
 const GetBillForTable = jest.fn();
@@ -452,5 +455,58 @@ describe("the rule itself, without a route in the way", () => {
     expect(out.tip_total).toBe(200);
     expect(REDACTED_BILL_MONEY_KEYS).not.toContain("tip_total");
     expect(REDACTED_ITEM_MONEY_KEYS).toEqual(["price"]);
+  });
+});
+
+// CLIENT ITEM 4, REVIEW FINDING — the two move answers carried money: the
+// destination's running bill (`total_amt`) and the removal summary's prices.
+describe("a move's answer, as a waiter-only session is told it", () => {
+  test("the amounts go; the dishes, the ticket and the print outcome stay", () => {
+    const answer = {
+      success: true, order_id: "o-65", from_table: "12", to_table: "15", total_amt: 3763,
+      items: [{ name: "KUNAFA BIRDS NEST", variation: null, quantity: 1 }],
+      kot_no: 65, print: { printed: true, kot_no: 65, tickets: 1 },
+      reprint_needed: true, reprint_table: "15", reprint_message: "Reprint 15",
+    };
+    const out = redactMoveAnswer(answer);
+    expect(out).not.toHaveProperty("total_amt");
+    const { total_amt: _gone, ...rest } = answer;
+    expect(out).toEqual(rest);
+    // A COPY: the audit line is written from the same object.
+    expect(answer.total_amt).toBe(3763);
+  });
+
+  test("the dish move's summary loses its price, its value and each line's price", () => {
+    const answer = {
+      success: true,
+      moved: { name: "Dal", price: 200, quantity: 2, value: 440, lines: [{ name: "Dal", price: 200, quantity: 1 }, { name: "Dal", price: 240, quantity: 1 }] },
+      items: [{ name: "Dal", variation: "Half", quantity: 2 }],
+      destinations: [{ order_id: "d", source_order_id: "s", kot_nos: [7], items: [] }],
+      prints: [{ order_id: "d", printed: true, kot_no: 7, tickets: 1 }],
+      kot_nos: [7],
+    };
+    const out = redactMoveAnswer(answer);
+    expect(out.moved).toEqual({ name: "Dal", quantity: 2, lines: [{ name: "Dal", quantity: 1 }, { name: "Dal", quantity: 1 }] });
+    expect(out.items).toBe(answer.items);
+    expect(out.destinations).toBe(answer.destinations);
+    expect(answer.moved.price).toBe(200);
+    expect(answer.moved.lines[0]!.price).toBe(200);
+  });
+
+  test("anything that is not an answer object passes through", () => {
+    expect(redactMoveAnswer(null)).toBeNull();
+    expect(redactMoveAnswer([1])).toEqual([1]);
+    expect(redactMoveAnswer("x")).toBe("x");
+    expect(redactMoveAnswer({ moved: null })).toEqual({ moved: null });
+  });
+
+  test("both move routes redact through it for a waiter-only session (the wiring)", () => {
+    const read = (rel: string): string => readFileSync(join(__dirname, "..", rel), "utf8");
+    const tables = read("routes/tables.ts");
+    const moveOrder = tables.slice(tables.indexOf('app.post("/tables/move-order"'));
+    expect(moveOrder.slice(0, moveOrder.indexOf("\napp."))).toMatch(/res\.json\(hidesPrices\(req\.auth\) \? redactMoveAnswer\(answer\) : answer\)/);
+    const bills = read("routes/bills.ts");
+    const moveItem = bills.slice(bills.indexOf("app.post('/bills/move-item'"));
+    expect(moveItem.slice(0, moveItem.indexOf("\napp."))).toMatch(/res\.json\(hidesPrices\(req\.auth\) \? redactMoveAnswer\(answer\) : answer\)/);
   });
 });
