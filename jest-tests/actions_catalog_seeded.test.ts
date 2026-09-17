@@ -26,8 +26,9 @@
 //   3. Migration 045 only ever inserts — it cannot rename a production row.
 
 import { describe, test, expect } from "@jest/globals";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import { REPORT_EMAIL_DDL_056 } from "../report_email_schema";
 
 const ROOT = join(__dirname, "..");
 const UUID = /["'`]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["'`]/g;
@@ -103,6 +104,15 @@ for (const path of migrationFiles) {
   const file = path.split("/").pop()!;
   for (const row of actionInserts(readFileSync(path, "utf8"))) {
     if (!seeded.has(row.id)) { seeded.set(row.id, { ...row, file }); }
+  }
+}
+// 056 (client item 9) ships in its own commit and is applied by hand. Until it
+// is on this branch, its two actions are seeded by the boot step that issues
+// the same statements (InitReportEmailSchema; report_email_migrations.test.ts
+// holds the file to REPORT_EMAIL_DDL_056 statement for statement).
+if (!existsSync(join(MIGRATIONS_DIR, "056_report_email_recipients.sql"))) {
+  for (const row of actionInserts(REPORT_EMAIL_DDL_056.join(";\n"))) {
+    if (!seeded.has(row.id)) { seeded.set(row.id, { ...row, file: "report_email_schema.ts (056 pending)" }); }
   }
 }
 

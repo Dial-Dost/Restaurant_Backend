@@ -1,0 +1,326 @@
+/**
+ * A SMALL, WRITE-ONLY .xlsx WRITER — no dependency beyond node:zlib.
+ *
+ * WHY NOT A LIBRARY. The obvious package (SheetJS) is published on npm only at
+ * 0.18.5, which carries known advisories on its READ path, and the maintained
+ * builds live on the vendor's own CDN rather than the registry this project
+ * installs from. A report email needs none of what a spreadsheet library is
+ * for — no reading, no formulas, no charts. It needs typed cells in named
+ * sheets, a bold header, money formatted as money, and a file Excel, LibreOffice,
+ * Google Sheets and Numbers all open. That is a few hundred lines of OOXML and
+ * a stored-or-deflated zip, which is what this is.
+ *
+ * WHAT IT WRITES (the minimum SpreadsheetML package every reader accepts):
+ *
+ *   [Content_Types].xml          what each part is
+ *   _rels/.rels                  the package points at the workbook
+ *   xl/workbook.xml              the sheet list, in order
+ *   xl/_rels/workbook.xml.rels   the workbook points at each sheet and the styles
+ *   xl/styles.xml                eight cell formats (see STYLE)
+ *   xl/worksheets/sheetN.xml     one per sheet
+ *
+ * CELLS ARE TYPED, AND THAT IS THE POINT OF AN XLSX OVER A CSV. A number is
+ * written as a number (`<c><v>1234.5</v></c>`), so an accountant's SUM works
+ * without a "convert text to number" step; text is an inline string, so nothing
+ * a guest typed can be evaluated as a formula. Money carries the `#,##0.00`
+ * format, counts `#,##0`.
+ *
+ * DETERMINISTIC. Every zip entry carries the same fixed DOS timestamp, so the
+ * same report renders to the same bytes. The delivery row stores the bytes once
+ * and a retry re-sends them; deterministic output also makes the tests exact.
+ */
+
+import { deflateRawSync } from "node:zlib";
+
+/** The formats a cell may carry. The numbers are the `s` index in styles.xml. */
+export const STYLE = Object.freeze({
+  plain: 0,
+  bold: 1,
+  money: 2,
+  moneyBold: 3,
+  int: 4,
+  intBold: 5,
+  decimal: 6,
+  wrap: 7,
+});
+
+export type CellKind = "text" | "money" | "int" | "decimal" | "date" | "datetime" | "percent";
+
+export interface CellObject {
+  v: string | number | boolean | null | undefined;
+  kind?: CellKind;
+  bold?: boolean;
+  wrap?: boolean;
+}
+
+export type Cell = string | number | boolean | null | undefined | CellObject;
+
+export interface SheetSpec {
+  /** Up to 31 characters; []:*?/\ are removed. Made unique by the writer. */
+  name: string;
+  rows: readonly (readonly Cell[])[];
+  /** Character widths per column, 0-based. Missing columns take Excel's default. */
+  widths?: readonly number[];
+  /** Freeze this many rows at the top (the header). 0 = none. */
+  freezeRows?: number;
+}
+
+/** Characters XML 1.0 cannot carry at all, even escaped. */
+// eslint-disable-next-line no-control-regex
+const XML_ILLEGAL = /[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]/g;
+
+export function xmlEscape(raw: string): string {
+  return raw
+    .replace(XML_ILLEGAL, "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** A1-style column letters: 0 -> A, 25 -> Z, 26 -> AA. */
+export function columnLetters(index: number): string {
+  let n = Math.max(0, Math.floor(index)) + 1;
+  let out = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    out = String.fromCharCode(65 + r) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
+}
+
+/** Excel refuses a sheet name with any of these, or one longer than 31. */
+export function sheetName(raw: string, taken: Set<string>): string {
+  const base = (raw.replace(/[[\]:*?/\\]/g, " ").replace(/\s+/g, " ").trim() || "Sheet").slice(0, 31);
+  let name = base;
+  for (let n = 2; taken.has(name.toLowerCase()); n += 1) {
+    const suffix = ` (${String(n)})`;
+    name = `${base.slice(0, 31 - suffix.length)}${suffix}`;
+  }
+  taken.add(name.toLowerCase());
+  return name;
+}
+
+/** Excel's own ceiling on one cell's text. */
+const MAX_CELL_TEXT = 32_767;
+
+function styleFor(cell: CellObject, numeric: boolean): number {
+  if (cell.wrap) {return STYLE.wrap;}
+  if (!numeric) {return cell.bold ? STYLE.bold : STYLE.plain;}
+  switch (cell.kind) {
+    case "money": return cell.bold ? STYLE.moneyBold : STYLE.money;
+    case "int": return cell.bold ? STYLE.intBold : STYLE.int;
+    case "decimal":
+    case "percent": return STYLE.decimal;
+    default: return cell.bold ? STYLE.bold : STYLE.plain;
+  }
+}
+
+function cellXml(ref: string, raw: Cell): string {
+  const cell: CellObject = raw !== null && typeof raw === "object" ? raw : { v: raw };
+  const v = cell.v;
+  if (v === null || v === undefined || v === "") {
+    // An empty cell that still carries a style keeps a bold header row whole.
+    return cell.bold ? `<c r="${ref}" s="${String(STYLE.bold)}"/>` : "";
+  }
+  if (typeof v === "number") {
+    // NaN and Infinity are not numbers any reader accepts; a blank is honest.
+    if (!Number.isFinite(v)) {return "";}
+    return `<c r="${ref}" s="${String(styleFor(cell, true))}"><v>${String(v)}</v></c>`;
+  }
+  if (typeof v === "boolean") {
+    return `<c r="${ref}" t="b"${cell.bold ? ` s="${String(STYLE.bold)}"` : ""}><v>${v ? "1" : "0"}</v></c>`;
+  }
+  const text = String(v).slice(0, MAX_CELL_TEXT);
+  const s = styleFor(cell, false);
+  // xml:space keeps a leading/trailing space a reader would otherwise trim.
+  return `<c r="${ref}" t="inlineStr"${s ? ` s="${String(s)}"` : ""}><is><t xml:space="preserve">${xmlEscape(text)}</t></is></c>`;
+}
+
+function sheetXml(spec: SheetSpec): string {
+  const parts: string[] = [];
+  parts.push('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n');
+  parts.push('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">');
+  const freeze = Math.max(0, Math.floor(spec.freezeRows ?? 0));
+  if (freeze > 0) {
+    parts.push(`<sheetViews><sheetView workbookViewId="0"><pane ySplit="${String(freeze)}" topLeftCell="A${String(freeze + 1)}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>`);
+  }
+  if (spec.widths && spec.widths.length > 0) {
+    parts.push("<cols>");
+    spec.widths.forEach((w, i) => {
+      const width = Math.max(4, Math.min(120, Number(w) || 10));
+      parts.push(`<col min="${String(i + 1)}" max="${String(i + 1)}" width="${width.toFixed(2)}" customWidth="1"/>`);
+    });
+    parts.push("</cols>");
+  }
+  parts.push("<sheetData>");
+  spec.rows.forEach((row, r) => {
+    const cells = row.map((c, ci) => cellXml(`${columnLetters(ci)}${String(r + 1)}`, c)).join("");
+    parts.push(`<row r="${String(r + 1)}">${cells}</row>`);
+  });
+  parts.push("</sheetData></worksheet>");
+  return parts.join("");
+}
+
+const STYLES_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+  + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+  + '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+  + '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+  + '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+  + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+  // Built-in number formats only (no <numFmts> block): 4 = #,##0.00, 3 = #,##0,
+  // 2 = 0.00. The order here IS the STYLE table above.
+  + '<cellXfs count="8">'
+  + '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+  + '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+  + '<xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+  + '<xf numFmtId="4" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>'
+  + '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+  + '<xf numFmtId="3" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>'
+  + '<xf numFmtId="2" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+  + '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf>'
+  + "</cellXfs>"
+  + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+  + "</styleSheet>";
+
+/** Build the workbook. At least one sheet; the first is the one that opens. */
+export function buildXlsx(sheets: readonly SheetSpec[]): Buffer {
+  if (sheets.length === 0) {throw new Error("buildXlsx: a workbook needs at least one sheet");}
+  const taken = new Set<string>();
+  const named = sheets.map((s) => ({ ...s, name: sheetName(s.name, taken) }));
+
+  const files: { name: string; data: Buffer }[] = [];
+  const add = (name: string, text: string) => { files.push({ name, data: Buffer.from(text, "utf8") }); };
+
+  add("[Content_Types].xml",
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    + '<Default Extension="xml" ContentType="application/xml"/>'
+    + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+    + named.map((_s, i) => `<Override PartName="/xl/worksheets/sheet${String(i + 1)}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")
+    + "</Types>");
+  add("_rels/.rels",
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+    + "</Relationships>");
+  add("xl/workbook.xml",
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+    + "<sheets>"
+    + named.map((s, i) => `<sheet name="${xmlEscape(s.name)}" sheetId="${String(i + 1)}" r:id="rId${String(i + 1)}"/>`).join("")
+    + "</sheets></workbook>");
+  add("xl/_rels/workbook.xml.rels",
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    + named.map((_s, i) => `<Relationship Id="rId${String(i + 1)}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${String(i + 1)}.xml"/>`).join("")
+    + `<Relationship Id="rId${String(named.length + 1)}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`
+    + "</Relationships>");
+  add("xl/styles.xml", STYLES_XML);
+  named.forEach((s, i) => { add(`xl/worksheets/sheet${String(i + 1)}.xml`, sheetXml(s)); });
+
+  return zip(files);
+}
+
+// --- The zip container ---------------------------------------------------------
+
+const CRC_TABLE: Uint32Array = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;}
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+/** The zip / PNG CRC-32 (IEEE 802.3). */
+export function crc32(buf: Uint8Array): number {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i += 1) {c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);}
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+/** 1980-01-01 00:00, the earliest DOS date — fixed, so output is deterministic. */
+const DOS_TIME = 0;
+const DOS_DATE = (0 << 9) | (1 << 5) | 1;
+
+/**
+ * A plain zip (no zip64, no encryption, no data descriptors): every size is
+ * known before its header is written. Entries are DEFLATEd unless that makes
+ * them larger, in which case they are STORED — both are what every reader
+ * handles. Refuses to exceed the 4 GB / 65,535-entry limits of the plain
+ * format rather than writing a file no reader opens.
+ */
+export function zip(files: readonly { name: string; data: Buffer }[]): Buffer {
+  if (files.length > 0xFFFF) {throw new Error("zip: too many entries");}
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = Buffer.from(f.name, "utf8");
+    const crc = crc32(f.data);
+    const deflated = deflateRawSync(f.data, { level: 6 });
+    const stored = deflated.length >= f.data.length;
+    const body = stored ? f.data : deflated;
+    const method = stored ? 0 : 8;
+    if (body.length > 0xFFFFFFFF || f.data.length > 0xFFFFFFFF || offset > 0xFFFFFFFF) {
+      throw new Error("zip: entry too large for a plain zip");
+    }
+    // Bit 11: the name is UTF-8. Every name here is ASCII, and the flag is still
+    // the honest thing to say.
+    const flags = 0x0800;
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034B50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt16LE(DOS_TIME, 10);
+    local.writeUInt16LE(DOS_DATE, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(body.length, 18);
+    local.writeUInt32LE(f.data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    locals.push(local, name, body);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014B50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(flags, 8);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt16LE(DOS_TIME, 12);
+    central.writeUInt16LE(DOS_DATE, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(body.length, 20);
+    central.writeUInt32LE(f.data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centrals.push(central, name);
+
+    offset += local.length + name.length + body.length;
+  }
+  const cd = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054B50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(cd.length, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...locals, cd, end]);
+}
+
+export const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";

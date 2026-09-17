@@ -25,6 +25,8 @@
 //   differently-permissioned endpoint, and must never quietly shorten.
 
 import { describe, test, expect, beforeAll } from "@jest/globals";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { makeFakeApp, type FakeApp } from "./platform_fixtures";
 
 jest.mock("pg", () => {
@@ -96,6 +98,28 @@ describe("the capability block the clients obey", () => {
     expect(caps.manage_roles).toBe(false);
   });
 
+  test("client items 1 and 2: a waiter may MOVE A TABLE — the flag answers the uuid POST /tables/move is gated on", () => {
+    const waiter = sessionCapabilities({ actions: CORE_ROLES.waiter as unknown as string[] });
+    expect(waiter.move_table).toBe(true);
+    // Move an order's route is gated on Add Orders, which a waiter holds too; the
+    // clients keep that control senior-only by their own floor scope.
+    expect(waiter.move_order).toBe(true);
+    const onlyOccupancy = sessionCapabilities({ actions: ["090ea8d4-e348-4e1b-9723-11131a73a085"] });
+    expect([onlyOccupancy.move_table, onlyOccupancy.move_order]).toEqual([true, false]);
+    const onlyOrders = sessionCapabilities({ actions: ["4ad474d4-5230-449c-874f-6a238b833bca"] });
+    expect([onlyOrders.move_table, onlyOrders.move_order]).toEqual([false, true]);
+    expect([sessionCapabilities({}).move_table, sessionCapabilities({}).move_order]).toEqual([false, false]);
+  });
+
+  test("the move flags name the SAME uuids the move routes are registered with", () => {
+    const tables = readFileSync(join(__dirname, "..", "routes", "tables.ts"), "utf8");
+    expect(tables).toMatch(/app\.post\("\/tables\/move", validateAction\("090ea8d4-e348-4e1b-9723-11131a73a085"\)/);
+    expect(tables).toMatch(/app\.post\("\/tables\/move-order", validateAction\("4ad474d4-5230-449c-874f-6a238b833bca"\)/);
+    const shared = readFileSync(join(__dirname, "..", "routes", "_shared.ts"), "utf8");
+    expect(shared).toMatch(/move_table: has\("090ea8d4-e348-4e1b-9723-11131a73a085"\)/);
+    expect(shared).toMatch(/move_order: has\("4ad474d4-5230-449c-874f-6a238b833bca"\)/);
+  });
+
   test("a missing or malformed action list denies rather than throwing", () => {
     // A session minted before a field existed, or a corrupt store read. The
     // direction matters: this decides what a CLIENT DRAWS, and drawing nothing
@@ -110,6 +134,32 @@ describe("the capability block the clients obey", () => {
     expect(onlyDelete.delete_table).toBe(true);
     expect(onlyDelete.settle_bill).toBe(false);
     expect(onlyDelete.edit_table).toBe(false);
+    expect(onlyDelete.cancel_kot).toBe(false);
+  });
+
+  // CLIENT ITEM 3 — "On the waiter dashboard, Cancel KOT option should be
+  // removed." The one flag that follows the ROLE: a waiter-only login is false
+  // even with Void Orders granted, and everybody else holds it exactly when they
+  // hold one of the two cancel routes' gates.
+  test("cancel_kot: false for a waiter-only login, whatever it was granted", () => {
+    const waiter = CORE_ROLES.waiter as unknown as string[];
+    const VOID = "c1f83b26-5a97-4e40-b8d3-7e02a9c4f156";
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter"], actions: waiter }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter"], actions: [...waiter, VOID] }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter", "d2b1f0c4-0000-4000-8000-000000000001"], actions: waiter }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "employee", role_all: ["employee", "waiter"], actions: waiter }).cancel_kot).toBe(false);
+    // …and the void flag itself still says what was granted: the role rule is cancel_kot's alone.
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter"], actions: [...waiter, VOID] }).void_order).toBe(true);
+  });
+
+  test("cancel_kot: true for every senior role that can take a cancel route, false for one that cannot", () => {
+    for (const role of ["manager", "cashier", "captain"] as const) {
+      expect([role, sessionCapabilities({ role, role_all: [role], actions: CORE_ROLES[role] as unknown as string[] }).cancel_kot]).toEqual([role, true]);
+    }
+    expect(sessionCapabilities({ role: "waiter", role_all: ["waiter", "captain"], actions: CORE_ROLES.waiter as unknown as string[] }).cancel_kot).toBe(true);
+    expect(sessionCapabilities({ role: "admin", role_all: ["admin"], actions: ["*"] }).cancel_kot).toBe(true);
+    expect(sessionCapabilities({ role: "valet", role_all: ["valet"], actions: [] }).cancel_kot).toBe(false);
+    expect(sessionCapabilities({ role: "manager", role_all: ["manager"], actions: ["c1f83b26-5a97-4e40-b8d3-7e02a9c4f156"] }).cancel_kot).toBe(true);
   });
 });
 

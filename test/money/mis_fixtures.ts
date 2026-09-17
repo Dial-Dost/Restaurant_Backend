@@ -35,8 +35,9 @@
 //   * a TIME SLOT is modelled from the SQL TEXT too: the time-of-day fragment
 //     misTimeSql appends is parsed back out (zone, start, end, crossing) and
 //     applied to each row's wall clock, on the column the fragment names. And it
-//     is REQUIRED whenever the bound instants are not local midnights — which is
-//     exactly when a reader resolved a slot — so a reader that bound a slot's
+//     is REQUIRED whenever the bound instants are not whole days (local
+//     midnights, or a trading day's close at both ends — isWholeDayBinding) —
+//     which is exactly when a reader resolved a slot — so a reader that bound a slot's
 //     outer bounds but forgot the fragment fails here instead of quietly
 //     counting every hour between them. Without this, every slot test would pass
 //     vacuously against the whole day;
@@ -416,6 +417,22 @@ function isLocalMidnight(value: unknown, tz: string): boolean {
   return w.minute === 0 && w.second === 0;
 }
 
+/**
+ * Does a binding cover WHOLE DAYS? Both bounds at local midnight (calendar
+ * days), or — since the trading day (client item 9) — both at the SAME
+ * wall-clock minute, a whole number of days apart: business dates that close
+ * at that minute. A slot's hull never has that shape (its two ends are the
+ * slot's start and end, which differ, or the slot is all day and resolves to
+ * none), so a slot that lost its time-of-day fragment is still refused.
+ */
+function isWholeDayBinding(from: unknown, to: unknown, tz: string): boolean {
+  if (isLocalMidnight(from, tz) && isLocalMidnight(to, tz)) {return true;}
+  if (typeof from !== "string" || typeof to !== "string") {return false;}
+  const a = wallMinute(from, tz), z = wallMinute(to, tz);
+  const span = new Date(to).getTime() - new Date(from).getTime();
+  return a.second === 0 && z.second === 0 && a.minute === z.minute && span > 0 && span % 86_400_000 === 0;
+}
+
 const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
@@ -431,7 +448,7 @@ function windowTest(q: string, params: unknown[], col: string, fromIdx = 2, toId
   const from = params[fromIdx], to = params[toIdx];
   const clock = `\\(\\(${escapeRe(col)}\\) at time zone '([^']+)'\\)::time`;
   const lower = new RegExp(`${clock} >= '(\\d{2}):(\\d{2})'::time`, "i").exec(q);
-  const midnights = isLocalMidnight(from, d.timezone) && isLocalMidnight(to, d.timezone);
+  const midnights = isWholeDayBinding(from, to, d.timezone);
   if (!lower) {
     if (/at time zone '[^']+'\)::time/i.test(q) || !midnights) {
       throw new Error(`mis fixture: the window is bound to a time slot but the time-of-day predicate on ${col} is missing — every hour between the outer bounds would be counted\n  ${q.slice(0, 260)}`);
@@ -500,7 +517,7 @@ function sessionSlotTest(q: string, params: unknown[]): (opened: number, closed:
   const tz = d.timezone;
   const from = params[1], to = params[2];
   const hasOverlap = SESSION_DAY_OVERLAP.test(q);
-  if (isLocalMidnight(from, tz) && isLocalMidnight(to, tz)) {
+  if (isWholeDayBinding(from, to, tz)) {
     if (hasOverlap || params.length > 3) {
       throw new Error(`mis fixture: a per-day session overlap on a whole-day binding — the hull lost the slot\n  ${q.slice(0, 260)}`);
     }
@@ -723,8 +740,17 @@ export async function fixtureQuery(sql: string, params: unknown[] = []): Promise
 function dispatch(q: string, params: unknown[]): unknown[] {
   if (DDL.test(q)) {return [];}
   if (/^select set_config\('app\.res_id'/i.test(q)) {return [];}
+  // A report email's per-read statement timeout (report_bundle.ts). Session state only.
+  if (/^select set_config\('statement_timeout'/i.test(q)) {return [];}
 
   const d = requireDb();
+
+  // What a report email names itself as (GetReportEmailIdentity).
+  if (/^select r\.res_name, r\.currency, r\.timezone, o\.outlet_name/i.test(q)) {
+    if (params[0] !== d.res_id) {return [];}
+    const outlet = d.outlets.find((o) => o.id === params[1]);
+    return [{ res_name: d.name, currency: "INR", timezone: d.timezone, outlet_name: outlet?.name ?? null }];
+  }
 
   // --- identity ---
   if (/from "Restaurant" r/i.test(q)) {
@@ -1176,18 +1202,37 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       return [...acc.entries()].map(([channel, v]) => ({ channel, bills: String(v.bills), total: v.total }));
     }
     // GetOverviewHeadline — the ladder read without the seating lateral, plus
-    // the online flag. The reader's EXISTS looks for any online order on the
-    // bill's TABLE; the fixture has no table ids, so it reads the bill's own
-    // order, which is the same answer for every bill these suites build.
-    if (/as is_online/i.test(q)) {
-      const walkIn = new Set(["dine_in", "dinein", "dine-in", "takeaway", "take_away", "pickup"]);
+    // the raw channel of the order behind each bill.
+    //
+    // MODELLED FROM THE SQL TEXT, both ways, so the rule is tested rather than
+    // assumed. Bound to the bill's own order (`o.id = b.order_id`), it answers
+    // that order's order_type — null when the bill names none or the row is
+    // gone, as the subquery does. Bound to the TABLE instead — the unbounded
+    // read this replaced — it answers the way that read did: any non-walk-in
+    // order ever rung on the bill's table makes the bill online. So a reader
+    // that slid back to the table fails on the numbers, not on a shape check.
+    if (/as headline_channel/i.test(q)) {
+      const walkIn = new Set(["", "dine_in", "dinein", "dine-in", "takeaway", "take_away", "pickup"]);
+      const ownOrder = /o\.id = b\.order_id/i.test(q);
+      const tableWide = /o\.table_id = b\.table_id/i.test(q);
+      if (ownOrder === tableWide) {
+        throw new Error(`mis fixture: the headline channel read must name exactly one binding\n  ${q.slice(0, 260)}`);
+      }
+      const channelOf = (b: FixtureBill): string | null => {
+        if (ownOrder) {return orderOf(b)?.order_type ?? (orderOf(b) ? "dine_in" : null);}
+        const table = (b.table_name ?? "").trim().toLowerCase();
+        const online = d.orders.find((o) => resOf(o) === resOf(b) && outletOf(o) === outletOf(b)
+          && table !== "" && (o.table_name ?? "").trim().toLowerCase() === table
+          && !walkIn.has((o.order_type ?? "dine_in").trim().toLowerCase()));
+        return online ? (online.order_type ?? null) : "dine_in";
+      };
       return [...rows]
         .sort((a, z) => new Date(a.settled_at).getTime() - new Date(z.settled_at).getTime())
         .map((b) => ({
           ...misBillRow(b, q),
           session_id: null,
           session_covers: null,
-          is_online: !walkIn.has(orderOf(b)?.order_type ?? "dine_in"),
+          headline_channel: channelOf(b),
         }));
     }
     // fetchMisBills — the shared ladder read.
@@ -1217,7 +1262,9 @@ function dispatch(q: string, params: unknown[]): unknown[] {
   if (/^select (admin_approved_at|id) from "Bills" where table_id = \$1 and res_id = \$2 and outlet_id = \$3 and closed_at is null/i.test(q)) {
     return [];
   }
-  if (/^select id, food from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and /i.test(q)) {
+  // The bill-item writers read status and bark time too (client item 4: a moved
+  // dish keeps its stage and its kitchen clock); the move pre-read does not.
+  if (/^select id, food(, status, barked_at)? from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and /i.test(q)) {
     // The still-owes predicate, read out of the SQL rather than assumed: a
     // settled or cancelled order must never lose a line to a bill edit.
     const settled = (/coalesce\(status::text, '1'\) not in \(([^)]*)\)/i.exec(q)?.[1] ?? "")
@@ -1229,7 +1276,7 @@ function dispatch(q: string, params: unknown[]): unknown[] {
         && tableIdOf(o.table_name ?? "") === params[2]
         && !settled.includes(String(o.status)))
       .sort((a, z) => new Date(a.created_at).getTime() - new Date(z.created_at).getTime())
-      .map((o) => ({ id: o.id, food: foodOf(o) }));
+      .map((o) => ({ id: o.id, food: foodOf(o), status: o.status ?? 1, barked_at: new Date(o.created_at) }));
   }
   if (/^update "Orders" set food = \$4::json(, status = 5)? where id = \$1 and res_id = \$2 and outlet_id = \$3$/i.test(q)) {
     const o = d.orders.find((x) => x.id === params[0] && resOf(x) === params[1] && outletOf(x) === params[2]);
@@ -1315,7 +1362,8 @@ function dispatch(q: string, params: unknown[]): unknown[] {
       outlet_id: String(params[2]),
       table_name: tableName,
       created_at: new Date().toISOString(),
-      status: 1,
+      // The stage the writer chose (a moved dish keeps its source's).
+      status: Number(params[5] ?? 1),
       items: Array.isArray(food.items) ? (food.items as FixtureOrderItem[]) : [],
     });
     return [];

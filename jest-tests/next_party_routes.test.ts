@@ -45,6 +45,10 @@ const mockEmit = jest.fn<(...a: unknown[]) => void>();
 const mockDispatch = jest.fn<AnyAsync>();
 const mockMerge = jest.fn<AnyAsync>();
 const mockMoveItem = jest.fn<AnyAsync>();
+const mockMoveParty = jest.fn<AnyAsync>();
+const mockAudit = jest.fn<AnyAsync>();
+const mockPaper = jest.fn<AnyAsync>();
+const mockCopyPaper = jest.fn<AnyAsync>();
 
 jest.mock("pg", () => {
   const query = async () => ({ rows: [] });
@@ -72,13 +76,19 @@ jest.mock("../database_supabase", () => {
     AddTable: (...a: unknown[]) => mockAddTable(...a),
     MergeTableBills: (...a: unknown[]) => mockMerge(...a),
     MoveBillItem: (...a: unknown[]) => mockMoveItem(...a),
+    MoveTableParty: (...a: unknown[]) => mockMoveParty(...a),
+    AddAuditLogEntry: (...a: unknown[]) => mockAudit(...a),
+    RecordBillPrintPaper: (...a: unknown[]) => mockPaper(...a),
+    CopyBillPrintPaper: (...a: unknown[]) => mockCopyPaper(...a),
+    GetOutlets: async () => [{ id: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb" }],
     GetRestaurantSettings: async () => ({ currency: "₹", bill_paper_width: "80mm", timezone: "Asia/Kolkata", auto_push_orders: true, bill_show_qr: false }),
     GetRestaurantProfile: async () => ({ outlet_name: "GGV", outlet_add: null, outlet_phone: null }),
     GetBillChargeConfigForTable: async () => ({
       taxConfig: {}, scPct: 0, includeServiceCharge: false, basis: "none",
       service_charge_removed: false, service_charge_applied: false, service_charge_percent: 0, waiver: null,
     }),
-    GetEmployeeDetailsFromEmpID: async () => null,
+    // A resolvable actor, so an audit line can be written (and read back here).
+    GetEmployeeDetailsFromEmpID: async () => ({ res_id: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", emp_Fname: "Atsu", emp_Lname: "" }),
     GetKotTableContext: async () => null,
     GetTableFeedbackContext: async () => null,
     RecordClientRenderedBillPrint: async () => ({ id: "job-claim", created_at: "2026-09-16T08:02:54.000Z" }),
@@ -171,14 +181,27 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  for (const m of [mockGuard, mockEnsure, mockAddOrder, mockGetOrders, mockUpdateSplit, mockGetBill, mockAddTable, mockEmit, mockDispatch, mockMerge, mockMoveItem]) {
+  for (const m of [mockGuard, mockEnsure, mockAddOrder, mockGetOrders, mockUpdateSplit, mockGetBill, mockAddTable, mockEmit, mockDispatch, mockMerge, mockMoveItem, mockMoveParty, mockAudit, mockPaper, mockCopyPaper]) {
     m.mockReset();
   }
+  mockAudit.mockResolvedValue(undefined);
+  mockPaper.mockResolvedValue(true);
+  mockCopyPaper.mockResolvedValue(true);
+  mockMoveParty.mockResolvedValue({
+    success: true, from_table: "12", to_table: "20", covers: 4, moved_orders: 2, total_amt: 1050,
+    moved_bill: false, moved_session: true, moved_waiter: false, moved_prints: 1, printed: true, printed_as: "12",
+    moved_order_ids: ["order-12"], moved_items: [{ name: "Gulab Jamun", variation: null, quantity: 1 }],
+  });
   mockGuard.mockResolvedValue({ table: "12", table_id: "t-12", parent_table: null, print_count: 0 });
   mockEnsure.mockResolvedValue(SEAT);
   mockAddOrder.mockResolvedValue({ id: "order-new" });
   mockMerge.mockResolvedValue({ success: true, total_amt: 1650, moved_orders: 1 });
-  mockMoveItem.mockResolvedValue({ success: true, moved: { name: "Gulab Jamun" } });
+  mockMoveItem.mockResolvedValue({
+    success: true,
+    moved: { name: "Gulab Jamun", price: 120, quantity: 1, lines: [], value: 120 },
+    items: [{ name: "Gulab Jamun", variation: null, quantity: 1 }],
+    destinations: [],
+  });
   mockUpdateSplit.mockResolvedValue(undefined);
   mockGetBill.mockResolvedValue(bill());
   mockAddTable.mockResolvedValue({ _id: "t-new", table_name: "16", capacity: 4, max_capacity: 4, section: null });
@@ -189,6 +212,8 @@ beforeEach(() => {
 });
 
 const tableAdded = () => mockEmit.mock.calls.filter((c) => c[1] === "table:added");
+/** The audit descriptions written, in order (AddAuditLogEntry's fifth argument). */
+const audited = (): string[] => mockAudit.mock.calls.map((c) => String(c[4]));
 
 // ===========================================================================
 describe("1. every bill print opens the next party's seat", () => {
@@ -271,6 +296,8 @@ describe("2a. POST /orders on a printed bill", () => {
       table: "12",
       next_party_table: "12 #2",
       next_party_action: "Take it on 12 (next party)",
+      add_to_printed_action: "Add to 12's printed bill",
+      add_to_printed_message: "12's bill has already been printed. Take a new party's order on 12 (next party), or, if it is for the same guests, add it to 12's printed bill and print the updated bill.",
       print_count: 1,
     });
     expect(mockAddOrder).not.toHaveBeenCalled();
@@ -469,6 +496,8 @@ describe("2d. the two doors that move food ONTO a printed table", () => {
       table: "12",
       next_party_table: null,
       next_party_action: null,
+      add_to_printed_action: null,
+      add_to_printed_message: null,
       print_count: 1,
     });
     expect(mockGuard).toHaveBeenCalledWith(RES, "12", { orderId: null });
@@ -497,6 +526,368 @@ describe("2d. the two doors that move food ONTO a printed table", () => {
     expect(r.body).not.toHaveProperty("reprint_needed");
     expect(mockGuard).toHaveBeenCalledWith(RES, "15", { orderId: null });
     expect(write()).toHaveBeenCalledTimes(1);
+  });
+
+  // CLIENT ITEM 4 — A MOVE CHANGES TWO BILLS. The SOURCE of a moved dish is held
+  // to the same rule: its paper would go on charging for food that has left.
+  const sourcePrinted = (): void => {
+    mockGuard.mockImplementation(async (_r: unknown, table: unknown) => (String(table) === "15"
+      ? { table: "15", table_id: "t-15", parent_table: null, print_count: 2 }
+      : { table: String(table), table_id: "t-x", parent_table: null, print_count: 0 }));
+  };
+
+  test("POST /bills/move-item: a waiter is refused 423 when the SOURCE's bill is printed, and nothing is written", async () => {
+    sourcePrinted();
+    const r = await moveItem(WAITER, "12");
+    expect(r.status).toBe(423);
+    expect(r.body).toEqual({
+      error: "15's bill has already been printed, so nothing can be moved off it. Ask a manager to move it and reprint the bill.",
+      code: BILL_PRINTED_CODE,
+      table: "15",
+      next_party_table: null,
+      next_party_action: null,
+      add_to_printed_action: null,
+      add_to_printed_message: null,
+      print_count: 2,
+    });
+    expect(mockGuard).toHaveBeenCalledWith(RES, "15", { orderId: null });
+    expect(mockMoveItem).not.toHaveBeenCalled();
+    expect(mockEnsure).not.toHaveBeenCalled();
+  });
+
+  test("POST /bills/move-item: a manager moves it off a printed source and is told to reprint THAT table", async () => {
+    sourcePrinted();
+    const r = await moveItem(SENIORS[0][1], "12");
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ success: true, reprint_needed: true, reprint_table: "15" });
+    expect(r.body).not.toHaveProperty("also_reprint_needed");
+    expect(mockMoveItem).toHaveBeenCalledTimes(1);
+  });
+
+  test("POST /bills/move-item: both papers printed — the destination first, the source as also_reprint", async () => {
+    mockGuard.mockImplementation(async (_r: unknown, table: unknown) => ({ table: String(table), table_id: `t-${String(table)}`, parent_table: null, print_count: 1 }));
+    const r = await moveItem(SENIORS[1][1], "12");
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ reprint_needed: true, reprint_table: "12", also_reprint_needed: true, also_reprint_table: "15" });
+    expect(String((r.body as Record<string, unknown>).also_reprint_message)).toMatch(/^15's bill was already printed/);
+  });
+});
+
+// ===========================================================================
+describe("2e. a waiter who CONFIRMED 'Add to printed bill' (2.0.2)", () => {
+  const order = { table: "12", items: [{ id: "i1", name: "Gulab Jamun", price: 120, quantity: 1 }], subtotal: 120, total: 120 };
+
+  test("POST /orders with add_to_printed_bill: allowed, told to print the updated bill, and audited AFTER the write", async () => {
+    mockGuard.mockResolvedValue(PRINTED);
+    const r = await harness.call("POST", "/orders", { body: { ...order, add_to_printed_bill: true }, auth: WAITER as never });
+    expect(r.status).toBe(201);
+    expect(r.body).toMatchObject({ id: "order-new", ...REPRINT_12 });
+    expect(mockAddOrder).toHaveBeenCalledTimes(1);
+    // No next-party seat: these are the same guests.
+    expect(mockEnsure).not.toHaveBeenCalled();
+    const line = audited().find((d) => d.startsWith("ADDED"));
+    expect(line).toBe("ADDED an order on the printed bill of table 12 (printed 1 time(s))");
+    const call = mockAudit.mock.calls.find((c) => String(c[4]).startsWith("ADDED"))!;
+    expect(call[6]).toMatchObject({ table: "12", after_print: true, confirmed: true, waiter_only: true, print_count: 1 });
+    // The Bill Edit report's key: the door, and the order that landed.
+    expect(call[6]).toMatchObject({ door: "new_order", order_id: "order-new" });
+    expect(mockAudit.mock.invocationCallOrder[mockAudit.mock.calls.indexOf(call)]).toBeGreaterThan(mockAddOrder.mock.invocationCallOrder[0]!);
+  });
+
+  test("a write that FAILS files no addition line", async () => {
+    mockGuard.mockResolvedValue(PRINTED);
+    mockAddOrder.mockRejectedValue(new Error("Cannot add order to unoccupied table."));
+    const r = await harness.call("POST", "/orders", { body: { ...order, add_to_printed_bill: true }, auth: WAITER as never });
+    expect(r.status).toBe(400);
+    expect(audited().filter((d) => d.startsWith("ADDED"))).toEqual([]);
+  });
+
+  test.each([
+    ["the string \"true\"", "true"],
+    ["1", 1],
+    ["false", false],
+  ])("anything but a literal true is no confirmation — %s is refused 423", async (_l, flag) => {
+    mockGuard.mockResolvedValue(PRINTED);
+    const r = await harness.call("POST", "/orders", { body: { ...order, add_to_printed_bill: flag }, auth: WAITER as never });
+    expect(r.status).toBe(423);
+    expect(mockAddOrder).not.toHaveBeenCalled();
+  });
+
+  test("POST /orders/:id/items with the flag: the line lands and the answer says reprint", async () => {
+    mockGuard.mockResolvedValue(PRINTED);
+    const r = await harness.call("POST", "/orders/:id/items", {
+      params: { id: "order-12" }, body: { name: "Gulab Jamun", price: 120, quantity: 1, add_to_printed_bill: true }, auth: WAITER as never,
+    });
+    expect(r.status).toBe(201);
+    expect(r.body).toMatchObject({ success: true, ...REPRINT_12 });
+    expect(mockUpdateSplit).toHaveBeenCalledTimes(1);
+    expect(audited()).toContain("ADDED an order on the printed bill of table 12 (printed 1 time(s))");
+    // No door: this route's own "Item added" line is what the Bill Edit report reads.
+    const call = mockAudit.mock.calls.find((c) => String(c[4]).startsWith("ADDED"))!;
+    expect(call[6]).not.toHaveProperty("door");
+  });
+
+  test.each([
+    ["POST /bills/merge", "/bills/merge", { from_table: "12 #2", to_table: "12" }, () => mockMerge, "a merge into"],
+    ["POST /bills/move-item", "/bills/move-item", { from_table: "15", to_table: "12", item_name: "Gulab Jamun", price: 120 }, () => mockMoveItem, "a move onto"],
+  ] as const)("%s with the flag is STILL refused for a waiter: a merge or a moved item stays a manager's act", async (_l, path, body, write, what) => {
+    mockGuard.mockResolvedValue(PRINTED);
+    const r = await harness.call("POST", path, { body: { ...body, add_to_printed_bill: true }, auth: WAITER as never });
+    expect(r.status).toBe(423);
+    expect(r.body).toMatchObject({ code: "bill_printed", table: "12", add_to_printed_action: null, next_party_table: null });
+    expect(write()).not.toHaveBeenCalled();
+    expect(mockEnsure).not.toHaveBeenCalled();
+    expect(audited().filter((d) => d.startsWith("ADDED"))).toEqual([]);
+    expect(audited()).toContain(`REFUSED ${what} table 12 — its bill was already printed 1 time(s)`);
+  });
+
+  test.each([
+    ["POST /bills/merge", "/bills/merge", { from_table: "12 #2", to_table: "12" }, () => mockMerge, "a merge into"],
+    ["POST /bills/move-item", "/bills/move-item", { from_table: "15", to_table: "12", item_name: "Gulab Jamun", price: 120 }, () => mockMoveItem, "a move onto"],
+  ] as const)("%s by a SENIOR lands as before, flag or not, and is audited as not confirmed", async (_l, path, body, write, what) => {
+    mockGuard.mockResolvedValue(PRINTED);
+    const r = await harness.call("POST", path, { body: { ...body, add_to_printed_bill: true }, auth: SENIORS[0][1] as never });
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject(REPRINT_12);
+    expect(write()).toHaveBeenCalledTimes(1);
+    expect(audited()).toContain(`ADDED ${what} the printed bill of table 12 (printed 1 time(s))`);
+    const call = mockAudit.mock.calls.find((c) => String(c[4]).startsWith("ADDED"))!;
+    expect(call[6]).toMatchObject({ confirmed: false, waiter_only: false });
+  });
+
+  test("a SENIOR's addition is audited too — confirmed: false, waiter_only: false", async () => {
+    mockGuard.mockResolvedValue(PRINTED);
+    const r = await harness.call("POST", "/orders", { body: order, auth: SENIORS[0][1] as never });
+    expect(r.status).toBe(201);
+    const call = mockAudit.mock.calls.find((c) => String(c[4]).startsWith("ADDED"))!;
+    expect(call[6]).toMatchObject({ confirmed: false, waiter_only: false });
+  });
+
+  test("an unprinted table files no addition line, flag or not", async () => {
+    const r = await harness.call("POST", "/orders", { body: { ...order, add_to_printed_bill: true }, auth: WAITER as never });
+    expect(r.status).toBe(201);
+    expect(r.body).not.toHaveProperty("reprint_needed");
+    expect(audited().filter((d) => d.startsWith("ADDED"))).toEqual([]);
+  });
+
+  test("the QR GUEST is refused even when the body carries the flag", async () => {
+    mockGuard.mockResolvedValue(PRINTED);
+    const r = await harness.call("POST", "/qr/:slug/order", {
+      params: { slug: "ggv" },
+      body: { t: encodeTableToken(RES, "12"), items: [{ id: "i1", name: "Gulab Jamun", price: 120, quantity: 1 }], add_to_printed_bill: true },
+      ip: "198.51.100.250",
+    });
+    expect(r.status).toBe(423);
+    expect(mockAddOrder).not.toHaveBeenCalled();
+    expect(r.body).toMatchObject({ add_to_printed_action: null });
+  });
+});
+
+// ===========================================================================
+describe("2f. moving a PRINTED party opens the green seat at the destination", () => {
+  const MOVER = identity("waiter", ["waiter"], ["090ea8d4-e348-4e1b-9723-11131a73a085"]);
+  const move = () => harness.call("POST", "/tables/move", { body: { from_table: "12", to_table: "20" }, auth: MOVER as never });
+
+  test("printed: the destination's next-party seat is made and named, after the move", async () => {
+    mockEnsure.mockResolvedValue({ table_name: "20 #2", parent_table: "20", party_no: 2, created: true });
+    const r = await move();
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({
+      to_table: "20", printed: true, printed_as: "12",
+      next_party_table: "20 #2", next_party_message: "Seat the next party at 20 (next party).",
+    });
+    expect(mockEnsure).toHaveBeenCalledWith(RES, "20");
+    expect(mockEnsure.mock.invocationCallOrder[0]).toBeGreaterThan(mockMoveParty.mock.invocationCallOrder[0]!);
+    expect(tableAdded()).toEqual([[RES, "table:added", { table_name: "20 #2", parent_table: "20", party_no: 2 }]]);
+    expect(audited().find((d) => d.startsWith("Moved the party"))).toBe(
+      "Moved the party at 12 to 20 (4 covers, 2 orders, no bill yet, printed bill carried — the paper says 12)",
+    );
+  });
+
+  test("not printed: no seat, and the answer is the move's own", async () => {
+    mockMoveParty.mockResolvedValue({
+      success: true, from_table: "12", to_table: "20", covers: 2, moved_orders: 1, total_amt: 300,
+      moved_bill: true, moved_session: true, moved_waiter: true, moved_prints: 0, printed: false, printed_as: null,
+      moved_order_ids: ["order-12"], moved_items: [{ name: "Gulab Jamun", variation: null, quantity: 1 }],
+    });
+    const r = await move();
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ printed: false, next_party_table: null, next_party_message: null });
+    expect(mockEnsure).not.toHaveBeenCalled();
+  });
+
+  test("a seat that cannot be made never fails the move", async () => {
+    mockEnsure.mockRejectedValue(new Error("pool exhausted"));
+    const r = await move();
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ printed: true, next_party_table: null });
+  });
+
+  test("the data layer's refusal (the same family) is the 400 the till shows", async () => {
+    mockMoveParty.mockRejectedValue(new Error("12 (next party) is the same table as 12 — pick a different table to move to."));
+    const r = await harness.call("POST", "/tables/move", { body: { from_table: "12", to_table: "12 #2" }, auth: MOVER as never });
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual({ error: "12 (next party) is the same table as 12 — pick a different table to move to." });
+    expect(mockEnsure).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+describe("2g. GET /bill-for-table says whether the paper is out of date", () => {
+  const READ = identity("manager", ["manager"], ["98b10bde-802d-4a5b-a726-53a826424f79", CLOSE_BILL]);
+  const WAITER_READ = identity("waiter", ["waiter"], ["98b10bde-802d-4a5b-a726-53a826424f79"]);
+  const read = (auth: unknown) => harness.call("GET", "/bill-for-table", { query: { table_name: "12" }, auth: auth as never });
+  const printedWith = async (digest: string | null) => ({ ...bill(1), last_paper_digest: digest, printed_total: 1050, printed_as: null });
+  // The fingerprint of bill(1) as printOpenTableBill would print it under this
+  // harness's charge config (no taxes, no service charge).
+  const sameDigest = async (): Promise<string> => {
+    const { billPaperDigest } = await import("../bill_paper_digest");
+    const { computeBillCharges } = await import("../billing_math");
+    return billPaperDigest({ items: bill(1).items, charges: computeBillCharges(1050, {}, 0, false, undefined), customerGstin: null });
+  };
+
+  test("unchanged since the print -> paper_stale false; the fingerprint itself is never sent", async () => {
+    mockGetBill.mockResolvedValue(await printedWith(await sameDigest()));
+    const r = await read(READ);
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ paper_stale: false, printed_total: 1050 });
+    expect(r.body).not.toHaveProperty("last_paper_digest");
+  });
+
+  // Client item 7 x items 1-2: the address prints under the GSTIN, so an
+  // address added after the print is a paper the guest does not hold.
+  test("an address added since the print -> paper_stale true", async () => {
+    mockGetBill.mockResolvedValue({ ...(await printedWith(await sameDigest())), customer_address: "12 MG Road\nBengaluru" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: true });
+  });
+
+  // The name is on the same paper, edited in the same dialog: a correction
+  // after the print is a paper the guest does not hold. A placeholder is not.
+  test("a guest name corrected since the print -> paper_stale true; 'Guest' is no name", async () => {
+    mockGetBill.mockResolvedValue({ ...(await printedWith(await sameDigest())), customer: "Acme Pvt Ltd" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: true });
+    mockGetBill.mockResolvedValue({ ...(await printedWith(await sameDigest())), customer: "Guest" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: false });
+  });
+
+  test("the name the paper was printed with is the one it is compared with", async () => {
+    const { billPaperDigest } = await import("../bill_paper_digest");
+    const { computeBillCharges } = await import("../billing_math");
+    const printed = billPaperDigest({
+      items: bill(1).items, charges: computeBillCharges(1050, {}, 0, false, undefined), customerGstin: null, customerName: "Acme Pvt Ltd",
+    });
+    mockGetBill.mockResolvedValue({ ...(await printedWith(printed)), customer: "Acme Pvt Ltd" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: false });
+  });
+
+  test("changed since the print -> paper_stale true", async () => {
+    mockGetBill.mockResolvedValue(await printedWith("0".repeat(64)));
+    expect((await read(READ)).body).toMatchObject({ paper_stale: true });
+  });
+
+  test("printed before 055 (nothing recorded) -> null, and never printed -> null", async () => {
+    mockGetBill.mockResolvedValue(await printedWith(null));
+    expect((await read(READ)).body).toMatchObject({ paper_stale: null });
+    mockGetBill.mockResolvedValue({ ...bill(0), last_paper_digest: null, printed_total: null, printed_as: null });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: null });
+  });
+
+  test("a waiter is told the paper is stale, but not the total it said", async () => {
+    mockGetBill.mockResolvedValue(await printedWith("0".repeat(64)));
+    const body = (await read(WAITER_READ)).body as Record<string, unknown>;
+    expect(body.paper_stale).toBe(true);
+    expect(body).not.toHaveProperty("printed_total");
+    expect(body).not.toHaveProperty("last_paper_digest");
+  });
+
+  // The claim hands the browser the PRICED bill to print (C4's one exception),
+  // and a waiter may now make that claim on stale paper. The old paper's record
+  // is not part of the receipt, for them or anyone.
+  test.each([
+    ["a waiter's updated print", () => WAITER],
+    ["a senior's print", () => SENIORS[0][1]],
+  ])("POST /print/bill/claim — %s: printable_bill carries the amounts, never the old paper's digest or total", async (_l, who) => {
+    mockGetBill.mockResolvedValue(await printedWith("0".repeat(64)));
+    const r = await harness.call("POST", "/print/bill/claim", { body: { table_name: "12" }, auth: who() as never });
+    expect(r.status).toBe(200);
+    const printable = (r.body as { printable_bill: Record<string, unknown> }).printable_bill;
+    expect(printable).toMatchObject({ bill_id: "bill-12", grand_total: 1050, subtotal: 1050, items: bill(1).items });
+    expect(printable).not.toHaveProperty("last_paper_digest");
+    expect(printable).not.toHaveProperty("printed_total");
+    expect(r.body).toMatchObject({ revised: true });
+    expect(JSON.stringify(r.body)).not.toContain("0".repeat(64));
+  });
+});
+
+// ===========================================================================
+// A SPLIT-PRINTED TABLE KEEPS ITS STALE-PAPER TRACKING. Every part is a counted
+// print of this seating, and whichever part is the latest job is "the paper",
+// so every part must carry the whole bill's record — or the tile reads unknown
+// and a waiter can never print the updated bill. (Review of 2.0.2: disabling
+// this record left every suite green.)
+describe("2h. POST /print/bill/split files what its paper said, on every part", () => {
+  const split = () => harness.call("POST", "/print/bill/split", { body: { table_name: "12", parts: 2 }, auth: SENIORS[0][1] as never });
+
+  test("RecordBillPrintPaper gets EVERY part's job id and the WHOLE bill's record, after the parts are out", async () => {
+    mockDispatch
+      .mockResolvedValueOnce({ jobId: "job-part-1", decision: { destinationName: "Front Till" }, assignedDeviceId: "dev-1" })
+      .mockResolvedValueOnce({ jobId: "job-part-2", decision: { destinationName: "Front Till" }, assignedDeviceId: "dev-1" });
+    const r = await split();
+    expect(r.status).toBe(200);
+    expect(mockDispatch).toHaveBeenCalledTimes(2);
+    expect(mockPaper).toHaveBeenCalledTimes(1);
+    const { billPaperDigest, billLinesDigest } = await import("../bill_paper_digest");
+    const { computeBillCharges } = await import("../billing_math");
+    expect(mockPaper).toHaveBeenCalledWith(RES, ["job-part-1", "job-part-2"], {
+      bill_digest: billPaperDigest({ items: bill(0).items, charges: computeBillCharges(1050, {}, 0, false, undefined), customerGstin: null }),
+      lines_digest: billLinesDigest(bill(0).items),
+      bill_grand_total: 1050,
+      table_name: "12",
+    });
+    expect(mockPaper.mock.invocationCallOrder[0]).toBeGreaterThan(mockDispatch.mock.invocationCallOrder[1]!);
+  });
+
+  test("a record that cannot be written never fails the split print", async () => {
+    mockPaper.mockRejectedValue(new Error("pool exhausted"));
+    const r = await split();
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ success: true, parts: 2 });
+  });
+});
+
+// ===========================================================================
+// THE WEB PRINT PAGE'S "Print ESC/POS" sends the claim's paper to a till as a
+// NEWER counted job of the same bill. It names the claim's job, and the publish
+// takes that job's record — or the seating's paper reads unknown from then on.
+describe("2i. POST /publish/bill carries the claim's paper record", () => {
+  const PUBLISH = "2ae797d9-2bef-4419-a33d-ab09590dbef9";
+  const PRINTER = identity("waiter", ["waiter"], [ADD_ORDERS, PUBLISH]);
+  const CLAIM_JOB = "9a000000-0000-4000-8000-000000000001";
+  const publish = (extra: Record<string, unknown>) => harness.call("POST", "/publish/bill", {
+    body: { billId: "bill-12", escBase64: "ZXNj", ...extra }, auth: PRINTER as never,
+  });
+
+  test("with the claim's job id: the new job takes that record, after it is dispatched", async () => {
+    const r = await publish({ paperJobId: CLAIM_JOB });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ success: true, jobId: "job-1", destination: "Front Till", device: "dev-1" });
+    expect(mockDispatch).toHaveBeenCalledWith(RES, expect.objectContaining({ bill_id: "bill-12", kind: "bill" }));
+    expect(mockCopyPaper).toHaveBeenCalledWith(RES, CLAIM_JOB, "job-1");
+    expect(mockCopyPaper.mock.invocationCallOrder[0]).toBeGreaterThan(mockDispatch.mock.invocationCallOrder[0]!);
+  });
+
+  test("without one (an older page, or no claim): published exactly as before, nothing copied", async () => {
+    const r = await publish({});
+    expect(r.status).toBe(200);
+    expect(mockDispatch).toHaveBeenCalledTimes(1);
+    expect(mockCopyPaper).not.toHaveBeenCalled();
+  });
+
+  test("no durable job (027 absent): nothing to copy onto", async () => {
+    mockDispatch.mockResolvedValue({ jobId: null, decision: { destinationName: null }, assignedDeviceId: null });
+    const r = await publish({ paperJobId: CLAIM_JOB });
+    expect(r.status).toBe(200);
+    expect(mockCopyPaper).not.toHaveBeenCalled();
   });
 });
 
@@ -583,9 +974,15 @@ describe("4. the wiring — nothing here is built and never called", () => {
     const bills = read("routes/bills.ts");
     expect(handler(bills, "app.post('/bills/merge'")).toMatch(/tableName: toTable, guest: false, write: "merge"/);
     expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/tableName: toTable, guest: false, write: "move"/);
-    for (const start of ["app.post('/bills/merge'", "app.post('/bills/move-item'"]) {
-      expect(handler(bills, start)).toMatch(/res\.json\(\{ \.\.\.result, \.\.\.reprintNeededFields\(guard\) \}\)/);
-    }
+    // Client item 4: a move is judged on its SOURCE too, and answers both reprints.
+    expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/tableName: fromTable, guest: false, write: "move_off"/);
+    expect(handler(bills, "app.post('/bills/merge'")).toMatch(/res\.json\(\{ \.\.\.result, \.\.\.reprintNeededFields\(guard\) \}\)/);
+    // The answer is built once and redacted for a waiter-only session before it is sent.
+    expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/const answer = \{ \.\.\.result, prints, kot_nos: kotNos, \.\.\.moveReprintFields\(guard, sourceGuard\) \};\s*res\.json\(hidesPrices\(req\.auth\) \? redactMoveAnswer\(answer\) : answer\);/);
+    const tablesRoutes = read("routes/tables.ts");
+    expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/tableName: toTable, guest: false, write: "move"/);
+    expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/tableName: sourceTable, guest: false, write: "move_off"/);
+    expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/\.\.\.moveReprintFields\(destinationGuard, sourceGuard\)/);
     for (const start of ['app.post("/orders",', "app.post('/orders/:id/items'"]) {
       expect(handler(read("routes/orders.ts"), start)).toMatch(/\.\.\.reprintNeededFields\(guard\),/);
     }
@@ -644,9 +1041,85 @@ describe("4. the wiring — nothing here is built and never called", () => {
   });
 
   test("the seating start is the same helper on both payloads", () => {
-    expect(chunk(DB, "GetBillForTable")).toMatch(/seatingStartOf\(bill\?\.created_at \?\? null, orderRows\[0\]\?\.created_at \?\? null\)/);
-    expect(chunk(DB, "GetTables")).toMatch(/seatingStartOf\(bill\?\.created_at \?\? null, firstOrderAtByTable\.get\(row\.id\) \?\? null\)/);
-    expect(chunk(DB, "GetOrderingPrintGuard")).toMatch(/seatingStartOf\(/);
+    // seatingStartFor, fed the SAME four facts everywhere: the open seating, the
+    // open bill's created_at, the first still-owing order and its arrival.
+    const four = (session: string, bill: string, first: string, arrival: string): RegExp => new RegExp(
+      `seatingStartFor\\(\\{\\s*sessionSeatedAt: ${session},\\s*billCreatedAt: ${bill},\\s*firstOrderAt: ${first},\\s*firstArrivalAt: ${arrival},\\s*\\}\\)`,
+    );
+    const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(chunk(DB, "GetBillForTable")).toMatch(four(
+      esc("await openSeatingStartOf(context, tableId)"), esc("bill?.created_at ?? null"),
+      esc("orderRows[0]?.created_at ?? null"), esc("firstArrivalOf(orderRows, normalized)"),
+    ));
+    expect(chunk(DB, "GetTables")).toMatch(four(
+      esc("row.is_occupied ? (seatingByTable.get(row.id) ?? null) : null"), esc("bill?.created_at ?? null"),
+      esc("firstOrderAtByTable.get(row.id) ?? null"), esc("firstArrivalByTable.get(row.id) ?? null"),
+    ));
+    expect(chunk(DB, "GetTables")).toMatch(/const seatingByTable = await openSeatingStarts\(context, null\);/);
+    // The order guard and the move share ONE seating read, and it bounds with the helper.
+    expect(chunk(DB, "GetOrderingPrintGuard")).toMatch(/await currentSeatingPrintState\(context, table\)/);
+    expect(chunk(DB, "currentSeatingPrintState")).toMatch(four(
+      esc("await openSeatingStartOf(context, table.id)"), esc("billRows[0]?.created_at ?? null"),
+      esc("firstOrder[0]?.first_at ?? null"), esc("firstOrder[0]?.first_arrival ?? null"),
+    ));
+    expect(chunk(DB, "MoveTableParty")).toMatch(/await currentSeatingPrintState\(freed\.context, \{ id: dstId, table_name: moved\.to_table \}\)/);
+    expect(chunk(DB, "rekeyMovedPartyPrints")).toMatch(four(
+      esc("startRows[0]?.seated_at ?? null"), esc("startRows[0]?.bill_created_at ?? null"),
+      esc("startRows[0]?.first_order_at ?? null"), esc("startRows[0]?.first_arrival ?? null"),
+    ));
+    // Nothing bounds a seating with the old two-fact rule any more.
+    expect(DB).not.toMatch(/\bseatingStartOf\(/);
+  });
+
+  test.each([
+    ["routes/orders.ts", 'app.post("/orders",', "await AddOrder("],
+    ["routes/orders.ts", "app.post('/orders/:id/items'", "await UpdateOrderItemsSplit("],
+    ["routes/bills.ts", "app.post('/bills/merge'", "await MergeTableBills("],
+    ["routes/bills.ts", "app.post('/bills/move-item'", "await MoveBillItem("],
+  ])("%s %s files the printed-bill addition AFTER its write lands", (file, start, write) => {
+    const body = handler(read(file), start);
+    const note = body.indexOf("await noteAdditionToPrintedBill(req, guard");
+    expect(note).toBeGreaterThan(body.indexOf(write));
+  });
+
+  test("the QR route never reads the intent flag — a guest is refused whatever the body says", () => {
+    expect(handler(read("routes/guest.ts"), 'app.post("/qr/:slug/order"')).not.toMatch(/confirmedPrinted|add_to_printed_bill/);
+    // ...and the staff guard honours it for an ORDER only (a merge or a moved item never).
+    expect(read("routes/_shared.ts")).toMatch(/const confirmedPrinted = write === "order" && \(target\.confirmedPrinted \?\? addToPrintedBillFlag\(req\.body\)\);/);
+  });
+
+  test("every bill print files what its paper said, AFTER the paper is out", () => {
+    const bills = read("routes/bills.ts");
+    const print = chunk(bills, "printOpenTableBill");
+    expect(print.indexOf("await recordPaper(restaurantId, [dispatched.jobId]")).toBeGreaterThan(print.indexOf("await dispatchPrintJob("));
+    const claim = chunk(bills, "claimClientRenderedBillPrint");
+    expect(claim.indexOf("await recordPaper(restaurantId, [recorded.id], paper)")).toBeGreaterThan(claim.indexOf("await RecordClientRenderedBillPrint("));
+    const split = handler(bills, "app.post('/print/bill/split'");
+    expect(split.indexOf("await recordPaper(restaurantId, jobs.map((j) => j.jobId)")).toBeGreaterThan(split.indexOf("await dispatchPrintJob("));
+    // ...as a statement of its own: nothing in front of it on its line (2h drives it).
+    expect(split).toMatch(/\n[ \t]*await recordPaper\(restaurantId, jobs\.map\(\(j\) => j\.jobId\)/);
+    // The recorder is the data layer's, and the three gate callers pass the tenant.
+    expect(bills).toMatch(/await RecordBillPrintPaper\(restaurantId, jobIds, paper\)/);
+    expect(handler(bills, "app.post('/print/bill',")).toMatch(/refuseWaiterBillReprint\(req, res, tableName, bill, restaurantId\)/);
+    expect(handler(bills, "app.post('/print/bill/claim'")).toMatch(/refuseWaiterBillReprint\(req, res, tableName, bill, restaurantId\)/);
+    expect(read("routes/mis_capture.ts")).toMatch(/refuseWaiterBillReprint\(req, res, tableName, bill, restaurantId\)/);
+  });
+
+  test("the bill read and the gate compare through ONE fingerprint", () => {
+    const bills = read("routes/bills.ts");
+    expect(chunk(bills, "billPaperStale")).toMatch(/paperStale\(await currentPaperDigest\(restaurantId, tableName, bill\), bill\.last_paper_digest\)/);
+    expect(chunk(bills, "refuseWaiterBillReprint")).toMatch(/await billPaperStale\(restaurantId, tableName, bill\)/);
+    expect(handler(read("routes/tables.ts"), 'app.get("/bill-for-table"')).toMatch(/paper_stale: await billPaperStale\(restaurantId, tableName, result\)/);
+    // And the floor tile compares the lines through the data layer's own read.
+    expect(chunk(DB, "GetTables")).toMatch(/paperStale\(billLinesDigest\(paperLinesByTable\.get\(row\.id\) \?\? \[\]\), prints\.paper\?\.lines_digest\)/);
+    expect(chunk(DB, "RecordBillPrintPaper")).toMatch(/update "PrintJobs"/);
+  });
+
+  test("the boot step issues 055 before the server listens", () => {
+    const index = read("index.ts");
+    const boot = index.indexOf("await InitPrintJobPaperSchema()");
+    expect(boot).toBeGreaterThan(-1);
+    expect(boot).toBeLessThan(index.indexOf("httpServer.listen("));
   });
 
   test("the boot step issues 053 before the server listens", () => {

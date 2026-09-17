@@ -18,6 +18,7 @@ import {
   averageBillValue,
   billDiscountMoney,
   classifyBillEdit,
+  PRINTED_BILL_NEW_ORDER_DOOR,
   composeBillMoney,
   formatMethodSplit,
   growthPct,
@@ -573,6 +574,32 @@ describe("classifyBillEdit", () => {
     expect(classifyBillEdit("383cc261-7e5c-4745-b16f-06a41e2ae047", null, { old_order_id: "o1" })?.kind).toBe("bill_replaced");
     expect(classifyBillEdit("c4d2e6f8-1a3b-4c5d-8e7f-2b4a6c8d0e1f", null, { bill_id: "b1", decision: "approve" })?.kind).toBe("discount_decision");
     expect(classifyBillEdit("8c3f5b21-0e74-4a96-b2d8-6f1a9c4e7b53", null, { order_id: "9f2" })?.kind).toBe("order_deleted");
+  });
+
+  // INTEGRATION REVIEW (kot-reports-email): 2.0.2 lets a waiter add a whole order
+  // to a printed bill, and the report whose job is "what changed after the bill
+  // was generated" — emailed daily now — had no row for it.
+  test("a new order placed on a PRINTED bill is an edit, keyed on its writer's flag, with its order and table", () => {
+    const line = "ADDED an order on the printed bill of table 12 (printed 1 time(s))";
+    const details = { table: "12", after_print: true, write: "order", print_count: 1, confirmed: true, waiter_only: true, order_id: "9f2", door: PRINTED_BILL_NEW_ORDER_DOOR };
+    const c = classifyBillEdit(CATCH_ALL, line, details);
+    expect(c).toMatchObject({ kind: "printed_bill_order_added", label: "Order added after the bill was printed", order_id: "9f2", table: "12" });
+    expect(PRINTED_BILL_NEW_ORDER_DOOR).toBe("new_order");
+    // The reason text is not what decides it: the same flags under other words still classify.
+    expect(classifyBillEdit(CATCH_ALL, "something else", details)?.kind).toBe("printed_bill_order_added");
+  });
+
+  test("…while the other doors' addition lines stay unclassified (each files its own classified line), and so does 'New order'", () => {
+    const base = { table: "12", after_print: true, print_count: 1, confirmed: true, waiter_only: false };
+    // POST /orders/:id/items (its Item added line classifies), a merge, a move: no door.
+    expect(classifyBillEdit(CATCH_ALL, "ADDED an order on the printed bill of table 12 (printed 1 time(s))", { ...base, write: "order" })).toBeNull();
+    expect(classifyBillEdit(CATCH_ALL, "ADDED a merge into the printed bill of table 12 (printed 1 time(s))", { ...base, write: "merge" })).toBeNull();
+    expect(classifyBillEdit(CATCH_ALL, "ADDED a move onto the printed bill of table 12 (printed 1 time(s))", { ...base, write: "move" })).toBeNull();
+    // A door without the after-print flag, or a string flag, is not the writer's claim.
+    expect(classifyBillEdit(CATCH_ALL, "x", { door: PRINTED_BILL_NEW_ORDER_DOOR })).toBeNull();
+    expect(classifyBillEdit(CATCH_ALL, "x", { after_print: "true", door: PRINTED_BILL_NEW_ORDER_DOOR })).toBeNull();
+    // Placing an order is still not an edit by itself.
+    expect(classifyBillEdit(CATCH_ALL, "New order 9f2 on table 12", { order_id: "9f2", table: "12" })).toBeNull();
   });
 
   test("the add-item entry reads the item NAME out of the whole item object", () => {

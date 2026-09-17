@@ -5,12 +5,13 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitKotDocketSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, InitBillCustomerAddressSchema, InitBillRoundOffSchema, InitKotDocketSchema, InitPrintJobPaperSchema, InitReportEmailSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
 import { closeRealtime, initRealtime } from "./realtime.js";
-import { runReportScheduleSweep } from "./report_schedules.js";
+import { markReportSweepArmed, recoverOrphanReportSends, runReportScheduleSweep, schedulerPermitted } from "./report_schedules.js";
+import { mailTransportStatus } from "./mailer.js";
 import { warnAboutLegacyReleaseEnv } from "./app_release.js";
 import { runIdempotencyReaperSweep } from "./idempotency.js";
 import { runPrintJobReaperSweep } from "./print_jobs.js";
@@ -58,6 +59,7 @@ import { registerPosterRoutes } from "./routes/posters.js";
 import { registerMisCaptureRoutes } from "./routes/mis_capture.js";
 import { InitBillNonChargeableSchema, registerNcSettleRoutes } from "./routes/nc_settle.js";
 import { registerMisReportRoutes } from "./routes/reports_mis.js";
+import { registerReportEmailRoutes } from "./routes/report_email.js";
 import { registerMenuTaxonomyRoutes } from "./routes/menu_taxonomy.js";
 import { registerSelfScorecardRoute } from "./routes/me.js";
 
@@ -455,6 +457,10 @@ registerPosterRoutes(app);
 // one of its paths is a literal under /reports/mis/, so it can neither shadow
 // nor be shadowed by the accounting /reports/* routes registered far above.
 registerMisReportRoutes(app);
+// Client item 9: the report email address book, Send now, the test email and
+// the delivery log's detail and files. After the accounting routes, whose
+// literal GET /reports/deliveries its /reports/deliveries/:id cannot shadow.
+registerReportEmailRoutes(app);
 // The MIS CAPTURE writes (non-chargeable, order voids, service-charge waivers).
 // These are the control ledgers the reports above read; without them the reports
 // are permanently empty, so an unregistered file here is a silent no-op.
@@ -677,6 +683,16 @@ async function bootstrap(): Promise<void> {
 		logger.info("✅ Next-party tables ready (migration 053)");
 	}
 
+	// "PrintJobs".bill_digest / lines_digest / bill_grand_total / table_name
+	// (migration 055, client items 1 and 2), ONCE, here, outside any transaction,
+	// and only the columns that are missing, under a 2s lock timeout — every
+	// docket and ack writes "PrintJobs". False means they are not there and this
+	// role cannot add them: no print records what it said, every paper reads
+	// "unknown", and a waiter's second print stays a senior's, exactly as 2.0.1.
+	if (await InitPrintJobPaperSchema()) {
+		logger.info("✅ Printed-bill fingerprints ready (migration 055)");
+	}
+
 	// "Restaurant".kot_print_style / kot_text_size (migration 050), ONCE, here,
 	// for the same reasons: until now only ensureBrandingColumns made them, on
 	// the first settings read of the process — possibly inside a transaction,
@@ -689,17 +705,56 @@ async function bootstrap(): Promise<void> {
 		logger.info("✅ KOT docket style columns ready (migration 050)");
 	}
 
+	// "Bills".customer_address (migration 054, client item 7), ONCE, here, for
+	// the reasons the steps above give — and "Bills" is the hottest money table,
+	// so the ALTER is only issued when the column is missing, under a 2s lock
+	// timeout. No request path ever issues it. Never throws; false means bills
+	// print exactly as 2.0.1 did and an address write answers 503 until 054 is
+	// applied (noticed within a minute, no restart).
+	if (await InitBillCustomerAddressSchema()) {
+		logger.info("✅ Bill customer address column ready (migration 054)");
+	}
+
+	// Migrations 056-058 (client item 9: report email), ONCE, here, outside any
+	// transaction — the step 048, 050, 051, 052 and 053 already have. PROBE FIRST:
+	// a database that has the schema is only asked; a missing part is made under
+	// a 2s lock timeout. Unconditional, like the print-routing latch: the answer
+	// is what every report-email route reads, and it must be true on the box
+	// that has the migrations whether or not the sweep is armed. Never throws;
+	// OFF means every new report-email write answers 503 and every existing
+	// report path is exactly what 2.0.1 did.
+	try {
+		const reportEmail = await InitReportEmailSchema();
+		if (reportEmail.m056 && reportEmail.m057 && reportEmail.m058) {
+			logger.info("✅ Report email schema ready (migrations 056-058)");
+		}
+	} catch (error) {
+		logger.warn({ err: error }, "report_email_boot_probe_failed — report email stays off");
+	}
+	{
+		const mail = mailTransportStatus();
+		if (mail.available) {
+			logger.info({ transport: mail.transport }, "✅ Report email transport ready");
+		} else {
+			logger.warn({ reason: mail.reason }, "Report email transport OFF — Send now answers 503 and email schedules wait");
+		}
+	}
+
 	// Run the reporting path's lazy DDL ONCE here, outside any transaction, so the
 	// scheduled-report sweep never triggers it inside withTenant's real one:
 	// ensureLazyTable swallows a 42501 in JavaScript but Postgres has already
 	// aborted the transaction, and every statement after it returns 25P02.
 	// Individually tolerant, so a least-privilege runtime just logs and moves on.
 	//
-	// Behind the SAME flag that arms the sweep below. It exists only for the sweep,
-	// and running it unconditionally would move four previously-lazy DDL blocks to
-	// every boot of every deployment — a real behaviour change in deployments that
-	// never asked for this feature, and the one thing that made "ships dark" false.
-	if (process.env.REPORT_SCHEDULER === "true") {
+	// PROBE-FIRST since item 9 (it asks the catalogue and adds only what is
+	// missing, under a 2s lock timeout) and on ITS OWN SWITCH: WARM_REPORTING_SCHEMA
+	// =true runs it without the sweep, =false keeps it off even with the sweep.
+	// Unset, it follows REPORT_SCHEDULER as it always did — it exists for the
+	// sweep, and running it on every boot of every deployment would be a
+	// behaviour change nobody asked for.
+	const warm = process.env.WARM_REPORTING_SCHEMA === "true"
+		|| (process.env.WARM_REPORTING_SCHEMA !== "false" && process.env.REPORT_SCHEDULER === "true");
+	if (warm) {
 		try {
 			await WarmReportingSchema();
 			logger.info("✅ Reporting schema warmed");
@@ -804,18 +859,31 @@ async function bootstrap(): Promise<void> {
 			reportSweepRunning = false;
 		}
 	};
-	// Ships DARK. Flip REPORT_SCHEDULER on once migration 026 is verified in prod;
-	// same posture as SEED_DEMO above.
-	if (process.env.REPORT_SCHEDULER === "true") {
+	// Ships DARK. Flip REPORT_SCHEDULER on once migrations 056-058 are applied
+	// and a test email has arrived (deploy/README.md, "Report email"). Since item
+	// 9 the sweep also refuses to run outside production unless
+	// REPORT_SCHEDULER_ALLOW_NON_PROD says so — the laptop stack points at the
+	// cloud database — and takes the single-row lease before every tick.
+	const sweepPermit = schedulerPermitted();
+	if (sweepPermit.ok) {
 		const reportSweepTimer = setInterval(
 			() => void reportSweep(),
 			Math.max(1, Number(process.env.REPORT_SWEEP_INTERVAL_MIN) || 5) * 60_000,
 		);
 		reportSweepTimer.unref?.();
+		markReportSweepArmed();
 		logger.info("✅ Scheduled report sweep armed");
 	} else {
-		logger.info("Scheduled report sweep disabled (set REPORT_SCHEDULER=true)");
+		logger.info({ reason: sweepPermit.reason }, "Scheduled report sweep disabled");
 	}
+
+	// A Send now or Run now whose process died mid-flight is picked up again once
+	// its lease lapses — recent ones only, production only; an email one only
+	// where mail can be sent. Independent of the sweep switch, like Send now
+	// itself. Fire-and-forget: never delays the boot.
+	void recoverOrphanReportSends()
+		.then((n) => { if (n > 0) {logger.info({ n }, "report_orphan_sends_resumed");} })
+		.catch((err) => { logger.warn({ err }, "report_orphan_scan_failed"); });
 
 	// Print-job reaper: mark outstanding jobs that outlived their TTL 'expired',
 	// then delete settled rows past the retention window.

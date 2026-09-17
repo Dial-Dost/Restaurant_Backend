@@ -811,6 +811,184 @@ deleting them is the one part of this rollback that is not reversible.
 
 ---
 
+## Report email (client item 9) — switching it on
+
+"Reports can be emailed to chosen email IDs, automatically, at the end of each
+day at a time the owner chooses." The code ships **dark** and safe: until the
+steps below are done, Send now answers `503 Email is not set up on this server`,
+no email schedule is ever claimed (the owner gets one bell a day saying so), and
+every existing report — screen, CSV, the Accounting inbox schedules — behaves
+exactly as on 2.0.1.
+
+**Everything here is done by the owner/operator, as root, on the VPS.** CI and
+`rd-entry` cannot touch `/opt/restaurant-dash/.env`, and no step below may be
+skipped or reordered.
+
+### The order
+
+1. **Deploy the backend.** The 2.0.2 release branch carries **no** migration
+   files: 054–058 ship on their own branch (`chore/migrations-054-058`, one file
+   per commit, on top of the release) and are applied by hand, so Gate B has
+   nothing to stop. The backend creates the 054–058 schema itself at boot,
+   because production connects as the table owner; the files still have to be
+   applied so `schema_migrations` records them.
+2. **Apply 054, 055, 056, 057, 058 by hand, in that order**, exactly as in
+   [*While the verb is NOT installed — by hand*](#while-the-verb-is-not-installed--by-hand).
+   Each file starts with `SET LOCAL lock_timeout = '5s'` and is idempotent.
+   054 and 055 issue their `ALTER TABLE` only for a column that is missing (the
+   runtime's own catalogue guard), and 056–058 were written that way from the
+   start, so once the runtime has made the schema none of the five takes an
+   ACCESS EXCLUSIVE lock: they can be applied during service without queueing a settle,
+   a bill read or a kitchen docket. If one does answer `lock_not_available`, the
+   schema was not there yet — re-run it off-peak.
+3. **Set the mail settings** in `/opt/restaurant-dash/.env` (next section).
+4. **Recreate the backend** so it reads them:
+   `docker compose -f /opt/restaurant-dash/docker-compose.yml up -d --force-recreate backend`
+   (`up -d` alone does not re-read an unchanged service).
+5. **Read the boot log** — both lines must be there:
+   `✅ Report email schema ready (migrations 056-058)` and
+   `✅ Report email transport ready` (with `"transport":"smtp"` or `"resend"`).
+   A `Report email transport OFF` line names the setting that is missing.
+   A `Report email is OFF — migrations 056-058 are not all applied` line means
+   step 2 is not done: until it is, **nothing scheduled runs** (the 2.0.1
+   in-app inbox schedules included) and Run now answers `503 schema_pending`.
+6. **Send a test email**: web or app → Insights → Reports → **Email reports** →
+   Address book → add your own address → **Send test email**. In Gmail, open it,
+   *⋮ → Show original*, and check **SPF: PASS, DKIM: PASS, DMARC: PASS**. If it
+   landed in spam, fix DNS before going further.
+   If the history shows the test as **failed**, its line names what to fix —
+   *this server's sign-in* (`SMTP_USER`/`SMTP_PASS`), *sender address*
+   (`SMTP_FROM`/`MAIL_FROM` and the verified domain), *relaying denied*, or
+   *connection* (host/port). Those are this server's settings, never the
+   address's fault: your address is **not** marked Refused. Fix `.env`,
+   recreate (step 4), and press **Send test email** again — with the sweep
+   still off (step 7) nothing retries a failed send by itself, and the history
+   says so.
+7. **Only now switch the schedule on**: add `REPORT_SCHEDULER=true` to `.env`
+   (with `NODE_ENV=production`, which the box already has) and recreate the
+   backend again. The log says `✅ Scheduled report sweep armed`.
+8. **Verify, read-only**, within ten minutes:
+   ```sql
+   BEGIN TRANSACTION READ ONLY;
+   SELECT holder IS NOT NULL AS leased, heartbeat_at, mail_ready, sent_day, sent_count
+     FROM "ReportSweepLease";
+   SELECT kind, status, count(*) FROM "ReportDeliveries"
+    WHERE created_at > now() - interval '1 day' GROUP BY 1, 2;
+   ROLLBACK;
+   ```
+   `heartbeat_at` must move every `REPORT_SWEEP_INTERVAL_MIN` (5) minutes and
+   `mail_ready` must be true.
+
+### Exactly what goes in `/opt/restaurant-dash/.env`
+
+Choose **one** transport. Values below are examples; the secrets never go
+anywhere but this file.
+
+**SMTP** (Amazon SES, ZeptoMail, Brevo, Postmark, a Google Workspace relay):
+
+```sh
+SMTP_HOST=email-smtp.ap-south-1.amazonaws.com
+SMTP_PORT=587                         # 465 means implicit TLS (SMTP_SECURE is then implied)
+SMTP_USER=<the provider's SMTP user>
+SMTP_PASS=<the provider's SMTP password>          # SECRET
+SMTP_FROM=reports@reports.example.com # a VERIFIED sender on the provider
+# or instead of the four above: SMTP_URL=smtps://<user>:<pass>@<host>:465
+# optional: SMTP_SECURE=true   SMTP_TIMEOUT_MS=20000
+```
+
+**HTTPS API** (when the box cannot reach 587/465 — see the port check):
+
+```sh
+MAIL_TRANSPORT=resend
+RESEND_API_KEY=<the Resend API key>               # SECRET
+MAIL_FROM=reports@reports.example.com # a VERIFIED domain on Resend
+```
+
+**Both transports** (all optional):
+
+```sh
+MAIL_FROM_NAME=Experio Reports        # shown as "<Restaurant> via Experio Reports"
+MAIL_REPLY_TO=support@example.com     # a mailbox someone reads
+REPORT_EMAIL_MAX_ATTACH_BYTES=5242880 # all attachments of one email, default 5 MB
+REPORT_EMAIL_TENANT_DAILY_CAP=200     # messages per restaurant per 24 h
+REPORT_EMAIL_PLATFORM_DAILY_CAP=2000  # messages for the whole platform per day
+REPORT_ARTIFACT_RETENTION_DAYS=90     # stored attachment bodies are purged after this
+REPORT_CATCHUP_MINUTES=360            # a missed schedule is still sent up to this late; a Run now or
+                                      # Send now not finished by then is dropped (and the owner told), never sent late
+REPORT_SEND_NOW=true                  # false switches Send now off without a deploy
+```
+
+**Last, after the test email:**
+
+```sh
+REPORT_SCHEDULER=true
+```
+
+**Never on the VPS:** `MAIL_TRANSPORT=log` (development only — the backend
+refuses it in production anyway) and `REPORT_SCHEDULER_ALLOW_NON_PROD` (lets a
+non-production process run the sweep). `WARM_REPORTING_SCHEMA` can stay unset:
+it follows `REPORT_SCHEDULER`, and since this release it only asks the catalogue
+and adds nothing on a database that already has the columns.
+
+**Make sure the container actually receives them.** `docker-compose.yml` is not
+in git; the backend service needs `env_file: .env` (or each name listed under
+`environment:`). Check without printing a secret:
+
+```sh
+docker compose -f /opt/restaurant-dash/docker-compose.yml exec backend \
+  sh -c 'for v in SMTP_HOST SMTP_PORT SMTP_FROM MAIL_TRANSPORT MAIL_FROM REPORT_SCHEDULER NODE_ENV; do printf "%s=%s\n" "$v" "$(printenv $v)"; done'
+```
+
+### The outbound port check (before choosing SMTP)
+
+Many VPS providers block outbound 25/465/587. From the VPS:
+
+```sh
+timeout 6 bash -c '</dev/tcp/email-smtp.ap-south-1.amazonaws.com/587' && echo "587 open" || echo "587 BLOCKED"
+timeout 6 bash -c '</dev/tcp/email-smtp.ap-south-1.amazonaws.com/465' && echo "465 open" || echo "465 BLOCKED"
+curl -sS -o /dev/null -w 'resend api: %{http_code}\n' https://api.resend.com/emails   # 401/405 = reachable
+```
+
+Both SMTP ports blocked → use `MAIL_TRANSPORT=resend`. A send that cannot
+connect fails in `SMTP_TIMEOUT_MS` and is retried (5, 30, 120 minutes); it never
+hangs the sweep.
+
+### DNS for the sending domain (Cloudflare, "DNS only" — grey cloud)
+
+Use a subdomain you control, e.g. `reports.example.com`:
+
+| Record | Name | Value |
+|---|---|---|
+| SPF (TXT) | `reports.example.com` | `v=spf1 include:<the provider's SPF domain> ~all` — ONE SPF record per name |
+| DKIM | as the provider shows (e.g. `resend._domainkey.reports`) | exactly as the provider shows (CNAME or TXT) |
+| DMARC (TXT) | `_dmarc.reports.example.com` | `v=DMARC1; p=none; rua=mailto:dmarc@example.com` — move to `p=quarantine` once reports pass |
+| Bounce / MAIL FROM (optional) | as the provider shows | the provider's MX + SPF |
+
+Without SPF and DKIM the reports go to spam; the provider will also refuse an
+unverified From.
+
+### Switching it off again
+
+| To stop | Do | Effect |
+|---|---|---|
+| scheduled emails | remove `REPORT_SCHEDULER`, recreate | no sweep; Send now still works |
+| on-demand sends | `REPORT_SEND_NOW=false`, recreate | Send now answers 503 |
+| all mail | `MAIL_TRANSPORT=off`, recreate | nothing is claimed or sent; one bell a day per restaurant with a due email schedule |
+
+056–058 are additive. A **2.0.1 backend** ignores the new tables and columns;
+if you roll back past this release, keep `REPORT_SCHEDULER` unset — a 2.0.1
+sweep would fail a bundle schedule's rows as "Unsupported report_key: bundle".
+Installed **2.0.1 apps** keep working: the schedule list only gained fields, and
+their create/edit bodies are stored as the single-report, calendar-day CSV
+schedules they always were. Editing a schedule that app cannot show (several
+reports, or one MIS report such as Item Wise) changes only its name, time and
+frequency — the reports it sends are kept. Its **Run now** answers with a
+sentence rather than queue something that cannot finish: `503` for an email
+schedule while mail is off, and `400` for a trading day that has not closed yet
+(a run always covers the most recent CLOSED trading day).
+
+---
+
 ## Triggering a manual deploy
 
 * **From GitHub:** Actions → *Deploy (production)* → **Run workflow** on `main`.

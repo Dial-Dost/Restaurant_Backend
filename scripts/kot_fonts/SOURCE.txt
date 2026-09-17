@@ -1,0 +1,13 @@
+DejaVu Sans Condensed (regular and bold), DejaVu fonts 2.37.
+
+Taken unmodified from the upstream release archive
+  https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip
+  sha256 7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a
+
+  ttf/DejaVuSansCondensed.ttf       sha256 8550cd5ca1acb65a8fc7877c46939cd0b4d909f8e7bc1e24716873d918c5e549
+  ttf/DejaVuSansCondensed-Bold.ttf  sha256 38098d0b8edd8430a0f53fb2831b5d36037563a998a620d3c87a4d7591766d20
+
+LICENSE and AUTHORS are the archive's own. Licence: Bitstream Vera Fonts
+(DejaVu changes are public domain). These files are dev-time input to
+scripts/build_kot_glyph_atlas.ts only and are kept out of the Docker image
+(.dockerignore). The generated kot_glyph_atlas.ts carries the licence notice.

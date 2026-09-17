@@ -195,7 +195,9 @@ describe("the writers that rewrite an order price chargeable lines, and keep the
   test("its write is guarded by the state it was built on, and a miss is said, never swallowed", () => {
     expect(split).toMatch(/and \$\{stillOwesStatusSql\(\)\}\n\s+and coalesce\(status::text, '1'\) <> '6'/);
     expect(split).toMatch(/\), ''\) = \$6\n\s+returning id`/);
-    expect(split).toMatch(/ncFlagSignature\(previousLines\)\],/);
+    // …then client item 3's pin ($7): a waiter's strip lands only on the Pending
+    // order it was judged on.
+    expect(split).toMatch(/ncFlagSignature\(previousLines\),\n\s+waiterStrip \? String\(PENDING_ORDER_STATUS_CODE\) : null\],/);
     expect(split).toMatch(/if \(!written\[0\]\) \{/);
   });
 

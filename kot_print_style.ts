@@ -115,7 +115,7 @@ export function parseKotPrintStyle(raw: unknown): KotPrintStyle | null {
  * answer is a per-restaurant choice rather than a third constant.
  *
  *   'small'     — a size down from the client's reference ticket.
- *   'standard'  — the client's reference ticket, dot for dot (28 dots per em on
+ *   'standard'  — the client's reference ticket's type size (27 dots per em on
  *                 80mm). What NULL, a missing column and anything unrecognised
  *                 read as.
  *   'large'     — a size up, for a pass read from further away.
@@ -124,9 +124,10 @@ export function parseKotPrintStyle(raw: unknown): KotPrintStyle | null {
  * has to contain every one of them; this module only knows the three words.
  *
  * IT APPLIES TO THE REFERENCE DOCKET ONLY. The classic text docket is set in the
- * printer's own built-in font, which has no sizes worth offering (integer
- * multiples of a 12x24 cell), so a restaurant on 'classic' keeps exactly the
- * bytes it has always printed whatever this says. The settings screens say so.
+ * printer's own built-in font at its normal size, which has no sizes worth
+ * offering (integer multiples of a 12x24 cell, and any multiple that is not the
+ * same both ways stretches the letters), so a restaurant on 'classic' prints
+ * the same docket whatever this says. The settings screens say so.
  *
  * Same rules as the style above, for the same reasons: READS forgive anything
  * and answer the default (this runs on the path that puts paper on the pass),

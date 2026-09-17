@@ -34,6 +34,8 @@
 // Dispatch THROWS on any unrecognised statement, so a code path that starts
 // issuing a new query fails loudly rather than silently receiving zero rows.
 
+import { orderArrivedAt } from "../order_moves";
+
 export const RES_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
 export const OUTLET_ID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
 export const RESTAURANT_SLUG = "gaia";
@@ -62,6 +64,8 @@ export interface OrderFix {
   /** '1' new … '4' paid, '5' cancelled, '6' payment pending, '7' closed, '8' awaiting approval. */
   status: string;
   created_at: string;
+  /** When the kitchen was told (MoveBillItem carries it to the dish's new order). */
+  barked_at?: string | null;
 }
 
 export interface BillFix {
@@ -99,6 +103,22 @@ export interface BookingFix {
   created_at: string;
 }
 
+/**
+ * One "PrintJobs" row (migration 027), as far as a MOVE touches it: the move
+ * re-addresses the party's `<name>-<epoch>` prints to the destination (client
+ * items 1 and 2), inside its own transaction, and then reads the destination's
+ * print state back.
+ */
+export interface PrintJobFix {
+  id: string;
+  bill_id: string;
+  kind: string;
+  status: string;
+  created_at: string;
+  /** Migration 055's paper name; null = not recorded. */
+  table_name: string | null;
+}
+
 interface Store {
   tables: TableFix[];
   orders: OrderFix[];
@@ -106,13 +126,16 @@ interface Store {
   sessions: SessionFix[];
   assignments: AssignmentFix[];
   bookings: BookingFix[];
+  printJobs: PrintJobFix[];
+  /** False models a database without migration 027: every "PrintJobs" statement raises 42P01. */
+  printLedger: boolean;
   /** ticket_key -> kot_no, migration 029's memo. */
   kotTickets: Map<string, number>;
   billSeq: number;
   log: string[];
   nextId: number;
   /** Snapshots pushed by BEGIN / SAVEPOINT and popped by COMMIT / ROLLBACK. */
-  stack: Omit<Store, "stack" | "failOn" | "log">[];
+  stack: Omit<Store, "stack" | "failOn" | "log" | "printLedger">[];
   /** Make the next statement matching this substring throw. */
   failOn: string | null;
 }
@@ -122,8 +145,14 @@ let store: Store = freshStore();
 function freshStore(): Store {
   return {
     tables: [], orders: [], bills: [], sessions: [], assignments: [], bookings: [],
+    printJobs: [], printLedger: true,
     kotTickets: new Map(), billSeq: 100, log: [], nextId: 1, stack: [], failOn: null,
   };
+}
+
+/** Model a database whose print ledger (migration 027) is not there. */
+export function setPrintLedgerPresent(present: boolean): void {
+  store.printLedger = present;
 }
 
 export function resetStore(): void {
@@ -136,10 +165,11 @@ export function failNextStatementContaining(needle: string | null): void {
   store.failOn = needle;
 }
 
-function snapshot(): Omit<Store, "stack" | "failOn" | "log"> {
+function snapshot(): Omit<Store, "stack" | "failOn" | "log" | "printLedger"> {
   return {
+    printJobs: store.printJobs.map((r) => ({ ...r })),
     tables: store.tables.map((r) => ({ ...r })),
-    orders: store.orders.map((r) => ({ ...r, food: { ...r.food } })),
+    orders: store.orders.map((r) => ({ ...r, food: JSON.parse(JSON.stringify(r.food)) as Record<string, unknown> })),
     bills: store.bills.map((r) => ({ ...r })),
     sessions: store.sessions.map((r) => ({ ...r })),
     assignments: store.assignments.map((r) => ({ ...r })),
@@ -150,7 +180,8 @@ function snapshot(): Omit<Store, "stack" | "failOn" | "log"> {
   };
 }
 
-function restore(snap: Omit<Store, "stack" | "failOn" | "log">): void {
+function restore(snap: Omit<Store, "stack" | "failOn" | "log" | "printLedger">): void {
+  store.printJobs = snap.printJobs;
   store.tables = snap.tables;
   store.orders = snap.orders;
   store.bills = snap.bills;
@@ -221,6 +252,20 @@ export function addBill(b: Partial<BillFix> & { table_id: string }): BillFix {
   return row;
 }
 
+/** A bill print in the ledger, addressed as routes/bills.ts addresses it. */
+export function addPrintJob(j: Partial<PrintJobFix> & { bill_id: string }): PrintJobFix {
+  const row: PrintJobFix = {
+    id: `pj-${String(store.nextId++)}`,
+    kind: "bill",
+    status: "delivered",
+    created_at: "2026-09-09T12:30:00.000Z",
+    table_name: null,
+    ...j,
+  };
+  store.printJobs.push(row);
+  return row;
+}
+
 /** Strip a table's seating rows, modelling the one state the repair has to cope
  *  with: a table that was occupied before the table_session_track trigger
  *  existed, so there is no open session to carry across. */
@@ -248,6 +293,7 @@ export function addBooking(tableId: string, status: string): void {
 export const tables = (): TableFix[] => store.tables.map((r) => ({ ...r }));
 export const orders = (): OrderFix[] => store.orders.map((r) => ({ ...r, food: { ...r.food } }));
 export const bills = (): BillFix[] => store.bills.map((r) => ({ ...r }));
+export const printJobs = (): PrintJobFix[] => store.printJobs.map((r) => ({ ...r }));
 export const sessions = (): SessionFix[] => store.sessions.map((r) => ({ ...r }));
 export const assignments = (): AssignmentFix[] => store.assignments.map((r) => ({ ...r }));
 export const bookings = (): BookingFix[] => store.bookings.map((r) => ({ ...r }));
@@ -322,6 +368,23 @@ function fireSessionTrigger(before: TableFix, after: TableFix): void {
 /** The active-order status filter every money statement here carries. */
 const isActive = (status: string): boolean => !["4", "5", "7"].includes(str(status) || "1");
 
+/** min(orderArrivalSql) over these orders, on the named table — as the SQL computes it. */
+function firstArrival(rows: readonly OrderFix[], tableName: string): Date | null {
+  let first: number | null = null;
+  for (const o of rows) {
+    const t = orderArrivedAt(o.food, tableName, o.created_at);
+    if (t !== null && (first === null || t < first)) {first = t;}
+  }
+  return first === null ? null : new Date(first);
+}
+
+/** max(seated_at) of a table's OPEN seating rows, or null. */
+function newestOpenSeating(tableId: string): Date | null {
+  const open = store.sessions.filter((x) => x.table_id === tableId && x.left_at === null).map((x) => x.seated_at).sort();
+  const last = open[open.length - 1];
+  return last ? new Date(last) : null;
+}
+
 function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
   const sql = sqlRaw.replace(/\s+/g, " ").trim();
   const s = sql.toLowerCase();
@@ -349,6 +412,115 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
 
   // --- context ------------------------------------------------------------
   if (s.includes('from "restaurant" r')) {return { rows: [contextRow()] };}
+
+  // --- the schema latches: 053 is not modelled here (no families), 055 is not
+  //     applied (no paper columns) — so neither feature's column is ever named.
+  if (s.includes("information_schema.columns")) {return { rows: [{ n: 0 }] };}
+
+  // --- the print ledger (027): the move's re-key and the read-back after it --
+  if (s.includes('"printjobs"') && !store.printLedger) {
+    throw Object.assign(new Error('relation "PrintJobs" does not exist'), { code: "42P01" });
+  }
+  if (s.startsWith("select (select min(o.created_at) from \"orders\" o")) {
+    const tableId = str(params[2]);
+    const owingRows = store.orders.filter((o) => o.table_id === tableId && isActive(o.status));
+    const owing = owingRows.map((o) => o.created_at).sort();
+    const bill = store.bills
+      .filter((b) => b.table_id === tableId && b.closed_at === null)
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+    // The seating bound's two other terms (seatingStartFor): the earliest
+    // ARRIVAL on the named table, and the table's open seating.
+    if (!s.includes("as first_arrival") || !s.includes('from "tablesessions" s where s.table_id = $3 and s.left_at is null')) {
+      throw new Error("table_move_fixtures: the re-key's seating start must read the arrivals and the open seating");
+    }
+    return {
+      rows: [{
+        first_order_at: owing[0] ? new Date(owing[0]) : null,
+        bill_created_at: bill ? new Date(bill.created_at) : null,
+        first_arrival: firstArrival(owingRows, str(params[3])),
+        seated_at: newestOpenSeating(tableId),
+      }],
+    };
+  }
+  if (s.startsWith('update "printjobs" set bill_id = $4 || bill_id where')) {
+    // The destination's previous party's prints: the same three bounds as the
+    // re-key below, and the old id kept whole behind the mark.
+    if (!s.includes("starts_with(bill_id, $3)") || !s.includes("~ '^([0-9]+|split-[0-9]+of[0-9]+)$'")
+      || !s.includes("created_at >= $6::timestamptz") || s.includes(" like ")) {
+      throw new Error("table_move_fixtures: the retirement must be bounded by the exact prefix, the suffix shape and the seating start");
+    }
+    const prefix = str(params[2]);
+    const mark = str(params[3]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.kind !== str(params[4]) || !j.bill_id.startsWith(prefix)) {continue;}
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(j.bill_id.slice(prefix.length))) {continue;}
+      if (Date.parse(j.created_at) < start) {continue;}
+      j.bill_id = `${mark}${j.bill_id}`;
+      out.push({ id: j.id });
+    }
+    return { rows: out };
+  }
+  if (s.startsWith('update "printjobs" set bill_id = $4 || substr(bill_id, length($3) + 1)')) {
+    // The statement's whole predicate, clause for clause: kind, the EXACT
+    // prefix (starts_with), the suffix shape, and the seating bound.
+    if (!s.includes("starts_with(bill_id, $3)") || !s.includes("~ '^([0-9]+|split-[0-9]+of[0-9]+)$'")
+      || !s.includes("created_at >= $6::timestamptz") || s.includes(" like ")) {
+      throw new Error("table_move_fixtures: the re-key must be bounded by the exact prefix, the suffix shape and the seating start");
+    }
+    const from = str(params[2]);
+    const to = str(params[3]);
+    const start = Date.parse(str(params[5]));
+    const out: { id: string }[] = [];
+    for (const j of store.printJobs) {
+      if (j.kind !== str(params[4]) || !j.bill_id.startsWith(from)) {continue;}
+      const tail = j.bill_id.slice(from.length);
+      if (!/^([0-9]+|split-[0-9]+of[0-9]+)$/.test(tail)) {continue;}
+      if (Date.parse(j.created_at) < start) {continue;}
+      j.bill_id = `${to}${tail}`;
+      out.push({ id: j.id });
+    }
+    return { rows: out };
+  }
+  if (s.startsWith('select id, created_at from "bills" where table_id = $1')) {
+    const open = store.bills
+      .filter((b) => b.table_id === str(params[0]) && b.closed_at === null)
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+    return { rows: open ? [{ id: open.id, created_at: new Date(open.created_at) }] : [] };
+  }
+  if (s.startsWith('select min(created_at) as first_at, min(coalesce(')) {
+    const owingRows = store.orders.filter((o) => o.table_id === str(params[2]) && isActive(o.status));
+    const owing = owingRows.map((o) => o.created_at).sort();
+    return { rows: [{ first_at: owing[0] ? new Date(owing[0]) : null, first_arrival: firstArrival(owingRows, str(params[3])) }] };
+  }
+  // --- the open seating the print bound reads (openSeatingStarts) -----------
+  if (s.startsWith(`select to_regclass('public."tablesessions"') is not null as present`)) {
+    return { rows: [{ present: true }] };
+  }
+  if (s.startsWith('select s.table_id::text as table_id, max(s.seated_at) as seated_at from "tablesessions" s join "tables" t')) {
+    if (!s.includes("s.left_at is null") || !s.includes("coalesce(t.is_occupied, false) = true")) {
+      throw new Error("table_move_fixtures: only an OCCUPIED table's OPEN seating bounds its prints");
+    }
+    const ids = Array.isArray(params[2]) ? (params[2] as string[]) : null;
+    const out: { table_id: string; seated_at: Date }[] = [];
+    for (const t of store.tables) {
+      if (!t.is_occupied || (ids && !ids.includes(t.id))) {continue;}
+      const at = newestOpenSeating(t.id);
+      if (at) {out.push({ table_id: t.id, seated_at: at });}
+    }
+    return { rows: out };
+  }
+  if (s.startsWith('select bill_id, created_at from "printjobs"')) {
+    const statuses = (params[3] as string[]) ?? [];
+    const floor = params[4] ? Date.parse(str(params[4])) : null;
+    return {
+      rows: store.printJobs
+        .filter((j) => j.kind === str(params[2]) && statuses.includes(j.status))
+        .filter((j) => floor === null || Date.parse(j.created_at) >= floor)
+        .map((j) => ({ bill_id: j.bill_id, created_at: new Date(j.created_at) })),
+    };
+  }
 
   // --- MoveTableParty / MoveOrderToTable: the locked two-row read ----------
   if (s.includes('from "tables"') && s.includes("order by id") && s.includes("coalesce(is_virtual, false) as is_virtual")) {
@@ -399,6 +571,74 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     };
   }
 
+  // --- MoveBillItem (client item 4): the source orders WITH their stage and
+  //     bark time, the lines coming off them, and the destination's new order.
+  if (s.includes('select id, food, status, barked_at from "orders"')) {
+    const tableId = str(params[2]);
+    return {
+      rows: store.orders
+        .filter((o) => o.table_id === tableId && isActive(o.status))
+        .sort((a, b) => (a.created_at < b.created_at ? -1 : 1))
+        .map((o) => ({ id: o.id, food: JSON.stringify(o.food), status: o.status, barked_at: o.barked_at ?? null })),
+    };
+  }
+  if (s.startsWith('select id from "tables" where res_id = $1 and outlet_id = $2 and lower(table_name) = lower($3)')) {
+    const name = str(params[2]).trim().toLowerCase();
+    const t = store.tables.find((x) => !x.is_deleted && x.table_name.trim().toLowerCase() === name);
+    return { rows: t ? [{ id: t.id }] : [] };
+  }
+  if (s.startsWith('update "orders" set food = $4::json, status = 5 where')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    if (o) { o.food = JSON.parse(str(params[3])) as Record<string, unknown>; o.status = "5"; }
+    return { rows: [] };
+  }
+  if (s.startsWith('update "orders" set food = $4::json where')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    if (o) { o.food = JSON.parse(str(params[3])) as Record<string, unknown>; }
+    return { rows: [] };
+  }
+  if (s.startsWith('insert into "orders" (id, created_at, res_id, outlet_id, food, table_id, status, barked_at)')) {
+    store.orders.push({
+      id: str(params[0]),
+      table_id: str(params[4]),
+      food: JSON.parse(str(params[3])) as Record<string, unknown>,
+      status: str(params[5]),
+      created_at: NOW,
+      barked_at: params[6] === null || params[6] === undefined ? null : str(params[6]),
+    });
+    return { rows: [] };
+  }
+  if (s.includes("from information_schema.columns") && s.includes("column_name = 'barked_at'")) {
+    return { rows: [{ column_name: "barked_at" }] };
+  }
+
+  // --- BarkOrder, on the order a dish move made (client item 4): the status
+  //     guard, and the compare-and-set read that answers already_barked.
+  if (s.startsWith('select status from "orders" where id = $1')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    return { rows: o ? [{ status: o.status }] : [] };
+  }
+  if (s.startsWith('select status, barked_at, food from "orders" where id = $1')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    return { rows: o ? [{ status: o.status, barked_at: o.barked_at ?? null, food: JSON.stringify(o.food) }] : [] };
+  }
+
+  // --- MoveOrderToTable: the destination's running orders (its guest), and the
+  //     moved ticket's placing instant (the previous party's prints it retires).
+  if (s.startsWith('select food from "orders" where res_id = $1 and outlet_id = $2 and table_id = $3')) {
+    const tableId = str(params[2]);
+    return {
+      rows: store.orders
+        .filter((o) => o.table_id === tableId && isActive(o.status))
+        .sort((a, b) => (a.created_at < b.created_at ? -1 : 1))
+        .map((o) => ({ food: JSON.stringify(o.food) })),
+    };
+  }
+  if (s.startsWith('select created_at from "orders" where id = $1')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    return { rows: o ? [{ created_at: new Date(o.created_at) }] : [] };
+  }
+
   // --- one order, by id ----------------------------------------------------
   if (s.includes('select id, table_id, food, status from "orders"')) {
     const o = store.orders.find((r) => r.id === str(params[0]));
@@ -407,10 +647,15 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
 
   // --- move an order -------------------------------------------------------
   if (s.startsWith('update "orders" set table_id =')) {
+    // Every door that changes an order's table stamps when it arrived, by the
+    // database's clock (foodWithTableSinceSql).
+    if (!s.includes("jsonb_set(($2)::jsonb, '{table_since}', to_jsonb(now()), true)::json")) {
+      throw new Error("table_move_fixtures: a table change must stamp food.table_since with now()");
+    }
     const o = store.orders.find((r) => r.id === str(params[2]));
     if (o) {
       o.table_id = str(params[0]);
-      o.food = JSON.parse(str(params[1])) as Record<string, unknown>;
+      o.food = { ...(JSON.parse(str(params[1])) as Record<string, unknown>), table_since: NOW };
     }
     return { rows: [] };
   }
@@ -474,6 +719,14 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     store.sessions = store.sessions.filter((x) => x.id !== str(params[0]));
     return { rows: [] };
   }
+  if (s.startsWith('update "tablesessions" set seated_at = least(seated_at, $2::timestamptz) where table_id = $1 and left_at is null')) {
+    for (const x of store.sessions) {
+      if (x.table_id !== str(params[0]) || x.left_at !== null) {continue;}
+      const floor = new Date(str(params[1])).toISOString();
+      if (floor < x.seated_at) {x.seated_at = floor;}
+    }
+    return { rows: [] };
+  }
   if (s.startsWith('update "tablesessions" set table_id =')) {
     const row = store.sessions.find((x) => x.id === str(params[0]));
     if (row) {
@@ -503,6 +756,9 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     } else if (s.includes("set is_occupied = true, num_covers = greatest(1, coalesce(num_covers, 1))")) {
       row.is_occupied = true;
       row.num_covers = Math.max(1, row.num_covers ?? 1);
+    } else if (s.startsWith('update "tables" set is_occupied = true where id = $1')) {
+      // MoveBillItem seats the destination and leaves its covers alone.
+      row.is_occupied = true;
     } else {
       throw new Error(`table_move_fixtures: unmodelled "Tables" update: ${sql.slice(0, 160)}`);
     }

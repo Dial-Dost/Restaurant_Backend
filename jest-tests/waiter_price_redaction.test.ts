@@ -34,8 +34,24 @@
 //                         most-polled endpoint in the product
 //
 // Redacting any two of those and leaving the third is redacting nothing.
+//
+// ============================================================================
+// AND THE SETTLED BILLS, WHICH ARE REFUSED RATHER THAN REDACTED
+// ============================================================================
+//   GET /bills/closed      every settled bill's total, tender and (client item 8)
+//                          who it was for
+//   GET /bills/closed/:id  one bill in full: priced lines, tax ladder, refund,
+//                          (client item 7) the guest's address; it also answers
+//                          an OPEN bill by id
+//
+// Both are gated on View Bill, which the core waiter role holds. Nothing a
+// waiter works from reads them, and a settled bill with its money taken out is
+// not a bill. So a waiter-only session gets a 403 and the reader is never asked.
+// See refuseWaiterSettledBillRead in routes/bills.ts.
 
 import { describe, test, expect, beforeAll, beforeEach } from "@jest/globals";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { makeFakeApp, type FakeApp } from "./platform_fixtures";
 import {
   REDACTED_BILL_MONEY_KEYS,
@@ -44,11 +60,14 @@ import {
   REDACTED_TABLE_ROW_MONEY_KEYS,
   hidesPrices,
   redactBillForTable,
+  redactMoveAnswer,
 } from "../price_scope";
 
 const GetBillForTable = jest.fn();
 const GetTables = jest.fn();
 const GetOrders = jest.fn();
+const ListClosedBills = jest.fn();
+const GetClosedBill = jest.fn();
 
 jest.mock("../database_supabase", () => ({
   __esModule: true,
@@ -56,6 +75,8 @@ jest.mock("../database_supabase", () => ({
   GetBillForTable: (...a: unknown[]) => GetBillForTable(...a),
   GetTables: (...a: unknown[]) => GetTables(...a),
   GetOrders: (...a: unknown[]) => GetOrders(...a),
+  ListClosedBills: (...a: unknown[]) => ListClosedBills(...a),
+  GetClosedBill: (...a: unknown[]) => GetClosedBill(...a),
   // routes/tables.ts's other imports.
   AddTable: jest.fn(), DeleteTableSection: jest.fn(), GetSeatingSuggestion: jest.fn(),
   GetTableReleaseImpact: jest.fn(), GetTableSections: jest.fn(), GetTableStatus: jest.fn(),
@@ -172,7 +193,24 @@ const BILL = () => ({
   print_count: 1,
   bill_printed_at: "2026-09-11T13:40:00.000Z",
   printed_at: "2026-09-11T13:40:00.000Z",
+  // Migration 055 (client items 1 and 2): what the latest paper said. The
+  // digest is the data layer's and never leaves the route; the printed total
+  // is money.
+  last_paper_digest: null as string | null,
+  printed_total: 4600 as number | null,
+  printed_as: null as string | null,
 });
+
+/**
+ * What GET /bill-for-table answers a senior with: the bill as the data layer
+ * read it, less the paper fingerprint it keeps to itself, plus `paper_stale`
+ * (null here: this print's content was never recorded).
+ */
+const SENIOR_BILL = () => {
+  const { last_paper_digest: _digest, ...rest } = BILL();
+  void _digest;
+  return { ...rest, paper_stale: null };
+};
 
 const TABLE_ROWS = () => [
   {
@@ -196,6 +234,39 @@ const ORDER_ROWS = () => [
   },
 ];
 
+/** GET /bills/closed as a senior reads it: one settled bill, with every money key it carries. */
+const CLOSED_PAGE = () => ({
+  bills: [
+    {
+      id: "bill-9", bill_no: "B-9", status: 3, table_id: "tbl-1", table_name: "T7", covers: 4,
+      grand_total: 4600, tax_total: 200, taxable_base: 4000, service_charge: 400, service_charge_percent: 10,
+      round_off: 0, payment_method: "UPI", payment_splits: [{ method: "UPI", amount: 4600 }],
+      discount_type: null, discount_value: 0, discount_amount: null, coupon_code: null,
+      customer_gstin: "29ABCDE1234F1Z5", customer: "Acme Pvt Ltd",
+      refunded: false, refund_amount: 0, apc: 1150,
+      created_at: "2026-09-11T12:00:00.000Z", settled_at: "2026-09-11T14:20:00.000Z",
+    },
+  ],
+  total: 1,
+  limit: 200,
+  offset: 0,
+  has_more: false,
+});
+
+/** GET /bills/closed/:id as a senior reads it. */
+const CLOSED_DETAIL = () => ({
+  ...CLOSED_PAGE().bills[0],
+  items: [{ name: "Paneer Tikka", price: 400, quantity: 10, note: null, line_total: 4000 }],
+  orders: [{ id: "ord-1", created_at: "2026-09-11T12:04:00.000Z", status: "7", subtotal: 4000, item_count: 10 }],
+  items_subtotal: 4000,
+  discount_amount: 0,
+  discounted_subtotal: 4000,
+  taxes: [{ name: "CGST", percentage: 2.5, amount: 100 }, { name: "SGST", percentage: 2.5, amount: 100 }],
+  target_apc: 900,
+  customer_address: "4th Floor, Prestige Tower\n12 Residency Road",
+  nc_total: 0,
+});
+
 let harness: FakeApp;
 
 beforeAll(async () => {
@@ -203,25 +274,35 @@ beforeAll(async () => {
   process.env.SUPABASE_DIRECT_URL = process.env.SUPABASE_DIRECT_URL || "postgres://fixture:fixture@localhost:5432/fixture";
   const tables = await import("../routes/tables");
   const orders = await import("../routes/orders");
+  const bills = await import("../routes/bills");
   harness = makeFakeApp();
   tables.registerTableRoutes(harness.app as never);
   tables.registerTableListRoute(harness.app as never);
   orders.registerOrderRoutes(harness.app as never);
+  bills.registerBillRoutes(harness.app as never);
 });
 
 beforeEach(() => {
   GetBillForTable.mockReset();
   GetTables.mockReset();
   GetOrders.mockReset();
+  ListClosedBills.mockReset();
+  GetClosedBill.mockReset();
   GetBillForTable.mockResolvedValue(BILL());
   GetTables.mockResolvedValue(TABLE_ROWS());
   GetOrders.mockResolvedValue(ORDER_ROWS());
+  ListClosedBills.mockResolvedValue(CLOSED_PAGE());
+  GetClosedBill.mockResolvedValue(CLOSED_DETAIL());
 });
 
 const billFor = (auth: unknown) =>
   harness.call("GET", "/bill-for-table", { query: { table_name: "T7" }, auth: auth as never });
 const tablesFor = (auth: unknown) => harness.call("GET", "/get-tables", { auth: auth as never });
 const ordersFor = (auth: unknown) => harness.call("GET", "/orders", { auth: auth as never });
+const settledFor = (auth: unknown) =>
+  harness.call("GET", "/bills/closed", { query: { restaurantId: RES, limit: "200" }, auth: auth as never });
+const settledBillFor = (auth: unknown) =>
+  harness.call("GET", "/bills/closed/:id", { params: { id: "bill-9" }, query: { restaurantId: RES }, auth: auth as never });
 
 const asMap = (body: unknown): Record<string, unknown> => body as Record<string, unknown>;
 const items = (body: unknown): Record<string, unknown>[] =>
@@ -320,12 +401,23 @@ describe("nobody senior loses a figure they have today", () => {
       expect(r.status).toBe(200);
       // The strongest form of "a manager response must be byte-identical": the
       // whole object, not a spot check of the fields this change touched.
-      expect(r.body).toEqual(BILL());
+      expect(r.body).toEqual(SENIOR_BILL());
     });
 
     test(`${who} still sees the floor grid's totals and the orders feed's`, async () => {
       expect((await tablesFor(auth)).body).toEqual(TABLE_ROWS());
       expect((await ordersFor(auth)).body).toEqual(ORDER_ROWS());
+    });
+
+    test(`${who} still reads the settled bills, list and detail, key for key`, async () => {
+      const list = await settledFor(auth);
+      expect(list.status).toBe(200);
+      expect(list.body).toEqual(CLOSED_PAGE());
+      expect(list.headers["X-Total-Count"]).toBe("1");
+      const one = await settledBillFor(auth);
+      expect(one.status).toBe(200);
+      expect(one.body).toEqual(CLOSED_DETAIL());
+      expect(GetClosedBill).toHaveBeenCalledWith(RES, "bill-9");
     });
   }
 });
@@ -396,6 +488,51 @@ describe("a table's bill is the sum of its orders — GET /orders", () => {
 });
 
 // ---------------------------------------------------------------------------
+describe("a settled bill is nothing but money — GET /bills/closed and /bills/closed/:id", () => {
+  const waiters = [
+    ["a waiter", WAITER],
+    ["a waiter with a custom role (the csrorganics shape)", WAITER_WITH_CUSTOM_ROLE],
+    ["a waiter behind the 'employee' placeholder", WAITER_WITH_PLACEHOLDER],
+  ] as const;
+
+  for (const [who, auth] of waiters) {
+    test(`${who} is refused the LIST, and the reader is never asked`, async () => {
+      // The waiter's OWN token holds View Bill, which is all this route asked
+      // for. It used to return every settled bill's grand_total, taxable_base
+      // and tender, and (since client item 8) the guest's name on each row.
+      const r = await settledFor(auth);
+      expect(r.status).toBe(403);
+      expect(ListClosedBills).not.toHaveBeenCalled();
+      const body = asMap(r.body);
+      expect(body.error).toBe("Forbidden");
+      // The refusal says who can look a bill up instead, from the one role list.
+      expect(body.details).toBe(
+        "Settled bills are not shown to a waiter. One of these roles can look one up: admin, manager, cashier, captain.");
+      expect(body.allowed_roles).toEqual(["admin", "manager", "cashier", "captain"]);
+      // Nothing of the page rides along with the refusal.
+      expect(Object.keys(body).sort()).toEqual(["allowed_roles", "details", "error"]);
+      expect(r.headers["X-Total-Count"]).toBeUndefined();
+    });
+
+    test(`${who} is refused ONE bill too: its prices, its address, and an open bill by id`, async () => {
+      const r = await settledBillFor(auth);
+      expect(r.status).toBe(403);
+      expect(GetClosedBill).not.toHaveBeenCalled();
+      expect(Object.keys(asMap(r.body)).sort()).toEqual(["allowed_roles", "details", "error"]);
+      expect(JSON.stringify(r.body)).not.toMatch(/4600|Prestige|Paneer|Acme/);
+    });
+  }
+
+  test("the permission gate still answers first: without View Bill it is that gate's own 403", async () => {
+    const r = await settledFor(identity("waiter", ["waiter"], [TABLES, ADD_ORDERS]));
+    expect(r.status).toBe(403);
+    expect(asMap(r.body).error).toBe("Action not permitted");
+    expect(asMap(r.body).requiredPermission).toBe(VIEW_BILL);
+    expect(ListClosedBills).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe("the rule itself, without a route in the way", () => {
   test("hidesPrices IS isWaiterOnly — an admin wildcard is never scoped", () => {
     // One rule, one place. If this ever stops delegating, the button the client
@@ -435,5 +572,58 @@ describe("the rule itself, without a route in the way", () => {
     expect(out.tip_total).toBe(200);
     expect(REDACTED_BILL_MONEY_KEYS).not.toContain("tip_total");
     expect(REDACTED_ITEM_MONEY_KEYS).toEqual(["price"]);
+  });
+});
+
+// CLIENT ITEM 4, REVIEW FINDING — the two move answers carried money: the
+// destination's running bill (`total_amt`) and the removal summary's prices.
+describe("a move's answer, as a waiter-only session is told it", () => {
+  test("the amounts go; the dishes, the ticket and the print outcome stay", () => {
+    const answer = {
+      success: true, order_id: "o-65", from_table: "12", to_table: "15", total_amt: 3763,
+      items: [{ name: "KUNAFA BIRDS NEST", variation: null, quantity: 1 }],
+      kot_no: 65, print: { printed: true, kot_no: 65, tickets: 1 },
+      reprint_needed: true, reprint_table: "15", reprint_message: "Reprint 15",
+    };
+    const out = redactMoveAnswer(answer);
+    expect(out).not.toHaveProperty("total_amt");
+    const { total_amt: _gone, ...rest } = answer;
+    expect(out).toEqual(rest);
+    // A COPY: the audit line is written from the same object.
+    expect(answer.total_amt).toBe(3763);
+  });
+
+  test("the dish move's summary loses its price, its value and each line's price", () => {
+    const answer = {
+      success: true,
+      moved: { name: "Dal", price: 200, quantity: 2, value: 440, lines: [{ name: "Dal", price: 200, quantity: 1 }, { name: "Dal", price: 240, quantity: 1 }] },
+      items: [{ name: "Dal", variation: "Half", quantity: 2 }],
+      destinations: [{ order_id: "d", source_order_id: "s", kot_nos: [7], items: [] }],
+      prints: [{ order_id: "d", printed: true, kot_no: 7, tickets: 1 }],
+      kot_nos: [7],
+    };
+    const out = redactMoveAnswer(answer);
+    expect(out.moved).toEqual({ name: "Dal", quantity: 2, lines: [{ name: "Dal", quantity: 1 }, { name: "Dal", quantity: 1 }] });
+    expect(out.items).toBe(answer.items);
+    expect(out.destinations).toBe(answer.destinations);
+    expect(answer.moved.price).toBe(200);
+    expect(answer.moved.lines[0]!.price).toBe(200);
+  });
+
+  test("anything that is not an answer object passes through", () => {
+    expect(redactMoveAnswer(null)).toBeNull();
+    expect(redactMoveAnswer([1])).toEqual([1]);
+    expect(redactMoveAnswer("x")).toBe("x");
+    expect(redactMoveAnswer({ moved: null })).toEqual({ moved: null });
+  });
+
+  test("both move routes redact through it for a waiter-only session (the wiring)", () => {
+    const read = (rel: string): string => readFileSync(join(__dirname, "..", rel), "utf8");
+    const tables = read("routes/tables.ts");
+    const moveOrder = tables.slice(tables.indexOf('app.post("/tables/move-order"'));
+    expect(moveOrder.slice(0, moveOrder.indexOf("\napp."))).toMatch(/res\.json\(hidesPrices\(req\.auth\) \? redactMoveAnswer\(answer\) : answer\)/);
+    const bills = read("routes/bills.ts");
+    const moveItem = bills.slice(bills.indexOf("app.post('/bills/move-item'"));
+    expect(moveItem.slice(0, moveItem.indexOf("\napp."))).toMatch(/res\.json\(hidesPrices\(req\.auth\) \? redactMoveAnswer\(answer\) : answer\)/);
   });
 });

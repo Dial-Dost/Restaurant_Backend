@@ -196,7 +196,7 @@ app.post("/auth/employee-login", rateLimit("login", 15, 60_000), validate, async
 			// ships the ANSWER and not the uuid to test against.
 			scope: {
 				...sessionRoleScope({ role: user.role, role_all: user.role_all, actions: Array.from(user.actions_set) }),
-				...sessionCapabilities({ actions: Array.from(user.actions_set) }),
+				...sessionCapabilities({ role: user.role, role_all: user.role_all, actions: Array.from(user.actions_set) }),
 			},
 			features: plan.features,
 			limits: plan.limits,
@@ -256,7 +256,9 @@ app.get("/auth/me", async (req: Request, res: Response) => {
 			// Recomputed here for the same reason waiter_only is: a permission
 			// granted or revoked while the app was closed must be in force at the
 			// next launch, not at the next password prompt.
-			...sessionCapabilities({ actions: session.actions }),
+			// `role` and `role_all` ride along for cancel_kot, the one flag the
+			// client asked to follow the role rather than the grant.
+			...sessionCapabilities({ role: session.role, role_all: session.role_all, actions: session.actions }),
 		},
 		features: session.features ?? {},
 		limits: session.limits ?? {},

@@ -159,8 +159,10 @@ describe("the slot is resolved once and reaches every report", () => {
   test("misContext resolves the slot, cuts the instants by it and appends its clamps", () => {
     const fn = body("misContext");
     expect(fn).toContain("resolveTimeSlot(q, presets)");
-    expect(fn).toContain("...slotWindowInstants(resolved, tz, slot)");
-    expect(fn).toContain("[...resolved.clamped, ...clamped]");
+    // Through the one converter that also knows the trading day (see below).
+    expect(fn).toContain("...misWindowInstants(resolved, tz, slot, shift)");
+    expect(fn).toContain("const allClamps = [...clamped, ...dayClamps];");
+    expect(fn).toContain("[...resolved.clamped, ...allClamps]");
     // The presets are read only when something names one.
     expect(fn).toContain('timeSlotNeedsPresets(q) || misBucketMode(q) === "session"');
     expect(fn).toContain("loadReportTimeSlots(context.res_id)");
@@ -177,18 +179,19 @@ describe("the slot is resolved once and reaches every report", () => {
 
   test("the Executive Summary's previous period is cut by the same slot", () => {
     const fn = body("GetExecutiveSummaryReport");
-    expect(fn).toContain("slotWindowInstants(prev, mc.tz, mc.window.slot)");
+    expect(fn).toContain("misWindowInstants(prev, mc.tz, mc.window.slot, mc.window.day_shift_min)");
     expect(fn).toContain("slot: mc.window.slot,");
-    expect(fn).not.toContain("windowInstants(prev, mc.tz)");
+    expect(fn).not.toContain(" windowInstants(prev, mc.tz)");
+    expect(fn).not.toContain("slotWindowInstants(prev");
   });
 
   test("the Sales Summary buckets on the service day, with the explicit order", () => {
     const fn = body("GetSalesSummaryReport");
-    expect(fn).toContain("composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot)");
+    expect(fn).toContain("composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot, mc.window.day_shift_min)");
     expect(fn).toContain("misNcByBucket(ncRows, mc, bucket)");
     expect(fn).toContain("misNcCompletedSeries(misSeries(bills, bucket, mc.presets), ncByBucket, timeBucketOrder(bucket, mc.presets))");
-    expect(body("misNcByBucket")).toContain("serviceDayKey(clock.key, minute, mc.window.slot)");
-    expect(body("composeMisBills")).toContain("serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot)");
+    expect(body("misNcByBucket")).toContain("serviceDayKey(clock.key, minute, mc.window.slot, mc.window.day_shift_min)");
+    expect(body("composeMisBills")).toContain("serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot, dayShift)");
   });
 
   test("the preset column is created at runtime with the other settings columns", () => {
@@ -208,8 +211,10 @@ describe("the HTTP surface passes it on", () => {
     expect(fn).toContain("time_to: req.query.time_to,");
   });
 
-  test("the CSV name carries the slot suffix", () => {
-    expect(functionChunks(ROUTES_SRC).get("misFilename")).toContain("${timeSlotFileSuffix(meta.time_slot)}.csv");
+  test("the CSV name carries the slot suffix (and, client item 9, the trading-day one after it)", () => {
+    const fn = functionChunks(ROUTES_SRC).get("misFilename") ?? "";
+    expect(fn).toContain("${timeSlotFileSuffix(meta.time_slot)}${close}.csv");
+    expect(fn).toContain("const close = meta.window.day_close ? tradingDayFileSuffix(parseDayClose(meta.window.day_close)) : \"\";");
   });
 
   test("the catalogue advertises the slot for every report it lists, and the four cuts", () => {

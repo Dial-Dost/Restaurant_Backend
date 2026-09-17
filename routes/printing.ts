@@ -149,6 +149,7 @@ import {
 } from "../database_supabase.js";
 import { buildKotBase64 } from "../escpos.js";
 import { logger } from "../observability.js";
+import { TEST_SLIP_REPLAY_MIN, testSlipBillId } from "../print_jobs.js";
 import { dispatchPrintJob } from "../print_routing.js";
 import { getIo, outletDeviceSockets, realtimeAdapterReady, syncDeviceRooms } from "../realtime.js";
 import { PERM_SETTINGS, enforcePermission, extractOutletId, extractRestaurantId, log_audit, validate, validateAction } from "./_shared.js";
@@ -1185,8 +1186,11 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 			if (!ticket) { continue; }
 			// bill_id is TEXT and is the handle a human uses to find this job in the
 			// queue afterwards. Stamped with the clock so two presses are two rows —
-			// a test slip is deliberately not deduplicated.
-			const billId = `print-test-${stamp.getTime()}-${role.replace(/[^a-z0-9:]+/gi, "-")}`;
+			// a test slip is deliberately not deduplicated here. It is also how
+			// replay recognises a test slip, so it is built in print_jobs.ts, next
+			// to the rule that reads it (testSlipRole): a slip no device took is
+			// replayed for TEST_SLIP_REPLAY_MIN only, newest per role.
+			const billId = testSlipBillId(stamp, role);
 			const dispatched = await dispatchPrintJob(ctx.restaurantId, {
 				outlet_id: ctx.outletId,
 				bill_id: billId,
@@ -1209,7 +1213,10 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 				outlet_id: ctx.outletId, roles: results.map((r) => r.role),
 			});
 		} catch (err) { logger.warn({ err }, "log_audit print_test failed"); }
-		res.json({ results, skipped });
+		// replayMinutes: how long a slip that NO device printed stays in the queue
+		// for a device that connects late. Both Settings cards say it, because
+		// "the kitchen PC is off" is the likeliest reason anybody presses this.
+		res.json({ results, skipped, replayMinutes: TEST_SLIP_REPLAY_MIN() });
 	} catch (err) {
 		logger.error({ err }, "print_test_failed");
 		res.status(500).json({ error: "Unable to send a test slip" });

@@ -5,22 +5,25 @@
  *     npx tsx scripts/build_kot_glyph_atlas.ts
  *
  * WHY A COMMITTED TABLE AND NOT A FONT AT RUNTIME. The kitchen docket has to be
- * set in a proportional Arial-metric face (the client's reference docket is one;
- * ESC/POS built-in fonts are monospaced and cannot match it), and a printer
- * takes a proportional face only as a raster. The three ways to get that raster
- * are: parse a .ttf in the server (a font file in the image, a parser on the hot
+ * set in a proportional face (the client's reference docket is Tahoma; ESC/POS
+ * built-in fonts are monospaced and cannot match it), and a printer takes a
+ * proportional face only as a raster. The three ways to get that raster are:
+ * parse a .ttf in the server (a font file in the image, a parser on the hot
  * path), ask the OS or sharp to draw text (fontconfig in the image, and bytes
  * that differ between a Windows laptop and Debian), or pre-render every glyph
  * once and commit the result. Only the third gives byte-identical dockets
  * everywhere, which is what lets escpos.test.ts pin a docket's sha256 at all.
  *
  * So this script and scripts/kot_ttf.ts read the .ttf files under
- * scripts/kot_fonts — which .dockerignore keeps out of the image — and the
+ * scripts/kot_fonts, which .dockerignore keeps out of the image, and the
  * runtime imports nothing but the generated table.
  *
- * THE FONT is Liberation Sans 2.1.5, SIL Open Font License 1.1: metric
- * compatible with Arial and redistributable, which Arial itself is not. The
- * licence travels with it in scripts/kot_fonts/LICENSE.
+ * THE FONT is DejaVu Sans Condensed 2.37 under the Bitstream Vera licence
+ * (DejaVu's changes are public domain): of the faces we may ship, the one whose
+ * proportions measure closest to the reference docket's Tahoma. The fit, and
+ * why not Tahoma itself, is in scripts/kot_atlas_build.ts; the licence travels
+ * with the files in scripts/kot_fonts/LICENSE and with the table in its header.
+ * It replaced Liberation Sans (Arial metrics) in 2.0.2.
  *
  * RE-RUN IT WHEN, and only when, the face, the sizes or the rasterizer change.
  * jest-tests/kot_raster.test.ts rebuilds the atlas in memory and fails if the

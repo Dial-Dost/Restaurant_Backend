@@ -16,14 +16,15 @@ import { z } from "zod";
 import { destroyAllForEmployee } from "../auth/sessions.js";
 import { getStore } from "../auth/store.js";
 import type { CustomerDemographics } from "../database_supabase.js";
-import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, EnsureNextPartyTable, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetOrderingPrintGuard, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
+import { AddAuditLogEntry, AddCustomer, AddEmailToCustomer, AddNotification, Audit_log_category, EnsureNextPartyTable, GetCustomerId, GetDueBookingReminders, GetEmployeeDetailsFromEmpID, GetMessagingConfig, GetOrderKotNumbers, GetOrderingPrintGuard, GetRestaurantLogoRaw, GetRestaurantAccountStatus, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetSuperadminEmployeeId, GetTableFeedbackContext, ListBillingCounters, MarkBookingReminderSent, RecordOutboundMessage, SetOrderCustomerId, UpdateCustomerDemographics, sanitizeTimezone, withTenant, zonedWallToUtc } from "../database_supabase.js";
 import { rasterizeBillLogo, type BillLogoRaster } from "../bill_logo.js";
 import { logger } from "../observability.js";
 import { MOBILE_10_ERROR, normalizeMobile10, normalizeOptionalMobile10 } from "../phone_validation.js";
 import type { ReportWindowQuery } from "../report_window.js";
 import { emitRestaurant } from "../realtime.js";
-import { BILL_PRINTED_STATUS, billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill, reprintNeededMessage, type BillPrintedWrite } from "../next_party.js";
-import { isWaiterOnly } from "../role_scope.js";
+import { BILL_PRINTED_STATUS, addToPrintedBillFlag, billPrintedRefusal, nextPartyAfterPrintMessage, orderOnPrintedBillVerdict, orderUpsertAddsToBill, printedBillAdditionAudit, reprintNeededMessage, type BillPrintedWrite } from "../next_party.js";
+import { isWaiterOnly, mayCancelKot, type RoleScopeInput } from "../role_scope.js";
+import { cancelNeedsSeniorBody, type CancelNeedsSeniorError } from "../cancel_authority.js";
 
 
 // Python feedback service URL. Use container host (PY_SERVER_URL) when set,
@@ -471,9 +472,41 @@ export interface SessionCapabilities {
 	 * commonest action of a rush behind the rarest one of a quiet morning.
 	 */
 	edit_menu: boolean;
+	/**
+	 * POST /tables/move — "Move table" (client items 1 and 2). The occupancy
+	 * uuid the route is gated on, which the core waiter role has always held:
+	 * the server let a waiter move a party and the web offered it, while the
+	 * app hid it behind a senior-only scope. The app now asks this.
+	 */
+	move_table: boolean;
+	/**
+	 * POST /tables/move-order — "Move an order". The "Add Orders" uuid the route
+	 * is gated on, so a waiter holds it too; the clients still keep this control
+	 * off a waiter-only floor (the client asked for Move table only), and this
+	 * answer is what a role WITHOUT it is refused by.
+	 */
+	move_order: boolean;
+	/**
+	 * "Cancel KOT" on the table sheet and the kitchen board, and "Cancelled" on
+	 * the app's stage sheet — cancelling food the kitchen has been told about.
+	 * PATCH /orders/:id/status -> Cancelled, POST /orders/:id/void, the POST
+	 * /orders upsert and DELETE /orders/:id/items/:itemId all refuse a
+	 * waiter-only login with `cancel_needs_senior` (client item 3; see
+	 * mayCancelTicketed in role_scope.ts).
+	 *
+	 * THE ONE FLAG THAT READS THE ROLE, and it is why this function now takes
+	 * `role` and `role_all`: the client asked for the WAITER to lose it, so a
+	 * waiter-only login is false even when a tenant has granted it "Void Orders
+	 * With Reason". Everyone else holds it exactly when they hold one of the two
+	 * cancel routes' gates.
+	 *
+	 * A Pending order's "Decline" does NOT read this flag: that order was never
+	 * ticketed, and the server lets a waiter decline it.
+	 */
+	cancel_kot: boolean;
 }
 
-export function sessionCapabilities(input: { actions?: unknown }): SessionCapabilities {
+export function sessionCapabilities(input: RoleScopeInput): SessionCapabilities {
 	const actions = Array.isArray(input.actions) ? input.actions.map((a) => String(a).trim()) : [];
 	const set = new Set(actions);
 	const has = (id: string): boolean => set.has("*") || set.has(id);
@@ -491,7 +524,55 @@ export function sessionCapabilities(input: { actions?: unknown }): SessionCapabi
 		view_roles: has("17ba6407-b703-4403-ab59-13235966053f"), // Get Roles
 		manage_roles: has("c0135d18-68b4-45e9-9b51-849158df6efd"), // Create/Update Role
 		edit_menu: has("ed800655-b937-44ba-a7ca-7458295886c9"), // Edit Menu
+		move_table: has("090ea8d4-e348-4e1b-9723-11131a73a085"), // Table Occupied (POST /tables/move)
+		move_order: has("4ad474d4-5230-449c-874f-6a238b833bca"), // Add Orders (POST /tables/move-order)
+		cancel_kot: mayCancelKot(input) && (has(PERM_VOID_ORDER) || has("4ad474d4-5230-449c-874f-6a238b833bca")), // Add Orders
 	};
+}
+
+/**
+ * CLIENT ITEM 3 — ANSWER A REFUSED CANCEL. Every door that can cancel a
+ * ticketed order (PATCH /orders/:id/status, POST /orders, POST
+ * /orders/:id/void, DELETE /orders/:id/items/:itemId, DELETE /orders/:id)
+ * turns the data layer's CancelNeedsSeniorError into the same 403 through
+ * here, so a client cannot tell which route refused it and a change to the
+ * words lands on all five.
+ * PATCH /orders/:id/status also answers a waiter's move of a ticket BACK to
+ * Pending this way (act "rewind"): that move was the first half of a cancel.
+ *
+ * AUDITED EVEN THOUGH NOTHING HAPPENED, as the refused release and the refused
+ * reprint are: a waiter trying to cancel a docket is exactly the event a
+ * manager wants to see at the end of a service. The sentence starts "REFUSED",
+ * so neither classifyBillEdit nor the Void KOT join reads it as a cancel.
+ *
+ * The KOT number is read here, after the refusal and outside any transaction,
+ * because it is only for the sentence: an unreadable one says "This order".
+ * Best-effort throughout — a failed audit or read never turns the 403 into a 500.
+ */
+export async function refuseTicketedCancel(req: Request, res: Response, err: CancelNeedsSeniorError): Promise<void> {
+	const restaurantId = extractRestaurantId(req);
+	let kotNos: number[] = [];
+	if (restaurantId) {
+		try {
+			kotNos = (await GetOrderKotNumbers(restaurantId, [err.order_id])).get(err.order_id) ?? [];
+		} catch {/* the sentence degrades to "This order" */}
+	}
+	const handle = kotNos.length > 0 ? ` (${kotNos.map((n) => `KOT-${String(n)}`).join(", ")})` : "";
+	// A rewind to Pending is named for what it is: not a cancel, but the step
+	// that would have let the next request pass as a decline.
+	const what = err.act === "remove_line"
+		? "removal of a dish from order"
+		: err.act === "rewind" ? "move back to Pending of order" : "cancel of order";
+	const cannot = err.act === "rewind" ? "put it back to Pending" : "cancel it";
+	try {
+		await log_audit(
+			req, "4ad474d4-5230-449c-874f-6a238b833bca",
+			`REFUSED ${what} ${err.order_id}${handle} — it has gone to the kitchen and a waiter cannot ${cannot}`,
+			Audit_log_category.Orders,
+			{ order_id: err.order_id, refused: true, code: err.code, act: err.act, kot_nos: kotNos },
+		);
+	} catch {/* a failed audit write must not turn a 403 into a 500 */}
+	res.status(err.status).json(cancelNeedsSeniorBody(err, kotNos));
 }
 
 // Revoke every live session of an employee. Must run whenever the identity or
@@ -514,6 +595,32 @@ export async function revokeEmployeeSessions(employeeId: string, reason: string)
 export function callerHasPermission(req: Request, actionId: string): boolean {
 	const actions = req.auth?.actions ?? [];
 	return actions.includes(actionId) || actions.includes("*");
+}
+
+// May this caller ask for the ALL-OUTLETS aggregate? The same roles the
+// X-Outlet-Id "all" sentinel is honoured for (rawRequestedOutletId): admin and
+// manager. Used where a WRITE stores that scope (a report schedule, a Send
+// now) — the sentinel itself is refused on writes, so the scope travels in the
+// body and is authorised here instead.
+export function callerMayUseAllOutlets(req: Request): boolean {
+	const auth = req.auth;
+	if (!auth) {return false;}
+	return [auth.role, ...(auth.role_all ?? [])].map((r) => String(r).toLowerCase()).some((r) => r === "admin" || r === "manager");
+}
+
+// A per-TENANT (or per-employee) limit on the shared session store, for a
+// route whose abuse is not an IP's: report email sends, test emails, address
+// book edits. Fails OPEN on a store error, like rateLimit — the durable limits
+// counted from the database still hold.
+export async function tenantRateLimited(key: string, maxPerWindow: number, windowSeconds: number): Promise<boolean> {
+	try {
+		const store = await getStore();
+		const count = await store.incr(`rl:${key}`, Math.max(1, Math.round(windowSeconds)));
+		return count > maxPerWindow;
+	} catch (err) {
+		logger.warn({ err: (err as any)?.message ?? err }, "tenant_rate_limit_store_error (failing open)");
+		return false;
+	}
 }
 
 // Non-responding admin check (for guards that decide their own error).
@@ -1334,15 +1441,18 @@ function announceNextPartyTable(
  * THE MONEY GUARD ON NEW ORDERS — an order added to a table whose CURRENT
  * seating's bill has already been printed.
  *
- *   * a waiter-only login or a QR guest -> 423 { code: "bill_printed", table,
- *     next_party_table } and NOTHING is written. The sentence says where the
- *     new party's order goes, and that a same-party addition is a manager's
- *     (who can add it and reprint). 423 and not 409: see BILL_PRINTED_STATUS
- *     for what a 409 did to the till's offline queue;
- *   * a senior role -> allowed; the caller spreads reprintNeededFields(guard)
- *     into its answer (`reprint_needed: true` and the sentence both clients
- *     show beside a Reprint action), because the paper in the guest's hand is
- *     now short;
+ *   * a QR guest, or a waiter-only login whose write did NOT carry
+ *     `add_to_printed_bill: true` -> 423 { code: "bill_printed", table,
+ *     next_party_table, add_to_printed_action } and NOTHING is written. The
+ *     sentence says where the new party's order goes, and that a same-party
+ *     addition is a manager's (the words every 2.0.0/2.0.1 till shows, and
+ *     still true for them). 423 and not 409: see BILL_PRINTED_STATUS for what
+ *     a 409 did to the till's offline queue;
+ *   * a senior role, or a waiter who confirmed (2.0.2's "Add to printed bill")
+ *     -> allowed; the caller spreads reprintNeededFields(guard) into its answer
+ *     (`reprint_needed: true` and the sentence both clients show beside a
+ *     Reprint action), because the paper in the guest's hand is now short, and
+ *     files noteAdditionToPrintedBill once its write has landed;
  *   * no print, no print state, a takeaway, or migration 053 absent -> allowed,
  *     exactly as before this guard existed.
  *
@@ -1376,7 +1486,18 @@ function announceNextPartyTable(
  */
 export type PrintedBillGuard =
 	| { refused: true }
-	| { refused: false; reprintNeeded: boolean; table: string | null; parentTable: string | null };
+	| {
+		refused: false;
+		reprintNeeded: boolean;
+		table: string | null;
+		parentTable: string | null;
+		/** How many times the bill had been printed when this write was let through (0 = not printed). */
+		printCount?: number;
+		/** What was written: an order, a merge or a moved item. */
+		write?: BillPrintedWrite;
+		/** The write carried add_to_printed_bill: true. */
+		confirmed?: boolean;
+	};
 
 export async function refuseOrderOnPrintedBill(
 	req: Request,
@@ -1391,10 +1512,20 @@ export async function refuseOrderOnPrintedBill(
 		write?: BillPrintedWrite;
 		/** The res UUID for the `table:added` emit, when restaurantId is a slug. */
 		emitRestaurantId?: string;
+		/**
+		 * The write said `add_to_printed_bill: true`. Omitted, the staff route's
+		 * own body is read (addToPrintedBillFlag); a guest is refused whatever it
+		 * says, so the QR route never needs to pass it. Honoured for an ORDER
+		 * only: a merge or a moved item is a manager's act on every client (no
+		 * client offers the confirm for one), so a waiter's body that says so
+		 * anyway is still refused.
+		 */
+		confirmedPrinted?: boolean;
 	},
 ): Promise<PrintedBillGuard> {
 	const { restaurantId, tableName, guest, upsert } = target;
 	const write = target.write ?? "order";
+	const confirmedPrinted = write === "order" && (target.confirmedPrinted ?? addToPrintedBillFlag(req.body));
 	const allow = { refused: false as const, reprintNeeded: false, table: null, parentTable: null };
 	let state: Awaited<ReturnType<typeof GetOrderingPrintGuard>> = null;
 	try {
@@ -1406,10 +1537,13 @@ export async function refuseOrderOnPrintedBill(
 	if (!state) {return allow;}
 	const waiterOnly = !guest && isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions });
 	const addsToBill = upsert ? orderUpsertAddsToBill(upsert.items, state.existing_lines ?? null) : true;
-	const verdict = orderOnPrintedBillVerdict({ printCount: state.print_count, waiterOnly, guest, addsToBill });
+	const verdict = orderOnPrintedBillVerdict({ printCount: state.print_count, waiterOnly, guest, addsToBill, confirmedPrinted });
 	if (verdict === "allow") {return allow;}
 	if (verdict === "reprint_needed") {
-		return { refused: false, reprintNeeded: true, table: state.table, parentTable: state.parent_table };
+		return {
+			refused: false, reprintNeeded: true, table: state.table, parentTable: state.parent_table,
+			printCount: state.print_count, write, confirmed: confirmedPrinted,
+		};
 	}
 
 	// The seat is made here too, not only at print time: a print whose seat
@@ -1419,7 +1553,7 @@ export async function refuseOrderOnPrintedBill(
 	const seat = write === "order" ? await EnsureNextPartyTable(restaurantId, state.table) : null;
 	if (seat?.created) {announceNextPartyTable(target.emitRestaurantId ?? restaurantId, seat);}
 	if (!guest) {
-		const what = write === "merge" ? "a merge into" : write === "move" ? "an item moved onto" : "an order on";
+		const what = write === "merge" ? "a merge into" : write === "move" ? "a move onto" : write === "move_off" ? "a move off" : "an order on";
 		try {
 			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
 				`REFUSED ${what} table ${state.table} — its bill was already printed ${String(state.print_count)} time(s)`,
@@ -1439,10 +1573,48 @@ export async function refuseOrderOnPrintedBill(
 }
 
 /**
- * What a route adds to its answer when a senior role has just put more on a
- * printed bill: `reprint_needed` and the sentence both clients show beside a
- * Reprint action (reprintNeededMessage). Nothing at all otherwise, so every
- * other answer is byte-for-byte what it was.
+ * THE AUDIT LINE FOR AN ADDITION THAT LANDED ON A PRINTED BILL — filed by every
+ * door refuseOrderOnPrintedBill guards, AFTER its write, so a line exists only
+ * for food that is really on the bill. The night cashier reads these to find
+ * the bills that grew after their paper was handed over; `confirmed` says
+ * whether the person pressed "Add to printed bill" (a waiter always has) or
+ * was a senior role adding as they always could. Nothing for any other write.
+ * Never throws: the write has committed.
+ */
+export async function noteAdditionToPrintedBill(
+	req: Request,
+	guard: PrintedBillGuard,
+	/**
+	 * Which door and which order, for the Bill Edit report. `door: "new_order"`
+	 * (POST /orders) is the one addition no other audit line classifies — the
+	 * item, merge and move doors each file their own — so classifyBillEdit keys
+	 * on it. Absent keys are simply not written.
+	 */
+	extra?: { orderId?: string | null; door?: string | null },
+): Promise<void> {
+	if (guard.refused || !guard.reprintNeeded || !guard.table) {return;}
+	const write = guard.write ?? "order";
+	const orderId = String(extra?.orderId ?? "").trim();
+	const door = String(extra?.door ?? "").trim();
+	try {
+		await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
+			printedBillAdditionAudit({ table: guard.table, printCount: guard.printCount ?? 0, write }),
+			write === "order" ? Audit_log_category.Orders : Audit_log_category.Bill,
+			{
+				table: guard.table, after_print: true, write, print_count: guard.printCount ?? 0,
+				confirmed: guard.confirmed === true,
+				waiter_only: isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions }),
+				...(orderId ? { order_id: orderId } : {}),
+				...(door ? { door } : {}),
+			});
+	} catch {/* a failed audit write must not turn a landed order into a 500 */}
+}
+
+/**
+ * What a route adds to its answer when a senior role — or a waiter who
+ * confirmed — has just put more on a printed bill: `reprint_needed` and the
+ * sentence both clients show beside a Reprint action (reprintNeededMessage).
+ * Nothing at all otherwise, so every other answer is byte-for-byte what it was.
  */
 export function reprintNeededFields(
 	guard: PrintedBillGuard,
@@ -1453,5 +1625,32 @@ export function reprintNeededFields(
 		reprint_message: reprintNeededMessage(guard.table, guard.parentTable),
 		// The table whose paper is short: the one a Reprint action prints.
 		reprint_table: guard.table,
+	};
+}
+
+/**
+ * CLIENT ITEM 4 — A MOVE CHANGES TWO BILLS. A senior role moving an order or a
+ * dish between two printed tables leaves BOTH papers wrong: the source's
+ * charges for food that has left, the destination's is short. The first table
+ * that needs a reprint rides in the ordinary `reprint_*` fields (so an
+ * installed app that reads only those still offers one), and when both do, the
+ * second rides in `also_reprint_*` with the same shape. Nothing at all when
+ * neither paper was printed.
+ */
+export function moveReprintFields(
+	destination: PrintedBillGuard,
+	source: PrintedBillGuard,
+): {
+	reprint_needed?: true; reprint_message?: string; reprint_table?: string;
+	also_reprint_needed?: true; also_reprint_message?: string; also_reprint_table?: string;
+} {
+	const needs = [reprintNeededFields(destination), reprintNeededFields(source)].filter((f) => f.reprint_needed === true);
+	const first = needs[0];
+	const second = needs[1];
+	return {
+		...(first ?? {}),
+		...(second
+			? { also_reprint_needed: true as const, also_reprint_message: second.reprint_message, also_reprint_table: second.reprint_table }
+			: {}),
 	};
 }

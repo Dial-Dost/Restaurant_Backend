@@ -49,7 +49,13 @@ import {
 // was only ever asserted as SOURCE TEXT and `if (false && …)` still contains the
 // text. A rule tested by reading the code is not tested. So the write itself is
 // observed: `insert into "ReportSchedules"` either ran or it did not.
-const dbfx: { inserts: { channel: unknown; recipients: unknown }[] } = { inserts: [] };
+const dbfx: {
+  inserts: { channel: unknown; recipients: unknown; report_keys?: unknown; window_mode?: unknown }[];
+  /** What the runtime's probe finds for migrations 056-058. */
+  ready: boolean;
+  /** The restaurant's address book: [email, status]. */
+  book: [string, "active" | "suppressed"][];
+} = { inserts: [], ready: false, book: [] };
 
 jest.mock("pg", () => {
   const query = async (sql: string, params?: unknown[]): Promise<{ rows: unknown[] }> => {
@@ -62,9 +68,18 @@ jest.mock("pg", () => {
         restaurant_main_office_add: null, restaurant_logo_url: null, timezone: null,
       }] };
     }
+    if (/to_regclass\('"ReportEmailRecipients"'\) is not null as m056/i.test(q)) {
+      return { rows: [{ m056: dbfx.ready, m057: dbfx.ready, m058: dbfx.ready }] };
+    }
+    if (/^select email_norm, status from "ReportEmailRecipients"/i.test(q)) {
+      return { rows: dbfx.book.map(([email, status]) => ({ email_norm: email.toLowerCase(), status })) };
+    }
+    if (/from "ReportSchedules" where res_id = \$1 and outlet_id = \$2 and channel = 'email'/i.test(q)) {
+      return { rows: [{ n: 0 }] };
+    }
     if (/^insert into "ReportSchedules"/i.test(q)) {
       const p2 = (params ?? []) as unknown[];
-      dbfx.inserts.push({ channel: p2[9], recipients: p2[10] });
+      dbfx.inserts.push({ channel: p2[9], recipients: p2[10], report_keys: p2[14], window_mode: p2[16] });
       return { rows: [{
         id: "33333333-3333-3333-3333-333333333333",
         outlet_id: "22222222-2222-2222-2222-222222222222",
@@ -100,7 +115,12 @@ beforeAll(async () => {
   db = await import("../database_supabase");
 });
 
-beforeEach(() => { dbfx.inserts = []; });
+beforeEach(() => {
+  dbfx.inserts = [];
+  dbfx.ready = false;
+  dbfx.book = [];
+  db.resetReportEmailSchemaCache();
+});
 
 /** A transport whose sendMail never settles — the failure the bound exists for. */
 const hangingTransport = (): TransportFactory => () => ({
@@ -348,21 +368,41 @@ describe("the sweep sends before it marks delivered, and the form can reach it",
     throw new Error(`readSource could not find ${relative} from ${process.cwd()}`);
   }
 
+  // Since item 9 the sweep sends ONE message per address (sendReportMessage),
+  // from runBundle; the three assertions below follow it there.
+  const bundleBody = (): string => {
+    const src = readSource("report_schedules.ts").replace(/\r\n/g, "\n");
+    const start = src.indexOf("async function runBundle(");
+    const end = src.indexOf("\nasync function runReportFor(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return src.slice(start, end);
+  };
+
   test("report_schedules.ts imports the sender and calls it", () => {
     const src = readSource("report_schedules.ts");
     expect(src).toMatch(/from "\.\/mailer\.js"/);
-    expect(src).toMatch(/await sendMail\(\{/);
+    expect(bundleBody()).toMatch(/const one = await sendReportMessage\(\{/);
   });
 
-  test("THE ORDER: the send is awaited BEFORE the row is marked delivered", () => {
+  test("THE ORDER: 'sending' commits, THEN the send, THEN the row is marked delivered", () => {
     // A row that says 'delivered' for mail that never left is the same defect as
     // a print job that acked paper nobody printed — and that one shipped here.
-    const src = readSource("report_schedules.ts");
-    const send = src.indexOf("await sendMail({");
-    const mark = src.indexOf("MarkReportDelivered(resId, {");
-    expect(send).toBeGreaterThan(-1);
-    expect(mark).toBeGreaterThan(-1);
-    expect(send).toBeLessThan(mark);
+    const body = bundleBody();
+    const sending = body.indexOf("MarkReportDeliverySending(resId, p.delivery_id, attempts, transport.kind, proposed)");
+    const send = body.indexOf("await sendReportMessage({");
+    const recorded = body.indexOf("await record(addr, \"delivered\")");
+    const mark = body.lastIndexOf("MarkReportDelivered(resId, {");
+    expect(sending).toBeGreaterThan(-1);
+    expect(send).toBeGreaterThan(sending);
+    expect(recorded).toBeGreaterThan(send);
+    expect(mark).toBeGreaterThan(recorded);
+    // The inbox branch marks delivered BEFORE any of that — and returns.
+    const inbox = body.indexOf("if (p.channel === \"inbox\") {");
+    const inboxEnd = body.indexOf("return { accepted: 0, refused: 0, skipped: 0, maybeDuplicate: false };");
+    expect(inbox).toBeGreaterThan(-1);
+    expect(inboxEnd).toBeGreaterThan(inbox);
+    expect(inboxEnd).toBeLessThan(sending);
   });
 
   test("the send happens OUTSIDE withTenant — no pooled client across an SMTP round trip", () => {
@@ -370,30 +410,44 @@ describe("the sweep sends before it marks delivered, and the form can reach it",
     // this project produced a full standstill once already, so this is a real
     // property and not a style note.
     //
-    // Asserted structurally rather than by indentation: the send IS legitimately
-    // nested (inside `if (p.channel === "email")`), so "is it indented less than
-    // the render" is the wrong question and passed for the wrong reason when it
-    // was tried. The right question is whether the withTenant that renders the
-    // artifact has CLOSED before the send begins.
-    const src = readSource("report_schedules.ts");
-    const body = src.slice(src.indexOf("async function runOccurrence"));
-    const open = body.indexOf("const artifact = await withTenant(ctx, async () => {");
-    const send = body.indexOf("await sendMail({");
-    expect(open).toBeGreaterThan(-1);
-    expect(send).toBeGreaterThan(open);
-
-    // The callback's closing line, at the statement indent the opening sits on.
-    const between = body.slice(open, send);
-    expect(between).toMatch(/\n {4}\}\);/);
-
-    // …and nothing reopens one between that close and the send.
-    const afterClose = between.slice(between.search(/\n {4}\}\);/));
-    expect(afterClose).not.toMatch(/withTenant\(/);
+    // Asserted structurally: EVERY withTenant opened in runBundle before the send
+    // has CLOSED before it — its parentheses balance before the send begins.
+    // Since item 9 there are several (the render, 'sending', the book check, the
+    // per-address outcome, the cap count); none may still be open.
+    const body = bundleBody();
+    const send = body.indexOf("await sendReportMessage({");
+    expect(send).toBeGreaterThan(-1);
+    let opened = 0;
+    for (let at = body.indexOf("withTenant("); at !== -1 && at < send; at = body.indexOf("withTenant(", at + 1)) {
+      opened += 1;
+      let depth = 0;
+      let close = -1;
+      for (let i = at + "withTenant".length; i < body.length; i += 1) {
+        if (body[i] === "(") { depth += 1; }
+        else if (body[i] === ")") { depth -= 1; if (depth === 0) { close = i; break; } }
+      }
+      expect(close).toBeGreaterThan(at);
+      expect(close).toBeLessThan(send);
+    }
+    expect(opened).toBeGreaterThan(3);
   });
 
-  test("the schedule's recipients reach the sender", () => {
-    const src = readSource("report_schedules.ts");
-    expect(src).toMatch(/normalizeRecipients\(p\.recipients\)/);
+  test("the 2.0.1 inbox path still renders inside its own transaction, closed before the bell", () => {
+    const src = readSource("report_schedules.ts").replace(/\r\n/g, "\n");
+    const body = src.slice(src.indexOf("async function runLegacyInbox("), src.indexOf("async function runBundle("));
+    const open = body.indexOf("const artifact = await withTenant(ctx, async () => {");
+    const deliver = body.indexOf("DeliverReportToInbox(resId, {");
+    expect(open).toBeGreaterThan(-1);
+    expect(deliver).toBeGreaterThan(open);
+    // The callback's closing line, at the statement indent the opening sits on.
+    const between = body.slice(open, deliver);
+    expect(between).toMatch(/\n {2}\}\);/);
+  });
+
+  test("the schedule's recipients reach the sender, one address per message", () => {
+    const body = bundleBody();
+    expect(body).toMatch(/for \(const addr of normalizeRecipients\(p\.recipients\)\) \{/);
+    expect(body).toMatch(/to: \[addr\],/);
   });
 
   test("'email' is a storable channel, because something now delivers it", () => {
@@ -416,17 +470,83 @@ describe("the sweep sends before it marks delivered, and the form can reach it",
     expect(String((err as Error)?.message)).toMatch(/in-app inbox/i);
   });
 
-  test("with a recipient it is written, and the addresses are the cleaned ones", async () => {
+  test("since item 9, an email schedule on a database without 056-058 is refused — nothing written", async () => {
+    // Addresses are CHOSEN from the restaurant's address book (migration 056);
+    // until it exists there is nothing to choose from, and the refusal says the
+    // database is behind rather than pretending the address was wrong.
+    const err = await db.CreateReportSchedule(RES_ID, {
+      name: "daily sales", report_key: "sales", channel: "email", recipients: ["owner@gaia.test"],
+    }).then(() => null, (e: unknown) => e);
+    expect(db.isReportEmailSchemaPending(err)).toBe(true);
+    expect(dbfx.inserts).toHaveLength(0);
+  });
+
+  test("with 056-058 in place, the addresses must be in the book — and are stored trimmed, de-duplicated", async () => {
+    dbfx.ready = true;
+    dbfx.book = [["Owner@Gaia.test", "active"], ["accounts@gaia.test", "active"]];
     const created = await db.CreateReportSchedule(RES_ID, {
       name: "daily sales", report_key: "sales", channel: "email",
-      recipients: [" Owner@Gaia.test ", "owner@gaia.test", "bad", "accounts@gaia.test"],
+      recipients: [" Owner@Gaia.test ", "owner@gaia.test", "accounts@gaia.test"],
     });
     expect(dbfx.inserts).toHaveLength(1);
     expect(dbfx.inserts[0]).toMatchObject({
       channel: "email",
       recipients: ["Owner@Gaia.test", "accounts@gaia.test"],
+      report_keys: ["sales"],
     });
     expect(created.recipients).toEqual(["Owner@Gaia.test", "accounts@gaia.test"]);
+  });
+
+  test("an address that is NOT in the book is refused by name — never silently dropped", async () => {
+    dbfx.ready = true;
+    dbfx.book = [["owner@gaia.test", "active"]];
+    const err = await db.CreateReportSchedule(RES_ID, {
+      name: "daily sales", report_key: "sales", channel: "email",
+      recipients: ["owner@gaia.test", "stranger@elsewhere.test"],
+    }).then(() => null, (e: unknown) => e);
+    expect(db.isReportEmailRequestError(err)).toBe(true);
+    expect(String((err as Error).message)).toMatch(/stranger@elsewhere\.test is not in this restaurant's address book/);
+    expect(dbfx.inserts).toHaveLength(0);
+  });
+
+  test("a paused (suppressed) address is refused too, and eleven are refused rather than cut to ten", async () => {
+    dbfx.ready = true;
+    dbfx.book = [["owner@gaia.test", "suppressed"]];
+    await expect(db.CreateReportSchedule(RES_ID, {
+      name: "x", report_key: "sales", channel: "email", recipients: ["owner@gaia.test"],
+    })).rejects.toThrow(/paused in the address book/);
+    const many = Array.from({ length: 11 }, (_v, i) => `p${String(i)}@x.test`);
+    dbfx.book = many.map((e) => [e, "active"]);
+    await expect(db.CreateReportSchedule(RES_ID, {
+      name: "x", report_key: "sales", channel: "email", recipients: many,
+    })).rejects.toThrow(/at most 10/);
+    expect(dbfx.inserts).toHaveLength(0);
+  });
+
+  test("a new daily bundle closes its day at the send time; GST on one is refused, not stored", async () => {
+    dbfx.ready = true;
+    dbfx.book = [["owner@gaia.test", "active"]];
+    await db.CreateReportSchedule(RES_ID, {
+      name: "night pack", channel: "email", recipients: ["owner@gaia.test"],
+      report_keys: ["sales_summary", "settlement_summary"], formats: ["xlsx"], hour_local: 2, minute_local: 0,
+    });
+    expect(dbfx.inserts[0]).toMatchObject({ report_keys: ["sales_summary", "settlement_summary"], window_mode: "trading_day" });
+    await expect(db.CreateReportSchedule(RES_ID, {
+      name: "bad", channel: "inbox", report_keys: ["sales_summary", "gst"], window_mode: "trading_day",
+    })).rejects.toThrow(/GST can only be sent for calendar days/);
+    expect(dbfx.inserts).toHaveLength(1);
+  });
+
+  test("the all-outlets scope is for an admin or a manager only", async () => {
+    dbfx.ready = true;
+    const err = await db.CreateReportSchedule(RES_ID, {
+      name: "group", channel: "inbox", report_keys: ["executive_summary"], outlet_scope: "all",
+    }, undefined, { allowAllOutlets: false }).then(() => null, (e: unknown) => e);
+    expect((err as { status?: number }).status).toBe(403);
+    await db.CreateReportSchedule(RES_ID, {
+      name: "group", channel: "inbox", report_keys: ["executive_summary"], outlet_scope: "all",
+    }, undefined, { allowAllOutlets: true });
+    expect(dbfx.inserts).toHaveLength(1);
   });
 
   test("an INBOX schedule still needs no recipients — nobody loses anything", async () => {

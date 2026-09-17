@@ -3,15 +3,19 @@
  * covers.
  */
 import type { Express, Request, Response } from "express";
-import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetSeatingSuggestion, GetTableReleaseImpact, GetTableSections, GetTableStatus, GetTables, MoveOrderToTable, MoveTableParty, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
+import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetOrderKotContext, GetOrderKotNumbers, GetSeatingSuggestion, GetTableReleaseImpact, GetTableSections, GetTableStatus, GetTables, MoveOrderToTable, MoveTableParty, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
 import { idempotent } from "../idempotency.js";
 import { printKotTableChange } from "../kot_move.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
-import { hidesPrices, redactBillForTable, redactTableList } from "../price_scope.js";
+import { hidesPrices, redactBillForTable, redactMoveAnswer, redactTableList } from "../price_scope.js";
 import { mayReleaseTable } from "../release_authority.js";
 import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
-import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
+// Client items 1 and 2: one fingerprint of the paper, the one the print gate uses.
+import { billPaperStale } from "./bills.js";
+import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractEmployeeUsername, extractRestaurantId, log_audit, moveReprintFields, nextPartyAfterPrint, nextPartyPrintMessage, noteAdditionToPrintedBill, refuseOrderOnPrintedBill, validateAction, type PrintedBillGuard } from "./_shared.js";
+import { voidItemsText } from "../mis_report_math.js";
+import { moveOrderAuditSentence } from "../order_moves.js";
 import { RESERVED_TABLE_NAME_ERROR, isReservedPartyName } from "../next_party.js";
 
 
@@ -854,6 +858,15 @@ app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"
 	The two acts are not interchangeable and the difference is money: a move keeps
 	one party on one bill, a merge puts two parties on one bill.
 
+	A PRINTED PARTY MOVES WITH ITS PAPER (client items 1 and 2 — a waiter moves
+	tables now, orange ones included). The print ledger follows them
+	(MoveTableParty re-addresses its `<name>-<epoch>` jobs), so the destination is
+	orange; and because the destination's number now holds a printed bill, the
+	next guests there get a green seat at once — the same nextPartyAfterPrint a
+	print calls — rather than on the floor read's backfill. `next_party_table`
+	names it. A move into the table's own family ("12" to "12 #2") is refused:
+	they are one table.
+
 	NO idempotent() AND NO OFFLINE QUEUE, deliberately, on both counts:
 
 	  * A REPLAY IS ALREADY SAFE. The precondition this write needs — the source
@@ -882,6 +895,15 @@ app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"),
 
 	try {
 		const result = await MoveTableParty(restaurantId, fromTable, toTable);
+		// The printed party's number needs its green seat (see the header). Never
+		// throws and never fails the move: the party has already moved.
+		const nextPartyTable = result.printed ? await nextPartyAfterPrint(req, restaurantId, result.to_table) : null;
+		// CLIENT ITEM 4 — the tickets that travelled, by the numbers the pass
+		// calls them and by their dishes, in the audit details. Read after the
+		// commit; an unreadable number costs the detail, never the move.
+		const movedKots = await GetOrderKotNumbers(restaurantId, result.moved_order_ids)
+			.then((m) => [...new Set(result.moved_order_ids.flatMap((id) => m.get(id) ?? []))])
+			.catch(() => [] as number[]);
 		// BOTH tables changed, so both floor plans have to. One event naming both
 		// ends rather than two, so a client cannot repaint half a move.
 		try {
@@ -896,12 +918,12 @@ app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"),
 			await log_audit(
 				req,
 				"090ea8d4-e348-4e1b-9723-11131a73a085",
-				`Moved the party at ${result.from_table} to ${result.to_table} (${String(result.covers)} covers, ${String(result.moved_orders)} order${result.moved_orders === 1 ? "" : "s"}, ${result.moved_bill ? "bill carried" : "no bill yet"})`,
+				`Moved the party at ${result.from_table} to ${result.to_table} (${String(result.covers)} covers, ${String(result.moved_orders)} order${result.moved_orders === 1 ? "" : "s"}, ${result.moved_bill ? "bill carried" : "no bill yet"}${result.printed ? `, printed bill carried${result.printed_as ? ` — the paper says ${result.printed_as}` : ""}` : ""})`,
 				Audit_log_category.Tables,
-				result,
+				{ ...result, next_party_table: nextPartyTable, kot_nos: movedKots, items: voidItemsText(result.moved_items) },
 			);
 		} catch (err) { logger.warn({ err }, "log_audit move-table failed"); }
-		res.json(result);
+		res.json({ ...result, next_party_table: nextPartyTable, next_party_message: nextPartyPrintMessage(nextPartyTable) });
 	} catch (error: any) {
 		logger.error({ err: error }, "move_table_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to move the table") });
@@ -935,6 +957,15 @@ app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"),
 	PERMISSION: the order/print gate the KOT reprint route already uses — moving a
 	ticket is the same class of act as reprinting one.
 
+	CLIENT ITEM 4 — WHAT MOVED, BY NAME, AND BOTH BILLS. The answer and the
+	audit line name the KOT and every dish on it ("Moved KOT-65 (KUNAFA BIRDS
+	NEST x1; …) from 12 to 15"), where they used to name a UUID. And a move
+	changes two bills, so both are held to the printed-bill rule BEFORE anything
+	is written: a waiter-only login is refused (423) when either table's bill has
+	been printed — the destination's paper would be short, the source's would
+	charge for food that has left — and a senior role is allowed and told which
+	papers to reprint (moveReprintFields).
+
 	NOT idempotent() AND NOT QUEUEABLE, for the reasons POST /tables/move gives
 	above, plus one of its own: this route PRINTS. A replay stops at "that order
 	is already on this table" before it reaches the printer, so the pass gets one
@@ -951,31 +982,69 @@ app.post("/tables/move-order", validateAction("4ad474d4-5230-449c-874f-6a238b833
 	if (!orderId || !toTable) { res.status(400).json({ error: "order_id and to_table are required" }); return; }
 
 	try {
-		const moved = await MoveOrderToTable(restaurantId, orderId, toTable);
+		// Where the order is now, read before the move so the SOURCE's print
+		// state can be judged. An unknown order skips the source check and meets
+		// MoveOrderToTable's own "Order not found".
+		const before = await GetOrderKotContext(restaurantId, orderId).catch(() => null);
+		const sourceTable = before?.table_name ?? "";
+		const destinationGuard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: toTable, guest: false, write: "move" });
+		if (destinationGuard.refused) {return;}
+		const noGuard: PrintedBillGuard = { refused: false, reprintNeeded: false, table: null, parentTable: null };
+		const sourceGuard = sourceTable && sourceTable.toLowerCase() !== toTable.toLowerCase()
+			? await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: sourceTable, guest: false, write: "move_off" })
+			: noGuard;
+		if (sourceGuard.refused) {return;}
+
+		const moved = await MoveOrderToTable(restaurantId, orderId, toTable, { by: extractEmployeeUsername(req) });
 		const print = await printKotTableChange({
 			restaurantId,
 			orderId: moved.order_id,
 			previousTableId: moved.from_table_id,
 			previousTableName: moved.from_table,
 		});
+		// The number the pass calls this ticket by: the correction's, else the
+		// ones already printed for it.
+		const kotNos = print.kot_no ? [print.kot_no] : moved.kot_nos;
 		try {
 			emitRestaurant(restaurantId, "table:order_moved", {
 				order_id: moved.order_id,
 				from_table: moved.from_table,
 				to_table: moved.to_table,
-				kot_no: print.kot_no,
+				kot_no: print.kot_no ?? kotNos[0] ?? null,
 			});
 		} catch { /* ignore realtime errors */ }
 		try {
 			await log_audit(
 				req,
 				"4ad474d4-5230-449c-874f-6a238b833bca",
-				`Moved order ${moved.order_id} from ${moved.from_table} to ${moved.to_table}${print.printed ? ` (correction docket KOT-${String(print.kot_no)} printed)` : " (no docket was on the pass)"}`,
+				moveOrderAuditSentence({
+					kotNos,
+					dishes: moved.items,
+					fromTable: moved.from_table,
+					toTable: moved.to_table,
+					printed: print.printed,
+					printReason: print.reason ?? null,
+				}),
 				Audit_log_category.Tables,
-				{ ...moved, print },
+				{
+					...moved, print,
+					// What the Bill Edit report reads (classifyBillEdit's base).
+					table: moved.to_table, from: moved.from_table, to: moved.to_table,
+					item: voidItemsText(moved.items), kot_no: kotNos[0] ?? null,
+				},
 			);
 		} catch (err) { logger.warn({ err }, "log_audit move-order failed"); }
-		res.json({ ...moved, print });
+		// Client items 1-2: every door the printed-bill guard judges files the
+		// addition line after its write. The destination grew; the source did not.
+		await noteAdditionToPrintedBill(req, destinationGuard);
+		// The destination's running total rides MoveOrderToTable's result; a
+		// waiter-only session is not told it (redactMoveAnswer).
+		const answer = {
+			...moved, print,
+			kot_no: kotNos[0] ?? null,
+			...moveReprintFields(destinationGuard, sourceGuard),
+		};
+		res.json(hidesPrices(req.auth) ? redactMoveAnswer(answer) : answer);
 	} catch (error: any) {
 		logger.error({ err: error }, "move_order_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to move that order") });
@@ -1155,7 +1224,16 @@ app.get("/bill-for-table", validateAction("98b10bde-802d-4a5b-a726-53a826424f79"
 		//
 		// A manager, cashier, captain or admin takes the `result` branch and gets
 		// a byte-identical response to the one they got before this existed.
-		res.json(hidesPrices(req.auth) ? redactBillForTable(result as unknown as Record<string, unknown>) : result);
+		// CLIENT ITEMS 1 AND 2 — IS THE PAPER THE GUEST IS HOLDING STILL RIGHT?
+		// Asked through the SAME fingerprint the print files and the print gate
+		// compares (currentPaperDigest), and only for a printed table. `true` puts
+		// "Print updated bill" in front of a waiter and the stale-paper warning in
+		// front of whoever settles; null (nothing printed, or printed before 055)
+		// changes nothing. The digest itself is the data layer's and is not sent.
+		const { last_paper_digest: _lastPaperDigest, ...bill } = result;
+		void _lastPaperDigest;
+		const payload = { ...bill, paper_stale: await billPaperStale(restaurantId, tableName, result) };
+		res.json(hidesPrices(req.auth) ? redactBillForTable(payload as unknown as Record<string, unknown>) : payload);
 	} catch (error: any) {
 		logger.error({ err: error }, "get_bill_for_table_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to get bill for table") });

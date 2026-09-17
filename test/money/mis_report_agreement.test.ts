@@ -967,6 +967,28 @@ describe("Bill Edit", () => {
     expect(edits.totals.edits).toBe(2);
   });
 
+  test("an order added to a PRINTED bill (2.0.2) is one row; the other doors' addition lines and 'New order' are not", async () => {
+    const base = standardDb();
+    const at = "2026-06-05T08:10:00.000Z";
+    const printed = { table: "T1", after_print: true, print_count: 1, confirmed: true, waiter_only: true };
+    useFixtureDb(standardDb({
+      audits: [
+        ...base.audits,
+        { id: "p1", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "New order o7 on table T1", details: { order_id: "o7", table: "T1" }, fname: "Jim", lname: "Waiter" },
+        { id: "p2", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "ADDED an order on the printed bill of table T1 (printed 1 time(s))", details: { ...printed, write: "order", order_id: "o7", door: "new_order" }, fname: "Jim", lname: "Waiter" },
+        { id: "p3", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "ADDED an order on the printed bill of table T1 (printed 1 time(s))", details: { ...printed, write: "order" }, fname: "Jim", lname: "Waiter" },
+        { id: "p4", created_at: at, action_id: CATCH_ALL, action_name: "Add Orders", reason: "ADDED a merge into the printed bill of table T1 (printed 1 time(s))", details: { ...printed, write: "merge" }, fname: "Asha", lname: "Rao" },
+      ],
+    }));
+    const edits = await db.GetBillEditReport(RID, { ...W, limit: 500 });
+    const added = edits.rows.filter((r) => r.kind === "printed_bill_order_added");
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({ order_id: "o7", table_name: "T1", by: "Jim Waiter", action: "Order added after the bill was printed" });
+    // The two edits the standard fixture already reports, plus this one.
+    expect(edits.totals.edits).toBe(3);
+    expect(edits.totals.by_kind).toEqual(expect.arrayContaining([{ kind: "printed_bill_order_added", label: "Order added after the bill was printed", count: 1 }]));
+  });
+
   test("the actor and the item ride along, and no before/after amount is invented", async () => {
     const edits = await db.GetBillEditReport(RID, { ...W, limit: 500 });
     const removal = edits.rows.find((r) => r.kind === "item_removed");
@@ -1990,6 +2012,29 @@ describe("Void KOT: a ticket emptied from the bill", () => {
     expect(voids.totals.voids).toBe(1);
     expect(voids.totals.value).toBe(3000);
     expectRowsAddUp(voids);
+  });
+
+  // CLIENT ITEM 4 — the dish now arrives WHOLE on its own order, and the source
+  // records what left it (moved_items). Neither may make the food count twice:
+  // Item Wise reads each order's `items`, and the source's list of moved lines
+  // is read by no report at all. (The move is dated inside the window, as a real
+  // one is on the day it happens — Item Wise buckets by when the order was made.)
+  test("Move item: Item Wise counts the moved dish once, at the same money, before and after", async () => {
+    useFixtureDb(floorDb());
+    const before = await db.GetItemWiseReport(RID, { ...W, limit: 500 });
+    jest.useFakeTimers({ doNotFake: ["nextTick", "setImmediate", "setTimeout", "setInterval", "queueMicrotask", "clearTimeout", "clearInterval", "clearImmediate"] });
+    jest.setSystemTime(new Date("2026-06-10T13:30:00.000Z"));
+    try {
+      await db.MoveBillItem(RID, "31A", "31", "Puchka", 200);
+    } finally {
+      jest.useRealTimers();
+    }
+    const after = await db.GetItemWiseReport(RID, { ...W, limit: 500 });
+    const puchka = (r: typeof before) => r.rows.find((x) => x.name === "Puchka");
+    expect(puchka(before)).toMatchObject({ qty: 1, gross_amount: 200 });
+    expect(puchka(after)).toMatchObject({ qty: puchka(before)?.qty, gross_amount: puchka(before)?.gross_amount });
+    expect(after.totals.gross_amount).toBe(before.totals.gross_amount);
+    expect(after.totals.qty).toBe(before.totals.qty);
   });
 
   test("a ticket that lost one dish to Remove and its last to Move still reports the removed dish", async () => {

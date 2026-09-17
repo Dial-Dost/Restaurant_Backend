@@ -6,23 +6,27 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState, ClosedBillDetail, OpenBillChargeConfig } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMovableLineSources, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable, RecordBillPrintPaper, CopyBillPrintPaper } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type ReceiptOptions, type SplitReceiptPart } from "../escpos.js";
 import { ncSettlementPrintJobId } from "../bill_print_state.js";
+import { billLinesDigest, billPaperDigest, billPrintedClock, paperStale, replacesBillLine, type BillPaperRecord } from "../bill_paper_digest.js";
 import { isNcSettleMethod } from "../payment_methods.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
+import { CUSTOMER_ADDRESS_ERROR, CustomerAddressInvalidError, CustomerAddressSchemaPendingError, normalizeCustomerAddress } from "../customer_address.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
+import { printKotItemMove, resolveMoveSourceKots, type KotMoveOutcome } from "../kot_move.js";
+import { moveItemAuditSentence } from "../order_moves.js";
 import { kotStamp } from "../kot_numbers.js";
 import { logger } from "../observability.js";
-import { hidesPrices, redactOpenBillPage } from "../price_scope.js";
+import { hidesPrices, redactMoveAnswer, redactOpenBillPage } from "../price_scope.js";
 import { ackPrintJob, isSchemaMissing, warnSchemaMissing } from "../print_jobs.js";
 import { dispatchPrintJob } from "../print_routing.js";
 import { emitRestaurant } from "../realtime.js";
 import { ROLES_OUTRANKING_WAITER, isWaiterOnly } from "../role_scope.js";
 import { uploadScreenshot } from "../storage_bucket_supabase.js";
 import { isDiscountAuthorityError } from "../discount_authority.js";
-import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, nextPartyAfterPrint, nextPartyPrintMessage, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
+import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, buildLogoEscPos, callerIsAdmin, clampLimit, counterIdFrom, enforceAdmin, enforcePermission, enforceRoles, enforceSettleAuthority, extractEmployeeId, extractEmployeeUsername, extractOutletId, extractRestaurantId, feedbackUrlForTable, fetchWithTimeout, log_audit, moveReprintFields, nextPartyAfterPrint, nextPartyPrintMessage, noteAdditionToPrintedBill, refuseOrderOnPrintedBill, reprintNeededFields, requireCounter, validate, validateAction, validateBody } from "./_shared.js";
 
 
 // Body schemas for the money/bill-mutation routes. `.passthrough()` keeps every
@@ -251,6 +255,45 @@ function looksLikeImage(buf: Buffer): boolean {
 	return false;
 }
 
+/*
+	C4 — A SETTLED BILL IS NOTHING BUT MONEY, SO A WAITER-ONLY SESSION IS
+	REFUSED IT.
+
+	View Bill is in the core waiter role because it is how a waiter reads their
+	table's RUNNING bill, and that read is redacted (price_scope.ts). The two
+	settled-bill reads, GET /bills/closed and GET /bills/closed/:id, were not.
+	A waiter's own token therefore listed every settled bill with its
+	grand_total, taxable_base, service charge and tender — and, since client
+	item 8, who each one was for — and the detail added the priced lines, the tax
+	ladder, the refund and (client item 7) the guest's address. GetClosedBill
+	answers any bill by id, so an OPEN bill's unredacted total was one id away as
+	well.
+
+	REFUSED, NOT REDACTED like /bills/open beside them, for two reasons:
+	  * nothing a waiter works from needs them. The app hides History, Reports
+	    and Accounting from a waiter-only session (RoleScope.hiddenModules) and
+	    the web sends one back to Orders and Tables. The web print page does read
+	    the detail for an order's bill id, but it already falls back to the
+	    claim's priced bill when that read comes back empty, and a waiter's own
+	    print is served from the claim;
+	  * a settled bill with its amounts taken out is not a bill, and the detail
+	    carries money in a dozen keys and four nested lists. A deny-list over
+	    that is one new field away from leaking again.
+
+	Same predicate as every other C4 door (hidesPrices, which IS isWaiterOnly),
+	so a manager, cashier, captain or admin reads exactly what they read before.
+	Returns TRUE when it has already answered 403; the caller must return.
+*/
+function refuseWaiterSettledBillRead(req: Request, res: Response): boolean {
+	if (!hidesPrices(req.auth)) { return false; }
+	res.status(403).json({
+		error: "Forbidden",
+		details: `Settled bills are not shown to a waiter. One of these roles can look one up: ${ROLES_OUTRANKING_WAITER.join(", ")}.`,
+		allowed_roles: ROLES_OUTRANKING_WAITER,
+	});
+	return true;
+}
+
 export function registerBillRoutes(app: Express): void {
 
 app.post("/bills", validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f"), async (req: Request, res: Response) => {
@@ -337,8 +380,9 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 //
 // Both are gated by the existing "View Bill" action (98b10bde…) — the same
 // permission that already lets a role read a table's running bill. No new
-// permission to hand out, and waiters/captains (who now hold it) can look up a
-// bill they just settled.
+// permission to hand out, and a captain (who now holds it) can look up a bill
+// they just settled. A WAITER-ONLY session holds it too, and is refused both —
+// see refuseWaiterSettledBillRead.
 
 // Paged, date-filterable list, newest settled first. Query params:
 //   limit (1-200, default 50), offset, from, to (ISO or YYYY-MM-DD),
@@ -353,6 +397,7 @@ app.post('/bills/replace', validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047"
 app.get('/bills/closed', validateAction("98b10bde-802d-4a5b-a726-53a826424f79"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
+	if (refuseWaiterSettledBillRead(req, res)) {return;}
 	const str = (v: unknown): string | undefined =>
 		typeof v === 'string' && v.trim().length > 0 ? v.trim().slice(0, 200) : undefined;
 	try {
@@ -412,6 +457,7 @@ app.get('/bills/closed/:id', validateAction("98b10bde-802d-4a5b-a726-53a826424f7
 	if (!restaurantId) {return res.status(400).json({ error: 'Missing restaurantId' });}
 	const billId = String(req.params.id ?? '').trim();
 	if (!billId) {return res.status(400).json({ error: 'Missing bill id' });}
+	if (refuseWaiterSettledBillRead(req, res)) {return;}
 	try {
 		const bill = await GetClosedBill(restaurantId, billId);
 		if (!bill) {return res.status(404).json({ error: 'Bill not found' });}
@@ -742,8 +788,15 @@ app.post('/bills/order/:orderId/waiter-confirm-payment', validateAction("2393edd
 		} catch {
 			// ignore realtime failures
 		}
+		// CLIENT ITEMS 1 AND 2 — "SETTLE ANYWAY". The till warned that the paper
+		// the guest is holding is older than the bill and the cashier settled
+		// regardless. Never refused (the drawer books the CURRENT total either
+		// way); recorded, so the night's settle log shows which bills were paid
+		// against paper that did not match them.
+		const staleNote = settledWithStalePaper(req.body);
+		if (staleNote) { extraAudit.settled_with_stale_paper = true; }
 		try {
-			await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", `Waiter confirmed payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, waiter: waiterEmployeeId, payment_method: result.payment_method, ...extraAudit });
+			await log_audit(req, "2393edd7-cdd9-439c-9ff3-d563d5216967", `Waiter confirmed payment for order ${orderId}${staleNote}`, Audit_log_category.Bill, { order_id: orderId, waiter: waiterEmployeeId, payment_method: result.payment_method, ...extraAudit });
 		} catch (err) {
 			logger.warn({ err }, 'log_audit waiter-confirm-payment failed');
 		}
@@ -783,8 +836,9 @@ app.post('/bills/order/:orderId/admin-approve-payment', validateAction("fc57d407
 		} catch {
 			// ignore realtime failures
 		}
+		const staleNote = settledWithStalePaper(req.body);
 		try {
-			await log_audit(req, "fc57d407-4bba-442c-97a2-9e6f3c57f288", `Admin approved payment for order ${orderId}`, Audit_log_category.Bill, { order_id: orderId, admin: adminEmployeeId });
+			await log_audit(req, "fc57d407-4bba-442c-97a2-9e6f3c57f288", `Admin approved payment for order ${orderId}${staleNote}`, Audit_log_category.Bill, { order_id: orderId, admin: adminEmployeeId, ...(staleNote ? { settled_with_stale_paper: true } : {}) });
 		} catch (err) {
 			logger.warn({ err }, 'log_audit admin-approve-payment failed');
 		}
@@ -902,18 +956,29 @@ export async function refuseWaiterBillReprint(
 	req: Request,
 	res: Response,
 	tableName: string,
-	bill: { print_count: number; bill_printed_at: string | null; printed_at: string | null },
+	bill: OpenTableBill,
+	/**
+	 * CLIENT ITEMS 1 AND 2 — the tenant, so the rule can ask whether the paper is
+	 * out of date. A waiter may now add to a printed bill (after saying so), and
+	 * the paper they handed over is then short; the ONE reprint a waiter may make
+	 * is the one that fixes it. Identical content — the second copy C3 exists to
+	 * stop — or content nobody recorded (a print from before migration 055) is
+	 * still a senior's. Omitted, the answer is "unknown": refused, as on 2.0.1.
+	 */
+	restaurantId?: string,
 ): Promise<boolean> {
 	if (!(bill.print_count > 0)) { return false; }
 	if (!isWaiterOnly({ role: req.auth?.role, role_all: req.auth?.role_all, actions: req.auth?.actions })) {
 		return false;
 	}
+	const stale = restaurantId ? await billPaperStale(restaurantId, tableName, bill) : null;
+	if (stale === true) { return false; }
 	try {
 		await log_audit(
 			req, "4ad474d4-5230-449c-874f-6a238b833bca",
 			`REFUSED reprint of table ${tableName}'s bill — already printed ${String(bill.print_count)} time(s); reprints need a senior role`,
 			Audit_log_category.Bill,
-			{ table: tableName, kind: "bill", refused: true, print_count: bill.print_count, first_printed_at: bill.bill_printed_at },
+			{ table: tableName, kind: "bill", refused: true, print_count: bill.print_count, first_printed_at: bill.bill_printed_at, paper_stale: stale },
 		);
 	} catch {/* a failed audit write must not turn a 403 into a 500 */}
 	// THE REFUSAL SAYS WHO CAN DO IT INSTEAD. A waiter handed a blank space
@@ -928,8 +993,20 @@ export async function refuseWaiterBillReprint(
 		bill_printed_at: bill.bill_printed_at,
 		printed_at: bill.printed_at,
 		allowed_roles: ROLES_OUTRANKING_WAITER,
+		// false: the paper still matches the bill. null: nobody can say.
+		paper_stale: stale,
 	});
 	return true;
+}
+
+/**
+ * The audit suffix for a settle the cashier made against out-of-date paper —
+ * "" unless the body said `settled_with_stale_paper: true` (the clients' "Settle
+ * anyway"). Only a literal true counts.
+ */
+function settledWithStalePaper(body: unknown): string {
+	const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+	return b.settled_with_stale_paper === true ? " — settled against an out-of-date printed bill (Settle anyway)" : "";
 }
 
 
@@ -945,10 +1022,25 @@ function customerGstinFromBody(body: Record<string, unknown>): string | null | u
 	return r.ok ? r.value : INVALID_GSTIN;
 }
 
-/** The two GSTIN refusals the data layer can raise, as their HTTP answers. True when it answered. */
+// Client item 7 — `customer_address`, read the same way: ABSENT is undefined
+// (unchanged), null or "" clears it, and a value over the limits is
+// INVALID_ADDRESS, answered 400 before anything is written. Over the limits is
+// refused, never cut — see customer_address.ts.
+const INVALID_ADDRESS = Symbol("invalid_address");
+function customerAddressFromBody(body: Record<string, unknown>): string | null | undefined | typeof INVALID_ADDRESS {
+	if (!Object.prototype.hasOwnProperty.call(body, "customer_address") || body.customer_address === undefined) { return undefined; }
+	const r = normalizeCustomerAddress(body.customer_address);
+	return r.ok ? r.value : INVALID_ADDRESS;
+}
+
+/**
+ * The refusals the data layer can raise for the GSTIN (046) and the address
+ * (054), as their HTTP answers. True when it answered.
+ */
 function sendCustomerGstinError(res: Response, err: unknown): boolean {
 	const name = (err as { name?: unknown } | null)?.name;
-	if (err instanceof CustomerGstinSchemaPendingError || name === "CustomerGstinSchemaPendingError") {
+	if (err instanceof CustomerGstinSchemaPendingError || name === "CustomerGstinSchemaPendingError"
+		|| err instanceof CustomerAddressSchemaPendingError || name === "CustomerAddressSchemaPendingError") {
 		res.status(503).json({ error: (err as Error).message });
 		return true;
 	}
@@ -956,7 +1048,21 @@ function sendCustomerGstinError(res: Response, err: unknown): boolean {
 		res.status(400).json({ error: CUSTOMER_GSTIN_ERROR });
 		return true;
 	}
+	if (err instanceof CustomerAddressInvalidError || name === "CustomerAddressInvalidError") {
+		res.status(400).json({ error: CUSTOMER_ADDRESS_ERROR });
+		return true;
+	}
 	return false;
+}
+
+/**
+ * The audit sentence's tail for an address edit — nothing when it was not sent.
+ * The address itself goes in the entry's details, never in the sentence a
+ * report prints.
+ */
+function addressAuditTail(address: string | null | undefined): string {
+	if (address === undefined) { return ""; }
+	return address ? " (address updated)" : " (address cleared)";
 }
 
 /** The open bill GetBillForTable reads, once a caller has answered the empty table. */
@@ -1059,6 +1165,67 @@ async function openTableBillCharges(
 	return { chargeCfg, waiverRequired, charges };
 }
 
+/**
+ * WHAT THIS BILL'S PAPER WOULD SAY NOW — the fingerprint of the paper
+ * printOpenTableBill would print for it (bill_paper_digest.ts), from the SAME
+ * ladder (openTableBillCharges) and the same lines.
+ *
+ * ONE FUNCTION FOR THE PAPER, THE GATE AND THE SHEET. The print files this
+ * fingerprint beside its job; refuseWaiterBillReprint and GET /bill-for-table's
+ * `paper_stale` compare the one filed against this one. Three callers building
+ * it three ways is how "the gate says stale, the paper says nothing changed"
+ * would happen, and the waiter caught between them is the person the rule is for.
+ */
+export async function currentPaperDigest(restaurantId: string, tableName: string, bill: OpenTableBill): Promise<string> {
+	const { charges } = await openTableBillCharges(restaurantId, tableName, bill, false);
+	return paperDigestOf(bill, charges);
+}
+
+function paperDigestOf(bill: OpenTableBill, charges: ReturnType<typeof computeBillCharges>): string {
+	// The name, GSTIN and address the paper prints (the renderer is handed the same fields).
+	const gstin = bill.customer_gstin;
+	return billPaperDigest({
+		items: bill.items, charges, customerGstin: gstin, customerAddress: bill.customer_address, customerName: bill.customer,
+	});
+}
+
+/**
+ * IS THE PAPER THIS SEATING WAS HANDED STILL RIGHT? true / false, or null when
+ * nothing was printed or the print's content was never recorded. Never throws:
+ * a ladder that cannot be priced is "unknown", which every caller treats as the
+ * 2.0.1 rule.
+ */
+export async function billPaperStale(restaurantId: string, tableName: string, bill: OpenTableBill): Promise<boolean | null> {
+	if (!(bill.print_count > 0) || !bill.last_paper_digest) { return null; }
+	try {
+		return paperStale(await currentPaperDigest(restaurantId, tableName, bill), bill.last_paper_digest);
+	} catch (err) {
+		logger.warn({ err, table: tableName }, "bill_paper_stale_failed (answering unknown)");
+		return null;
+	}
+}
+
+/**
+ * File what a print said beside its job(s). Never throws — RecordBillPrintPaper
+ * does not, and this guards the call itself, because the paper is already out.
+ */
+async function recordPaper(restaurantId: string, jobIds: readonly (string | null | undefined)[], paper: BillPaperRecord): Promise<void> {
+	try {
+		await RecordBillPrintPaper(restaurantId, jobIds, paper);
+	} catch (err) {
+		logger.warn({ err }, "record_bill_print_paper_failed");
+	}
+}
+
+/** The restaurant's zone for a printed clock; the fleet default when it cannot be read. */
+async function restaurantTimezone(restaurantId: string): Promise<string> {
+	try {
+		return (await GetRestaurantSettings(restaurantId))?.timezone || "Asia/Kolkata";
+	} catch {
+		return "Asia/Kolkata";
+	}
+}
+
 /** What printOpenTableBill put on a printer, in the words its callers answer with. */
 export interface OpenTableBillPrint {
 	billId: string;
@@ -1075,6 +1242,11 @@ export interface OpenTableBillPrint {
 	 * nextPartyAfterPrint.
 	 */
 	next_party_table: string | null;
+	/**
+	 * Client items 1 and 2: this print REPLACES an earlier one because the bill
+	 * changed since — the paper carries "** UPDATED BILL **".
+	 */
+	revised: boolean;
 }
 
 /**
@@ -1113,6 +1285,15 @@ export async function printOpenTableBill(
 	const { restaurantId, outletId, tableName, bill, settings, profile, askedWithoutServiceCharge } = target;
 	const kind = "bill" as const;
 	const { chargeCfg, waiverRequired, charges } = await openTableBillCharges(restaurantId, tableName, bill, askedWithoutServiceCharge);
+	// CLIENT ITEMS 1 AND 2 — WHAT THIS PAPER SAYS, and whether it replaces a
+	// paper that said something else. The fingerprint is taken from THIS ladder
+	// (currentPaperDigest builds it the same way), so the gate that let this
+	// print through and the record of what it printed cannot disagree.
+	const paperDigest = paperDigestOf(bill, charges);
+	const revised = bill.print_count > 0 && paperStale(paperDigest, bill.last_paper_digest) === true;
+	const revisedNote = revised
+		? replacesBillLine(billPrintedClock(bill.printed_at, settings.timezone || "Asia/Kolkata"))
+		: null;
 	// Column layout + logo raster width follow the configured paper size
 	// (58mm = 32 cols / 384 dots, 80mm = 48 cols / 576 dots).
 	const is58 = settings.bill_paper_width === "58mm";
@@ -1171,6 +1352,8 @@ export async function printOpenTableBill(
 		total: charges.subtotal,
 		customer: bill.customer,
 		customerGstin: bill.customer_gstin ?? null,
+		// Client item 7 — the guest's address, under the GSTIN (escpos.ts).
+		customerAddress: bill.customer_address ?? null,
 		billNo: bill.bill_no,
 		cashier: cashier || null,
 		// THE DATE LINE, IN THE RESTAURANT'S ZONE ("13/09/26 23:19"). Unset, the
@@ -1212,6 +1395,12 @@ export async function printOpenTableBill(
 		// of this seating's bill prints BEFORE this one — the same number C3
 		// just refused a waiter on — so a first print (0) never carries it.
 		reprint: bill.print_count > 0,
+		// ...UNLESS THE BILL CHANGED SINCE (client items 1 and 2). A copy of a
+		// bill that has grown is a different document: "** UPDATED BILL **" and
+		// "Replaces the bill printed 13:32" take the banner's place, so a guest
+		// holding two papers pays the right one. A senior's identical copy keeps
+		// "** REPRINT **".
+		revisedNote,
 		// THE DISCLAIMER FOLLOWS THE CHARGE, NOT ONE LEG OF IT (G2; F2 root
 		// cause 3). This predicate was `charges.service_charge > 0` — the
 		// restaurant_percent leg alone — so a tenant charging through a tax
@@ -1237,6 +1426,13 @@ export async function printOpenTableBill(
 	const dispatched = await dispatchPrintJob(restaurantId, {
 		outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
 	});
+	// What this paper said, beside its job (migration 055).
+	await recordPaper(restaurantId, [dispatched.jobId], {
+		bill_digest: paperDigest,
+		lines_digest: billLinesDigest(bill.items),
+		bill_grand_total: charges.grand_total,
+		table_name: tableName,
+	});
 	// THE AUDIT LINE SAYS WHAT THE PAPER ACTUALLY SAYS. It used to read "(no
 	// service charge)" off the REQUEST, which is how a print that reduced a
 	// total nobody authorised left a trail claiming it was fine. It now
@@ -1247,7 +1443,12 @@ export async function printOpenTableBill(
 		: waiverRequired
 			? " (asked WITHOUT the service charge; no waiver is recorded, so the charge is ON this bill)"
 			: "";
-	try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null }); } catch {/* ignore */}
+	// An UPDATED bill says so, with the total the guest was holding and the one
+	// they hold now — the pair the night cashier needs.
+	const revisedNoteAudit = revised
+		? ` — UPDATED bill (was ${bill.printed_total === null || bill.printed_total === undefined ? "unknown" : Number(bill.printed_total).toFixed(2)}, now ${charges.grand_total.toFixed(2)})`
+		: "";
+	try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Printed ${kind} for table ${tableName}${revisedNoteAudit}${scNote}`, Audit_log_category.Bill, { table: tableName, kind, no_service_charge: askedWithoutServiceCharge, service_charge_removed: chargeCfg.service_charge_removed, service_charge_waiver_required: waiverRequired, service_charge_waiver_id: chargeCfg.waiver?.id ?? null, ...(revised ? { revised: true, printed_total_before: bill.printed_total ?? null, grand_total: charges.grand_total } : {}) }); } catch {/* ignore */}
 	// CLIENT ITEM 6 — AFTER the paper is dispatched, never before and never
 	// instead: the next party gets a seat because this one has its bill. Any
 	// print, by anyone, opens it; nextPartyAfterPrint never throws.
@@ -1261,6 +1462,7 @@ export async function printOpenTableBill(
 		service_charge_waiver_required: waiverRequired,
 		grand_total: charges.grand_total,
 		next_party_table: nextPartyTable,
+		revised,
 	};
 }
 
@@ -1279,6 +1481,19 @@ export async function claimClientRenderedBillPrint(
 	target: { restaurantId: string; outletId: string; tableName: string; bill: OpenTableBill },
 ) {
 	const { restaurantId, outletId, tableName, bill } = target;
+	// CLIENT ITEMS 1 AND 2: the browser's paper is this bill (`printable_bill`
+	// below), so its fingerprint is this bill's — built as the thermal print
+	// builds it. A fingerprint that cannot be taken files nothing ("unknown").
+	let paper: BillPaperRecord | null = null;
+	let revised = false;
+	try {
+		const { charges } = await openTableBillCharges(restaurantId, tableName, bill, false);
+		const digest = paperDigestOf(bill, charges);
+		paper = { bill_digest: digest, lines_digest: billLinesDigest(bill.items), bill_grand_total: charges.grand_total, table_name: tableName };
+		revised = bill.print_count > 0 && paperStale(digest, bill.last_paper_digest) === true;
+	} catch (err) {
+		logger.warn({ err, table: tableName }, "claim_paper_digest_failed");
+	}
 	// The SAME bill_id shape /print/bill writes, including the
 	// `<table>-<epoch>` fallback for a table with no "Bills" row yet.
 	// bill_print_state.ts matches BOTH shapes and matches the fallback as a
@@ -1302,6 +1517,7 @@ export async function claimClientRenderedBillPrint(
 		if (!isSchemaMissing(err)) { throw err; }
 		warnSchemaMissing("print_bill_claim", err);
 	}
+	if (recorded && paper) { await recordPaper(restaurantId, [recorded.id], paper); }
 
 	// THE AUDIT LINE IS THE ONE /print/bill FILES, under the same Action id
 	// and the same category, worded so a manager scanning the log can see
@@ -1311,9 +1527,9 @@ export async function claimClientRenderedBillPrint(
 	try {
 		await log_audit(
 			req, "4ad474d4-5230-449c-874f-6a238b833bca",
-			`Printed bill for table ${tableName} from the web dashboard (browser print — no thermal copy)`,
+			`Printed bill for table ${tableName} from the web dashboard (browser print — no thermal copy)${revised ? " — UPDATED bill" : ""}`,
 			Audit_log_category.Bill,
-			{ table: tableName, kind: "bill", source: "web_dashboard", claim: true, recorded: recorded !== null, job_id: recorded?.id ?? null },
+			{ table: tableName, kind: "bill", source: "web_dashboard", claim: true, recorded: recorded !== null, job_id: recorded?.id ?? null, ...(revised ? { revised: true, printed_total_before: bill.printed_total ?? null } : {}) },
 		);
 	} catch {/* ignore */}
 
@@ -1345,6 +1561,12 @@ export async function claimClientRenderedBillPrint(
 		// Where the next party at this number sits — see nextPartyAfterPrint.
 		next_party_table: nextPartyTable,
 		next_party_message: nextPartyPrintMessage(nextPartyTable),
+		// Client items 1 and 2: the browser's paper replaces an out-of-date one,
+		// and says so in these words (the thermal print's banner and line).
+		revised,
+		revised_note: revised
+			? replacesBillLine(billPrintedClock(bill.printed_at, await restaurantTimezone(restaurantId)))
+			: null,
 		// THE PRICED BILL, BECAUSE THIS IS THE GUEST'S RECEIPT.
 		//
 		// THE BUG THIS CLOSES, found in a live browser pass: on the web
@@ -1378,8 +1600,23 @@ export async function claimClientRenderedBillPrint(
 		// authorises a print; the ledger is bookkeeping. Withholding the bill
 		// there would leave a waiter unable to produce paper on exactly the
 		// database where nothing else is stopping them.
-		printable_bill: bill,
+		printable_bill: printableBillOf(bill),
 	};
+}
+
+/**
+ * THE BILL A CLAIM HANDS THE BROWSER TO PRINT — the open bill without the
+ * record of the paper that came before it (migration 055). `last_paper_digest`
+ * never leaves the data layer (GET /bill-for-table strips it too), and
+ * `printed_total` is the total on the OLD paper: it is on nobody's receipt, so
+ * C4's exception above (the figures being printed, at the moment they are
+ * printed) does not reach it. The print page reads neither.
+ */
+function printableBillOf(bill: OpenTableBill): Omit<OpenTableBill, "last_paper_digest" | "printed_total"> {
+	const { last_paper_digest: _lastPaperDigest, printed_total: _printedTotal, ...printable } = bill;
+	void _lastPaperDigest;
+	void _printedTotal;
+	return printable;
 }
 
 /**
@@ -1427,6 +1664,8 @@ export function settledBillReceiptOptions(
 		total: bill.items_subtotal,
 		customer: bill.customer,
 		customerGstin: bill.customer_gstin ?? null,
+		// Client item 7 — the guest's address, under the GSTIN (escpos.ts).
+		customerAddress: bill.customer_address ?? null,
 		billNo: bill.bill_no,
 		cashier: bill.created_by ?? null,
 		// The date the bill was RAISED, not today: a reprint is a second copy of
@@ -1483,6 +1722,8 @@ app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9")
 	const outletId = extractOutletId(req);
 	const billId = typeof body.billId === 'string' ? body.billId.trim() : '';
 	const escBase64 = typeof body.escBase64 === 'string' ? body.escBase64 : (typeof body.esc === 'string' ? body.esc : null);
+	// Optional: the print claim these bytes came from (see CopyBillPrintPaper).
+	const paperJobId = typeof body.paperJobId === 'string' ? body.paperJobId.trim() : '';
 
 	if (!restaurantId || !outletId || !billId || !escBase64) {
 		res.status(400).json({ error: 'restaurantId, outletId, billId and escBase64 are required' });
@@ -1524,6 +1765,13 @@ app.post('/publish/bill', validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9")
 		const dispatched = await dispatchPrintJob(restaurantId, {
 			outlet_id: outletId, bill_id: billId, kind: "bill", station: null, esc_base64: escBase64,
 		});
+		// CLIENT ITEMS 1 AND 2: the web print page sends the bytes of the paper its
+		// claim just recorded, and names that claim's job. This job is the newer
+		// counted print of the same bill, so it takes the claim's record (never
+		// one re-taken now) or the seating's paper would read unknown from here on.
+		if (paperJobId && dispatched.jobId) {
+			await CopyBillPrintPaper(restaurantId, paperJobId, dispatched.jobId);
+		}
 		// `jobId` keeps its exact meaning and position; `destination`/`device` are
 		// ADDITIVE and are null for every unrouted outlet, so a till written against
 		// this route before routing existed reads the same body it always did. They
@@ -1572,7 +1820,7 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 		// KOT IS UNTOUCHED, and the test is here rather than inside the helper:
 		// `kind === "kot"` is a kitchen docket, not a bill, and a waiter reprints
 		// a lost ticket all shift and always could.
-		if (kind === "bill" && await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
+		if (kind === "bill" && await refuseWaiterBillReprint(req, res, tableName, bill, restaurantId)) { return; }
 		// Column layout + logo raster width follow the configured paper size
 		// (58mm = 32 cols / 384 dots, 80mm = 48 cols / 576 dots).
 		const is58 = settings.bill_paper_width === "58mm";
@@ -1675,6 +1923,8 @@ app.post('/print/bill', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), 
 			// the words the dashboard uses too.
 			next_party_table: printed.next_party_table,
 			next_party_message: nextPartyPrintMessage(printed.next_party_table),
+			// Client items 1 and 2: this paper replaced an out-of-date one.
+			revised: printed.revised,
 		});
 	} catch (err: any) {
 		logger.error({ err }, 'print_bill_failed');
@@ -1772,7 +2022,7 @@ app.post('/print/bill/claim', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			res.status(400).json({ error: 'Nothing to print for this table' });
 			return;
 		}
-		if (await refuseWaiterBillReprint(req, res, tableName, bill)) { return; }
+		if (await refuseWaiterBillReprint(req, res, tableName, bill, restaurantId)) { return; }
 
 		// The ledger row, the audit line and the priced bill are
 		// claimClientRenderedBillPrint's, which the composite waiver-and-print
@@ -2057,7 +2307,27 @@ app.post('/bills/remove-item', validateBody(sBillRemoveItem), async (req: Reques
 	}
 });
 
-// Move a wrongly-placed item from one table to another (front-of-house fix).
+/*
+	Move a wrongly-placed item from one table to another (front-of-house fix).
+
+	CLIENT ITEM 4 — "IMPLEMENTED CORRECTLY", in four parts:
+
+	  * BOTH BILLS. The printed-bill rule is applied to the source as well as the
+	    destination before anything is written (write "move_off" / "move"): a
+	    waiter-only login is refused when either paper has been printed, a
+	    senior role is told which to reprint (moveReprintFields).
+	  * THE WHOLE DISH. MoveBillItem carries each line whole — size, note, hold,
+	    order-taker — and refuses a comped one ("reverse the comp first"),
+	    answered 400 with that sentence like every other refusal here.
+	  * THE KITCHEN. The number the pass knows each dish by is resolved BEFORE
+	    the move (the source ticket's key stops matching once a line leaves),
+	    and afterwards a docket for the moved dish prints on the new table under
+	    that number, headed "*** MOVED FROM 31A ***" (kot_move.ts). Never
+	    ticketed, nothing prints.
+	  * THE RECORD. The audit line names the dish, the quantity and the KOT:
+	    "Moved item NOT YOUR PUCHKA x1 from 31A (KOT-35) to 31" — keeping the
+	    "Moved item " prefix the Bill Edit report classifies on.
+*/
 app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), validateBody(sBillMoveItem), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -2074,10 +2344,46 @@ app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 		// the item belongs to somebody seated), a senior role is told to reprint.
 		const guard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: toTable, guest: false, write: "move" });
 		if (guard.refused) {return;}
-		const result = await MoveBillItem(restaurantId, fromTable, toTable, itemName, price);
+		const sourceGuard = await refuseOrderOnPrintedBill(req, res, { restaurantId, tableName: fromTable, guest: false, write: "move_off" });
+		if (sourceGuard.refused) {return;}
+		// READ BEFORE THE MOVE: which tickets the dish is on, and their numbers.
+		// Best-effort — an unreadable number costs the docket, never the move.
+		const sources = await GetMovableLineSources(restaurantId, fromTable, itemName, price).catch(() => []);
+		const kotNosByOrder = await resolveMoveSourceKots(restaurantId, sources);
+		const result = await MoveBillItem(restaurantId, fromTable, toTable, itemName, price, {
+			by: extractEmployeeUsername(req),
+			kotNosByOrder,
+		});
+		// The dish's docket on its new table, one per destination order. After the
+		// commit, and it never fails the move (printKotItemMove never throws).
+		const prints: (KotMoveOutcome & { order_id: string })[] = [];
+		for (const dest of result.destinations) {
+			const outcome = await printKotItemMove({
+				restaurantId, orderId: dest.order_id, previousTableName: fromTable, kotNo: dest.kot_nos[0] ?? null,
+			});
+			prints.push({ ...outcome, order_id: dest.order_id });
+		}
+		const kotNos = [...new Set(result.destinations.flatMap((d) => d.kot_nos))];
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
-		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Moved item ${result.moved.name} from ${fromTable} to ${toTable}`, Audit_log_category.Bill, { from: fromTable, to: toTable, item: itemName }); } catch {/* ignore */}
-		res.json({ ...result, ...reprintNeededFields(guard) });
+		try {
+			await log_audit(
+				req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				moveItemAuditSentence({ dishes: result.items, fallbackName: result.moved.name, fromTable, toTable, kotNos }),
+				Audit_log_category.Bill,
+				{
+					from: fromTable, to: toTable, item: itemName,
+					items: result.items, kot_nos: kotNos,
+					order_ids: result.destinations.map((d) => d.order_id),
+					source_order_ids: result.destinations.map((d) => d.source_order_id),
+					prints,
+				},
+			);
+		} catch {/* ignore */}
+		await noteAdditionToPrintedBill(req, guard);
+		// `moved` is the removal summary, prices and all; a waiter-only session
+		// is told the dishes and not their worth (redactMoveAnswer).
+		const answer = { ...result, prints, kot_nos: kotNos, ...moveReprintFields(guard, sourceGuard) };
+		res.json(hidesPrices(req.auth) ? redactMoveAnswer(answer) : answer);
 	} catch (e: any) {
 		logger.error({ err: e }, 'move_bill_item_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to move item') });
@@ -2247,6 +2553,11 @@ app.post('/bills/apply-coupon', validateAction("4ad474d4-5230-449c-874f-6a238b83
 // a till built before the field existed renames a bill without wiping a GSTIN;
 // null or "" clears it. The response gains `customer_gstin` and nothing else
 // moves.
+//
+// Client item 7 — `customer_address`, by the same rule: omitted is unchanged
+// (every 2.0.1 till omits it), null or "" clears it, over 5 lines or 250
+// characters is a 400, and an address write before migration 054 is a 503
+// before anything is written. The response gains `customer_address`.
 app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -2256,8 +2567,10 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
 	const gstin = customerGstinFromBody(body);
 	if (gstin === INVALID_GSTIN) { res.status(400).json({ error: CUSTOMER_GSTIN_ERROR }); return; }
+	const address = customerAddressFromBody(body);
+	if (address === INVALID_ADDRESS) { res.status(400).json({ error: CUSTOMER_ADDRESS_ERROR }); return; }
 	try {
-		const result = await SetBillCustomerName(restaurantId, tableName, customer, gstin);
+		const result = await SetBillCustomerName(restaurantId, tableName, customer, gstin, address);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: tableName }); } catch {/* ignore */}
 		try {
 			const nameLine = result.customer
@@ -2265,9 +2578,14 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 				: `Cleared the bill name on table ${tableName}`;
 			const gstinLine = gstin === undefined ? "" : (gstin ? ` (GSTIN ${gstin})` : " (GSTIN cleared)");
 			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
-				`${nameLine}${gstinLine}`,
+				`${nameLine}${gstinLine}${addressAuditTail(address)}`,
 				Audit_log_category.Bill,
-				{ table: tableName, customer: result.customer, ...(gstin === undefined ? {} : { customer_gstin: gstin }) });
+				{
+					table: tableName,
+					customer: result.customer,
+					...(gstin === undefined ? {} : { customer_gstin: gstin }),
+					...(address === undefined ? {} : { customer_address: address }),
+				});
 		} catch {/* ignore */}
 		res.json(result);
 	} catch (e: any) {
@@ -2278,14 +2596,19 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 });
 
 /*
-	Round 2 item 1 — THE NAME AND GSTIN ON A PAST (SETTLED) BILL, from Accounting.
+	Round 2 item 1 — THE NAME AND GSTIN ON A PAST (SETTLED) BILL, from Accounting
+	(and, since client item 8, from the app's History, which opens the same
+	sheet behind the same permission). Client item 7 adds the address.
 
-	POST /bills/:billId/customer-details  body { "customer": "...", "customer_gstin": "..." | null }
-	  -> 200 { success: true, bill_id, customer, customer_gstin }
+	POST /bills/:billId/customer-details
+	  body { "customer": "...", "customer_gstin": "..." | null, "customer_address": "..." | null }
+	  -> 200 { success: true, bill_id, customer, customer_gstin, customer_address }
 	  -> 400 { error: "GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5" }
+	  -> 400 { error: "Address can be at most 5 lines and 250 characters" }
 	  -> 404 { error: "Bill not found" }       not a settled bill of this tenant
 	  -> 503 { error: "This server has not finished updating — try again shortly" }
-	                                           a GSTIN write before migration 046
+	                                           a GSTIN write before migration 046,
+	                                           or an address write before 054
 
 	WHO MAY DO IT: ACCOUNTING_PERM — exactly what E5's /print/bill/settled
 	requires, because the button lives beside that reprint in the same past-bills
@@ -2294,9 +2617,11 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 	validateAction's 403. /bills/customer-name stays the waiter's door for the
 	RUNNING bill, and still refuses a settled one.
 
-	WHAT IT CHANGES: the name and the GSTIN, nothing else — see
-	SetClosedBillCustomerDetails. `customer_gstin` omitted leaves it unchanged, the
-	same rule as the live route, so a name-only correction works before 046.
+	WHAT IT CHANGES: the name, the GSTIN and the address, nothing else — see
+	SetClosedBillCustomerDetails. `customer_gstin` or `customer_address` omitted
+	leaves that field unchanged, the same rule as the live route, so a name-only
+	correction works before 046 and 054, and a 2.0.1 app's name/GSTIN edit never
+	wipes an address it cannot see.
 */
 app.post('/bills/:billId/customer-details', validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -2307,18 +2632,34 @@ app.post('/bills/:billId/customer-details', validateAction(ACCOUNTING_PERM), asy
 	const customer = typeof body.customer === "string" ? body.customer : "";
 	const gstin = customerGstinFromBody(body);
 	if (gstin === INVALID_GSTIN) { res.status(400).json({ error: CUSTOMER_GSTIN_ERROR }); return; }
+	const address = customerAddressFromBody(body);
+	if (address === INVALID_ADDRESS) { res.status(400).json({ error: CUSTOMER_ADDRESS_ERROR }); return; }
 	try {
-		const result = await SetClosedBillCustomerDetails(restaurantId, billId, customer, gstin);
+		const result = await SetClosedBillCustomerDetails(restaurantId, billId, customer, gstin, address);
 		if (!result) { res.status(404).json({ error: "Bill not found" }); return; }
 		try {
-			const what = gstin === undefined ? "name" : "name/GSTIN";
+			const what = ["name", ...(gstin === undefined ? [] : ["GSTIN"]), ...(address === undefined ? [] : ["address"])].join("/");
 			await log_audit(req, ACCOUNTING_PERM,
 				`Changed the ${what} on bill #${result.bill_no ?? result.bill_id}${result.table_name ? ` (table ${result.table_name})` : ""} \u2014 ` +
-					`name "${result.customer ?? "Guest"}"${gstin === undefined ? "" : `, GSTIN ${result.customer_gstin ?? "cleared"}`}`,
+					`name "${result.customer ?? "Guest"}"${gstin === undefined ? "" : `, GSTIN ${result.customer_gstin ?? "cleared"}`}` +
+					addressAuditTail(address),
 				Audit_log_category.Bill,
-				{ bill_id: result.bill_id, bill_no: result.bill_no, customer: result.customer, ...(gstin === undefined ? {} : { customer_gstin: result.customer_gstin }), settled_bill_edit: true });
+				{
+					bill_id: result.bill_id,
+					bill_no: result.bill_no,
+					customer: result.customer,
+					...(gstin === undefined ? {} : { customer_gstin: result.customer_gstin }),
+					...(address === undefined ? {} : { customer_address: result.customer_address }),
+					settled_bill_edit: true,
+				});
 		} catch {/* a failed audit write must never fail the edit */}
-		res.json({ success: true, bill_id: result.bill_id, customer: result.customer, customer_gstin: result.customer_gstin });
+		res.json({
+			success: true,
+			bill_id: result.bill_id,
+			customer: result.customer,
+			customer_gstin: result.customer_gstin,
+			customer_address: result.customer_address,
+		});
 	} catch (e: any) {
 		if (sendCustomerGstinError(res, e)) { return; }
 		logger.error({ err: e }, 'set_closed_bill_customer_details_failed');
@@ -2556,6 +2897,8 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			total: bill.subtotal,
 			customer: bill.customer,
 			customerGstin: bill.customer_gstin ?? null,
+			// Client item 7 — the guest's address, under the GSTIN (escpos.ts).
+			customerAddress: bill.customer_address ?? null,
 			billNo: bill.bill_no,
 			// Restaurant-zone stamp, as on the whole bill (see /print/bill).
 			printedAt: kotStamp(new Date(), settings.timezone || "Asia/Kolkata"),
@@ -2610,6 +2953,16 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 				{ table: tableName, mode, parts: receipts.length, totals: receipts.map((r) => r.grandTotal) });
 		} catch {/* a failed audit write must never fail the print */}
 
+		// What the paper said (migration 055). EVERY part carries the WHOLE bill's
+		// fingerprint: the parts together are this bill, and the latest counted
+		// job — whichever part that is — must say what the guests were handed.
+		try {
+			const digest = await currentPaperDigest(restaurantId, tableName, bill);
+			await recordPaper(restaurantId, jobs.map((j) => j.jobId), {
+				bill_digest: digest, lines_digest: billLinesDigest(bill.items), bill_grand_total: bill.grand_total, table_name: tableName,
+			});
+		} catch (err) { logger.warn({ err, table: tableName }, "split_paper_digest_failed"); }
+
 		// A split print is a print of this bill: the next party gets its seat.
 		const nextPartyTable = await nextPartyAfterPrint(req, restaurantId, tableName);
 
@@ -2641,6 +2994,7 @@ app.post('/bills/merge', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"),
 		const result = await MergeTableBills(restaurantId, fromTable, toTable);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: fromTable }); emitRestaurant(restaurantId, "bill:updated", { table: toTable }); } catch {/* ignore */}
 		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Merged table ${fromTable} into ${toTable} (${result.moved_orders} orders)`, Audit_log_category.Bill, { from: fromTable, to: toTable }); } catch {/* ignore */}
+		await noteAdditionToPrintedBill(req, guard);
 		res.json({ ...result, ...reprintNeededFields(guard) });
 	} catch (e: any) {
 		logger.error({ err: e }, 'merge_bill_failed');

@@ -25,6 +25,7 @@ import { describe, test, expect, beforeAll, beforeEach, afterEach, jest } from "
 import {
   RES_ID,
   OUTLET_ID,
+  type PrintJobRow as PrintJobFixtureRow,
   OTHER_OUTLET_ID,
   FOREIGN_OUTLET_ID,
   addJob,
@@ -68,12 +69,12 @@ beforeAll(async () => {
     process.env.SUPABASE_DIRECT_URL || "postgres://fixture:fixture@localhost:5432/fixture";
   // Clear any inherited tuning so the SHIPPED DEFAULTS are what is under test:
   // 30-minute KOT TTL, 12-hour bill TTL, 2-minute lease, 20 jobs per resume,
-  // 7-day retention. A developer with one of these exported would otherwise get a
+  // 7-day retention, 5-minute test-slip replay. A developer with one of these exported would otherwise get a
   // green run that proves something different from CI's.
   for (const k of [
     "PRINT_JOB_KOT_TTL_MIN", "PRINT_JOB_BILL_TTL_MIN", "PRINT_JOB_LEASE_MIN",
     "PRINT_JOB_REPLAY_LIMIT", "PRINT_JOB_RETENTION_DAYS", "PRINT_JOB_MAX_B64_CHARS",
-    "PRINT_JOB_PURGE_LIMIT",
+    "PRINT_JOB_PURGE_LIMIT", "PRINT_JOB_TEST_REPLAY_MIN",
   ]) { delete process.env[k]; }
   mod = await import("../print_jobs");
   realtime = await import("../realtime");
@@ -485,3 +486,169 @@ describe("the wire payload", () => {
     expect(p.escBase64).toBe("esc");
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /print/test's slips ride this queue, but a till that connects late gets
+// at most ONE per role, and only a fresh one. The defect: three presses at a
+// kitchen printer whose PC was off became three "PRINTER TEST" dockets when it
+// reconnected ten minutes later, mid-service — in the style the owner had since
+// switched away from.
+describe("test slips on replay", () => {
+  /** A slip as POST /print/test enqueues it: its bill_id, kind and station. */
+  function pressed(role: string, at: number): PrintJobFixtureRow {
+    return addJob({ ...pressedShape(role, at), esc_base64: `esc-test-${role}-${String(at)}` });
+  }
+
+  test("a fresh slip nobody printed IS handed to the till that connects — a flap mid-test still prints", async () => {
+    const slip = pressed("kot", T0 - 30_000);
+    const a = till("till-a");
+    await expect(connect(a)).resolves.toBe(1);
+    expect(a.received[0]).toMatchObject({ jobId: slip.id, replay: true, kind: "kot" });
+    expect(row(slip.id).status).toBe("delivered");
+  });
+
+  test("a slip older than five minutes is NOT handed over, and is settled so no till is offered it again", async () => {
+    const stale = pressed("kot", T0 - 10 * MIN);
+    // A REAL docket of the same age still replays: the KOT TTL is thirty minutes.
+    const docket = addJob({ kind: "kot", station: "Grill", bill_id: "order-9", created_at: new Date(T0 - 10 * MIN) });
+    const a = till("till-a");
+    await expect(connect(a)).resolves.toBe(1);
+    expect(a.received.map((p) => p.jobId)).toEqual([docket.id]);
+    expect(row(stale.id)).toMatchObject({ status: "expired", claimed_until: null });
+    expect(row(stale.id).settled_at).toEqual(new Date(T0));
+
+    // Long after the lease, a second till is not offered it either (the docket,
+    // printed, is out of the way).
+    await mod.ackPrintJob(RES_ID, docket.id, "printed");
+    jest.setSystemTime(new Date(T0 + 10 * MIN));
+    await expect(connect(till("till-b"))).resolves.toBe(0);
+  });
+
+  test("a slip just inside the window is replayed; one just outside is not", async () => {
+    const inside = pressed("kot", T0 - 5 * MIN + 1);
+    const outside = pressed("kot:BAR", T0 - 5 * MIN);
+    const a = till("till-a");
+    await expect(connect(a)).resolves.toBe(1);
+    expect(a.received.map((p) => p.jobId)).toEqual([inside.id]);
+    expect(row(outside.id).status).toBe("expired");
+  });
+
+  test("a BILL-role slip does not inherit the twelve-hour bill replay", async () => {
+    const stale = pressed("bill", T0 - 2 * HOUR);
+    const bill = addJob({ kind: "bill", bill_id: "B-real", created_at: new Date(T0 - 2 * HOUR) });
+    const a = till("till-a");
+    await expect(connect(a)).resolves.toBe(1);
+    expect(a.received.map((p) => p.billId)).toEqual(["B-real"]);
+    expect(row(bill.id).status).toBe("delivered");
+    expect(row(stale.id).status).toBe("expired");
+  });
+
+  test("three presses at a dead printer replay as ONE slip — the newest — per role", async () => {
+    const first = pressed("kot", T0 - 3 * MIN);
+    const bar = pressed("kot:BAR", T0 - 150_000);
+    const second = pressed("kot", T0 - 2 * MIN);
+    const third = pressed("kot", T0 - 1 * MIN);
+    const a = till("till-a");
+    await expect(connect(a)).resolves.toBe(2);
+    expect(a.received.map((p) => p.jobId)).toEqual([bar.id, third.id]);
+    expect(row(first.id).status).toBe("expired");
+    expect(row(second.id).status).toBe("expired");
+    expect(row(third.id).status).toBe("delivered");
+    expect(row(bar.id).status).toBe("delivered");
+  });
+
+  test("two presses in the same millisecond: the later row is the one replayed", async () => {
+    const one = pressed("kot", T0 - MIN);
+    const two = pressed("kot", T0 - MIN);
+    const a = till("till-a");
+    await expect(connect(a)).resolves.toBe(1);
+    expect(a.received[0].jobId).toBe(two.id);
+    expect(row(one.id).status).toBe("expired");
+  });
+
+  test("a till that cannot ack is still handed nothing — and settles nothing", async () => {
+    const stale = pressed("kot", T0 - 10 * MIN);
+    await expect(connect(till("till-old"), { agentVersion: null })).resolves.toBe(0);
+    expect(row(stale.id).status).toBe("pending");
+  });
+
+  test("the settle is fenced on the claim: a row another till holds is left alone", async () => {
+    // Driven at the statement, because resume only ever passes ids its own
+    // claim returned.
+    const held = addJob({
+      ...pressedShape("kot", T0 - 10 * MIN), status: "delivered", claimed_by: "till-b", claimed_until: new Date(T0 + MIN),
+    });
+    const acked = addJob({ ...pressedShape("kot", T0 - 10 * MIN), status: "acked", claimed_by: "till-a" });
+    const mine = addJob({
+      ...pressedShape("kot", T0 - 10 * MIN), status: "delivered", claimed_by: "till-a", claimed_until: new Date(T0 + MIN),
+    });
+    const db = await import("../database_supabase");
+    await expect(db.ExpireClaimedPrintJobs(RES_ID, [held.id, acked.id, mine.id], "till-a")).resolves.toBe(1);
+    expect(row(held.id).status).toBe("delivered");
+    expect(row(acked.id).status).toBe("acked");
+    expect(row(mine.id)).toMatchObject({ status: "expired", claimed_until: null });
+    await expect(db.ExpireClaimedPrintJobs(RES_ID, [], "till-a")).resolves.toBe(0);
+  });
+
+  test("the window is the env knob, never zero", () => {
+    expect(mod.TEST_SLIP_REPLAY_MIN()).toBe(5);
+    process.env.PRINT_JOB_TEST_REPLAY_MIN = "2";
+    try {
+      expect(mod.TEST_SLIP_REPLAY_MIN()).toBe(2);
+      const rows = [
+        { id: "a", ...pressedShape("kot", T0 - 3 * MIN) },
+        { id: "b", ...pressedShape("bill", T0 - 90_000) },
+      ];
+      expect([...mod.testSlipsNotToReplay(rows, new Date(T0))]).toEqual(["a"]);
+      // Zero would drop every slip, including the one pressed a second ago.
+      process.env.PRINT_JOB_TEST_REPLAY_MIN = "0.2";
+      expect(mod.TEST_SLIP_REPLAY_MIN()).toBe(1);
+    } finally {
+      delete process.env.PRINT_JOB_TEST_REPLAY_MIN;
+    }
+  });
+});
+
+describe("what counts as a test slip", () => {
+  test("every role POST /print/test can press reads back as that role", () => {
+    for (const role of ["bill", "kot", "kot:BAR", "kot:TANDOOR 2", "kot:PASTRY/COLD"]) {
+      expect([role, mod.testSlipRole(pressedShape(role, T0))]).toEqual([role, role]);
+    }
+  });
+
+  test("real jobs are never test slips — including a table somebody named print-test", () => {
+    const real = [
+      { bill_id: "3f3f3f3f-1111-4111-8111-3f3f3f3f3f3f", kind: "bill", station: null },
+      { bill_id: "order-77", kind: "kot", station: "GRILL" },
+      // The fallback bill id is `<table>-<epoch>`: it always ENDS in the epoch.
+      { bill_id: `print-test-${String(T0)}-bill-${String(T0)}`, kind: "bill", station: null },
+      { bill_id: `print-test-5-${String(T0)}`, kind: "bill", station: null },
+      // The right shape, the wrong row: its kind or station disagrees with the role.
+      { bill_id: mod.testSlipBillId(new Date(T0), "kot:BAR"), kind: "kot", station: "GRILL" },
+      { bill_id: mod.testSlipBillId(new Date(T0), "kot"), kind: "bill", station: null },
+      { bill_id: mod.testSlipBillId(new Date(T0), "bill"), kind: "kot", station: null },
+      { bill_id: "print-test-123-kot", kind: "kot", station: null },
+      { bill_id: `x-print-test-${String(T0)}-kot`, kind: "kot", station: null },
+    ];
+    for (const job of real) {
+      expect([job.bill_id, mod.testSlipRole(job)]).toEqual([job.bill_id, null]);
+    }
+    const aged = real.map((j, i) => ({ ...j, id: `r${String(i)}`, created_at: new Date(T0 - 24 * HOUR) }));
+    expect(mod.testSlipsNotToReplay(aged, new Date(T0)).size).toBe(0);
+  });
+
+  test("the bill_id is the one the route has always written", () => {
+    expect(mod.testSlipBillId(new Date(T0), "kot:TANDOOR 2")).toBe(`print-test-${String(T0)}-kot:TANDOOR-2`);
+    expect(mod.testSlipBillId(new Date(T0), "bill")).toBe(`print-test-${String(T0)}-bill`);
+  });
+});
+
+/** The bill_id / kind / station / time a test slip for `role` is enqueued with. */
+function pressedShape(role: string, at: number): { bill_id: string; kind: string; station: string | null; created_at: Date } {
+  return {
+    bill_id: mod.testSlipBillId(new Date(at), role),
+    kind: role === "bill" ? "bill" : "kot",
+    station: role.startsWith("kot:") ? role.slice(4) : null,
+    created_at: new Date(at),
+  };
+}

@@ -30,6 +30,7 @@ import { downloadFile } from "./storage_bucket_supabase.js";
 import { signTable, encodeTableToken } from "./qr_signing.js";
 import { MOBILE_10_ERROR, normalizeMobile10 } from "./phone_validation.js";
 import { CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "./customer_gstin.js";
+import { CustomerAddressInvalidError, CustomerAddressSchemaPendingError, normalizeCustomerAddress } from "./customer_address.js";
 import {
   KOT_PRINT_STYLE_DEFAULT,
   KOT_TEXT_SIZE_DEFAULT,
@@ -118,6 +119,32 @@ import {
 // The write-off rule for a DISCOUNT. Pure, for the same reason
 // release_authority.ts is: it decides who may make a bill disappear.
 import { DiscountAuthorityError, mayDiscountBill } from "./discount_authority.js";
+// Client items 3 and 4 (2026-09-17): who may cancel a ticketed order, and what
+// a move stamps on the orders it touches. Both pure; see their headers.
+import { isWaiterOnly, mayCancelTicketed, mayPutBackToPending, PENDING_ORDER_STATUS_CODE, type RoleScopeInput } from "./role_scope.js";
+import { CancelNeedsSeniorError } from "./cancel_authority.js";
+import {
+  ORDER_TABLE_SINCE_KEY,
+  appendOrderMove,
+  carriedLine,
+  comppedMoveRefusal,
+  foodWithTableSinceSql,
+  holdsComppedLine,
+  movedDestinationFood,
+  movedDish,
+  movedFromKotNos,
+  movedOrderStatusCode,
+  orderArrivalSql,
+  orderArrivedAt,
+  orderDishes,
+  orderMoveProvenance,
+  seatingIdentityOf,
+  settledWindowSql,
+  withFilledSeatingIdentity,
+  withSeatingIdentity,
+  type MovedDish,
+  type OrderMoveProvenance,
+} from "./order_moves.js";
 // C3's print state. ONE rule, applied to BOTH payloads that answer "has this
 // bill been printed" — /bill-for-table and the /get-tables row the floor grid
 // renders. See its header for why the floor grid had nothing to read.
@@ -125,12 +152,18 @@ import {
   BILL_PRINT_JOB_KIND,
   COUNTED_PRINT_JOB_STATUSES,
   NO_BILL_PRINTS,
-  seatingStartOf,
+  PREVIOUS_PARTY_PRINT_MARK,
+  billPrintFallbackPrefix,
+  latestBillPaper,
+  seatingStartFor,
   summarizeBillPrints,
   type BillPrintJobRow,
   type BillPrintSeating,
   type BillPrintState,
 } from "./bill_print_state.js";
+// Client items 1 and 2 — what a printed bill SAID (migration 055), so a waiter's
+// second print can be told apart from the one that fixes out-of-date paper.
+import { billLinesDigest, paperStale, printedAsName, type BillPaperRecord, type PaperLine } from "./bill_paper_digest.js";
 // Client item 6 — the next party at a printed table (migration 053). The rules
 // (the reserved name, which seat to hand out, which idle rows to retire) are
 // pure and live there; this file only reads and writes the rows.
@@ -138,6 +171,8 @@ import {
   RESERVED_TABLE_NAME_ERROR,
   freeFamilySeat,
   isReservedPartyName,
+  sameFamilyMoveError,
+  sameTableFamily,
   nextFreePartySeq,
   nextPartyLabel,
   nextPartyName,
@@ -300,6 +335,7 @@ import {
   resolveReportWindow,
   type ReportWindowQuery,
   type ResolvedReportWindow,
+  type WindowClamp,
   DEFAULT_TIME_SLOTS,
   TimeSlotConfigError,
   fixedTimeBuckets,
@@ -317,6 +353,11 @@ import {
   timeSlotNote,
   timeSlotsForStorage,
   validateTimeSlotPresets,
+  dayCloseOfShift,
+  dayShiftForClose,
+  parseDayClose,
+  tradingDayBounds,
+  tradingDayNote,
   type TimeBucketMode,
   type TimeSlot,
   type TimeSlotMeta,
@@ -420,7 +461,28 @@ import { serviceClock, tableServiceClock, type ServiceClock } from "./service_cl
 export { serviceClock, tableServiceClock } from "./service_clock.js";
 export type { ServiceClock, ServiceClockInput } from "./service_clock.js";
 import { logger } from "./observability.js";
-import { normalizeRecipients } from "./mailer.js";
+import { GLANCE_FIGURE_KEYS, glanceDrill, glanceDrills, type GlanceDrill, type GlanceDrills } from "./glance_drill.js";
+import { isPlausibleEmail, normalizeRecipients } from "./mailer.js";
+// Client item 9: which reports can be emailed, and the runtime half of
+// migrations 056-058. Both pure, so their rules are proved without a pool.
+import {
+  MAX_ADDRESS_BOOK,
+  MAX_EMAIL_SCHEDULES_PER_OUTLET,
+  MAX_REPORT_RECIPIENTS,
+  CALENDAR_ONLY_KEYS,
+  isWindowMode,
+  legacyReportKey,
+  reportKeysOfRow,
+  validateReportFormats,
+  validateReportSelection,
+  type ReportWindowMode,
+} from "./report_catalogue.js";
+import {
+  REPORT_EMAIL_DDL_056,
+  REPORT_EMAIL_DDL_057,
+  REPORT_EMAIL_DDL_058,
+  REPORT_EMAIL_SCHEMA_PROBE,
+} from "./report_email_schema.js";
 
 /**
  * "Close Bill" (a953d044) — the ONE capability that means "may make money leave
@@ -1246,6 +1308,14 @@ export interface OrderRecord {
    * it is never what the server prints from — see GetKotNumbersForOrders.
    */
   kot_nos?: number[];
+  /**
+   * CLIENT ITEM 4 — the move provenance (orderMoveProvenance, order_moves.ts).
+   * Each is ABSENT on an order that never moved, for the reason kot_nos is.
+   */
+  moved_from?: OrderMoveProvenance["moved_from"];
+  moved_at?: OrderMoveProvenance["moved_at"];
+  emptied_by?: OrderMoveProvenance["emptied_by"];
+  moved_items?: OrderMoveProvenance["moved_items"];
 }
 
 // A built-in id, 'Split', or a custom mode's own id (payment_methods.ts).
@@ -2106,6 +2176,8 @@ export const __poolHygieneTestSeam = {
     ddlInFlight.clear();
     // Migration 052's catalogue answer is a schema memo too.
     billNcColumnsSeen = false;
+    // ...and so is "does TableSessions exist" (the print bound's seating read).
+    tableSessionsRelation = null;
   },
   ensureLazyTable,
   ensureOutletColumns: (client?: PoolClient): Promise<void> => ensureOutletColumns(client),
@@ -4211,7 +4283,7 @@ async function nextPartyParentName(context: RestaurantContext, tableId: string):
  * THE PRINT STATE OF A TABLE'S CURRENT SEATING, and nothing else — what the
  * money guard on new orders asks. GetBillForTable answers the same question on
  * the way to pricing the whole bill; this is the cheap half, reduced through
- * the SAME seating bound (seatingStartOf) and the SAME ledger read, so the
+ * the SAME seating bound (seatingStartFor) and the SAME ledger read, so the
  * guard and the Print button can never disagree about "printed".
  *
  * Null when the table is unknown, is a takeaway, or the feature is off — the
@@ -4249,26 +4321,8 @@ export async function GetOrderingPrintGuard(
   );
   const table = tableRows[0];
   if (!table || table.is_virtual === true) {return null;}
-  const billRows = await runQuery<{ id: string; created_at: Date | null }>(
-    `select id, created_at from "Bills"
-      where table_id = $1 and res_id = $2 and outlet_id = $3
-        and status != 3 and closed_at is null
-      order by created_at desc
-      limit 1`,
-    [table.id, context.res_id, context.outlet_id],
-  );
-  const firstOrder = await runQuery<{ first_at: Date | null }>(
-    `select min(created_at) as first_at from "Orders"
-      where res_id = $1 and outlet_id = $2 and table_id = $3
-        and ${stillOwesStatusSql()}`,
-    [context.res_id, context.outlet_id, table.id],
-  );
-  const start = seatingStartOf(billRows[0]?.created_at ?? null, firstOrder[0]?.first_at ?? null);
-  // Nothing on the table at all: nothing can have been printed for this party.
-  if (start === null && !billRows[0]) {
-    return { table: table.table_name, table_id: table.id, parent_table: null, print_count: 0, existing_lines: null };
-  }
-  const prints = await billPrintHistoryForTable(context, table.id, billRows[0]?.id ?? null, table.table_name, start);
+  // The seating's bounds and its print state — the same helper the move uses.
+  const { prints } = await currentSeatingPrintState(context, table);
   let existingLines: StoredOrderLine[] | null = null;
   const orderId = String(opts.orderId ?? "").trim();
   if (prints.print_count > 0 && isUuid(orderId)) {
@@ -5184,7 +5238,7 @@ function buildApcSuggestions(
 export async function GetBillForTable(
   restaurantId: string,
   table_name: string,
-): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; service_charge_basis: OpenBillChargeConfig["basis"]; service_charge_applied: boolean; taxes: BillTaxLine[]; tax_total: number; round_off: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null } | null> {
+): Promise<{ bill_id: string | null; table_id: string; total_amt: number; subtotal: number; discount: number; discount_type: "percent" | "flat" | null; discount_value: number; service_charge: number; service_charge_percent: number; service_charge_waived: boolean; service_charge_waiver: ServiceChargeWaiverRecord | null; service_charge_basis: OpenBillChargeConfig["basis"]; service_charge_applied: boolean; taxes: BillTaxLine[]; tax_total: number; round_off: number; grand_total: number; nc_total: number; covers: number; apc: number; order_ids: string[]; kot_nos: number[]; order_notes: string[]; items: { name: string; price: number; quantity: number; note?: string; menu_id?: string; nc?: true; nc_kind?: string; variation?: string; held_qty?: number }[]; target_apc: number; apc_status: string; apc_suggestions: string[]; payment_method: string | null; payment_status: string | null; screenshot_url: string | null; bill_no: string | null; customer: string | null; customer_gstin: string | null; customer_address: string | null; coupon_code: string | null; bill_created_at: string | null; waiter_confirmed_at: string | null; admin_approved_at: string | null; discount_applied_at: string | null; first_order_at: string | null; last_order_at: string | null; service: ServiceClock; print_count: number; bill_printed_at: string | null; printed_at: string | null; last_paper_digest: string | null; printed_total: number | null; printed_as: string | null } | null> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
   await ensureRecordTimestampColumns();
@@ -5278,6 +5332,9 @@ export async function GetBillForTable(
   // orders — the carrier every GSTIN writer always writes (see the migration
   // 046 block beside SetBillCustomerName).
   let billCustomerGstin = "";
+  // Client item 7: the guest's address, by the same rule, off the same orders
+  // (see the migration 054 block beside readBillCustomerGstins).
+  let billCustomerAddress = "";
   let ncTotal = 0;
   // THE ORDER-LEVEL NOTES ON THIS TABLE, one per contributing order, in the
   // order they were placed and de-duplicated.
@@ -5300,6 +5357,7 @@ export async function GetBillForTable(
       if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") {billCustomer = c;}
     }
     if (!billCustomerGstin) {billCustomerGstin = foodCustomerGstin(f);}
+    if (!billCustomerAddress) {billCustomerAddress = foodCustomerAddress(f);}
     const orderNote = String((f).note ?? "").trim();
     if (orderNote && !orderNotes.includes(orderNote)) {orderNotes.push(orderNote);}
     const list = Array.isArray((f).items) ? (f as { items: unknown[] }).items : [];
@@ -5449,12 +5507,18 @@ export async function GetBillForTable(
     tableId,
     bill?.id ?? null,
     normalized,
-    // The seating starts at the EARLIER of the bill row and the earliest
-    // still-owing order. Both are "the current party", and anything printed
-    // before it belongs to the previous one — but a bill row created by a
-    // discount, a waiver or a tender AFTER a waiter's print must not move the
-    // start past that print. See seatingStartOf.
-    seatingStartOf(bill?.created_at ?? null, orderRows[0]?.created_at ?? null),
+    // The seating starts at the open seating's seated_at, or earlier when the
+    // bill row or an order's ARRIVAL here is earlier; without an open seating,
+    // at the EARLIER of the bill row and the earliest still-owing order. A bill
+    // row created by a discount, a waiver or a tender AFTER a waiter's print
+    // must not move the start past that print, and neither may an order moving
+    // off or onto the table. See seatingStartFor.
+    seatingStartFor({
+      sessionSeatedAt: await openSeatingStartOf(context, tableId),
+      billCreatedAt: bill?.created_at ?? null,
+      firstOrderAt: orderRows[0]?.created_at ?? null,
+      firstArrivalAt: firstArrivalOf(orderRows, normalized),
+    }),
   );
 
   return {
@@ -5516,6 +5580,9 @@ export async function GetBillForTable(
     customer: billCustomer || null,
     // NOT MONEY, so C4's waiter redaction leaves it on the payload.
     customer_gstin: billCustomerGstin || null,
+    // Nor is this. The guest QR view never carries it: guest_bill_view.ts is
+    // an allowlist and does not name it.
+    customer_address: billCustomerAddress || null,
     coupon_code: bill?.coupon_code ?? null,
     // When each step of the OPEN bill happened. All UTC instants; the caller
     // renders them in the restaurant's timezone (GET /restaurant/settings).
@@ -5555,6 +5622,18 @@ export async function GetBillForTable(
     print_count: prints.print_count,
     bill_printed_at: prints.bill_printed_at,
     printed_at: prints.printed_at,
+    // CLIENT ITEMS 1 AND 2 (migration 055) — WHAT THE LATEST PAPER SAID. All
+    // three are null when nothing was printed, and when the print's content was
+    // never recorded (before 055). `last_paper_digest` is compared by
+    // routes/bills.ts's currentPaperDigest — the print gate and GET
+    // /bill-for-table's `paper_stale` — and never sent on as it stands.
+    // `printed_total` is the grand total the guest is holding: MONEY, so C4
+    // takes it off a waiter's payload (REDACTED_BILL_MONEY_KEYS). `printed_as`
+    // is the name on that paper when it is not this table's any more (a moved
+    // party).
+    last_paper_digest: prints.paper?.bill_digest ?? null,
+    printed_total: prints.paper?.bill_grand_total ?? null,
+    printed_as: printedAsName(prints.paper?.table_name, normalized),
   };
 }
 
@@ -5583,7 +5662,7 @@ async function billPrintHistoryForTable(
   openBillId: string | null,
   tableName: string,
   seatingStart: Date | string | null,
-): Promise<BillPrintState> {
+): Promise<SeatingPrintState> {
   // `tableId` is not in the predicate — bill_id already identifies the bill, and
   // the fallback shape is per-table-name. It is taken so callers cannot pass a
   // name and an id that disagree, and so this signature does not have to change
@@ -5591,8 +5670,16 @@ async function billPrintHistoryForTable(
   void tableId;
   const seatings = [{ open_bill_id: openBillId, table_name: tableName, seating_start: seatingStart }];
   const byName = await billPrintStateForSeatings(context, seatings);
-  return byName.get(tableName) ?? NO_BILL_PRINTS;
+  return byName.get(tableName) ?? NO_SEATING_PRINTS;
 }
+
+/**
+ * C3's three fields, plus WHAT THE LATEST PAPER SAID (migration 055; null when
+ * nothing was printed). The paper is the data layer's, never a payload's: each
+ * reader decides what of it to send (see GetBillForTable and GetTables).
+ */
+type SeatingPrintState = BillPrintState & { paper: BillPaperRecord | null };
+const NO_SEATING_PRINTS: SeatingPrintState = { ...NO_BILL_PRINTS, paper: null };
 
 /**
  * THE SAME QUESTION FOR MANY TABLES AT ONCE — what /get-tables needs.
@@ -5619,9 +5706,9 @@ async function billPrintHistoryForTable(
 async function billPrintStateForSeatings(
   context: RestaurantContext,
   seatings: readonly BillPrintSeating[],
-): Promise<Map<string, BillPrintState>> {
-  const out = new Map<string, BillPrintState>();
-  for (const s of seatings) { out.set(s.table_name, NO_BILL_PRINTS); }
+): Promise<Map<string, SeatingPrintState>> {
+  const out = new Map<string, SeatingPrintState>();
+  for (const s of seatings) { out.set(s.table_name, NO_SEATING_PRINTS); }
   if (seatings.length === 0) { return out; }
 
   // The lower bound is the EARLIEST seating asked about; each table's own bound
@@ -5636,20 +5723,258 @@ async function billPrintStateForSeatings(
     floor = floor === null ? t : Math.min(floor, t);
   }
 
-  const rows = await captureRead("PrintJobs", () => runQuery<BillPrintJobRow>(
-    `select bill_id, created_at from "PrintJobs"
-      where res_id = $1 and outlet_id = $2 and kind = $3
+  // Migration 055's four columns ride along ONLY when the latch says they are
+  // there. A 42703 is caught by captureRead as "nothing printed", which is the
+  // one answer this read must never give on a table that WAS printed: a waiter
+  // would get their print back. So an absent column is asked of the catalogue
+  // first, and a stale "present" that answers 42703 anyway falls back to the
+  // pre-055 statement rather than to empty (outside a transaction only — inside
+  // one the 42703 has already aborted it, and the caller must hear so).
+  const params = [
+    context.res_id, context.outlet_id, BILL_PRINT_JOB_KIND,
+    [...COUNTED_PRINT_JOB_STATUSES],
+    floor === null ? null : new Date(floor).toISOString(),
+  ];
+  const where = `where res_id = $1 and outlet_id = $2 and kind = $3
         and status = any($4::text[])
-        and ($5::timestamptz is null or created_at >= $5)`,
-    [
-      context.res_id, context.outlet_id, BILL_PRINT_JOB_KIND,
-      [...COUNTED_PRINT_JOB_STATUSES],
-      floor === null ? null : new Date(floor).toISOString(),
-    ],
-  ), [] as BillPrintJobRow[]);
+        and ($5::timestamptz is null or created_at >= $5)`;
+  const plain = (): Promise<BillPrintJobRow[]> => runQuery<BillPrintJobRow>(
+    `select bill_id, created_at from "PrintJobs"
+      ${where}`,
+    params,
+  );
+  const withPaper = await printJobPaperReady();
+  const rows = await captureRead("PrintJobs", async () => {
+    if (!withPaper) { return plain(); }
+    try {
+      return await runQuery<BillPrintJobRow>(
+        `select bill_id, created_at, bill_digest, lines_digest, bill_grand_total, table_name from "PrintJobs"
+      ${where}`,
+        params,
+      );
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code !== "42703" || (tenantStorage.getStore()?.txnDepth ?? 0) > 0) { throw err; }
+      notePrintJobPaperMissing();
+      return plain();
+    }
+  }, [] as BillPrintJobRow[]);
 
-  for (const s of seatings) { out.set(s.table_name, summarizeBillPrints(rows, s)); }
+  for (const s of seatings) {
+    out.set(s.table_name, { ...summarizeBillPrints(rows, s), paper: latestBillPaper(rows, s) });
+  }
   return out;
+}
+
+// --- What a printed bill SAID (migration 055, client items 1 and 2) -----------
+//
+// bill_paper_digest.ts argues the design. Everything below reads and writes the
+// four columns, and degrades — as 053 does — to "exactly as before this
+// feature" when they are not there: no digest is written, none is read, every
+// paper is "unknown", and a waiter's second print is a senior's, as on 2.0.1.
+
+/**
+ * Migration 055, statement for statement (print_job_paper_digest.test.ts holds
+ * the file to these). The runtime issues them itself because production
+ * connects as the table owner — see ensurePrintJobPaperColumns for how.
+ */
+export const PRINT_JOB_PAPER_DDL: readonly string[] = [
+  `alter table "PrintJobs" add column if not exists bill_digest text`,
+  `alter table "PrintJobs" add column if not exists lines_digest text`,
+  `alter table "PrintJobs" add column if not exists bill_grand_total numeric(12,2)`,
+  `alter table "PrintJobs" add column if not exists table_name text`,
+];
+
+const PRINT_JOB_PAPER_COLUMNS = ["bill_digest", "lines_digest", "bill_grand_total", "table_name"] as const;
+
+// THE LATCH, in nextPartyReady's shape: asked of information_schema, because a
+// 42703 inside an open transaction aborts it. PRESENT is remembered for good;
+// ABSENT is re-asked after a minute, because 055 may be applied by hand while
+// this process runs.
+let printJobPaperColumns: { present: boolean; checkedAt: number } | null = null;
+const PRINT_JOB_PAPER_REPROBE_MS = 60_000;
+
+async function countPrintJobPaperColumns(): Promise<number> {
+  const rows = await runQuery<{ n: unknown }>(
+    `select count(*)::int as n from information_schema.columns
+      where table_schema = 'public' and table_name = 'PrintJobs'
+        and column_name = any($1::text[])`,
+    [[...PRINT_JOB_PAPER_COLUMNS]],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
+/**
+ * Add whichever of the four is missing — ONLY those, and under a 2-second
+ * LOCAL lock timeout inside the one statement. "PrintJobs" is written by every
+ * docket and every ack, and ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE
+ * even when it has nothing to do, so a blanket re-run would queue the kitchen
+ * behind it (the 2026-08-24 standstill's shape). NEVER inside a transaction: a
+ * DDL rolled back with its caller would leave the latch believing it happened.
+ */
+async function ensurePrintJobPaperColumns(): Promise<void> {
+  if ((tenantStorage.getStore()?.txnDepth ?? 0) > 0) {return;}
+  const adds = PRINT_JOB_PAPER_DDL.map((sql, i) => `
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'PrintJobs'
+                             and column_name = '${PRINT_JOB_PAPER_COLUMNS[i]}') then
+             ${sql};
+           end if;`).join("");
+  await ensureLazyTable("PrintJobs.paper_digest", async () => {
+    await runQuery(`do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);${adds}
+         end $$`);
+  });
+}
+
+/** Are the four columns there? Adds them first when this is a connection that may. */
+async function printJobPaperReady(): Promise<boolean> {
+  const now = Date.now();
+  const known = printJobPaperColumns;
+  if (known && (known.present || now - known.checkedAt < PRINT_JOB_PAPER_REPROBE_MS)) {return known.present;}
+  let present = false;
+  try {
+    present = (await countPrintJobPaperColumns()) === PRINT_JOB_PAPER_COLUMNS.length;
+    if (!present && (tenantStorage.getStore()?.txnDepth ?? 0) === 0) {
+      try {
+        await ensurePrintJobPaperColumns();
+      } catch (err) {
+        logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_ensure_failed");
+      }
+      present = (await countPrintJobPaperColumns()) === PRINT_JOB_PAPER_COLUMNS.length;
+    }
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_probe_failed");
+  }
+  if (!present && known?.present !== false) {
+    logger.warn("Printed-bill fingerprints are OFF — migration 055 is not applied here and this role could not add it. A waiter's second print stays a senior's, exactly as before.");
+  }
+  printJobPaperColumns = { present, checkedAt: now };
+  return present;
+}
+
+/** A read or write answered 42703 although the latch said present: believe the database. */
+function notePrintJobPaperMissing(): void {
+  printJobPaperColumns = { present: false, checkedAt: Date.now() };
+}
+
+/** Test seam (jest only): forget what the latch learned. */
+export function resetPrintJobPaperCache(): void {
+  printJobPaperColumns = null;
+  ddlEnsured.delete("PrintJobs.paper_digest");
+}
+
+/**
+ * Boot-time half — before the listener, outside any transaction, the step
+ * 048 and 050-053 already have. Never throws; answers whether the feature is ON.
+ */
+export async function InitPrintJobPaperSchema(): Promise<boolean> {
+  printJobPaperColumns = null;
+  try {
+    return await printJobPaperReady();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * FILE WHAT A BILL PRINT SAID, beside the job(s) that printed it.
+ *
+ * A follow-up UPDATE by job id rather than four more columns on the insert:
+ * EnqueuePrintJob's statement shapes are the print router's, and the lease they
+ * write is the reason each is exactly what it is. The instant between the
+ * insert and this update reads as "unknown", which fails closed (a waiter's
+ * reprint is a senior's) — the direction C3 already chose.
+ *
+ * NEVER THROWS AND NEVER FAILS THE PRINT: the paper is already out. A missing
+ * ledger (027) or missing columns (055) write nothing and answer false.
+ */
+export async function RecordBillPrintPaper(
+  restaurantId: string,
+  jobIds: readonly (string | null | undefined)[],
+  paper: BillPaperRecord,
+): Promise<boolean> {
+  const ids = [...new Set(jobIds.map((id) => String(id ?? "").trim()).filter((id) => isUuid(id)))];
+  if (ids.length === 0) {return false;}
+  try {
+    const context = await requireRestaurantContext(restaurantId);
+    if (!(await printJobPaperReady())) {return false;}
+    await runQuery(
+      `update "PrintJobs"
+          set bill_digest = $3, lines_digest = $4, bill_grand_total = $5, table_name = $6
+        where res_id = $1 and id = any($2::uuid[])`,
+      [context.res_id, ids, paper.bill_digest, paper.lines_digest, paper.bill_grand_total, paper.table_name],
+    );
+    return true;
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === "42703") {notePrintJobPaperMissing();}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_record_failed");
+    return false;
+  }
+}
+
+/**
+ * THE SAME PAPER, SENT TO A THERMAL PRINTER TOO — the web print page's
+ * "Print ESC/POS" (POST /publish/bill) after its claim.
+ *
+ * The page renders its bytes from the claim's own `printable_bill`, so the
+ * publish is the claim's paper again. Its job is a counted print of the same
+ * bill id and the NEWER one, so without this it became "the paper" with nothing
+ * recorded: paper_stale went unknown and a waiter could never print the updated
+ * bill for that seating. The record is copied from the claim's job, never
+ * re-taken from the bill as it is now — the bytes are the claim's, and a bill
+ * that changed in between must still read stale.
+ *
+ * Only between two bill jobs of this tenant filed under the SAME bill_id: a
+ * job id from another bill (or another restaurant) copies nothing. Never
+ * throws, like RecordBillPrintPaper.
+ */
+export async function CopyBillPrintPaper(restaurantId: string, fromJobId: string, toJobId: string): Promise<boolean> {
+  const from = String(fromJobId ?? "").trim();
+  const to = String(toJobId ?? "").trim();
+  if (!isUuid(from) || !isUuid(to) || from === to) {return false;}
+  try {
+    const context = await requireRestaurantContext(restaurantId);
+    if (!(await printJobPaperReady())) {return false;}
+    const rows = await runQuery<{ id: string }>(
+      `update "PrintJobs" t
+          set bill_digest = f.bill_digest, lines_digest = f.lines_digest,
+              bill_grand_total = f.bill_grand_total, table_name = f.table_name
+         from "PrintJobs" f
+        where t.res_id = $1 and t.id = $3::uuid and t.kind = $4
+          and f.res_id = $1 and f.id = $2::uuid and f.kind = $4
+          and f.bill_id = t.bill_id
+        returning t.id`,
+      [context.res_id, from, to, BILL_PRINT_JOB_KIND],
+    );
+    return rows.length > 0;
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === "42703") {notePrintJobPaperMissing();}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "print_job_paper_copy_failed");
+    return false;
+  }
+}
+
+/**
+ * The lines one stored order puts on its table's paper, in the shape
+ * bill_paper_digest.ts fingerprints — read EXACTLY as GetBillForTable reads
+ * them (the `items` list, the name fallback, the price, the whole-number
+ * quantity, the comp flag and the snapshotted variation), so the floor tile's
+ * lines digest and the print's are one function of the same lines.
+ */
+function paperLinesOfFood(food: unknown): PaperLine[] {
+  const f = parseJsonObject(food) ?? {};
+  const list = Array.isArray((f).items) ? (f as { items: unknown[] }).items : [];
+  return list.map((raw) => {
+    const it = (raw ?? {}) as Record<string, unknown>;
+    return {
+      name: String(it.name ?? "Item"),
+      price: parseNumeric(it.price),
+      quantity: Math.max(1, Math.round(parseNumeric(it.quantity) || 1)),
+      nc: isNonChargeableLine(it),
+      variation: String(it.variation_name ?? "").trim(),
+    };
+  });
 }
 
 export async function AddBooking(
@@ -5871,7 +6196,7 @@ export async function GetTables(
   time?: string | Date | null,
   /** Internal: false on the one re-read after a backfill made a seat. */
   opts: { backfillNextParty?: boolean } = {},
-): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null; parent_table: string | null; party_no: number | null; display_name: string }[] | null> {
+): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null; paper_stale: boolean | null; printed_as: string | null; parent_table: string | null; party_no: number | null; display_name: string }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
 
@@ -6034,9 +6359,20 @@ export async function GetTables(
   // rung as non-chargeable). "There is an order" and "the order is worth
   // something" are different questions and the floor plan asks the first one.
   const orderedTables = new Set<string>();
+  // The lines each table's paper would print now (migration 055), so a printed
+  // tile can say the paper is out of date. Collected from the rows already read;
+  // fingerprinted below only for tables that have been printed.
+  const paperLinesByTable = new Map<string, PaperLine[]>();
+  // ...and when each still-owing order ARRIVED on its table (orderArrivedAt), for
+  // the seating bound below: a moved ticket arrived at the move.
+  const firstArrivalByTable = new Map<string, number>();
+  const tableNameById = new Map(tableRows.map((r) => [r.id, r.table_name]));
   for (const o of activeOrders) {
     if (!o.table_id) {continue;}
     orderedTables.add(o.table_id);
+    const lines = paperLinesByTable.get(o.table_id) ?? [];
+    lines.push(...paperLinesOfFood(o.food));
+    paperLinesByTable.set(o.table_id, lines);
     const p = parseJsonObject(o.food) ?? {};
     const t = parseNumeric(p.total) > 0 ? parseNumeric(p.total) : parseNumeric(p.subtotal);
     totalByTable.set(o.table_id, (totalByTable.get(o.table_id) ?? 0) + t);
@@ -6044,6 +6380,11 @@ export async function GetTables(
     if (Number.isFinite(placed)) {
       const seen = firstOrderAtByTable.get(o.table_id);
       if (seen === undefined || placed < seen) { firstOrderAtByTable.set(o.table_id, placed); }
+    }
+    const arrived = orderArrivedAt(p, tableNameById.get(o.table_id) ?? "", o.created_at);
+    if (arrived !== null) {
+      const seen = firstArrivalByTable.get(o.table_id);
+      if (seen === undefined || arrived < seen) { firstArrivalByTable.set(o.table_id, arrived); }
     }
   }
 
@@ -6058,16 +6399,23 @@ export async function GetTables(
   // the defect C3 exists to remove. bill_print_state.ts holds the rule and BOTH
   // payloads reduce through it.
   //
-  // The seating bound is the EARLIER of the open bill's created_at and the
-  // earliest still-owing order — exactly GetBillForTable's, through the same
-  // seatingStartOf, so the grid and the sheet can never disagree about whether a
-  // print belongs to this party. A table with neither has nothing to have
-  // printed, so it is left out of the read entirely rather than dropping the
-  // time bound for the whole floor.
+  // The seating bound is exactly GetBillForTable's, through the same
+  // seatingStartFor: the open seating (one read for the whole floor), the open
+  // bill's created_at and the earliest still-owing order's arrival — so the grid
+  // and the sheet can never disagree about whether a print belongs to this
+  // party. A table with none of them has nothing to have printed, so it is left
+  // out of the read entirely rather than dropping the time bound for the whole
+  // floor.
+  const seatingByTable = await openSeatingStarts(context, null);
   const printSeatings: BillPrintSeating[] = [];
   for (const row of tableRows) {
     const bill = openBillByTable.get(row.id) ?? null;
-    const start = seatingStartOf(bill?.created_at ?? null, firstOrderAtByTable.get(row.id) ?? null);
+    const start = seatingStartFor({
+      sessionSeatedAt: row.is_occupied ? (seatingByTable.get(row.id) ?? null) : null,
+      billCreatedAt: bill?.created_at ?? null,
+      firstOrderAt: firstOrderAtByTable.get(row.id) ?? null,
+      firstArrivalAt: firstArrivalByTable.get(row.id) ?? null,
+    });
     if (start === null) { continue; }
     printSeatings.push({ open_bill_id: bill?.id ?? null, table_name: row.table_name, seating_start: start });
   }
@@ -6076,7 +6424,7 @@ export async function GetTables(
   // everything else for the same reason — a grid that 500s is a worse outage
   // than a print flag that reads 0.
   const printStateByTable = await billPrintStateForSeatings(context, printSeatings)
-    .catch(() => new Map<string, BillPrintState>());
+    .catch(() => new Map<string, SeatingPrintState>());
 
   // The outlet's chosen section order (migration 041), so the floor plan groups
   // in the order the owner arranged rather than alphabetically.
@@ -6165,7 +6513,7 @@ export async function GetTables(
     const tCovers = Math.max(1, parseNumeric(row.num_covers) ?? 1);
     const tTotal = totalByTable.get(row.id) ?? 0;
     const tApc = occupied && tTotal > 0 ? round2(tTotal / tCovers) : 0;
-    const prints = printStateByTable.get(row.table_name) ?? NO_BILL_PRINTS;
+    const prints = printStateByTable.get(row.table_name) ?? NO_SEATING_PRINTS;
     // A sibling is a second seat at the SAME table: it sits in the root's zone
     // and carries the root's booking state. Its occupancy, money, covers, OTP,
     // QR and print state are its OWN — that is the entire point of the row.
@@ -6245,6 +6593,19 @@ export async function GetTables(
       print_count: prints.print_count,
       bill_printed_at: prints.bill_printed_at,
       printed_at: prints.printed_at,
+      // CLIENT ITEMS 1 AND 2 (migration 055). A printed table stays on a
+      // waiter's floor now, in orange, and more can be added to its bill — so
+      // the tile has to be able to say "the paper is out of date, print it
+      // again". Decided from the LINES alone (bill_paper_digest.ts says why the
+      // floor cannot price forty ladders); a discount or a waiver changed after
+      // the print shows on the bill sheet and at the print gate instead. Null
+      // when nothing was printed or the print's content is unknown. NOT money.
+      paper_stale: prints.print_count > 0
+        ? paperStale(billLinesDigest(paperLinesByTable.get(row.id) ?? []), prints.paper?.lines_digest)
+        : null,
+      // The name on that paper when it is not this table's (a moved party):
+      // "Printed as 12" on the tile at 20.
+      printed_as: prints.print_count > 0 ? printedAsName(prints.paper?.table_name, row.table_name) : null,
     };
   });
 }
@@ -11889,6 +12250,9 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
   // never come back with durations that imply the response took a second to
   // build. It is also what `as_of` on each clock refers to.
   const clockNowMs = Date.now();
+  // A dish-move ticket's KOT number(s) as recorded on the ticket itself, for
+  // the rows no docket carried one for — see the KOT block below.
+  const movedKotNosById = new Map<string, number[]>();
 
   const result = rows.map((row) => {
     const payload = parseJsonObject(row.food) ?? {};
@@ -11994,7 +12358,18 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
       // clock there would report a table as finished while the money is still
       // outstanding and the guests are still sitting there.
       service: serviceClock({ placed_at: row.created_at, settled_at: row.closed_at }, clockNowMs),
+      // CLIENT ITEM 4 — WHERE THIS TICKET CAME FROM, AND WHAT LEFT IT.
+      // `moved_from` / `moved_at` name the table a moved ticket (or a moved
+      // dish's new ticket) came from, so the table sheet can say "KOT 65 · from
+      // 12"; `emptied_by` and `moved_items` let a ticket a dish move emptied
+      // say "Moved to 31: 1 × NOT YOUR PUCHKA" instead of "Cancelled · 0 item(s)".
+      // ADDITIVE and absent on an order that never moved. Names, sizes and
+      // quantities only — no price leaves through here, so the waiter
+      // redaction (price_scope.ts) has nothing to add.
+      ...orderMoveProvenance(payload),
     };
+    const movedKots = movedFromKotNos(payload);
+    if (movedKots.length > 0) { movedKotNosById.set(row.id, movedKots); }
 
     // include flattened and split representations if available
     if (items_split) {
@@ -12041,6 +12416,13 @@ export async function GetOrders(restaurantId: string, station?: string): Promise
         if (nos && nos.length > 0) { order.kot_nos = nos; }
       }
     }
+  }
+  // CLIENT ITEM 4 — a dish moved while dockets were off (or whose docket did
+  // not print) still reads under the number the kitchen cooked it as, rather
+  // than falling into "No KOT number". Printed numbers always win.
+  for (const order of visible) {
+    const moved = movedKotNosById.get(order.id);
+    if (moved && !(order.kot_nos && order.kot_nos.length > 0)) { order.kot_nos = moved; }
   }
 
   return visible;
@@ -14252,6 +14634,13 @@ export async function UpdateOrderItemsSplit(
      * bills off is not a stricter gate; it is a broken screen.
      */
     isAdmin?: boolean;
+    /**
+     * Who is asking, for client item 3: a waiter-only login may not take a
+     * line off an order the kitchen has been told about (DELETE
+     * /orders/:id/items/:itemId). Only a write that TAKES A LINE OFF is judged;
+     * moving a line between Served and Preparing, or adding one, is not.
+     */
+    actor?: RoleScopeInput | null;
   },
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
@@ -14317,6 +14706,19 @@ export async function UpdateOrderItemsSplit(
     (parseJsonObject(r) ?? {}) as { price?: unknown; quantity?: unknown; nc?: unknown });
   const repricedSubtotal = chargeableSubtotal(moneyLines);
   const repricedNc = nonChargeableValue(moneyLines);
+
+  // CLIENT ITEM 3 — A WAITER DOES NOT TAKE FOOD OFF A TICKET. Decided on what
+  // this write takes off (linesTakenOff, the same list stamped below) and the
+  // status the order holds now; the write further down is pinned to that
+  // status, so an approval landing in between refuses rather than slipping by.
+  const takenOff = linesTakenOff(previousLines, flattened as unknown[]);
+  const waiterStrip = takenOff.length > 0 && opts?.actor != null && isWaiterOnly(opts.actor);
+  // The status is read only for the one caller the rule applies to, so every
+  // other edit issues exactly the statements it always did.
+  if (waiterStrip && opts?.actor != null
+      && !(await waiterMayCancel(context, opts.actor, orderId, await readOrderStatusCode(context, orderId)))) {
+    throw new CancelNeedsSeniorError(orderId, "remove_line");
+  }
 
   // ==========================================================================
   // THE WRITE-OFF GATE. See this function's header for the rule and the reuse.
@@ -14416,7 +14818,6 @@ export async function UpdateOrderItemsSplit(
   // release later cancels. Without the stamp its Void KOT row named no dish and
   // counted no value. Moving a line between Served and Preparing, or adding one,
   // takes nothing off and stamps nothing. See linesTakenOff.
-  const takenOff = linesTakenOff(previousLines, flattened as unknown[]);
   const { nc_subtotal: _staleNc, ...payloadRest } = payload;
   const newPayload = stampLineRemoval(
     {
@@ -14452,6 +14853,7 @@ export async function UpdateOrderItemsSplit(
       where id = $3 and res_id = $4 and outlet_id = $5
         and ${stillOwesStatusSql()}
         and coalesce(status::text, '1') <> '6'
+        and ($7::text is null or coalesce(status::text, '1') = $7::text)
         and coalesce((
               select string_agg(coalesce(x ->> 'nc_id', ''), ',' order by coalesce(x ->> 'nc_id', '') collate "C")
                 from jsonb_array_elements(
@@ -14460,8 +14862,20 @@ export async function UpdateOrderItemsSplit(
                where x -> 'nc' = 'true'::jsonb
             ), '') = $6
       returning id`,
-    [JSON.stringify(newPayload), toOrderStatusCode(newStatus), orderId, context.res_id, context.outlet_id, ncFlagSignature(previousLines)],
+    [JSON.stringify(newPayload), toOrderStatusCode(newStatus), orderId, context.res_id, context.outlet_id, ncFlagSignature(previousLines),
+      waiterStrip ? String(PENDING_ORDER_STATUS_CODE) : null],
   );
+  if (!written[0] && waiterStrip) {
+    // Settled, cancelled or awaiting payment approval since: the house words.
+    await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
+    // Accepted to the kitchen while this was being built: it is a ticket now.
+    // Still Pending means the pin was not what missed (a comp changed the
+    // lines), so the ordinary "changed on another screen" answer below is the
+    // true one — a "REFUSED" audit line would name an act nobody refused.
+    if ((await readOrderStatusCode(context, orderId)) !== PENDING_ORDER_STATUS_CODE) {
+      throw new CancelNeedsSeniorError(orderId, "remove_line");
+    }
+  }
   if (!written[0]) {
     // Settled, cancelled or awaiting approval in the meantime: the house words.
     await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
@@ -14533,6 +14947,17 @@ async function consumeInventory(restaurantId: string, context: RestaurantContext
 export async function AddOrder(
   restaurantId: string,
   order: Partial<OrderRecord>,
+  opts?: {
+    /**
+     * Who is asking, for client item 3. POST /orders is also the dashboard's
+     * upsert, and an upsert that names an existing order with status
+     * "Cancelled" is a cancel by another door — one that recorded no reason, no
+     * void row and no slip. A waiter-only login is refused it on a ticketed
+     * order exactly as the status route refuses it. Absent = no role rule (the
+     * guest page, the queue seat, every internal caller).
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<{ id: string }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
@@ -14581,9 +15006,9 @@ export async function AddOrder(
   }
 
   const id = isUuid(String(order.id ?? "")) ? String(order.id) : randomUUID();
-  const existingOrderRows = await runQuery<{ food: unknown; barked_at: Date | string | null }>(
+  const existingOrderRows = await runQuery<{ food: unknown; barked_at: Date | string | null; status: unknown }>(
     `
-      select food, barked_at
+      select food, barked_at, status
       from "Orders"
       where id = $1 and res_id = $2 and outlet_id = $3
       limit 1
@@ -14750,6 +15175,37 @@ export async function AddOrder(
     }
   }
 
+  // CLIENT ITEM 3 — THE UPSERT DOOR. Judged on the status this write will
+  // actually store (the merge above turns a resend that adds lines back into
+  // Preparing), against the status the order holds now, before anything is
+  // written.
+  const storedCode = isNewOrder ? null : Number(existingOrderRows[0]?.status ?? 1);
+  const upsertActor = !isNewOrder && opts?.actor != null && isWaiterOnly(opts.actor) ? opts.actor : null;
+  // NEVER BACK TO PENDING FOR A WAITER-ONLY LOGIN (mayPutBackToPending) — and
+  // here, unlike PATCH /orders/:id/status, the stage the body names is KEPT
+  // rather than refused. This route is also the dashboard's whole-order save,
+  // which resends whatever status the screen last read: an edit made from a
+  // list that still said Pending after the ticket was accepted is an ordinary
+  // edit, not an attempt to un-ticket it, so it lands on the stage the order
+  // really has. What it can no longer do is make a ticket look Pending, which
+  // was the first half of a two-request cancel.
+  if (upsertActor !== null && storedCode !== null && statusCode === PENDING_ORDER_STATUS_CODE
+      && !mayPutBackToPending(upsertActor, storedCode)) {
+    statusCode = storedCode;
+    (order as any).status = fromOrderStatusCode(storedCode);
+  }
+  if (!isNewOrder && statusCode === 5 && opts?.actor != null && storedCode !== 5
+      && !(await waiterMayCancel(context, opts.actor, id, storedCode))) {
+    throw new CancelNeedsSeniorError(id);
+  }
+  // …and whenever the waiter rule rested on "still Pending", the write says so,
+  // as SetOrderStatus's does: a decline (or a Pending resend) that arrives after
+  // an acceptance matches nothing and is answered below, instead of cancelling
+  // the ticket that has just printed or putting it back to Pending.
+  const upsertPin = upsertActor !== null && (statusCode === 5 || statusCode === PENDING_ORDER_STATUS_CODE)
+    ? String(PENDING_ORDER_STATUS_CODE)
+    : null;
+
   // SECURITY: never bill a staff-entered line below its menu price, and never
   // trust the client's subtotal/total. A waiter posting {price: 390 x3, total: 1}
   // used to settle 1,170 of food for ₹1.16 while the bill still printed all three
@@ -14840,8 +15296,36 @@ export async function AddOrder(
         : (typeof existingPayload.delivery_address === "string" ? existingPayload.delivery_address : null),
   };
   if (itemsSplitForStore !== undefined) {payload.items_split = itemsSplitForStore;}
+  // CLIENT ITEM 4 — WHERE THIS TICKET CAME FROM SURVIVES AN EDIT. The payload
+  // above is rebuilt from scratch, so without this a status change or an edit
+  // resent through this upsert would wipe the move history MoveOrderToTable
+  // and MoveBillItem stamped, and the table sheet would stop saying "from 12".
+  // SERVER-OWNED: only ever carried from the stored row, never read off the
+  // request.
+  //
+  // THE GUEST'S GSTIN AND ADDRESS ARE THE SAME KIND OF KEY. Only
+  // SetBillCustomerName and SetClosedBillCustomerDetails write them; the web's
+  // "Update Order" and "Bill Verification" resend whole orders through this
+  // upsert, and rebuilding the payload wiped both — the running bill (which
+  // reads them off the orders) then printed neither, and the paper fingerprint
+  // turned stale, so a waiter's UPDATED BILL dropped the guest's address. A
+  // copy in the request body is ignored, exactly as before.
+  for (const key of ["moves", "moved_from", "moved_items", "emptied_by", "customer_gstin", "customer_address"] as const) {
+    if (existingPayload[key] !== undefined) {payload[key] = existingPayload[key];}
+  }
+  // WHEN IT ARRIVED ON ITS TABLE (ORDER_TABLE_SINCE_KEY), which the settled-bill
+  // window reads. Kept while the resend names the table the order is on; a
+  // resend that puts it on ANOTHER table is itself a move, and arrives now.
+  if (!isNewOrder) {
+    const storedTable = String(existingPayload.table ?? "").trim().toLowerCase();
+    if (storedTable !== "" && storedTable !== tableName.toLowerCase()) {
+      payload[ORDER_TABLE_SINCE_KEY] = new Date().toISOString();
+    } else if (existingPayload[ORDER_TABLE_SINCE_KEY] !== undefined) {
+      payload[ORDER_TABLE_SINCE_KEY] = existingPayload[ORDER_TABLE_SINCE_KEY];
+    }
+  }
 
-  await runQuery(
+  const upserted = await runQuery<{ id: string }>(
     `
       insert into "Orders"
         (id, created_at, res_id, outlet_id, food, table_id, status, cust_id, barked_at)
@@ -14854,9 +15338,21 @@ export async function AddOrder(
         status = excluded.status,
         cust_id = coalesce(excluded.cust_id, "Orders".cust_id),
         barked_at = coalesce("Orders".barked_at, excluded.barked_at)
+      where $9::text is null or coalesce("Orders".status::text, '1') = $9::text
+      returning id
     `,
-    [id, context.res_id, context.outlet_id, JSON.stringify(payload), table.id, statusCode, customerId, barkedAt],
+    [id, context.res_id, context.outlet_id, JSON.stringify(payload), table.id, statusCode, customerId, barkedAt, upsertPin],
   );
+  // Only a pinned write can match nothing (an unpinned upsert always inserts or
+  // updates), so every other caller skips this.
+  if (upsertPin !== null && upserted.length === 0) {
+    // Declined, cancelled or settled on another screen: the house words.
+    await assertOrderStatusEditable(context, id);
+    // Accepted to the kitchen: a decline is now a cancel of a ticket…
+    if (statusCode === 5) {throw new CancelNeedsSeniorError(id);}
+    // …and a Pending resend is an edit of a ticket this screen has not seen.
+    throw new Error("This order was sent to the kitchen while it was being edited. Refresh it and try again.");
+  }
 
   // Ensure the Tables.row linked_order_id is updated to point to this order
   try {
@@ -14939,15 +15435,47 @@ export async function SetOrderCustomerId(
 export async function DeleteOrder(
   restaurantId: string,
   orderId: string,
+  opts?: {
+    /**
+     * The SESSION deleting, for client item 3. Deleting an order is the most
+     * complete way food stops being cooked (a CANCELLED slip prints), so a
+     * waiter-only login is refused a ticketed order here exactly as on every
+     * other cancelling door — even when a tenant has granted it "Delete Orders"
+     * (8c3f5b21), because the rule names the waiter, not a permission. Absent =
+     * no role rule (internal callers).
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<boolean> {
   const context = await requireRestaurantContext(restaurantId);
+  const id = orderId.trim();
+  const locked = opts?.actor != null && isWaiterOnly(opts.actor);
+  // The printed KOT numbers the waiter rule also asks, read BEFORE the
+  // transaction so it never holds a second pooled connection while its own is
+  // open (VoidOrderWithReason's reasoning). Only for a waiter-only login.
+  const printedKotNos = locked
+    ? ((await GetKotNumbersForOrders(context.res_id, context.outlet_id, [id])).get(id) ?? [])
+    : [];
   // Must return (and await via return) the transaction — a floating promise here
   // ran the DELETE detached on the request's pooled client (racing connection
   // release) and the route always saw `false` → a spurious 404 on every delete.
   return withTransaction(async (client) => {
     // "Permanently cancelled" means the row stays: deleting it would erase the
     // very record the audit-log undo needs to reverse.
-    await assertOrderNotCancelled(context, orderId.trim(), ORDER_CANCELLED_DELETE_MESSAGE, client);
+    await assertOrderNotCancelled(context, id, ORDER_CANCELLED_DELETE_MESSAGE, client);
+    // CLIENT ITEM 3. Inside the transaction, before the DELETE, with the row
+    // locked so it cannot be accepted to the kitchen between the read and the
+    // write: a refusal deletes nothing, and the route prints no slip.
+    if (locked) {
+      const statusRows = await runQuery<{ status: number | string | null }>(
+        `select status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1 for update`,
+        [id, context.res_id, context.outlet_id],
+        client,
+      );
+      if (statusRows[0] && !(await waiterMayCancel(context, opts!.actor!, id, Number(statusRows[0].status ?? 0), printedKotNos))) {
+        throw new CancelNeedsSeniorError(id);
+      }
+    }
     const rows = await runQuery<{ id: string }>(
       `
         delete from "Orders"
@@ -15091,6 +15619,34 @@ export interface RemovedBillLine {
 }
 
 /**
+ * The bill line a name-and-price request means — ONE rule, for the removal and
+ * for the move pre-read (GetMovableLineSources) alike, so the route resolves
+ * the KOT numbers of exactly the orders the move will then take lines from.
+ */
+function billLineMatcher(itemName: string, itemPrice: number): (it: unknown) => boolean {
+  const wantName = itemName.trim().toLowerCase();
+  return (raw: unknown) => {
+    const it = (raw ?? {}) as { name?: unknown; price?: unknown };
+    return String(it.name ?? "").trim().toLowerCase() === wantName &&
+      (!Number.isFinite(itemPrice) || itemPrice <= 0 || Math.abs((Number(it.price) || 0) - itemPrice) < 0.005);
+  };
+}
+
+/** One source order a move took lines off, with those lines WHOLE. */
+interface MovedLineSource {
+  order_id: string;
+  /** The source order's status column before the move. */
+  status: unknown;
+  barked_at: Date | string | null;
+  /** The source order's food as it stood before the move. */
+  food: Record<string, unknown>;
+  /** Every line taken off it, every key kept, price and quantity clamped. */
+  lines: Record<string, unknown>[];
+  /** Line id -> the Served/Preparing tuple it sat in, when the order had a split. */
+  splitLabels: Map<string, string> | null;
+}
+
+/**
  * WHY THIS RETURNS EVERY LINE AND NOT A SUMMARY — the money hole it closes.
  *
  * This helper matches on NAME, and matches on price only when the caller gave
@@ -15132,30 +15688,49 @@ async function removeItemFromTableOrders(
   itemPrice: number,
   client: PoolClient,
   mode: LineRemovalMode,
-): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number } | null> {
-  const orders = await runQuery<{ id: string; food: unknown }>(
-    `select id, food from "Orders"
+  /**
+   * A MOVE only (client item 4): where the lines go, stamped on the source as
+   * MOVED_LINES_KEY. `orderIdFor` names the destination order made for each
+   * source order.
+   */
+  moveTo?: { to_table: string; orderIdFor: (sourceOrderId: string) => string } | null,
+): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number; sources: MovedLineSource[] } | null> {
+  const orders = await runQuery<{ id: string; food: unknown; status: unknown; barked_at: Date | string | null }>(
+    `select id, food, status, barked_at from "Orders"
        where res_id = $1 and outlet_id = $2 and table_id = $3
          and ${stillOwesStatusSql()}
      order by created_at asc`,
     [context.res_id, context.outlet_id, tableId],
     client,
   );
-  const wantName = itemName.trim().toLowerCase();
-  const matches = (it: any) =>
-    String(it?.name ?? "").trim().toLowerCase() === wantName &&
-    (!Number.isFinite(itemPrice) || itemPrice <= 0 || Math.abs((Number(it?.price) || 0) - itemPrice) < 0.005);
+  const matches = billLineMatcher(itemName, itemPrice);
+
+  // A COMPED DISH IS NOT MOVED (client decision, 2026-09-17) — refused before a
+  // single row is touched. See comppedMoveRefusal for why the comp is reversed
+  // first rather than carried.
+  if (mode === "move") {
+    for (const o of orders) {
+      const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
+      const items: any[] = Array.isArray(f.items) ? f.items : [];
+      const hit = items.filter((it) => matches(it));
+      if (holdsComppedLine(hit)) {
+        throw new Error(comppedMoveRefusal(String(hit[0]?.name ?? itemName).trim() || itemName, String(f.table ?? "").trim() || "this table"));
+      }
+    }
+  }
 
   let removedName = "";
   let removedPrice = 0;
   let removedQty = 0;
   const removedLines: RemovedBillLine[] = [];
+  const sources: MovedLineSource[] = [];
 
   for (const o of orders) {
     const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
     const items: any[] = Array.isArray(f.items) ? f.items : [];
     const keep = items.filter((it) => !matches(it));
     if (keep.length === items.length) {continue;} // nothing removed from this order
+    const wholeLines: Record<string, unknown>[] = [];
     for (const it of items) {
       if (!matches(it)) {continue;}
       const lineName = String(it?.name ?? "Item");
@@ -15164,6 +15739,10 @@ async function removeItemFromTableOrders(
       const safe = clampLineCharge(it as { price?: unknown; quantity?: unknown });
       const lineQty = Math.max(1, Math.round(safe.quantity));
       removedLines.push({ name: lineName, price: safe.price, quantity: lineQty });
+      // The WHOLE line, for a move: the destination gets the dish as it was
+      // ordered — size, note, hold, menu id — at the price and quantity the
+      // money above was computed from, so the two can never disagree.
+      wholeLines.push(carriedLine((it ?? {}) as Record<string, unknown>, safe.price, lineQty));
       // The summary the existing callers and the audit line read. `price` is the
       // FIRST match rather than the last, so the name and the price in the audit
       // sentence describe the same line; `lines` is what money is computed from.
@@ -15171,9 +15750,18 @@ async function removeItemFromTableOrders(
       removedQty += lineQty;
     }
     let split = f.items_split;
+    let splitLabels: Map<string, string> | null = null;
     if (Array.isArray(split)) {
+      splitLabels = new Map();
+      for (const t of split) {
+        if (!Array.isArray(t) || !Array.isArray(t[1])) {continue;}
+        for (const it of t[1]) {
+          if (matches(it) && it?.id != null) {splitLabels.set(String(it.id), String(t[0] ?? ""));}
+        }
+      }
       split = split.map((t: any) => Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter((it: any) => !matches(it))] : t);
     }
+    sources.push({ order_id: o.id, status: o.status, barked_at: o.barked_at, food: { ...f }, lines: wholeLines, splitLabels });
     // OVER THE CHARGEABLE LINES (migration 034), as every other order writer
     // prices: summing a comped dish here charged it again the moment any other
     // dish came off the table. The quantity rule is unchanged.
@@ -15188,6 +15776,7 @@ async function removeItemFromTableOrders(
       mode,
       keep.length === 0,
       new Date().toISOString(),
+      moveTo ? { to_table: moveTo.to_table, to_order_id: moveTo.orderIdFor(o.id) } : null,
     );
     if (split !== undefined) {newFood.items_split = split;}
     if (keep.length === 0) {
@@ -15212,7 +15801,44 @@ async function removeItemFromTableOrders(
       [consolidated, openBill[0].id, context.res_id, context.outlet_id], client);
   }
   const value = round2(removedLines.reduce((sum, l) => sum + l.price * l.quantity, 0));
-  return { name: removedName || itemName, price: removedPrice, quantity: removedQty, lines: removedLines, value };
+  return { name: removedName || itemName, price: removedPrice, quantity: removedQty, lines: removedLines, value, sources };
+}
+
+/**
+ * WHICH ORDERS A MOVE-ITEM WILL TAKE LINES FROM, read BEFORE the move.
+ *
+ * POST /bills/move-item prints a docket for the moved dish under the number the
+ * kitchen already knows it by, and that number is found by the order's ticket
+ * key — a fingerprint of its item set, which stops matching the moment a line
+ * leaves. So the route asks this first, resolves the numbers, and only then
+ * moves (the same trap DELETE /orders/:id/items/:itemId reads around).
+ * Same statement and the same matcher as the move itself; a read only.
+ */
+export async function GetMovableLineSources(
+  restaurantId: string,
+  fromTable: string,
+  itemName: string,
+  itemPrice: number,
+): Promise<{ order_id: string; lines: Record<string, unknown>[] }[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tableId = await tableIdByName(context, fromTable);
+  if (!tableId) {return [];}
+  const rows = await runQuery<{ id: string; food: unknown }>(
+    `select id, food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and ${stillOwesStatusSql()}
+        order by created_at asc`,
+    [context.res_id, context.outlet_id, tableId],
+  );
+  const matches = billLineMatcher(itemName, itemPrice);
+  const out: { order_id: string; lines: Record<string, unknown>[] }[] = [];
+  for (const r of rows) {
+    const f = (parseJsonObject(r.food) ?? {}) as Record<string, unknown>;
+    const hit = (Array.isArray(f.items) ? (f.items as unknown[]) : []).filter((it) => matches(it));
+    if (hit.length === 0) {continue;}
+    out.push({ order_id: r.id, lines: hit.map((it) => ({ ...((it ?? {}) as Record<string, unknown>) })) });
+  }
+  return out;
 }
 
 // Admin: remove a wrongly-added item (by name+price) from a table's bill.
@@ -15289,8 +15915,10 @@ export async function RemoveBillItem(
     const tableId = await tableIdByName(context, tableName, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
-    const removed = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove");
-    if (!removed) {throw new Error("Item not found on this table's bill");}
+    const found = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove");
+    if (!found) {throw new Error("Item not found on this table's bill");}
+    // The whole source orders are the move's business, not this answer's.
+    const { sources: _sources, ...removed } = found;
     return { success: true, removed };
   });
 }
@@ -15392,18 +16020,33 @@ export async function SetBillItemNote(
  * field existed keeps renaming bills without wiping a GSTIN somebody else typed.
  * null or "" clears it. See writeCustomerGstinToFood for where it lives and
  * why, and billCustomerGstinColumnPresent for the 503 on an unmigrated database.
+ *
+ * ----------------------------------------------------------------------------
+ * CLIENT ITEM 7 — AND THE GUEST'S ADDRESS, BY THE SAME RULE
+ * ----------------------------------------------------------------------------
+ * `rawAddress` undefined leaves the address alone (every 2.0.1 till omits it);
+ * null or "" clears it; over 5 lines or 250 characters throws
+ * CustomerAddressInvalidError. It lives where the GSTIN does — beside the name
+ * on every still-owing order, and on the open "Bills" row when there is one —
+ * and migration 054 is its column (see the block beside the GSTIN's).
  */
 export async function SetBillCustomerName(
   restaurantId: string,
   tableName: string,
   rawName: string,
   rawGstin?: string | null,
-): Promise<{ success: true; customer: string | null; customer_gstin: string | null; orders_updated: number }> {
+  rawAddress?: string | null,
+): Promise<{ success: true; customer: string | null; customer_gstin: string | null; customer_address: string | null; orders_updated: number }> {
   const gstin = resolveCustomerGstinInput(rawGstin);
+  const address = resolveCustomerAddressInput(rawAddress);
   // Asked BEFORE the transaction opens, and of the catalogue rather than of the
   // column: a refused GSTIN write must refuse without having renamed anything.
   if (gstin !== undefined && !(await billCustomerGstinColumnPresent())) {
     throw new CustomerGstinSchemaPendingError();
+  }
+  // The same for the address and migration 054.
+  if (address !== undefined && !(await billCustomerAddressColumnPresent())) {
+    throw new CustomerAddressSchemaPendingError();
   }
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
@@ -15432,8 +16075,8 @@ export async function SetBillCustomerName(
       // "Guest" is what AddOrder writes when nobody typed a name, so CLEARING
       // restores that rather than leaving an empty header.
       const next = name || "Guest";
-      const newFood = writeCustomerGstinToFood({ ...f, customer: next }, gstin);
-      if (String(f.customer ?? "") === next && foodCustomerGstin(f) === foodCustomerGstin(newFood)) {continue;}
+      const newFood = writeCustomerAddressToFood(writeCustomerGstinToFood({ ...f, customer: next }, gstin), address);
+      if (String(f.customer ?? "") === next && sameCustomerIdentity(f, newFood)) {continue;}
       await runQuery(
         `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
         [o.id, context.res_id, context.outlet_id, JSON.stringify(newFood)],
@@ -15454,10 +16097,24 @@ export async function SetBillCustomerName(
         client,
       );
     }
+    // And the address, the same way (054). Its own statement, so a GSTIN-only
+    // or address-only edit names only the column it writes.
+    if (address !== undefined) {
+      await runQuery(
+        `update "Bills" set customer_address = $4
+           where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null`,
+        [tableId, context.res_id, context.outlet_id, address],
+        client,
+      );
+    }
     const current = gstin !== undefined
       ? gstin
       : (orders.map((o) => foodCustomerGstin(parseJsonObject(o.food) ?? {})).find((g) => g) || null);
-    return { success: true, customer: name || null, customer_gstin: current, orders_updated: updated };
+    // Unchanged: what the running bill reads (GetBillForTable), off the same orders.
+    const currentAddress = address !== undefined
+      ? address
+      : (orders.map((o) => foodCustomerAddress(parseJsonObject(o.food) ?? {})).find((a) => a) || null);
+    return { success: true, customer: name || null, customer_gstin: current, customer_address: currentAddress, orders_updated: updated };
   });
 }
 
@@ -15590,6 +16247,185 @@ async function readBillCustomerGstins(context: RestaurantContext, billIds: strin
   return out;
 }
 
+// --- Client item 7: the guest's address (migration 054) ---------------------
+//
+// EXACTLY THE GSTIN'S SHAPE, ONE FIELD OVER. It lives beside the name and the
+// GSTIN in "Orders".food (customer_address) on every order of the seating, and
+// in "Bills".customer_address (054) whenever there is a bill row to write it on.
+// The read rule is the GSTIN's: the running bill reads the orders alone; a
+// settled bill reads the row's column first, then its orders. Clearing strips
+// both carriers.
+//
+// ONLY THE DETAIL READS IT. The settled-bill LIST carries the name and the
+// GSTIN, not the address: less personal data on a screen that shows fifty
+// bills at once, and a lighter page. A client that edits from a list row
+// therefore does not know the address, and must not send one it was not given
+// (the omitted-means-unchanged rule is what keeps that safe).
+//
+// A DATABASE WITHOUT 054. Unlike 046, the runtime ADDS this column itself, once,
+// at boot (InitBillCustomerAddressSchema) — production connects as the table
+// owner. Where it cannot (a least-privilege runtime, or a lock it would not
+// wait for), everything below degrades the way the GSTIN does:
+//   * reads ask billCustomerAddressColumnPresent first, and still catch 42703;
+//   * an ADDRESS write is refused with CustomerAddressSchemaPendingError (503)
+//     before anything is written;
+//   * a name- or GSTIN-only write never asks.
+// No request path ever issues the ALTER: "Bills" is the hottest money table, and
+// DDL there from inside a settle is the 2026-08-24 standstill.
+
+/**
+ * undefined -> leave it alone; null -> clear; a string -> the normalized
+ * address. Throws CustomerAddressInvalidError for anything else (the routes
+ * validate first so the 400 carries the sentence; this is the data layer not
+ * trusting every future caller to).
+ */
+function resolveCustomerAddressInput(raw: unknown): string | null | undefined {
+  if (raw === undefined) {return undefined;}
+  const r = normalizeCustomerAddress(raw);
+  if (!r.ok) {throw new CustomerAddressInvalidError();}
+  return r.value;
+}
+
+/** The address an order's food blob carries, or "" — never "null"/"undefined". */
+function foodCustomerAddress(food: Record<string, unknown>): string {
+  const a = typeof food.customer_address === "string" ? food.customer_address.trim() : "";
+  return a.toLowerCase() === "null" || a.toLowerCase() === "undefined" ? "" : a;
+}
+
+/** A copy of `food` with the address set (string), removed (null) or untouched (undefined). */
+function writeCustomerAddressToFood(food: Record<string, any>, address: string | null | undefined): Record<string, any> {
+  if (address === undefined) {return food;}
+  const out = { ...food };
+  if (address) {out.customer_address = address;} else {delete out.customer_address;}
+  return out;
+}
+
+/** Do two food blobs carry the same GSTIN and address? (The name is compared by the caller.) */
+function sameCustomerIdentity(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return foodCustomerGstin(a) === foodCustomerGstin(b) && foodCustomerAddress(a) === foodCustomerAddress(b);
+}
+
+// THE LATCH, the GSTIN's (see billCustomerGstinColumnPresent): asked of
+// information_schema, PRESENT remembered for good, ABSENT re-asked after a
+// minute — 054 may be applied by hand while this process runs.
+let billCustomerAddressColumn: { present: boolean; checkedAt: number } | null = null;
+const BILL_CUSTOMER_ADDRESS_REPROBE_MS = 60_000;
+
+async function billCustomerAddressColumnPresent(): Promise<boolean> {
+  const now = Date.now();
+  const known = billCustomerAddressColumn;
+  if (known && (known.present || now - known.checkedAt < BILL_CUSTOMER_ADDRESS_REPROBE_MS)) {return known.present;}
+  let present = false;
+  try {
+    const rows = await runQuery<{ column_name: string }>(
+      `select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'Bills' and column_name = 'customer_address'`,
+    );
+    present = rows.length > 0;
+  } catch (err) {
+    logger.warn({ err }, "bill_customer_address_probe_failed");
+  }
+  if (!present && known?.present !== false) {
+    logger.warn("Guest address on bills is OFF — migration 054 is not applied here and this role could not add it. Bills print without it and an address write answers 503.");
+  }
+  billCustomerAddressColumn = { present, checkedAt: now };
+  return present;
+}
+
+/** Test seam (jest only): forget what the latch learned. */
+export function resetBillCustomerAddressColumnCache(): void {
+  billCustomerAddressColumn = null;
+}
+
+/**
+ * "Bills".customer_address for each bill id that has one. Empty when 054 is not
+ * there — including when the latch said it was and the column answered 42703,
+ * which flips the latch rather than failing the read.
+ *
+ * AUTOCOMMIT ONLY. A 42703 inside an open transaction aborts it, so every
+ * caller reads this outside one (GetClosedBill is a plain read;
+ * SetClosedBillCustomerDetails asks after its transaction has committed).
+ */
+async function readBillCustomerAddresses(context: RestaurantContext, billIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = billIds.filter((id) => isUuid(id));
+  if (ids.length === 0) {return out;}
+  if (!(await billCustomerAddressColumnPresent())) {return out;}
+  try {
+    const rows = await runQuery<{ id: string; customer_address: string | null }>(
+      `select id, customer_address from "Bills"
+        where res_id = $1 and id = any($2::uuid[]) and customer_address is not null`,
+      [context.res_id, ids],
+    );
+    for (const r of rows) {
+      const a = String(r.customer_address ?? "").trim();
+      if (a) {out.set(String(r.id), a);}
+    }
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code !== "42703") {throw err;}
+    billCustomerAddressColumn = { present: false, checkedAt: Date.now() };
+    logger.warn({ err: (err as { message?: string }).message }, "bill_customer_address_read_failed");
+  }
+  return out;
+}
+
+/**
+ * Migration 054's column, ONCE, at boot — before the listener, outside any
+ * transaction, the step 048, 050, 051, 052 and 053 already have.
+ *
+ * ONLY WHEN IT IS MISSING, because ADD COLUMN IF NOT EXISTS takes ACCESS
+ * EXCLUSIVE on "Bills" even when it has nothing to do; and under a 2-second
+ * LOCAL lock_timeout inside the one statement, so a settle still running on the
+ * container being replaced refuses this fast instead of queueing every bill
+ * read behind it (InitKotDocketSchema's reasoning, on a hotter table). A
+ * nullable column with no default is a catalogue-only change: no row is
+ * rewritten. The statement is migrations/054_bill_customer_address.sql's
+ * (bill_customer_address_migration.test.ts holds the two together).
+ *
+ * Never throws. False is loud and harmless: bills print exactly as 2.0.1 did,
+ * and an address write answers 503 until 054 is applied — the latch notices
+ * within a minute, no restart needed.
+ */
+export async function InitBillCustomerAddressSchema(): Promise<boolean> {
+  const present = async (): Promise<boolean> => {
+    const rows = await runQuery<{ n: number | string }>(
+      `select count(*)::int as n from information_schema.columns
+        where table_schema = 'public' and table_name = 'Bills' and column_name = 'customer_address'`,
+    );
+    return Number(rows[0]?.n ?? 0) === 1;
+  };
+  try {
+    if (!(await present())) {
+      await runQuery(
+        `do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'Bills'
+                             and column_name = 'customer_address') then
+             alter table "Bills" add column if not exists customer_address text;
+           end if;
+         end $$`,
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, "bill_customer_address_boot_ensure_failed — address writes answer 503 until migration 054 is applied");
+  }
+  try {
+    const ok = await present();
+    // Seeds the latch with what the catalogue says NOW, so the first address
+    // write of the process does not have to ask again.
+    billCustomerAddressColumn = { present: ok, checkedAt: Date.now() };
+    if (ok) {return true;}
+    logger.error("Bills.customer_address is MISSING and could not be added by this role — guest addresses cannot be saved until migration 054 is applied");
+    return false;
+  } catch (err) {
+    logger.warn({ err }, "bill_customer_address_probe_failed");
+    billCustomerAddressColumn = null;
+    return false;
+  }
+}
+
 /**
  * Round 2 item 1 — CHANGE THE NAME AND/OR GSTIN ON A PAST (SETTLED) BILL, from
  * Accounting.
@@ -15616,22 +16452,35 @@ async function readBillCustomerGstins(context: RestaurantContext, billIds: strin
  *
  * `rawGstin` undefined leaves the GSTIN alone (a name-only edit works before 046).
  * Returns null when there is no settled bill with this id for the tenant.
+ *
+ * CLIENT ITEM 7 — `rawAddress`, by the same rule (undefined leaves it alone, a
+ * name/GSTIN edit works before 054), written to the same orders and to the
+ * row's own column. Still nothing but identity: the write set gains one
+ * `set customer_address` statement and one more food key.
  */
 export async function SetClosedBillCustomerDetails(
   restaurantId: string,
   billId: string,
   rawName: string,
   rawGstin?: string | null,
-): Promise<{ success: true; bill_id: string; bill_no: string | null; table_name: string | null; customer: string | null; customer_gstin: string | null; orders_updated: number } | null> {
+  rawAddress?: string | null,
+): Promise<{ success: true; bill_id: string; bill_no: string | null; table_name: string | null; customer: string | null; customer_gstin: string | null; customer_address: string | null; orders_updated: number } | null> {
   const id = String(billId ?? "").trim();
   // Not a uuid is not a bill — answered as "not found" rather than letting the
   // uuid cast raise 22P02 as a 500.
   if (!isUuid(id)) {return null;}
   const gstin = resolveCustomerGstinInput(rawGstin);
+  const address = resolveCustomerAddressInput(rawAddress);
   if (gstin !== undefined && !(await billCustomerGstinColumnPresent())) {
     throw new CustomerGstinSchemaPendingError();
   }
-  return withTransaction(async (client) => {
+  if (address !== undefined && !(await billCustomerAddressColumnPresent())) {
+    throw new CustomerAddressSchemaPendingError();
+  }
+  // The settled-bill window reads "Orders".updated_at (settledWindowSql). Ensured
+  // BEFORE the transaction, so no DDL runs inside it.
+  await ensureRecordTimestampColumns();
+  const written = await withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     await ensureBillWorkflowColumns(client);
     const og = isAllOutlets() ? "true" : "false";
@@ -15661,8 +16510,8 @@ export async function SetClosedBillCustomerDetails(
     let updated = 0;
     for (const o of orders) {
       const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
-      const newFood = writeCustomerGstinToFood({ ...f, customer: next }, gstin);
-      if (String(f.customer ?? "") === next && foodCustomerGstin(f) === foodCustomerGstin(newFood)) {continue;}
+      const newFood = writeCustomerAddressToFood(writeCustomerGstinToFood({ ...f, customer: next }, gstin), address);
+      if (String(f.customer ?? "") === next && sameCustomerIdentity(f, newFood)) {continue;}
       await runQuery(
         `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
         [o.id, context.res_id, context.outlet_id, JSON.stringify(newFood)],
@@ -15674,6 +16523,13 @@ export async function SetClosedBillCustomerDetails(
       await runQuery(
         `update "Bills" set customer_gstin = $3 where id = $1 and res_id = $2`,
         [row.id, context.res_id, gstin],
+        client,
+      );
+    }
+    if (address !== undefined) {
+      await runQuery(
+        `update "Bills" set customer_address = $3 where id = $1 and res_id = $2`,
+        [row.id, context.res_id, address],
         client,
       );
     }
@@ -15691,27 +16547,71 @@ export async function SetClosedBillCustomerDetails(
       current = current ?? (orders.map((o) => foodCustomerGstin(parseJsonObject(o.food) ?? {})).find((g) => g) || null);
     }
     return {
-      success: true,
+      success: true as const,
       bill_id: row.id,
       bill_no: row.bill_no == null ? null : String(row.bill_no),
       table_name: row.table_name,
       customer: name || null,
       customer_gstin: current,
       orders_updated: updated,
+      // The orders' address, for the unchanged case below.
+      ordersAddress: orders.map((o) => foodCustomerAddress(parseJsonObject(o.food) ?? {})).find((a) => a) || null,
+      context,
     };
   });
+  if (!written) {return null;}
+  const { ordersAddress, context, ...result } = written;
+  // Unchanged: what the bill carries, by the read rule — the column, then the
+  // orders. Read AFTER the commit, on autocommit, because a stale latch that
+  // meets a 42703 must cost this answer its column, not the edit its commit.
+  const customerAddress = address !== undefined
+    ? address
+    : ((await readBillCustomerAddresses(context, [result.bill_id])).get(result.bill_id) ?? ordersAddress);
+  return { ...result, customer_address: customerAddress };
 }
 
 // Move a wrongly-placed item from one table to another: removes it from the
-// source bill and appends it as a fresh order on the destination (occupying it
-// if needed).
+// source bill and carries it, whole, to the destination (occupying it if
+// needed).
+//
+// CLIENT ITEM 4 — "IMPLEMENTED CORRECTLY". This used to rebuild each moved line
+// as a bare { id, name, price, quantity } on ONE new "Moved item" order, so the
+// size ("(Half)"), the kitchen note, the course hold, the menu id the docket
+// routes by, who took the order and — for a comped dish — the comp itself were
+// all lost, and the dish landed with no KOT number in the "not sent to the
+// kitchen" group while the source ticket read "Cancelled · 0 item(s)". Now:
+//
+//   * a comped line is REFUSED (removeItemFromTableOrders; comppedMoveRefusal);
+//   * each SOURCE order gets its own destination order, carrying its lines
+//     whole (carriedLine), its order-taker, channel and note, and `moved_from`
+//     naming the table, the order and the KOT number(s) it was cooked under;
+//   * the destination keeps the source's stage (Served stays Served, Pending
+//     stays Pending, anything else is Preparing) and the source's bark time;
+//   * the source records what left it and where (MOVED_LINES_KEY).
+//
+// `kotNosByOrder` is what the route resolved BEFORE the move (see
+// GetMovableLineSources): the number the kitchen knows each source ticket by.
+// The route prints the moved dish's docket under it once this has committed.
 export async function MoveBillItem(
   restaurantId: string,
   fromTable: string,
   toTable: string,
   itemName: string,
   itemPrice: number,
-): Promise<{ success: true; moved: { name: string; price: number; quantity: number } }> {
+  opts?: {
+    /** Who pressed it, recorded on the destination's `moved_from`. */
+    by?: string | null;
+    kotNosByOrder?: ReadonlyMap<string, readonly number[]> | null;
+  },
+): Promise<{
+  success: true;
+  /** The removal's summary, the shape this route has always answered with. */
+  moved: { name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number };
+  /** Every dish that moved: name, size, quantity. Never a price. */
+  items: MovedDish[];
+  /** One per source order: the order made on the destination for its lines. */
+  destinations: { order_id: string; source_order_id: string; kot_nos: number[]; items: MovedDish[] }[];
+}> {
   return withTransaction(async (client) => {
     await ensureTableOccupancyColumns(client);
     await ensureOrderBarkColumns();
@@ -15724,14 +16624,27 @@ export async function MoveBillItem(
     await assertBillEditable(context, fromId, client);
     await assertBillEditable(context, toId, client);
 
-    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client, "move");
+    // One destination order per source order, named before the removal so the
+    // source's record of where its lines went can carry the id.
+    const newIds = new Map<string, string>();
+    const orderIdFor = (sourceOrderId: string): string => {
+      const known = newIds.get(sourceOrderId);
+      if (known) {return known;}
+      const fresh = randomUUID();
+      newIds.set(sourceOrderId, fresh);
+      return fresh;
+    };
+    const at = new Date().toISOString();
+    const moved = await removeItemFromTableOrders(context, fromId, itemName, itemPrice, client, "move", {
+      to_table: toTable.trim(),
+      orderIdFor,
+    });
     if (!moved) {throw new Error("Item not found on the source table");}
 
     // Ensure the destination table is occupied so the order/bill attaches.
     await runQuery(`update "Tables" set is_occupied = true where id = $1 and res_id = $2 and outlet_id = $3`,
       [toId, context.res_id, context.outlet_id], client);
 
-    const newOrderId = randomUUID();
     // EVERY LINE THAT LEFT THE SOURCE, AT THE PRICE IT LEFT AT.
     //
     // This used to be a single line priced `moved.price x moved.quantity`, which
@@ -15741,28 +16654,59 @@ export async function MoveBillItem(
     // left the source at their real prices and arrived as two of the cheaper
     // one. See removeItemFromTableOrders' header for the money that went
     // missing. A move must CONSERVE: what the destination gains is exactly what
-    // the source lost, line for line.
-    const movedItems = moved.lines.map((l) => ({
-      id: randomUUID(), name: l.name, price: l.price, quantity: l.quantity,
-    }));
-    const lineTotal = round2(movedItems.reduce((sum, l) => sum + l.price * l.quantity, 0));
-    const food = {
-      id: newOrderId,
-      table: toTable.trim(),
-      customer: "Moved item",
-      items: movedItems,
-      subtotal: lineTotal,
-      total: lineTotal,
-      taxes: [],
-      applyServiceCharge: false,
-      status: "Preparing",
-    };
-    // A moved item was already barked/cooking on its source table — keep it so.
-    await runQuery(
-      `insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, barked_at) values ($1, now(), $2, $3, $4::json, $5, 1, now())`,
-      [newOrderId, context.res_id, context.outlet_id, JSON.stringify(food), toId],
-      client,
-    );
+    // the source lost, line for line — `source.lines` carry the same clamped
+    // price and quantity `moved.lines` summed.
+    const destinations: { order_id: string; source_order_id: string; kot_nos: number[]; items: MovedDish[] }[] = [];
+    for (const source of moved.sources) {
+      if (source.lines.length === 0) {continue;}
+      const newOrderId = orderIdFor(source.order_id);
+      const statusCode = movedOrderStatusCode(source.status);
+      const kotNos = [...(opts?.kotNosByOrder?.get(source.order_id) ?? [])];
+      const labels = source.splitLabels;
+      const food = movedDestinationFood({
+        orderId: newOrderId,
+        toTable: toTable.trim(),
+        lines: source.lines,
+        source: source.food,
+        statusLabel: fromOrderStatusCode(statusCode),
+        movedFrom: {
+          table: String(source.food.table ?? "").trim() || fromTable.trim(),
+          order_id: source.order_id,
+          kot_nos: kotNos,
+          at,
+          by: String(opts?.by ?? "").trim() || null,
+        },
+        splitLabelOf: labels ? (line) => labels.get(String(line.id ?? "")) ?? null : null,
+      });
+      // The source's bark time: the dish was already on the kitchen's clock (or
+      // was not), and moving it changes neither. A Served order with no bark
+      // time (written before the column existed) is stamped now, because an
+      // un-barked order may not stand past the kitchen queue.
+      //
+      // A TICKETED DISH IS STAMPED NOW TOO, as every moved dish was before
+      // 2.0.2, even when its source was never barked (the usual case: GGV
+      // barked 1 of 80 printed tickets in a fortnight). The kitchen has paper
+      // for it, and printKotItemMove re-dockets it under that number — a PINNED
+      // number, which memoises nothing for this new order. Left un-barked, both
+      // clients would offer "Bark → kitchen" on it, and the bark's
+      // autoPrintOrderKot would find no memo for (this table, this dish) and
+      // print the dish again under a NEW number: a second order, as far as the
+      // pass can tell. A barked order stops at BarkOrder's already_barked.
+      const barkedAt = source.barked_at
+        ? new Date(source.barked_at).toISOString()
+        : (statusCode === 2 || kotNos.length > 0 ? at : null);
+      await runQuery(
+        `insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, barked_at) values ($1, now(), $2, $3, $4::json, $5, $6, $7)`,
+        [newOrderId, context.res_id, context.outlet_id, JSON.stringify(food), toId, statusCode, barkedAt],
+        client,
+      );
+      destinations.push({
+        order_id: newOrderId,
+        source_order_id: source.order_id,
+        kot_nos: kotNos,
+        items: source.lines.map(movedDish),
+      });
+    }
 
     const toBill = await runQuery<{ id: string }>(
       `select id from "Bills" where table_id = $1 and res_id = $2 and outlet_id = $3 and closed_at is null order by created_at desc limit 1`,
@@ -15774,7 +16718,13 @@ export async function MoveBillItem(
       await runQuery(`update "Bills" set total_amt = $1, round_off = null where id = $2 and res_id = $3 and outlet_id = $4`,
         [consolidated, toBill[0].id, context.res_id, context.outlet_id], client);
     }
-    return { success: true, moved };
+    const { sources: _sources, ...summary } = moved;
+    return {
+      success: true,
+      moved: summary,
+      items: destinations.flatMap((d) => d.items),
+      destinations,
+    };
   });
 }
 
@@ -16513,8 +17463,11 @@ export async function MergeTableBills(
     for (const o of orders) {
       const f = (parseJsonObject(o.food) ?? {});
       f.table = destName;
+      // Stamped with when it ARRIVED on the destination (ORDER_TABLE_SINCE_KEY),
+      // so the destination's settled-bill window places it on this bill and not
+      // on the one its previous party paid before the merge.
       await runQuery(
-        `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+        `update "Orders" set table_id = $1, food = ${foodWithTableSinceSql("$2")} where id = $3 and res_id = $4 and outlet_id = $5`,
         [toId, JSON.stringify(f), o.id, context.res_id, context.outlet_id],
         client,
       );
@@ -16671,8 +17624,25 @@ export async function MoveTableParty(
   moved_session: boolean;
   /** True when a waiter assignment travelled with the party. */
   moved_waiter: boolean;
+  /**
+   * Client items 1 and 2: the moved party's bill has been printed (its paper
+   * came with them), so the route opens a green next-party seat at the
+   * destination. False on a database that cannot say.
+   */
+  printed: boolean;
+  /** The table name on that paper ("12" after 12 -> 20), or null when unknown / not printed. */
+  printed_as: string | null;
+  /** How many `<name>-<epoch>` print jobs were re-addressed to the destination. */
+  moved_prints: number;
+  /** The ids of the orders that travelled — for the route to name their KOTs. */
+  moved_order_ids: string[];
+  /** Their dishes (client item 4): name, size, quantity. Never a price. */
+  moved_items: MovedDish[];
 }> {
   const freed: FreedTable = { context: null, tableId: null };
+  // Asked BEFORE the transaction: the latch may add columns, which it never does
+  // inside one, and the family check below names 053's column only when it exists.
+  const withParty = await nextPartyReady();
   const out = await withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
@@ -16700,11 +17670,12 @@ export async function MoveTableParty(
       linked_order_id: string | null;
       order_otp: string | null;
       is_virtual: boolean;
+      parent_table_id?: string | null;
     }>(
       `select id, table_name, capacity, max_capacity,
               coalesce(is_occupied, false) as is_occupied,
               num_covers, linked_order_id, order_otp,
-              coalesce(is_virtual, false) as is_virtual
+              coalesce(is_virtual, false) as is_virtual${withParty ? ", parent_table_id" : ""}
          from "Tables"
         where res_id = $1 and outlet_id = $2
           and lower(btrim(table_name)) in (lower(btrim($3)), lower(btrim($4)))
@@ -16720,6 +17691,10 @@ export async function MoveTableParty(
     // A virtual row is the hidden table provisioned to back ONE takeaway or
     // delivery order. It is not somewhere a party can sit, in either direction.
     if (src.is_virtual || dst.is_virtual) {throw new Error("Takeaway and delivery orders are not seated at a table, so they cannot be moved this way");}
+    // "12" AND "12 #2" ARE ONE TABLE (client items 1 and 2). See sameTableFamily
+    // for what a move between them would do to the floor. Only asked with 053
+    // present: without it there are no families.
+    if (withParty && sameTableFamily(src, dst)) {throw new Error(sameFamilyMoveError(src.table_name, dst.table_name));}
     if (!src.is_occupied) {throw new Error(`${src.table_name} is not seated - there is no party to move.`);}
     if (dst.is_occupied) {
       throw new Error(
@@ -16753,9 +17728,16 @@ export async function MoveTableParty(
       throw new Error(`${dst.table_name} still has an open bill even though nobody is seated there. Release ${dst.table_name} first, then move.`);
     }
 
+    // 0. THE PAPER THIS PARTY WAS HANDED. Asked while the orders and the bill
+    //    are still on the source, because the seating that bounds it is the source's.
+    const { moved: movedPrints, start: partyStart } = await rekeyMovedPartyPrints(context, src, dst, client);
+
     // 1. THE ORDERS. table_id is what every reader joins on; `food.table` is the
     //    printed/displayed name and is carried in step with it so a KOT reprint,
-    //    the KDS card and the bill all say the same table.
+    //    the KDS card and the bill all say the same table. Each is stamped with
+    //    when it ARRIVED here (ORDER_TABLE_SINCE_KEY): the settled-bill window
+    //    reads that, not created_at, so these orders can never fall into the
+    //    bill of the party that sat here before.
     const orders = await runQuery<{ id: string; food: unknown }>(
       `select id, food from "Orders"
         where res_id = $1 and outlet_id = $2 and table_id = $3
@@ -16768,7 +17750,7 @@ export async function MoveTableParty(
       const f = parseJsonObject(o.food) ?? {};
       f.table = dst.table_name;
       await runQuery(
-        `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+        `update "Orders" set table_id = $1, food = ${foodWithTableSinceSql("$2")} where id = $3 and res_id = $4 and outlet_id = $5`,
         [dst.id, JSON.stringify(f), o.id, context.res_id, context.outlet_id],
         client,
       );
@@ -16832,6 +17814,18 @@ export async function MoveTableParty(
         client,
       );
       movedSession = true;
+    } else if (partyStart) {
+      // NO SEATING TO CARRY: the destination keeps the fresh row the trigger
+      // opened at the move — but the party sat down before that, and its paper
+      // (re-keyed above) was printed before it. Backdated to the start the
+      // retirement used, so the print bound the destination reads now is that
+      // one, and the party's own print still counts.
+      await runQuery(
+        `update "TableSessions" set seated_at = least(seated_at, $2::timestamptz)
+          where table_id = $1 and left_at is null`,
+        [dst.id, partyStart.toISOString()],
+        client,
+      );
     }
 
     // 4. THE WAITER. Re-pointed rather than re-assigned: assignTableById runs the
@@ -16872,12 +17866,271 @@ export async function MoveTableParty(
       moved_bill: movedBill.length > 0,
       moved_session: movedSession,
       moved_waiter: movedWaiter.length > 0,
+      moved_prints: movedPrints,
+      dst_id: dst.id,
+      moved_order_ids: orders.map((o) => o.id),
+      moved_items: orders.flatMap((o) => orderDishes(parseJsonObject(o.food) ?? {})),
     };
   });
   // The party LEFT the source: tidy its family (client item 6). Moving the
   // printed party at 12 to 15 frees 12, and "12 #2" is no longer needed.
   await afterTableFreed(freed);
+  // WAS THEIR BILL PRINTED? Read after the commit, through the SAME seating rule
+  // the floor and the print gate use, so "the destination is orange" is decided
+  // exactly as the next /get-tables will decide it. A read that fails is "not
+  // printed": the move has happened, and a missing green seat is what the floor
+  // read's backfill repairs.
+  const { dst_id: dstId, ...moved } = out;
+  let printed = false;
+  let printedAs: string | null = null;
+  try {
+    if (freed.context) {
+      const state = await currentSeatingPrintState(freed.context, { id: dstId, table_name: moved.to_table });
+      printed = state.prints.print_count > 0;
+      printedAs = printed ? (state.prints.paper?.table_name ?? null) : null;
+    }
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err, table: moved.to_table }, "move_party_print_state_failed");
+  }
+  return { ...moved, printed, printed_as: printedAs };
+}
+
+/**
+ * CARRY A MOVED PARTY'S FALLBACK-ADDRESSED PRINTS TO THE DESTINATION — inside
+ * the move's own transaction, so a move that rolls back leaves them where they
+ * were.
+ *
+ * A print of a table with no "Bills" row yet is filed as `<table>-<epoch>` (or
+ * `<table>-split-<i>of<n>`), and the print state matches it by the table's NAME
+ * (bill_print_state.ts). Production GGV filed 23 of its last 30 bill prints that
+ * way. A move carries the bill row — and with it every print addressed to the
+ * bill's id — but left these behind: the printed party arrived at 20 reading
+ * "not printed", a print there was a first print with no REPRINT banner, and the
+ * orange tile went green under a guest already holding paper.
+ *
+ * BOUNDED TWICE, because the name is shared with every party that ever sat at
+ * the source: by the SEATING START (seatingStartFor over this party's seating,
+ * bill and orders — the previous party's prints stay behind) and by the EXACT
+ * prefix and shape (`starts_with`, never LIKE, and only an epoch or a split
+ * suffix after it, so "12-A-…" is not 12's).
+ *
+ * THE DESTINATION'S HISTORY FIRST. The party keeps its seating and its bill
+ * row, so its seating starts before the move, and at the destination that bound
+ * counted every `<dst>-<epoch>` print made after it — the bill of the party
+ * that sat there, paid and left in the meantime (4 of the last 12 production
+ * moves). The destination is free with no open bill (checked above), so those
+ * prints are nobody's now: they are re-filed as `previous-party:<id>`
+ * (previousPartyPrintJobId) under the same two bounds, and only THEN is the
+ * party's own paper carried in, so it can never be retired with them.
+ *
+ * The start is returned: a party with no seating row to carry keeps its start
+ * on the fresh one the destination opens (MoveTableParty), so the bound the
+ * destination reads afterwards is the one the retirement used.
+ *
+ * IN A SAVEPOINT: a ledger that is not there (027 unapplied, or its grants
+ * missing) must not abort the move — it has no prints to carry. Any other
+ * failure does abort it: a printed party arriving unprinted is the defect.
+ */
+async function rekeyMovedPartyPrints(
+  context: RestaurantContext,
+  src: { id: string; table_name: string },
+  dst: { table_name: string },
+  client: PoolClient,
+): Promise<{ moved: number; start: Date | null }> {
+  // The source is occupied (MoveTableParty refuses otherwise) and
+  // "TableSessions" exists (ensured in the same transaction), so its open
+  // seating is read in the same statement.
+  const startRows = await runQuery<{
+    first_order_at: Date | null; bill_created_at: Date | null;
+    first_arrival?: Date | null; seated_at?: Date | null;
+  }>(
+    `select (select min(o.created_at) from "Orders" o
+              where o.res_id = $1 and o.outlet_id = $2 and o.table_id = $3
+                and ${stillOwesStatusSql("o.status")}) as first_order_at,
+            (select b.created_at from "Bills" b
+              where b.res_id = $1 and b.outlet_id = $2 and b.table_id = $3
+                and b.status != 3 and b.closed_at is null
+              order by b.created_at desc limit 1) as bill_created_at,
+            (select min(${orderArrivalSql({ food: "o.food", createdAt: "o.created_at", tableName: "$4" })}) from "Orders" o
+              where o.res_id = $1 and o.outlet_id = $2 and o.table_id = $3
+                and ${stillOwesStatusSql("o.status")}) as first_arrival,
+            (select max(s.seated_at) from "TableSessions" s
+              where s.table_id = $3 and s.left_at is null) as seated_at`,
+    [context.res_id, context.outlet_id, src.id, src.table_name],
+    client,
+  );
+  const start = seatingStartFor({
+    sessionSeatedAt: startRows[0]?.seated_at ?? null,
+    billCreatedAt: startRows[0]?.bill_created_at ?? null,
+    firstOrderAt: startRows[0]?.first_order_at ?? null,
+    firstArrivalAt: startRows[0]?.first_arrival ?? null,
+  });
+  // Nothing on the table: nothing this party can have printed.
+  if (start === null) {return { moved: 0, start: null };}
+  const from = billPrintFallbackPrefix(src.table_name);
+  const to = billPrintFallbackPrefix(dst.table_name);
+  await runQuery("savepoint move_party_print_rekey", [], client);
+  try {
+    await retirePreviousPartyPrints(context, dst.table_name, start, client);
+    const rows = await runQuery<{ id: string }>(
+      `update "PrintJobs"
+          set bill_id = $4 || substr(bill_id, length($3) + 1)
+        where res_id = $1 and outlet_id = $2 and kind = $5
+          and starts_with(bill_id, $3)
+          and substr(bill_id, length($3) + 1) ~ '^([0-9]+|split-[0-9]+of[0-9]+)$'
+          and created_at >= $6::timestamptz
+        returning id`,
+      [context.res_id, context.outlet_id, from, to, BILL_PRINT_JOB_KIND, start.toISOString()],
+      client,
+    );
+    await runQuery("release savepoint move_party_print_rekey", [], client);
+    return { moved: rows.length, start };
+  } catch (err) {
+    await runQuery("rollback to savepoint move_party_print_rekey", [], client);
+    if (!isCaptureTableMissing(err)) {throw err;}
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "move_party_print_rekey_skipped (print ledger unavailable)");
+    return { moved: 0, start };
+  }
+}
+
+/**
+ * RE-FILE A FREE TABLE'S PREVIOUS PARTIES' FALLBACK PRINTS as
+ * `previous-party:<old id>` — every `<table>-<epoch>` / `<table>-split-NofM`
+ * bill job made at or after `since`. Run inside the caller's transaction (and
+ * savepoint): by MoveTableParty for the destination it lands on, and by
+ * MoveOrderToTable when a ticket seats a free table. A free table with no open
+ * bill has nobody seated, so those papers are nobody's; left under the table's
+ * name, the arriving seating could count them as its own.
+ */
+async function retirePreviousPartyPrints(
+  context: RestaurantContext,
+  tableName: string,
+  since: Date,
+  client: PoolClient,
+): Promise<number> {
+  // $3 is the table's prefix; `$4 || bill_id` keeps the old id whole.
+  const retired = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set bill_id = $4 || bill_id
+      where res_id = $1 and outlet_id = $2 and kind = $5
+        and starts_with(bill_id, $3)
+        and substr(bill_id, length($3) + 1) ~ '^([0-9]+|split-[0-9]+of[0-9]+)$'
+        and created_at >= $6::timestamptz
+      returning id`,
+    [context.res_id, context.outlet_id, billPrintFallbackPrefix(tableName), PREVIOUS_PARTY_PRINT_MARK, BILL_PRINT_JOB_KIND, since.toISOString()],
+    client,
+  );
+  if (retired.length > 0) {
+    logger.info({ table: tableName, retired: retired.length }, "previous_party_prints_retired");
+  }
+  return retired.length;
+}
+
+// THE OPEN SEATING, read for the print bound (seatingStartFor). "TableSessions"
+// is created lazily (ensureTableSessionsTable), so the readers below ask the
+// catalogue first — to_regclass never raises — rather than issue DDL on the
+// floor poll or let a missing relation fail a statement. PRESENT is remembered
+// for good; ABSENT is re-asked after a minute.
+let tableSessionsRelation: { present: boolean; checkedAt: number } | null = null;
+
+async function tableSessionsReadable(): Promise<boolean> {
+  const known = tableSessionsRelation;
+  const now = Date.now();
+  if (known && (known.present || now - known.checkedAt < 60_000)) {return known.present;}
+  let present = false;
+  try {
+    const rows = await runQuery<{ present: boolean }>(`select to_regclass('public."TableSessions"') is not null as present`);
+    present = rows[0]?.present === true;
+  } catch {
+    present = false;
+  }
+  tableSessionsRelation = { present, checkedAt: now };
+  return present;
+}
+
+/**
+ * seated_at of the open seating of each OCCUPIED table asked about (every
+ * table of the outlet when `tableIds` is null) — the newest open row, as the
+ * trigger closes it. A free table's leftover open row is not a seating. Never
+ * throws: no answer is "no seating", which is the rule as it was.
+ */
+async function openSeatingStarts(context: RestaurantContext, tableIds: string[] | null): Promise<Map<string, Date>> {
+  const out = new Map<string, Date>();
+  if (!(await tableSessionsReadable())) {return out;}
+  try {
+    const rows = await runQuery<{ table_id: string; seated_at: Date | string | null }>(
+      `select s.table_id::text as table_id, max(s.seated_at) as seated_at
+         from "TableSessions" s
+         join "Tables" t on t.id = s.table_id
+        where t.res_id = $1 and t.outlet_id = $2
+          and s.left_at is null
+          and coalesce(t.is_occupied, false) = true
+          and ($3::uuid[] is null or s.table_id = any($3::uuid[]))
+        group by s.table_id`,
+      [context.res_id, context.outlet_id, tableIds],
+    );
+    for (const r of rows) {
+      const at = r.seated_at ? new Date(r.seated_at) : null;
+      if (at && Number.isFinite(at.getTime())) {out.set(String(r.table_id), at);}
+    }
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "open_seating_read_failed (print bound falls back to the orders)");
+  }
   return out;
+}
+
+async function openSeatingStartOf(context: RestaurantContext, tableId: string): Promise<Date | null> {
+  return (await openSeatingStarts(context, [tableId])).get(tableId) ?? null;
+}
+
+/** The earliest ARRIVAL on `tableName` of these still-owing orders (orderArrivedAt). */
+function firstArrivalOf(rows: readonly { food: unknown; created_at: Date | string | null }[], tableName: string): Date | null {
+  let first: number | null = null;
+  for (const r of rows) {
+    const t = orderArrivedAt(parseJsonObject(r.food) ?? {}, tableName, r.created_at);
+    if (t !== null && (first === null || t < first)) {first = t;}
+  }
+  return first === null ? null : new Date(first);
+}
+
+/**
+ * THE PRINT STATE OF A TABLE'S CURRENT SEATING — the bill and first-order read
+ * that bounds a seating, and the ledger read behind it. One helper, so the move
+ * and the order guard can never bound a seating differently.
+ */
+async function currentSeatingPrintState(
+  context: RestaurantContext,
+  table: { id: string; table_name: string },
+): Promise<{ openBillId: string | null; start: Date | null; prints: SeatingPrintState }> {
+  const billRows = await runQuery<{ id: string; created_at: Date | null }>(
+    `select id, created_at from "Bills"
+      where table_id = $1 and res_id = $2 and outlet_id = $3
+        and status != 3 and closed_at is null
+      order by created_at desc
+      limit 1`,
+    [table.id, context.res_id, context.outlet_id],
+  );
+  const firstOrder = await runQuery<{ first_at: Date | null; first_arrival: Date | null }>(
+    `select min(created_at) as first_at,
+            min(${orderArrivalSql({ food: "food", createdAt: "created_at", tableName: "$4" })}) as first_arrival
+       from "Orders"
+      where res_id = $1 and outlet_id = $2 and table_id = $3
+        and ${stillOwesStatusSql()}`,
+    [context.res_id, context.outlet_id, table.id, table.table_name],
+  );
+  const openBillId = billRows[0]?.id ?? null;
+  const start = seatingStartFor({
+    sessionSeatedAt: await openSeatingStartOf(context, table.id),
+    billCreatedAt: billRows[0]?.created_at ?? null,
+    firstOrderAt: firstOrder[0]?.first_at ?? null,
+    firstArrivalAt: firstOrder[0]?.first_arrival ?? null,
+  });
+  // Nothing on the table at all: nothing can have been printed for this party.
+  if (start === null && !openBillId) {
+    return { openBillId, start, prints: NO_SEATING_PRINTS };
+  }
+  const prints = await billPrintHistoryForTable(context, table.id, openBillId, table.table_name, start);
+  return { openBillId, start, prints };
 }
 
 /** Carry a SEATED reservation from one table to another. Only seated/arrived
@@ -16945,11 +18198,21 @@ async function moveSeatedBookingsBetweenTables(
  * about that is a printing decision. This returns the facts that decision needs
  * (both table names and ids, the outlet, the order's lines) and the route calls
  * the printer. See POST /tables/move-order.
+ *
+ * CLIENT ITEM 4 — THE DISHES, AND WHERE THE TICKET CAME FROM. The result names
+ * every dish on the ticket (never a price), so the route's audit line and both
+ * clients' confirmations can say what moved; and the move is appended to the
+ * order's own `food.moves` in the same update, so GET /orders can tell the
+ * table sheet "KOT 65 · from 12". A json key on the existing blob: no DDL.
  */
 export async function MoveOrderToTable(
   restaurantId: string,
   orderId: string,
   toTable: string,
+  opts?: {
+    /** Who pressed it, recorded on the move. */
+    by?: string | null;
+  },
 ): Promise<{
   success: true;
   order_id: string;
@@ -16966,8 +18229,12 @@ export async function MoveOrderToTable(
    *  is still seated - this is the "seated, nothing ordered" state, said out
    *  loud so the caller can tell staff rather than let them find it. */
   source_now_empty: boolean;
+  /** Every dish on the moved ticket: name, size, quantity. Never a price. */
+  items: MovedDish[];
+  /** The KOT number(s) printed for this order, read after the move. Empty when none. */
+  kot_nos: number[];
 }> {
-  return withTransaction(async (client) => {
+  const moved = await withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
     await ensureTableSessionsTable(client);
@@ -17020,13 +18287,60 @@ export async function MoveOrderToTable(
     await assertBillEditable(context, order.table_id, client);
     await assertBillEditable(context, dst.id, client);
 
-    const food = parseJsonObject(order.food) ?? {};
-    food.table = dst.table_name;
+    // THE GUEST ON THE TICKET IS THE DESTINATION'S. The name, GSTIN and address
+    // on an order belong to its seating (SetBillCustomerName writes them onto
+    // every running order of the table), so the ticket takes the identity the
+    // destination's paper already prints — "Guest" and nothing when it prints
+    // none, as a dish move writes — instead of carrying 12's company onto 15's
+    // GST invoice. Read in the destination's own order (created_at), exactly
+    // as GetBillForTable reads it.
+    const dstOrders = await runQuery<{ food: unknown }>(
+      `select food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and ${stillOwesStatusSql()}
+        order by created_at asc`,
+      [context.res_id, context.outlet_id, dst.id],
+      client,
+    );
+    const dstIdentity = seatingIdentityOf(dstOrders.map((r) => parseJsonObject(r.food) ?? {}));
+    // ...and the SOURCE's, as its paper prints it now (the ticket included), so
+    // the orders it keeps still name its guest once the ticket has gone.
+    const srcOrders = await runQuery<{ id: string; food: unknown }>(
+      `select id, food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and ${stillOwesStatusSql()}
+        order by created_at asc`,
+      [context.res_id, context.outlet_id, order.table_id],
+      client,
+    );
+    const srcIdentity = seatingIdentityOf(srcOrders.map((r) => parseJsonObject(r.food) ?? {}));
+
+    const stored = parseJsonObject(order.food) ?? {};
+    const food = withSeatingIdentity(appendOrderMove(stored, {
+      from_table: src?.table_name ?? "",
+      to_table: dst.table_name,
+      at: new Date().toISOString(),
+      by: String(opts?.by ?? "").trim() || null,
+    }), dstIdentity);
+    // Stamped with when it ARRIVED (ORDER_TABLE_SINCE_KEY), by the database's
+    // clock: the settled-bill window reads that, not created_at.
     await runQuery(
-      `update "Orders" set table_id = $1, food = $2::json where id = $3 and res_id = $4 and outlet_id = $5`,
+      `update "Orders" set table_id = $1, food = ${foodWithTableSinceSql("$2")} where id = $3 and res_id = $4 and outlet_id = $5`,
       [dst.id, JSON.stringify(food), order.id, context.res_id, context.outlet_id],
       client,
     );
+    // The source's remaining orders keep its guest (withFilledSeatingIdentity):
+    // filled where they carry none, never overwritten.
+    for (const o of srcOrders) {
+      if (o.id === order.id) {continue;}
+      const filled = withFilledSeatingIdentity(parseJsonObject(o.food) ?? {}, srcIdentity);
+      if (!filled) {continue;}
+      await runQuery(
+        `update "Orders" set food = $4::json where id = $1 and res_id = $2 and outlet_id = $3`,
+        [o.id, context.res_id, context.outlet_id, JSON.stringify(filled)],
+        client,
+      );
+    }
 
     // Seat the destination if it was not, exactly as placing the order there
     // would have. num_covers is left alone (coalesced to at least 1) so a table
@@ -17040,6 +18354,28 @@ export async function MoveOrderToTable(
         [dst.id, context.res_id, context.outlet_id],
         client,
       );
+      // THE PAPER OF WHOEVER SAT HERE BEFORE is nobody's now: the table was
+      // free. Its `<dst>-<epoch>` prints made since this ticket was placed are
+      // re-filed (retirePreviousPartyPrints), as MoveTableParty does for the
+      // table a party lands on, so the seating this move opens can never count
+      // them as its own. In a savepoint: a missing ledger has nothing to retire.
+      const placed = await runQuery<{ created_at: Date | null }>(
+        `select created_at from "Orders" where id = $1 and res_id = $2 and outlet_id = $3`,
+        [order.id, context.res_id, context.outlet_id],
+        client,
+      );
+      const since = placed[0]?.created_at ? new Date(placed[0].created_at) : null;
+      if (since && Number.isFinite(since.getTime())) {
+        await runQuery("savepoint move_order_print_retire", [], client);
+        try {
+          await retirePreviousPartyPrints(context, dst.table_name, since, client);
+          await runQuery("release savepoint move_order_print_retire", [], client);
+        } catch (err) {
+          await runQuery("rollback to savepoint move_order_print_retire", [], client);
+          if (!isCaptureTableMissing(err)) {throw err;}
+          logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "move_order_print_retire_skipped (print ledger unavailable)");
+        }
+      }
     }
 
     // Both ends' bills are re-summed from their orders. The source keeps its
@@ -17068,8 +18404,16 @@ export async function MoveOrderToTable(
       seated_destination: seatedDestination,
       total_amt: total,
       source_now_empty: Number(remaining[0]?.n ?? 0) === 0,
+      items: orderDishes(stored),
     };
   });
+  // AFTER the transaction, so the read never holds a second pooled connection
+  // while the move's is open. Never fails the move: an unreadable number is no
+  // number.
+  const kotNos = await GetOrderKotNumbers(restaurantId, [moved.order_id])
+    .then((m) => m.get(moved.order_id) ?? [])
+    .catch(() => [] as number[]);
+  return { ...moved, kot_nos: kotNos };
 }
 
 /** Re-sum a table's open bill from its active orders, creating the bill row if
@@ -17353,8 +18697,10 @@ export async function ReopenBill(
   byUsername?: string | null,
 ): Promise<ReopenedBill> {
   // Resolved BEFORE the transaction: the 053 latch may issue DDL, which must
-  // never run inside one (see nextPartyReady).
+  // never run inside one (see nextPartyReady). The same for "Orders".updated_at,
+  // which the restore's window reads (settledWindowSql).
   const withNextParty = await nextPartyReady();
+  await ensureRecordTimestampColumns();
   return withTransaction(async (client) => {
     await ensureBillWorkflowColumns(client);
     await ensureTableOccupancyColumns(client);
@@ -17458,9 +18804,11 @@ export async function ReopenBill(
     // a guest has paid — there is none.
     const wasNc = isNcSettleMethod(bill.payment_method);
 
-    // Restore THIS session's settled orders (Paid/Closed between the previous
-    // bill's close and this bill's close) so the bill is actionable again. Older
-    // sessions' orders stay settled; Cancelled orders stay cancelled.
+    // Restore THIS session's settled orders (Paid/Closed, ARRIVED on the table
+    // between the previous bill's close and this bill's close — settledWindowSql,
+    // so an order moved here after the previous party paid is this bill's, and
+    // one moved away is not) so the bill is actionable again. Older sessions'
+    // orders stay settled; Cancelled orders stay cancelled.
     let restored = 0;
     let tableName: string | null = null;
     if (bill.table_id) {
@@ -17477,7 +18825,12 @@ export async function ReopenBill(
                 food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb('${wasNc ? "Served" : "Payment Pending Approval"}'::text), true)
           where res_id = $1 and outlet_id = $2 and table_id = $3
             and coalesce(status::text, '1') in ('4', '7')
-            and created_at > $4 and created_at <= $5
+            and ${settledWindowSql({
+              alias: `"Orders"`,
+              tableName: `(select tn.table_name from "Tables" tn where tn.id = "Orders".table_id)`,
+              prevClosed: "$4::timestamptz",
+              closedAt: "$5::timestamptz",
+            })}
           returning id`,
         [context.res_id, context.outlet_id, bill.table_id, prev[0]?.prev_closed ?? new Date(0), bill.closed_at],
         client,
@@ -17635,6 +18988,11 @@ export interface ClosedBillSummary {
   // rule in the block beside SetBillCustomerName — "Bills".customer_gstin, else
   // the bill's orders. Null when neither carries one. Not money.
   customer_gstin: string | null;
+  // Who the bill was made out to, by the identity rule (the picked orders, then
+  // the whole identity window). Client item 8: the list used to leave it out,
+  // so a settled bill's row could not say whose bill it was until it was opened
+  // or edited. Null for a walk-in ("Guest" is a placeholder, not a name).
+  customer: string | null;
   refunded: boolean;
   refund_amount: number;
   apc: number | null;
@@ -17666,6 +19024,10 @@ export interface ClosedBillDetail extends ClosedBillSummary {
   taxes: BillTaxLine[];
   target_apc: number;
   customer: string | null;
+  // Client item 7 (migration 054): the guest's address, lines joined by LF —
+  // "Bills".customer_address, else the bill's orders. DETAIL ONLY: the list
+  // does not carry it. Not money.
+  customer_address: string | null;
   seated_at: string | null;
   left_at: string | null;
   waiter_confirmed_at: string | null;
@@ -17919,6 +19281,7 @@ function mapClosedBillSummary(row: ClosedBillRow, scPct = 0): ClosedBillSummary 
     coupon_code: row.coupon_code,
     // Filled in by the list and detail readers, which know the orders.
     customer_gstin: null,
+    customer: null,
     refunded: Boolean(row.refunded_at),
     refund_amount: round2(parseNumeric(row.refund_amount)),
     apc: covers && covers > 0 ? round2(apcBase / covers) : null,
@@ -17950,9 +19313,11 @@ function closedBillDiscount(
 }
 
 /**
- * The orders that made up a closed bill: everything settled on that table
- * between the PREVIOUS bill's close and this one's. Identical window to
- * ReopenBill, which is the proven inverse of settlement.
+ * The orders that made up a closed bill: everything settled on that table that
+ * ARRIVED there between the PREVIOUS bill's close and this one's
+ * (settledWindowSql — an order moved in keeps its created_at, and is placed by
+ * when it landed). Identical window to ReopenBill, which is the proven inverse
+ * of settlement.
  */
 async function ordersForClosedBill(
   context: RestaurantContext,
@@ -17979,10 +19344,15 @@ async function ordersForClosedBill(
   );
   return runQuery<{ id: string; created_at: Date; status: unknown; food: unknown }>(
     `select id, created_at, status, food
-       from "Orders"
+       from "Orders" o
       where res_id = $1 and outlet_id = $2 and table_id = $3
         and coalesce(status::text, '1') = any($4::text[])
-        and created_at > $5 and created_at <= $6
+        and ${settledWindowSql({
+          alias: "o",
+          tableName: `(select tn.table_name from "Tables" tn where tn.id = o.table_id)`,
+          prevClosed: "$5::timestamptz",
+          closedAt: "$6::timestamptz",
+        })}
       order by created_at asc`,
     [context.res_id, context.outlet_id, row.table_id, statusCodes, prev[0]?.prev_closed ?? new Date(0), row.closed_at],
   );
@@ -17995,6 +19365,7 @@ interface ClosedBillItemAggregate {
   nc_total: number;
   customer: string | null;
   customer_gstin: string | null;
+  customer_address: string | null;
   order_ids: string[];
   orders: ClosedBillDetail["orders"];
 }
@@ -18007,6 +19378,7 @@ function aggregateClosedBillOrders(
   const orders: ClosedBillDetail["orders"] = [];
   let customer = "";
   let customerGstin = "";
+  let customerAddress = "";
   let items_subtotal = 0;
   let ncTotal = 0;
   for (const o of orderRows) {
@@ -18016,6 +19388,7 @@ function aggregateClosedBillOrders(
       if (c && c.toLowerCase() !== "guest" && c.toLowerCase() !== "qr guest") {customer = c;}
     }
     if (!customerGstin) {customerGstin = foodCustomerGstin(food);}
+    if (!customerAddress) {customerAddress = foodCustomerAddress(food);}
     const sub = parseNumeric(food.subtotal) > 0 ? parseNumeric(food.subtotal) : parseNumeric(food.total);
     items_subtotal += sub;
     const list = Array.isArray(food.items) ? (food.items as unknown[]) : [];
@@ -18064,6 +19437,7 @@ function aggregateClosedBillOrders(
     nc_total: ncTotal,
     customer: customer || null,
     customer_gstin: customerGstin || null,
+    customer_address: customerAddress || null,
     order_ids: orderRows.map((o) => o.id),
     orders,
   };
@@ -18170,13 +19544,15 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
   // WHO THE BILL IS MADE OUT TO, by the identity rule (CLOSED_BILL_IDENTITY_STATUS_CODES):
   // the picked set first, then the whole identity window — which is exactly the
   // set SetClosedBillCustomerDetails writes, so a write always reads back. The
-  // GSTIN prefers the bill row's own column over both.
+  // GSTIN and the address (054) prefer the bill row's own column over both.
   let customer = agg.customer;
   let customerGstin = (await readBillCustomerGstins(context, [row.id])).get(row.id) ?? agg.customer_gstin;
-  if (!customer || !customerGstin) {
+  let customerAddress = (await readBillCustomerAddresses(context, [row.id])).get(row.id) ?? agg.customer_address;
+  if (!customer || !customerGstin || !customerAddress) {
     identityAgg = identityAgg ?? aggregateClosedBillOrders(await ordersForClosedBill(context, row, CLOSED_BILL_IDENTITY_STATUS_CODES));
     customer = customer ?? identityAgg.customer;
     customerGstin = customerGstin ?? identityAgg.customer_gstin;
+    customerAddress = customerAddress ?? identityAgg.customer_address;
   }
 
   const summary = mapClosedBillSummary(row, scPct);
@@ -18211,6 +19587,7 @@ export async function GetClosedBill(restaurantId: string, billId: string): Promi
     target_apc,
     customer,
     customer_gstin: customerGstin,
+    customer_address: customerAddress,
     seated_at: iso(row.seated_at),
     left_at: iso(row.left_at),
     waiter_confirmed_at: iso(row.waiter_confirmed_at),
@@ -18266,39 +19643,76 @@ export interface ClosedBillListFilter {
  * this close, inclusive; the bill's own order_id for a row with no table or no
  * close), over the identity statuses (CLOSED_BILL_IDENTITY_STATUS_CODES) — and
  * touches no 046 column, so it runs on an unmigrated database too.
+ *
+ * CLIENT ITEM 8 — AND THE NAME. The summary never carried `customer` (only the
+ * detail did), so the app's row chip for "who was this bill for" appeared only
+ * after an edit in place, and History's rows could not say it at all. The name
+ * has no column — it lives only on the orders — so it rides in the SAME
+ * statement, over the same window and the same ORDER BY, and the statement now
+ * runs for the whole page rather than only for bills whose row holds no GSTIN.
+ * Still two statements per page. The placeholders the ordering flows store
+ * ("Guest", "QR Guest") are skipped in SQL exactly as aggregateClosedBillOrders
+ * skips them. The ADDRESS is not read here (see the 054 block).
  */
-async function readClosedBillListCustomerGstins(context: RestaurantContext, billIds: string[]): Promise<Map<string, string>> {
-  const out = await readBillCustomerGstins(context, billIds);
-  const missing = billIds.filter((id) => !out.has(id) && isUuid(id));
-  if (missing.length === 0) {return out;}
-  const rows = await runQuery<{ id: string; food_gstin: string | null }>(
-    `select b.id::text as id,
-            (select nullif(btrim(o.food::jsonb ->> 'customer_gstin'), '')
-               from "Orders" o
-              where o.res_id = b.res_id and o.outlet_id = b.outlet_id
+async function readClosedBillListIdentity(
+  context: RestaurantContext,
+  billIds: string[],
+): Promise<Map<string, { customer: string | null; customer_gstin: string | null }>> {
+  const gstins = await readBillCustomerGstins(context, billIds);
+  const out = new Map<string, { customer: string | null; customer_gstin: string | null }>();
+  for (const id of billIds) {out.set(id, { customer: null, customer_gstin: gstins.get(id) ?? null });}
+  const ids = billIds.filter((id) => isUuid(id));
+  if (ids.length === 0) {return out;}
+  // One window, written once and used by both subqueries.
+  // The previous close on the bill's table is read ONCE per bill (the lateral
+  // `pc` below) and named by both bounds of the window.
+  const inWindow = `o.res_id = b.res_id and o.outlet_id = b.outlet_id
                 and case
                       when b.table_id is null or b.closed_at is null then o.id = b.order_id
                       else o.table_id = b.table_id
                        and coalesce(o.status::text, '1') = any($3::text[])
-                       and o.created_at <= b.closed_at
-                       and o.created_at > coalesce((
-                             select max(p.closed_at) from "Bills" p
-                              where p.table_id = b.table_id and p.res_id = b.res_id and p.outlet_id = b.outlet_id
-                                and p.id <> b.id and p.closed_at is not null and p.closed_at <= b.closed_at
-                           ), 'epoch'::timestamptz)
-                    end
+                       and ${settledWindowSql({
+                         alias: "o",
+                         tableName: "pc.table_name",
+                         prevClosed: "pc.prev_closed",
+                         closedAt: "b.closed_at",
+                       })}
+                    end`;
+  // Settled orders before cancelled ones, then oldest first: the detail read's
+  // "picked set, then identity window" in one ORDER BY.
+  const firstFirst = `order by (coalesce(o.status::text, '1') = '5') asc, o.created_at asc
+              limit 1`;
+  const rows = await runQuery<{ id: string; food_gstin: string | null; food_customer: string | null }>(
+    `select b.id::text as id,
+            (select nullif(btrim(o.food::jsonb ->> 'customer_gstin'), '')
+               from "Orders" o
+              where ${inWindow}
                 and nullif(btrim(o.food::jsonb ->> 'customer_gstin'), '') is not null
-              -- Settled orders before cancelled ones, then oldest first: the
-              -- detail read's "picked set, then identity window" in one ORDER BY.
-              order by (coalesce(o.status::text, '1') = '5') asc, o.created_at asc
-              limit 1) as food_gstin
+              ${firstFirst}) as food_gstin,
+            (select btrim(o.food::jsonb ->> 'customer')
+               from "Orders" o
+              where ${inWindow}
+                and lower(coalesce(btrim(o.food::jsonb ->> 'customer'), '')) not in ('', 'guest', 'qr guest', 'null', 'undefined')
+              ${firstFirst}) as food_customer
        from "Bills" b
+       cross join lateral (
+         select coalesce((select max(p.closed_at) from "Bills" p
+                           where p.table_id = b.table_id and p.res_id = b.res_id and p.outlet_id = b.outlet_id
+                             and p.id <> b.id and p.closed_at is not null and p.closed_at <= b.closed_at),
+                         'epoch'::timestamptz) as prev_closed,
+                (select tn.table_name from "Tables" tn where tn.id = b.table_id) as table_name
+       ) pc
       where b.res_id = $1 and b.id = any($2::uuid[])`,
-    [context.res_id, missing, CLOSED_BILL_IDENTITY_STATUS_CODES],
+    [context.res_id, ids, CLOSED_BILL_IDENTITY_STATUS_CODES],
   );
   for (const r of rows) {
+    const id = String(r.id);
+    const entry = out.get(id);
+    if (!entry) {continue;}
     const g = String(r.food_gstin ?? "").trim();
-    if (g && g.toLowerCase() !== "null") {out.set(String(r.id), g);}
+    if (!entry.customer_gstin && g && g.toLowerCase() !== "null") {entry.customer_gstin = g;}
+    const c = String(r.food_customer ?? "").trim();
+    if (c) {entry.customer = c;}
   }
   return out;
 }
@@ -18380,8 +19794,12 @@ export async function ListClosedBills(
   // The service-charge percent is read ONCE for the page (not per row) so the
   // list's charge split matches the detail read's.
   const scPct = await getServiceChargePercent(context.res_id).catch(() => 0);
-  const gstins = await readClosedBillListCustomerGstins(context, rows.map((row) => row.id));
-  const bills = rows.map((row) => ({ ...mapClosedBillSummary(row, scPct), customer_gstin: gstins.get(row.id) ?? null }));
+  const identity = await readClosedBillListIdentity(context, rows.map((row) => row.id));
+  const bills = rows.map((row) => ({
+    ...mapClosedBillSummary(row, scPct),
+    customer_gstin: identity.get(row.id)?.customer_gstin ?? null,
+    customer: identity.get(row.id)?.customer ?? null,
+  }));
 
   return { bills, total, limit, offset, has_more: offset + bills.length < total };
 }
@@ -19322,10 +20740,46 @@ export interface SalesReport {
   by_method: { method: string; label?: string; sales: number; bills: number }[];
 }
 
-export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string): Promise<SalesReport> {
+/**
+ * How the accounting Sales report may be read besides its dates. Only the
+ * emailed report passes this; the /reports/sales routes never do, so every
+ * screen and every .csv they serve is exactly what it was.
+ */
+export interface SalesReportOptions {
+  /**
+   * A TRADING DAY's shift in minutes (report_window.ts). `from`/`to` are then
+   * business dates, the bills are those settled in [from 00:00 + shift,
+   * to+1 00:00 + shift), and by_day buckets each bill on its business date —
+   * the same instants and the same buckets as the MIS Sales Summary read with
+   * the same close, which test/money pins.
+   */
+  dayShiftMin?: number;
+}
+
+/** The business date an instant counts on under a trading-day shift. */
+function tradingDayKeyOf(value: Date | string, tz: string, shift: number): string {
+  const clock = zonedClockParts(value, tz);
+  return clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, null, shift) : "";
+}
+
+/** [fromIso, toIso) of business dates `from`..`to` under a shift. */
+function tradingRangeInstants(fromDate: string, toDate: string, tz: string, shift: number): { fromIso: string; toIso: string } {
+  const b = tradingDayBounds({ from: fromDate, to: toDate }, shift);
+  return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
+}
+
+/** A shift a caller asked for, kept inside what a trading day can be. */
+function boundedDayShift(raw: unknown): number {
+  const n = Math.round(Number(raw));
+  return Number.isFinite(n) && n >= -719 && n <= 720 ? n : 0;
+}
+
+export async function GetSalesReport(restaurantId: string, fromIso?: string, toIso?: string, opts: SalesReportOptions = {}): Promise<SalesReport> {
   const context = await requireRestaurantContext(restaurantId);
   const range = normalizeReportRange(fromIso, toIso, context.timezone);
-  const bills = await getSettledBills(context, range.fromIso, range.toIso);
+  const shift = boundedDayShift(opts.dayShiftMin);
+  const bounds = shift ? tradingRangeInstants(range.fromDate, range.toDate, context.timezone, shift) : range;
+  const bills = await getSettledBills(context, bounds.fromIso, bounds.toIso);
   const scPct = await getServiceChargePercent(context.res_id);
 
   let totalSales = 0, totalTax = 0, totalService = 0, totalRefund = 0, totalRefundedTax = 0;
@@ -19344,7 +20798,8 @@ export async function GetSalesReport(restaurantId: string, fromIso?: string, toI
     totalService = round2(totalService + service);
     totalRefund = round2(totalRefund + b.refund_amount);
     totalRefundedTax = round2(totalRefundedTax + refundedTaxOf(b, tax));
-    const day = dayKeyOf(b.settled_at, context.timezone);
+    // The business date on a trading day, the calendar day otherwise.
+    const day = shift ? tradingDayKeyOf(b.settled_at, context.timezone, shift) : dayKeyOf(b.settled_at, context.timezone);
     const dd = byDay.get(day) ?? { sales: 0, net: 0, tax: 0, service_charge: 0, refund: 0, bills: 0 };
     dd.sales = round2(dd.sales + gross); dd.tax = round2(dd.tax + tax);
     dd.net = round2(dd.net + charges.taxable_base);
@@ -19981,6 +21436,75 @@ export const REPORT_MAX_ATTEMPTS = 3;
 /** Consecutive failures after which a schedule disables itself. */
 export const REPORT_SCHEDULE_FAILURE_LIMIT = 5;
 
+/**
+ * The catch-up window, in minutes (REPORT_CATCHUP_MINUTES, default six hours):
+ * how late the sweep may still CLAIM a scheduled occurrence, and — since the
+ * item 9 review — how long a Run now or Send now may wait to be FINISHED. One
+ * reader, so the two can never disagree.
+ */
+export function reportCatchupMinutes(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.REPORT_CATCHUP_MINUTES);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 360;
+}
+
+/** The error a row gets when its last attempt's worker never came back. Unchanged since 026. */
+export const REPORT_RETRIES_EXHAUSTED = "Retries exhausted";
+/** …and when that worker died mid-send (058): some addresses may have it. */
+export const REPORT_STOPPED_MID_SEND =
+  "The server stopped while sending this report, and it has no retries left. The history shows which addresses had it.";
+
+/** A Run now or Send now nobody finished inside the catch-up window. */
+export function reportDroppedLateSentence(maxAgeMin: number): string {
+  const hours = maxAgeMin / 60;
+  const span = Number.isInteger(hours) ? `${String(hours)} hour${hours === 1 ? "" : "s"}` : `${String(maxAgeMin)} minutes`;
+  return `Not sent within ${span} of being asked for, so it was dropped rather than sent late. Ask for it again.`;
+}
+
+/**
+ * WHAT A DELIVERY ROW MEANS to the person reading it — which is not always
+ * what its status column says, and the difference is where the item 9 review
+ * found screens waiting forever.
+ *
+ *   * A row whose LAST attempt's worker died ('claimed', 'rendered' or
+ *     'sending', attempts spent, lease lapsed) will never move again. The
+ *     sweep's reaper marks it failed; until it runs (or on a server whose
+ *     sweep is off) the reading says so anyway.
+ *   * A Run now or Send now older than the catch-up window is dropped, not
+ *     sent late — the reaper again, and the same reading before it.
+ *   * `final` says whether anything more will happen without a person: a
+ *     'failed' row with attempts left is RETRIED by the sweep (its
+ *     next_attempt_at says when). A client that called every 'failed' final
+ *     told the owner "Couldn't send" for an email that went out five minutes
+ *     later — and invited a second send of it.
+ *
+ * Pure; `now` and the window are injected.
+ */
+export function deliveryReading(
+  r: {
+    status: string; attempts: number; kind: string; error: string | null;
+    next_attempt_at: Date | string | null; created_at: Date | string;
+  },
+  now: Date,
+  maxAgeMin: number,
+): { status: string; final: boolean; error: string | null } {
+  const at = (v: Date | string | null): number => (v === null ? Number.NaN : new Date(v).getTime());
+  const nextAt = at(r.next_attempt_at);
+  const due = Number.isNaN(nextAt) || nextAt <= now.getTime();
+  const spent = r.attempts >= REPORT_MAX_ATTEMPTS;
+  const open = r.status === "claimed" || r.status === "rendered" || r.status === "sending";
+  const onDemand = r.kind === "manual" || r.kind === "adhoc";
+  const stale = onDemand && at(r.created_at) <= now.getTime() - maxAgeMin * 60_000;
+  if (open && due && spent) {
+    return { status: "failed", final: true, error: r.error ?? (r.status === "sending" ? REPORT_STOPPED_MID_SEND : REPORT_RETRIES_EXHAUSTED) };
+  }
+  if ((open || r.status === "failed") && due && !spent && stale) {
+    const said = reportDroppedLateSentence(maxAgeMin);
+    return { status: "failed", final: true, error: (r.error ? `${said} Last problem: ${r.error}` : said).slice(0, 800) };
+  }
+  if (r.status === "failed") { return { status: "failed", final: spent, error: r.error }; }
+  return { status: r.status, final: r.status === "delivered" || r.status === "abandoned", error: r.error };
+}
+
 export interface ReportScheduleRecord {
   id: string;
   outlet_id: string;
@@ -19995,6 +21519,14 @@ export interface ReportScheduleRecord {
   /** Migration 044. Empty for 'inbox'; at least one address for 'email'. */
   recipients: string[];
   format: string;
+  /** Migration 057: the reports in the bundle — `[report_key]` on an older row. */
+  report_keys: string[];
+  /** Migration 057: 'xlsx' and/or 'csv'. `[format]` on an older row. */
+  formats: string[];
+  /** Migration 057: 'calendar' (every older row) or 'trading_day'. */
+  window_mode: string;
+  /** Migration 057: 'outlet' (every older row) or 'all'. */
+  outlet_scope: string;
   enabled: boolean;
   last_occurrence_key: string | null;
   last_status: string | null;
@@ -20021,14 +21553,21 @@ export interface DueReportSchedule {
   /** Migration 044. Empty for an inbox schedule, at least one for an email one. */
   recipients: string[];
   format: string;
+  /** Migration 057, with its pre-057 readings (see ReportScheduleRecord). */
+  report_keys: string[];
+  formats: string[];
+  window_mode: string;
+  outlet_scope: string;
   created_at: Date;
 }
 
 export interface RetryableReportDelivery {
   id: string;
-  schedule_id: string;
+  /** Null for a Send now (migration 058). */
+  schedule_id: string | null;
   outlet_id: string;
-  /** Migration 044. Read LIVE from the schedule — see the query's comment. */
+  /** Migration 044. Read LIVE from the schedule — see the query's comment. A
+   *  Send now carries its own snapshot instead: it has no schedule to read. */
   recipients: string[];
   occurrence_key: string | null;
   period_from: string;
@@ -20039,11 +21578,22 @@ export interface RetryableReportDelivery {
   name: string;
   report_key: string;
   format: string;
+  /** Migration 058, with their pre-058 readings. */
+  kind: "scheduled" | "manual" | "adhoc";
+  status: string;
+  report_keys: string[];
+  formats: string[];
+  outlet_scope: string;
+  day_close: string | null;
+  window_start_at: string | null;
+  window_end_at: string | null;
+  requested_by: string | null;
 }
 
 export interface ReportDeliveryRecord {
   id: string;
-  schedule_id: string;
+  /** Null for a Send now (migration 058). */
+  schedule_id: string | null;
   outlet_id: string;
   occurrence_key: string | null;
   fire_at: Date;
@@ -20059,14 +21609,41 @@ export interface ReportDeliveryRecord {
   error: string | null;
   delivered_at: Date | null;
   created_at: Date;
+  /** Migration 044: the addresses the provider ACCEPTED. It was stored and
+   *  never returned until item 9 — the web type already declared it. */
+  delivered_to: string[];
+  /** Migration 058 — defaults below on a database without it. */
+  kind: "scheduled" | "manual" | "adhoc";
+  report_keys: string[];
+  formats: string[];
+  outlet_scope: string;
+  day_close: string | null;
+  window_start_at: Date | null;
+  window_end_at: Date | null;
+  /** The addresses a Send now was addressed to. Null for a scheduled row. */
+  recipients: string[] | null;
+  rejected_to: string[];
+  skipped_to: string[];
+  provider: string | null;
+  requested_by: string | null;
+  sending_at: Date | null;
+  maybe_duplicate: boolean;
+  files: ReportDeliveryFileRecord[];
+  /** When the sweep next tries a 'failed' row with attempts left. */
+  next_attempt_at: Date | null;
+  /** Nothing more will happen to this row without a person (deliveryReading). */
+  final: boolean;
 }
 
-const SCHEDULE_COLS = `id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+const SCHEDULE_COLS =`id, outlet_id, name, report_key, frequency, hour_local, minute_local,
          weekday, day_of_month, channel, recipients, format, enabled, last_occurrence_key,
          last_status, last_error, last_run_at, consecutive_failures, created_at, updated_at`;
 
 /** The same list without migration 044's column. See scheduleRead. */
 const SCHEDULE_COLS_PRE_044 = SCHEDULE_COLS.replace(" recipients,", "");
+
+/** The list with migration 057's four columns. Read only once the latch says they exist. */
+const SCHEDULE_COLS_057 = `${SCHEDULE_COLS}, report_keys, formats, window_mode, outlet_scope`;
 
 /**
  * A READ OF "ReportSchedules" THAT SURVIVES AN UNAPPLIED MIGRATION 044.
@@ -20101,6 +21678,13 @@ async function scheduleRead<T extends QueryResultRow>(
   build: (cols: string) => string,
   params: unknown[],
 ): Promise<T[]> {
+  // Migration 057's columns only when the latch has SEEN them — never by
+  // trial and error, because a failed statement inside the sweep's transaction
+  // would abort it. Absent, the rows read as the single-report, CSV,
+  // calendar-day schedules they are (mapReportSchedule).
+  if (await reportEmailSchemaReady()) {
+    return runQuery<T>(build(SCHEDULE_COLS_057), params);
+  }
   try {
     return await runQuery<T>(build(SCHEDULE_COLS), params);
   } catch (err) {
@@ -20130,8 +21714,20 @@ function scheduleWriteError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
 
+/** Migration 057's four fields, read with their pre-057 meaning when absent. */
+function bundleFieldsOf(r: Record<string, any>): Pick<ReportScheduleRecord, "report_keys" | "formats" | "window_mode" | "outlet_scope"> {
+  const formats = Array.isArray(r.formats) ? r.formats.map((x: unknown) => String(x)).filter((f: string) => f === "csv" || f === "xlsx") : [];
+  return {
+    report_keys: reportKeysOfRow(r),
+    formats: formats.length > 0 ? formats : [String(r.format ?? "csv")],
+    window_mode: r.window_mode === "trading_day" ? "trading_day" : "calendar",
+    outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+  };
+}
+
 function mapReportSchedule(r: Record<string, any>): ReportScheduleRecord {
   return {
+    ...bundleFieldsOf(r),
     recipients: Array.isArray(r.recipients) ? r.recipients.map((x: unknown) => String(x)) : [],
     id: String(r.id),
     outlet_id: String(r.outlet_id),
@@ -20171,6 +21767,32 @@ function boundedInt(raw: unknown, lo: number, hi: number, label: string): number
   return n;
 }
 
+/**
+ * Does this payload ask for something a 2.0.1 schedule could not be? Any of
+ * migration 057's fields, a recipient picked from the address book, or the
+ * email channel — which since item 9 only ever addresses the book.
+ */
+function isBundlePayload(input: Record<string, unknown>): boolean {
+  return ["report_keys", "formats", "window_mode", "outlet_scope", "recipient_ids"].some((k) => input[k] !== undefined)
+    || String(input.channel ?? "").trim().toLowerCase() === "email"
+    || (input.report_key !== undefined && !(REPORT_SCHEDULE_KEYS as readonly string[]).includes(String(input.report_key).trim().toLowerCase()));
+}
+
+/** One of the three accounting reports, alone — the only selection a 2.0.1 form can show. */
+function isLegacyAccountingSelection(keys: readonly string[]): boolean {
+  return keys.length === 1 && (REPORT_SCHEDULE_KEYS as readonly string[]).includes(keys[0]);
+}
+
+/** Is this stored row something only the bundle path can write back? */
+function isBundleRow(r: ReportScheduleRecord): boolean {
+  return r.channel === "email"
+    || r.report_keys.length !== 1
+    || !(REPORT_SCHEDULE_KEYS as readonly string[]).includes(r.report_key)
+    || r.formats.length !== 1 || r.formats[0] !== "csv"
+    || r.window_mode !== "calendar"
+    || r.outlet_scope !== "outlet";
+}
+
 /** Validate the whole shape in one place so a bad payload is a 400 with a
  *  sentence in it, never a raw 23514 from one of migration 026's CHECKs. */
 function normalizeSchedulePayload(
@@ -20181,9 +21803,7 @@ function normalizeSchedulePayload(
   minute_local: number; weekday: number | null; day_of_month: number | null;
   channel: string; recipients: string[]; format: string; enabled: boolean;
 } {
-  const name = String(input.name ?? base?.name ?? "").trim();
-  if (!name) { throw new Error("name is required"); }
-  const frequency = oneOf(input.frequency ?? base?.frequency ?? "daily", REPORT_SCHEDULE_FREQUENCIES, "frequency");
+  const { name, frequency } = scheduleCoreOf(input, base);
   const channel = oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel");
   // Cleaned the way mailer.ts will read them — trimmed, de-duplicated
   // case-insensitively, implausible entries dropped, capped at ten — so what the
@@ -20200,9 +21820,167 @@ function normalizeSchedulePayload(
       + " Add one, or set this schedule to deliver to the in-app inbox instead.",
     );
   }
+  const core = scheduleCoreOf(input, base);
+  return {
+    ...core,
+    name,
+    report_key: oneOf(input.report_key ?? base?.report_key ?? "sales", REPORT_SCHEDULE_KEYS, "report_key"),
+    channel,
+    recipients,
+    format: oneOf(input.format ?? base?.format ?? "csv", REPORT_SCHEDULE_FORMATS, "format"),
+  };
+}
+
+
+interface BundleSchedulePayload {
+  name: string; report_key: string; frequency: string; hour_local: number;
+  minute_local: number; weekday: number | null; day_of_month: number | null;
+  channel: string; recipients: string[]; format: string; enabled: boolean;
+  report_keys: string[]; formats: string[]; window_mode: ReportWindowMode; outlet_scope: "outlet" | "all";
+}
+
+/** Refused out loud, as a 400 with a sentence (or a 403 for the scope). */
+function bundleError(message: string, status = 400): ReportEmailRequestError {
+  return new ReportEmailRequestError(message, status);
+}
+
+/**
+ * The bundle schedule a payload describes, checked against the catalogue, the
+ * address book and the caller's scope — one sentence per refusal.
+ *
+ * THREE RULES THAT PROTECT A SCHEDULE FROM AN OLDER CLIENT. A 2.0.1 app edits
+ * with {name, report_key, frequency, hour_local, minute_local} and knows only
+ * three report keys, resetting anything else to 'sales' in its form:
+ *   * a report_key alone never CHANGES what a schedule sends unless the row is
+ *     itself one of those three (all a 2.0.1 form can show). With report_keys
+ *     absent, any other row — two or more keys, or one MIS report such as
+ *     Item Wise — keeps its reports; otherwise that app's Edit turned an Item
+ *     Wise schedule into "Sales (accounting)" without anyone choosing it;
+ *   * omitted recipients, formats, scope and window keep the stored ones —
+ *     and the stored recipients are NOT re-checked against the book on such an
+ *     edit (the send-time check skips a removed address), so pausing a
+ *     schedule never fails because somebody left the book;
+ *   * moving a trading-day schedule off daily returns it to calendar days,
+ *     since a trading day exists only for a daily run.
+ */
+async function normalizeBundlePayload(
+  resId: string,
+  restaurantId: string,
+  input: Record<string, unknown>,
+  base: ReportScheduleRecord | undefined,
+  opts: { allowAllOutlets: boolean },
+): Promise<BundleSchedulePayload> {
+  const core = scheduleCoreOf(input, base);
+  const channel = oneOf(input.channel ?? base?.channel ?? "inbox", REPORT_SCHEDULE_CHANNELS, "channel");
+
+  const legacyKey = input.report_key === undefined ? undefined : String(input.report_key).trim().toLowerCase();
+  // Only a row a 2.0.1 form can represent takes the key that form sends.
+  const legacyEditable = !base || isLegacyAccountingSelection(base.report_keys);
+  const rawKeys: unknown = input.report_keys !== undefined
+    ? input.report_keys
+    : legacyKey !== undefined && legacyKey !== "bundle" && legacyEditable
+      ? [legacyKey]
+      : base?.report_keys ?? ["sales"];
+  const askedKeys = (Array.isArray(rawKeys) ? rawKeys : [rawKeys]).map((k) => String(k ?? "").trim().toLowerCase());
+
+  let windowMode: ReportWindowMode;
+  if (input.window_mode !== undefined) {
+    if (!isWindowMode(input.window_mode)) {throw bundleError("window_mode must be calendar or trading_day");}
+    windowMode = input.window_mode;
+  } else if (base) {
+    windowMode = base.window_mode === "trading_day" && core.frequency === "daily" ? "trading_day" : "calendar";
+  } else {
+    // A NEW daily schedule closes its day at the send time unless it carries a
+    // report that may only be read on calendar days.
+    windowMode = core.frequency === "daily" && !askedKeys.some((k) => CALENDAR_ONLY_KEYS.includes(k)) ? "trading_day" : "calendar";
+  }
+  if (windowMode === "trading_day" && core.frequency !== "daily") {
+    throw bundleError("\"The day that just ended\" only applies to a daily schedule. Choose \"previous calendar day\" for a weekly or monthly one.");
+  }
+  const selection = validateReportSelection(askedKeys, windowMode);
+  if (!selection.ok) {throw bundleError(selection.error);}
+
+  const rawFormats: unknown = input.formats !== undefined
+    ? input.formats
+    : input.format !== undefined
+      ? [input.format]
+      : base?.formats;
+  const formats = validateReportFormats(rawFormats);
+  if (!formats.ok) {throw bundleError(formats.error);}
+
+  const scopeRaw = String(input.outlet_scope ?? base?.outlet_scope ?? "outlet").trim().toLowerCase();
+  if (scopeRaw !== "outlet" && scopeRaw !== "all") {throw bundleError("outlet_scope must be outlet or all");}
+  if (scopeRaw === "all" && base?.outlet_scope !== "all" && !opts.allowAllOutlets) {
+    throw bundleError("Only an admin or a manager can send reports for all outlets combined.", 403);
+  }
+
+  let recipients: string[] = [];
+  if (channel === "email") {
+    const asked = input.recipient_ids !== undefined || input.recipients !== undefined;
+    if (!asked && base) {
+      recipients = [...base.recipients];
+    } else if (input.recipient_ids !== undefined) {
+      const ids = Array.isArray(input.recipient_ids) ? input.recipient_ids.map((x) => String(x)) : [];
+      if (ids.length > MAX_REPORT_RECIPIENTS) {throw bundleError(`Choose at most ${String(MAX_REPORT_RECIPIENTS)} addresses.`);}
+      const found = await GetReportEmailRecipientsByIds(restaurantId, ids);
+      if (found.length !== new Set(ids).size) {
+        throw bundleError("One of the chosen addresses is no longer in the address book. Reload and choose again.");
+      }
+      recipients = found.map((r) => r.email);
+    } else {
+      const list = Array.isArray(input.recipients)
+        ? input.recipients.map((x) => String(x ?? "").trim()).filter(Boolean)
+        : typeof input.recipients === "string"
+          ? input.recipients.split(/[,;\n]/).map((x) => x.trim()).filter(Boolean)
+          : [];
+      const seen = new Set<string>();
+      const unique = list.filter((e) => { const k = normalizeEmailKey(e); if (seen.has(k)) {return false;} seen.add(k); return true; });
+      if (unique.length > MAX_REPORT_RECIPIENTS) {throw bundleError(`Choose at most ${String(MAX_REPORT_RECIPIENTS)} addresses.`);}
+      const book = await ReportEmailBookStatus(resId);
+      for (const e of unique) {
+        const status = book.get(normalizeEmailKey(e));
+        if (status !== "active") {
+          throw bundleError(status === "suppressed"
+            ? `${e} is paused in the address book and cannot receive reports.`
+            : `${e} is not in this restaurant's address book. Add it there first (Settings permission), then choose it.`);
+        }
+      }
+      recipients = unique;
+    }
+    if (recipients.length === 0) {
+      throw bundleError("An email schedule needs at least one address from the address book. Choose one, or deliver this schedule to the in-app inbox instead.");
+    }
+  }
+
+  return {
+    ...core,
+    channel,
+    recipients,
+    report_keys: selection.keys,
+    report_key: legacyReportKey(selection.keys),
+    formats: formats.formats,
+    format: formats.formats[0],
+    window_mode: windowMode,
+    outlet_scope: scopeRaw,
+  };
+}
+
+/**
+ * The half of a schedule every shape shares — name, cadence, clock, on/off —
+ * validated once for the 2.0.1 path and the bundle path alike.
+ */
+function scheduleCoreOf(
+  input: Record<string, unknown>,
+  base?: ReportScheduleRecord,
+): {
+  name: string; frequency: string; hour_local: number; minute_local: number;
+  weekday: number | null; day_of_month: number | null; enabled: boolean;
+} {
+  const name = String(input.name ?? base?.name ?? "").trim();
+  if (!name) { throw new Error("name is required"); }
+  const frequency = oneOf(input.frequency ?? base?.frequency ?? "daily", REPORT_SCHEDULE_FREQUENCIES, "frequency");
   return {
     name: name.slice(0, 120),
-    report_key: oneOf(input.report_key ?? base?.report_key ?? "sales", REPORT_SCHEDULE_KEYS, "report_key"),
     frequency,
     hour_local: boundedInt(input.hour_local ?? base?.hour_local ?? 8, 0, 23, "hour_local"),
     minute_local: boundedInt(input.minute_local ?? base?.minute_local ?? 0, 0, 59, "minute_local"),
@@ -20215,9 +21993,6 @@ function normalizeSchedulePayload(
     day_of_month: frequency === "monthly"
       ? boundedInt(input.day_of_month ?? base?.day_of_month ?? 1, 1, 28, "day_of_month")
       : null,
-    channel,
-    recipients,
-    format: oneOf(input.format ?? base?.format ?? "csv", REPORT_SCHEDULE_FORMATS, "format"),
     enabled: input.enabled === undefined ? (base?.enabled ?? true) : input.enabled !== false,
   };
 }
@@ -20253,8 +22028,37 @@ export async function CreateReportSchedule(
   restaurantId: string,
   input: Record<string, unknown>,
   createdBy?: string,
+  opts: { allowAllOutlets?: boolean } = {},
 ): Promise<ReportScheduleRecord> {
   const context = await requireRestaurantContext(restaurantId);
+  if (isBundlePayload(input)) {
+    if (!(await reportEmailSchemaReady())) {
+      // The older sentences first where they apply ("an email schedule needs a
+      // recipient"), then the honest one: this server's database is behind.
+      normalizeSchedulePayload({ ...input, report_key: "sales", format: "csv" });
+      throw new ReportEmailSchemaPendingError();
+    }
+    const b = await normalizeBundlePayload(context.res_id, restaurantId, input, undefined, { allowAllOutlets: opts.allowAllOutlets === true });
+    if (b.channel === "email" && (await CountEmailSchedules(context.res_id, context.outlet_id)) >= MAX_EMAIL_SCHEDULES_PER_OUTLET) {
+      throw bundleError(`An outlet can have at most ${String(MAX_EMAIL_SCHEDULES_PER_OUTLET)} email schedules. Remove one first.`);
+    }
+    const inserted = await runQuery<Record<string, any>>(
+      `insert into "ReportSchedules"
+         (res_id, outlet_id, name, report_key, frequency, hour_local, minute_local,
+          weekday, day_of_month, channel, recipients, format, enabled, created_by, updated_by,
+          report_keys, formats, window_mode, outlet_scope)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15,$16,$17,$18)
+       returning ${SCHEDULE_COLS_057}`,
+      [
+        context.res_id, context.outlet_id, b.name, b.report_key, b.frequency,
+        b.hour_local, b.minute_local, b.weekday, b.day_of_month, b.channel,
+        b.recipients, b.format, b.enabled, (createdBy ?? "").trim() || null,
+        b.report_keys, b.formats, b.window_mode, b.outlet_scope,
+      ],
+    );
+    if (!inserted[0]) { throw new Error("Failed to create report schedule"); }
+    return mapReportSchedule(inserted[0]);
+  }
   const p = normalizeSchedulePayload(input);
   // The insert names migration 044's column, so an unapplied 044 raises 42703
   // here. scheduleWriteError turns that into a sentence an owner can act on —
@@ -20281,10 +22085,39 @@ export async function UpdateReportSchedule(
   scheduleId: string,
   input: Record<string, unknown>,
   updatedBy?: string,
+  opts: { allowAllOutlets?: boolean } = {},
 ): Promise<ReportScheduleRecord> {
   const context = await requireRestaurantContext(restaurantId);
   const existing = await GetReportSchedule(restaurantId, scheduleId);
   if (!existing) { throw new Error("Unknown report schedule"); }
+  if (isBundlePayload(input) || isBundleRow(existing)) {
+    if (!(await reportEmailSchemaReady())) {throw new ReportEmailSchemaPendingError();}
+    const b = await normalizeBundlePayload(context.res_id, restaurantId, input, existing, { allowAllOutlets: opts.allowAllOutlets === true });
+    if (b.channel === "email" && existing.channel !== "email"
+      && (await CountEmailSchedules(context.res_id, context.outlet_id)) >= MAX_EMAIL_SCHEDULES_PER_OUTLET) {
+      throw bundleError(`An outlet can have at most ${String(MAX_EMAIL_SCHEDULES_PER_OUTLET)} email schedules. Remove one first.`);
+    }
+    const reEnabled = b.enabled && !existing.enabled;
+    const changed = await runQuery<Record<string, any>>(
+      `update "ReportSchedules"
+          set name = $4, report_key = $5, frequency = $6, hour_local = $7,
+              minute_local = $8, weekday = $9, day_of_month = $10, channel = $11,
+              recipients = $12, format = $13, enabled = $14, updated_by = $15,
+              updated_at = now(),
+              consecutive_failures = case when $16 then 0 else consecutive_failures end,
+              report_keys = $17, formats = $18, window_mode = $19, outlet_scope = $20
+        where id = $3 and res_id = $1 and outlet_id = $2 and archived_at is null
+        returning ${SCHEDULE_COLS_057}`,
+      [
+        context.res_id, context.outlet_id, scheduleId, b.name, b.report_key,
+        b.frequency, b.hour_local, b.minute_local, b.weekday, b.day_of_month,
+        b.channel, b.recipients, b.format, b.enabled, (updatedBy ?? "").trim() || null, reEnabled,
+        b.report_keys, b.formats, b.window_mode, b.outlet_scope,
+      ],
+    );
+    if (!changed[0]) { throw new Error("Unknown report schedule"); }
+    return mapReportSchedule(changed[0]);
+  }
   const p = normalizeSchedulePayload(input, existing);
   // Re-enabling clears the failure streak: the owner has looked at it, and
   // otherwise the auto-disable in TouchReportScheduleOutcome would trip again on
@@ -20336,51 +22169,135 @@ export async function ArchiveReportSchedule(
   return rows.length > 0;
 }
 
-export async function GetReportDeliveries(
-  restaurantId: string,
-  opts: { schedule_id?: string; limit?: number } = {},
-): Promise<ReportDeliveryRecord[]> {
-  const context = await requireRestaurantContext(restaurantId);
-  const og = isAllOutlets() ? "true" : "false";
-  const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
-  const params: unknown[] = [context.res_id, context.outlet_id, limit];
-  let scheduleFilter = "";
-  if (opts.schedule_id) {
-    if (!isUuid(opts.schedule_id)) { return []; }
-    params.push(opts.schedule_id);
-    scheduleFilter = ` and schedule_id = $${String(params.length)}`;
-  }
-  const rows = await runQuery<Record<string, any>>(
-    `select id, schedule_id, outlet_id, occurrence_key, fire_at,
-            to_char(period_from, 'YYYY-MM-DD') as period_from,
-            to_char(period_to,   'YYYY-MM-DD') as period_to,
-            timezone, status, attempts, channel, artifact_name, artifact_bytes,
-            artifact_truncated, error, delivered_at, created_at
-       from "ReportDeliveries"
-      where res_id = $1 and (${og} or outlet_id = $2)${scheduleFilter}
-      order by created_at desc
-      limit $3`,
-    params,
+/** The delivery columns a 2.0.1 database has (044's delivered_to included). */
+const DELIVERY_COLS = `d.id, d.schedule_id, d.outlet_id, d.occurrence_key, d.fire_at,
+            to_char(d.period_from, 'YYYY-MM-DD') as period_from,
+            to_char(d.period_to,   'YYYY-MM-DD') as period_to,
+            d.timezone, d.status, d.attempts, d.channel, d.artifact_name, d.artifact_bytes,
+            d.artifact_truncated, d.error, d.delivered_at, d.created_at, d.delivered_to,
+            d.next_attempt_at`;
+
+/** …and migration 058's, with the files as one JSON list (never their bodies). */
+const DELIVERY_COLS_058 = `${DELIVERY_COLS},
+            d.kind, d.report_keys, d.formats, d.outlet_scope, d.day_close,
+            d.window_start_at, d.window_end_at, d.recipients, d.rejected_to, d.skipped_to,
+            d.provider, d.requested_by, d.sending_at, d.maybe_duplicate,
+            coalesce((
+              select json_agg(json_build_object(
+                       'id', f.id, 'report_key', f.report_key, 'format', f.format,
+                       'filename', f.filename, 'mime', f.mime, 'bytes', f.bytes,
+                       'rows', f.rows, 'truncated', f.truncated, 'purged', f.body is null)
+                     order by f.created_at, f.id)
+                from "ReportDeliveryFiles" f
+               where f.delivery_id = d.id and f.res_id = d.res_id
+            ), '[]'::json) as files`;
+
+function mapDelivery(r: Record<string, any>, now: Date = new Date()): ReportDeliveryRecord {
+  const files = Array.isArray(r.files) ? r.files : [];
+  const kind = r.kind === "adhoc" || r.kind === "manual" ? r.kind
+    : typeof r.occurrence_key === "string" && r.occurrence_key.startsWith("manual:") ? "manual" : "scheduled";
+  const attempts = Number(r.attempts) || 0;
+  // What the row MEANS, not only what its status column says — a dead last
+  // attempt reads as failed on a server whose reaper has not run.
+  const reading = deliveryReading(
+    { status: String(r.status), attempts, kind, error: r.error ?? null, next_attempt_at: r.next_attempt_at ?? null, created_at: r.created_at },
+    now,
+    reportCatchupMinutes(),
   );
-  return rows.map((r) => ({
+  return {
     id: String(r.id),
-    schedule_id: String(r.schedule_id),
+    schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
     outlet_id: String(r.outlet_id),
     occurrence_key: r.occurrence_key ?? null,
     fire_at: r.fire_at,
     period_from: String(r.period_from),
     period_to: String(r.period_to),
     timezone: String(r.timezone),
-    status: String(r.status),
-    attempts: Number(r.attempts) || 0,
+    status: reading.status,
+    attempts,
     channel: r.channel ?? null,
     artifact_name: r.artifact_name ?? null,
     artifact_bytes: r.artifact_bytes === null || r.artifact_bytes === undefined ? null : Number(r.artifact_bytes),
     artifact_truncated: r.artifact_truncated === true,
-    error: r.error ?? null,
+    error: reading.error,
     delivered_at: r.delivered_at ?? null,
     created_at: r.created_at,
-  }));
+    delivered_to: textArray(r.delivered_to),
+    kind,
+    report_keys: reportKeysOfRow(r),
+    formats: textArray(r.formats).length > 0 ? textArray(r.formats) : ["csv"],
+    outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+    day_close: r.day_close ?? null,
+    window_start_at: r.window_start_at ?? null,
+    window_end_at: r.window_end_at ?? null,
+    recipients: Array.isArray(r.recipients) ? textArray(r.recipients) : null,
+    rejected_to: textArray(r.rejected_to),
+    skipped_to: textArray(r.skipped_to),
+    provider: r.provider ?? null,
+    requested_by: r.requested_by ?? null,
+    sending_at: r.sending_at ?? null,
+    maybe_duplicate: r.maybe_duplicate === true,
+    files: files.map((f: Record<string, any>) => ({
+      id: String(f.id),
+      report_key: String(f.report_key),
+      format: String(f.format),
+      filename: String(f.filename),
+      mime: String(f.mime),
+      bytes: Number(f.bytes) || 0,
+      rows: Number(f.rows) || 0,
+      truncated: f.truncated === true,
+      purged: f.purged === true,
+    })),
+    next_attempt_at: reading.final || r.next_attempt_at === undefined ? null : r.next_attempt_at,
+    final: reading.final,
+  };
+}
+
+export async function GetReportDeliveries(
+  restaurantId: string,
+  opts: { schedule_id?: string; limit?: number; kind?: string } = {},
+): Promise<ReportDeliveryRecord[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  const og = isAllOutlets() ? "true" : "false";
+  const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
+  const params: unknown[] = [context.res_id, context.outlet_id, limit];
+  const ready = await reportEmailSchemaReady();
+  let filter = "";
+  if (opts.schedule_id) {
+    if (!isUuid(opts.schedule_id)) { return []; }
+    params.push(opts.schedule_id);
+    filter += ` and d.schedule_id = $${String(params.length)}`;
+  }
+  if (opts.kind && ready && ["scheduled", "manual", "adhoc"].includes(opts.kind)) {
+    params.push(opts.kind);
+    filter += ` and d.kind = $${String(params.length)}`;
+  }
+  const rows = await runQuery<Record<string, any>>(
+    `select ${ready ? DELIVERY_COLS_058 : DELIVERY_COLS}
+       from "ReportDeliveries" d
+      where d.res_id = $1 and (${og} or d.outlet_id = $2)${filter}
+      order by d.created_at desc
+      limit $3`,
+    params,
+  );
+  const now = new Date();
+  return rows.map((r) => mapDelivery(r, now));
+}
+
+/** One delivery — what Send now's caller polls. Scoped like the list. */
+export async function GetReportDelivery(restaurantId: string, deliveryId: string): Promise<ReportDeliveryRecord | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(deliveryId)) { return null; }
+  const og = isAllOutlets() ? "true" : "false";
+  const ready = await reportEmailSchemaReady();
+  const rows = await runQuery<Record<string, any>>(
+    `select ${ready ? DELIVERY_COLS_058 : DELIVERY_COLS}
+       from "ReportDeliveries" d
+      where d.id = $3 and d.res_id = $1 and (${og} or d.outlet_id = $2)
+      limit 1`,
+    [context.res_id, context.outlet_id, deliveryId],
+  );
+  return rows[0] ? mapDelivery(rows[0]) : null;
 }
 
 /** Scoped by res_id AND outlet, never by id alone — the artifact is the tenant's
@@ -20427,7 +22344,8 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
   // list that only the email channel would have read.
   const rows = await scheduleRead<Record<string, any>>(
     (cols) => `select id, outlet_id, name, report_key, frequency, hour_local, minute_local,
-            weekday, day_of_month, channel, ${cols.includes("recipients") ? "recipients," : ""} format, created_at
+            weekday, day_of_month, channel, ${cols.includes("recipients") ? "recipients," : ""} format,
+            ${cols.includes("window_mode") ? "report_keys, formats, window_mode, outlet_scope," : ""} created_at
        from "ReportSchedules"
       where res_id = $1 and enabled = true and archived_at is null
       order by created_at asc
@@ -20447,6 +22365,7 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
     channel: String(r.channel),
     recipients: Array.isArray(r.recipients) ? r.recipients.map((x: unknown) => String(x)) : [],
     format: String(r.format),
+    ...bundleFieldsOf(r),
     created_at: r.created_at,
   }));
 }
@@ -20454,8 +22373,82 @@ export async function ListDueReportSchedules(resId: string, limit = 200): Promis
 /** Occurrences whose lease has expired and that still have attempts left. The
  *  schedule join is NOT filtered on `enabled`: a claimed occurrence is work that
  *  was already accepted, and dropping it on a toggle would leave a row stuck at
- *  'claimed' forever with nothing to explain it. */
-export async function ListRetryableReportDeliveries(resId: string, limit = 50): Promise<RetryableReportDelivery[]> {
+ *  'claimed' forever with nothing to explain it.
+ *
+ *  A RUN NOW OR SEND NOW IS NOT RETRIED PAST THE CATCH-UP WINDOW (`maxAgeMin`).
+ *  Without that bound, one claimed while this server had no mail transport
+ *  sat 'Queued' until some later deploy had one, and was then emailed —
+ *  days-old, to whoever was on it. The reaper fails it instead
+ *  (ReapExhaustedReportDeliveries). A scheduled occurrence keeps the bound it
+ *  always had: it is not claimed that late. */
+export async function ListRetryableReportDeliveries(
+  resId: string,
+  limit = 50,
+  maxAgeMin: number = reportCatchupMinutes(),
+): Promise<RetryableReportDelivery[]> {
+  const bounded = Math.max(1, Math.min(limit, 200));
+  const maxAge = Math.max(1, Math.round(maxAgeMin));
+  if (await reportEmailSchemaReady()) {
+    // A LEFT JOIN since migration 058: a Send now has no schedule, and an
+    // inner join would leave every failed one unretried forever. A scheduled
+    // row whose schedule row is missing is still skipped, as before.
+    //
+    // 'sending' is retryable once its lease has lapsed — that is a process that
+    // died mid-send, and the retry sends only to the addresses it had not
+    // finished (TakeReportDeliveryAttempt marks it maybe_duplicate).
+    const rows = await runQuery<Record<string, any>>(
+      `select d.id, d.schedule_id, d.outlet_id, d.occurrence_key,
+              to_char(d.period_from, 'YYYY-MM-DD') as period_from,
+              to_char(d.period_to,   'YYYY-MM-DD') as period_to,
+              d.timezone, d.attempts, d.channel, d.status,
+              coalesce(s.name, 'Send now') as name,
+              coalesce(s.report_key, 'bundle') as report_key,
+              coalesce(s.format, d.formats[1], 'csv') as format,
+              -- The schedule's CURRENT list for a scheduled row (044's decision,
+              -- see below); the snapshot a Send now was addressed to otherwise.
+              case when d.schedule_id is null then d.recipients else s.recipients end as recipients,
+              d.kind, d.outlet_scope, d.day_close, d.window_start_at, d.window_end_at, d.requested_by,
+              -- What the occurrence was CLAIMED as, like d.channel; a row written
+              -- before 058 carries empty lists and reads the schedule's.
+              case when cardinality(d.report_keys) > 0 then d.report_keys else s.report_keys end as report_keys,
+              case when d.kind = 'scheduled' and cardinality(d.report_keys) = 0 then s.formats else d.formats end as formats
+         from "ReportDeliveries" d
+         left join "ReportSchedules" s on s.id = d.schedule_id and s.res_id = d.res_id
+        where d.res_id = $1
+          and d.status in ('claimed','rendered','sending','failed')
+          and d.attempts < $2
+          and d.next_attempt_at <= now()
+          and (d.schedule_id is null or s.id is not null)
+          and (d.kind = 'scheduled' or d.created_at > now() - make_interval(mins => $4::int))
+        order by d.created_at asc
+        limit $3`,
+      [resId, REPORT_MAX_ATTEMPTS, bounded, maxAge],
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
+      outlet_id: String(r.outlet_id),
+      occurrence_key: r.occurrence_key ?? null,
+      period_from: String(r.period_from),
+      period_to: String(r.period_to),
+      timezone: String(r.timezone),
+      attempts: Number(r.attempts) || 0,
+      channel: r.channel ?? null,
+      recipients: textArray(r.recipients),
+      name: String(r.name ?? ""),
+      report_key: String(r.report_key),
+      format: String(r.format),
+      kind: r.kind === "adhoc" || r.kind === "manual" ? r.kind : "scheduled",
+      status: String(r.status),
+      report_keys: reportKeysOfRow(r),
+      formats: textArray(r.formats).length > 0 ? textArray(r.formats) : [String(r.format ?? "csv")],
+      outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+      day_close: r.day_close ?? null,
+      window_start_at: r.window_start_at ? new Date(r.window_start_at).toISOString() : null,
+      window_end_at: r.window_end_at ? new Date(r.window_end_at).toISOString() : null,
+      requested_by: r.requested_by ?? null,
+    }));
+  }
   const rows = await runQuery<Record<string, any>>(
     `select d.id, d.schedule_id, d.outlet_id, d.occurrence_key,
             to_char(d.period_from, 'YYYY-MM-DD') as period_from,
@@ -20478,9 +22471,11 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
         and d.status in ('claimed','rendered','failed')
         and d.attempts < $2
         and d.next_attempt_at <= now()
+        and (d.occurrence_key is null or d.occurrence_key not like 'manual:%'
+             or d.created_at > now() - make_interval(mins => $4::int))
       order by d.created_at asc
       limit $3`,
-    [resId, REPORT_MAX_ATTEMPTS, Math.max(1, Math.min(limit, 200))],
+    [resId, REPORT_MAX_ATTEMPTS, bounded, maxAge],
   );
   return rows.map((r) => ({
     id: String(r.id),
@@ -20496,22 +22491,117 @@ export async function ListRetryableReportDeliveries(resId: string, limit = 50): 
     name: String(r.name ?? ""),
     report_key: String(r.report_key),
     format: String(r.format),
+    kind: typeof r.occurrence_key === "string" && r.occurrence_key.startsWith("manual:") ? "manual" : "scheduled",
+    status: "claimed",
+    report_keys: reportKeysOfRow(r),
+    formats: [String(r.format ?? "csv")],
+    outlet_scope: "outlet",
+    day_close: null,
+    window_start_at: null,
+    window_end_at: null,
+    requested_by: null,
   }));
 }
 
-/** Without this, a row that used up its attempts sits at 'claimed' forever and is
- *  excluded from the retry scan by `attempts < 3` — invisible rather than failed.
- *  A plain idempotent UPDATE, so two replicas running it concurrently is fine. */
-export async function ReapExhaustedReportDeliveries(resId: string): Promise<number> {
-  const rows = await runQuery<{ id: string }>(
-    `update "ReportDeliveries"
-        set status = 'failed', error = coalesce(error, 'Retries exhausted')
-      where res_id = $1 and attempts >= $2 and next_attempt_at <= now()
-        and status in ('claimed','rendered')
-      returning id`,
-    [resId, REPORT_MAX_ATTEMPTS],
-  );
-  return rows.length;
+/** One delivery shaped for a run — what a Send now or Run now kick works from. */
+export async function GetRunnableReportDelivery(resId: string, deliveryId: string): Promise<RetryableReportDelivery | null> {
+  // The id is only ever COMPARED with rows the retry scan returned — never bound.
+  const all = await ListRetryableReportDeliveries(resId, 200);
+  return all.find((d) => d.id === deliveryId) ?? null;
+}
+
+/** A row the reaper just failed for good, shaped like a retry row so the sweep
+ *  can tell the owner about it the way recordFailure does, with the error the
+ *  row now carries. */
+export interface ReapedReportDelivery extends RetryableReportDelivery {
+  error: string;
+}
+
+/**
+ * Without this, a row that used up its attempts sits at 'claimed' forever and is
+ * excluded from the retry scan by `attempts < 3` — invisible rather than failed.
+ * An idempotent UPDATE, so two replicas running it concurrently is fine: the
+ * second finds nothing left to fail, so the owner hears once.
+ *
+ * SINCE THE ITEM 9 REVIEW it fails two more kinds of row that nothing else
+ * would ever settle, and hands them back so the sweep rings the final-failure
+ * bell and marks the schedule card — a plain UPDATE left the owner staring at
+ * "Sending" (and the app polling) with no bell at all:
+ *   * 'sending' on its last attempt, the worker gone (a deploy recreate is
+ *     enough) — its per-address outcome is already on the row;
+ *   * a Run now or Send now older than the catch-up window that never
+ *     finished — dropped, not sent late (ListRetryableReportDeliveries no
+ *     longer offers it).
+ */
+export async function ReapExhaustedReportDeliveries(
+  resId: string,
+  maxAgeMin: number = reportCatchupMinutes(),
+): Promise<ReapedReportDelivery[]> {
+  const maxAge = Math.max(1, Math.round(maxAgeMin));
+  if (await reportEmailSchemaReady()) {
+    const rows = await runQuery<Record<string, any>>(
+      `with reaped as (
+         update "ReportDeliveries" d
+            set status = 'failed',
+                attempts = greatest(d.attempts, $2),
+                error = case
+                  when d.attempts >= $2 then coalesce(d.error, case when d.status = 'sending' then $4::text else $5::text end)
+                  else left($6::text || coalesce(' Last problem: ' || d.error, ''), 800)
+                end
+          where d.res_id = $1
+            and d.next_attempt_at <= now()
+            and ((d.attempts >= $2 and d.status in ('claimed','rendered','sending'))
+              or (d.kind in ('manual','adhoc') and d.attempts < $2
+                  and d.status in ('claimed','rendered','sending','failed')
+                  and d.created_at <= now() - make_interval(mins => $3::int)))
+          returning d.id, d.res_id, d.schedule_id, d.outlet_id, d.occurrence_key, d.period_from, d.period_to,
+                    d.timezone, d.attempts, d.channel, d.status, d.error, d.kind, d.report_keys, d.formats,
+                    d.outlet_scope, d.day_close, d.window_start_at, d.window_end_at, d.requested_by, d.recipients
+       )
+       select r.id, r.schedule_id, r.outlet_id, r.occurrence_key,
+              to_char(r.period_from, 'YYYY-MM-DD') as period_from,
+              to_char(r.period_to,   'YYYY-MM-DD') as period_to,
+              r.timezone, r.attempts, r.channel, r.status, r.error,
+              coalesce(s.name, 'Send now') as name,
+              coalesce(s.report_key, 'bundle') as report_key,
+              coalesce(s.format, r.formats[1], 'csv') as format,
+              case when r.schedule_id is null then r.recipients else s.recipients end as recipients,
+              r.kind, r.outlet_scope, r.day_close, r.window_start_at, r.window_end_at, r.requested_by,
+              case when cardinality(r.report_keys) > 0 then r.report_keys else s.report_keys end as report_keys,
+              case when r.kind = 'scheduled' and cardinality(r.report_keys) = 0 then s.formats else r.formats end as formats
+         from reaped r
+         left join "ReportSchedules" s on s.id = r.schedule_id and s.res_id = r.res_id`,
+      [resId, REPORT_MAX_ATTEMPTS, maxAge, REPORT_STOPPED_MID_SEND, REPORT_RETRIES_EXHAUSTED, reportDroppedLateSentence(maxAge)],
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      schedule_id: r.schedule_id === null || r.schedule_id === undefined ? null : String(r.schedule_id),
+      outlet_id: String(r.outlet_id),
+      occurrence_key: r.occurrence_key ?? null,
+      period_from: String(r.period_from),
+      period_to: String(r.period_to),
+      timezone: String(r.timezone),
+      attempts: Number(r.attempts) || 0,
+      channel: r.channel ?? null,
+      recipients: textArray(r.recipients),
+      name: String(r.name ?? ""),
+      report_key: String(r.report_key),
+      format: String(r.format),
+      kind: r.kind === "adhoc" || r.kind === "manual" ? r.kind : "scheduled",
+      status: String(r.status),
+      report_keys: reportKeysOfRow(r),
+      formats: textArray(r.formats).length > 0 ? textArray(r.formats) : [String(r.format ?? "csv")],
+      outlet_scope: r.outlet_scope === "all" ? "all" : "outlet",
+      day_close: r.day_close ?? null,
+      window_start_at: r.window_start_at ? new Date(r.window_start_at).toISOString() : null,
+      window_end_at: r.window_end_at ? new Date(r.window_end_at).toISOString() : null,
+      requested_by: r.requested_by ?? null,
+      error: String(r.error ?? REPORT_RETRIES_EXHAUSTED),
+    }));
+  }
+  // The sweep, this function's only caller, does not run on a database without
+  // 058 (report_schedules.ts rule 6), and nothing else settles a row there.
+  return [];
 }
 
 /**
@@ -20591,10 +22681,155 @@ export async function WarmReportingSchema(): Promise<void> {
     try { await fn(); }
     catch (err) { logger.warn({ err, label }, "warm_reporting_schema_step_failed"); }
   };
-  await step("Bills.workflow_cols", () => ensureBillWorkflowColumns());
-  await step("Expenses", () => ensureExpensesTable());
-  await step("Notifications", () => ensureNotificationsTable());
-  await step("branding_columns", () => ensureBrandingColumns());
+  // PROBE FIRST (client item 9, before the scheduler may be switched on).
+  // `ADD COLUMN IF NOT EXISTS` takes ACCESS EXCLUSIVE before it looks, and the
+  // two groups below are ~17 ALTERs on "Bills" and ~40 on "Restaurant" — the
+  // two tables every request reads first. Issued blind at boot, with no lock
+  // timeout, they are the shape of the 2026-08-24 convoy. So the catalogue is
+  // asked, only the MISSING columns are added (under a 2s LOCAL lock timeout,
+  // the InitKotDocketSchema pattern), and when nothing is missing the lazy
+  // helpers are simply marked done — the same end state, with no lock taken.
+  await step("Bills.workflow_cols", () => warmColumns("Bills", BILL_WORKFLOW_COLUMN_DDL, () => {
+    ddlEnsured.add("Bills.round_off");
+    ddlEnsured.add("Bills.workflow_cols");
+  }));
+  await step("Bills.workflow_actions", () => seedBillWorkflowActions());
+  await step("Expenses", () => warmTable("Expenses", null, () => ensureExpensesTable(), () => { ddlEnsured.add("Expenses"); }));
+  await step("Notifications", () => warmTable("Notifications", "notifications_res_idx", () => ensureNotificationsTable(), () => { ddlEnsured.add("Notifications"); }));
+  await step("branding_columns", () => warmColumns("Restaurant", RESTAURANT_BRANDING_COLUMN_DDL, () => { brandingColsEnsured = true; }));
+}
+
+/**
+ * The "Bills" columns ensureBillWorkflowColumns issues (with 048's round_off),
+ * as [name, definition] — held to that function statement by statement by
+ * jest-tests/report_warm_schema.test.ts, so the probe can never ask about a
+ * different list from the one the lazy path creates.
+ */
+export const BILL_WORKFLOW_COLUMN_DDL: readonly (readonly [string, string])[] = [
+  ["round_off", "numeric(12,2)"],
+  ["payment_method", "text"],
+  ["waiter_confirmed_at", "timestamptz"],
+  ["waiter_confirmed_by_username", "text"],
+  ["payment_proof_screenshot_url", "text"],
+  ["admin_approved_at", "timestamptz"],
+  ["admin_approved_by_username", "text"],
+  ["closed_at", "timestamptz"],
+  ["closed_by_username", "text"],
+  ["discount_type", "text"],
+  ["discount_value", "numeric"],
+  ["coupon_code", "text"],
+  ["refunded_at", "timestamptz"],
+  ["refunded_by_username", "text"],
+  ["refund_amount", "numeric"],
+  ["refund_reason", "text"],
+  ["refund_ref", "text"],
+  ["payment_splits", "jsonb"],
+];
+
+/** The "Restaurant" columns ensureBrandingColumns issues, likewise held to it. */
+export const RESTAURANT_BRANDING_COLUMN_DDL: readonly (readonly [string, string])[] = [
+  ["theme_color", "text"],
+  ["auto_push_orders", "boolean default true"],
+  ["currency", "text"],
+  ["payment_config", "jsonb"],
+  ["razorpay_key_id", "text"],
+  ["razorpay_key_secret", "text"],
+  ["service_charge", "numeric default 0"],
+  ["feedback_config", "jsonb"],
+  ["bill_logo_svg", "text"],
+  ["bill_paper_width", "text"],
+  ["bill_legal_name", "text"],
+  ["bill_gstin", "text"],
+  ["bill_qr_note", "text"],
+  ["queue_show_menu", "boolean default true"],
+  ["queue_menu_config", "jsonb default null"],
+  ["discount_approval_threshold", "numeric default 0"],
+  ["bill_reopen_window_min", "integer default 240"],
+  ["alert_discount_pct", "numeric default 10"],
+  ["alert_void_count", "integer default 5"],
+  ["loyalty_earn_per_100", "numeric default 0"],
+  ["loyalty_point_value", "numeric default 1"],
+  ["aggregator_key", "text"],
+  ["booking_deposit_amount", "numeric default 0"],
+  ["booking_deposit_min_party", "integer default 0"],
+  ["booking_cancel_window_hours", "integer default 24"],
+  ["booking_min_spend", "numeric default 0"],
+  ["msg_provider", "text default 'none'"],
+  ["msg_sender", "text"],
+  ["msg_key_id", "text"],
+  ["msg_key_secret", "text"],
+  ["msg_reminder_hours", "integer default 2"],
+  ["msg_webhook_secret", "text"],
+  ["kitchen_sections", "jsonb"],
+  ["inventory_categories", "jsonb"],
+  ["timezone", "text default 'Asia/Kolkata'"],
+  ["require_table_otp", "boolean default false"],
+  ["kot_auto_print", "boolean default true"],
+  ["bill_show_qr", "boolean default true"],
+  ["brand_config", "jsonb default null"],
+  ["menu_badges", "jsonb default null"],
+  ["report_time_slots", "jsonb default null"],
+  ["kot_print_style", "text"],
+  ["kot_text_size", "text"],
+];
+
+async function existingColumns(table: string): Promise<Set<string>> {
+  const rows = await runQuery<{ column_name: string }>(
+    `select column_name from information_schema.columns where table_schema = 'public' and table_name = $1`,
+    [table],
+  );
+  return new Set(rows.map((r) => String(r.column_name)));
+}
+
+/**
+ * Ask which of `spec` are missing and add only those, in ONE DO block under a
+ * 2-second transaction-local lock timeout. `markDone` runs only when every
+ * column is there afterwards; otherwise the lazy path stays armed and retries.
+ * Table and column text are the constants above — never input.
+ */
+async function warmColumns(table: string, spec: readonly (readonly [string, string])[], markDone: () => void): Promise<void> {
+  const present = await existingColumns(table);
+  const missing = spec.filter(([name]) => !present.has(name));
+  if (missing.length > 0) {
+    await runQuery(
+      `do $$
+       begin
+         perform set_config('lock_timeout', '2s', true);
+         ${missing.map(([name, def]) => `alter table "${table}" add column if not exists ${name} ${def};`).join("\n         ")}
+       end $$`,
+    );
+    const after = await existingColumns(table);
+    const still = spec.filter(([name]) => !after.has(name)).map(([name]) => name);
+    if (still.length > 0) {
+      logger.warn({ table, missing: still }, "warm_reporting_schema_columns_missing");
+      return;
+    }
+  }
+  markDone();
+}
+
+/** A lazy table is warm when it exists with RLS forced (and its index, when it has one). */
+async function warmTable(table: string, index: string | null, ensure: () => Promise<void>, markDone: () => void): Promise<void> {
+  const probe = async () => {
+    const rows = await runQuery<{ ok: boolean }>(
+      `select exists (select 1 from pg_class where oid = to_regclass($1) and relrowsecurity and relforcerowsecurity)
+              and ($2::text is null or to_regclass($2::text) is not null) as ok`,
+      [`"${table}"`, index],
+    );
+    return rows[0]?.ok === true;
+  };
+  if (await probe()) { markDone(); return; }
+  await ensure();
+}
+
+/** The two audit labels ensureBillWorkflowColumns seeds — an INSERT, no DDL, no lock worth naming. */
+async function seedBillWorkflowActions(): Promise<void> {
+  await runQuery(
+    `insert into "Actions" (id, action_name, action_desc, "group")
+     values ('c4d2e6f8-1a3b-4c5d-8e7f-2b4a6c8d0e1f', 'Approve Discount', 'Review (approve/reject) staff bill-discount requests', 'Bills'::"Action_groups"),
+            ('d5e3f7a9-2b4c-4d6e-9f80-3c5b7d9e1f2a', 'Reopened bill', 'Re-open a closed bill within the allowed window', 'Bills'::"Action_groups")
+     on conflict (id) do nothing`,
+  ).catch(() => {/* seeded by migrations under least-privilege runtimes */});
 }
 
 // --- Group 3: the occurrence lifecycle — the at-most-once machinery ----------
@@ -20613,8 +22848,37 @@ export async function ClaimReportOccurrence(
     fire_at: Date; period_from: string; period_to: string; timezone: string;
     claimed_by: string; status: "claimed" | "abandoned"; channel: string;
     next_attempt_at: Date;
+    /** Migration 058: what the occurrence is being claimed AS. */
+    bundle?: {
+      kind: "scheduled" | "manual";
+      report_keys: string[]; formats: string[]; outlet_scope: string;
+      day_close: string | null; window_start_at: string; window_end_at: string;
+      requested_by?: string | null;
+    };
   },
 ): Promise<string | null> {
+  if (claim.bundle && (await reportEmailSchemaReady())) {
+    const b = claim.bundle;
+    const claimed = await runQuery<{ id: string }>(
+      // The same partial-index ON CONFLICT as below, predicate repeated.
+      `insert into "ReportDeliveries"
+         (res_id, outlet_id, schedule_id, occurrence_key, fire_at,
+          period_from, period_to, timezone, claimed_by, status, channel, next_attempt_at,
+          kind, report_keys, formats, outlet_scope, day_close, window_start_at, window_end_at, requested_by)
+       values ($1,$2,$3,$4,$5,$6::date,$7::date,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+       on conflict (schedule_id, occurrence_key) where occurrence_key is not null
+         do nothing
+       returning id`,
+      [
+        resId, claim.outlet_id, claim.schedule_id, claim.occurrence_key,
+        claim.fire_at.toISOString(), claim.period_from, claim.period_to, claim.timezone,
+        claim.claimed_by, claim.status, claim.channel, claim.next_attempt_at.toISOString(),
+        b.kind, b.report_keys, b.formats, b.outlet_scope, b.day_close, b.window_start_at, b.window_end_at,
+        b.requested_by ?? null,
+      ],
+    );
+    return claimed[0]?.id ?? null;
+  }
   const rows = await runQuery<{ id: string }>(
     // report_deliveries_occurrence_uniq is PARTIAL (where occurrence_key is not
     // null). Postgres will NOT infer a partial index unless the ON CONFLICT
@@ -20659,8 +22923,22 @@ export async function TakeReportDeliveryAttempt(
   leaseUntil: Date,
   workerId: string,
 ): Promise<number | null> {
+  // Since 058 a row found mid-send ('sending', its lease lapsed) is a process
+  // that died between two messages. It is resumed — and flagged, because an
+  // address whose send completed but whose outcome was never committed will
+  // get the report again. The guarantee SMTP gives is "at least once".
   const rows = await runQuery<{ attempts: number }>(
-    `update "ReportDeliveries"
+    (await reportEmailSchemaReady())
+      ? `update "ReportDeliveries"
+        set attempts = attempts + 1,
+            next_attempt_at = $4,
+            claimed_by = $5,
+            maybe_duplicate = maybe_duplicate or status = 'sending',
+            status = case when status = 'failed' then 'claimed' else status end
+      where id = $1 and res_id = $2 and attempts = $3
+        and status in ('claimed','rendered','sending','failed')
+      returning attempts`
+      : `update "ReportDeliveries"
         set attempts = attempts + 1,
             next_attempt_at = $4,
             claimed_by = $5,
@@ -20744,13 +23022,18 @@ export async function MarkReportDelivered(
     deliveryId: string; attempts: number; scheduleId: string;
     occurrenceKey: string | null; title: string; body: string;
     channel?: string; deliveredTo?: readonly string[];
+    /** Where the bell sends the owner to read it (default Accounting, 026's). */
+    module?: string;
   },
 ): Promise<void> {
   const rows = await runQuery<{ id: string }>(
+    // delivered_to: the caller's list on the one-shot path (inbox, 044's
+    // email); on the per-address path (item 9) it is already on the row,
+    // committed address by address, and null here leaves it as it is.
     `update "ReportDeliveries"
         set status = 'delivered', delivered_at = now(), error = null,
             channel = coalesce($4, channel),
-            delivered_to = $5
+            delivered_to = coalesce($5, delivered_to)
       where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'
       returning id`,
     [
@@ -20769,7 +23052,7 @@ export async function MarkReportDelivered(
     meta: {
       // notificationEntityOf has no case for "report" and finds no id it knows,
       // so it returns a null module and AddNotification leaves this one alone.
-      module: "Accounting",
+      module: d.module ?? "Accounting",
       schedule_id: d.scheduleId,
       delivery_id: d.deliveryId,
       occurrence_key: d.occurrenceKey,
@@ -20795,14 +23078,20 @@ export async function RecordReportDeliveryFailure(
   attempts: number,
   nextAttemptAt: Date,
   error: string,
+  opts: { final?: boolean } = {},
 ): Promise<void> {
   await runQuery(
     // CAS on the same token: a superseded worker's error must never land on a row
     // another worker has already delivered.
+    //
+    // `final` is a failure no retry can fix (every address refused, nothing
+    // left to send): the row takes its last attempt now, so the retry scan and
+    // the reaper both see it as done.
     `update "ReportDeliveries"
-        set status = 'failed', error = $5, next_attempt_at = $4
+        set status = 'failed', error = $5, next_attempt_at = $4,
+            attempts = case when $6::boolean then greatest(attempts, $7::int) else attempts end
       where id = $1 and res_id = $2 and attempts = $3 and status <> 'delivered'`,
-    [deliveryId, resId, attempts, nextAttemptAt.toISOString(), error.slice(0, 800)],
+    [deliveryId, resId, attempts, nextAttemptAt.toISOString(), error.slice(0, 800), opts.final === true, REPORT_MAX_ATTEMPTS],
   );
 }
 
@@ -20842,6 +23131,822 @@ export async function TouchReportScheduleOutcome(
   );
   const row = rows[0];
   return { auto_disabled: !ok && row?.enabled === false };
+}
+
+
+// --- Report email (client item 9; migrations 056-058) -------------------------
+//
+// The address book, the bundle schedule's extra columns, the delivery log's
+// per-address outcomes, the attachment store and the sweep's single-row lease.
+// report_schedules.ts orchestrates; report_bundle.ts renders; every statement
+// is here, for the reason the header of this section's 026 half gives.
+//
+// DEGRADATION. The backend ships before 056-058 are applied by hand, and issues
+// their statements itself at boot (InitReportEmailSchema). On a runtime that
+// cannot (app_runtime, no DDL), the latch below stays false and:
+//   * every read that would name a new column issues the SQL it issued on
+//     2.0.1 (and reads the new fields as their defaults);
+//   * every NEW write — the address book, Send now, a bundle or email
+//     schedule, a test email — throws ReportEmailSchemaPendingError, which the
+//     routes answer 503 with one sentence;
+//   * a 2.0.1-shaped inbox schedule (one accounting report, CSV, calendar day)
+//     can still be created and edited exactly as before;
+//   * but NOTHING SCHEDULED RUNS. The sweep's lease, the per-address log and
+//     the file store all live in 058, so the sweep waits for it (report_schedules.ts
+//     rule 6) — inbox schedules included — and Run now answers 503 rather than
+//     queue a run nothing will finish. The sentences below once promised
+//     "existing scheduled reports keep running"; they say what happens instead.
+
+/** A new report-email write on a database that has not got 056-058 yet. */
+export class ReportEmailSchemaPendingError extends Error {
+  readonly code = "REPORT_EMAIL_SCHEMA_PENDING";
+  constructor() {
+    super("Email reports need a database update (migrations 056-058) that has not been applied to this server yet. Until it is, no scheduled report is sent from this server; ask your administrator to apply it.");
+    this.name = "ReportEmailSchemaPendingError";
+  }
+}
+
+/** A refusal the person can act on: one sentence, and the status a route answers with. */
+export class ReportEmailRequestError extends Error {
+  readonly code = "REPORT_EMAIL_REQUEST";
+  constructor(message: string, readonly status = 400, readonly reason = "invalid") {
+    super(message);
+    this.name = "ReportEmailRequestError";
+  }
+}
+
+export function isReportEmailSchemaPending(e: unknown): e is ReportEmailSchemaPendingError {
+  return (e as { code?: unknown } | null)?.code === "REPORT_EMAIL_SCHEMA_PENDING";
+}
+export function isReportEmailRequestError(e: unknown): e is ReportEmailRequestError {
+  return (e as { code?: unknown } | null)?.code === "REPORT_EMAIL_REQUEST";
+}
+
+interface ReportEmailSchemaState { m056: boolean; m057: boolean; m058: boolean }
+
+// THE LATCH, in nextPartyReady's shape: PRESENT is remembered for good; ABSENT
+// is re-asked after a minute (056-058 may be applied by hand while this process
+// runs) — by a catalogue read only, never by DDL at request time.
+let reportEmailSchema: (ReportEmailSchemaState & { checkedAt: number }) | null = null;
+const REPORT_EMAIL_REPROBE_MS = 60_000;
+
+async function probeReportEmailSchema(): Promise<ReportEmailSchemaState> {
+  const rows = await runQuery<{ m056: boolean | null; m057: boolean | null; m058: boolean | null }>(REPORT_EMAIL_SCHEMA_PROBE);
+  const r = rows[0];
+  return { m056: r?.m056 === true, m057: r?.m057 === true, m058: r?.m058 === true };
+}
+
+const allReady = (s: ReportEmailSchemaState | null): boolean => !!s && s.m056 && s.m057 && s.m058;
+
+/** Is every part of 056-058 in place? Never throws: a failed probe is "no". */
+export async function reportEmailSchemaReady(): Promise<boolean> {
+  const now = Date.now();
+  const known = reportEmailSchema;
+  if (known && (allReady(known) || now - known.checkedAt < REPORT_EMAIL_REPROBE_MS)) {return allReady(known);}
+  try {
+    const state = await probeReportEmailSchema();
+    reportEmailSchema = { ...state, checkedAt: now };
+    return allReady(state);
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "report_email_schema_probe_failed");
+    reportEmailSchema = { m056: false, m057: false, m058: false, checkedAt: now };
+    return false;
+  }
+}
+
+async function requireReportEmailSchema(): Promise<void> {
+  if (!(await reportEmailSchemaReady())) {throw new ReportEmailSchemaPendingError();}
+}
+
+/** Test seam (jest only): forget what the latch learned. */
+export function resetReportEmailSchemaCache(): void {
+  reportEmailSchema = null;
+}
+
+/**
+ * Run `fn` with NO ambient tenant connection.
+ *
+ * A route that starts background work (Send now, Run now) must not let that
+ * work inherit the request's AsyncLocalStorage: withTenant is re-entrant, so
+ * the work would run on the REQUEST's connection — holding it across an SMTP
+ * round trip, and bound to the caller's outlet rather than the delivery's.
+ * `exit` gives the callback, and every continuation it schedules, an empty
+ * store, so each withTenant inside checks out its own short-lived client.
+ */
+export function runOutsideTenantContext<T>(fn: () => T): T {
+  return tenantStorage.exit(fn);
+}
+
+/** Bound every statement of the ambient transaction (a report read). LOCAL: it ends with the transaction. */
+export async function SetLocalStatementTimeout(ms: number): Promise<void> {
+  await runQuery(`select set_config('statement_timeout', $1, true)`, [`${String(Math.max(1000, Math.round(ms)))}ms`]);
+}
+
+/** What a report email says about where it came from. Read inside the delivery's own transaction. */
+export async function GetReportEmailIdentity(resId: string, outletId: string): Promise<{
+  restaurant_name: string; outlet_name: string | null; currency: string | null; timezone: string;
+}> {
+  const rows = await runQuery<{ res_name: string | null; currency: string | null; timezone: string | null; outlet_name: string | null }>(
+    `select r.res_name, r.currency, r.timezone, o.outlet_name
+       from "Restaurant" r
+       left join "Outlets" o on o.id = $2 and o.res_id = r.id
+      where r.id = $1
+      limit 1`,
+    [resId, isUuid(outletId) ? outletId : null],
+  );
+  const r = rows[0];
+  return {
+    restaurant_name: String(r?.res_name ?? "").trim() || "Your restaurant",
+    outlet_name: r?.outlet_name ?? null,
+    currency: r?.currency ?? null,
+    timezone: sanitizeTimezone(r?.timezone),
+  };
+}
+
+export interface ReportEmailWindow {
+  from: string;
+  to: string;
+  days: number;
+  clamped: WindowClamp[];
+  /** "HH:mm" on a trading day, null for calendar days (a 00:00 close is calendar days). */
+  day_close: string | null;
+  day_shift_min: number;
+  /** The first instant the reports count, and the first they do not. */
+  window_start_at: string;
+  window_end_at: string;
+  timezone: string;
+}
+
+/**
+ * The window a Send now or a schedule occurrence covers, as the MIS readers
+ * will read it: resolveReportWindow's days, then the trading day's instants
+ * through misWindowInstants — the SAME conversion misContext makes, so the
+ * instants on the delivery row are the instants the reports bound.
+ */
+export async function ResolveReportEmailWindow(
+  restaurantId: string,
+  q: { from?: unknown; to?: unknown; day_close?: unknown },
+  maxDays: number,
+): Promise<ReportEmailWindow> {
+  const context = await requireRestaurantContext(restaurantId);
+  return reportEmailWindowIn(context.timezone, q, maxDays);
+}
+
+/** ResolveReportEmailWindow for a zone already known (the sweep reads it directly). */
+export function reportEmailWindowIn(
+  tz: string,
+  q: { from?: unknown; to?: unknown; day_close?: unknown },
+  maxDays: number,
+  now?: Date,
+): ReportEmailWindow {
+  const w = resolveReportWindow({ from: q.from, to: q.to }, tz, { defaultDays: 1, maxDays, now });
+  const clamped: WindowClamp[] = [...w.clamped];
+  const raw = Array.isArray(q.day_close) ? q.day_close[0] : q.day_close;
+  let shift = 0;
+  if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
+    const close = parseDayClose(raw);
+    if (close === null) {clamped.push("day_close_unparseable");}
+    else {shift = dayShiftForClose(close);}
+  }
+  const instants = misWindowInstants(w, tz, null, shift);
+  return {
+    from: w.from,
+    to: w.to,
+    days: w.days,
+    clamped,
+    day_close: shift ? formatClock(dayCloseOfShift(shift)) : null,
+    day_shift_min: shift,
+    window_start_at: instants.fromIso,
+    window_end_at: instants.toIso,
+    timezone: tz,
+  };
+}
+
+/**
+ * Migrations 056-058, ONCE, at boot — before the listener, outside any request
+ * transaction: the step 048, 050, 051, 052 and 053 already have.
+ *
+ * PROBE FIRST. The statements are all catalogue-guarded, but even the guarded
+ * form costs a transaction per file, so a database that already has the
+ * schema is only asked, never altered. A missing part is made in ONE
+ * transaction per migration under a 2-second LOCAL lock_timeout — the file's
+ * own shape — so a lock held by the process being replaced refuses this fast
+ * instead of queueing readers behind it; the next boot tries again.
+ *
+ * Never throws. The answer is also the latch every route reads.
+ */
+export async function InitReportEmailSchema(): Promise<ReportEmailSchemaState> {
+  let state: ReportEmailSchemaState = { m056: false, m057: false, m058: false };
+  try {
+    state = await probeReportEmailSchema();
+  } catch (err) {
+    logger.warn({ err: (err as { message?: string } | null)?.message ?? err }, "report_email_schema_probe_failed");
+  }
+  const groups: [keyof ReportEmailSchemaState, readonly string[]][] = [
+    ["m056", REPORT_EMAIL_DDL_056],
+    ["m057", REPORT_EMAIL_DDL_057],
+    ["m058", REPORT_EMAIL_DDL_058],
+  ];
+  for (const [key, statements] of groups) {
+    if (state[key]) {continue;}
+    try {
+      await withTransaction(async (client) => {
+        await runQuery(`set local lock_timeout = '2s'`, [], client);
+        for (const sql of statements) {await runQuery(sql, [], client);}
+      });
+    } catch (err) {
+      logger.warn({ err: (err as { message?: string } | null)?.message ?? err, migration: key.slice(1) }, "report_email_schema_boot_ensure_failed");
+    }
+  }
+  try {
+    state = await probeReportEmailSchema();
+  } catch {
+    state = { m056: false, m057: false, m058: false };
+  }
+  reportEmailSchema = { ...state, checkedAt: Date.now() };
+  if (!allReady(state)) {
+    logger.error({ ...state }, "Report email is OFF — migrations 056-058 are not all applied here and this role could not add them. The scheduled report sweep WAITS until they are: no scheduled report (in-app inbox ones included) is sent from this server.");
+  }
+  return state;
+}
+
+// --- The address book (056) --------------------------------------------------
+
+export interface ReportEmailRecipient {
+  id: string;
+  email: string;
+  label: string | null;
+  status: "active" | "suppressed";
+  suppressed_reason: string | null;
+  created_at: Date;
+  created_by: string | null;
+}
+
+const RECIPIENT_COLS = `id, email, label, status, suppressed_reason, created_at, created_by`;
+
+function mapRecipient(r: Record<string, any>): ReportEmailRecipient {
+  return {
+    id: String(r.id),
+    email: String(r.email),
+    label: r.label ?? null,
+    status: r.status === "suppressed" ? "suppressed" : "active",
+    suppressed_reason: r.suppressed_reason ?? null,
+    created_at: r.created_at,
+    created_by: r.created_by ?? null,
+  };
+}
+
+/** A label cleaned the way time-slot labels are: no control characters, one space, 60 characters. */
+function cleanRecipientLabel(raw: unknown): string | null {
+  if (typeof raw !== "string") {return null;}
+  let out = "";
+  for (const ch of raw) {
+    const code = ch.codePointAt(0) ?? 0;
+    out += code < 32 || code === 127 ? " " : ch;
+  }
+  const s = out.replace(/\s+/g, " ").trim();
+  return s ? [...s].slice(0, 60).join("") : null;
+}
+
+/** The restaurant's LIVE addresses (removed ones are history, not the book). Restaurant-wide. */
+export async function ListReportEmailRecipients(restaurantId: string): Promise<ReportEmailRecipient[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!(await reportEmailSchemaReady())) {return [];}
+  const rows = await runQuery<Record<string, any>>(
+    `select ${RECIPIENT_COLS} from "ReportEmailRecipients"
+      where res_id = $1 and removed_at is null
+      order by created_at asc, id asc`,
+    [context.res_id],
+  );
+  return rows.map(mapRecipient);
+}
+
+/**
+ * Add one address. REFUSED OUT LOUD: an implausible address, a 26th, or one
+ * already in the book. The address is trimmed before it is stored (the column
+ * refuses whitespace); its case is kept, and uniqueness ignores it.
+ */
+export async function AddReportEmailRecipient(
+  restaurantId: string,
+  input: { email?: unknown; label?: unknown },
+  createdBy?: string,
+): Promise<ReportEmailRecipient> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  const email = String(input.email ?? "").trim();
+  if (!isPlausibleEmail(email)) {
+    throw new ReportEmailRequestError("That does not look like an email address. Check for a missing @ or a typo.");
+  }
+  const label = cleanRecipientLabel(input.label);
+  return withTransaction(async (client) => {
+    // Serialise two editors on one restaurant, so the cap cannot be raced past.
+    await runQuery(`select pg_advisory_xact_lock(hashtext('report_email_book:' || $1::text))`, [context.res_id], client);
+    const counted = await runQuery<{ n: number }>(
+      `select count(*)::int as n from "ReportEmailRecipients" where res_id = $1 and removed_at is null`,
+      [context.res_id],
+      client,
+    );
+    if (Number(counted[0]?.n ?? 0) >= MAX_ADDRESS_BOOK) {
+      throw new ReportEmailRequestError(`The address book holds at most ${String(MAX_ADDRESS_BOOK)} addresses. Remove one before adding another.`);
+    }
+    const dup = await runQuery<{ id: string }>(
+      `select id from "ReportEmailRecipients"
+        where res_id = $1 and removed_at is null and email_norm = lower(btrim($2::text)) limit 1`,
+      [context.res_id, email],
+      client,
+    );
+    if (dup[0]) {throw new ReportEmailRequestError(`${email} is already in the address book.`, 409, "duplicate");}
+    const rows = await runQuery<Record<string, any>>(
+      `insert into "ReportEmailRecipients" (res_id, email, label, created_by)
+       values ($1, $2, $3, $4)
+       returning ${RECIPIENT_COLS}`,
+      [context.res_id, email, label, (createdBy ?? "").trim() || null],
+      client,
+    );
+    if (!rows[0]) {throw new Error("Failed to add the address");}
+    return mapRecipient(rows[0]);
+  });
+}
+
+/** Soft-delete one address. Null when there is no such live address. */
+export async function RemoveReportEmailRecipient(
+  restaurantId: string,
+  recipientId: string,
+  removedBy?: string,
+): Promise<ReportEmailRecipient | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  if (!isUuid(recipientId)) {return null;}
+  const rows = await runQuery<Record<string, any>>(
+    `update "ReportEmailRecipients"
+        set removed_at = now(), removed_by = $3
+      where id = $2 and res_id = $1 and removed_at is null
+      returning ${RECIPIENT_COLS}`,
+    [context.res_id, recipientId, (removedBy ?? "").trim() || null],
+  );
+  return rows[0] ? mapRecipient(rows[0]) : null;
+}
+
+/** Live book entries by id, in the order asked. Unknown or removed ids are simply absent. */
+export async function GetReportEmailRecipientsByIds(restaurantId: string, ids: readonly string[]): Promise<ReportEmailRecipient[]> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  const wanted = [...new Set(ids.filter((id) => isUuid(id)))];
+  if (wanted.length === 0) {return [];}
+  const rows = await runQuery<Record<string, any>>(
+    `select ${RECIPIENT_COLS} from "ReportEmailRecipients"
+      where res_id = $1 and removed_at is null and id = any($2::uuid[])`,
+    [context.res_id, wanted],
+  );
+  const byId = new Map(rows.map((r) => [String(r.id), mapRecipient(r)]));
+  return wanted.map((id) => byId.get(id)).filter((r): r is ReportEmailRecipient => !!r);
+}
+
+/**
+ * The status of each address in the book, keyed by its normalised form —
+ * res_id-scoped, for the sweep's SEND-TIME check. An address that is absent
+ * (never added, or removed) is not in the map.
+ */
+export async function ReportEmailBookStatus(resId: string): Promise<Map<string, "active" | "suppressed">> {
+  const rows = await runQuery<{ email_norm: string; status: string }>(
+    `select email_norm, status from "ReportEmailRecipients" where res_id = $1 and removed_at is null`,
+    [resId],
+  );
+  return new Map(rows.map((r) => [String(r.email_norm), r.status === "suppressed" ? "suppressed" : "active"]));
+}
+
+export const normalizeEmailKey = (email: string): string => String(email ?? "").trim().toLowerCase();
+
+// --- Ad hoc sends (Send now) -------------------------------------------------
+
+export interface AdhocDeliveryInput {
+  client_request_id: string;
+  report_keys: string[];
+  formats: string[];
+  outlet_scope: "outlet" | "all";
+  period_from: string;
+  period_to: string;
+  day_close: string | null;
+  window_start_at: string;
+  window_end_at: string;
+  timezone: string;
+  recipients: string[];
+  requested_by: string | null;
+}
+
+/**
+ * Insert one Send now, or find the one this client_request_id already made.
+ *
+ * `occurrence_key` is 'adhoc:<client_request_id>', and 058's
+ * report_deliveries_adhoc_uniq makes it unique per restaurant among rows with
+ * no schedule — so a request retried after a dropped response lands on the
+ * SAME row, and the client is told it is a replay rather than sent twice. The
+ * ON CONFLICT repeats the index predicate, or Postgres answers 42P10.
+ */
+export async function InsertAdhocReportDelivery(
+  restaurantId: string,
+  input: AdhocDeliveryInput,
+): Promise<{ id: string; replayed: boolean }> {
+  const context = await requireRestaurantContext(restaurantId);
+  await requireReportEmailSchema();
+  const key = `adhoc:${input.client_request_id}`;
+  const inserted = await runQuery<{ id: string }>(
+    `insert into "ReportDeliveries"
+       (res_id, outlet_id, schedule_id, occurrence_key, fire_at, period_from, period_to, timezone,
+        claimed_by, status, channel, next_attempt_at, kind, report_keys, formats, outlet_scope,
+        day_close, window_start_at, window_end_at, recipients, requested_by)
+     values ($1, $2, null, $3, now(), $4::date, $5::date, $6,
+             'send-now', 'claimed', 'email', now(), 'adhoc', $7, $8, $9,
+             $10, $11, $12, $13, $14)
+     on conflict (res_id, occurrence_key) where schedule_id is null do nothing
+     returning id`,
+    [
+      context.res_id, context.outlet_id, key, input.period_from, input.period_to, input.timezone,
+      input.report_keys, input.formats, input.outlet_scope, input.day_close,
+      input.window_start_at, input.window_end_at, input.recipients, input.requested_by,
+    ],
+  );
+  if (inserted[0]) {return { id: String(inserted[0].id), replayed: false };}
+  const existing = await runQuery<{ id: string }>(
+    `select id from "ReportDeliveries" where res_id = $1 and schedule_id is null and occurrence_key = $2 limit 1`,
+    [context.res_id, key],
+  );
+  if (!existing[0]) {throw new Error("Send now could not be recorded");}
+  return { id: String(existing[0].id), replayed: true };
+}
+
+/**
+ * Messages this restaurant's reports were ACCEPTED for in the last 24 hours —
+ * the durable half of the per-restaurant daily cap. Counted from the delivery
+ * log itself, so a restart cannot reset it.
+ */
+export async function CountRecentReportEmails(resId: string): Promise<number> {
+  if (!(await reportEmailSchemaReady())) {return 0;}
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select coalesce(sum(coalesce(cardinality(delivered_to), 0)), 0)::int as n
+       from "ReportDeliveries"
+      where res_id = $1 and channel = 'email' and created_at > now() - interval '24 hours'`,
+    [resId],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/**
+ * Ad hoc sends ASKED FOR recently — the durable half of the Send now and test
+ * email limits (a restart does not reset them). `tests` counts only test
+ * emails (an ad hoc row with no reports), or only real sends when false.
+ */
+export async function CountRecentAdhocSends(resId: string, minutes: number, tests: boolean): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select count(*)::int as n from "ReportDeliveries"
+      where res_id = $1 and kind = 'adhoc' and created_at > now() - make_interval(mins => $2::int)
+        and (cardinality(report_keys) = 0) = $3::boolean`,
+    [resId, Math.max(1, Math.round(minutes)), tests],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/** The Send now a client_request_id already made, if any — so a replay skips the limits. */
+export async function FindAdhocDelivery(restaurantId: string, clientRequestId: string): Promise<string | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const rows = await runQuery<{ id: string }>(
+    `select id from "ReportDeliveries" where res_id = $1 and schedule_id is null and occurrence_key = $2 limit 1`,
+    [context.res_id, `adhoc:${clientRequestId}`],
+  );
+  return rows[0] ? String(rows[0].id) : null;
+}
+
+/** Live email schedules on one outlet — for the per-outlet cap. */
+export async function CountEmailSchedules(resId: string, outletId: string): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select count(*)::int as n from "ReportSchedules"
+      where res_id = $1 and outlet_id = $2 and channel = 'email' and archived_at is null`,
+    [resId, outletId],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+// --- The attachment store (058) ------------------------------------------------
+
+export interface ReportDeliveryFileRecord {
+  id: string;
+  report_key: string;
+  format: string;
+  filename: string;
+  mime: string;
+  bytes: number;
+  rows: number;
+  truncated: boolean;
+  /** The body was purged after the retention window; the row stays as history. */
+  purged: boolean;
+}
+
+export interface RenderedReportFile {
+  report_key: string;
+  format: "csv" | "xlsx";
+  filename: string;
+  mime: string;
+  body: Buffer;
+  rows: number;
+  truncated: boolean;
+}
+
+/**
+ * Store a delivery's files and mark it rendered — one statement set, in the
+ * caller's transaction, behind the same attempts compare-and-swap as every
+ * other write on the row. A superseded worker's files never replace the
+ * winner's: zero rows from the CAS throws before anything is written.
+ *
+ * `meta` is what the email BODY is built from besides the files (the headline
+ * figures, the restaurant's name, the "Generated" time), stored with them so a
+ * retry sends the same message — see report_email_content.ts,
+ * ReportMessageMeta. Null keeps whatever the row has.
+ */
+export async function StoreReportDeliveryFiles(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  files: readonly RenderedReportFile[],
+  meta: unknown = null,
+): Promise<void> {
+  // A row found mid-send with nothing stored (only a hand-made or very old
+  // one) is re-rendered and STAYS 'sending', so the resume that follows is
+  // still recognised as one.
+  const cas = await runQuery<{ id: string }>(
+    `update "ReportDeliveries"
+        set status = case when status = 'sending' then 'sending' else 'rendered' end, error = null,
+            message_meta = coalesce($4::jsonb, message_meta)
+      where id = $1 and res_id = $2 and attempts = $3 and status in ('claimed','rendered','sending','failed')
+      returning id`,
+    [deliveryId, resId, attempts, meta === null || meta === undefined ? null : JSON.stringify(meta)],
+  );
+  if (!cas[0]) {throw new Error("Report delivery was superseded by another attempt");}
+  await runQuery(`delete from "ReportDeliveryFiles" where res_id = $1 and delivery_id = $2`, [resId, deliveryId]);
+  for (const f of files) {
+    await runQuery(
+      `insert into "ReportDeliveryFiles" (res_id, delivery_id, report_key, format, filename, mime, bytes, rows, truncated, body)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [resId, deliveryId, f.report_key, f.format, f.filename, f.mime, f.body.length, f.rows, f.truncated, f.body],
+    );
+  }
+}
+
+/** The stored files WITH their bodies, for a send or a resend. Purged bodies are absent. */
+export async function LoadReportDeliveryFiles(resId: string, deliveryId: string): Promise<RenderedReportFile[]> {
+  const rows = await runQuery<{ report_key: string; format: string; filename: string; mime: string; rows: number; truncated: boolean; body: Buffer | null }>(
+    `select report_key, format, filename, mime, rows, truncated, body
+       from "ReportDeliveryFiles"
+      where res_id = $1 and delivery_id = $2 and body is not null
+      order by created_at asc, id asc`,
+    [resId, deliveryId],
+  );
+  return rows.map((r) => ({
+    report_key: String(r.report_key),
+    format: r.format === "xlsx" ? "xlsx" : "csv",
+    filename: String(r.filename),
+    mime: String(r.mime),
+    body: Buffer.isBuffer(r.body) ? r.body : Buffer.from(r.body ?? ""),
+    rows: Number(r.rows) || 0,
+    truncated: r.truncated === true,
+  }));
+}
+
+/** One file for download — scoped by res_id AND the caller's outlet, never by id alone. */
+export async function GetReportDeliveryFile(
+  restaurantId: string,
+  deliveryId: string,
+  fileId: string,
+): Promise<{ filename: string; mime: string; body: Buffer } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  if (!isUuid(deliveryId) || !isUuid(fileId) || !(await reportEmailSchemaReady())) {return null;}
+  const og = isAllOutlets() ? "true" : "false";
+  const rows = await runQuery<{ filename: string; mime: string; body: Buffer | null }>(
+    `select f.filename, f.mime, f.body
+       from "ReportDeliveryFiles" f
+       join "ReportDeliveries" d on d.id = f.delivery_id and d.res_id = f.res_id
+      where f.id = $3 and f.delivery_id = $4 and f.res_id = $1 and (${og} or d.outlet_id = $2)
+      limit 1`,
+    [context.res_id, context.outlet_id, fileId, deliveryId],
+  );
+  const row = rows[0];
+  if (!row?.body) {return null;}
+  return { filename: row.filename, mime: row.mime, body: Buffer.isBuffer(row.body) ? row.body : Buffer.from(row.body) };
+}
+
+/** Nightly: drop file BODIES older than the retention window; the rows stay as history. */
+export async function PurgeReportDeliveryFileBodies(resId: string, days: number): Promise<number> {
+  const rows = await runQuery<{ id: string }>(
+    `update "ReportDeliveryFiles" set body = null, purged_at = now()
+      where res_id = $1 and body is not null and created_at < now() - make_interval(days => $2::int)
+      returning id`,
+    [resId, Math.max(1, Math.round(days))],
+  );
+  return rows.length;
+}
+
+// --- Sending, one address at a time (058) ------------------------------------
+
+export interface SendingState {
+  delivered_to: string[];
+  rejected_to: string[];
+  skipped_to: string[];
+  /** The body's inputs as the row keeps them — the FIRST attempt's, on a retry. */
+  message_meta: unknown;
+}
+
+const textArray = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => String(x)) : []);
+
+/**
+ * Commit 'sending' BEFORE the first message leaves, and hand back what has
+ * already been decided per address — a resumed send skips those.
+ *
+ * `meta` is this attempt's proposal for the body's inputs; the row keeps the
+ * FIRST one it was given (the render's, or a test email's first attempt) and
+ * hands that back, so every attempt builds the same message.
+ */
+export async function MarkReportDeliverySending(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  provider: string,
+  meta: unknown = null,
+): Promise<SendingState | null> {
+  const rows = await runQuery<{ delivered_to: unknown; rejected_to: unknown; skipped_to: unknown; message_meta: unknown }>(
+    `update "ReportDeliveries"
+        set status = 'sending', sending_at = coalesce(sending_at, now()), provider = $4, channel = 'email',
+            message_meta = coalesce(message_meta, $5::jsonb)
+      where id = $1 and res_id = $2 and attempts = $3 and status in ('claimed','rendered','sending','failed')
+      returning delivered_to, rejected_to, skipped_to, message_meta`,
+    [deliveryId, resId, attempts, provider, meta === null || meta === undefined ? null : JSON.stringify(meta)],
+  );
+  const r = rows[0];
+  if (!r) {return null;}
+  return {
+    delivered_to: textArray(r.delivered_to),
+    rejected_to: textArray(r.rejected_to),
+    skipped_to: textArray(r.skipped_to),
+    message_meta: r.message_meta ?? null,
+  };
+}
+
+/**
+ * Record ONE address's outcome, committed on its own, straight after its send.
+ * The column is chosen by name from a fixed set, never from input. Behind the
+ * attempts CAS, and idempotent: an address already recorded is not added twice.
+ */
+export async function RecordReportRecipientOutcome(
+  resId: string,
+  deliveryId: string,
+  attempts: number,
+  email: string,
+  outcome: "delivered" | "rejected" | "skipped",
+): Promise<boolean> {
+  const column = outcome === "delivered" ? "delivered_to" : outcome === "rejected" ? "rejected_to" : "skipped_to";
+  const rows = await runQuery<{ id: string }>(
+    `update "ReportDeliveries"
+        set ${column} = case when $4 = any(coalesce(${column}, '{}')) then ${column}
+                             else array_append(coalesce(${column}, '{}'), $4::text) end
+      where id = $1 and res_id = $2 and attempts = $3 and status = 'sending'
+      returning id`,
+    [deliveryId, resId, attempts, email],
+  );
+  return rows.length > 0;
+}
+
+// --- The sweep's lease and the platform-wide cap (058) ------------------------
+//
+// "ReportSweepLease" has ONE row and no res_id: it is the platform's, not a
+// tenant's, and it is read and written on the raw pool. The statements below
+// are the whole of its protocol.
+
+/**
+ * Take (or renew) the sweep lease for `holder`. True means this process runs
+ * this tick; false means another holds it — skip, and hold no connection.
+ */
+export async function AcquireReportSweepLease(holder: string, host: string, mailReady: boolean, leaseMinutes: number): Promise<boolean> {
+  const rows = await runQuery<{ holder: string }>(
+    `update "ReportSweepLease"
+        set holder = $1, host = $2, until = now() + make_interval(mins => $3::int),
+            heartbeat_at = now(), mail_ready = $4
+      where id = 1 and (until < now() or holder = $1)
+      returning holder`,
+    [holder, host.slice(0, 120), Math.max(1, Math.round(leaseMinutes)), mailReady],
+  );
+  return rows.length > 0;
+}
+
+export interface ReportSweepStatus {
+  holder_is_me: boolean;
+  leader_seen_at: Date | null;
+  lease_until: Date | null;
+  mail_ready: boolean;
+  sent_today: number;
+}
+
+/** What GET /reports/email/config says about the scheduler. Null before 058. */
+export async function GetReportSweepStatus(holder: string): Promise<ReportSweepStatus | null> {
+  if (!(await reportEmailSchemaReady())) {return null;}
+  const rows = await runQuery<{ holder: string | null; heartbeat_at: Date | null; until: Date | null; mail_ready: boolean; sent: number | string | null }>(
+    `select holder, heartbeat_at, until, mail_ready,
+            case when sent_day = current_date then sent_count else 0 end as sent
+       from "ReportSweepLease" where id = 1`,
+  );
+  const r = rows[0];
+  if (!r) {return null;}
+  return {
+    holder_is_me: r.holder === holder,
+    leader_seen_at: r.heartbeat_at ?? null,
+    lease_until: r.until ?? null,
+    mail_ready: r.mail_ready === true,
+    sent_today: Number(r.sent ?? 0) || 0,
+  };
+}
+
+/** Today's platform-wide count of accepted report emails, without changing it. */
+export async function PeekPlatformReportEmails(): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `select case when sent_day = current_date then sent_count else 0 end as n from "ReportSweepLease" where id = 1`,
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/** Count `n` more accepted messages against today. Returns today's total. */
+export async function AddPlatformReportEmails(n: number): Promise<number> {
+  const rows = await runQuery<{ n: number | string | null }>(
+    `update "ReportSweepLease"
+        set sent_count = case when sent_day = current_date then sent_count + $1 else $1 end,
+            sent_day = current_date
+      where id = 1
+      returning sent_count as n`,
+    [Math.max(0, Math.round(n))],
+  );
+  return Number(rows[0]?.n ?? 0) || 0;
+}
+
+/** True exactly once per calendar day (server date), for the one process that should purge. */
+export async function ClaimReportPurgeDay(): Promise<boolean> {
+  const rows = await runQuery<{ id: number }>(
+    `update "ReportSweepLease" set purged_day = current_date
+      where id = 1 and purged_day is distinct from current_date
+      returning id`,
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Send nows and Run nows left unfinished by a process that died — recent ones
+ * only — with WHEN each may be tried again. A worker that died mid-attempt
+ * left its lease on the row (ten minutes), and a deploy's recreate is back
+ * well inside that: a scan that asked only for rows already due found none,
+ * and on a server whose sweep is off nothing else would ever come back for
+ * them. The caller waits out each lease instead.
+ */
+export async function ListOrphanAdhocDeliveries(
+  resId: string,
+  maxAgeMinutes: number,
+): Promise<{ id: string; outlet_id: string; next_attempt_at: Date }[]> {
+  const rows = await runQuery<{ id: string; outlet_id: string; next_attempt_at: Date | string }>(
+    `select id, outlet_id, next_attempt_at from "ReportDeliveries"
+      where res_id = $1 and kind in ('adhoc','manual')
+        and status in ('claimed','rendered','sending','failed')
+        and attempts < $2
+        and created_at > now() - make_interval(mins => $3::int)
+      order by created_at asc
+      limit 20`,
+    [resId, REPORT_MAX_ATTEMPTS, Math.max(1, Math.round(maxAgeMinutes))],
+  );
+  return rows.map((r) => ({ id: String(r.id), outlet_id: String(r.outlet_id), next_attempt_at: new Date(r.next_attempt_at) }));
+}
+
+/**
+ * Ring the bell ONCE for the day about something the owner must fix — today:
+ * "email is not set up on this server" while an email schedule is due.
+ * De-duplicated on the notification log itself, so a restart does not ring it
+ * again. Carries no figures and no addresses.
+ *
+ * `view: 'email'` is where it opens: this bell names no delivery and no
+ * schedule, and the app read only those to leave the report grid — so the owner
+ * told "scheduled email reports are waiting" landed on Item Wise.
+ */
+export async function NotifyReportOnce(
+  resId: string,
+  n: { kind: string; day: string; title: string; body: string },
+): Promise<boolean> {
+  await ensureNotificationsTable();
+  const seen = await runQuery<{ id: string }>(
+    `select id from "Notifications"
+      where res_id = $1 and type = 'report' and meta->>'kind' = $2 and meta->>'day' = $3
+      limit 1`,
+    [resId, n.kind, n.day],
+  );
+  if (seen[0]) {return false;}
+  await AddNotification(resId, {
+    type: "report",
+    title: n.title,
+    body: n.body,
+    meta: { module: "Reports", view: "email", kind: n.kind, day: n.day },
+  });
+  return true;
 }
 
 export async function AddBill(
@@ -23022,6 +26127,35 @@ async function readOrderStatusCode(
 }
 
 /**
+ * CLIENT ITEM 3 — MAY THIS LOGIN CANCEL THIS ORDER, given the status the
+ * writer just read? mayCancelTicketed, plus the fact the status column cannot
+ * be trusted to carry alone: the KOT numbers PrintJobs holds for the order
+ * (migration 043). A Pending order with a printed number was ticketed before
+ * somebody put it back to Pending, and a waiter-only login does not cancel it.
+ *
+ * THE READ IS MADE ONLY WHERE IT CAN CHANGE THE ANSWER — a waiter-only login
+ * and a Pending order — so every other write issues exactly the statements it
+ * always did. `printedKotNos` lets a caller that must not open a second pooled
+ * connection (VoidOrderWithReason, inside its transaction) read it first.
+ * GetKotNumbersForOrders never throws and answers nothing when 043 is not
+ * applied, which leaves the status rule standing on its own.
+ */
+async function waiterMayCancel(
+  context: RestaurantContext,
+  actor: RoleScopeInput,
+  orderId: string,
+  previousCode: number | null,
+  printedKotNos?: readonly number[],
+): Promise<boolean> {
+  if (!isWaiterOnly(actor)) {return true;}
+  if (previousCode !== PENDING_ORDER_STATUS_CODE) {return false;}
+  const nos = printedKotNos
+    ?? (await GetKotNumbersForOrders(context.res_id, context.outlet_id, [orderId])).get(orderId)
+    ?? [];
+  return mayCancelTicketed(actor, previousCode, nos);
+}
+
+/**
  * The shared cancelled guard. Kept callable on its own (not only through
  * assertOrderStatusEditable) so a path that is NOT a status edit — DeleteOrder —
  * can refuse cancelled orders with a message that fits what it was asked to do.
@@ -23175,6 +26309,14 @@ export async function SetOrderStatus(
   restaurantId: string,
   orderId: string,
   status: string,
+  opts?: {
+    /**
+     * Who is asking, for client item 3: a waiter-only login may not cancel an
+     * order the kitchen has been told about (mayCancelTicketed). Absent = no
+     * role rule, which is every caller that is not a route acting for a person.
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<SetOrderStatusResult> {
   const context = await requireRestaurantContext(restaurantId);
   const code = toOrderStatusCode(status);
@@ -23183,9 +26325,33 @@ export async function SetOrderStatus(
   // Re-cancelling an already-cancelled order is a clean idempotent NO-OP: the
   // order is already where the caller wants it, so there is nothing to refuse
   // and nothing to write (and no second undo envelope to record).
+  //
+  // BEFORE the waiter check below, deliberately: an offline outbox replay of a
+  // cancel that already landed must stay a harmless 200, not turn into a 403
+  // that parks a red chip for a write that succeeded.
   if (previousCode === 5 && code === 5) {
     return { ok: true, changed: false, previous_status: "Cancelled" };
   }
+  // CLIENT ITEM 3 — THE CHECK LIVES HERE, beside the read it depends on, and
+  // before anything is written: a refusal flips no status, writes no void row
+  // and prints no slip (the route only reaches those after this returns).
+  //
+  // TWO WRITES ARE JUDGED, because "Pending" is what makes a waiter's cancel a
+  // decline: the cancel itself, and a move BACK to Pending, which was the first
+  // half of a two-request cancel of a ticket the kitchen holds (and which
+  // suppressed the CANCELLED slip on the way). See mayPutBackToPending.
+  //
+  // A settled or cancelled order is not judged here: assertOrderStatusEditable
+  // below refuses it in the words every other edit gets.
+  const waiterOnly = opts?.actor != null && isWaiterOnly(opts.actor);
+  const locked = previousCode === 5 || previousCode === 4 || previousCode === 7;
+  if (!locked && code === PENDING_ORDER_STATUS_CODE && opts?.actor != null && !mayPutBackToPending(opts.actor, previousCode)) {
+    throw new CancelNeedsSeniorError(orderId, "rewind");
+  }
+  if (!locked && code === 5 && opts?.actor != null && !(await waiterMayCancel(context, opts.actor, orderId, previousCode))) {
+    throw new CancelNeedsSeniorError(orderId);
+  }
+  const waiterPinned = waiterOnly && (code === 5 || code === PENDING_ORDER_STATUS_CODE);
   // Cancelled is terminal; Paid/Closed are locked. Any other transition off a
   // cancelled order is refused here, which is what makes PATCH
   // /orders/:id/status (and every other caller) safe.
@@ -23193,16 +26359,40 @@ export async function SetOrderStatus(
   // An un-barked order can be accepted (Preparing) or cancelled, but never
   // advanced past the kitchen queue — the bark is the step in between.
   if (code === 2 || code === 3) {await assertOrderBarked(context, orderId);}
+  // A waiter's decline is allowed ONLY because the order is still Pending, so
+  // the write says so: if the order was accepted to the kitchen between the
+  // read above and this statement, it matches nothing and is refused below
+  // rather than cancelling a ticket that has just printed. A waiter's
+  // Pending -> Pending is pinned the same way, so it cannot land on top of that
+  // acceptance and undo it.
   const rows = await runQuery<{ id: string }>(
     `
       update "Orders"
       set status = $1,
           food = jsonb_set(coalesce(food::jsonb, '{}'::jsonb), '{status}', to_jsonb($2::text), true)
       where id = $3 and res_id = $4 and outlet_id = $5
+        and ($6::text is null or coalesce(status::text, '1') = $6::text)
       returning id
     `,
-    [code, status, orderId, context.res_id, context.outlet_id],
+    [code, status, orderId, context.res_id, context.outlet_id, waiterPinned ? String(PENDING_ORDER_STATUS_CODE) : null],
   );
+  if (rows.length === 0 && waiterPinned) {
+    // The pinned write missed: the order is no longer Pending. What it is NOW
+    // decides the answer, so a decline that lost a race is told the truth.
+    const nowCode = await readOrderStatusCode(context, orderId);
+    if (nowCode === null) {return { ok: false, changed: false, previous_status: null };}
+    // Declined by somebody else in the meantime — the order is where this
+    // caller wanted it. The same harmless no-op as the replay at the top, and
+    // for the same reason: a 403 here would park a red chip for a cancel that
+    // happened, and write a "REFUSED" audit line for an act nobody refused.
+    if (nowCode === 5 && code === 5) {
+      return { ok: true, changed: false, previous_status: "Cancelled" };
+    }
+    // Cancelled (for a rewind) or settled: the house words.
+    await assertOrderStatusEditable(context, orderId);
+    // Accepted to the kitchen: it is a ticket now.
+    throw new CancelNeedsSeniorError(orderId, code === 5 ? "cancel" : "rewind");
+  }
   if (rows.length > 0) {
     try { await applyTimingForStatus(context, orderId, status); } catch (err) { logger.warn({ err }, "timing status hook failed"); }
   }
@@ -30595,7 +33785,7 @@ export interface NotificationTarget {
 // Which module + entity a notification points at. Type wins (it is set by the
 // producer); meta ids disambiguate the overloaded `warning` type. Mirrors the
 // owner app's _moduleForType so both agree on the destination.
-function notificationEntityOf(
+export function notificationEntityOf(
   type: string,
   meta: Record<string, unknown>,
 ): { module: string | null; entity: { type: string; id: string } | null } {
@@ -30626,6 +33816,12 @@ function notificationEntityOf(
       // KPI/exception alerts are restaurant-wide numbers, not a row — Analytics
       // is the honest destination and there is nothing to focus.
       return { module: "Analytics", entity: null };
+    case "report":
+      // A report delivery (client item 9). Its history, files and per-address
+      // outcome live in Reports → Email reports; a 2.0.1 inbox schedule's bell
+      // still says Accounting, whose card now points there. Nothing row-shaped
+      // to focus — the delivery id rides in `meta` for the client that wants it.
+      return { module: s("module") === "Accounting" ? "Accounting" : "Reports", entity: null };
     default:
       break;
   }
@@ -33987,6 +37183,17 @@ export async function GetKotNumbersForOrders(
 }
 
 /**
+ * The KOT numbers printed for some orders, for a caller that holds a restaurant
+ * id rather than a resolved context — the routes' refusal sentences and move
+ * audit lines. Same read, same degradation (an empty map), scoped to the
+ * caller's outlet.
+ */
+export async function GetOrderKotNumbers(restaurantId: string, orderIds: string[]): Promise<Map<string, number[]>> {
+  const context = await requireRestaurantContext(restaurantId);
+  return GetKotNumbersForOrders(context.res_id, isAllOutlets() ? null : context.outlet_id, orderIds);
+}
+
+/**
  * Every KOT number that fed one bill, in allocation order — the "Token No.: 214,
  * 218, 236, …" line the client photographed on a real printed GAIA bill.
  *
@@ -35023,6 +38230,33 @@ export async function ExpirePrintJobs(resId: string, cutoffs: { kot: Date; bill:
 }
 
 /**
+ * Settle, as 'expired', jobs that ONE CLAIM just took and decided not to hand
+ * over — POST /print/test slips too old, or superseded by a newer press, to be
+ * worth printing (print_jobs.ts, "test slips"). Returns how many it settled.
+ *
+ * FENCED ON THE CLAIM THAT TOOK THEM: `claimed_by` is the claiming socket's
+ * agentId and `status in ('delivered')` is what that claim wrote, so a row some
+ * other till has since acked, or re-claimed after this till's lease lapsed, is
+ * not touched. The ids come from that claim's own RETURNING, never from a
+ * client. claimed_until is cleared as an ack clears it: a settled row holds no
+ * lease.
+ */
+export async function ExpireClaimedPrintJobs(resId: string, jobIds: string[], agentId: string): Promise<number> {
+  if (jobIds.length === 0) { return 0; }
+  const rows = await runQuery<{ id: string }>(
+    `update "PrintJobs"
+        set status = 'expired', settled_at = now(), claimed_until = null
+      where res_id = $1
+        and id = any($2::uuid[])
+        and claimed_by = $3
+        and status in ('delivered')
+      returning id`,
+    [resId, jobIds, agentId],
+  );
+  return rows.length;
+}
+
+/**
  * Reaper, half two: delete settled rows past the retention window.
  *
  * Keyed on settled_at, NEVER on created_at. A job that sat pending for a
@@ -35226,33 +38460,66 @@ async function routingWrite<T>(where: string, run: () => Promise<T>): Promise<T>
  * ensureLazyTable wrapper bounds it to one run per process; running it off the
  * hot path is what makes that one run harmless.
  */
+export const PRINT_ROUTING_COLUMN_DDL: readonly (readonly [string, string])[] = [
+  // WHO the router picked, and WHERE on that machine. No foreign key on either:
+  // deleting a device must never cascade into settled receipt history (027/038's
+  // rule), so these stay plain uuids that may name a row that no longer exists.
+  ["assigned_device_id", "uuid"],
+  ["assigned_target", "text"],
+  ["destination_id", "uuid"],
+  // The assignment deadline AND the lease — see EnqueuePrintJob for why one
+  // clock rather than two.
+  ["assign_expires_at", "timestamptz"],
+  // The fence every reassignment compares against. Two replicas can both decide
+  // to escalate the same silent job; the generation is what makes exactly one
+  // of them win, with no leader lock.
+  ["assign_generation", "smallint not null default 0"],
+  // The accept beat's stamp: "a device is trying" is a different state from
+  // "a device was told", and only the first earns the long deadline.
+  ["assign_accepted_at", "timestamptz"],
+  // Every device that has already failed this job. This is what "never ask the
+  // same jammed printer twice" survives on once 'failed' stops being terminal
+  // for the job, and what makes the client's own ack retry a no-op.
+  ["failed_devices", "jsonb not null default '[]'::jsonb"],
+  // Receipt history: which machine actually produced the paper.
+  ["printed_by_device", "uuid"],
+  // The trace that answers "why did the bar docket print at the pass?". Without
+  // it the fallback rung is invisible and the feature quietly stops being one.
+  ["broadcast_at", "timestamptz"],
+];
+
+/**
+ * ASK FIRST. ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on "PrintJobs"
+ * BEFORE it looks, and the nine used to run on every boot with no lock timeout:
+ * one session still holding any lock on "PrintJobs" (a settle on the container
+ * being replaced) hung the boot indefinitely — ahead of every 2.0.2 step that
+ * was deliberately limited to 2 seconds, and ahead of the listener. Production
+ * has all nine (042), so the step reads the catalogue and does nothing; a box
+ * missing some adds ONLY those, in one statement under a 2-second LOCAL lock
+ * timeout (ensurePrintJobPaperColumns' shape). A timeout throws, the memo stays
+ * unset, and initPrintRoutingSchema's `limit 0` probe decides the latch.
+ */
 export async function ensurePrintRoutingColumns(): Promise<void> {
   await ensureLazyTable("PrintJobs.print_routing_cols", async () => {
-    // WHO the router picked, and WHERE on that machine. No foreign key on either:
-    // deleting a device must never cascade into settled receipt history (027/038's
-    // rule), so these stay plain uuids that may name a row that no longer exists.
-    await runQuery(`alter table "PrintJobs" add column if not exists assigned_device_id uuid`);
-    await runQuery(`alter table "PrintJobs" add column if not exists assigned_target text`);
-    await runQuery(`alter table "PrintJobs" add column if not exists destination_id uuid`);
-    // The assignment deadline AND the lease — see EnqueuePrintJob for why one
-    // clock rather than two.
-    await runQuery(`alter table "PrintJobs" add column if not exists assign_expires_at timestamptz`);
-    // The fence every reassignment compares against. Two replicas can both decide
-    // to escalate the same silent job; the generation is what makes exactly one
-    // of them win, with no leader lock.
-    await runQuery(`alter table "PrintJobs" add column if not exists assign_generation smallint not null default 0`);
-    // The accept beat's stamp: "a device is trying" is a different state from
-    // "a device was told", and only the first earns the long deadline.
-    await runQuery(`alter table "PrintJobs" add column if not exists assign_accepted_at timestamptz`);
-    // Every device that has already failed this job. This is what "never ask the
-    // same jammed printer twice" survives on once 'failed' stops being terminal
-    // for the job, and what makes the client's own ack retry a no-op.
-    await runQuery(`alter table "PrintJobs" add column if not exists failed_devices jsonb not null default '[]'::jsonb`);
-    // Receipt history: which machine actually produced the paper.
-    await runQuery(`alter table "PrintJobs" add column if not exists printed_by_device uuid`);
-    // The trace that answers "why did the bar docket print at the pass?". Without
-    // it the fallback rung is invisible and the feature quietly stops being one.
-    await runQuery(`alter table "PrintJobs" add column if not exists broadcast_at timestamptz`);
+    const rows = await runQuery<{ column_name: string }>(
+      `select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'PrintJobs'
+          and column_name = any($1::text[])`,
+      [PRINT_ROUTING_COLUMN_DDL.map(([name]) => name)],
+    );
+    const have = new Set(rows.map((r) => String(r.column_name)));
+    const missing = PRINT_ROUTING_COLUMN_DDL.filter(([name]) => !have.has(name));
+    if (missing.length === 0) {return;}
+    const adds = missing.map(([name, definition]) => `
+           if not exists (select 1 from information_schema.columns
+                           where table_schema = 'public' and table_name = 'PrintJobs'
+                             and column_name = '${name}') then
+             alter table "PrintJobs" add column if not exists ${name} ${definition};
+           end if;`).join("");
+    await runQuery(`do $$
+         begin
+           perform set_config('lock_timeout', '2s', true);${adds}
+         end $$`);
   });
 }
 
@@ -36331,6 +39598,13 @@ export interface MisWindow extends ResolvedReportWindow {
   toIso: string;
   /** The part of each day the report is cut by. null = all day. */
   slot: TimeSlot | null;
+  /**
+   * The TRADING DAY's shift in minutes (report_window.ts): 0 for calendar
+   * days, +120 for a day that closes at 02:00, -30 for one that closes at
+   * 23:30. Never non-zero together with a slot. With a shift, `from`/`to` are
+   * BUSINESS dates and the instants above are shifted by it at both ends.
+   */
+  day_shift_min: number;
 }
 
 /** Everything the nine share: identity, zone, scope and the resolved window. */
@@ -36354,6 +39628,12 @@ export interface MisReportQuery extends ReportWindowQuery {
   offset?: unknown;
   /** The time-wise toggle: "day" (default), "hour", "hour_of_day" or "session". */
   bucket?: unknown;
+  /**
+   * HH:mm — read the window on TRADING days that close at this minute rather
+   * than on calendar days (report_window.ts). Refused, with the clamp named,
+   * alongside a time slot.
+   */
+  day_close?: unknown;
 }
 
 /** One column, so the client's column picker and TOTALS row are server-driven. */
@@ -36367,11 +39647,25 @@ export interface MisColumn {
   default_on?: boolean;
 }
 
+/**
+ * meta.window. A trading-day read ADDS three fields — the close and the two
+ * instants the SQL bound — and a calendar read has exactly the shape it always
+ * had, so every existing client and every stored CSV name is unchanged.
+ */
+export interface MisMetaWindow extends ResolvedReportWindow {
+  /** HH:mm the business day closes at; present only on a trading-day read. */
+  day_close?: string;
+  /** The first instant counted (inclusive), on a trading-day read. */
+  from_at?: string;
+  /** The first instant NOT counted, on a trading-day read. */
+  to_at?: string;
+}
+
 /** The envelope every one of the nine returns. */
 export interface MisReportMeta {
   report: string;
   title: string;
-  window: ResolvedReportWindow;
+  window: MisMetaWindow;
   /** The part of each day this payload was cut by; null = all day. */
   time_slot: TimeSlotMeta | null;
   timezone: string;
@@ -36443,19 +39737,41 @@ async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisC
     ? (await loadReportTimeSlots(context.res_id)).slots
     : [];
   const { slot, clamped } = resolveTimeSlot(q, presets);
+  // THE TRADING DAY (report_window.ts), resolved after the slot because the two
+  // are not combined: a close asked alongside a slot is dropped, NAMED, and the
+  // slot is kept. A close of 00:00 is a zero shift — the calendar read, byte
+  // for byte. An unreadable close is calendar days with its own clamp.
+  const dayClose = misDayClose(q);
+  const dayClamps: WindowClamp[] = [];
+  let shift = 0;
+  if (dayClose === false) {dayClamps.push("day_close_unparseable");}
+  else if (dayClose !== null) {
+    if (slot) {dayClamps.push("day_close_with_slot");}
+    else {shift = dayShiftForClose(dayClose);}
+  }
+  const allClamps = [...clamped, ...dayClamps];
   return {
     context,
     og: allOutlets ? "true" : "false",
     allOutlets,
     window: {
       ...resolved,
-      clamped: clamped.length > 0 ? [...resolved.clamped, ...clamped] : resolved.clamped,
-      ...slotWindowInstants(resolved, tz, slot),
+      clamped: allClamps.length > 0 ? [...resolved.clamped, ...allClamps] : resolved.clamped,
+      ...misWindowInstants(resolved, tz, slot, shift),
       slot,
+      day_shift_min: shift,
     },
     tz,
     presets,
   };
+}
+
+/** `?day_close=`: minutes, null when absent, false when unreadable. */
+function misDayClose(q: MisReportQuery): number | null | false {
+  const raw = Array.isArray(q.day_close) ? q.day_close[0] : q.day_close;
+  if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {return null;}
+  const m = parseDayClose(raw);
+  return m === null ? false : m;
 }
 
 // --- Time slots (report_window.ts) -------------------------------------------
@@ -36476,6 +39792,23 @@ async function misContext(restaurantId: string, q: MisReportQuery): Promise<MisC
 function slotWindowInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot | null): { fromIso: string; toIso: string } {
   if (!slot) {return windowInstants(w, tz);}
   const b = slotBounds(w, slot);
+  return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
+}
+
+/**
+ * THE ONE PLACE a MIS window becomes instants: a slot's outer bounds, a
+ * trading day's shifted bounds, or — with neither — windowInstants itself.
+ *
+ * A shift moves BOTH ends by the same wall-clock minutes (tradingDayBounds), so
+ * business date K binds [K 00:00 + shift, K+1 00:00 + shift) and consecutive
+ * days tile. The conversion is slotWallInstant's, so a DST day follows the wall
+ * clock exactly as a slot does. A shift and a slot never arrive together
+ * (misContext refuses the pair); if one ever did, the slot would win, as it
+ * does there.
+ */
+function misWindowInstants(w: { from: string; to: string }, tz: string, slot: TimeSlot | null, shift: number): { fromIso: string; toIso: string } {
+  if (slot || !shift) {return slotWindowInstants(w, tz, slot);}
+  const b = tradingDayBounds(w, shift);
   return { fromIso: slotWallInstant(b.fromKey, b.fromMin, tz), toIso: slotWallInstant(b.toKey, b.toMin, tz) };
 }
 
@@ -36664,10 +39997,15 @@ async function misMeta(mc: MisContext, report: string, title: string, notes: str
       outletName = rows[0]?.outlet_name ?? null;
     } catch { outletName = null; }
   }
+  const shift = mc.window.day_shift_min;
   return {
     report,
     title,
-    window: { from: mc.window.from, to: mc.window.to, days: mc.window.days, source: mc.window.source, clamped: mc.window.clamped },
+    window: {
+      from: mc.window.from, to: mc.window.to, days: mc.window.days, source: mc.window.source, clamped: mc.window.clamped,
+      // Only on a trading-day read, so a calendar payload is the shape it was.
+      ...(shift ? { day_close: formatClock(dayCloseOfShift(shift)), from_at: mc.window.fromIso, to_at: mc.window.toIso } : {}),
+    },
     time_slot: timeSlotMeta(mc.window.slot),
     timezone: mc.tz,
     outlet_scope: mc.allOutlets ? "all" : "outlet",
@@ -36682,7 +40020,11 @@ async function misMeta(mc: MisContext, report: string, title: string, notes: str
         timeSlotNote(mc.window.slot, MIS_SLOT_SUBJECT[report] ?? "rows"),
         ...(MIS_SLOT_EXTRA[report] ? [MIS_SLOT_EXTRA[report]] : []),
       ]
-      : notes,
+      // A trading day says where its days begin and end, on every report —
+      // the one caveat that explains why a 01:30 bill is on yesterday's line.
+      : shift
+        ? [...notes, tradingDayNote(dayCloseOfShift(shift))]
+        : notes,
   };
 }
 
@@ -36852,7 +40194,7 @@ function misNcByBucket(rows: readonly MisNcRow[], mc: MisContext, mode: TimeBuck
     // slot's after-midnight comp counts on the day its slot started.
     const minute = clock.hour * 60 + clock.minute;
     const key = timeBucketKey(mode, {
-      serviceDay: serviceDayKey(clock.key, minute, mc.window.slot), calendarDay: clock.key, minute,
+      serviceDay: serviceDayKey(clock.key, minute, mc.window.slot, mc.window.day_shift_min), calendarDay: clock.key, minute,
     }, mc.presets);
     const acc = out.get(key) ?? zeroNonChargeable();
     addNonChargeable(acc, r);
@@ -36998,7 +40340,7 @@ async function fetchMisBills(mc: MisContext): Promise<MisBillRow[]> {
 interface MisBill {
   row: MisBillRow;
   money: BillMoney;
-  /** The BUSINESS day: the calendar day, or under a crossing slot the day it started. */
+  /** The BUSINESS day: the calendar day, the day a crossing slot started, or the trading day. */
   day: string;
   hour: number;
   /** The local calendar day and minute of day the bill settled at. */
@@ -37014,7 +40356,7 @@ interface MisBill {
  * `scPct` is read once for the whole set, not per bill, so the service-charge
  * classification here is identical to the one the bill-detail screen shows.
  */
-function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: TimeSlot | null = null): MisBill[] {
+function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: TimeSlot | null = null, dayShift = 0): MisBill[] {
   return rows.map((row) => {
     const grand = round2(parseNumeric(row.total_amt));
     const charges = closedBillCharges(grand, parseTaxLines(row.tax_breakdown), scPct, parseNumeric(row.round_off));
@@ -37028,7 +40370,7 @@ function composeMisBills(rows: MisBillRow[], scPct: number, tz: string, slot: Ti
         discount_value: parseNumeric(row.discount_value),
         refund_amount: parseNumeric(row.refund_amount),
       }),
-      day: clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot) : "",
+      day: clock ? serviceDayKey(clock.key, clock.hour * 60 + clock.minute, slot, dayShift) : "",
       hour: clock?.hour ?? 0,
       calendar_day: clock?.key ?? "",
       minute: clock ? clock.hour * 60 + clock.minute : 0,
@@ -38095,7 +41437,7 @@ export async function GetSalesSummaryReport(restaurantId: string, q: MisReportQu
   const mc = await misContext(restaurantId, q);
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
   // The slot moves a crossing slot's after-midnight bills onto the day it began.
-  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot);
+  const bills = composeMisBills(await fetchMisBills(mc), scPct, mc.tz, mc.window.slot, mc.window.day_shift_min);
   const bucket = misBucketMode(q);
   const ncRows = await fetchMisNonChargeables(mc);
   const nc = misNcTotals(ncRows);
@@ -38441,9 +41783,10 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
   const scPct = await getServiceChargePercent(mc.context.res_id).catch(() => 0);
 
   const prev = previousWindow(mc.window.from, mc.window.to);
-  // The previous period is cut by the SAME slot: Lunch against last month's
-  // Lunch, never against last month's whole day.
-  const prevInstants = slotWindowInstants(prev, mc.tz, mc.window.slot);
+  // The previous period is cut by the SAME slot — Lunch against last month's
+  // Lunch, never against last month's whole day — and read on the SAME trading
+  // day, so a 02:00 close compares like with like.
+  const prevInstants = misWindowInstants(prev, mc.tz, mc.window.slot, mc.window.day_shift_min);
   const prevMc: MisContext = {
     ...mc,
     window: {
@@ -38451,6 +41794,7 @@ export async function GetExecutiveSummaryReport(restaurantId: string, q: MisRepo
       source: mc.window.source, clamped: [],
       ...prevInstants,
       slot: mc.window.slot,
+      day_shift_min: mc.window.day_shift_min,
     },
   };
 
@@ -38837,16 +42181,55 @@ export async function GetSettlementSummaryReport(restaurantId: string, q: MisRep
 // kind of thing that makes an overview page slow enough that people stop opening
 // it.
 //
-// The channel comes from a lateral over "Orders" rather than from a column,
+// The channel comes from a subquery over "Orders" rather than from a column,
 // because there is no column: order_type lives inside the food JSON blob, and
-// "Bills" has never carried it. EXISTS rather than a join, so a bill with four
-// online orders is still one bill.
+// "Bills" has never carried it.
+//
+// THE BILL'S OWN ORDER, AND ONLY THAT ONE. This read used to ask whether ANY
+// order on the bill's TABLE had ever been online — every order the table had
+// ever had, with no window — so one delivery ticket rung on a table in March
+// would have turned every later dine-in bill on it into online trade. It now
+// reads the order the bill was raised from ("Bills".order_id), which is the
+// rule the Sales Summary's order-type split already states ("counts the bill
+// against the order it was raised from"). So Online (gross) is the Sales
+// Summary's delivery and other channels for the same day, by construction, and
+// a bill whose order row is gone is in neither. The verdict is isOnlineChannel's,
+// in TypeScript, so there is one list of walk-in spellings and not a second copy
+// of it inside a SQL string.
 
 /** One figure and the sentence that says what it counts. */
 export interface HeadlineFigure {
   value: number;
   label: string;
   hint: string;
+  /**
+   * Where tapping it leads (client item 10) — glance_drill.ts. Additive: a 2.0.1
+   * client ignores it, and a newer client falls back to its own copy of the
+   * same table when an older backend leaves it out.
+   */
+  drill?: GlanceDrill;
+}
+
+/**
+ * TODAY'S LADDER, rung by rung — the Sales Summary's totals for today, from the
+ * same composeMisBills over the same bills, summed by the same addToLadder. What
+ * the net and gross sheets print between the two figures, so "net" and "gross"
+ * read as the steps that join them.
+ *
+ * NO COVERS, NO APC, NO ABV. This read nulls the seating (see the query), so a
+ * covers rung here would read 0 on a full restaurant and an APC would divide by
+ * it. Those live on the report the sheet jumps to.
+ */
+export interface HeadlineLadder {
+  bills: number;
+  item_total: number;
+  discount: number;
+  net: number;
+  service_charge: number;
+  tax: number;
+  round_off: number;
+  grand_total: number;
+  refund: number;
 }
 
 export interface OverviewHeadline {
@@ -38893,6 +42276,16 @@ export interface OverviewHeadline {
    * The Sales Summary's `nc_bills` / `nc_value` for today, by construction.
    */
   today_nc: HeadlineSection & { bills: number; value: number };
+  /** Today's rungs. net === today_net.value, grand_total === today_gross.value. */
+  today_ladder: HeadlineLadder;
+  /** How many of today's bills are behind the two Online figures. */
+  today_online_bills: number;
+  /**
+   * Where every other element of the box leads (glance_drill.ts): the header,
+   * the bill count, the three chips, the by-method label and each of its rows,
+   * the split note, the Unallocated warning, NC and the empty-day sentence.
+   */
+  drills: GlanceDrills;
 }
 
 /** A labelled group of rows on the headline card. */
@@ -38902,8 +42295,11 @@ export interface HeadlineSection {
 }
 
 interface HeadlineBillRow extends MisBillRow {
-  /** True when any order on this bill came through an online channel. */
-  is_online: boolean;
+  /**
+   * order_type off the order this bill was raised from, raw; null when the bill
+   * names no order or that order row is gone. isOnlineChannel decides.
+   */
+  headline_channel: string | null;
 }
 
 /**
@@ -38945,13 +42341,10 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
             b.discount_type, b.discount_value, b.coupon_code,
             coalesce(b.refund_amount, 0) as refund_amount,
             null::uuid as session_id, null::int as session_covers,
-            exists (
-              select 1 from "Orders" o
-               where o.res_id = b.res_id and o.outlet_id = b.outlet_id
-                 and o.table_id = b.table_id
-                 and coalesce(o.food->>'order_type', 'dine_in') not in
-                     ('dine_in','dinein','dine-in','takeaway','take_away','pickup')
-            ) as is_online
+            (select (o.food)::jsonb->>'order_type'
+               from "Orders" o
+              where o.id = b.order_id and o.res_id = b.res_id and o.outlet_id = b.outlet_id
+            ) as headline_channel
        from "Bills" b
       where b.res_id = $1 and (${og} or b.outlet_id = $2)
         and ${misSettledPredicate(null)}
@@ -38962,8 +42355,10 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   const composed = composeMisBills(rows, scPct, tz);
 
   let todayNet = 0, todayGross = 0, onlineNet = 0, onlineGross = 0, monthGross = 0;
-  let todayBills = 0;
+  let todayBills = 0, onlineBills = 0;
   const todaySettled: SettlementBill[] = [];
+  // Today's rungs, on the Sales Summary's own accumulator (see HeadlineLadder).
+  const todayRungs = zeroLadder();
   for (let i = 0; i < composed.length; i += 1) {
     const b = composed[i];
     monthGross = round2(monthGross + b.money.grand_total);
@@ -38971,7 +42366,9 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
     todayBills += 1;
     todayNet = round2(todayNet + b.money.net);
     todayGross = round2(todayGross + b.money.grand_total);
-    if (rows[i].is_online === true) {
+    addToLadder(todayRungs, b.money);
+    if (isOnlineChannel(rows[i].headline_channel)) {
+      onlineBills += 1;
       onlineNet = round2(onlineNet + b.money.net);
       onlineGross = round2(onlineGross + b.money.grand_total);
     }
@@ -39015,7 +42412,8 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
   const labelOf = byMethod.rows.length > 0
     ? await paymentLabelsFor(context).catch(() => (m: string) => m)
     : (m: string) => m;
-  return {
+  const drillDay = { today, month_from: monthFrom };
+  const headline: OverviewHeadline = {
     today,
     month_from: monthFrom,
     timezone: tz,
@@ -39069,7 +42467,29 @@ export async function GetOverviewHeadline(restaurantId: string): Promise<Overvie
       bills: todayNcBills,
       value: todayNc.value,
     },
+    today_ladder: {
+      bills: todayRungs.bills,
+      item_total: todayRungs.item_total,
+      discount: todayRungs.discount,
+      net: todayRungs.net,
+      service_charge: todayRungs.service_charge,
+      tax: todayRungs.tax,
+      round_off: todayRungs.round_off,
+      grand_total: todayRungs.grand_total,
+      refund: todayRungs.refund,
+    },
+    today_online_bills: onlineBills,
+    // Filled in below, off the rows actually shipped.
+    drills: glanceDrills(drillDay, []),
   };
+  // WHERE EACH ELEMENT LEADS (client item 10). One row drill per mode the box
+  // actually shows, keyed by the stored id that row carries, and each figure
+  // carries its own so a client never maps a key it did not expect.
+  headline.drills = glanceDrills(drillDay, headline.today_by_method.map((r) => r.method));
+  for (const key of GLANCE_FIGURE_KEYS) {
+    headline[key] = { ...headline[key], drill: glanceDrill(key, drillDay) };
+  }
+  return headline;
 }
 
 // --- Drill-down --------------------------------------------------------------
@@ -40714,13 +44134,49 @@ export type VoidOrderWithReasonResult =
 export async function VoidOrderWithReason(
   restaurantId: string,
   input: Omit<RecordOrderVoidInput, "scope" | "item_id" | "item_name">,
+  opts?: {
+    /**
+     * The SESSION making the void, for client item 3 — not the authoriser named
+     * in the body. A waiter-only login is refused a ticketed order here even
+     * with a manager's name and a "Void Orders With Reason" grant: the client
+     * asked for the waiter to lose Cancel KOT, and this is the route the app
+     * takes for it when the grant is held.
+     */
+    actor?: RoleScopeInput | null;
+  },
 ): Promise<VoidOrderWithReasonResult> {
   const orderId = String(input.order_id ?? "").trim();
   if (!orderId) {throw new Error("order id is required");}
+  const locked = opts?.actor != null && isWaiterOnly(opts.actor);
+  // The printed KOT numbers the waiter rule also asks (waiterMayCancel), read
+  // BEFORE the transaction so it never holds a second pooled connection while
+  // its own is open — and so before the status is known, which costs one read
+  // for the rare waiter-only login a tenant granted Void Orders, and nothing
+  // for anyone else. A number, once printed, stays printed, so reading it first
+  // loses nothing; the approval race is the row lock's job below.
+  let printedKotNos: number[] = [];
+  if (locked) {
+    const context = await requireRestaurantContext(restaurantId);
+    printedKotNos = (await GetKotNumbersForOrders(context.res_id, context.outlet_id, [orderId])).get(orderId) ?? [];
+  }
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
-    const previousCode = await readOrderStatusCode(context, orderId, client);
+    // `for update` when the role rule applies: the verdict rests on this read,
+    // so the row must not be accepted to the kitchen between it and the write.
+    const previousCode = locked
+      ? await runQuery<{ status: number | string | null }>(
+        `select status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1 for update`,
+        [orderId, context.res_id, context.outlet_id],
+        client,
+      ).then((rows) => (rows[0] ? Number(rows[0].status ?? 0) : null))
+      : await readOrderStatusCode(context, orderId, client);
     if (previousCode === null) {return { ok: false };}
+    // CLIENT ITEM 3. Inside the transaction and before the ledger write, so a
+    // refusal rolls back to nothing: no void row, no status flip, no slip.
+    if (opts?.actor != null && previousCode !== 5 && previousCode !== 4 && previousCode !== 7
+        && !(await waiterMayCancel(context, opts.actor, orderId, previousCode, printedKotNos))) {
+      throw new CancelNeedsSeniorError(orderId);
+    }
     // Cancelled is terminal and Paid/Closed are locked — the same guard, and the
     // same messages, every other status edit refuses on.
     await assertOrderStatusEditable(context, orderId, client);
