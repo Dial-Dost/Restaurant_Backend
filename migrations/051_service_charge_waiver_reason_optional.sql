@@ -1,0 +1,76 @@
+-- Migration 051: a service-charge waiver's REASON is optional.
+--
+-- ============================================================================
+-- WHAT THE CLIENT ASKED FOR
+-- ============================================================================
+-- "When waiving a service charge, the reason should not be mandatory and should
+-- be left as optional." (app 2.0.1)
+--
+-- Production bears it out: all twelve waivers recorded since 036 carry 2-6
+-- characters of filler ("hi", "gc", "gr") typed to get past the gate, and the
+-- preselected kind already says why.
+--
+-- ============================================================================
+-- WHAT CHANGES
+-- ============================================================================
+-- "ServiceChargeWaivers".reason loses NOT NULL. Nothing else.
+--
+-- WHY NULL AND NOT A PLACEHOLDER STRING. A waiver recorded without a reason
+-- has no reason; writing "No reason given" into the column would put words in
+-- the ledger nobody typed, indistinguishable from a person who typed them
+-- (mis_capture.ts normalizeVocabulary makes the same argument about kinds).
+-- NULL is also this schema's convention for every other optional reason
+-- ("DiscountRequests".reason, "Bills".reason, "BillTenders".void_reason,
+-- "StockMovements".reason), and every report renders it as a blank.
+--
+-- WHY 036's CHECK IS LEFT ALONE. `CHECK (btrim(reason) <> '')` is UNKNOWN, not
+-- false, for NULL, so it admits NULL and still refuses '' and whitespace: "no
+-- reason" has exactly one spelling. WaiveServiceCharge normalises blank input
+-- to NULL before the insert.
+--
+-- WHAT STAYS REQUIRED: waiver_kind (NOT NULL + CHECK) — now the only "why" a
+-- waiver is guaranteed to carry, and the Service Charge Deny report's by-kind
+-- axis — and both usernames (NOT NULL + non-blank CHECKs). The reversal's
+-- reason, the comp's, the void's and the tender void's are untouched.
+--
+-- ============================================================================
+-- LOCKING
+-- ============================================================================
+-- ALTER ... DROP NOT NULL is catalogue-only (no rewrite, no scan) but takes
+-- ACCESS EXCLUSIVE on the table, and every bill read joins this table
+-- (liveServiceChargeWaiver). lock_timeout makes a busy moment fail fast and
+-- retryable instead of queueing every bill read behind it (the 2026-08-24
+-- standstill's shape). Apply it off-peak.
+--
+-- LOCAL, because scripts/migrate.ts runs each file inside begin/commit on a
+-- pooled client, and a session-level SET would leak into the next file.
+--
+-- ============================================================================
+-- THE RUNTIME DOES THIS TOO
+-- ============================================================================
+-- Production runs as the table owner, so the backend issues this same
+-- DROP NOT NULL itself (ensureServiceChargeWaiverReasonNullable): at boot,
+-- before the listener, with its own 2s lock_timeout, only while the column is
+-- still NOT NULL, never inside a transaction. Whether a reasonless waiver is
+-- written is decided from the column's ACTUAL nullability afterwards, and
+-- re-read on the next reasonless waiver while it is still NOT NULL — so this
+-- file applied by hand switches the feature on without a restart, and a
+-- database it has not reached refuses a missing reason exactly as before
+-- (a 400, nothing written). Re-running this file is harmless.
+--
+-- ============================================================================
+-- ROLLBACK (only if needed)
+-- ============================================================================
+-- Rows with NULL must be given a reason first, then the backend restarted so
+-- its latch reads NOT NULL again (until then a reasonless waiver is refused
+-- by the insert's own 23502 handler, as a 400):
+--   UPDATE "ServiceChargeWaivers" SET reason = '(none given)' WHERE reason IS NULL;
+--   ALTER TABLE "ServiceChargeWaivers" ALTER COLUMN reason SET NOT NULL;
+-- and ship a backend without the runtime ensure, or it will drop it again.
+
+SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE "ServiceChargeWaivers" ALTER COLUMN reason DROP NOT NULL;
+
+COMMENT ON COLUMN "ServiceChargeWaivers".reason IS
+  'Optional since 051. NULL = no reason given. Never blank: 036''s CHECK (btrim(reason) <> '''') still refuses '''' and whitespace.';
