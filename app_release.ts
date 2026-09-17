@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "2.0.1";
+const LATEST = "2.0.2";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,12 +118,14 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"The kitchen ticket now looks like your reference KOT, in its own typeface, and you can choose Small, "+
-		"Standard or Large text in Settings (or switch back to the old text ticket if a kitchen printer prints it "+
-		"blank). A held dish now just says [Hold]. When a bill has been printed, the waiter sees the same table "+
-		"number marked Next party for the next guests. Settle as NC is now a way to close a bill, and NC bills "+
-		"show in reports. The reason is optional when removing a service charge, and the clear button in the "+
-		"order search now clears the text.",
+		"A table whose bill is printed now stays on the waiter's floor in orange, with a green table of the same "+
+		"number for the next guests. Waiters can add dishes to a printed bill (print it again, marked UPDATED BILL, "+
+		"before taking payment) and can move a table, but can no longer cancel a KOT. Moved orders show their "+
+		"dish names. The kitchen ticket uses a narrower typeface, closer to your sample, and Settings has a Print a "+
+		"test KOT button. The x now clears every search box. A bill can carry the guest's address with the name "+
+		"and GSTIN, and old bills can be reprinted from History. Reports has a new Email reports area to send reports "+
+		"to the addresses you choose, daily at a set time or right away, once email sending is switched on. Everything in Today at a glance now opens its details. Screens also "+
+		"fit better on small phones and with large text.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
