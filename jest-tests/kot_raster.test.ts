@@ -18,11 +18,14 @@ import {
   DOTS_PER_COL,
   KOT_BANNER_SCALE,
   KOT_BODY_PPEM,
+  KOT_NOTE_SCALE,
   KOT_RASTER_CHUNK_ROWS,
+  KOT_RULE_TEXT,
   buildKotBase64,
   buildReceiptBase64,
   encodeKotRaster,
   kotAtlasFaces,
+  kotFaceKey,
   kotPrintStyleOf,
   kotProfile,
   kotTextSizeOf,
@@ -39,7 +42,7 @@ import {
 } from "../escpos";
 import { KOT_ATLAS } from "../kot_glyph_atlas";
 import { BILL_LOGO_MAX_HEIGHT } from "../bill_logo";
-import { KOT_ATLAS_FACES, atlasToModule, buildKotGlyphAtlas } from "../scripts/kot_atlas_build";
+import { KOT_ATLAS_FACES, KOT_FONT_FILES, KOT_NOTE_SHEAR, atlasToModule, buildKotGlyphAtlas } from "../scripts/kot_atlas_build";
 import { KOT_TEXT_SIZES } from "../kot_print_style";
 import { kotPaper, readKotRaster, rollPpems } from "./kot_raster_read";
 
@@ -138,8 +141,9 @@ describe("the glyph atlas cannot drift from the script that builds it", () => {
       for (const size of SIZES) {
         const p = kotProfile(roll, size);
         for (const weight of ["r", "b"]) { expect(KOT_ATLAS[`${p.ppem}${weight}`]).toBeDefined(); }
-        // A banner is only ever set bold (kotRunFace).
+        // A banner is only ever set bold, a note only slanted (kotRunFace).
         expect(KOT_ATLAS[`${p.bannerPpem}b`]).toBeDefined();
+        expect(KOT_ATLAS[`${p.notePpem}o`]).toBeDefined();
       }
     }
   });
@@ -147,7 +151,7 @@ describe("the glyph atlas cannot drift from the script that builds it", () => {
   test("the builder bakes exactly the faces the renderer can ask for — nothing missing, nothing dead", () => {
     // The unused 30/40/42/56 faces of the first cut are the case this catches:
     // half the table was type no docket could be set in any more.
-    const baked = KOT_ATLAS_FACES.flatMap((f) => f.weights.map((w) => `${f.ppem}${w}`));
+    const baked = KOT_ATLAS_FACES.flatMap((f) => f.styles.map((w) => `${f.ppem}${w}`));
     expect([...baked].sort()).toEqual([...kotAtlasFaces()].sort());
     expect(Object.keys(KOT_ATLAS).sort()).toEqual([...kotAtlasFaces()].sort());
   });
@@ -160,7 +164,7 @@ describe("the glyph atlas cannot drift from the script that builds it", () => {
       for (const cols of ROLLS) {
         for (const size of SIZES) {
           for (const d of draws(plan({ ...opts, reprint: true }, cols, size))) {
-            used.add(`${d.face.ppem}${d.face.weight === 700 ? "b" : "r"}`);
+            used.add(kotFaceKey(d.face));
           }
         }
       }
@@ -169,10 +173,50 @@ describe("the glyph atlas cannot drift from the script that builds it", () => {
   });
 
   test("the module stays a reasonable size for a table that ships in the server", () => {
-    // 11 faces of ASCII: ~120KB of source. A size added without thought (or a
-    // stray weight) shows up here before it shows up in a cold start.
+    // 16 faces of ASCII: ~172KB of source (11 faces and ~120KB before the
+    // slanted note faces and the licence notice). A size added without thought
+    // (or a stray style) shows up here before it shows up in a cold start.
     const bytes = readFileSync(join(REPO, "kot_glyph_atlas.ts")).length;
-    expect(bytes).toBeLessThan(160_000);
+    expect(bytes).toBeLessThan(190_000);
+  });
+
+  test("THE FACE IS DEJAVU SANS CONDENSED, and only the files it is built from are committed", () => {
+    // Never Tahoma: it is the photograph's face and may not ship. The fit that
+    // chose DejaVu is in scripts/kot_atlas_build.ts.
+    expect(KOT_FONT_FILES).toEqual({ r: "DejaVuSansCondensed.ttf", b: "DejaVuSansCondensed-Bold.ttf" });
+    const dir = readdirSync(join(REPO, "scripts", "kot_fonts")).sort();
+    expect(dir).toEqual(["AUTHORS", "DejaVuSansCondensed-Bold.ttf", "DejaVuSansCondensed.ttf", "LICENSE", "SOURCE.txt"]);
+    expect(dir.filter((f) => /tahoma|liberation/i.test(f))).toEqual([]);
+    expect(readFileSync(join(REPO, "scripts", "kot_fonts", "LICENSE"), "utf8")).toContain("Bitstream Vera Fonts Copyright");
+  });
+
+  test("the licence notice travels with the table that ships", () => {
+    // The Bitstream Vera licence's one condition: the notice goes with every copy.
+    const module = readFileSync(join(REPO, "kot_glyph_atlas.ts"), "utf8");
+    expect(module).toContain("DejaVu Sans Condensed");
+    expect(module).toContain("Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.");
+    expect(module).toContain("The above copyright and trademark notices and this permission notice shall");
+  });
+
+  test("only the note faces are slanted, and they really lean", () => {
+    for (const [key, face] of Object.entries(KOT_ATLAS)) {
+      expect({ key, slant: face.slant }).toEqual({ key, slant: key.endsWith("o") ? KOT_NOTE_SHEAR : 0 });
+      expect({ key, weight: face.weight }).toEqual({ key, weight: key.endsWith("b") ? 700 : 400 });
+    }
+    // An "l" is one vertical stroke upright. Slanted, its top row starts to the
+    // right of its bottom row, by about slant x height.
+    const firstInk = (face: string, row: "top" | "bottom") => {
+      const g = KOT_ATLAS[face]!.g[108]!;
+      const px = Buffer.from(g.d, "base64");
+      const stride = (g.w + 7) >> 3;
+      const y = row === "top" ? 0 : g.h - 1;
+      for (let x = 0; x < g.w; x++) { if ((px[y * stride + (x >> 3)] ?? 0) & (0x80 >> (x & 7))) { return x; } }
+      return -1;
+    };
+    expect(firstInk("23r", "top")).toBe(firstInk("23r", "bottom"));
+    const lean = firstInk("23o", "top") - firstInk("23o", "bottom");
+    const h = KOT_ATLAS["23o"]!.g[108]!.h;
+    expect(Math.abs(lean - KOT_NOTE_SHEAR * h)).toBeLessThanOrEqual(1.5);
   });
 
   test("it is ASCII 32..126 and nothing else — the fold happens before the type", () => {
@@ -189,21 +233,22 @@ describe("the glyph atlas cannot drift from the script that builds it", () => {
  * THE TEXT SIZE — "Restaurant".kot_text_size.
  *
  * The client, having printed the first reference docket: "The font sizes must
- * be smaller in the KOT." Standard is now their reference photograph (28 dots
- * per em on 80mm), with a step either side of it an owner can pick in Settings.
+ * be smaller in the KOT." Standard is their reference photograph (27 dots per
+ * em on 80mm in the docket's face), with a step either side of it an owner can
+ * pick in Settings.
  */
 describe("the text size a restaurant chose", () => {
   test("the sizes are exactly the agreed table", () => {
     expect(KOT_BODY_PPEM).toEqual({
-      "80mm": { small: 24, standard: 28, large: 34 },
-      "58mm": { small: 22, standard: 24, large: 28 },
+      "80mm": { small: 23, standard: 27, large: 33 },
+      "58mm": { small: 21, standard: 23, large: 27 },
     });
   });
 
-  test("STANDARD ON 80mm IS THE CLIENT'S REFERENCE PHOTOGRAPH — 28 dots per em — and it is the default", () => {
-    expect(kotProfile(576)).toEqual({ widthDots: 576, textSize: "standard", ppem: 28, bannerPpem: 39 });
+  test("STANDARD ON 80mm IS THE CLIENT'S REFERENCE PHOTOGRAPH — 27 dots per em — and it is the default", () => {
+    expect(kotProfile(576)).toEqual({ widthDots: 576, textSize: "standard", ppem: 27, bannerPpem: 38, notePpem: 23 });
     expect(kotProfile(576, "standard")).toEqual(kotProfile(576));
-    expect(kotProfile(384)).toEqual({ widthDots: 384, textSize: "standard", ppem: 24, bannerPpem: 34 });
+    expect(kotProfile(384)).toEqual({ widthDots: 384, textSize: "standard", ppem: 23, bannerPpem: 32, notePpem: 20 });
   });
 
   test("every roll and size resolves to its row of the table, and the banner is 1.4x bold, rounded", () => {
@@ -212,17 +257,20 @@ describe("the text size a restaurant chose", () => {
         const p = kotProfile(cols * DOTS_PER_COL, size);
         expect(p.ppem).toBe(KOT_BODY_PPEM[rollName(cols)][size]);
         expect(p.bannerPpem).toBe(Math.round(p.ppem * KOT_BANNER_SCALE));
+        expect(p.notePpem).toBe(Math.round(p.ppem * KOT_NOTE_SCALE));
         expect(p.textSize).toBe(size);
       }
     }
-    // The rounding, spelled out: 24→34, 28→39, 34→48, 22→31.
-    expect([24, 28, 34, 22].map((b) => Math.round(b * KOT_BANNER_SCALE))).toEqual([34, 39, 48, 31]);
+    // The rounding, spelled out. Banners: 21→29, 23→32, 27→38, 33→46.
+    expect([21, 23, 27, 33].map((b) => Math.round(b * KOT_BANNER_SCALE))).toEqual([29, 32, 38, 46]);
+    // Notes: 21→18, 23→20, 27→23, 33→29.
+    expect([21, 23, 27, 33].map((b) => Math.round(b * KOT_NOTE_SCALE))).toEqual([18, 20, 23, 29]);
   });
 
   test("anything that is not a size is standard — a NULL column, a missing one, a typo", () => {
     for (const raw of [undefined, null, "", "  ", "medium", "SMALLER", 7, {}]) {
       expect(kotTextSizeOf(raw)).toBe("standard");
-      expect(kotProfile(576, raw).ppem).toBe(28);
+      expect(kotProfile(576, raw).ppem).toBe(27);
     }
     expect(kotTextSizeOf(" Small ")).toBe("small");
     expect(kotTextSizeOf("LARGE")).toBe("large");
@@ -486,17 +534,167 @@ describe("the banner is the largest face on the paper", () => {
     expect(draws(p).map((d) => [d.face.ppem, d.face.weight])[0]).toEqual([profile.ppem, 700]);
   });
 
-  test("an ordinary docket is set entirely in one size", () => {
+  test("an ordinary docket is set in body type, except its note", () => {
     for (const size of SIZES) {
       const p = plan(docket, 48, size);
-      expect(new Set(draws(p).map((d) => d.face.ppem))).toEqual(new Set([p.geometry.ppem]));
+      const notes = draws(p).filter((d) => d.text.startsWith("[Note]"));
+      expect(notes.map((d) => kotFaceKey(d.face))).toEqual([`${p.geometry.notePpem}o`]);
+      const rest = draws(p).filter((d) => !d.text.startsWith("[Note]"));
+      expect(new Set(rest.map((d) => d.face.ppem))).toEqual(new Set([p.geometry.ppem]));
     }
   });
 });
 
+/**
+ * THE TYPE IS THE PHOTOGRAPH'S — measured, not eyeballed.
+ *
+ * Client, item 5: "The font style should be similar to the reference photos
+ * ... the font looks elongated and stretched vertically ... reduce the font
+ * size as well." These are the numbers the investigation took off their photo
+ * (ink widths in photo pixels, 2.19 px per printer dot, the paper's own scale
+ * measured from its 48-hyphen rules), and the standard 80mm docket has to land
+ * on them: same width line for line, same capital and x-height, same pitch.
+ */
+describe("the standard docket's type measures like the client's photograph", () => {
+  const PX_PER_DOT = 2.19;
+  const PHOTO: [string, boolean, number][] = [
+    ["KOT", true, 112], ["Dine In: DOME SECTION", true, 699], ["Table No: 33", true, 363],
+    ["Ghewar Berry Mousse", true, 661], ["Gaia Rose Cookies", true, 553],
+    ["Running Table", false, 349], ["08/09/26 14:13", false, 408], ["KOT - 21", false, 221],
+    ["Persons - 4", false, 286], ["No.Item", false, 216], ["Qty", false, 85],
+  ];
+  const profile = kotProfile(576, "standard");
+  const ratios = PHOTO.map(([text, bold, px]) => {
+    const p = planKotRaster([{ k: "line", align: "left", bold, size: "body", text }], KOT_ATLAS, profile.ppem, 576);
+    const d = p.ops[0]!.draws[0]!;
+    return px / PX_PER_DOT / (d.x1 - d.x0);
+  });
+  const mean = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+  const cv = Math.sqrt(ratios.reduce((a, b) => a + (b - mean) ** 2, 0) / ratios.length) / mean;
+
+  test("every measured line is the photo's width — on average within 2%", () => {
+    // 0.995 today. At 28 dots per em (2.0.1's number) this face prints ~4% wide.
+    expect(Math.abs(mean - 1)).toBeLessThan(0.02);
+  });
+
+  test("and the widths agree with each other — the face has the photo's proportions", () => {
+    // 3.8% today; Liberation Sans, the 2.0.1 face, spreads 5.5% on the same lines.
+    expect(cv).toBeLessThan(0.045);
+  });
+
+  test("capitals, lowercase and line pitch are the photo's 20 / 15 / 33 dots", () => {
+    expect(KOT_ATLAS[`${profile.ppem}b`]!.g[72]!.h).toBe(20);     // "H" — photo 19.6
+    expect(KOT_ATLAS[`${profile.ppem}r`]!.g[120]!.h).toBe(15);    // "x" — photo 14.7
+    const p = plan(docket, 48, "standard");
+    expect(new Set(p.ops.map((op) => op.height))).toEqual(new Set([33]));
+  });
+
+  test("nothing is stretched: every glyph is drawn at its own proportions, one dot per dot", () => {
+    // The 2.0.0 complaint was ESC ! double height. The raster is sent at GS v 0
+    // mode 0 (see "the bytes"), and no face is taller than it is set: a capital
+    // is 0.74em tall, as the outline says, at every size.
+    for (const key of kotAtlasFaces().filter((k) => !k.endsWith("o"))) {
+      const face = KOT_ATLAS[key]!;
+      expect({ key, ratio: +(face.g[72]!.h / face.ppem).toFixed(1) }).toEqual({ key, ratio: 0.7 });
+    }
+  });
+});
+
+describe("a note is smaller and slanted; a hold is not", () => {
+  const withBoth: ReceiptOptions = {
+    ...docket,
+    items: [{ name: "Gulab Jamun", quantity: 3, price: 0, held: true, note: "fire with dessert" }],
+  };
+  for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
+    test(`${rollName(cols)}, ${size}`, () => {
+      const p = plan(withBoth, cols, size);
+      const hold = draws(p).filter((d) => d.text === "[Hold]");
+      const note = draws(p).filter((d) => d.text.startsWith("[Note]"));
+      expect(hold.map((d) => kotFaceKey(d.face))).toEqual([`${p.geometry.ppem}r`]);
+      expect(note.map((d) => kotFaceKey(d.face))).toEqual([`${p.geometry.notePpem}o`]);
+      expect(note[0]!.face.slant).toBe(KOT_NOTE_SHEAR);
+      expect(hold[0]!.face.slant).toBe(0);
+      expect(p.geometry.notePpem).toBeLessThan(p.geometry.ppem);
+      // Both hang on the name column, on the body pitch.
+      expect([hold[0]!.x, note[0]!.x]).toEqual([p.geometry.nameX, p.geometry.nameX]);
+    });
+  }
+
+  test("a long note wraps short of the column by its own lean, and reads back whole", () => {
+    const long = "no onion no garlic, extra spicy, serve with the mains and keep the raita on the side please";
+    for (const [cols, size] of ROLLS.flatMap((c) => SIZES.map((s) => [c, s] as const))) {
+      const p = plan({ ...docket, items: [{ name: "Roti", quantity: 1, price: 0, note: long }] }, cols, size);
+      const lines = draws(p).filter((d) => d.face.slant > 0);
+      expect(lines.length).toBeGreaterThan(1);
+      for (const d of lines) { expect(d.x1).toBeLessThanOrEqual(p.geometry.qtyLeft); }
+    }
+    const paper = kotPaper(buildReceiptBase64({ ...docket, items: [{ name: "Roti", quantity: 1, price: 0, note: long }] }, 48), 48);
+    expect(paper.replace(/\n/g, " ")).toContain(`[Note] ${long}`);
+  });
+});
+
+/**
+ * THE RULES ARE THE PHOTOGRAPH'S: a line of hyphens, 48 across the 80mm roll.
+ */
+describe("a rule is a line of hyphens", () => {
+  for (const cols of ROLLS) {
+    for (const size of SIZES) {
+      test(`one hyphen per column, on a full line — ${rollName(cols)}, ${size}`, () => {
+        const p = plan(stress, cols, size);
+        const rules = p.ops.filter((op) => op.kind === "rule");
+        expect(rules.length).toBe(5);
+        const textPitch = p.ops.find((op) => op.kind === "text" && op.draws[0]?.face.ppem === p.geometry.ppem)!.height;
+        for (const op of rules) {
+          expect(op.height).toBe(textPitch);
+          expect(op.draws.map((d) => [d.text, d.cell, kotFaceKey(d.face)])).toEqual([
+            [KOT_RULE_TEXT.repeat(cols), DOTS_PER_COL, `${p.geometry.ppem}r`],
+          ]);
+          expect(op.draws[0]!.x0).toBeGreaterThanOrEqual(0);
+          expect(op.draws[0]!.x1).toBeLessThanOrEqual(p.widthDots);
+        }
+      });
+    }
+    test(`the paper shows ${cols} separate, equal dashes on every rule — ${rollName(cols)}`, () => {
+      const b = bytes(buildReceiptBase64(docket, cols));
+      const p = plan(docket, cols);
+      const stride = (p.widthDots + 7) >> 3;
+      // Stack the GS v 0 blocks back into one page.
+      const rows: Buffer[] = [];
+      for (let i = 2; b[i] === 0x1d && b[i + 1] === 0x76;) {
+        const h = (b[i + 6] ?? 0) | ((b[i + 7] ?? 0) << 8);
+        for (let r = 0; r < h; r++) { rows.push(b.subarray(i + 8 + r * stride, i + 8 + (r + 1) * stride)); }
+        i += 8 + stride * h;
+      }
+      let y = 0;
+      let checked = 0;
+      for (const op of p.ops) {
+        if (op.kind === "rule") {
+          const inked = rows.slice(y, y + op.height).filter((r) => r.some((v) => v !== 0));
+          // A hyphen is a short, flat stroke — two or three dots, never a band.
+          expect(inked.length).toBeGreaterThanOrEqual(1);
+          expect(inked.length).toBeLessThanOrEqual(3);
+          for (const row of inked) {
+            const runs: number[] = [];
+            let run = 0;
+            for (let x = 0; x < p.widthDots; x++) {
+              if ((row[x >> 3] ?? 0) & (0x80 >> (x & 7))) { run += 1; } else if (run) { runs.push(run); run = 0; }
+            }
+            if (run) { runs.push(run); }
+            expect(runs.length).toBe(cols);
+            expect(new Set(runs).size).toBe(1);
+          }
+          checked += 1;
+        }
+        y += op.height;
+      }
+      expect(checked).toBe(4);
+    });
+  }
+});
+
 describe("wrapping is measured in dots, because the type is proportional", () => {
   // The standard 80mm dish-name face — the one a docket wraps most often in.
-  const face = KOT_ATLAS["28b"]!;
+  const face = KOT_ATLAS["27b"]!;
 
   test("a word that fits stays on its line; one that does not moves down whole", () => {
     const lines = kotWrap(face, "Ghewar Berry Mousse", 200);
@@ -525,7 +723,7 @@ describe("a next-party table's name is one word on the docket", () => {
   // "12 #2" has a space in it. Broken there, the table-move slip read
   // "... WAS 105" then "#2 ***" — the first line naming the ROOT's docket, the
   // one the pass must NOT pull — and a 58mm "Table No:" line lost its "#2".
-  const face = KOT_ATLAS["28b"]!;
+  const face = KOT_ATLAS["27b"]!;
 
   test("'#<n>' is measured and moved with the word before it", () => {
     expect(kotWrapUnits("*** TABLE CHANGED - WAS 105 #2 ***")).toEqual(["***", "TABLE", "CHANGED", "-", "WAS", "105 #2", "***"]);
@@ -900,19 +1098,23 @@ describe("the TrueType half is dev-time only", () => {
  * the document the kitchen cooks from, and a silent change to it is a silent
  * change to what comes out of the pass.
  *
- * Last re-pinned for the text-size setting (standard = the client's reference
- * photograph, 28 dots per em on 80mm; was 40) and for the hold line saying only
- * "[Hold]". Every variant is the STANDARD size — what a restaurant that never
- * opens the setting prints — and the reference docket is pinned at all three.
+ * Last re-pinned for 2.0.2's face (DejaVu Sans Condensed, the permissive face
+ * closest to the photograph's Tahoma; was Liberation Sans), its sizes (standard
+ * 27 dots per em on 80mm; was 28), the smaller slanted "[Note]", the 0.2em
+ * leading and the 48-hyphen rules on a full line — with the before/after
+ * renders compared side by side against the client's photo. Before that: the
+ * text-size setting (was 40) and the hold line saying only "[Hold]". Every
+ * variant is the STANDARD size — what a restaurant that never opens the
+ * setting prints — and the reference docket is pinned at all three.
  */
 describe("the reference docket's committed bytes", () => {
   const SIZE_GOLDEN: Record<string, string> = {
-    "small @48": "34808:0d6c89ca7bf0e76a2423b2e4c415279ebe5bbee030336e706c344d536cfa9d08",
-    "standard @48": "40784:d810dadb6efe8df4636c7a49ba9f419f7e025795010c980bfaed243dc526f06b",
-    "large @48": "50288:e718d8b2a105ab9f847b2f58b88a418b8a96af268586d5848a1e11ca9afd0be3",
-    "small @32": "21576:4ff27e96952fa93517b045186ec67a0bc22e7562e82316e46fa74a573e8c336d",
-    "standard @32": "23216:f1b4a208e56f55f3802fe8597f0c2fa220e8e9a97f3f155089b6033e5e4ddb3e",
-    "large @32": "28832:1d8106674b8efbddeae987aa7952986c30b6188104823f278858a3a8c599c761",
+    "small @48": "41072:d8ffcc0106b53bb21b66cbb7d6d8a555898a398d013adff93dfaa0a34a27041b",
+    "standard @48": "45176:9dd48d3a74af71f0c34ec44dc37982f163d62642be3c3bd259ba85f09313574b",
+    "large @48": "57496:722c4149aa1b4f977973ea249c419f1677b79b54f42a8514b137a171b2dc708e",
+    "small @32": "23744:a79ad70b4ef52347eb76cc61287f1e12de8d8fbc9099179b6cad1da95ac7990c",
+    "standard @32": "27392:81e38f677c1d80787eed1dde58ba0776f774e7591a65a8020b1086f3dc920554",
+    "large @32": "31712:b6de143712e09c536c2d42d3e38a2b0cc89729167a00787522c1f516ac9c8ad3",
   };
 
   test("the reference docket at every size, both rolls", () => {
@@ -933,26 +1135,26 @@ describe("the reference docket's committed bytes", () => {
   });
 
   const RASTER_GOLDEN: Record<string, string> = {
-    "the reference docket @48": "40784:d810dadb6efe8df4636c7a49ba9f419f7e025795010c980bfaed243dc526f06b",
-    "the reference docket @32": "23216:f1b4a208e56f55f3802fe8597f0c2fa220e8e9a97f3f155089b6033e5e4ddb3e",
-    "a long name with a hold and a note @48": "58936:4e7242563bb85846a9af1bcbe4cdf3358c669261231bfc2d89d19fe832c503ce",
-    "a long name with a hold and a note @32": "36328:960a41bfb8b4957f105a0650f049b7cd1310d25fd896a1e42a2278007d6ce0a6",
-    "a reprint @48": "62176:e694f6407e0c2d0030f44bdafc282ca33b26b4fee1e5ddce6ad1fba0b1ecdc2e",
-    "a reprint @32": "38200:492043ee8490b9b812cf1b726b3d34e02c7b7ccef7afc78b67507140221d700d",
-    "a cancellation @48": "65632:9bb34f4af8362231663937c6a56dc24d2b49fdcee3690a3a1b53348168e6d4b8",
-    "a cancellation @32": "41560:9a37a38c0d3b1495b9ec064ed5e0e91280b6dee5f8cb106938ebf41878a02f2f",
-    "a per-station docket @48": "43232:08202a6648ebdeba300a298b343df8a8764238793124abbdba87ad7d6918cf85",
-    "a per-station docket @32": "24608:70e5836e303cda6b2b7c5e68f0862f3ba4689d601783f6dd0d64d44f43eeef2e",
-    "an empty ticket @48": "30984:1b67c63b439919ead4bf6faa6a173da1ade10500b77b10c45aa00433caae985e",
-    "an empty ticket @32": "17640:c0fdbfd42dd053052369566d63d2770f553b6e5b8686884396c3f7434648f7e6",
-    "an unnumbered, unassigned ticket @48": "32424:e2ca1f072cb0ee5ad6b16f6eaa829fb8e3e4aa2ebf8e848f51c417d97f0d3b74",
-    "an unnumbered, unassigned ticket @32": "18456:2f65017a21eb1492ef051696acf75978be1f49a60b81730a71770e7f7a484e4d",
-    "an unbroken 60-character token @48": "35888:557d8fe58aee044c0e76dc6c121c5e3f71499f415540d6baeca93813ee8d2545",
-    "an unbroken 60-character token @32": "21816:c783c6c91ff9deb994fdae4aeec06b1ff79b578b5e5b021d97aad495a69e3938",
-    "a four-digit quantity @48": "33432:6b0ea96d2972534820389d57446f618273ead1b0351904dab8e371565c5914ef",
-    "a four-digit quantity @32": "19032:d91fdae8a675eb89f3a84dd79b2d39f0dc252ff62141d07dbca6fe0685e57e3b",
-    "a name folded from non-ASCII @48": "33432:2754c2ed9410b1935fb6ee86c52c2a4403b29cabefdd55c252340cd50ecc3a93",
-    "a name folded from non-ASCII @32": "19032:ef6d47b7b6e63bf18fd4b85ae716e78341579a646af7b2c2a5573a769023cd02",
+    "the reference docket @48": "45176:9dd48d3a74af71f0c34ec44dc37982f163d62642be3c3bd259ba85f09313574b",
+    "the reference docket @32": "27392:81e38f677c1d80787eed1dde58ba0776f774e7591a65a8020b1086f3dc920554",
+    "a long name with a hold and a note @48": "61816:7a170d4eabc88f66d0d27db3d79203bbf8340438c3fb1dd2c10962214a2d60ae",
+    "a long name with a hold and a note @32": "41800:d871056022e5868627a79381c2a1d6e1a9563d6691a79e5c1cca07258e3e54dd",
+    "a reprint @48": "65056:95f2e9f799c78938eb7f002a83f7b5f600b39cfc8b58285f148edb4b8f324f1d",
+    "a reprint @32": "43672:562be581e04212dfb09bb8a38e82746f230a595c53b4580c0b8796d1b0334833",
+    "a cancellation @48": "69816:d670d782dc74e5f75b6431c59a45e9bf03add8d9d6b6171af0dd9797c9fd17cb",
+    "a cancellation @32": "48000:eb2f343257341372b14c55180553874979a371022695032871cb69b16911bba7",
+    "a per-station docket @48": "47552:ce780e8017e54574f36c44b6df625581f22a6a5ead86cfcb9956388ddc6305c9",
+    "a per-station docket @32": "28832:f7ce016417ce6081ac7e0421b3c58ae0a35508224eaf466f94622c36ffb7c357",
+    "an empty ticket @48": "35672:00bd718209137908f44299e5aa3b79ccebd157908c7570ddd8c072c1ea0d37cc",
+    "an empty ticket @32": "21624:bacf92698f3ab6b184a421a497ae0562e0ffc853b496687c83bd7620084eaa9e",
+    "an unnumbered, unassigned ticket @48": "35672:971192e956d2bf1a6af568668a687156e5c8ad7e104004e099ad1f2583f327b3",
+    "an unnumbered, unassigned ticket @32": "21624:754b860b9613001eba9b9a7127c6c175ccd956bb828fa3ac59c34e2d2a143be5",
+    "an unbroken 60-character token @48": "40424:51ca1276535f39a2d90aa123041c4f8635b07e229d17836cf1d3e5dcd760b0d1",
+    "an unbroken 60-character token @32": "25952:a51398a5936f1778de88efb2792f458a3f11276bd51df7f3e62db0fb41794004",
+    "a four-digit quantity @48": "38048:9ab0dcbd197beadb43d200e00bd1099ea5e70987eeb52898168e8fc359559170",
+    "a four-digit quantity @32": "23064:572419a0d6d8f6335c1dd6d21e17e2f067a37658a66e2de961efc52b8d1391f2",
+    "a name folded from non-ASCII @48": "38048:fac1690051cdf98046c86251612e39ee1d1496054843889c7c852a2681608419",
+    "a name folded from non-ASCII @32": "23064:4a46236f6e64825103e6922e7c2ba466f5bdcc995a4c3cd06ffc8594dfb976fa",
   };
 
   test("every variant, both rolls", () => {

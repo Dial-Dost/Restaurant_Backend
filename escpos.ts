@@ -588,21 +588,29 @@ export function billRule(dots: number, thick = false): Buffer {
  *                                           what a docket says.
  *
  * WHY A RASTER AND NOT PRINTER FONTS. The reference docket is set in a
- * PROPORTIONAL Arial-metric face. ESC/POS built-in fonts are monospaced and
- * come in integer multiples only, so the closest the text renderer could get
- * was double height — which stretches the glyphs to a 1:4 aspect and reads as
- * a different typeface, which is exactly what the client reported. A
- * proportional face reaches a thermal printer only as a bitmap. So the text is
- * drawn from kot_glyph_atlas.ts, a committed table of 1-bit glyphs
- * (Liberation Sans, metric-compatible with Arial), and shipped as GS v 0 —
- * the same raster command the bill's logo and rules already use.
+ * PROPORTIONAL face — Tahoma, measured off the client's photograph. ESC/POS
+ * built-in fonts are monospaced and come in integer multiples only, so the
+ * closest the text renderer could get was double height — which stretches the
+ * glyphs to a 1:4 aspect and reads as a different typeface, which is exactly
+ * what the client reported. A proportional face reaches a thermal printer only
+ * as a bitmap. So the text is drawn from kot_glyph_atlas.ts, a committed table
+ * of 1-bit glyphs, and shipped as GS v 0 — the same raster command the bill's
+ * logo and rules already use.
+ *
+ * THE FACE IS DEJAVU SANS CONDENSED, not Tahoma (which may not ship) and no
+ * longer Liberation Sans (Arial's proportions, which the client read as "the
+ * font style is wrong"). Of the faces we may ship it measures closest to the
+ * photograph — same widths line for line, same capital and x-heights at the
+ * same size. scripts/kot_atlas_build.ts has the numbers.
  *
  * AND WHY THE TEXT RENDERER STAYS. A printer that ignores GS v 0 prints a
  * BLANK ticket from this path — silent order loss, in the one document a
  * kitchen cooks from. No printer model is on record anywhere in production
  * ("PrintDevices" is empty), so the old docket is kept as a live fallback,
  * chosen per restaurant by "Restaurant".kot_print_style: 'classic' prints the
- * text docket, byte for byte as it always has. See ReceiptOptions.kotPrintStyle.
+ * text docket, word for word as it always has, in the printer's own font at its
+ * normal size (no longer stretched to double height — see `body`). See
+ * ReceiptOptions.kotPrintStyle.
  * =========================================================================== */
 
 /**
@@ -640,11 +648,15 @@ export function kotTextSizeOf(value: unknown): KotTextSize {
  * WHY THESE NUMBERS. The first reference docket set body type at 40 on the
  * 576-dot 80mm roll (30 on 58mm), because the client had asked for bigger type
  * twice. Having printed it, they asked for it smaller ("The font sizes must be
- * smaller in the KOT"). Measured against their own reference photograph, the
- * ticket they approved is 28 dots per em on 80mm — so 28 IS 'standard', and a
- * restaurant that never opens the setting gets the photograph, dot for dot.
- * 'small' and 'large' are a step either side of it, and the 58mm roll steps
- * down with its narrower paper.
+ * smaller in the KOT"). Their own reference photograph is Tahoma at 27 dots per
+ * em, and fitting the docket's face to that photograph line by line lands on
+ * 26.8 — so 27 IS 'standard', and a restaurant that never opens the setting
+ * gets the photograph's type: capitals 20 dots tall, lowercase 15, a line every
+ * 33 dots. (It was 28 while the face was Liberation Sans, whose capitals are
+ * shorter per em; the size of the type on the paper is what was kept.)
+ * 'small' and 'large' are the same steps either side of it they always were
+ * (x0.86 and x1.21, rounded), and the 58mm roll steps down with its narrower
+ * paper by the same ratios.
  *
  * The cost of the larger sizes is that a long dish name wraps to a second line,
  * which the encoder is built to render cleanly; nothing on the paper is ever
@@ -657,16 +669,18 @@ export function kotTextSizeOf(value: unknown): KotTextSize {
  * for is shipped.
  */
 export const KOT_BODY_PPEM: Readonly<Record<"80mm" | "58mm", Readonly<Record<KotTextSize, number>>>> = {
-  "80mm": { small: 24, standard: 28, large: 34 },
-  "58mm": { small: 22, standard: 24, large: 28 },
+  "80mm": { small: 23, standard: 27, large: 33 },
+  "58mm": { small: 21, standard: 23, large: 27 },
 };
 
 /**
  * The type sizes one docket is set in.
  *
- * BANNERS ARE THE ONLY THING THAT CHANGES SIZE ON A DOCKET. REPRINT and
- * CANCELLED print at 1.4x the body, in BOLD, so they are unmistakably the
- * largest thing on the paper whatever size the restaurant chose; everywhere else
+ * TWO THINGS CHANGE SIZE ON A DOCKET, and only two. REPRINT and CANCELLED
+ * print at 1.4x the body, in BOLD, so they are unmistakably the largest thing
+ * on the paper whatever size the restaurant chose. A dish's "[Note]" prints a
+ * step SMALLER and slanted, as the reference docket sets it — the one line on
+ * the ticket that qualifies another rather than naming a dish. Everywhere else
  * emphasis is WEIGHT, exactly as the reference docket does it.
  */
 export interface KotProfile {
@@ -678,10 +692,25 @@ export interface KotProfile {
   ppem: number;
   /** REPRINT / CANCELLED size, dots per em — always set bold. */
   bannerPpem: number;
+  /** A "[Note]" line's size, dots per em — always set in the slanted face. */
+  notePpem: number;
 }
 
 /** REPRINT and CANCELLED, relative to body type. */
 export const KOT_BANNER_SCALE = 1.4;
+
+/**
+ * A "[Note]" line, relative to body type.
+ *
+ * Measured, like the body size: the photograph's "[Note] Hold Dessert" is 207
+ * dots of ink, which in the docket's face slanted as the photo slants it is
+ * 23.1 dots per em against a 26.8 body — 0.86. 0.87 rounds to the same 23 at
+ * standard and keeps the smaller sizes a readable step below their body.
+ *
+ * "[Hold]" is NOT a note and does not shrink: it is an instruction the kitchen
+ * acts on, set upright at body size where a chef scans for it.
+ */
+export const KOT_NOTE_SCALE = 0.87;
 
 /**
  * The profile for a roll `widthDots` wide at the restaurant's `textSize`
@@ -692,15 +721,22 @@ export const KOT_BANNER_SCALE = 1.4;
 export function kotProfile(widthDots: number, textSize?: unknown): KotProfile {
   const size = kotTextSizeOf(textSize);
   const ppem = KOT_BODY_PPEM[widthDots >= 576 ? "80mm" : "58mm"][size];
-  return { widthDots, textSize: size, ppem, bannerPpem: Math.round(ppem * KOT_BANNER_SCALE) };
+  return {
+    widthDots,
+    textSize: size,
+    ppem,
+    bannerPpem: Math.round(ppem * KOT_BANNER_SCALE),
+    notePpem: Math.round(ppem * KOT_NOTE_SCALE),
+  };
 }
 
 /**
- * EVERY FACE A DOCKET CAN BE SET IN, as atlas keys ("<ppem><r|b>"), sorted.
+ * EVERY FACE A DOCKET CAN BE SET IN, as atlas keys ("<ppem><r|b|o>"), sorted.
  *
- * Each body size in both weights — a dish name is bold, a note is not — and
- * each banner size in bold only, because planKotRaster never sets a banner in
- * any other weight. This is the list the committed atlas must match exactly.
+ * Each body size regular and bold — a dish name is bold, the rest is not —
+ * each banner size in bold only, and each note size in the slanted face only
+ * ("o"), because planKotRaster never sets a banner or a note any other way.
+ * This is the list the committed atlas must match exactly.
  */
 export function kotAtlasFaces(): string[] {
   const keys = new Set<string>();
@@ -709,13 +745,26 @@ export function kotAtlasFaces(): string[] {
       keys.add(`${ppem}r`);
       keys.add(`${ppem}b`);
       keys.add(`${Math.round(ppem * KOT_BANNER_SCALE)}b`);
+      keys.add(`${Math.round(ppem * KOT_NOTE_SCALE)}o`);
     }
   }
-  return [...keys].sort((a, b) => parseInt(a, 10) - parseInt(b, 10) || a.localeCompare(b));
+  const order = (k: string) => "rbo".indexOf(k.slice(-1));
+  return [...keys].sort((a, b) => parseInt(a, 10) - parseInt(b, 10) || order(a) - order(b));
 }
 
-/** Body text, or a banner. There is no third size on a docket. */
-export type KotSize = "body" | "banner";
+/** The atlas key a face was baked under — "27b", "23o". */
+export function kotFaceKey(face: KotFace): string {
+  return `${face.ppem}${face.slant ? "o" : face.weight >= 700 ? "b" : "r"}`;
+}
+
+/**
+ * Body text, a banner, or a note. There is no fourth size on a docket.
+ *
+ * A NOTE IS A SIZE AND A STYLE AT ONCE: smaller, and slanted, never bold. It is
+ * one word because the two never come apart on the reference docket — and a
+ * row cannot ask for "slanted body" or "upright note", which nobody designed.
+ */
+export type KotSize = "body" | "banner" | "note";
 
 /**
  * The three columns of the item table. A cell says WHICH column it is in, never
@@ -737,7 +786,7 @@ export interface KotCell {
  * `line` is a whole-width line; `cols` is a row of the item table, whose `name`
  * cell is the only thing allowed to wrap (and whose continuations, and any
  * [Hold] or [Note] under it, hang under the name column). `rule` is the dashed
- * separator.
+ * separator — a line of hyphens, as the reference prints it.
  */
 export type KotRow =
   | { k: "line"; align: "center" | "left"; bold: boolean; size: KotSize; text: string }
@@ -775,7 +824,7 @@ export const KOT_HOLD_LINE = "[Hold]";
  *   ------------------------------
  *   No.Item                      Qty
  *   1 Subz Tehri                   1  dish name BOLD, qty a bare right-aligned number
- *     [Note] Hold Dessert             indented to the name column, upright
+ *     [Note] Hold Dessert             indented to the name column, SMALLER and slanted
  *   ------------------------------
  *   Total Qty                      3
  *
@@ -910,11 +959,16 @@ export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
     // THE HOLD, WHERE A NOTE GOES — directly under the dish it holds, in the
     // slot a kitchen note uses. The client asked for exactly this placement
     // twice, and then for the line to say only "[Hold]" (see KOT_HOLD_LINE).
+    // UPRIGHT AND AT BODY SIZE, unlike the note below it: "[Hold]" is an
+    // instruction the pass acts on ("fire 3"), and it keeps the weight of one.
     if (it.held === true) { cols([{ text: KOT_HOLD_LINE, at: "name", bold: false }]); }
-    // Upright and unemphasised on purpose: a docket on which everything is
-    // emphasised emphasises nothing.
+    // THE NOTE IS SET AS THE REFERENCE SETS IT: a step smaller and slanted
+    // (KOT_NOTE_SCALE), never bold. It qualifies the dish above it, so it reads
+    // as belonging to that dish rather than as the next line of the order —
+    // and a docket on which everything is emphasised emphasises nothing. (It
+    // was upright at body size until the client's "the font style is wrong".)
     const note = String(it.note ?? "").trim();
-    if (note) { cols([{ text: `[Note] ${note}`, at: "name", bold: false }]); }
+    if (note) { cols([{ text: `[Note] ${note}`, at: "name", bold: false, size: "note" }]); }
   }
 
   rule();
@@ -960,6 +1014,7 @@ export interface KotGeometry {
   widthDots: number;
   ppem: number;
   bannerPpem: number;
+  notePpem: number;
   /** White kept at each edge. */
   margin: number;
   /** Left edge of the No. column, and of every left-aligned line. */
@@ -975,10 +1030,11 @@ export interface KotGeometry {
   /** The quantity column: right-aligned against qtyRight. */
   qtyLeft: number;
   qtyRight: number;
-  /** Dash length and stroke thickness of a rule, and the band it sits in. */
-  dash: number;
-  ruleThick: number;
-  ruleHeight: number;
+  /**
+   * A rule is a row of hyphens, one to each `ruleCell` dots — see KOT_RULE_TEXT.
+   */
+  ruleDashes: number;
+  ruleCell: number;
   /** White above and below a line of type. */
   leading: number;
 }
@@ -989,6 +1045,11 @@ export interface KotDraw {
   text: string;
   /** Pen position, in dots from the left edge of the roll. */
   x: number;
+  /**
+   * Set only on a rule: the run is MONOSPACED, one glyph centred in each cell
+   * this many dots wide, instead of advancing by the face's own widths.
+   */
+  cell?: number;
   /** Ink extent of the run: [x0, x1). Nothing may fall outside [0, widthDots). */
   x0: number;
   x1: number;
@@ -1003,6 +1064,19 @@ export interface KotOp {
   baseline: number;
   draws: KotDraw[];
 }
+
+/**
+ * THE RULE IS A LINE OF HYPHENS — the reference docket's own separator.
+ *
+ * The photograph's rules are 48 hyphens across the 80mm roll, printed on a line
+ * of their own like any other line of type. They used to be drawn here as
+ * geometric dashes in a band a third of a line tall, which is the one part of
+ * the old docket that looked machine-drawn next to the photo. Now a rule is the
+ * body face's own hyphen, one per printer column (DOTS_PER_COL): 48 on the 80mm
+ * roll, 32 on 58mm — the same count the classic text docket's `sep` prints — on
+ * a line exactly as tall as a line of text.
+ */
+export const KOT_RULE_TEXT = "-";
 
 export interface KotRasterPlan {
   widthDots: number;
@@ -1026,15 +1100,24 @@ function kotFace(atlas: Record<string, KotFace>, ppem: number, bold: boolean): K
  * on the paper, and it is the reason the atlas carries each banner size in bold
  * only (kotAtlasFaces) — so a banner row that one day arrived with bold: false
  * still prints, rather than throwing for a face nobody baked.
+ *
+ * A NOTE IS ALWAYS THE SLANTED FACE, never bold, for the same reason: the atlas
+ * carries note sizes in that one style.
  */
 function kotRunFace(
   atlas: Record<string, KotFace>,
-  ppem: number,
-  bannerPpem: number,
+  sizes: { ppem: number; bannerPpem: number; notePpem: number },
   size: KotSize | undefined,
   bold: boolean,
 ): KotFace {
-  return size === "banner" ? kotFace(atlas, bannerPpem, true) : kotFace(atlas, ppem, bold);
+  if (size === "banner") { return kotFace(atlas, sizes.bannerPpem, true); }
+  if (size === "note") {
+    const key = `${sizes.notePpem}o`;
+    const face = atlas[key];
+    if (!face) { throw new Error(`kot glyph atlas has no face ${key} — re-run scripts/build_kot_glyph_atlas.ts`); }
+    return face;
+  }
+  return kotFace(atlas, sizes.ppem, bold);
 }
 
 /**
@@ -1060,6 +1143,24 @@ function kotWidth16(face: KotFace, text: string): number {
 /** Width of `text` in whole dots. */
 export function kotTextWidth(face: KotFace, text: string): number {
   return Math.round(kotWidth16(face, text) / 16);
+}
+
+/**
+ * Where each glyph of a run starts, in SIXTEENTHS of a dot.
+ *
+ * ONE FUNCTION FOR THE PLAN AND THE BITMAP, so the ink extent a geometry
+ * assertion checks is the ink the encoder lays down. An ordinary run advances
+ * by the face's widths; a rule (`cell`) centres each glyph in its own cell.
+ */
+function kotPens(face: KotFace, text: string, x: number, cell?: number): number[] {
+  const pens: number[] = [];
+  let pen16 = Math.round(x * 16);
+  for (let i = 0; i < text.length; i++) {
+    const g = kotGlyph(face, text.charCodeAt(i));
+    if (cell) { pens.push(pen16 + i * cell * 16 + ((cell * 16 - g.a) >> 1)); }
+    else { pens.push(pen16); pen16 += g.a; }
+  }
+  return pens;
 }
 
 /**
@@ -1132,11 +1233,16 @@ export function kotWrap(face: KotFace, text: string, maxDots: number): string[] 
  * rolls are laid out by one rule.
  */
 function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, ppem: number, widthDots: number): KotGeometry {
-  const bannerPpem = Math.round(ppem * KOT_BANNER_SCALE);
+  const sizes = {
+    ppem,
+    bannerPpem: Math.round(ppem * KOT_BANNER_SCALE),
+    notePpem: Math.round(ppem * KOT_NOTE_SCALE),
+  };
+  const { bannerPpem, notePpem } = sizes;
   // WHITE AT BOTH EDGES, for the reason the bill sets printer margins: a roll
   // whose head is a dot or two narrower than nominal clips whatever touches the
   // edge, and on a docket the thing at the right edge is the quantity. 0.3em is
-  // 7 to 10 dots at the docket's sizes, about a millimetre — visible, and cheap
+  // 6 to 10 dots at the docket's sizes, about a millimetre — visible, and cheap
   // in a column that only ever holds two or three digits.
   const margin = Math.round(ppem * 0.3);
   const numX = margin;
@@ -1156,7 +1262,7 @@ function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, pp
     if (row.k !== "cols" || !row.cells.some((c) => c.at === "name")) { continue; }
     for (const cell of row.cells) {
       if (cell.at !== "num") { continue; }
-      const w = kotTextWidth(kotRunFace(atlas, ppem, bannerPpem, cell.size, cell.bold), cell.text);
+      const w = kotTextWidth(kotRunFace(atlas, sizes, cell.size, cell.bold), cell.text);
       if (w > numW) { numW = w; }
     }
   }
@@ -1174,7 +1280,7 @@ function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, pp
     if (row.k !== "cols") { continue; }
     for (const cell of row.cells) {
       if (cell.at !== "qty") { continue; }
-      const w = kotTextWidth(kotRunFace(atlas, ppem, bannerPpem, cell.size, cell.bold), cell.text);
+      const w = kotTextWidth(kotRunFace(atlas, sizes, cell.size, cell.bold), cell.text);
       if (w > qtyW) { qtyW = w; }
     }
   }
@@ -1188,16 +1294,22 @@ function kotGeometry(rows: readonly KotRow[], atlas: Record<string, KotFace>, pp
     widthDots,
     ppem,
     bannerPpem,
+    notePpem,
     margin,
     numX,
     nameX,
     nameMax,
     qtyLeft,
     qtyRight,
-    dash: Math.max(2, Math.round(ppem * 0.22)),
-    ruleThick: Math.max(1, Math.round(ppem / 14)),
-    ruleHeight: Math.max(3, Math.round(ppem * 0.5)),
-    leading: Math.round(ppem * 0.25),
+    // One hyphen per printer column, each in a column-wide cell (KOT_RULE_TEXT).
+    ruleDashes: Math.floor(widthDots / DOTS_PER_COL),
+    ruleCell: DOTS_PER_COL,
+    // 0.2em. With the face's own tallest and deepest ink that is a line every
+    // 1.2em — 33 dots at standard, the photograph's line pitch (Tahoma's own
+    // line height is 1.21em). It was 0.25em, which with DejaVu's taller
+    // extents would print every docket a dot or two per line longer than the
+    // ticket it copies.
+    leading: Math.round(ppem * 0.2),
   };
 }
 
@@ -1216,38 +1328,49 @@ export function planKotRaster(
   widthDots: number,
 ): KotRasterPlan {
   const G = kotGeometry(rows, atlas, ppem, widthDots);
-  const faceFor = (size: KotSize | undefined, bold: boolean) =>
-    kotRunFace(atlas, G.ppem, G.bannerPpem, size, bold);
+  const faceFor = (size: KotSize | undefined, bold: boolean) => kotRunFace(atlas, G, size, bold);
   // ROW HEIGHT COMES FROM THE BOLD FACE OF THE SIZE, for every row of that size:
   // a bold line and a regular line have to sit on the same pitch or the docket
   // walks. Both are measured from the atlas's own per-face extremes, so the
-  // pitch is a property of the type and not a number someone guessed.
+  // pitch is a property of the type and not a number someone guessed. A note
+  // row and a rule sit on the BODY pitch: on the reference they are lines of
+  // the docket like any other, however small or light their type.
   const boxOf = (size: KotSize) => {
     const face = kotFace(atlas, size === "banner" ? G.bannerPpem : G.ppem, true);
     return { height: face.top + face.bottom + G.leading, baseline: face.top + Math.ceil(G.leading / 2) };
   };
-  const place = (face: KotFace, text: string, x: number): KotDraw => {
+  const place = (face: KotFace, text: string, x: number, cell?: number): KotDraw => {
     // The ink of a run starts at the first glyph's left bearing and ends at the
     // last one's right edge, which is not the same as [pen, pen + advance).
-    let pen16 = Math.round(x * 16);
+    const pens = kotPens(face, text, x, cell);
     let x0 = Infinity;
     let x1 = -Infinity;
     for (let i = 0; i < text.length; i++) {
       const g = kotGlyph(face, text.charCodeAt(i));
       if (g.w > 0) {
-        const gx = (pen16 >> 4) + g.l;
+        const gx = (pens[i]! >> 4) + g.l;
         if (gx < x0) { x0 = gx; }
         if (gx + g.w > x1) { x1 = gx + g.w; }
       }
-      pen16 += g.a;
     }
-    return { face, text, x, x0: x0 === Infinity ? x : x0, x1: x1 === -Infinity ? x : x1 };
+    return { face, text, x, ...(cell ? { cell } : {}), x0: x0 === Infinity ? x : x0, x1: x1 === -Infinity ? x : x1 };
   };
+  // A SLANTED LINE IS WRAPPED SHORT BY ITS OWN LEAN. Advances are upright, but
+  // the top of the last letter leans right by slant x its height, and that ink
+  // must still end inside the column it was measured for.
+  const wrapWidth = (face: KotFace, maxDots: number) => maxDots - Math.ceil(face.slant * face.top);
 
   const ops: KotOp[] = [];
   for (const row of rows) {
     if (row.k === "rule") {
-      ops.push({ kind: "rule", height: G.ruleHeight, baseline: 0, draws: [] });
+      const box = boxOf("body");
+      const face = faceFor("body", false);
+      const hyphens = KOT_RULE_TEXT.repeat(G.ruleDashes);
+      // Centred as a block: on both rolls the cells fill the paper exactly
+      // (576 = 48 x 12, 384 = 32 x 12), so this is 0 today and stays honest
+      // for a roll that is not a whole number of columns.
+      const x = Math.floor((G.widthDots - G.ruleDashes * G.ruleCell) / 2);
+      ops.push({ kind: "rule", height: box.height, baseline: box.baseline, draws: [place(face, hyphens, x, G.ruleCell)] });
       continue;
     }
     if (row.k === "line") {
@@ -1262,8 +1385,8 @@ export function planKotRaster(
         size = "body";
         face = faceFor("body", row.bold);
       }
-      const box = boxOf(size);
-      for (const text of kotWrap(face, row.text, room)) {
+      const box = boxOf(size === "banner" ? "banner" : "body");
+      for (const text of kotWrap(face, row.text, wrapWidth(face, room))) {
         const w = kotTextWidth(face, text);
         const x = row.align === "center" ? Math.max(G.margin, Math.floor((G.widthDots - w) / 2)) : G.numX;
         ops.push({ kind: "text", height: box.height, baseline: box.baseline, draws: [place(face, text, x)] });
@@ -1276,8 +1399,9 @@ export function planKotRaster(
     const box = boxOf("body");
     const nameCell = row.cells.find((c) => c.at === "name");
     const others = row.cells.filter((c) => c.at !== "name");
-    const nameLines = nameCell
-      ? kotWrap(faceFor(nameCell.size, nameCell.bold), nameCell.text, G.nameMax)
+    const nameFace = nameCell ? faceFor(nameCell.size, nameCell.bold) : null;
+    const nameLines = nameCell && nameFace
+      ? kotWrap(nameFace, nameCell.text, wrapWidth(nameFace, G.nameMax))
       : [];
     const lines = Math.max(1, nameLines.length);
     for (let i = 0; i < lines; i++) {
@@ -1290,8 +1414,8 @@ export function planKotRaster(
         }
       }
       const text = nameLines[i];
-      if (nameCell && text !== undefined) {
-        draws.push(place(faceFor(nameCell.size, nameCell.bold), text, G.nameX));
+      if (nameFace && text !== undefined) {
+        draws.push(place(nameFace, text, G.nameX));
       }
       ops.push({ kind: "text", height: box.height, baseline: box.baseline, draws });
     }
@@ -1323,31 +1447,16 @@ export function encodeKotRaster(
   };
 
   let y = 0;
+  // A rule is drawn like any other line — its hyphens are glyphs, placed by
+  // planKotRaster in cells of their own (KOT_RULE_TEXT).
   for (const op of plan.ops) {
-    if (op.kind === "rule") {
-      // A DASHED rule, as the reference draws it — whole dashes only, centred,
-      // so the row never ends in a stub that reads as a broken line.
-      const G = plan.geometry;
-      const period = G.dash * 2;
-      const count = Math.floor(widthDots / period);
-      const offset = Math.floor((widthDots - count * period) / 2);
-      const top = y + Math.floor((op.height - G.ruleThick) / 2);
-      for (let d = 0; d < count; d++) {
-        const x0 = offset + d * period;
-        for (let t = 0; t < G.ruleThick; t++) {
-          for (let x = x0; x < x0 + G.dash; x++) { ink(x, top + t); }
-        }
-      }
-      y += op.height;
-      continue;
-    }
     for (const draw of op.draws) {
-      let pen16 = Math.round(draw.x * 16);
+      const pens = kotPens(draw.face, draw.text, draw.x, draw.cell);
       const baseline = y + op.baseline;
       for (let i = 0; i < draw.text.length; i++) {
         const g = kotGlyph(draw.face, draw.text.charCodeAt(i));
         if (g.w > 0 && g.h > 0) {
-          const gx = (pen16 >> 4) + g.l;
+          const gx = (pens[i]! >> 4) + g.l;
           const gy = baseline - g.t;
           const src = Buffer.from(g.d, "base64");
           const gstride = (g.w + 7) >> 3;
@@ -1357,7 +1466,6 @@ export function encodeKotRaster(
             }
           }
         }
-        pen16 += g.a;
       }
     }
     y += op.height;

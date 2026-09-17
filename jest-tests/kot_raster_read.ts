@@ -77,10 +77,12 @@ function candidatesOf(face: KotFace): Candidate[] {
 /**
  * How many dots a glyph may share with the glyph before it.
  *
- * TYPE TOUCHES. At 28 dots per em, bold, the arm of an "r" and the arm of the
- * "y" after it land on the same dot — in "Berry", on the reference docket
- * itself. That is how a proportional face rasterises at a small size, not a
- * smear: erasing the "r" takes the shared dot with it, and a reader that then
+ * TYPE TOUCHES. At a docket's sizes, bold, two neighbouring letters can land
+ * on the same dot — the arm of an "r" and the arm of the "y" after it did, in
+ * "Berry", on the reference docket itself — and a slanted note leans one
+ * letter's top over the next one's foot. That is how a proportional face
+ * rasterises at a small size, not a smear: erasing the "r" takes the shared
+ * dot with it, and a reader that then
  * demanded every one of the "y"'s dots still be un-read would leave the whole
  * "y" as leftover ink. So a glyph may reuse up to this many dots that an
  * earlier glyph on the line already accounted for. More than that is not two
@@ -227,8 +229,10 @@ export function readKotRaster(escBase64: string, widthDots: number, ppems: reado
   const cv = kotCanvas(escBase64, widthDots);
   const faces: KotFace[] = [];
   for (const ppem of ppems) {
-    for (const weight of ["r", "b"] as const) {
-      const face = KOT_ATLAS[`${ppem}${weight}`];
+    // Regular, bold, and the slanted note face — whichever of them this size
+    // was baked in.
+    for (const style of ["r", "b", "o"] as const) {
+      const face = KOT_ATLAS[`${ppem}${style}`];
       if (face) { faces.push(face); }
     }
   }
@@ -262,14 +266,14 @@ export function readKotRaster(escBase64: string, widthDots: number, ppems: reado
 /** Roll width in dots for a docket built at `cols` columns (48 = 80mm, 32 = 58mm). */
 export const rollDots = (cols: number): number => cols * 12;
 /**
- * The faces a docket of that roll can be set in — body and banner — at the
- * restaurant's text size (absent = 'standard', as on the paper). Taken from
+ * The faces a docket of that roll can be set in — body, banner and note — at
+ * the restaurant's text size (absent = 'standard', as on the paper). Taken from
  * kotProfile rather than restated, so a size change cannot leave this reader
  * looking for type the docket no longer uses.
  */
 export const rollPpems = (cols: number, textSize?: string): number[] => {
   const p = kotProfile(rollDots(cols), textSize);
-  return [p.ppem, p.bannerPpem];
+  return [p.ppem, p.bannerPpem, p.notePpem];
 };
 
 /**
