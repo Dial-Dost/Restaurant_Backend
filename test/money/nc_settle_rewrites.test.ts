@@ -363,6 +363,8 @@ describe("re-opening a bill made 'NC' by the ₹0 hardening", () => {
       order({ status: 4, items: [{ ...PANEER, nc: true, nc_id: "nc-item-0", nc_kind: "staff_meal" }, clone(JAMUN)] }),
     ];
     useState(makeState({
+      // Settled, so the table is free (every settle path releases it).
+      table: { id: TABLE_ID, name: "T7", is_occupied: false, num_covers: 1 },
       orders: allComped,
       nc: [jamunRow(), { ...jamunRow(), id: "nc-item-0", item_id: "p", item_name: "Paneer Tikka", quantity: 1, unit_price: 350, nc_kind: "staff_meal" }],
       bills: [{

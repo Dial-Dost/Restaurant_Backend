@@ -437,6 +437,11 @@ export function fixtureQuery(sql: string, params: unknown[] = []): { rows: unkno
     s.table.is_occupied = false; s.table.num_covers = 1;
     return { rows: [] };
   }
+  // ReopenBill's "has this table a new party?" — seated, or owing again.
+  if (/^select t\.table_name, \(\(coalesce\(t\.is_deleted, false\) = false and coalesce\(t\.is_occupied, false\)\) or exists \(select 1 from "Orders" o/i.test(q)) {
+    requireShape(q, "coalesce(o.status::text, '1') not in", "a new party is one that still owes, by the owing rule");
+    return { rows: [{ table_name: s.table.name, busy: s.table.is_occupied || s.orders.some((o) => STILL_OWES(o.status)) }] };
+  }
   if (/^update "Tables" set is_occupied = true where id = \$1/i.test(q)) {
     s.table.is_occupied = true;
     return { rows: [{ table_name: s.table.name }] };

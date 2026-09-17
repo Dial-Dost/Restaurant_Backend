@@ -36,7 +36,9 @@ const mockNext: {
   authoriser: "ok" | "not_found" | "not_permitted";
   dispatchFails: boolean;
   counters: { id: string }[];
-} = { settle: null, authoriser: "ok", dispatchFails: false, counters: [] };
+  /** Fields the stubbed GetClosedBill answers with on top of the NC bill below. */
+  closedBill: Record<string, unknown>;
+} = { settle: null, authoriser: "ok", dispatchFails: false, counters: [], closedBill: {} };
 
 jest.mock("pg", () => {
   class FakePool {
@@ -101,6 +103,8 @@ jest.mock("../../database_supabase", () => {
         discount_amount: 0, coupon_code: null, service_charge: 0, service_charge_percent: 0,
         taxes: [], grand_total: 0, round_off: 0, nc_total: 1400,
         nc_settlement: { kind: "complimentary", kind_label: "Complimentary", authorised_by: "manager01", marked_by: "cashier1", reason: "x", lines: 2, value: 1400, would_have_charged: null },
+        payment_method: "NC",
+        ...mockNext.closedBill,
       });
     },
   };
@@ -121,9 +125,13 @@ const SESSION = {
 };
 const BODY = { nc_kind: "complimentary", reason: "Owner's family", authorised_by: "manager01", expected_value: 1400 };
 
-async function call(body: Record<string, unknown> = BODY, auth: Record<string, unknown> = SESSION): Promise<{ status: number; body: any }> {
-  const route = registered.find((r) => r.method === "POST" && r.path === "/bills/order/:orderId/settle-nc");
-  if (!route) { throw new Error("settle-nc is not registered"); }
+async function call(
+  body: Record<string, unknown> = BODY,
+  auth: Record<string, unknown> = SESSION,
+  path = "/bills/order/:orderId/settle-nc",
+): Promise<{ status: number; body: any }> {
+  const route = registered.find((r) => r.method === "POST" && r.path === path);
+  if (!route) { throw new Error(`${path} is not registered`); }
   const out = { status: 200, body: undefined as any };
   let ended = false;
   const res = {
@@ -155,6 +163,9 @@ beforeEach(async () => {
     process.env.SUPABASE_DIRECT_URL = process.env.SUPABASE_DIRECT_URL || "postgres://fixture:fixture@localhost:5432/fixture";
     const routes = await import("../../routes/nc_settle");
     routes.registerNcSettleRoutes(fakeApp as never);
+    // The accounting reprint (POST /print/bill/settled), for the paper's job id.
+    const bills = await import("../../routes/bills");
+    bills.registerBillPrintAndEditRoutes(fakeApp as never);
   }
   mockCalls.length = 0;
   mockAudit.length = 0;
@@ -163,6 +174,7 @@ beforeEach(async () => {
   mockNext.authoriser = "ok";
   mockNext.dispatchFails = false;
   mockNext.counters = [];
+  mockNext.closedBill = {};
 });
 
 describe("the two gates", () => {
@@ -327,7 +339,10 @@ describe("a settled NC bill: the record and the paper", () => {
     expect(answer.body.print_error).toBeUndefined();
     expect(called("GetClosedBill")[0]?.args[1]).toBe(BILL);
     const job = called("dispatchPrintJob")[0]?.args[1] as Record<string, unknown>;
-    expect(job).toMatchObject({ outlet_id: "out-1", bill_id: BILL, kind: "bill", station: null });
+    // Filed under `<bill>-nc`: a 0.00 paper must never count as this bill's
+    // print if the bill is re-opened (bill_print_state.ncSettlementPrintJobId).
+    expect(job).toMatchObject({ outlet_id: "out-1", bill_id: `${BILL}-nc`, kind: "bill", station: null });
+    expect(job.bill_id).not.toBe(BILL);
     const paper = mockReceipts[0] ?? "";
     expect(paper).not.toContain("REPRINT");
     expect(paper).toMatch(/Thali \(NC\)\s+3\s+400\.00\s+0\.00/);
@@ -399,5 +414,37 @@ describe("the settled reprint reads the settlement back off the bill (POST /prin
   test("an explicit override wins over the bill's own settlement", async () => {
     const paper = await reprint({ nc_settlement: settlement }, { settlement: null });
     expect(paper).not.toContain("Settled: Non-chargeable");
+  });
+});
+
+describe("an NC bill's paper is never filed as a print OF that bill", () => {
+  // A re-opened NC bill is an open, unpaid bill again under the same id, and
+  // the seating rule (bill_print_state.ts) counts every 'bill' job addressed to
+  // that id. A 0.00 paper filed there made the table read as printed: a
+  // waiter's order refused 423, a next-party seat opened beside it.
+  // test/money/next_party_nc.test.ts drives that end to end.
+  const ACCOUNTING_PERM = "df75119b-e5f1-4f38-aba5-78a1cf182f56";
+  const ACCOUNTANT = { ...SESSION, actions: [ACCOUNTING_PERM] };
+  const reprintJob = async (): Promise<Record<string, unknown>> => {
+    const answer = await call({ bill_id: BILL }, ACCOUNTANT, "/print/bill/settled");
+    expect(answer.status).toBe(200);
+    return called("dispatchPrintJob")[0]?.args[1] as Record<string, unknown>;
+  };
+
+  test("the settle's original goes under `<bill>-nc`", async () => {
+    await call();
+    expect((called("dispatchPrintJob")[0]?.args[1] as Record<string, unknown>).bill_id).toBe(`${BILL}-nc`);
+  });
+
+  test("so does the accounting reprint of an NC bill", async () => {
+    const job = await reprintJob();
+    expect(job).toMatchObject({ outlet_id: "out-1", bill_id: `${BILL}-nc`, kind: "bill", station: null });
+    expect(mockReceipts[0]).toContain("REPRINT");
+  });
+
+  test("a PAID bill's reprint keeps its own id, as before", async () => {
+    mockNext.closedBill = { payment_method: "Cash", nc_settlement: null };
+    const job = await reprintJob();
+    expect(job).toMatchObject({ bill_id: BILL, kind: "bill" });
   });
 });

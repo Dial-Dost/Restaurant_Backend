@@ -8,6 +8,8 @@ import type { BillSectionAxis, BillTenderState, ClosedBillDetail, OpenBillCharge
 import { z } from "zod";
 import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type ReceiptOptions, type SplitReceiptPart } from "../escpos.js";
+import { ncSettlementPrintJobId } from "../bill_print_state.js";
+import { isNcSettleMethod } from "../payment_methods.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
@@ -1857,8 +1859,12 @@ app.post('/print/bill/settled', validateAction(ACCOUNTING_PERM), async (req: Req
 		// there is derived from today's tax or service-charge configuration.
 		const escBase64 = buildReceiptBase64(settledBillReceiptOptions(bill, { settings, profile, logo, reprint: true }), cols);
 
+		// An NC bill's copy is filed where its original was (ncSettlementPrintJobId):
+		// a 0.00 paper must not count as a print of the bill if it is re-opened.
 		const dispatched = await dispatchPrintJob(restaurantId, {
-			outlet_id: outletId, bill_id: bill.id, kind: "bill", station: null, esc_base64: escBase64,
+			outlet_id: outletId,
+			bill_id: isNcSettleMethod(bill.payment_method) ? ncSettlementPrintJobId(bill.id) : bill.id,
+			kind: "bill", station: null, esc_base64: escBase64,
 		});
 		try {
 			await log_audit(req, ACCOUNTING_PERM,

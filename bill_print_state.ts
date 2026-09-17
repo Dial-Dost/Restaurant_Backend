@@ -150,6 +150,27 @@ export function splitPrintPrefix(openBillId: string): string {
 	return `${String(openBillId ?? "").trim()}-split-`;
 }
 
+/**
+ * The bill_id a NON-CHARGEABLE bill's paper is filed under: `<bill id>-nc`. The
+ * settle-as-NC original (routes/nc_settle.ts) and the accounting reprint of an
+ * NC bill (POST /print/bill/settled) both use it.
+ *
+ * NOT THE BILL'S OWN ID, because that id is what this rule counts, and an NC
+ * paper is not this seating's bill. It reads 0.00 "Non-chargeable"; nobody was
+ * handed an amount to pay. While the bill stays closed nothing asks, but a
+ * RE-OPENED NC bill is an open, unpaid bill again under that same id, and a
+ * paper filed under it made the seating read as printed: a waiter's order was
+ * refused 423, a waiter could not print the real bill, seniors were told to
+ * reprint, and the floor read opened a next-party seat beside a table whose
+ * chargeable bill nobody had seen. `<id>-nc` is neither the id nor
+ * `<id>-split-…`, and it starts with a UUID rather than `<table name>-`, so no
+ * seating counts it. "PrintJobs".bill_id is free text (027) and the tills only
+ * log it.
+ */
+export function ncSettlementPrintJobId(billId: string): string {
+	return `${billId.trim()}-nc`;
+}
+
 /** Does this print job belong to this table's CURRENT seating? */
 export function billPrintJobBelongsToSeating(job: BillPrintJobRow, seating: BillPrintSeating): boolean {
 	const billId = String(job?.bill_id ?? "").trim();

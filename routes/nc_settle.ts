@@ -71,6 +71,7 @@ import {
 	SetBillCounter,
 	SettleBillAsNonChargeable,
 } from "../database_supabase.js";
+import { ncSettlementPrintJobId } from "../bill_print_state.js";
 import { buildReceiptBase64 } from "../escpos.js";
 import { NON_CHARGEABLE_KINDS } from "../mis_capture.js";
 import { NC_WHOLE_BILL_ONLY, ncKindLabel } from "../nc_settle.js";
@@ -265,8 +266,11 @@ app.post("/bills/order/:orderId/settle-nc", validateAction(PERM_NON_CHARGEABLE),
 					wouldHaveCharged: result.would_have_charged,
 				},
 			}), is58 ? 32 : 48);
+			// Filed under `<bill id>-nc`, NOT the bill's id: a 0.00 paper is not this
+			// seating's bill print, and a re-opened NC bill must not read as printed
+			// (see ncSettlementPrintJobId).
 			await dispatchPrintJob(restaurantId, {
-				outlet_id: outletId, bill_id: result.bill_id, kind: "bill", station: null, esc_base64: escBase64,
+				outlet_id: outletId, bill_id: ncSettlementPrintJobId(result.bill_id), kind: "bill", station: null, esc_base64: escBase64,
 			});
 			printed = true;
 		} catch (err) {

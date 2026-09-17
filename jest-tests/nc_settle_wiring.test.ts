@@ -80,6 +80,22 @@ describe("migration 052's DDL: at boot and before the settle — never inside it
     expect(settle.slice(tx)).not.toMatch(/ensureBillNcColumns\(/);
   });
 
+  test("the settle tidies next-party seats AFTER its commit, as every other settle path does", () => {
+    // test/money/next_party_nc.test.ts drives it; this pins where it runs. Inside
+    // the transaction a failed tidy would undo a settled bill.
+    const settle = chunk(DB, "SettleBillAsNonChargeable");
+    const tx = settle.search(/withTransaction(<[^>]*>)?\(/);
+    const tidy = settle.indexOf("await afterTableFreed(freed);");
+    expect(tidy).toBeGreaterThan(tx);
+    expect(settle.slice(tidy)).toMatch(/^await afterTableFreed\(freed\);\n\s+return out;\n\}/);
+    expect(settle).toMatch(/freed\.tableId = tableId;/);
+  });
+
+  test("the NC paper is filed under `<bill>-nc`, never the bill's own id — the original and the reprint", () => {
+    expect(ROUTE).toMatch(/bill_id: ncSettlementPrintJobId\(result\.bill_id\)/);
+    expect(BILLS).toMatch(/bill_id: isNcSettleMethod\(bill\.payment_method\) \? ncSettlementPrintJobId\(bill\.id\) : bill\.id,/);
+  });
+
   test("nothing else issues it", () => {
     const callers = [...DB.matchAll(/ensureBillNcColumns\(\)/g)].length;
     // Its own definition line does not match `()` followed by nothing: count the calls.

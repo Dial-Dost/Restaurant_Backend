@@ -17379,6 +17379,35 @@ export async function ReopenBill(
         client,
       );
       if (open[0]) {throw new Error("The table already has a new open bill — settle or clear it first");}
+
+      // ...AND A NEW PARTY WITH NO BILL ROW YET. A party that has sat down and
+      // ordered usually has no "Bills" row until a print, a waiver or a settle
+      // makes one, so the check above cannot see it — and the re-open below
+      // would put this bill's orders back on that table, where every open-bill
+      // read sums them into the NEW party's bill (an NC bill's food at full
+      // price, its comps reversed). Every settle path frees its table and closes
+      // its owing orders, so a table that is seated again, or owes money again,
+      // after this bill closed has been given to somebody else. That includes a
+      // next-party seat brought back under the SAME row id by the next print
+      // ("12 #2" revived for a fourth party), which reviveNextPartySeatForReopen
+      // cannot tell from its own seat because the row is live. A retired seat
+      // (is_deleted) is idle by construction and is left to that revive.
+      const seated = await runQuery<{ table_name: string; busy: boolean }>(
+        `select t.table_name,
+                ((coalesce(t.is_deleted, false) = false and coalesce(t.is_occupied, false))
+                  or exists (select 1 from "Orders" o
+                              where o.res_id = t.res_id and o.outlet_id = t.outlet_id and o.table_id = t.id
+                                and ${stillOwesStatusSql("o.status")})) as busy
+           from "Tables" t
+          where t.id = $1 and t.res_id = $2 and t.outlet_id = $3
+          limit 1`,
+        [bill.table_id, context.res_id, context.outlet_id],
+        client,
+      );
+      if (seated[0]?.busy === true) {
+        const name = String(seated[0].table_name ?? "").trim() || "This table";
+        throw new Error(`${name} has a new party since this bill was closed. Settle, move or release ${name} first, then re-open this bill.`);
+      }
     }
 
     const updated = await runQuery<{ id: string; waiter_confirmed_at: Date | null; status: number | null; created_at: Date }>(

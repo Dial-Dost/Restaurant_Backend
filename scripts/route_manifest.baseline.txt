@@ -265,7 +265,7 @@ mw08 USE     *                                                      | <inline(re
 0243 POST    /publish/bill                                          | validateAction("2ae797d9-2bef-4419-a33d-ab09590dbef9") | c9bc6a64
 0244 POST    /print/bill                                            | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 6132547c
 0245 POST    /print/bill/claim                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | bd383548
-0246 POST    /print/bill/settled                                    | validateAction(ACCOUNTING_PERM)                | ef560f4d
+0246 POST    /print/bill/settled                                    | validateAction(ACCOUNTING_PERM)                | 87b9be68
 0247 POST    /print/ack                                             | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sPrintAck) | 07728a6e
 0248 POST    /print/kot/order/:id                                   | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 754ac87a
 0249 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428
@@ -402,7 +402,7 @@ mw08 USE     *                                                      | <inline(re
 0380 POST    /bills/service-charge-waiver                           | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sWaiveServiceCharge) | b4045e33
 0381 POST    /bills/service-charge-waiver/:id/reverse               | validateAction(PERM_SERVICE_CHARGE_WAIVER) -> validateBody(sReverse) | 38c3d7c2
 0382 POST    /bills/service-charge-waiver/print                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sRemoveServiceChargeAndPrint) | d9a80ac2
-0383 POST    /bills/order/:orderId/settle-nc                        | validateAction(PERM_NON_CHARGEABLE)            | f5b880d7
+0383 POST    /bills/order/:orderId/settle-nc                        | validateAction(PERM_NON_CHARGEABLE)            | 65e249fd
 0384 GET     /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") | 215c021d
 0385 POST    /bills/tenders                                         | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sBillTenders) | 64ca2a01
 0386 POST    /bills/tenders/:id/void                                | validateAction("2393edd7-cdd9-439c-9ff3-d563d5216967") -> validateBody(sTenderVoid) | 2dec2c35

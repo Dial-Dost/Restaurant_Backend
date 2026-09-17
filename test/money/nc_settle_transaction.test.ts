@@ -439,6 +439,9 @@ describe("the settle paths that meet an NC bill", () => {
 
   test("re-opening a bill that was PAID is unchanged: its method kept, its orders awaiting approval", async () => {
     useState(makeState({
+      // A settled table is a FREE table: every settle path releases it, and
+      // ReopenBill refuses a table that has been seated again since.
+      table: { id: TABLE_ID, name: "T7", is_occupied: false, num_covers: 1 },
       orders: twoRounds().map((o) => ({ ...o, status: 4 })),
       bills: [openBill({
         payment_method: "Cash", total_amt: 838.24, closed_at: "2026-09-16T11:00:00Z", status: 2,

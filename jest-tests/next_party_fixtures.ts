@@ -20,6 +20,10 @@
 //    columns), and ANY statement naming parent_table_id or party_seq throws
 //    42703 — so a reader that names the columns without asking first fails
 //    loudly here, exactly as it would in production.
+// 4) THE NC LEDGER (migration 052), so SettleBillAsNonChargeable and the
+//    re-open that undoes it run over the SAME floor as the next-party seats —
+//    the combination neither feature's own fixture can reach (nc_settle_fixture
+//    has one table and no 053; this one had no 052).
 //
 // WHAT IT DOES NOT MODEL: RLS, and rollback under concurrency (a ROLLBACK
 // restores the whole store to the snapshot its BEGIN took; no test here rolls
@@ -107,12 +111,37 @@ export interface PrintJobFix {
   status: string;
 }
 
+/** One "OrderItemNonChargeable" row, as far as a settle-as-NC and its re-open use it. */
+export interface NcRowFix {
+  id: string;
+  created_at: string;
+  outlet_id: string;
+  order_id: string;
+  item_id: string;
+  item_name: string;
+  table_id: string | null;
+  nc_kind: string;
+  reason: string;
+  quantity: number;
+  unit_price: number;
+  menu_price_at_nc: number | null;
+  marked_by_username: string;
+  authorised_by_username: string;
+  scope: string;
+  bill_id: string | null;
+  settle_group: string | null;
+  reversed_at: string | null;
+  reversed_by_username: string | null;
+  reversal_reason: string | null;
+}
+
 interface Store {
   tables: TableFix[];
   orders: OrderFix[];
   bills: BillFix[];
   sessions: SessionFix[];
   printJobs: PrintJobFix[];
+  nc: NcRowFix[];
   assignments: { table_id: string; employee_id: string }[];
   bookings: BookingFix[];
   /** Outlets.default_tax, verbatim. */
@@ -135,7 +164,7 @@ let store: Store = freshStore();
 
 function freshStore(): Store {
   return {
-    tables: [], orders: [], bills: [], sessions: [], printJobs: [], assignments: [], bookings: [],
+    tables: [], orders: [], bills: [], sessions: [], printJobs: [], nc: [], assignments: [], bookings: [],
     // Outlets.default_tax as the shipped seed stores it (000_base_schema.sql).
     taxes: { SGST: 2.5, CGST: 2.5 },
     scPct: 0,
@@ -177,6 +206,7 @@ function snapshot(): Snapshot {
     bills: store.bills.map((r) => ({ ...r })),
     sessions: store.sessions.map((r) => ({ ...r })),
     printJobs: store.printJobs.map((r) => ({ ...r })),
+    nc: store.nc.map((r) => ({ ...r })),
     assignments: store.assignments.map((r) => ({ ...r })),
     bookings: store.bookings.map((r) => ({ ...r })),
     taxes: store.taxes,
@@ -318,6 +348,7 @@ export const tables = (): TableFix[] => store.tables.map((r) => ({ ...r }));
 export const orders = (): OrderFix[] => store.orders.map((r) => ({ ...r, food: { ...r.food } }));
 export const bills = (): BillFix[] => store.bills.map((r) => ({ ...r }));
 export const sessions = (): SessionFix[] => store.sessions.map((r) => ({ ...r }));
+export const ncRows = (): NcRowFix[] => store.nc.map((r) => ({ ...r }));
 export const assignments = () => store.assignments.map((r) => ({ ...r }));
 export const statements = (): string[] => [...store.log];
 
@@ -535,6 +566,9 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     };
   }
 
+  const nc = await ncDispatch(clientId, s, params);
+  if (nc) {return nc;}
+
   // =========================================================================
   // "Tables"
   // =========================================================================
@@ -670,6 +704,15 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
     if (!t || !t.is_deleted || clash) {return { rows: [] };}
     updateTable(t, { is_deleted: false, is_occupied: true });
     return { rows: [{ table_name: t.table_name }] };
+  }
+  // ReopenBill's "has this table a new party?" — seated (a live row) or owing.
+  if (s.startsWith("select t.table_name, ((coalesce(t.is_deleted, false) = false and coalesce(t.is_occupied, false)) or exists (select 1 from \"orders\" o")) {
+    if (!s.includes("coalesce(o.status::text, '1') not in ('4','5','7')")) {
+      throw new Error("next_party_fixtures: the new-party check must use the owing rule");
+    }
+    const t = byId(0, 2);
+    const busy = t ? ((!t.is_deleted && t.is_occupied) || store.orders.some((o) => o.table_id === t.id && inOutlet(o, params, 2) && isOwing(o.status))) : false;
+    return { rows: t ? [{ table_name: t.table_name, busy }] : [] };
   }
   // ReopenBill's ordinary re-seat: live rows only.
   if (s.startsWith("update \"tables\" set is_occupied = true where id = $1")) {
@@ -1153,6 +1196,162 @@ async function query(clientId: number, stack: Snapshot[], sqlRaw: string, params
   }
 
   throw new Error(`next_party_fixtures: unmodelled SQL: ${sql.slice(0, 260)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Settle as NC (migration 052) and its re-open, over the same floor. Only the
+// statements those two paths issue; anything else falls through to the
+// dispatch above, which throws on what it does not know.
+// ---------------------------------------------------------------------------
+
+const ncValue = (r: NcRowFix): number => Math.round(r.quantity * r.unit_price * 100) / 100;
+
+function ncOut(r: NcRowFix): Record<string, unknown> {
+  return {
+    id: r.id, created_at: new Date(r.created_at), outlet_id: r.outlet_id, order_id: r.order_id,
+    item_id: r.item_id, item_name: r.item_name, table_id: r.table_id, nc_kind: r.nc_kind,
+    reason: r.reason, quantity: r.quantity, unit_price: r.unit_price, menu_price_at_nc: r.menu_price_at_nc,
+    value: ncValue(r), marked_by_username: r.marked_by_username, authorised_by_username: r.authorised_by_username,
+    reversed_at: r.reversed_at ? new Date(r.reversed_at) : null,
+    reversed_by_username: r.reversed_by_username, reversal_reason: r.reversal_reason,
+  };
+}
+
+async function ncDispatch(clientId: number, s: string, params: unknown[]): Promise<{ rows: unknown[] } | null> {
+  // billNcColumnsPresent: 052 is modelled as applied.
+  if (s.includes("information_schema.columns") && s.includes("table_name = 'orderitemnonchargeable'")) {
+    return { rows: [{ n: 3 }] };
+  }
+  // GetMenuItems — the settle's advisory price snapshot. Nothing on the menu here.
+  if (s.includes('from "menu" m left join "menue_sub_cat"')) {return { rows: [] };}
+  if (s.startsWith('select table_id, status from "orders" where id = $1')) {
+    const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    return { rows: o ? [{ table_id: o.table_id, status: o.status }] : [] };
+  }
+  if (s.startsWith('select status from "orders" where id = $1')) {
+    const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    return { rows: o ? [{ status: o.status }] : [] };
+  }
+  // The settle's owing orders, locked FIRST.
+  if (s.startsWith('select id, food, status from "orders" where res_id = $1 and outlet_id = $2 and table_id = $3')) {
+    if (!s.endsWith("for update")) {throw new Error("next_party_fixtures: the NC settle must lock the owing orders");}
+    const rows = store.orders
+      .filter((o) => inOutlet(o, params, 1) && o.table_id === str(params[2]) && isOwing(o.status))
+      .sort((a, z) => (a.created_at < z.created_at ? -1 : 1));
+    for (const o of rows) {await lockRow(clientId, o.id);}
+    return { rows: rows.map((o) => ({ id: o.id, food: JSON.stringify(o.food), status: o.status })) };
+  }
+  // assertTableSessionOpen.
+  if (s.startsWith('select count(*)::int as n from "orders" where res_id = $1 and outlet_id = $2 and table_id = $3')) {
+    return { rows: [{ n: store.orders.filter((o) => inOutlet(o, params, 1) && o.table_id === str(params[2]) && isOwing(o.status)).length }] };
+  }
+  // closedNcBillForTable: the table's newest bill, whatever its state.
+  if (s.startsWith('select id, bill_no::text as bill_no, payment_method, closed_at from "bills"')) {
+    const b = store.bills.filter((x) => x.table_id === str(params[0]) && inOutlet(x, params, 2))
+      .sort((a, z) => (a.created_at < z.created_at ? 1 : -1))[0];
+    return { rows: b ? [{ id: b.id, bill_no: b.bill_no, payment_method: b.payment_method, closed_at: b.closed_at ? new Date(b.closed_at) : null }] : [] };
+  }
+  if (s.startsWith('select id, bill_no::text as bill_no, waiter_confirmed_at, discount_value, coupon_code from "bills"')) {
+    if (!s.endsWith("for update")) {throw new Error("next_party_fixtures: the NC settle must lock the open bill");}
+    const b = openBillOf(str(params[0]), (x) => inOutlet(x, params, 2));
+    return { rows: b ? [{ id: b.id, bill_no: b.bill_no, waiter_confirmed_at: b.waiter_confirmed_at, discount_value: b.discount_value, coupon_code: null }] : [] };
+  }
+  // The NC settle's own bill, minted only when the table has none.
+  if (s.startsWith('insert into "bills"') && s.includes("returning id, bill_no::text as bill_no")) {
+    const tableId = str(params[3]);
+    if (openBillOf(tableId)) {return { rows: [] };}
+    store.bills.push({
+      id: str(params[0]), outlet_id: str(params[2]), table_id: tableId, status: 1, bill_no: str(params[7]),
+      total_amt: Number(params[6]), tax_breakdown: [], round_off: null, created_at: nowIso(), closed_at: null,
+      closed_by_username: null, waiter_confirmed_at: null, admin_approved_at: null, admin_approved_by_username: null,
+      payment_method: null, payment_proof_screenshot_url: null, discount_type: null, discount_value: 0,
+    });
+    return { rows: [{ id: str(params[0]), bill_no: str(params[7]) }] };
+  }
+  if (s.startsWith('select bill_no::text as bill_no from "bills" where id = $1')) {
+    const b = store.bills.find((x) => x.id === str(params[0]));
+    return { rows: b ? [{ bill_no: b.bill_no }] : [] };
+  }
+  if (s.startsWith('insert into "orderitemnonchargeable"')) {
+    if (!s.includes("'bill',$17,$18")) {throw new Error("next_party_fixtures: a settle's comps are scope 'bill'");}
+    const [id, , outlet, orderId, itemId, name, tableId, kind, reason, qty, unit, menuPrice, , by, , auth, billId, group] = params;
+    if (store.nc.some((r) => r.order_id === str(orderId) && r.item_id === str(itemId) && r.reversed_at === null)) {
+      throw Object.assign(new Error("duplicate key value violates unique constraint \"orderitemnc_live_line_uidx\""), { code: "23505" });
+    }
+    const row: NcRowFix = {
+      id: str(id), created_at: nowIso(), outlet_id: str(outlet), order_id: str(orderId), item_id: str(itemId),
+      item_name: str(name), table_id: tableId === null ? null : str(tableId), nc_kind: str(kind), reason: str(reason),
+      quantity: Number(qty), unit_price: Number(unit), menu_price_at_nc: menuPrice === null ? null : Number(menuPrice),
+      marked_by_username: str(by), authorised_by_username: str(auth), scope: "bill", bill_id: str(billId),
+      settle_group: str(group), reversed_at: null, reversed_by_username: null, reversal_reason: null,
+    };
+    store.nc.push(row);
+    return { rows: [ncOut(row)] };
+  }
+  if (s.startsWith('update "orders" set food = $4::json where id = $1')) {
+    const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    if (o) {o.food = JSON.parse(str(params[3])) as Record<string, unknown>;}
+    return { rows: [] };
+  }
+  if (s.startsWith('select food from "orders" where id = $1') && s.endsWith("for update")) {
+    const o = store.orders.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    if (o) {await lockRow(clientId, o.id);}
+    return { rows: o ? [{ food: JSON.stringify(o.food) }] : [] };
+  }
+  // liveNcOnOrders.
+  if (s.includes('from "orderitemnonchargeable" where res_id = $1 and order_id = any($2::uuid[]) and reversed_at is null')) {
+    const ids = ((params[1] as string[]) ?? []).map(String);
+    return { rows: store.nc.filter((r) => ids.includes(r.order_id) && r.reversed_at === null).map(ncOut) };
+  }
+  // The settle's close: 'NC', ₹0, every stamp.
+  if (s.startsWith('update "bills" set payment_method = $1, payment_splits = null, payment_proof_screenshot_url = null, total_amt = 0')) {
+    const b = store.bills.find((x) => x.id === str(params[2]) && inOutlet(x, params, 4) && x.closed_at === null && x.status !== 3);
+    if (!b) {return { rows: [] };}
+    Object.assign(b, {
+      payment_method: str(params[0]), payment_proof_screenshot_url: null, total_amt: 0, tax_breakdown: [],
+      round_off: Number(params[5]), waiter_confirmed_at: nowIso(), admin_approved_at: nowIso(),
+      admin_approved_by_username: str(params[1]), closed_at: nowIso(), closed_by_username: str(params[1]), status: 2,
+    });
+    return { rows: [{ id: b.id }] };
+  }
+  // ReopenBill of an NC bill: the settle's comps reversed...
+  if (s.startsWith('update "orderitemnonchargeable" set reversed_at = now()')) {
+    if (!s.includes("scope = 'bill'")) {throw new Error("next_party_fixtures: a re-open reverses the settle's comps only");}
+    const out: Record<string, unknown>[] = [];
+    for (const r of store.nc) {
+      if (r.bill_id !== str(params[1]) || r.scope !== "bill" || r.reversed_at !== null) {continue;}
+      Object.assign(r, { reversed_at: nowIso(), reversed_by_username: str(params[2]), reversal_reason: str(params[3]) });
+      out.push({ id: r.id, order_id: r.order_id, value: ncValue(r), settle_group: r.settle_group });
+    }
+    return { rows: out };
+  }
+  // ...its orders back to Served (a paid bill's go to Payment Pending Approval)...
+  if (s.startsWith('update "orders" set status = 2, food = jsonb_set(')) {
+    const after = at(new Date(params[3] as string | Date).toISOString());
+    const upTo = at(new Date(params[4] as string | Date).toISOString());
+    const out: { id: string }[] = [];
+    for (const o of store.orders) {
+      if (!inOutlet(o, params, 1) || o.table_id !== str(params[2]) || !["4", "7"].includes(str(o.status) || "1")) {continue;}
+      const placed = at(o.created_at);
+      if (!(placed > after && placed <= upTo)) {continue;}
+      o.status = "2";
+      o.food = { ...o.food, status: "Served" };
+      out.push({ id: o.id });
+    }
+    return { rows: out };
+  }
+  // ...and the bill an ordinary unpaid one again.
+  if (s.startsWith('update "bills" set payment_method = null, payment_splits = null, payment_proof_screenshot_url = null, waiter_confirmed_at = null')) {
+    const b = store.bills.find((x) => x.id === str(params[0]) && inOutlet(x, params, 2));
+    if (b) {
+      Object.assign(b, {
+        payment_method: null, payment_proof_screenshot_url: null, waiter_confirmed_at: null,
+        total_amt: Number(params[3]), tax_breakdown: [], round_off: null,
+      });
+    }
+    return { rows: [] };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
