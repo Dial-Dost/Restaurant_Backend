@@ -144,9 +144,9 @@ describe("hrefs: only parameters the dashboard parses", () => {
     if (!reports || !accounting || !history || !slots || !resolver) {return;}
     expect(reports).toMatch(/params\?\.get\("report"\)/);
     expect(reports).toMatch(/useDateRange\("reports", \{ params \}\)/);
-    expect(slots).toMatch(/get\("slot"\)/);
+    expect(slots).toMatch(/get\(['"]slot['"]\)/);
     expect(accounting).toMatch(/useDateRange\("accounting", \{ params: search \}\)/);
-    expect(accounting).toMatch(/search\?\.get\("method"\)/);
+    expect(accounting).toMatch(/search\??\.get\("method"\)/);
     expect(accounting).toMatch(/id="settled-bills"/);
     expect(history).toMatch(/useDateRange\("history", \{[^}]*params: search/);
   });
