@@ -94,7 +94,7 @@ mw08 USE     *                                                      | <inline(re
 0072 POST    /occupy-table                                          | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") -> idempotent() | bc7147f1
 0073 PATCH   /table-covers                                          | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") -> idempotent() | c6460a4d
 0074 POST    /tables/move                                           | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | a1e6ed75
-0075 POST    /tables/move-order                                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | d602b6de
+0075 POST    /tables/move-order                                     | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | bbdc56c3
 0076 POST    /release-table                                         | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") -> idempotent() | 9836f1b8
 0077 GET     /table-status                                          | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | f9dc6d2b
 0078 GET     /bill-for-table                                        | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 6fd48811
@@ -269,7 +269,7 @@ mw08 USE     *                                                      | <inline(re
 0247 POST    /print/ack                                             | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sPrintAck) | 07728a6e
 0248 POST    /print/kot/order/:id                                   | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 754ac87a
 0249 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428
-0250 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | c0bca48a
+0250 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | f3bd7f19
 0251 POST    /bills/discount                                        | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillDiscount) | b2f8567d
 0252 POST    /print/devices/register                                | validateAction(PERM_PRINT)                     | 6e17326c
 0253 GET     /print/devices                                         | validateAction(PERM_PRINT)                     | f9a58e78

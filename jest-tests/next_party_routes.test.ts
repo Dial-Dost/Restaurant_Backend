@@ -633,7 +633,8 @@ describe("4. the wiring — nothing here is built and never called", () => {
     // Client item 4: a move is judged on its SOURCE too, and answers both reprints.
     expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/tableName: fromTable, guest: false, write: "move_off"/);
     expect(handler(bills, "app.post('/bills/merge'")).toMatch(/res\.json\(\{ \.\.\.result, \.\.\.reprintNeededFields\(guard\) \}\)/);
-    expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/\.\.\.moveReprintFields\(guard, sourceGuard\) \}\)/);
+    // The answer is built once and redacted for a waiter-only session before it is sent.
+    expect(handler(bills, "app.post('/bills/move-item'")).toMatch(/const answer = \{ \.\.\.result, prints, kot_nos: kotNos, \.\.\.moveReprintFields\(guard, sourceGuard\) \};\s*res\.json\(hidesPrices\(req\.auth\) \? redactMoveAnswer\(answer\) : answer\);/);
     const tablesRoutes = read("routes/tables.ts");
     expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/tableName: toTable, guest: false, write: "move"/);
     expect(handler(tablesRoutes, 'app.post("/tables/move-order"')).toMatch(/tableName: sourceTable, guest: false, write: "move_off"/);

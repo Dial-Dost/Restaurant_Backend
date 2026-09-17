@@ -240,6 +240,42 @@ describe("MoveBillItem — the dish arrives whole", () => {
     expect(r.moved.value).toBe(440);
   });
 
+  // REVIEW FINDING — THE SECOND DOCKET. Production barks almost no ticket (GGV:
+  // 1 of 80 printed orders in a fortnight), so a moved dish's source is almost
+  // always un-barked. Copied across as-is, the destination offered "Bark ->
+  // kitchen", and the bark's automatic print found no memo for (31, the dish) —
+  // the move's docket is PINNED and memoises nothing — and printed the dish
+  // again under a NEW number. A ticketed dish arrives barked, as it did before.
+  test("an UN-barked but ticketed dish arrives barked, so the destination's bark prints nothing", async () => {
+    const { a31, t31 } = tables31();
+    const src = addOrder({
+      table_id: a31, status: "1", barked_at: null,
+      food: { table: "31A", items: [{ id: "l1", name: "NOT YOUR PUCHKA", price: 469, quantity: 1 }, { id: "l2", name: "Chai", price: 40, quantity: 1 }], subtotal: 509, total: 509 },
+    });
+    const r = await db.MoveBillItem(RESTAURANT_SLUG, "31A", "31", "NOT YOUR PUCHKA", 469, {
+      kotNosByOrder: new Map([[src.id, [35]]]),
+    });
+    const d = orders().find((o) => o.table_id === t31)!;
+    expect(d.barked_at).toEqual(expect.any(String));
+    expect(Number.isNaN(Date.parse(String(d.barked_at)))).toBe(false);
+    // The source is not touched: it was un-barked and stays so.
+    expect(orders().find((o) => o.id === src.id)!.barked_at).toBeNull();
+    // THE BARK: BarkOrder's compare-and-set answers already_barked, which is
+    // what stops POST /orders/:id/bark before autoPrintOrderKot (routes/orders.ts).
+    const bark = await db.BarkOrder(RESTAURANT_SLUG, r.destinations[0]!.order_id, "expo");
+    expect(bark).toEqual({ barked_at: d.barked_at, already_barked: true });
+  });
+
+  test("a dish the kitchen was never given paper for keeps its source's un-barked state", async () => {
+    const { a31, t31 } = tables31();
+    const src = addOrder({
+      table_id: a31, status: "1", barked_at: null,
+      food: { table: "31A", items: [{ id: "l1", name: "NOT YOUR PUCHKA", price: 469, quantity: 1 }], subtotal: 469, total: 469 },
+    });
+    await db.MoveBillItem(RESTAURANT_SLUG, "31A", "31", "NOT YOUR PUCHKA", 469, { kotNosByOrder: new Map([[src.id, []]]) });
+    expect(orders().find((o) => o.table_id === t31)!.barked_at ?? null).toBeNull();
+  });
+
   test("Served stays Served, Pending stays Pending, and a split keeps its labels", async () => {
     const { a31, t31 } = tables31();
     addOrder({

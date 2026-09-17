@@ -147,6 +147,21 @@ describe("POST /tables/move-order — the ticket, by name", () => {
     });
   });
 
+  // REVIEW FINDING — MoveOrderToTable answers the destination's running bill as
+  // `total_amt`, and the route spread it into the answer. Web stock waiters
+  // keep "Move table", and the dashboard hands this body to the browser.
+  test("a waiter-only session is not told the table's running total; a manager still is", async () => {
+    const w = await moveOrder(WAITER);
+    expect(w.status).toBe(200);
+    expect(w.body).not.toHaveProperty("total_amt");
+    expect(w.body).toMatchObject({ order_id: ORDER, from_table: "12", to_table: "15", items: GGV_DISHES, kot_no: 65, print: { printed: true } });
+    expect(JSON.stringify(w.body)).not.toContain("3763");
+    const m = await moveOrder(MANAGER);
+    expect(m.body).toMatchObject({ total_amt: 3763, items: GGV_DISHES });
+    // The manager's audit record is not redacted by the waiter rule either way.
+    expect(lastAudit().details).toMatchObject({ total_amt: 3763 });
+  });
+
   test("the answer carries the dishes (no price) and the KOT, for both clients' confirmations", async () => {
     const r = await moveOrder(WAITER);
     expect(r.status).toBe(200);
@@ -281,6 +296,24 @@ describe("POST /bills/move-item — the dish, the kitchen and the record", () =>
     expect(reason).toBe("Moved item NOT YOUR PUCHKA x1 from 31A (KOT-35) to 31");
     expect(details).toMatchObject({ from: "31A", to: "31", kot_nos: [35], order_ids: ["new-1"], source_order_ids: ["src-1"] });
     expect(classifyBillEdit(ADD_ORDERS, reason, details)?.kind).toBe("item_moved");
+  });
+
+  test("REVIEW FINDING — a waiter-only session is told the dish, never its price or the value that moved", async () => {
+    const w = await moveItem(WAITER);
+    expect(w.status).toBe(200);
+    expect(w.body).toMatchObject({
+      success: true, kot_nos: [35],
+      moved: { name: "NOT YOUR PUCHKA", quantity: 1, lines: [{ name: "NOT YOUR PUCHKA", quantity: 1 }] },
+      items: [{ name: "NOT YOUR PUCHKA", variation: null, quantity: 1 }],
+      prints: [{ order_id: "new-1", printed: true, kot_no: 35 }],
+    });
+    const moved = (w.body as { moved: Record<string, unknown> & { lines: Record<string, unknown>[] } }).moved;
+    expect(moved).not.toHaveProperty("price");
+    expect(moved).not.toHaveProperty("value");
+    expect(moved.lines[0]).not.toHaveProperty("price");
+    expect(JSON.stringify(w.body)).not.toContain("469");
+    const a = await moveItem(ADMIN);
+    expect(a.body).toMatchObject({ moved: { price: 469, value: 469, lines: [{ price: 469 }] } });
   });
 
   test("the answer says what printed, per destination order", async () => {

@@ -82,6 +82,13 @@ interface StripFixture {
   sql: string[];
   /** Every re-pricing write the data layer issued. THE assertion of this suite. */
   writes: { food: string; status: number }[];
+  /** KOT numbers PrintJobs holds for the order (client item 3's decline rule). */
+  printed: number[];
+  /**
+   * Make the guarded write match nothing, and leave the order at this status —
+   * what a concurrent comp (still 8) or acceptance (1) looks like to it.
+   */
+  missWriteAt: number | null;
 }
 
 const fx: StripFixture = {
@@ -91,6 +98,8 @@ const fx: StripFixture = {
   voidsTableMissing: false,
   sql: [],
   writes: [],
+  printed: [],
+  missWriteAt: null,
 };
 
 jest.mock("pg", () => {
@@ -133,6 +142,13 @@ jest.mock("pg", () => {
     if (/^select table_name from "Tables"/i.test(q)) { return { rows: [{ table_name: "T7" }] }; }
     if (/^select total_amt from "Bills"/i.test(q)) { return { rows: [] }; }
     // THE WRITE. The whole suite is about whether this statement ever runs.
+    if (/^select bill_id, kot_no from "PrintJobs"/i.test(q)) {
+      return { rows: fx.printed.map((n) => ({ bill_id: `order-${ORDER_ID}`, kot_no: n })) };
+    }
+    if (/^update "Orders" set food = \$1::json, status = \$2/i.test(q) && fx.missWriteAt !== null) {
+      fx.order.status = fx.missWriteAt;
+      return { rows: [] };
+    }
     if (/^update "Orders" set food = \$1::json, status = \$2/i.test(q)) {
       const p = (params ?? []) as unknown[];
       fx.writes.push({ food: String(p[0]), status: Number(p[1]) });
@@ -219,6 +235,9 @@ beforeEach(() => {
   fx.voidsTableMissing = false;
   fx.order = { food: {}, table_id: TABLE_ID, status: 1 };
   fx.siblings = [];
+  fx.printed = [];
+  fx.missWriteAt = null;
+  db.__kotNumberLinkTestSeam.setSchemaReady(false);
 
   GetOrders.mockReset();
   RecordOrderVoid.mockReset();
@@ -804,6 +823,59 @@ describe("client item 3 — a waiter never takes a dish off a ticket the kitchen
       fourThousand();
       expect((await del(WAITER)).status).toBe(200);
       expect(fx.writes).toHaveLength(1);
+    } finally { seatStatus = 1; }
+  });
+
+  // REVIEW FINDINGS — "Pending" is a status column, and it can be written back.
+  test("…unless PrintJobs holds a KOT number for it: that order WAS ticketed, and is refused before anything is written", async () => {
+    seatStatus = 8;
+    db.__kotNumberLinkTestSeam.setSchemaReady(true);
+    try {
+      fourThousand();
+      fx.printed = [14];
+      const r = await del(WAITER);
+      expect(r.status).toBe(403);
+      expect(r.body).toMatchObject({ code: "cancel_needs_senior", kot_nos: [14] });
+      expect(fx.writes).toEqual([]);
+      expect(RecordOrderVoid).not.toHaveBeenCalled();
+    } finally { seatStatus = 1; }
+  });
+
+  test("a Pending order whose guarded write missed while it STAYED Pending (a comp changed the lines) gets the ordinary words, not a refusal", async () => {
+    seatStatus = 8;
+    try {
+      fourThousand();
+      fx.missWriteAt = 8;
+      const r = await del(WAITER);
+      // This route answers a plain error as 500 with its message (its outer catch).
+      expect(r.status).toBe(500);
+      expect((r.body as { code?: unknown }).code).toBeUndefined();
+      expect(String((r.body as { error?: unknown }).error)).toMatch(/changed on another screen/);
+      expect(auditLines().some((l) => l.startsWith("REFUSED"))).toBe(false);
+    } finally { seatStatus = 1; }
+  });
+
+  test("…and one accepted to the kitchen in that moment is refused as the ticket it now is", async () => {
+    seatStatus = 8;
+    try {
+      fourThousand();
+      fx.missWriteAt = 1;
+      const r = await del(WAITER);
+      expect(r.status).toBe(403);
+      expect(r.body).toMatchObject({ code: "cancel_needs_senior" });
+    } finally { seatStatus = 1; }
+  });
+
+  test("…and one declined in that moment gets the cancelled-order words", async () => {
+    seatStatus = 8;
+    try {
+      fourThousand();
+      fx.missWriteAt = 5;
+      const r = await del(WAITER);
+      expect(r.status).toBe(500);
+      expect((r.body as { code?: unknown }).code).toBeUndefined();
+      expect(String((r.body as { error?: unknown }).error)).toMatch(/cancel/i);
+      expect(auditLines().some((l) => l.startsWith("REFUSED"))).toBe(false);
     } finally { seatStatus = 1; }
   });
 });

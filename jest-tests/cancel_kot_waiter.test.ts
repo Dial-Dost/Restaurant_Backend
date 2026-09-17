@@ -29,7 +29,7 @@ import { describe, test, expect, beforeAll, beforeEach, jest } from "@jest/globa
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeFakeApp, type FakeApp } from "./platform_fixtures";
-import { CANCEL_NEEDS_SENIOR, PENDING_ORDER_STATUS_CODE, ROLES_OUTRANKING_WAITER, mayCancelKot, mayCancelTicketed } from "../role_scope";
+import { CANCEL_NEEDS_SENIOR, PENDING_ORDER_STATUS_CODE, ROLES_OUTRANKING_WAITER, mayCancelKot, mayCancelTicketed, mayPutBackToPending } from "../role_scope";
 import {
   CancelNeedsSeniorError,
   cancelNeedsSeniorBody,
@@ -58,9 +58,11 @@ interface Fx {
   /** When set, the status the order has by the time the UPDATE runs. */
   statusAtWrite: number | null;
   exists: boolean;
+  /** KOT numbers PrintJobs holds for the order (migration 043's link). */
+  printed: number[];
   sql: { q: string; params: unknown[] }[];
 }
-const fx: Fx = { foodExtra: {}, status: 1, statusAtWrite: null, exists: true, sql: [] };
+const fx: Fx = { foodExtra: {}, status: 1, statusAtWrite: null, exists: true, printed: [], sql: [] };
 
 jest.mock("pg", () => {
   const query = async (sql: string, params: unknown[] = []): Promise<{ rows: unknown[] }> => {
@@ -84,6 +86,18 @@ jest.mock("pg", () => {
     }
     if (/^select food, barked_at, status from "Orders"/i.test(q)) {
       return { rows: fx.exists ? [{ food: { table: "11", items: [{ id: "l1", name: "HARA DHANIYA PULAO", price: 629, quantity: 1 }], ...fx.foodExtra }, barked_at: new Date(), status: fx.status }] : [] };
+    }
+    // AddOrder's upsert: `where $9 is null or status = $9` on the conflict, and
+    // `returning id` — a pinned write that no longer matches returns nothing.
+    if (/^insert into "Orders" \(id, created_at, res_id, outlet_id, food, table_id, status, cust_id, barked_at\)/i.test(q)) {
+      if (fx.statusAtWrite !== null) { fx.status = fx.statusAtWrite; fx.statusAtWrite = null; }
+      const pin = params[8];
+      if (fx.exists && pin !== null && pin !== undefined && String(fx.status) !== String(pin)) { return { rows: [] }; }
+      fx.status = Number(params[5]);
+      return { rows: [{ id: params[0] }] };
+    }
+    if (/^select bill_id, kot_no from "PrintJobs"/i.test(q)) {
+      return { rows: fx.printed.map((n) => ({ bill_id: `order-${ORDER}`, kot_no: n })) };
     }
     return { rows: [] };
   };
@@ -170,7 +184,9 @@ beforeEach(() => {
   fx.status = 1;
   fx.statusAtWrite = null;
   fx.exists = true;
+  fx.printed = [];
   fx.sql = [];
+  db.__kotNumberLinkTestSeam.setSchemaReady(false);
   for (const m of [mockRecordVoid, mockAudit, mockKotNos, mockGuard, mockResolveAuthoriser, mockCancelSlip]) { m.mockReset(); }
   mockRecordVoid.mockResolvedValue({ id: "void-1", void_kind: "other", stage: "after_print" });
   mockAudit.mockResolvedValue(true);
@@ -184,6 +200,7 @@ const statusWrites = () => fx.sql.filter((s) => /^update "Orders" set status = \
 const orderInserts = () => fx.sql.filter((s) => /^insert into "Orders"/i.test(s.q));
 const auditLines = (): string[] => mockAudit.mock.calls.map((c) => String(c[4]));
 const SENTENCE_KOT3 = "KOT-3 has gone to the kitchen. Only a manager, cashier, captain or admin can cancel it — ask one of them.";
+const SENTENCE_KOT3_REWIND = "KOT-3 has gone to the kitchen, so it cannot be put back to Pending. Only a manager, cashier, captain or admin can change that — ask one of them.";
 
 // ===========================================================================
 describe("the rule and its words", () => {
@@ -193,6 +210,27 @@ describe("the rule and its words", () => {
     }
     expect(mayCancelTicketed({ role: "waiter", role_all: ["waiter"], actions: [ADD_ORDERS] }, PENDING_ORDER_STATUS_CODE)).toBe(true);
     expect(PENDING_ORDER_STATUS_CODE).toBe(8);
+  });
+
+  test("REVIEW — a Pending order with a KOT number on paper WAS ticketed, and a waiter does not cancel it", () => {
+    const waiter = { role: "waiter", role_all: ["waiter"], actions: [ADD_ORDERS] };
+    expect(mayCancelTicketed(waiter, 8, [14])).toBe(false);
+    expect(mayCancelTicketed(waiter, 8, [])).toBe(true);
+    // Only a real number counts: garbage from the reader never refuses a decline.
+    expect(mayCancelTicketed(waiter, 8, [0, -1, Number.NaN])).toBe(true);
+    // A senior is not judged by it.
+    expect(mayCancelTicketed({ role: "manager", role_all: ["manager"], actions: [] }, 1, [14])).toBe(true);
+  });
+
+  test("REVIEW — a waiter-only login may name Pending only for an order that already is Pending", () => {
+    const waiter = { role: "waiter", role_all: ["waiter"], actions: [ADD_ORDERS] };
+    for (const code of [1, 2, 3, 6, null, undefined]) {
+      expect({ code, allowed: mayPutBackToPending(waiter, code) }).toEqual({ code, allowed: false });
+    }
+    expect(mayPutBackToPending(waiter, 8)).toBe(true);
+    for (const [, auth] of SENIORS) {
+      expect(mayPutBackToPending(auth, 1)).toBe(true);
+    }
   });
 
   test("the scoping is the server's isWaiterOnly — custom roles and the 'employee' fallback do not lift it; a senior role does", () => {
@@ -214,6 +252,7 @@ describe("the rule and its words", () => {
     expect(cancelNeedsSeniorSentence([5, 5, 7])).toBe("KOT-5, KOT-7 have gone to the kitchen. Only a manager, cashier, captain or admin can cancel it — ask one of them.");
     expect(cancelNeedsSeniorSentence([9], "remove_line")).toBe("KOT-9 has gone to the kitchen, so a dish cannot be taken off it here. Only a manager, cashier, captain or admin can do that — ask one of them.");
     expect(cancelNeedsSeniorSentence([0, -1, Number.NaN])).toMatch(/^This order has gone/);
+    expect(cancelNeedsSeniorSentence([3], "rewind")).toBe(SENTENCE_KOT3_REWIND);
   });
 
   test("the error is tagged, and the body carries the code, the sentence and the machine list", () => {
@@ -278,6 +317,67 @@ describe("SetOrderStatus — the check is beside the read and before the write",
     fx.exists = false;
     await expect(db.SetOrderStatus(RES, ORDER, "Cancelled", asWaiter)).resolves.toEqual({ ok: false, changed: false, previous_status: null });
   });
+
+  // REVIEW FINDING — THE TWO-REQUEST CANCEL. "Pending" is what makes a waiter's
+  // cancel a decline, and it was a status any Add Orders holder could write
+  // back: Preparing -> Pending -> Cancelled, and no slip on the way.
+  test.each([[1], [2], [3], [6]])("a ticket (status %s) is NOT put back to Pending — refused as a rewind, nothing written", async (code) => {
+    fx.status = code;
+    await expect(db.SetOrderStatus(RES, ORDER, "Pending", asWaiter)).rejects.toMatchObject({ code: "cancel_needs_senior", act: "rewind", order_id: ORDER });
+    expect(statusWrites()).toEqual([]);
+    expect(fx.status).toBe(code);
+  });
+
+  test("a Pending order named Pending again is pinned to Pending, so it cannot undo an acceptance that lands first", async () => {
+    fx.status = 8;
+    fx.statusAtWrite = 1;
+    await expect(db.SetOrderStatus(RES, ORDER, "Pending", asWaiter)).rejects.toMatchObject({ code: "cancel_needs_senior", act: "rewind" });
+    expect(statusWrites()[0]!.params[5]).toBe("8");
+    expect(fx.status).toBe(1);
+  });
+
+  test("a senior role's stage changes are not judged by the waiter rule", async () => {
+    fx.status = 1;
+    await expect(db.SetOrderStatus(RES, ORDER, "Pending", { actor: { role: "manager", role_all: ["manager"], actions: [ADD_ORDERS] } }))
+      .resolves.toMatchObject({ ok: true, changed: true });
+    expect(statusWrites()[0]!.params[5]).toBeNull();
+  });
+
+  test("the decline also asks PrintJobs: a Pending order with a KOT number was ticketed, and is refused before anything is written", async () => {
+    db.__kotNumberLinkTestSeam.setSchemaReady(true);
+    fx.status = 8;
+    fx.printed = [3];
+    await expect(db.SetOrderStatus(RES, ORDER, "Cancelled", asWaiter)).rejects.toMatchObject({ code: "cancel_needs_senior", act: "cancel" });
+    expect(statusWrites()).toEqual([]);
+    expect(fx.status).toBe(8);
+    expect(fx.sql.some((s) => /from "PrintJobs"/i.test(s.q))).toBe(true);
+  });
+
+  test("…and the read is made only for a waiter's decline — a ticketed cancel and a senior never ask it", async () => {
+    db.__kotNumberLinkTestSeam.setSchemaReady(true);
+    fx.status = 1;
+    await expect(db.SetOrderStatus(RES, ORDER, "Cancelled", asWaiter)).rejects.toMatchObject({ code: "cancel_needs_senior" });
+    await db.SetOrderStatus(RES, ORDER, "Cancelled", { actor: { role: "manager", role_all: ["manager"], actions: [ADD_ORDERS] } });
+    expect(fx.sql.some((s) => /from "PrintJobs"/i.test(s.q))).toBe(false);
+  });
+
+  test("REVIEW FINDING — declined by somebody else between the read and the write: a harmless no-op, not a 403", async () => {
+    fx.status = 8;
+    fx.statusAtWrite = 5;
+    await expect(db.SetOrderStatus(RES, ORDER, "Cancelled", asWaiter)).resolves.toEqual({ ok: true, changed: false, previous_status: "Cancelled" });
+    expect(fx.status).toBe(5);
+  });
+
+  test("a settled or cancelled order keeps the house words, for a cancel and for a rewind", async () => {
+    fx.status = 4;
+    await expect(db.SetOrderStatus(RES, ORDER, "Cancelled", asWaiter)).rejects.toThrow(/already settled and locked/);
+    await expect(db.SetOrderStatus(RES, ORDER, "Pending", asWaiter)).rejects.toThrow(/already settled and locked/);
+    fx.status = 5;
+    const err = await db.SetOrderStatus(RES, ORDER, "Pending", asWaiter).then(() => null, (e: unknown) => e as { code?: unknown; message?: unknown });
+    expect(err?.code).toBeUndefined();
+    expect(String(err?.message)).toMatch(/cancel/i);
+    expect(statusWrites()).toEqual([]);
+  });
 });
 
 // ===========================================================================
@@ -324,6 +424,38 @@ describe("PATCH /orders/:id/status — what the waiter is told", () => {
     expect(mockCancelSlip).toHaveBeenCalledWith(expect.objectContaining({ orderId: ORDER, previousStatus: "Pending" }));
   });
 
+  test("REVIEW FINDING — THE TWO-STEP REWIND: Pending is refused, so the cancel after it is refused too, and nothing prints", async () => {
+    fx.status = 1;
+    const rewind = await cancel(WAITER, { status: "Pending" });
+    expect(rewind.status).toBe(403);
+    expect(rewind.body).toEqual({
+      error: "Forbidden", code: "cancel_needs_senior", details: SENTENCE_KOT3_REWIND,
+      allowed_roles: ROLES_OUTRANKING_WAITER, order_id: ORDER, kot_nos: [3],
+    });
+    expect(fx.status).toBe(1);
+    const then = await cancel(WAITER);
+    expect(then.status).toBe(403);
+    expect(fx.status).toBe(1);
+    expect(statusWrites()).toEqual([]);
+    expect(mockRecordVoid).not.toHaveBeenCalled();
+    expect(mockCancelSlip).not.toHaveBeenCalled();
+    expect(auditLines()).toEqual([
+      `REFUSED move back to Pending of order ${ORDER} (KOT-3) — it has gone to the kitchen and a waiter cannot put it back to Pending`,
+      `REFUSED cancel of order ${ORDER} (KOT-3) — it has gone to the kitchen and a waiter cannot cancel it`,
+    ]);
+  });
+
+  test("REVIEW FINDING — a decline that lost the race to another decline: 200 unchanged, nothing refused on the record, no slip", async () => {
+    fx.status = 8;
+    fx.statusAtWrite = 5;
+    const r = await cancel(WAITER);
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ success: true, unchanged: true });
+    expect(auditLines()).toEqual([]);
+    expect(mockRecordVoid).not.toHaveBeenCalled();
+    expect(mockCancelSlip).not.toHaveBeenCalled();
+  });
+
   test.each(SENIORS)("%s cancels a ticketed order exactly as before", async (_l, auth) => {
     fx.status = 1;
     const r = await cancel(auth);
@@ -349,12 +481,86 @@ describe("POST /orders — the upsert side door", () => {
     expect(mockCancelSlip).not.toHaveBeenCalled();
   });
 
-  test("…a Pending one goes through, as the decline it is", async () => {
+  test("…a Pending one goes through, as the decline it is — pinned to Pending", async () => {
     fx.status = 8;
     const r = await upsert(WAITER, "Cancelled");
     expect(r.status).toBe(201);
     expect(orderInserts()).toHaveLength(1);
     expect(orderInserts()[0]!.params[5]).toBe(5);
+    expect(orderInserts()[0]!.params[8]).toBe("8");
+    expect(fx.status).toBe(5);
+  });
+
+  test("REVIEW FINDING — THE REWIND THROUGH THE UPSERT: the stored stage is kept, so the cancel after it is still refused", async () => {
+    fx.status = 1;
+    const rewind = await upsert(WAITER, "Pending");
+    expect(rewind.status).toBe(201);
+    expect(orderInserts()).toHaveLength(1);
+    expect(orderInserts()[0]!.params[5]).toBe(1);
+    // Nothing the rule rests on, so nothing is pinned.
+    expect(orderInserts()[0]!.params[8]).toBeNull();
+    expect((JSON.parse(String(orderInserts()[0]!.params[3])) as { status: string }).status).toBe("Preparing");
+    expect(fx.status).toBe(1);
+    fx.sql = [];
+    const then = await upsert(WAITER, "Cancelled");
+    expect(then.status).toBe(403);
+    expect(orderInserts()).toEqual([]);
+    expect(fx.status).toBe(1);
+    expect(mockCancelSlip).not.toHaveBeenCalled();
+  });
+
+  test("…a stale Pending resend is an ordinary edit of what the order really is (Served stays Served)", async () => {
+    fx.status = 2;
+    const r = await upsert(WAITER, "Pending");
+    expect(r.status).toBe(201);
+    expect(orderInserts()[0]!.params[5]).toBe(2);
+    expect((JSON.parse(String(orderInserts()[0]!.params[3])) as { status: string }).status).toBe("Served");
+  });
+
+  test("a senior's upsert may still name Pending (not judged by the waiter rule)", async () => {
+    fx.status = 1;
+    const r = await upsert(SENIORS[0][1], "Pending");
+    expect(r.status).toBe(201);
+    expect(orderInserts()[0]!.params[5]).toBe(8);
+    expect(orderInserts()[0]!.params[8]).toBeNull();
+  });
+
+  test("THE RACE ON THE UPSERT: a decline that lands after an acceptance matches nothing and is refused", async () => {
+    fx.status = 8;
+    fx.statusAtWrite = 1;
+    const r = await upsert(WAITER, "Cancelled");
+    expect(r.status).toBe(403);
+    expect(r.body).toMatchObject({ code: "cancel_needs_senior", order_id: ORDER });
+    expect(fx.status).toBe(1);
+  });
+
+  test("…a Pending resend that lands after an acceptance matches nothing and asks for a refresh", async () => {
+    fx.status = 8;
+    fx.statusAtWrite = 1;
+    const r = await upsert(WAITER, "Pending");
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual({ error: "This order was sent to the kitchen while it was being edited. Refresh it and try again." });
+    expect(fx.status).toBe(1);
+  });
+
+  test("…and a decline that lands after another decline gets the house words, not a refusal", async () => {
+    fx.status = 8;
+    fx.statusAtWrite = 5;
+    const r = await upsert(WAITER, "Cancelled");
+    expect(r.status).toBe(400);
+    expect((r.body as { code?: unknown }).code).toBeUndefined();
+    expect(String((r.body as { error?: unknown }).error)).toMatch(/cancel/i);
+    expect(auditLines().some((l) => l.startsWith("REFUSED"))).toBe(false);
+  });
+
+  test("the upsert's decline asks PrintJobs too: a Pending order with a KOT number is refused, nothing written", async () => {
+    db.__kotNumberLinkTestSeam.setSchemaReady(true);
+    fx.status = 8;
+    fx.printed = [3];
+    const r = await upsert(WAITER, "Cancelled");
+    expect(r.status).toBe(403);
+    expect(orderInserts()).toEqual([]);
+    expect(fx.status).toBe(8);
   });
 
   test("CLIENT ITEM 4 — an upsert keeps the move history the server stamped, and a client cannot write one", async () => {
@@ -439,6 +645,20 @@ describe("POST /orders/:id/void — the grant does not outrank the role here", (
     expect(after.length).toBeGreaterThan(0);
   };
 
+  test("a Pending order with a KOT number on paper is refused — the number read BEFORE the transaction opens", async () => {
+    db.__kotNumberLinkTestSeam.setSchemaReady(true);
+    fx.status = 8;
+    fx.printed = [3];
+    const r = await voidIt(WAITER_WITH_VOID);
+    expect(r.status).toBe(403);
+    expect(r.body).toMatchObject({ code: "cancel_needs_senior" });
+    expect(mockRecordVoid).not.toHaveBeenCalled();
+    const qs = fx.sql.map((s) => s.q);
+    const printRead = qs.findIndex((q) => /from "PrintJobs"/i.test(q));
+    expect(printRead).toBeGreaterThan(-1);
+    expect(printRead).toBeLessThan(qs.indexOf("BEGIN"));
+  });
+
   test("a Pending order passes the waiter check (the void itself then runs as before)", async () => {
     fx.status = 8;
     const r = await voidIt(WAITER_WITH_VOID);
@@ -488,9 +708,19 @@ describe("the wiring — nothing here is built and never called", () => {
     expect(auth).not.toMatch(/sessionCapabilities\(\{ actions:/);
   });
 
+  test("every writer's cancel check goes through waiterMayCancel (the PrintJobs half included)", () => {
+    const src = read("database_supabase.ts");
+    // SetOrderStatus, AddOrder, UpdateOrderItemsSplit and VoidOrderWithReason.
+    expect(src.match(/await waiterMayCancel\(/g)?.length).toBe(4);
+    // No writer judges the bare status any more: the one call is inside waiterMayCancel.
+    expect(src.match(/mayCancelTicketed\(/g)?.length).toBe(1);
+    expect(src).toMatch(/!mayPutBackToPending\(opts\.actor, previousCode\)/);
+    expect(src).toMatch(/!mayPutBackToPending\(upsertActor, storedCode\)/);
+  });
+
   test("the refusal's pieces are reached from shipping code, not only from this suite", () => {
     const shipping = ["routes/_shared.ts", "routes/orders.ts", "routes/mis_capture.ts", "database_supabase.ts"].map(read).join("\n");
-    for (const symbol of ["CancelNeedsSeniorError", "cancelNeedsSeniorBody", "isCancelNeedsSeniorError", "refuseTicketedCancel", "mayCancelTicketed", "mayCancelKot"]) {
+    for (const symbol of ["CancelNeedsSeniorError", "cancelNeedsSeniorBody", "isCancelNeedsSeniorError", "refuseTicketedCancel", "mayCancelTicketed", "mayCancelKot", "mayPutBackToPending", "waiterMayCancel"]) {
       expect({ symbol, used: shipping.includes(`${symbol}(`) }).toEqual({ symbol, used: true });
     }
   });

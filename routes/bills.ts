@@ -17,7 +17,7 @@ import { printKotItemMove, resolveMoveSourceKots, type KotMoveOutcome } from "..
 import { moveItemAuditSentence } from "../order_moves.js";
 import { kotStamp } from "../kot_numbers.js";
 import { logger } from "../observability.js";
-import { hidesPrices, redactOpenBillPage } from "../price_scope.js";
+import { hidesPrices, redactMoveAnswer, redactOpenBillPage } from "../price_scope.js";
 import { ackPrintJob, isSchemaMissing, warnSchemaMissing } from "../print_jobs.js";
 import { dispatchPrintJob } from "../print_routing.js";
 import { emitRestaurant } from "../realtime.js";
@@ -2131,7 +2131,10 @@ app.post('/bills/move-item', validateAction("4ad474d4-5230-449c-874f-6a238b833bc
 				},
 			);
 		} catch {/* ignore */}
-		res.json({ ...result, prints, kot_nos: kotNos, ...moveReprintFields(guard, sourceGuard) });
+		// `moved` is the removal summary, prices and all; a waiter-only session
+		// is told the dishes and not their worth (redactMoveAnswer).
+		const answer = { ...result, prints, kot_nos: kotNos, ...moveReprintFields(guard, sourceGuard) };
+		res.json(hidesPrices(req.auth) ? redactMoveAnswer(answer) : answer);
 	} catch (e: any) {
 		logger.error({ err: e }, 'move_bill_item_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to move item') });

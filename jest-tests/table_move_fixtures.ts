@@ -442,6 +442,17 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     return { rows: [{ column_name: "barked_at" }] };
   }
 
+  // --- BarkOrder, on the order a dish move made (client item 4): the status
+  //     guard, and the compare-and-set read that answers already_barked.
+  if (s.startsWith('select status from "orders" where id = $1')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    return { rows: o ? [{ status: o.status }] : [] };
+  }
+  if (s.startsWith('select status, barked_at, food from "orders" where id = $1')) {
+    const o = store.orders.find((r) => r.id === str(params[0]));
+    return { rows: o ? [{ status: o.status, barked_at: o.barked_at ?? null, food: JSON.stringify(o.food) }] : [] };
+  }
+
   // --- one order, by id ----------------------------------------------------
   if (s.includes('select id, table_id, food, status from "orders"')) {
     const o = store.orders.find((r) => r.id === str(params[0]));

@@ -176,13 +176,48 @@ export function sessionRoleScope(input: RoleScopeInput): SessionRoleScope {
  * the same place the write happens (SetOrderStatus, AddOrder,
  * VoidOrderWithReason, UpdateOrderItemsSplit), because a check made anywhere
  * else races the approval that turns a Pending order into a ticket.
+ *
+ * THE STATUS COLUMN ALONE IS NOT PROOF, and `printedKotNos` is why this takes
+ * a third argument. Status 8 is a column anyone with Add Orders could once
+ * write back: a waiter set a Preparing ticket to "Pending", then cancelled it
+ * as a "decline" — and the CANCELLED slip was suppressed too, because a
+ * Pending cancel prints none. The rewind itself is now refused
+ * (mayPutBackToPending), but a senior can still write status 8 by hand, so the
+ * decline also asks the one fact nothing can undo: a KOT number PrintJobs holds
+ * for the order (migration 043). A Pending order with a printed number HAS
+ * been ticketed, and a waiter-only login does not cancel it. An unreadable
+ * number reads as none — the status rule above still stands on its own.
  */
 export const CANCEL_NEEDS_SENIOR = "cancel_needs_senior";
 
 /** "Orders".status 8 — placed, not yet accepted to the kitchen, never ticketed. */
 export const PENDING_ORDER_STATUS_CODE = 8;
 
-export function mayCancelTicketed(input: RoleScopeInput, previousStatusCode: number | null | undefined): boolean {
+export function mayCancelTicketed(
+	input: RoleScopeInput,
+	previousStatusCode: number | null | undefined,
+	printedKotNos: readonly number[] = [],
+): boolean {
+	if (!isWaiterOnly(input)) { return true; }
+	return previousStatusCode === PENDING_ORDER_STATUS_CODE
+		&& !printedKotNos.some((n) => Number.isFinite(n) && n > 0);
+}
+
+/**
+ * May this login put an order back to PENDING (status 8)?
+ *
+ * "Pending" is the one status that means "the kitchen was never told", and it
+ * is what lets a waiter decline an order (mayCancelTicketed). So a waiter-only
+ * login may name it only for an order that is ALREADY Pending: moving a
+ * Preparing, Served or Bill Verification ticket back to it was the first half
+ * of a two-request cancel that closed none of item 3's doors. No screen offers
+ * the move — the app's stage sheet and the dashboard's stage buttons never list
+ * Pending — so the only request this refuses is a crafted one.
+ *
+ * A senior role keeps whatever it had: it may cancel the ticket outright, so a
+ * rewind gives it nothing it did not already hold.
+ */
+export function mayPutBackToPending(input: RoleScopeInput, previousStatusCode: number | null | undefined): boolean {
 	if (!isWaiterOnly(input)) { return true; }
 	return previousStatusCode === PENDING_ORDER_STATUS_CODE;
 }

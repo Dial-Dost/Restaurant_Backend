@@ -520,6 +520,8 @@ export function sessionCapabilities(input: RoleScopeInput): SessionCapabilities 
  * /orders/:id/void, DELETE /orders/:id/items/:itemId) turns the data layer's
  * CancelNeedsSeniorError into the same 403 through here, so a client cannot
  * tell which route refused it and a change to the words lands on all four.
+ * PATCH /orders/:id/status also answers a waiter's move of a ticket BACK to
+ * Pending this way (act "rewind"): that move was the first half of a cancel.
  *
  * AUDITED EVEN THOUGH NOTHING HAPPENED, as the refused release and the refused
  * reprint are: a waiter trying to cancel a docket is exactly the event a
@@ -539,11 +541,16 @@ export async function refuseTicketedCancel(req: Request, res: Response, err: Can
 		} catch {/* the sentence degrades to "This order" */}
 	}
 	const handle = kotNos.length > 0 ? ` (${kotNos.map((n) => `KOT-${String(n)}`).join(", ")})` : "";
-	const what = err.act === "remove_line" ? "removal of a dish from order" : "cancel of order";
+	// A rewind to Pending is named for what it is: not a cancel, but the step
+	// that would have let the next request pass as a decline.
+	const what = err.act === "remove_line"
+		? "removal of a dish from order"
+		: err.act === "rewind" ? "move back to Pending of order" : "cancel of order";
+	const cannot = err.act === "rewind" ? "put it back to Pending" : "cancel it";
 	try {
 		await log_audit(
 			req, "4ad474d4-5230-449c-874f-6a238b833bca",
-			`REFUSED ${what} ${err.order_id}${handle} — it has gone to the kitchen and a waiter cannot cancel it`,
+			`REFUSED ${what} ${err.order_id}${handle} — it has gone to the kitchen and a waiter cannot ${cannot}`,
 			Audit_log_category.Orders,
 			{ order_id: err.order_id, refused: true, code: err.code, act: err.act, kot_nos: kotNos },
 		);

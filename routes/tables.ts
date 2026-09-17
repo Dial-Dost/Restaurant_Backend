@@ -8,7 +8,7 @@ import { idempotent } from "../idempotency.js";
 import { printKotTableChange } from "../kot_move.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
-import { hidesPrices, redactBillForTable, redactTableList } from "../price_scope.js";
+import { hidesPrices, redactBillForTable, redactMoveAnswer, redactTableList } from "../price_scope.js";
 import { mayReleaseTable } from "../release_authority.js";
 import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
 import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractEmployeeUsername, extractRestaurantId, log_audit, moveReprintFields, refuseOrderOnPrintedBill, validateAction, type PrintedBillGuard } from "./_shared.js";
@@ -1020,11 +1020,14 @@ app.post("/tables/move-order", validateAction("4ad474d4-5230-449c-874f-6a238b833
 				},
 			);
 		} catch (err) { logger.warn({ err }, "log_audit move-order failed"); }
-		res.json({
+		// The destination's running total rides MoveOrderToTable's result; a
+		// waiter-only session is not told it (redactMoveAnswer).
+		const answer = {
 			...moved, print,
 			kot_no: kotNos[0] ?? null,
 			...moveReprintFields(destinationGuard, sourceGuard),
-		});
+		};
+		res.json(hidesPrices(req.auth) ? redactMoveAnswer(answer) : answer);
 	} catch (error: any) {
 		logger.error({ err: error }, "move_order_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to move that order") });

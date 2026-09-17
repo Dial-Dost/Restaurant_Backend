@@ -27,8 +27,14 @@
  */
 import { CANCEL_NEEDS_SENIOR, ROLES_OUTRANKING_WAITER } from "./role_scope.js";
 
-/** What was refused. The sentence differs; the rule does not. */
-export type CancelRefusalAct = "cancel" | "remove_line";
+/**
+ * What was refused. The sentence differs; the rule does not.
+ *
+ * "rewind" is putting a ticketed order back to Pending (mayPutBackToPending):
+ * not a cancel by itself, but the first half of one, since a Pending order is
+ * what a waiter may decline.
+ */
+export type CancelRefusalAct = "cancel" | "remove_line" | "rewind";
 
 export class CancelNeedsSeniorError extends Error {
 	readonly code = CANCEL_NEEDS_SENIOR;
@@ -76,9 +82,13 @@ export function cancelNeedsSeniorSentence(kotNos: readonly number[], act: Cancel
 	const ticket = nos.length === 0 ? "This order" : nos.map((n) => `KOT-${String(n)}`).join(", ");
 	const verb = nos.length > 1 ? "have" : "has";
 	const only = `Only ${seniorRolesPhrase()}`;
-	return act === "remove_line"
-		? `${ticket} ${verb} gone to the kitchen, so a dish cannot be taken off it here. ${only} can do that — ask one of them.`
-		: `${ticket} ${verb} gone to the kitchen. ${only} can cancel it — ask one of them.`;
+	if (act === "remove_line") {
+		return `${ticket} ${verb} gone to the kitchen, so a dish cannot be taken off it here. ${only} can do that — ask one of them.`;
+	}
+	if (act === "rewind") {
+		return `${ticket} ${verb} gone to the kitchen, so it cannot be put back to Pending. ${only} can change that — ask one of them.`;
+	}
+	return `${ticket} ${verb} gone to the kitchen. ${only} can cancel it — ask one of them.`;
 }
 
 /** The 403 body. `allowed_roles` is the machine list; `details` is the sentence. */

@@ -120,7 +120,7 @@ import {
 import { DiscountAuthorityError, mayDiscountBill } from "./discount_authority.js";
 // Client items 3 and 4 (2026-09-17): who may cancel a ticketed order, and what
 // a move stamps on the orders it touches. Both pure; see their headers.
-import { isWaiterOnly, mayCancelTicketed, PENDING_ORDER_STATUS_CODE, type RoleScopeInput } from "./role_scope.js";
+import { isWaiterOnly, mayCancelTicketed, mayPutBackToPending, PENDING_ORDER_STATUS_CODE, type RoleScopeInput } from "./role_scope.js";
 import { CancelNeedsSeniorError } from "./cancel_authority.js";
 import {
   appendOrderMove,
@@ -14380,7 +14380,8 @@ export async function UpdateOrderItemsSplit(
   const waiterStrip = takenOff.length > 0 && opts?.actor != null && isWaiterOnly(opts.actor);
   // The status is read only for the one caller the rule applies to, so every
   // other edit issues exactly the statements it always did.
-  if (waiterStrip && opts?.actor != null && !mayCancelTicketed(opts.actor, await readOrderStatusCode(context, orderId))) {
+  if (waiterStrip && opts?.actor != null
+      && !(await waiterMayCancel(context, opts.actor, orderId, await readOrderStatusCode(context, orderId)))) {
     throw new CancelNeedsSeniorError(orderId, "remove_line");
   }
 
@@ -14530,9 +14531,15 @@ export async function UpdateOrderItemsSplit(
       waiterStrip ? String(PENDING_ORDER_STATUS_CODE) : null],
   );
   if (!written[0] && waiterStrip) {
-    // Accepted to the kitchen while this was being built: it is a ticket now.
+    // Settled, cancelled or awaiting payment approval since: the house words.
     await assertOrderStatusEditable(context, orderId, undefined, { refuseWhilePaymentPending: true });
-    throw new CancelNeedsSeniorError(orderId, "remove_line");
+    // Accepted to the kitchen while this was being built: it is a ticket now.
+    // Still Pending means the pin was not what missed (a comp changed the
+    // lines), so the ordinary "changed on another screen" answer below is the
+    // true one — a "REFUSED" audit line would name an act nobody refused.
+    if ((await readOrderStatusCode(context, orderId)) !== PENDING_ORDER_STATUS_CODE) {
+      throw new CancelNeedsSeniorError(orderId, "remove_line");
+    }
   }
   if (!written[0]) {
     // Settled, cancelled or awaiting approval in the meantime: the house words.
@@ -14837,12 +14844,32 @@ export async function AddOrder(
   // actually store (the merge above turns a resend that adds lines back into
   // Preparing), against the status the order holds now, before anything is
   // written.
-  if (!isNewOrder && statusCode === 5 && opts?.actor != null) {
-    const storedCode = Number(existingOrderRows[0]?.status ?? 1);
-    if (storedCode !== 5 && !mayCancelTicketed(opts.actor, storedCode)) {
-      throw new CancelNeedsSeniorError(id);
-    }
+  const storedCode = isNewOrder ? null : Number(existingOrderRows[0]?.status ?? 1);
+  const upsertActor = !isNewOrder && opts?.actor != null && isWaiterOnly(opts.actor) ? opts.actor : null;
+  // NEVER BACK TO PENDING FOR A WAITER-ONLY LOGIN (mayPutBackToPending) — and
+  // here, unlike PATCH /orders/:id/status, the stage the body names is KEPT
+  // rather than refused. This route is also the dashboard's whole-order save,
+  // which resends whatever status the screen last read: an edit made from a
+  // list that still said Pending after the ticket was accepted is an ordinary
+  // edit, not an attempt to un-ticket it, so it lands on the stage the order
+  // really has. What it can no longer do is make a ticket look Pending, which
+  // was the first half of a two-request cancel.
+  if (upsertActor !== null && storedCode !== null && statusCode === PENDING_ORDER_STATUS_CODE
+      && !mayPutBackToPending(upsertActor, storedCode)) {
+    statusCode = storedCode;
+    (order as any).status = fromOrderStatusCode(storedCode);
   }
+  if (!isNewOrder && statusCode === 5 && opts?.actor != null && storedCode !== 5
+      && !(await waiterMayCancel(context, opts.actor, id, storedCode))) {
+    throw new CancelNeedsSeniorError(id);
+  }
+  // …and whenever the waiter rule rested on "still Pending", the write says so,
+  // as SetOrderStatus's does: a decline (or a Pending resend) that arrives after
+  // an acceptance matches nothing and is answered below, instead of cancelling
+  // the ticket that has just printed or putting it back to Pending.
+  const upsertPin = upsertActor !== null && (statusCode === 5 || statusCode === PENDING_ORDER_STATUS_CODE)
+    ? String(PENDING_ORDER_STATUS_CODE)
+    : null;
 
   // SECURITY: never bill a staff-entered line below its menu price, and never
   // trust the client's subtotal/total. A waiter posting {price: 390 x3, total: 1}
@@ -14944,7 +14971,7 @@ export async function AddOrder(
     if (existingPayload[key] !== undefined) {payload[key] = existingPayload[key];}
   }
 
-  await runQuery(
+  const upserted = await runQuery<{ id: string }>(
     `
       insert into "Orders"
         (id, created_at, res_id, outlet_id, food, table_id, status, cust_id, barked_at)
@@ -14957,9 +14984,21 @@ export async function AddOrder(
         status = excluded.status,
         cust_id = coalesce(excluded.cust_id, "Orders".cust_id),
         barked_at = coalesce("Orders".barked_at, excluded.barked_at)
+      where $9::text is null or coalesce("Orders".status::text, '1') = $9::text
+      returning id
     `,
-    [id, context.res_id, context.outlet_id, JSON.stringify(payload), table.id, statusCode, customerId, barkedAt],
+    [id, context.res_id, context.outlet_id, JSON.stringify(payload), table.id, statusCode, customerId, barkedAt, upsertPin],
   );
+  // Only a pinned write can match nothing (an unpinned upsert always inserts or
+  // updates), so every other caller skips this.
+  if (upsertPin !== null && upserted.length === 0) {
+    // Declined, cancelled or settled on another screen: the house words.
+    await assertOrderStatusEditable(context, id);
+    // Accepted to the kitchen: a decline is now a cancel of a ticket…
+    if (statusCode === 5) {throw new CancelNeedsSeniorError(id);}
+    // …and a Pending resend is an edit of a ticket this screen has not seen.
+    throw new Error("This order was sent to the kitchen while it was being edited. Refresh it and try again.");
+  }
 
   // Ensure the Tables.row linked_order_id is updated to point to this order
   try {
@@ -16017,9 +16056,19 @@ export async function MoveBillItem(
       // was not), and moving it changes neither. A Served order with no bark
       // time (written before the column existed) is stamped now, because an
       // un-barked order may not stand past the kitchen queue.
+      //
+      // A TICKETED DISH IS STAMPED NOW TOO, as every moved dish was before
+      // 2.0.2, even when its source was never barked (the usual case: GGV
+      // barked 1 of 80 printed tickets in a fortnight). The kitchen has paper
+      // for it, and printKotItemMove re-dockets it under that number — a PINNED
+      // number, which memoises nothing for this new order. Left un-barked, both
+      // clients would offer "Bark → kitchen" on it, and the bark's
+      // autoPrintOrderKot would find no memo for (this table, this dish) and
+      // print the dish again under a NEW number: a second order, as far as the
+      // pass can tell. A barked order stops at BarkOrder's already_barked.
       const barkedAt = source.barked_at
         ? new Date(source.barked_at).toISOString()
-        : (statusCode === 2 ? at : null);
+        : (statusCode === 2 || kotNos.length > 0 ? at : null);
       await runQuery(
         `insert into "Orders" (id, created_at, res_id, outlet_id, food, table_id, status, barked_at) values ($1, now(), $2, $3, $4::json, $5, $6, $7)`,
         [newOrderId, context.res_id, context.outlet_id, JSON.stringify(food), toId, statusCode, barkedAt],
@@ -23330,6 +23379,35 @@ async function readOrderStatusCode(
 }
 
 /**
+ * CLIENT ITEM 3 — MAY THIS LOGIN CANCEL THIS ORDER, given the status the
+ * writer just read? mayCancelTicketed, plus the fact the status column cannot
+ * be trusted to carry alone: the KOT numbers PrintJobs holds for the order
+ * (migration 043). A Pending order with a printed number was ticketed before
+ * somebody put it back to Pending, and a waiter-only login does not cancel it.
+ *
+ * THE READ IS MADE ONLY WHERE IT CAN CHANGE THE ANSWER — a waiter-only login
+ * and a Pending order — so every other write issues exactly the statements it
+ * always did. `printedKotNos` lets a caller that must not open a second pooled
+ * connection (VoidOrderWithReason, inside its transaction) read it first.
+ * GetKotNumbersForOrders never throws and answers nothing when 043 is not
+ * applied, which leaves the status rule standing on its own.
+ */
+async function waiterMayCancel(
+  context: RestaurantContext,
+  actor: RoleScopeInput,
+  orderId: string,
+  previousCode: number | null,
+  printedKotNos?: readonly number[],
+): Promise<boolean> {
+  if (!isWaiterOnly(actor)) {return true;}
+  if (previousCode !== PENDING_ORDER_STATUS_CODE) {return false;}
+  const nos = printedKotNos
+    ?? (await GetKotNumbersForOrders(context.res_id, context.outlet_id, [orderId])).get(orderId)
+    ?? [];
+  return mayCancelTicketed(actor, previousCode, nos);
+}
+
+/**
  * The shared cancelled guard. Kept callable on its own (not only through
  * assertOrderStatusEditable) so a path that is NOT a status edit — DeleteOrder —
  * can refuse cancelled orders with a message that fits what it was asked to do.
@@ -23509,10 +23587,23 @@ export async function SetOrderStatus(
   // CLIENT ITEM 3 — THE CHECK LIVES HERE, beside the read it depends on, and
   // before anything is written: a refusal flips no status, writes no void row
   // and prints no slip (the route only reaches those after this returns).
-  const waiterCancel = code === 5 && opts?.actor != null && isWaiterOnly(opts.actor);
-  if (code === 5 && opts?.actor != null && !mayCancelTicketed(opts.actor, previousCode)) {
+  //
+  // TWO WRITES ARE JUDGED, because "Pending" is what makes a waiter's cancel a
+  // decline: the cancel itself, and a move BACK to Pending, which was the first
+  // half of a two-request cancel of a ticket the kitchen holds (and which
+  // suppressed the CANCELLED slip on the way). See mayPutBackToPending.
+  //
+  // A settled or cancelled order is not judged here: assertOrderStatusEditable
+  // below refuses it in the words every other edit gets.
+  const waiterOnly = opts?.actor != null && isWaiterOnly(opts.actor);
+  const locked = previousCode === 5 || previousCode === 4 || previousCode === 7;
+  if (!locked && code === PENDING_ORDER_STATUS_CODE && opts?.actor != null && !mayPutBackToPending(opts.actor, previousCode)) {
+    throw new CancelNeedsSeniorError(orderId, "rewind");
+  }
+  if (!locked && code === 5 && opts?.actor != null && !(await waiterMayCancel(context, opts.actor, orderId, previousCode))) {
     throw new CancelNeedsSeniorError(orderId);
   }
+  const waiterPinned = waiterOnly && (code === 5 || code === PENDING_ORDER_STATUS_CODE);
   // Cancelled is terminal; Paid/Closed are locked. Any other transition off a
   // cancelled order is refused here, which is what makes PATCH
   // /orders/:id/status (and every other caller) safe.
@@ -23523,7 +23614,9 @@ export async function SetOrderStatus(
   // A waiter's decline is allowed ONLY because the order is still Pending, so
   // the write says so: if the order was accepted to the kitchen between the
   // read above and this statement, it matches nothing and is refused below
-  // rather than cancelling a ticket that has just printed.
+  // rather than cancelling a ticket that has just printed. A waiter's
+  // Pending -> Pending is pinned the same way, so it cannot land on top of that
+  // acceptance and undo it.
   const rows = await runQuery<{ id: string }>(
     `
       update "Orders"
@@ -23533,10 +23626,24 @@ export async function SetOrderStatus(
         and ($6::text is null or coalesce(status::text, '1') = $6::text)
       returning id
     `,
-    [code, status, orderId, context.res_id, context.outlet_id, waiterCancel ? String(PENDING_ORDER_STATUS_CODE) : null],
+    [code, status, orderId, context.res_id, context.outlet_id, waiterPinned ? String(PENDING_ORDER_STATUS_CODE) : null],
   );
-  if (rows.length === 0 && waiterCancel && (await readOrderStatusCode(context, orderId)) !== null) {
-    throw new CancelNeedsSeniorError(orderId);
+  if (rows.length === 0 && waiterPinned) {
+    // The pinned write missed: the order is no longer Pending. What it is NOW
+    // decides the answer, so a decline that lost a race is told the truth.
+    const nowCode = await readOrderStatusCode(context, orderId);
+    if (nowCode === null) {return { ok: false, changed: false, previous_status: null };}
+    // Declined by somebody else in the meantime — the order is where this
+    // caller wanted it. The same harmless no-op as the replay at the top, and
+    // for the same reason: a 403 here would park a red chip for a cancel that
+    // happened, and write a "REFUSED" audit line for an act nobody refused.
+    if (nowCode === 5 && code === 5) {
+      return { ok: true, changed: false, previous_status: "Cancelled" };
+    }
+    // Cancelled (for a rewind) or settled: the house words.
+    await assertOrderStatusEditable(context, orderId);
+    // Accepted to the kitchen: it is a ticket now.
+    throw new CancelNeedsSeniorError(orderId, code === 5 ? "cancel" : "rewind");
   }
   if (rows.length > 0) {
     try { await applyTimingForStatus(context, orderId, status); } catch (err) { logger.warn({ err }, "timing status hook failed"); }
@@ -41073,11 +41180,22 @@ export async function VoidOrderWithReason(
 ): Promise<VoidOrderWithReasonResult> {
   const orderId = String(input.order_id ?? "").trim();
   if (!orderId) {throw new Error("order id is required");}
+  const locked = opts?.actor != null && isWaiterOnly(opts.actor);
+  // The printed KOT numbers the waiter rule also asks (waiterMayCancel), read
+  // BEFORE the transaction so it never holds a second pooled connection while
+  // its own is open — and so before the status is known, which costs one read
+  // for the rare waiter-only login a tenant granted Void Orders, and nothing
+  // for anyone else. A number, once printed, stays printed, so reading it first
+  // loses nothing; the approval race is the row lock's job below.
+  let printedKotNos: number[] = [];
+  if (locked) {
+    const context = await requireRestaurantContext(restaurantId);
+    printedKotNos = (await GetKotNumbersForOrders(context.res_id, context.outlet_id, [orderId])).get(orderId) ?? [];
+  }
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     // `for update` when the role rule applies: the verdict rests on this read,
     // so the row must not be accepted to the kitchen between it and the write.
-    const locked = opts?.actor != null && isWaiterOnly(opts.actor);
     const previousCode = locked
       ? await runQuery<{ status: number | string | null }>(
         `select status from "Orders" where id = $1 and res_id = $2 and outlet_id = $3 limit 1 for update`,
@@ -41088,7 +41206,8 @@ export async function VoidOrderWithReason(
     if (previousCode === null) {return { ok: false };}
     // CLIENT ITEM 3. Inside the transaction and before the ledger write, so a
     // refusal rolls back to nothing: no void row, no status flip, no slip.
-    if (opts?.actor != null && previousCode !== 5 && !mayCancelTicketed(opts.actor, previousCode)) {
+    if (opts?.actor != null && previousCode !== 5 && previousCode !== 4 && previousCode !== 7
+        && !(await waiterMayCancel(context, opts.actor, orderId, previousCode, printedKotNos))) {
       throw new CancelNeedsSeniorError(orderId);
     }
     // Cancelled is terminal and Paid/Closed are locked — the same guard, and the
