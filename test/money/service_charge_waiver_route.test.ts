@@ -78,7 +78,7 @@ const AUTH = {
   employeeUsername: "cashier1", role: "admin", actions: ["*"],
 };
 
-async function waive(): Promise<Answer> {
+async function waive(overrides: Record<string, unknown> = {}): Promise<Answer> {
   const route = registered.find((r) => r.method === "POST" && r.path === "/bills/service-charge-waiver");
   if (!route) { throw new Error("no route registered for POST /bills/service-charge-waiver"); }
   const out: Answer = { status: 200, body: undefined };
@@ -92,7 +92,7 @@ async function waive(): Promise<Answer> {
   };
   const req = {
     params: {}, query: {}, headers: {}, auth: AUTH,
-    body: { table_name: "T15", waiver_kind: "guest_request", reason: "Guest asked", authorised_by: "manager01" },
+    body: { table_name: "T15", waiver_kind: "guest_request", reason: "Guest asked", authorised_by: "manager01", ...overrides },
   };
   for (const h of route.handlers) {
     let advanced = false;
@@ -179,5 +179,53 @@ describe("the charge IS a tax line (Gaia): the client's receipt, 5457 -> 4982", 
     mockNext.waive = waiverResult(quote);
     await waive();
     expect(auditLine()).toContain("(₹474.50; ₹474.50 with its tax, before round-off; grand total ₹5457.00 → ₹4982.00)");
+  });
+});
+
+describe("the reason is optional (client item, 2.0.1): the route hands it on and lets the data layer decide", () => {
+  // Whether a reasonless waiver may be STORED is the column's answer (migration
+  // 051), and WaiveServiceCharge asks it — pinned in
+  // service_charge_waiver_reason_optional.test.ts. The route must not refuse a
+  // missing reason itself, or 051 could never turn the feature on.
+  const quote = quoteServiceChargeWaiver(5499, { SGST: 2.5, CGST: 2.5 }, 10);
+  const sentReason = (): unknown =>
+    (mockCalls.find((c) => c.fn === "WaiveServiceCharge")?.args[1] as Record<string, unknown> | undefined)?.reason;
+
+  test.each([
+    ["absent", { reason: undefined }, null],
+    ["null", { reason: null }, null],
+    ["empty", { reason: "" }, ""],
+    ["whitespace", { reason: "   " }, "   "],
+  ])("reason %s reaches WaiveServiceCharge (which stores none as NULL)", async (_label, overrides, expected) => {
+    mockNext.waive = waiverResult(quote);
+    const answer = await waive(overrides);
+    expect(answer.status).toBe(201);
+    expect(sentReason()).toBe(expected);
+  });
+
+  test("a waiver the data layer refuses for want of a reason is its clean 400, verbatim", async () => {
+    // What WaiveServiceCharge throws where the column is still NOT NULL.
+    mockNext.waive = Promise.reject(new Error("A reason is required to waive the service charge."));
+    (mockNext.waive as Promise<unknown>).catch(() => undefined);
+    const answer = await waive({ reason: undefined });
+    expect(answer.status).toBe(400);
+    expect(answer.body).toEqual({ error: "A reason is required to waive the service charge." });
+    expect(mockCalls.some((c) => c.fn === "AddAuditLogEntry")).toBe(false);
+  });
+
+  test("the kind and the authoriser are still required by the schema", async () => {
+    expect((await waive({ waiver_kind: undefined, reason: undefined })).status).toBe(400);
+    expect((await waive({ authorised_by: undefined, reason: undefined })).status).toBe(400);
+    expect((await waive({ reason: "x".repeat(401) })).status).toBe(400);
+    expect(mockCalls.some((c) => c.fn === "WaiveServiceCharge")).toBe(false);
+  });
+
+  test("the audit line of a reasonless waiver says reason: null, and its sentence never names one", async () => {
+    const result = waiverResult(quote) as { record: Record<string, unknown> };
+    result.record.reason = null;
+    mockNext.waive = result;
+    await waive({ reason: undefined });
+    expect(auditDetails()).toMatchObject({ reason: null, waiver_kind: "guest_request" });
+    expect(auditLine()).not.toMatch(/null|undefined/);
   });
 });

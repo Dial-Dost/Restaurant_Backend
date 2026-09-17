@@ -679,6 +679,10 @@ export type BillEditKind =
   // original, because "12 comps" and "12 comps, 2 of which a manager overturned"
   // are different facts and the second is the interesting one.
   | "item_non_chargeable" | "item_non_chargeable_reversed"
+  // A whole bill settled as NC (migration 052), and that settle undone by a
+  // re-open. Its own kind: "one dish comped" and "the whole table given away"
+  // are different acts, and a control reader looks for the second.
+  | "bill_non_chargeable" | "bill_non_chargeable_reversed"
   | "order_voided"
   | "service_charge_waived" | "service_charge_waiver_reversed";
 
@@ -811,6 +815,14 @@ export function classifyBillEdit(
     // own flag, not a reading of its prose. Detail shape over reason text is the
     // rule this classifier already follows everywhere below.
     case ACTION_NON_CHARGEABLE:
+      // `scope: 'bill'` is the NC settle's own flag (routes/nc_settle.ts), read
+      // before `reversal` for the same reason reversal is read at all: the
+      // writer says what it did, and the prose is never consulted.
+      if (d.scope === "bill") {
+        return d.reversal === true
+          ? hit("bill_non_chargeable_reversed", "Bill NC undone (re-opened)")
+          : hit("bill_non_chargeable", "Bill settled as non-chargeable");
+      }
       return d.reversal === true
         ? hit("item_non_chargeable_reversed", "Non-chargeable reversed")
         : hit("item_non_chargeable", "Item made non-chargeable");

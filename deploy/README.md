@@ -90,6 +90,7 @@ cold-start crash in CloudWatch rather than as a compiler error.
   Dashboard    --->  |  /print/*       -->  ALB  -->  ECS Fargate  (always-on)  |
   Guest QR     --->  |  /publish/*     -->  ALB  -->  ECS Fargate  (always-on)  |
   Till / web   --->  |  /bills/service-charge-waiver/print --> ALB --> Fargate  |
+  Till / web   --->  |  /bills/order/*/settle-nc           --> ALB --> Fargate  |
                      |  everything else -->  HTTP API  -->  Lambda              |
                      +---------------------------------------------------------+
                                           |
@@ -174,6 +175,7 @@ Lambda at all**:
 | `POST /print/bill` (also emits the per-station KOTs) | routes/bills.ts:506 | Fargate |
 | `POST /publish/bill` | routes/bills.ts:463 | Fargate |
 | `POST /bills/service-charge-waiver/print` (records the waiver, then prints through `printOpenTableBill`) | routes/mis_capture.ts | Fargate |
+| `POST /bills/order/:orderId/settle-nc` (settles the bill as non-chargeable, then prints the NC bill through `dispatchPrintJob`) | routes/nc_settle.ts | Fargate |
 
 CloudFront routes `/print/*` and `/publish/*` to the ALB. On that task the emit is
 an in-process delivery to a socket it already owns — no Redis hop, no freeze.
@@ -187,6 +189,10 @@ waiver commits, the answer says `printed: true`, and no paper comes out.
 `jest-tests/bill_print_doors_always_on.test.ts` reads every route that dispatches a
 bill print and fails if no `realtimeAlb` behaviour in `template.yaml` matches it,
 so a fourth door cannot be added under a new prefix and quietly land on Lambda.
+
+The fourth door is "Settle as NC" (client item 5), under `/bills/order/` beside
+the other settle routes. Its behaviour is `/bills/order/*/settle-nc`: the only
+route with that ending, so the wildcard drags no other bill route onto the task.
 
 **One hostname is mandatory, not cosmetic.** `printer_service.dart:96` calls
 `io.io(AppConfig.backendUrl, opts)` — the Socket.IO client is constructed from

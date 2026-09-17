@@ -5,6 +5,7 @@
 import type { Express, Request, Response } from "express";
 import { Audit_log_category, GetPublicBranding, GetRestaurantLogo, GetRestaurantProfile, GetRestaurantSettings, SetBranding, SetRestaurantSettings, UpdateRestaurantProfile } from "../database_supabase.js";
 import { BILL_LOGO_SVG_MAX_CHARS, billLogoDots, billLogoInkShare, cleanBillLogoSvg, rasterizeBillLogo } from "../bill_logo.js";
+import { parseKotPrintStyle, parseKotTextSize } from "../kot_print_style.js";
 import { logger } from "../observability.js";
 import { PaymentConfigError } from "../payment_methods.js";
 import { uploadMenuImage } from "../storage_bucket_supabase.js";
@@ -324,6 +325,34 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 		}
 		body.timezone = tz;
 	}
+	// REFUSED OUT LOUD, for the same reason the zone above is: this switch decides
+	// what the KITCHEN's paper is made of, and an owner reaches for it because a
+	// printer is producing blank tickets. Coercing an unrecognised value to the
+	// default would answer 200 to someone who had just chosen "Classic text
+	// docket" and leave the kitchen on the docket it cannot print — the save
+	// reporting success is what would stop them looking for the real problem.
+	// Only checked when the key carries a VALUE. Omitting it means "unchanged",
+	// and so does an explicit null: a client that reads the settings document and
+	// posts it back is sending what the server gave it, and refusing its null
+	// would turn every such save into a 400 over a switch that client has never
+	// heard of. Null and 'reference' mean the same thing in the column anyway, so
+	// there is nothing an owner could have intended by it that is being lost.
+	if (body.kot_print_style !== undefined && body.kot_print_style !== null && parseKotPrintStyle(body.kot_print_style) === null) {
+		res.status(400).json({
+			error: `"${String(body.kot_print_style)}" is not a KOT print style. Use "reference" for the reference docket or "classic" for the plain text docket.`,
+		});
+		return;
+	}
+	// The reference docket's type size, refused out loud on the same terms: an
+	// owner who picked "Small" and got a 200 for a value that stored nothing
+	// would stand at the pass wondering why the dockets did not change. Absent
+	// and null both mean "unchanged", for the read-modify-write client above.
+	if (body.kot_text_size !== undefined && body.kot_text_size !== null && parseKotTextSize(body.kot_text_size) === null) {
+		res.status(400).json({
+			error: `"${String(body.kot_text_size)}" is not a KOT text size. Use "small", "standard" (the reference docket's size) or "large".`,
+		});
+		return;
+	}
 	try {
 		// Snapshot before the write so the undo can restore ONLY the keys this
 		// request actually changed (never the whole settings document).
@@ -373,12 +402,30 @@ app.post("/restaurant/settings", validate, async (req: Request, res: Response) =
 			// Whether the customer bill prints the feedback/valet QR (bill_show_qr).
 			// Same rule: only an explicit boolean writes.
 			bill_show_qr: typeof body.bill_show_qr === "boolean" ? body.bill_show_qr : undefined,
+			// Which kitchen docket this restaurant prints (kot_print_style,
+			// migration 050). Already validated above, so what reaches the data
+			// layer is one of the two styles or nothing at all — the data layer
+			// parses it again and writes only on a real choice, so a client that
+			// has never heard of the switch cannot move a kitchen off the docket it
+			// is printing by leaving the key out.
+			kot_print_style: body.kot_print_style !== undefined ? body.kot_print_style : undefined,
+			// How large the reference docket's type is (kot_text_size, migration
+			// 050's second column). Validated above; written only on a real size.
+			kot_text_size: body.kot_text_size !== undefined ? body.kot_text_size : undefined,
 		});
 		const settingsUndo = buildSettingsUndo(priorSettings, result);
 		try {
 			await log_audit(req, "60d14e9c-45cc-4dc2-b017-56058cc3ae33", `Updated restaurant settings`, Audit_log_category.General, {
 				auto_push_orders: result.auto_push_orders,
 				currency: result.currency,
+				// NAMED IN THE LINE ITSELF, not left to the undo envelope, and only
+				// when this request touched it. The undo carries every changed key,
+				// but this one is the answer to "why did the kitchen stop getting
+				// paper on the 14th?" — and that question is asked by someone
+				// scanning audit entries, not by someone expanding each one.
+				...(body.kot_print_style !== undefined ? { kot_print_style: result.kot_print_style } : {}),
+				// Same rule for the size: named when this request touched it.
+				...(body.kot_text_size !== undefined ? { kot_text_size: result.kot_text_size } : {}),
 				...(settingsUndo ? { undo: settingsUndo } : {}),
 			});
 		} catch (err) { logger.warn({ err }, "log_audit settings failed"); }

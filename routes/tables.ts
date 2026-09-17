@@ -12,6 +12,7 @@ import { hidesPrices, redactBillForTable, redactTableList } from "../price_scope
 import { mayReleaseTable } from "../release_authority.js";
 import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest } from "../table_sections_order.js";
 import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractRestaurantId, log_audit, validateAction } from "./_shared.js";
+import { RESERVED_TABLE_NAME_ERROR, isReservedPartyName } from "../next_party.js";
 
 
 /*
@@ -294,6 +295,14 @@ app.post("/add-table", validateAction("194ce6ee-b867-4be3-b5f0-48c28ce0a81b"), a
 	// trimmed name, so nothing could ever address it again).
 	if (typeof table?.name !== "string" || table.name.trim().length === 0) {
 		res.status(400).json({ error: "Table name is required" });
+		return;
+	}
+	// CLIENT ITEM 6. "12 #2" is the name the server gives the next party at a
+	// printed table 12, so a hand-made table may not take that shape — two rows
+	// answering to one name would put an order on the wrong bill. Said in words,
+	// not folded into the "Table exists" the catch below answers with.
+	if (isReservedPartyName(table.name)) {
+		res.status(400).json({ error: RESERVED_TABLE_NAME_ERROR, code: "reserved_table_name" });
 		return;
 	}
 

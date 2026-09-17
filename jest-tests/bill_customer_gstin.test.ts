@@ -677,7 +677,11 @@ describe("every bill print path hands the GSTIN to the renderer", () => {
   test("/print/bill, /print/bill/settled and the split print all pass customerGstin", () => {
     const src = source();
     expect(src.match(/customerGstin:\s*bill\.customer_gstin\s*\?\?\s*null/g)).toHaveLength(3);
+    // The settled reprint (and the NC settle's paper) build their options in
+    // settledBillReceiptOptions; the route must hand it the settled bill.
     const settled = src.slice(src.indexOf("app.post('/print/bill/settled'"));
-    expect(settled.slice(0, settled.indexOf("\n});"))).toMatch(/customerGstin:\s*bill\.customer_gstin/);
+    expect(settled.slice(0, settled.indexOf("\n});"))).toMatch(/settledBillReceiptOptions\(bill, \{/);
+    const options = src.slice(src.indexOf("export function settledBillReceiptOptions("));
+    expect(options.slice(0, /\r?\n\}\r?\n/.exec(options)?.index ?? 0)).toMatch(/customerGstin:\s*bill\.customer_gstin/);
   });
 });

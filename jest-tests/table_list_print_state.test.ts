@@ -238,6 +238,34 @@ describe("the shipped /get-tables payload", () => {
     expect(row?.bill_printed_at).toBe(PRINT_1);
   });
 
+  test("THE SEATING-START REGRESSION: a bill row made AFTER a fallback print does not un-print the table", async () => {
+    // Production, GGV table 12 on 2026-09-16: the waiter printed at 08:02 with no
+    // "Bills" row, so the job was filed under "12-<epoch>"; the manager's waiver
+    // made the row at 08:05. The seating used to start at the ROW, i.e. after
+    // its own print — the print stopped counting, the table came back onto the
+    // waiter's floor and their one print was handed back. The start is now the
+    // EARLIER of the row and the first still-owing order (seatingStartOf).
+    fx.bills = [
+      { id: BILL_T7, table_id: T7, created_at: SEATED_AT },
+      { id: "66666666-6666-6666-6666-666666666666", table_id: T8, created_at: "2026-09-11T13:45:00.000Z" },
+    ];
+    fx.printJobs = [{ bill_id: "T8-1789000000000", created_at: PRINT_1 }];
+    const row = await tableRow("T8");
+    expect(row?.print_count).toBe(1);
+    expect(row?.bill_printed_at).toBe(PRINT_1);
+  });
+
+  test("a SPLIT print of the open bill counts as a print of it", async () => {
+    fx.printJobs = [
+      { bill_id: `${BILL_T7}-split-1of2`, created_at: PRINT_1 },
+      { bill_id: `${BILL_T7}-split-2of2`, created_at: PRINT_1 },
+    ];
+    expect((await tableRow("T7"))?.print_count).toBe(2);
+    // …and only of THAT bill: another bill's split is not T7's.
+    fx.printJobs = [{ bill_id: "99999999-9999-9999-9999-999999999999-split-1of2", created_at: PRINT_1 }];
+    expect((await tableRow("T7"))?.print_count).toBe(0);
+  });
+
   test("ONE query for the whole floor, not one per table", async () => {
     // /get-tables is the most-polled endpoint in the product. A per-table
     // aggregate would add a round trip per table to every poll of every device.

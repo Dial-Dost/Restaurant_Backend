@@ -127,8 +127,11 @@ import type { Express, Request, Response } from "express";
 import {
 	Audit_log_category,
 	DeletePrintDestination,
+	GetKotPrintStyle,
+	GetKotTextSize,
 	GetPrintDeviceTargets,
 	GetRestaurantProfile,
+	GetRestaurantSettings,
 	ListPrintDestinations,
 	ListPrintDevices,
 	ListPrintRoutes,
@@ -172,9 +175,21 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
  *  roll; past the cap the response says how many were skipped. */
 const MAX_TEST_ROLES = 12;
 
-/** Paper width for the test slip, in columns. Same two widths the bill path
- *  offers (58mm = 32, 80mm = 48). */
-const TEST_SLIP_COLS = 48;
+/**
+ * Paper width for the test slip, in columns — the restaurant's own roll, read
+ * the way every docket dispatcher reads it (58mm = 32, anything else = 48).
+ *
+ * NOT A CONSTANT. Since the slip is the reference RASTER docket, its width is
+ * its image's width in dots: 576 at 48 columns, 384 at 32. A 58mm head handed a
+ * 576-dot image drops or crops it, so a fixed 48 made the button report "blank"
+ * on a printer that prints every real docket fine — and send the owner to the
+ * Classic switch for nothing. A failed settings read is the 80mm the constant
+ * used to say.
+ */
+async function testSlipCols(restaurantId: string): Promise<number> {
+	const settings = await GetRestaurantSettings(restaurantId).catch(() => null);
+	return settings?.bill_paper_width === "58mm" ? 32 : 48;
+}
 
 /** Same 750ms outletDeviceSockets races the adapter with. A health screen that
  *  hangs on a wedged Redis adapter is worse than one that says "unknown". */
@@ -1129,6 +1144,20 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 
 		const profile = await GetRestaurantProfile(ctx.restaurantId).catch(() => null);
 		const restaurantName = profile?.outlet_name || profile?.restaurant_name || "Printer test";
+		// THE TEST SLIP PRINTS IN THIS RESTAURANT'S OWN KOT STYLE, and this is the
+		// one place where that matters most. The slip's whole job is to answer "does
+		// paper come out of that machine?" — so it has to be made of the same bytes
+		// the machine will be sent at service. A slip that always printed as text
+		// would come out clean on a printer that cannot draw the raster docket and
+		// tell the owner their setup is fine, which is the exact false negative this
+		// button exists to rule out. It is also the fastest way to CHECK the switch:
+		// flip to Classic, press test, read the paper.
+		const kotPrintStyle = await GetKotPrintStyle(ctx.restaurantId);
+		// And at the restaurant's own type size, for the same reason: an owner who
+		// has just picked "Small" presses this to see what the kitchen will get.
+		const kotTextSize = await GetKotTextSize(ctx.restaurantId);
+		// And on the restaurant's own roll: a raster's width IS the roll's.
+		const cols = await testSlipCols(ctx.restaurantId);
 		const stamp = new Date();
 		const results: Record<string, unknown>[] = [];
 		for (const role of roles) {
@@ -1150,7 +1179,9 @@ app.post("/print/test", validateAction(PERM_PRINT), async (req: Request, res: Re
 				printedAt: stamp.toISOString().slice(0, 16).replace("T", " "),
 				orderContext: "Printer test",
 				station,
-			}, TEST_SLIP_COLS)[0];
+				kotPrintStyle,
+				kotTextSize,
+			}, cols)[0];
 			if (!ticket) { continue; }
 			// bill_id is TEXT and is the handle a human uses to find this job in the
 			// queue afterwards. Stamped with the clock so two presses are two rows —

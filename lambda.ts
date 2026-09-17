@@ -79,9 +79,10 @@
 // It costs what it costs, stated plainly: two Redis connections and their TLS
 // handshakes are now ON the cold-start path instead of racing it. That is the
 // price of the emits actually leaving the container. Printing does not depend on
-// it either way — POST /print/bill, POST /publish/bill and POST
-// /bills/service-charge-waiver/print are routed to the always-on Fargate task by
-// the CloudFront behaviours in deploy/template.yaml.
+// it either way — POST /print/bill, POST /publish/bill, POST
+// /bills/service-charge-waiver/print and POST /bills/order/:orderId/settle-nc
+// are routed to the always-on Fargate task by the CloudFront behaviours in
+// deploy/template.yaml.
 // ---------------------------------------------------------------------------
 
 import type { RequestListener } from "node:http";
@@ -417,7 +418,9 @@ export const handler: Handler<unknown, unknown> = async (event, context) => {
 	// money — POST /print/bill (routes/bills.ts, which also emits the per-station
 	// KOTs), POST /publish/bill (routes/bills.ts), and the one that is not under
 	// /print/, POST /bills/service-charge-waiver/print (routes/mis_capture.ts,
-	// which records a waiver and then prints through printOpenTableBill) — are
+	// which records a waiver and then prints through printOpenTableBill) and POST
+	// /bills/order/:orderId/settle-nc (routes/nc_settle.ts, which settles a bill
+	// as non-chargeable and then prints it through dispatchPrintJob) — are
 	// therefore routed to the always-on task by the CloudFront behaviours in
 	// deploy/template.yaml and never reach this code path.
 	// jest-tests/bill_print_doors_always_on.test.ts holds that list to the routes.

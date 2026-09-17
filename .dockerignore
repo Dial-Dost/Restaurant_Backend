@@ -19,6 +19,13 @@ __pycache__
 .ruff_cache
 .mypy_cache
 
+# Fonts. The KOT raster prints from kot_glyph_atlas.ts, a COMMITTED table of
+# pre-rendered glyphs; the .ttf files these were built from are dev-time input
+# to scripts/build_kot_glyph_atlas.ts and have no business in a runtime image
+# (the Dockerfile copies scripts/ for the migration runner). Keeping them out is
+# also what makes "the server parses no font" a fact rather than an intention.
+scripts/kot_fonts
+
 # Tests / test artifacts
 test
 jest-tests
