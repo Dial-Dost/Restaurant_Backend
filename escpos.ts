@@ -137,6 +137,17 @@ export interface ReceiptOptions {
    * Absent prints NOTHING — the same rule `gstin` obeys for the restaurant's own.
    */
   customerGstin?: string | null;
+  /**
+   * BILL ONLY (client item 7): the guest's address, printed as "Address: <line 1>"
+   * and then one line per stored line, directly under "Customer GSTIN:" and
+   * above the rule that closes the customer slot — so the slot reads Name,
+   * GSTIN, Address. Pre-normalized by the caller (customer_address.ts: LF line
+   * breaks, at most 5 lines and 250 characters). Each line is word-wrapped on
+   * its own, so the breaks the guest gave survive and no value is cut; a token
+   * wider than the roll is hard-split, never dropped. Absent prints NOTHING,
+   * and a bill without one is byte-for-byte the bill 2.0.1 printed.
+   */
+  customerAddress?: string | null;
   billNo?: string | null;
   cashier?: string | null;
   /**
@@ -471,6 +482,27 @@ function addressLines(address: string, width: number): string[] {
     .map((l) => l.trim())
     .filter(Boolean)
     .flatMap((l) => wrapText(l, width));
+}
+
+/**
+ * The GUEST's address (client item 7) as the customer slot's entries: one per
+ * stored line, the first labelled "Address:", each to be wrapped on its own.
+ *
+ * Spelled out here rather than imported, because this file keeps its one
+ * data-only import. customer_address.ts's customerAddressBillLines is the same
+ * rule, and jest-tests/bill_customer_address.test.ts holds the two together —
+ * as the web's billCustomerLines and the app's are held to the paper.
+ *
+ * Unlike addressLines above, the label goes on BEFORE wrapping: it is part of
+ * the first line's width, and a label wrapped onto a line of its own would not
+ * be read as belonging to the address.
+ */
+function customerAddressEntries(address: string): string[] {
+  return address
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l, i) => (i === 0 ? `Address: ${l}` : l));
 }
 
 /**
@@ -1622,7 +1654,8 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // WHO THE BILL IS MADE OUT TO — the "Name:" slot the client's own printed
     // bill has, between the restaurant header and the date block, worded as it
     // is there. Round 2 item 1 adds the corporate party's GSTIN directly under
-    // it, only when one is set.
+    // it, only when one is set; client item 7 adds the guest's address under
+    // that, only when one is set.
     //
     // A WALK-IN LEAVES THE SLOT BLANK, as the client's bill does. "Guest" is the
     // placeholder the ordering flows store for "nobody gave a name"; printed, it
@@ -1632,6 +1665,13 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     for (const l of wrapText(asciiSafe(named ? `Name: ${named}` : "Name:"), W)) {line(l);}
     const customerGstin = present(opts.customerGstin);
     if (customerGstin) {for (const l of wrapText(asciiSafe(`Customer GSTIN: ${customerGstin}`), W)) {line(l);}}
+    // THE ADDRESS, ONE STORED LINE AT A TIME. Split before wrapping (see
+    // customerAddressEntries): wrapText splits on any whitespace, and would
+    // otherwise fold the guest's lines into one paragraph. ASCII-folded before
+    // it is measured, like every other field here.
+    for (const entry of customerAddressEntries(present(opts.customerAddress))) {
+      for (const l of wrapText(asciiSafe(entry), W)) {line(l);}
+    }
     rule();
   }
   const now = new Date().toLocaleString();

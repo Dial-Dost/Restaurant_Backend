@@ -244,7 +244,7 @@ describe("GSTIN validation — one rule, mirrored by every client", () => {
 describe("the running table's bill: name + GSTIN", () => {
   test("EVERY still-owing order carries the GSTIN beside the name, and the open bill row gets it", async () => {
     const r = await db.SetBillCustomerName(RES, "T7", "Acme Pvt Ltd", "29abcde 1234f1z5");
-    expect(r).toEqual({ success: true, customer: "Acme Pvt Ltd", customer_gstin: GSTIN, orders_updated: 2 });
+    expect(r).toEqual({ success: true, customer: "Acme Pvt Ltd", customer_gstin: GSTIN, customer_address: null, orders_updated: 2 });
     expect(fx.orderWrites.map((w) => w.id).sort()).toEqual(["o1", "o2"]);
     for (const w of fx.orderWrites) {
       expect(w.food.customer).toBe("Acme Pvt Ltd");

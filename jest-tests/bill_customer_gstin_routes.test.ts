@@ -135,22 +135,23 @@ describe("POST /bills/customer-name — the running table", () => {
   test("OMITTED customer_gstin reaches the data layer as undefined (unchanged), and old clients see the same result plus the field", async () => {
     const r = await live({ table_name: "T7", customer: "Acme" });
     expect(r.status).toBe(200);
-    expect(SetBillCustomerName).toHaveBeenCalledWith(RES, "T7", "Acme", undefined);
-    expect(SetBillCustomerName.mock.calls[0]).toHaveLength(4);
+    // Client item 7: the address is the fifth argument, and omitted too.
+    expect(SetBillCustomerName).toHaveBeenCalledWith(RES, "T7", "Acme", undefined, undefined);
+    expect(SetBillCustomerName.mock.calls[0]).toHaveLength(5);
     expect(r.body).toEqual({ success: true, customer: "Acme", customer_gstin: "27AAAAA0000A1Z5", orders_updated: 2 });
   });
 
   test("a valid GSTIN is passed normalized (lowercase + spaces)", async () => {
     const r = await live({ table_name: "T7", customer: "Acme", customer_gstin: " 29abcde 1234 f1z5 " });
     expect(r.status).toBe(200);
-    expect(SetBillCustomerName).toHaveBeenCalledWith(RES, "T7", "Acme", GSTIN);
+    expect(SetBillCustomerName).toHaveBeenCalledWith(RES, "T7", "Acme", GSTIN, undefined);
     expect((r.body as Record<string, unknown>).customer_gstin).toBe(GSTIN);
   });
 
   test.each([[null], [""], ["   "]])("customer_gstin %p CLEARS (null reaches the data layer)", async (value) => {
     const r = await live({ table_name: "T7", customer: "Acme", customer_gstin: value });
     expect(r.status).toBe(200);
-    expect(SetBillCustomerName).toHaveBeenCalledWith(RES, "T7", "Acme", null);
+    expect(SetBillCustomerName).toHaveBeenCalledWith(RES, "T7", "Acme", null, undefined);
   });
 
   test.each([["29ABCDE1234F1Z"], ["hello"], [12345], [{ gstin: GSTIN }]])("invalid %p -> 400 with the contract sentence; nothing written", async (value) => {
@@ -187,7 +188,7 @@ describe("POST /bills/:billId/customer-details — a past (settled) bill", () =>
   test("an accountant changes both; the response is exactly the contract's shape", async () => {
     const r = await past({ customer: "Acme Pvt Ltd", customer_gstin: "29abcde1234f1z5" });
     expect(r.status).toBe(200);
-    expect(SetClosedBillCustomerDetails).toHaveBeenCalledWith(RES, BILL_ID, "Acme Pvt Ltd", GSTIN);
+    expect(SetClosedBillCustomerDetails).toHaveBeenCalledWith(RES, BILL_ID, "Acme Pvt Ltd", GSTIN, undefined);
     expect(r.body).toEqual({ success: true, bill_id: BILL_ID, customer: "Acme Pvt Ltd", customer_gstin: GSTIN });
   });
 
@@ -223,11 +224,11 @@ describe("POST /bills/:billId/customer-details — a past (settled) bill", () =>
 
   test("\"\" and null clear; omitted leaves it unchanged", async () => {
     await past({ customer: "Acme", customer_gstin: "" });
-    expect(SetClosedBillCustomerDetails).toHaveBeenLastCalledWith(RES, BILL_ID, "Acme", null);
+    expect(SetClosedBillCustomerDetails).toHaveBeenLastCalledWith(RES, BILL_ID, "Acme", null, undefined);
     await past({ customer: "Acme", customer_gstin: null });
-    expect(SetClosedBillCustomerDetails).toHaveBeenLastCalledWith(RES, BILL_ID, "Acme", null);
+    expect(SetClosedBillCustomerDetails).toHaveBeenLastCalledWith(RES, BILL_ID, "Acme", null, undefined);
     await past({ customer: "Acme" });
-    expect(SetClosedBillCustomerDetails).toHaveBeenLastCalledWith(RES, BILL_ID, "Acme", undefined);
+    expect(SetClosedBillCustomerDetails).toHaveBeenLastCalledWith(RES, BILL_ID, "Acme", undefined, undefined);
   });
 
   test("migration 046 not applied -> 503 with the contract sentence", async () => {
@@ -250,7 +251,7 @@ describe("POST /bills/:billId/customer-details — a past (settled) bill", () =>
 
   test("the response carries no money", async () => {
     const r = await past({ customer: "Acme", customer_gstin: GSTIN });
-    expect(Object.keys(r.body as object).sort()).toEqual(["bill_id", "customer", "customer_gstin", "success"]);
+    expect(Object.keys(r.body as object).sort()).toEqual(["bill_id", "customer", "customer_address", "customer_gstin", "success"]);
   });
 });
 

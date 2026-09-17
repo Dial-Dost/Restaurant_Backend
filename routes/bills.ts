@@ -12,6 +12,7 @@ import { ncSettlementPrintJobId } from "../bill_print_state.js";
 import { isNcSettleMethod } from "../payment_methods.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
+import { CUSTOMER_ADDRESS_ERROR, CustomerAddressInvalidError, CustomerAddressSchemaPendingError, normalizeCustomerAddress } from "../customer_address.js";
 import { dispatchKot, logKotDispatched } from "../kot_print.js";
 import { kotStamp } from "../kot_numbers.js";
 import { logger } from "../observability.js";
@@ -945,10 +946,25 @@ function customerGstinFromBody(body: Record<string, unknown>): string | null | u
 	return r.ok ? r.value : INVALID_GSTIN;
 }
 
-/** The two GSTIN refusals the data layer can raise, as their HTTP answers. True when it answered. */
+// Client item 7 — `customer_address`, read the same way: ABSENT is undefined
+// (unchanged), null or "" clears it, and a value over the limits is
+// INVALID_ADDRESS, answered 400 before anything is written. Over the limits is
+// refused, never cut — see customer_address.ts.
+const INVALID_ADDRESS = Symbol("invalid_address");
+function customerAddressFromBody(body: Record<string, unknown>): string | null | undefined | typeof INVALID_ADDRESS {
+	if (!Object.prototype.hasOwnProperty.call(body, "customer_address") || body.customer_address === undefined) { return undefined; }
+	const r = normalizeCustomerAddress(body.customer_address);
+	return r.ok ? r.value : INVALID_ADDRESS;
+}
+
+/**
+ * The refusals the data layer can raise for the GSTIN (046) and the address
+ * (054), as their HTTP answers. True when it answered.
+ */
 function sendCustomerGstinError(res: Response, err: unknown): boolean {
 	const name = (err as { name?: unknown } | null)?.name;
-	if (err instanceof CustomerGstinSchemaPendingError || name === "CustomerGstinSchemaPendingError") {
+	if (err instanceof CustomerGstinSchemaPendingError || name === "CustomerGstinSchemaPendingError"
+		|| err instanceof CustomerAddressSchemaPendingError || name === "CustomerAddressSchemaPendingError") {
 		res.status(503).json({ error: (err as Error).message });
 		return true;
 	}
@@ -956,7 +972,21 @@ function sendCustomerGstinError(res: Response, err: unknown): boolean {
 		res.status(400).json({ error: CUSTOMER_GSTIN_ERROR });
 		return true;
 	}
+	if (err instanceof CustomerAddressInvalidError || name === "CustomerAddressInvalidError") {
+		res.status(400).json({ error: CUSTOMER_ADDRESS_ERROR });
+		return true;
+	}
 	return false;
+}
+
+/**
+ * The audit sentence's tail for an address edit — nothing when it was not sent.
+ * The address itself goes in the entry's details, never in the sentence a
+ * report prints.
+ */
+function addressAuditTail(address: string | null | undefined): string {
+	if (address === undefined) { return ""; }
+	return address ? " (address updated)" : " (address cleared)";
 }
 
 /** The open bill GetBillForTable reads, once a caller has answered the empty table. */
@@ -1171,6 +1201,8 @@ export async function printOpenTableBill(
 		total: charges.subtotal,
 		customer: bill.customer,
 		customerGstin: bill.customer_gstin ?? null,
+		// Client item 7 — the guest's address, under the GSTIN (escpos.ts).
+		customerAddress: bill.customer_address ?? null,
 		billNo: bill.bill_no,
 		cashier: cashier || null,
 		// THE DATE LINE, IN THE RESTAURANT'S ZONE ("13/09/26 23:19"). Unset, the
@@ -1427,6 +1459,8 @@ export function settledBillReceiptOptions(
 		total: bill.items_subtotal,
 		customer: bill.customer,
 		customerGstin: bill.customer_gstin ?? null,
+		// Client item 7 — the guest's address, under the GSTIN (escpos.ts).
+		customerAddress: bill.customer_address ?? null,
 		billNo: bill.bill_no,
 		cashier: bill.created_by ?? null,
 		// The date the bill was RAISED, not today: a reprint is a second copy of
@@ -2247,6 +2281,11 @@ app.post('/bills/apply-coupon', validateAction("4ad474d4-5230-449c-874f-6a238b83
 // a till built before the field existed renames a bill without wiping a GSTIN;
 // null or "" clears it. The response gains `customer_gstin` and nothing else
 // moves.
+//
+// Client item 7 — `customer_address`, by the same rule: omitted is unchanged
+// (every 2.0.1 till omits it), null or "" clears it, over 5 lines or 250
+// characters is a 400, and an address write before migration 054 is a 503
+// before anything is written. The response gains `customer_address`.
 app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
@@ -2256,8 +2295,10 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
 	const gstin = customerGstinFromBody(body);
 	if (gstin === INVALID_GSTIN) { res.status(400).json({ error: CUSTOMER_GSTIN_ERROR }); return; }
+	const address = customerAddressFromBody(body);
+	if (address === INVALID_ADDRESS) { res.status(400).json({ error: CUSTOMER_ADDRESS_ERROR }); return; }
 	try {
-		const result = await SetBillCustomerName(restaurantId, tableName, customer, gstin);
+		const result = await SetBillCustomerName(restaurantId, tableName, customer, gstin, address);
 		try { emitRestaurant(restaurantId, "bill:updated", { table: tableName }); } catch {/* ignore */}
 		try {
 			const nameLine = result.customer
@@ -2265,9 +2306,14 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 				: `Cleared the bill name on table ${tableName}`;
 			const gstinLine = gstin === undefined ? "" : (gstin ? ` (GSTIN ${gstin})` : " (GSTIN cleared)");
 			await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca",
-				`${nameLine}${gstinLine}`,
+				`${nameLine}${gstinLine}${addressAuditTail(address)}`,
 				Audit_log_category.Bill,
-				{ table: tableName, customer: result.customer, ...(gstin === undefined ? {} : { customer_gstin: gstin }) });
+				{
+					table: tableName,
+					customer: result.customer,
+					...(gstin === undefined ? {} : { customer_gstin: gstin }),
+					...(address === undefined ? {} : { customer_address: address }),
+				});
 		} catch {/* ignore */}
 		res.json(result);
 	} catch (e: any) {
@@ -2278,14 +2324,19 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 });
 
 /*
-	Round 2 item 1 — THE NAME AND GSTIN ON A PAST (SETTLED) BILL, from Accounting.
+	Round 2 item 1 — THE NAME AND GSTIN ON A PAST (SETTLED) BILL, from Accounting
+	(and, since client item 8, from the app's History, which opens the same
+	sheet behind the same permission). Client item 7 adds the address.
 
-	POST /bills/:billId/customer-details  body { "customer": "...", "customer_gstin": "..." | null }
-	  -> 200 { success: true, bill_id, customer, customer_gstin }
+	POST /bills/:billId/customer-details
+	  body { "customer": "...", "customer_gstin": "..." | null, "customer_address": "..." | null }
+	  -> 200 { success: true, bill_id, customer, customer_gstin, customer_address }
 	  -> 400 { error: "GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5" }
+	  -> 400 { error: "Address can be at most 5 lines and 250 characters" }
 	  -> 404 { error: "Bill not found" }       not a settled bill of this tenant
 	  -> 503 { error: "This server has not finished updating — try again shortly" }
-	                                           a GSTIN write before migration 046
+	                                           a GSTIN write before migration 046,
+	                                           or an address write before 054
 
 	WHO MAY DO IT: ACCOUNTING_PERM — exactly what E5's /print/bill/settled
 	requires, because the button lives beside that reprint in the same past-bills
@@ -2294,9 +2345,11 @@ app.post('/bills/customer-name', validateAction("4ad474d4-5230-449c-874f-6a238b8
 	validateAction's 403. /bills/customer-name stays the waiter's door for the
 	RUNNING bill, and still refuses a settled one.
 
-	WHAT IT CHANGES: the name and the GSTIN, nothing else — see
-	SetClosedBillCustomerDetails. `customer_gstin` omitted leaves it unchanged, the
-	same rule as the live route, so a name-only correction works before 046.
+	WHAT IT CHANGES: the name, the GSTIN and the address, nothing else — see
+	SetClosedBillCustomerDetails. `customer_gstin` or `customer_address` omitted
+	leaves that field unchanged, the same rule as the live route, so a name-only
+	correction works before 046 and 054, and a 2.0.1 app's name/GSTIN edit never
+	wipes an address it cannot see.
 */
 app.post('/bills/:billId/customer-details', validateAction(ACCOUNTING_PERM), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
@@ -2307,18 +2360,34 @@ app.post('/bills/:billId/customer-details', validateAction(ACCOUNTING_PERM), asy
 	const customer = typeof body.customer === "string" ? body.customer : "";
 	const gstin = customerGstinFromBody(body);
 	if (gstin === INVALID_GSTIN) { res.status(400).json({ error: CUSTOMER_GSTIN_ERROR }); return; }
+	const address = customerAddressFromBody(body);
+	if (address === INVALID_ADDRESS) { res.status(400).json({ error: CUSTOMER_ADDRESS_ERROR }); return; }
 	try {
-		const result = await SetClosedBillCustomerDetails(restaurantId, billId, customer, gstin);
+		const result = await SetClosedBillCustomerDetails(restaurantId, billId, customer, gstin, address);
 		if (!result) { res.status(404).json({ error: "Bill not found" }); return; }
 		try {
-			const what = gstin === undefined ? "name" : "name/GSTIN";
+			const what = ["name", ...(gstin === undefined ? [] : ["GSTIN"]), ...(address === undefined ? [] : ["address"])].join("/");
 			await log_audit(req, ACCOUNTING_PERM,
 				`Changed the ${what} on bill #${result.bill_no ?? result.bill_id}${result.table_name ? ` (table ${result.table_name})` : ""} \u2014 ` +
-					`name "${result.customer ?? "Guest"}"${gstin === undefined ? "" : `, GSTIN ${result.customer_gstin ?? "cleared"}`}`,
+					`name "${result.customer ?? "Guest"}"${gstin === undefined ? "" : `, GSTIN ${result.customer_gstin ?? "cleared"}`}` +
+					addressAuditTail(address),
 				Audit_log_category.Bill,
-				{ bill_id: result.bill_id, bill_no: result.bill_no, customer: result.customer, ...(gstin === undefined ? {} : { customer_gstin: result.customer_gstin }), settled_bill_edit: true });
+				{
+					bill_id: result.bill_id,
+					bill_no: result.bill_no,
+					customer: result.customer,
+					...(gstin === undefined ? {} : { customer_gstin: result.customer_gstin }),
+					...(address === undefined ? {} : { customer_address: result.customer_address }),
+					settled_bill_edit: true,
+				});
 		} catch {/* a failed audit write must never fail the edit */}
-		res.json({ success: true, bill_id: result.bill_id, customer: result.customer, customer_gstin: result.customer_gstin });
+		res.json({
+			success: true,
+			bill_id: result.bill_id,
+			customer: result.customer,
+			customer_gstin: result.customer_gstin,
+			customer_address: result.customer_address,
+		});
 	} catch (e: any) {
 		if (sendCustomerGstinError(res, e)) { return; }
 		logger.error({ err: e }, 'set_closed_bill_customer_details_failed');
@@ -2556,6 +2625,8 @@ app.post('/print/bill/split', validateAction("4ad474d4-5230-449c-874f-6a238b833b
 			total: bill.subtotal,
 			customer: bill.customer,
 			customerGstin: bill.customer_gstin ?? null,
+			// Client item 7 — the guest's address, under the GSTIN (escpos.ts).
+			customerAddress: bill.customer_address ?? null,
 			billNo: bill.bill_no,
 			// Restaurant-zone stamp, as on the whole bill (see /print/bill).
 			printedAt: kotStamp(new Date(), settings.timezone || "Asia/Kolkata"),
