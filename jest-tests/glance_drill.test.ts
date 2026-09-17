@@ -11,7 +11,10 @@
 //     working filter and is not, so every href is held to GLANCE_WEB_PARAMS —
 //     and that list is re-checked against the pages' own parsing;
 //   * every windowed jump is the server's day (or month), ALL DAY — a report
-//     that remembered "Lunch" would otherwise show a slice.
+//     that remembered "Lunch" would otherwise show a slice — and that includes
+//     a fallback: Analytics opened on its remembered 30 days is not "today";
+//   * a figure only leads to a screen that shows it: the online figures have no
+//     fallback, because only the Sales Summary cuts trade by order type.
 
 import { describe, expect, test } from "@jest/globals";
 import * as fs from "node:fs";
@@ -137,11 +140,12 @@ describe("hrefs: only parameters the dashboard parses", () => {
     const reports = sibling("Restaurant_Dashboard_UI", "src/app/dashboard/reports/page.tsx");
     const accounting = sibling("Restaurant_Dashboard_UI", "src/app/dashboard/accounting/page.tsx");
     const history = sibling("Restaurant_Dashboard_UI", "src/app/dashboard/history/page.tsx");
+    const analytics = sibling("Restaurant_Dashboard_UI", "src/app/dashboard/analytics/page.tsx");
     const slots = sibling("Restaurant_Dashboard_UI", "src/lib/report-time-slots.ts");
     // A dashboard checkout from before item 10 has no resolver and nothing to
     // pin; the one that ships it must parse every parameter this file emits.
     const resolver = sibling("Restaurant_Dashboard_UI", "src/lib/glance-destinations.ts");
-    if (!reports || !accounting || !history || !slots || !resolver) {return;}
+    if (!reports || !accounting || !history || !analytics || !slots || !resolver) {return;}
     expect(reports).toMatch(/params\?\.get\("report"\)/);
     expect(reports).toMatch(/useDateRange\("reports", \{ params \}\)/);
     expect(slots).toMatch(/get\(['"]slot['"]\)/);
@@ -149,6 +153,7 @@ describe("hrefs: only parameters the dashboard parses", () => {
     expect(accounting).toMatch(/search\??\.get\("method"\)/);
     expect(accounting).toMatch(/id="settled-bills"/);
     expect(history).toMatch(/useDateRange\("history", \{[^}]*params: search/);
+    expect(analytics).toMatch(/useDateRange\("analytics", \{ params: search \}\)/);
   });
 
   test("the query order is fixed, empty values are dropped and a method is encoded", () => {
@@ -185,7 +190,7 @@ describe("windows: the server's day, all day", () => {
       expect(d.fallbacks.map((f) => [f.module, f.params])).toEqual([
         ["Accounting", { from: DAY.month_from, to: DAY.today }],
         ["History", { from: DAY.month_from, to: DAY.today }],
-        ["Analytics", {}],
+        ["Analytics", { from: DAY.month_from, to: DAY.today }],
       ]);
     }
     expect(glanceDrill("today_net", DAY).params.from).toBe(DAY.today);
@@ -193,10 +198,33 @@ describe("windows: the server's day, all day", () => {
 
   test("modules that parse no window are sent none", () => {
     for (const { key, t } of allTargets()) {
-      if (["Analytics", "Cash register", "Tables", "Orders", "Settings"].includes(t.module)) {
+      if (["Cash register", "Tables", "Orders", "Settings"].includes(t.module)) {
         expect({ key, params: t.params }).toEqual({ key, params: {} });
       }
     }
+  });
+
+  test("every jump from a windowed element carries that window, fallbacks included", () => {
+    let analytics = 0;
+    for (const [key, route] of Object.entries(GLANCE_ROUTES)) {
+      if (route.window === "none") {continue;}
+      const d = glanceDrill(key, DAY, "Cash");
+      for (const t of [d, ...d.fallbacks]) {
+        if (["Cash register", "Tables", "Orders", "Settings"].includes(t.module)) {continue;}
+        const from = route.window === "month" ? DAY.month_from : DAY.today;
+        expect({ key, module: t.module, from: t.params.from, to: t.params.to }).toEqual({ key, module: t.module, from, to: DAY.today });
+        if (t.module === "Analytics") {
+          analytics += 1;
+          // The window and nothing else: Analytics has no report tab or bill filter.
+          expect({ key, params: t.params }).toEqual({ key, params: { from, to: DAY.today } });
+          expect(t.href).toBe(`/dashboard/analytics?from=${from}&to=${DAY.today}`);
+        }
+      }
+    }
+    // A table that stopped naming Analytics would make the loop above vacuous.
+    expect(analytics).toBeGreaterThan(0);
+    // A route with no window still sends Analytics none.
+    expect(glanceParamsFor("Analytics", { window: "none" }, DAY)).toEqual({});
   });
 });
 
@@ -212,8 +240,14 @@ describe("the destinations the investigation settled on", () => {
   };
 
   test("the money figures open the MIS pack, which computes them the same way", () => {
-    for (const k of ["today_net", "today_gross", "online_net", "online_gross"]) {
+    for (const k of ["today_net", "today_gross"]) {
       expect(row(k)).toEqual({ module: "Reports", report: "sales_summary", fallbacks: ["Accounting", "Analytics"], secondary: undefined });
+    }
+    // Online trade is cut by order type on the Sales Summary and nowhere else:
+    // Accounting and Analytics would open without the figure, so there is no
+    // fallback — the sheet explains the rule on its own.
+    for (const k of ["online_net", "online_gross"]) {
+      expect(row(k)).toEqual({ module: "Reports", report: "sales_summary", fallbacks: [], secondary: undefined });
     }
     expect(row("month_to_date")).toEqual({ module: "Reports", report: "sales_summary", fallbacks: ["Accounting", "History", "Analytics"], secondary: undefined });
     expect(row("header")).toEqual(row("today_net"));

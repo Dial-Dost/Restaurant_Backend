@@ -141,8 +141,11 @@ export const GLANCE_ROUTES: Readonly<Record<string, GlanceRoute>> = {
   month: { module: "Reports", report: "sales_summary", window: "month", fallbacks: ["Accounting", "History", "Analytics"] },
   today_net: { module: "Reports", report: "sales_summary", window: "day", fallbacks: ["Accounting", "Analytics"] },
   today_gross: { module: "Reports", report: "sales_summary", window: "day", fallbacks: ["Accounting", "Analytics"] },
-  online_net: { module: "Reports", report: "sales_summary", window: "day", fallbacks: ["Accounting", "Analytics"] },
-  online_gross: { module: "Reports", report: "sales_summary", window: "day", fallbacks: ["Accounting", "Analytics"] },
+  // No fallback: the Sales Summary's order-type split is the only screen that
+  // shows online trade. Accounting and Analytics have no such cut, and a link
+  // to a page without the figure is a dead end dressed as a destination.
+  online_net: { module: "Reports", report: "sales_summary", window: "day", fallbacks: [] },
+  online_gross: { module: "Reports", report: "sales_summary", window: "day", fallbacks: [] },
   cash_collection: {
     module: "Reports", report: "settlement_summary", window: "day", method: "Cash", bills: true,
     fallbacks: ["Accounting", "Analytics"],
@@ -189,8 +192,11 @@ export function glanceRowMethod(method: string): string {
  *   Reports     report + the window + slot=all
  *   Accounting  the window (+ method)
  *   History     the window
- *   anything else takes nothing: Analytics, Cash register, Tables, Orders and
- *   Settings parse no window, and an unread key is a filter that is not there.
+ *   Analytics   the window: its one picker seeds from ?from=&to= on the web and
+ *               from the remembered window in the app, and a fallback that
+ *               opened on "the last 30 days" would not show the tapped figure
+ *   anything else takes nothing: Cash register, Tables, Orders and Settings
+ *   parse no window, and an unread key is a filter that is not there.
  */
 export function glanceParamsFor(
   module: string,
@@ -210,6 +216,7 @@ export function glanceParamsFor(
     case "Accounting":
       return { ...(windowed ? { from, to } : {}), ...(method ? { method } : {}) };
     case "History":
+    case "Analytics":
       return windowed ? { from, to } : {};
     default:
       return {};
