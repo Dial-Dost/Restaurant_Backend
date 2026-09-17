@@ -267,7 +267,7 @@ describe("the live repro: a RELEASED bill whose only orders are cancelled", () =
   test("write -> closed detail and list read back BOTH the name and the GSTIN", async () => {
     const w = await edit(RELEASED_BILL, { customer: NAME, customer_gstin: GSTIN });
     expect(w.status).toBe(200);
-    expect(w.body).toEqual({ success: true, bill_id: RELEASED_BILL, customer: NAME, customer_gstin: GSTIN });
+    expect(w.body).toEqual({ success: true, bill_id: RELEASED_BILL, customer: NAME, customer_gstin: GSTIN, customer_address: null });
 
     const d = await detail(RELEASED_BILL);
     expect(d.customer).toBe(NAME);           // was null: the bug
@@ -311,7 +311,7 @@ describe("the live repro: a RELEASED bill whose only orders are cancelled", () =
 describe("a normally PAID bill with a voided round in its window", () => {
   test("write -> closed detail, list row AND the settled reprint all carry both", async () => {
     const w = await edit(PAID_BILL, { customer: NAME, customer_gstin: "29aaxfn 2701q1zf" });
-    expect(w.body).toEqual({ success: true, bill_id: PAID_BILL, customer: NAME, customer_gstin: GSTIN });
+    expect(w.body).toEqual({ success: true, bill_id: PAID_BILL, customer: NAME, customer_gstin: GSTIN, customer_address: null });
 
     const d = await detail(PAID_BILL);
     expect(d.customer).toBe(NAME);

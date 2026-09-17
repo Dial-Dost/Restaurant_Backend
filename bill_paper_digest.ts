@@ -38,7 +38,9 @@
  * or not, quantity — merged, so the same dish ordered in two rounds reads the
  * same as one line of two), and every rung of the ladder (subtotal, discount,
  * service charge and its percent, each tax line, round-off, grand total), and
- * the customer GSTIN (a corporate guest's claim hangs on it).
+ * the customer GSTIN and address (a corporate guest's claim hangs on them;
+ * client item 7 prints the address under the GSTIN, so an address added after
+ * the print leaves the guest holding an invoice without it).
  *
  * OUT: the time, the cashier, the bill number, the logo and the QR. A second
  * print differs in all of those and says nothing new about what is owed.
@@ -143,8 +145,11 @@ export function billPaperDigest(input: {
 	items: readonly PaperLine[] | null | undefined;
 	charges: PaperCharges;
 	customerGstin?: string | null;
+	/** The customer_address the paper prints (client item 7). */
+	customerAddress?: string | null;
 }): string {
 	const c = input.charges ?? {};
+	const address = paperAddress(input.customerAddress);
 	const taxes = (c.taxes ?? [])
 		.map((t) => [text(t?.name).toLowerCase(), money(t?.percentage), money(t?.amount)] as const)
 		.sort((a, b) => (a.join("|") < b.join("|") ? -1 : 1));
@@ -160,7 +165,15 @@ export function billPaperDigest(input: {
 		round_off: money(c.round_off),
 		grand_total: money(c.grand_total),
 		customer_gstin: text(input.customerGstin).toUpperCase(),
+		// Only when there is one, so every bill without an address keeps the
+		// fingerprint it had before the address slot existed.
+		...(address ? { customer_address: address } : {}),
 	});
+}
+
+/** The address as lines: each trimmed, blank ones dropped, CRLF read as LF. */
+function paperAddress(value: unknown): string {
+	return text(value).split(/\r\n?|\n/).map((l) => l.trim()).filter((l) => l.length > 0).join("\n");
 }
 
 /**

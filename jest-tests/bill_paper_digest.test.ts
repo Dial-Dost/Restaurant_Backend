@@ -47,6 +47,7 @@ describe("the whole-paper fingerprint moves with the money, and only with the mo
     ["the round-off", { charges: { ...LADDER, round_off: -0.5 } }],
     ["the grand total", { charges: { ...LADDER, grand_total: 2427 } }],
     ["the customer's GSTIN", { customerGstin: "29ABCDE1234F1Z5" }],
+    ["the customer's address (client item 7 prints it)", { customerAddress: "12 MG Road\nBengaluru 560001" }],
   ])("%s changes it", (_label, over) => {
     expect(paper(over as never)).not.toBe(paper());
   });
@@ -67,6 +68,17 @@ describe("the whole-paper fingerprint moves with the money, and only with the mo
       customerGstin: " 29ABCDE1234F1Z5 ",
     });
     expect(b).toBe(a);
+  });
+
+  test("an address changes it by its lines, not by how they were typed; no address is the pre-address fingerprint", () => {
+    const one = paper({ customerAddress: "12 MG Road\nBengaluru 560001" });
+    expect(paper({ customerAddress: " 12 MG Road \r\n\r\n Bengaluru 560001 " })).toBe(one);
+    expect(paper({ customerAddress: "12 MG Road\nBengaluru 560002" })).not.toBe(one);
+    expect(paper({ customerAddress: "12 MG Road Bengaluru 560001" })).not.toBe(one);
+    // Absent, null, empty and blank all read as the paper before the slot existed:
+    // the fingerprint waiter-floor's module gave this bill before the merge.
+    expect(paper()).toBe("7741b3376dfb054a2419bf51afb6d6b11265fa76e4f29fdcd30d7afbd372bd92");
+    for (const none of [undefined, null, "", "  \n "]) { expect(paper({ customerAddress: none })).toBe(paper()); }
   });
 
   test("a percent with no charge beside it prints nothing, so it is not paper", () => {

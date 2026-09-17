@@ -105,9 +105,9 @@ mw08 USE     *                                                      | <inline(re
 0083 PATCH   /booking/:id/status                                    | validateAction("fdeecab6-7c3a-4239-b87c-99a96f50c551") | ba7d143b
 0084 POST    /bills                                                 | validateAction("9186e53e-0fda-4ec8-ad20-2f9feaadb77f") | 39eddf8b
 0085 POST    /bills/replace                                         | validateAction("383cc261-7e5c-4745-b16f-06a41e2ae047") | dc9dd3ee
-0086 GET     /bills/closed                                          | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | e901c19b
+0086 GET     /bills/closed                                          | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | bf948d3c
 0087 GET     /bills/open                                            | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 7fc3f4a6
-0088 GET     /bills/closed/:id                                      | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 27085ddb
+0088 GET     /bills/closed/:id                                      | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | daf09983
 0089 GET     /bills/order/:orderId                                  | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | 5293cc31
 0090 GET     /restaurant/logo                                       | validate                                       | ea5a4f85
 0091 GET     /restaurant/logo/escpos                                | validate                                       | 58166787
@@ -295,11 +295,11 @@ mw08 USE     *                                                      | <inline(re
 0273 POST    /aggregator/generate-key                               | validate                                       | 7f2a327f
 0274 POST    /aggregator/order                                      | rateLimit("aggregator", 120, 60000)            | de83301d
 0275 POST    /bills/apply-coupon                                    | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillApplyCoupon) | 558fdf31
-0276 POST    /bills/customer-name                                   | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 2904ec0d
-0277 POST    /bills/:billId/customer-details                        | validateAction(ACCOUNTING_PERM)                | 1d1d516c
+0276 POST    /bills/customer-name                                   | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | caa15234
+0277 POST    /bills/:billId/customer-details                        | validateAction(ACCOUNTING_PERM)                | 41f0821b
 0278 POST    /bills/item-note                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillItemNote) | 1716a034
 0279 POST    /bills/split                                           | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") -> validateBody(sBillSplit) | 25132b86
-0280 POST    /print/bill/split                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 85171df5
+0280 POST    /print/bill/split                                      | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 61c8a8cc
 0281 POST    /bills/merge                                           | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMerge) | 1f7823b0
 0282 POST    /bills/refund                                          | validateBody(sBillRefund)                      | d2089aa7
 0283 POST    /bills/:id/reopen                                      | validate                                       | c25d6925

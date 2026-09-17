@@ -749,6 +749,13 @@ describe("2g. GET /bill-for-table says whether the paper is out of date", () => 
     expect(r.body).not.toHaveProperty("last_paper_digest");
   });
 
+  // Client item 7 x items 1-2: the address prints under the GSTIN, so an
+  // address added after the print is a paper the guest does not hold.
+  test("an address added since the print -> paper_stale true", async () => {
+    mockGetBill.mockResolvedValue({ ...(await printedWith(await sameDigest())), customer_address: "12 MG Road\nBengaluru" });
+    expect((await read(READ)).body).toMatchObject({ paper_stale: true });
+  });
+
   test("changed since the print -> paper_stale true", async () => {
     mockGetBill.mockResolvedValue(await printedWith("0".repeat(64)));
     expect((await read(READ)).body).toMatchObject({ paper_stale: true });

@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "http";
 import { getSession, refreshTtl } from "./auth/sessions.js";
-import { DbBusyError, EnsureRestaurantSeed, InitBillRoundOffSchema, InitKotDocketSchema, InitPrintJobPaperSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
+import { DbBusyError, EnsureRestaurantSeed, InitBillCustomerAddressSchema, InitBillRoundOffSchema, InitKotDocketSchema, InitPrintJobPaperSchema, InitServiceChargeWaiverReasonSchema, InitTableNextPartySchema, ListRestaurantIds, ResolveOutletForRestaurant, RunExceptionChecks, WarmReportingSchema, closePools, ensureFeaturePermissionActions, initPrintRoutingSchema, openTenantConnection, verifyTenantRlsAtBoot, withTenant } from "./database_supabase.js";
 import { captureException, initObservability, logger, metricsMiddleware } from "./observability.js";
 import { archivedStatusSupported, archivedStatusUnsupportedMessage, closePlatformPool, platformDbConfigured } from "./platform/db.js";
 import { registerPlatformRoutes } from "./platform/routes.js";
@@ -697,6 +697,16 @@ async function bootstrap(): Promise<void> {
 	// setting cannot be saved yet.
 	if (await InitKotDocketSchema()) {
 		logger.info("✅ KOT docket style columns ready (migration 050)");
+	}
+
+	// "Bills".customer_address (migration 054, client item 7), ONCE, here, for
+	// the reasons the steps above give — and "Bills" is the hottest money table,
+	// so the ALTER is only issued when the column is missing, under a 2s lock
+	// timeout. No request path ever issues it. Never throws; false means bills
+	// print exactly as 2.0.1 did and an address write answers 503 until 054 is
+	// applied (noticed within a minute, no restart).
+	if (await InitBillCustomerAddressSchema()) {
+		logger.info("✅ Bill customer address column ready (migration 054)");
 	}
 
 	// Run the reporting path's lazy DDL ONCE here, outside any transaction, so the
