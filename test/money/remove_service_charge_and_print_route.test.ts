@@ -32,7 +32,7 @@
 // visible to the resolver — is modelled by setting that row, and the quote it
 // records is the REAL quoteServiceChargeWaiver.
 
-import { describe, test, expect, beforeEach, jest } from "@jest/globals";
+import { describe, test, expect, beforeEach, afterEach, jest } from "@jest/globals";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { quoteServiceChargeWaiver } from "../../billing_math";
@@ -56,7 +56,19 @@ const mockDb: {
   /** The open bill's row and invoice number — null until something mints them. */
   billId: string | null;
   billNo: string | null;
-} = { taxConfig: null, scPct: 0, waiver: null, subtotal: 0, items: 1, printCount: 0, billId: null, billNo: null };
+  /**
+   * "ServiceChargeWaivers".reason as information_schema reports it. "NO" — the
+   * column as 036 made it, before migration 051 — unless a test says otherwise.
+   */
+  reasonNullable: "YES" | "NO";
+  /** What the runtime's own DROP NOT NULL does: take effect (the owner) or 42501. */
+  reasonAlter: "applies" | "refused";
+} = {
+  taxConfig: null, scPct: 0, waiver: null, subtotal: 0, items: 1, printCount: 0, billId: null, billNo: null,
+  reasonNullable: "NO", reasonAlter: "refused",
+};
+/** Every statement the fixture answered, in order — for "the schema was (not) asked". */
+const mockSql: string[] = [];
 
 /** Every AddAuditLogEntry(res, outlet, emp, action, description, category, details). */
 const mockAudit: unknown[][] = [];
@@ -75,6 +87,17 @@ const mockNext: {
 jest.mock("pg", () => {
   const answer = (sql: string): unknown[] => {
     const q = String(sql);
+    mockSql.push(q);
+    // Migration 051's runtime ensure, and the latch's read of the column.
+    if (/^\s*do \$\$/i.test(q) && q.includes('alter table "ServiceChargeWaivers" alter column reason drop not null')) {
+      if (mockDb.reasonNullable === "YES") { return []; }
+      if (mockDb.reasonAlter === "refused") {
+        throw Object.assign(new Error("must be owner of table ServiceChargeWaivers"), { code: "42501" });
+      }
+      mockDb.reasonNullable = "YES";
+      return [];
+    }
+    if (q.includes("select is_nullable from information_schema.columns")) { return [{ is_nullable: mockDb.reasonNullable }]; }
     if (q.includes('select default_tax from "Outlets"')) { return [{ default_tax: mockDb.taxConfig }]; }
     if (q.includes('select service_charge from "Restaurant"')) { return [{ service_charge: mockDb.scPct }]; }
     if (q.includes('from "Restaurant" r')) {
@@ -319,6 +342,10 @@ beforeEach(async () => {
   mockDb.printCount = 0;
   mockDb.billId = mockIds.bill;
   mockDb.billNo = "B-1";
+  mockDb.reasonNullable = "NO";
+  mockDb.reasonAlter = "refused";
+  (await import("../../database_supabase")).__scWaiverReasonTestSeam.reset();
+  mockSql.length = 0;
   mockAudit.length = 0;
   mockReceipts.length = 0;
   mockCalls.length = 0;
@@ -505,6 +532,8 @@ describe("refusals are answered before any waiver is written", () => {
     nothingWritten();
   });
 
+  // The fixture's column is NOT NULL (migration 051 not applied): the reason is
+  // still required here, as it was before 2.0.1. The optional case is below.
   test.each([
     ["no kind", { reason: "Guest asked", authorised_by: "manager01" }],
     ["no reason", { waiver_kind: "guest_request", authorised_by: "manager01" }],
@@ -819,5 +848,183 @@ describe("wiring", () => {
     const fn = db.slice(db.indexOf("export async function GetBillForTable("), db.indexOf("export async function GetBillForTable(") + 40000);
     expect(fn).toContain("service_charge_basis: chargeCfg.basis,");
     expect(fn).toContain("service_charge_applied: chargeCfg.service_charge_applied,");
+  });
+});
+
+// ============================================================================
+// THE REASON IS OPTIONAL WHERE MIGRATION 051 HAS MADE IT SO (client item, 2.0.1)
+// ============================================================================
+//
+// "When waiving a service charge, the reason should not be mandatory and should
+// be left as optional." The kind and the authoriser stay required. Whether a
+// reasonless waiver may be written is the COLUMN's answer, read after the
+// runtime's own DROP NOT NULL — so a server whose database still says NOT NULL
+// answers exactly as it did, and one where 051 lands later needs no restart.
+
+const NO_REASON_FORMS: [string, Record<string, unknown>][] = [
+  ["absent", {}],
+  ["empty", { reason: "" }],
+  ["whitespace", { reason: "   " }],
+  ["null", { reason: null }],
+];
+const refusals = (): unknown[][] =>
+  auditsUnder(ADD_ORDERS).filter((a) => String(a[4]).startsWith("REFUSED removal of the service charge"));
+const isDdl = (q: string): boolean => /^\s*do \$\$/i.test(q);
+
+describe("051 applied: a waiver without a reason is recorded and printed", () => {
+  beforeEach(() => { mockDb.reasonNullable = "YES"; });
+  afterEach(() => { mockDb.reasonNullable = "NO"; });
+
+  test.each(NO_REASON_FORMS)("reason %s -> 200, one waiver with reason null, paper == drawer", async (_label, extra) => {
+    const answer = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01", ...extra }, MANAGER);
+    expect(answer.status).toBe(200);
+    expect(answer.body).toMatchObject({ printed: true, waiver_created: true, service_charge_removed: true });
+    expect(called("WaiveServiceCharge")).toBe(1);
+    const [, input] = mockCalls.find((c) => c.fn === "WaiveServiceCharge")!.args as [string, Record<string, any>];
+    expect(input.reason).toBeNull();
+    expect(input.waiver_kind).toBe("guest_request");
+    expect(input.actor).toMatchObject({ username: "cashier1", authorised_by_username: "manager01" });
+    expect(auditsUnder(WAIVE)).toHaveLength(1);
+    expect(refusals()).toHaveLength(0);
+    // THE INVARIANT still holds: the reason is not an input to any amount.
+    expect(Number(mockReceipts[0]!.grandTotal)).toBe((await drawer()).grand_total);
+  });
+
+  test("a typed reason is handed on trimmed, exactly as before", async () => {
+    await call(ROUTE, { table_name: "T1", ...WAIVER_FORM, reason: "  Long wait  " }, MANAGER);
+    const [, input] = mockCalls.find((c) => c.fn === "WaiveServiceCharge")!.args as [string, Record<string, any>];
+    expect(input.reason).toBe("Long wait");
+  });
+
+  test("the waiver line carries reason: null in its details and no reason in its sentence", async () => {
+    mockNext.waive = async (...a: unknown[]) => {
+      const r = (await commitsAWaiver()(...a)) as { record: Record<string, unknown> };
+      r.record.reason = null;
+      return r;
+    };
+    await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01" }, MANAGER);
+    const [line] = auditsUnder(WAIVE);
+    expect(line![6]).toMatchObject({ reason: null, waiver_kind: "guest_request", authorised_by: "manager01" });
+    expect(String(line![4])).not.toMatch(/null|undefined/);
+  });
+
+  test("NO KIND is still refused: 400 kind_required, one REFUSED line saying so, nothing written", async () => {
+    const answer = await call(ROUTE, { table_name: "T1", authorised_by: "manager01" }, MANAGER);
+    expect(answer.status).toBe(400);
+    expect(answer.body.error).toBe("Say why the service charge is coming off — waiver_kind is required.");
+    const lines = refusals();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]![4]).toBe(`${REFUSED_PREFIX}no waiver kind was given; nothing was waived or printed`);
+    expect(lines[0]![6]).toEqual({
+      table: "T1", refused: true, refusal: "kind_required",
+      service_charge_basis: "tax_line", service_charge_waiver_required: true, authorised_by: null,
+    });
+    // A control record, not a bill edit.
+    expect(classifyBillEdit(ADD_ORDERS, String(lines[0]![4]), lines[0]![6] as Record<string, unknown>)).toBeNull();
+    nothingWritten();
+  });
+
+  test("no kind WITH a reason is the same kind_required refusal", async () => {
+    const answer = await call(ROUTE, { table_name: "T1", reason: "Guest asked", authorised_by: "manager01" }, MANAGER);
+    expect(answer.status).toBe(400);
+    expect(refusals()[0]![6]).toMatchObject({ refusal: "kind_required" });
+    nothingWritten();
+  });
+
+  test("NO AUTHORISER is still refused, before anything is written", async () => {
+    const answer = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request" }, MANAGER);
+    expect(answer.status).toBe(400);
+    expect(refusals()[0]![6]).toMatchObject({ refusal: "authoriser_missing" });
+    nothingWritten();
+  });
+
+  test("the waive permission is still checked first", async () => {
+    const answer = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01" }, CASHIER);
+    expect(answer.status).toBe(403);
+    nothingWritten();
+  });
+
+  test("a reason over 400 characters is still the schema's 400", async () => {
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM, reason: "x".repeat(401) }, MANAGER);
+    expect(answer.status).toBe(400);
+    nothingWritten();
+  });
+});
+
+describe("051 NOT applied, and this role may not apply it: today's refusal, exactly", () => {
+  test.each(NO_REASON_FORMS)("reason %s -> 400 reason_required, one REFUSED line, nothing written", async (_label, extra) => {
+    const answer = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01", ...extra }, MANAGER);
+    expect(answer.status).toBe(400);
+    expect(answer.body.error).toBe("Say why the service charge is coming off — waiver_kind and reason are required.");
+    // "" and null used to die in the schema with a generic 400 and no line;
+    // they now reach the handler, so every reasonless attempt is on the record.
+    expect(refusals()).toHaveLength(1);
+    expect(refusals()[0]![6]).toMatchObject({ refusal: "reason_required" });
+    nothingWritten();
+  });
+
+  test("a waiver WITH a reason never asks the schema anything", async () => {
+    const answer = await call(ROUTE, { table_name: "T1", ...WAIVER_FORM }, MANAGER);
+    expect(answer.status).toBe(200);
+    expect(mockSql.some((q) => q.includes("information_schema"))).toBe(false);
+  });
+
+  test("051 applied by hand later: the NEXT reasonless waiver goes through, with no restart", async () => {
+    const before = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01" }, MANAGER);
+    expect(before.status).toBe(400);
+    mockDb.reasonNullable = "YES"; // migrate.ts, run by hand on the VPS
+    const after = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01" }, MANAGER);
+    expect(after.status).toBe(200);
+    expect(called("WaiveServiceCharge")).toBe(1);
+    // The refused ALTER was memoised (42501 is the migration's job), so it was
+    // issued once, not once per request.
+    expect(mockSql.filter(isDdl)).toHaveLength(1);
+  });
+});
+
+describe("051 NOT applied, and this role IS the table owner: the runtime applies it on the spot", () => {
+  test("the first reasonless waiver issues the DROP NOT NULL, reads the column, and goes through", async () => {
+    mockDb.reasonAlter = "applies";
+    const answer = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01" }, MANAGER);
+    expect(answer.status).toBe(200);
+    const ddl = mockSql.findIndex(isDdl);
+    const probe = mockSql.findIndex((q) => q.includes("select is_nullable from information_schema.columns"));
+    expect(ddl).toBeGreaterThan(-1);
+    expect(probe).toBeGreaterThan(ddl);
+    // Once on, it stays on: the next one asks nothing.
+    mockSql.length = 0;
+    mockDb.waiver = null;
+    const again = await call(ROUTE, { table_name: "T1", waiver_kind: "guest_request", authorised_by: "manager01" }, MANAGER);
+    expect(again.status).toBe(200);
+    expect(mockSql.some((q) => q.includes("information_schema"))).toBe(false);
+  });
+});
+
+describe("wiring · the optional reason is the waiver's alone", () => {
+  const route = (): string =>
+    readFileSync(join(__dirname, "..", "..", "routes", "mis_capture.ts"), "utf8").replace(/\r\n/g, "\n");
+  const schema = (src: string, name: string): string => {
+    const at = src.indexOf(`const ${name} = `);
+    return src.slice(at, src.indexOf("})", at));
+  };
+
+  test("only the two waiver schemas take the optional reason; the comp, the void and every reversal keep sReason", () => {
+    const src = route();
+    expect(src).toContain("const sReason = z.string().min(1).max(400);");
+    expect(src).toContain("const sOptionalWaiverReason = z.string().max(400).nullish();");
+    expect(src.match(/reason: sOptionalWaiverReason/g) ?? []).toHaveLength(2);
+    expect(schema(src, "sWaiveServiceCharge")).toContain("reason: sOptionalWaiverReason,");
+    expect(schema(src, "sRemoveServiceChargeAndPrint")).toContain("reason: sOptionalWaiverReason,");
+    expect(schema(src, "sMarkNonChargeable")).toContain("reason: sReason,");
+    expect(schema(src, "sVoidOrder")).toContain("reason: sReason,");
+    expect(src).toContain("const sReverse = z.object({ reason: sReason }).passthrough();");
+  });
+
+  test("the composite route asks the schema only when the form is incomplete, and hands on null for none", () => {
+    const src = route();
+    expect(src).toMatch(/if \(!kind \|\| !reason\) \{[\s\S]{0,300}?if \(!\(await resolveServiceChargeWaiverReasonOptional\(\)\)\) \{/);
+    expect(src.match(/resolveServiceChargeWaiverReasonOptional\(/g) ?? []).toHaveLength(1);
+    expect(src).toContain("reason: reason || null,");
+    expect(src).toContain("reason: body.reason ?? null,");
   });
 });

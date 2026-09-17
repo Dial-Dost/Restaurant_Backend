@@ -123,6 +123,7 @@ import {
 	ReverseServiceChargeWaiver,
 	VoidOrderWithReason,
 	WaiveServiceCharge,
+	resolveServiceChargeWaiverReasonOptional,
 } from "../database_supabase.js";
 import { dispatchCancellationKot } from "../kot_print.js";
 import { NON_CHARGEABLE_KINDS, SERVICE_CHARGE_WAIVER_KINDS, VOID_KINDS } from "../mis_capture.js";
@@ -170,9 +171,16 @@ const sVoidOrder = z.object({
 	authorised_by: sAuthorisedBy,
 }).passthrough();
 
+// A service-charge waiver's reason is OPTIONAL (client item, 2.0.1): absent,
+// "", whitespace and null all mean "no reason given", and the data layer stores
+// NULL — never '' — where migration 051 lets it, and refuses as before where it
+// does not. The kind and the second name stay required. Every other capture
+// keeps sReason: a comp, a void and both reversals still need one.
+const sOptionalWaiverReason = z.string().max(400).nullish();
+
 const sWaiveServiceCharge = z.object({
 	waiver_kind: z.enum(SERVICE_CHARGE_WAIVER_KINDS),
-	reason: sReason,
+	reason: sOptionalWaiverReason,
 	authorised_by: sAuthorisedBy,
 	table_name: z.string().optional(),
 	bill_id: z.string().optional(),
@@ -192,7 +200,7 @@ const sWaiveServiceCharge = z.object({
 const sRemoveServiceChargeAndPrint = z.object({
 	table_name: z.string(),
 	waiver_kind: z.enum(SERVICE_CHARGE_WAIVER_KINDS).optional(),
-	reason: sReason.optional(),
+	reason: sOptionalWaiverReason,
 	authorised_by: sAuthorisedBy.optional(),
 	// "client" is the web dashboard, which renders its own paper in the browser
 	// and only needs the print CLAIMED (POST /print/bill/claim's half).
@@ -341,11 +349,14 @@ async function auditServiceChargeWaiver(
 const SERVICE_CHARGE_REMOVAL_REFUSALS = {
 	waiver_required: "the caller does not hold the 'Waive Service Charge' permission",
 	reason_required: "no waiver kind or reason was given",
+	// Once the reason is optional (051) only the kind can be missing, and the
+	// line says exactly that rather than naming a field nobody has to send.
+	kind_required: "no waiver kind was given",
 	no_username: "the session carries no username to sign a waiver with",
 	authoriser_missing: "no authoriser was named",
 	authoriser_not_found: "the named authoriser is not a staff member of this outlet",
 	authoriser_not_permitted: "the named authoriser may not authorise a service-charge waiver",
-} as const satisfies Record<"waiver_required" | "reason_required" | ActorRefusal, string>;
+} as const satisfies Record<"waiver_required" | "reason_required" | "kind_required" | ActorRefusal, string>;
 
 /**
  * A REFUSED "REMOVE SERVICE CHARGE & PRINT", ON THE RECORD.
@@ -647,8 +658,12 @@ app.post("/orders/:id/void", validateAction(PERM_VOID_ORDER), validateBody(sVoid
 	Take the service charge off a table's OPEN bill.
 
 	POST /bills/service-charge-waiver
-	  body { table_name | bill_id, waiver_kind, reason, authorised_by }
+	  body { table_name | bill_id, waiver_kind, reason?, authorised_by }
 	  -> 201 { waiver, grand_total_before, grand_total_after }
+
+	The reason is optional (migration 051); WaiveServiceCharge stores a missing
+	one as NULL, or refuses it with its own 400 where the column is still NOT
+	NULL.
 
 	Works in BOTH shapes this fleet runs — "Restaurant".service_charge and a
 	"Service Charge" line inside "Outlets".default_tax — because the saving is
@@ -672,7 +687,7 @@ app.post("/orders/:id/void", validateAction(PERM_VOID_ORDER), validateBody(sVoid
 app.post("/bills/service-charge-waiver", validateAction(PERM_SERVICE_CHARGE_WAIVER), validateBody(sWaiveServiceCharge), async (req: Request, res: Response) => {
 	const restaurantId = extractRestaurantId(req);
 	if (!restaurantId) { res.status(400).json({ error: "Missing restaurantId" }); return; }
-	const body = req.body as { waiver_kind: string; reason: string; table_name?: string; bill_id?: string };
+	const body = req.body as { waiver_kind: string; reason?: string | null; table_name?: string; bill_id?: string };
 	const tableName = String(body.table_name ?? "").trim();
 	const billId = String(body.bill_id ?? "").trim();
 
@@ -684,7 +699,7 @@ app.post("/bills/service-charge-waiver", validateAction(PERM_SERVICE_CHARGE_WAIV
 			...(tableName ? { table_name: tableName } : {}),
 			...(billId ? { bill_id: billId } : {}),
 			waiver_kind: body.waiver_kind,
-			reason: body.reason,
+			reason: body.reason ?? null,
 			actor: {
 				employee_id: who.employee_id,
 				username: who.username,
@@ -758,7 +773,8 @@ app.post("/bills/service-charge-waiver/:id/reverse", validateAction(PERM_SERVICE
 	  -> 200 { success, waiver, waiver_created, grand_total_before, grand_total_after,
 	           service_charge_removed, printed, print_error?, render, ...the print's own fields }
 	  -> 400 nothing on the table / no service charge on it (nothing_to_remove) /
-	         a missing kind, reason or authoriser / anything WaiveServiceCharge refuses
+	         a missing kind or authoriser (or reason, before migration 051) /
+	         anything WaiveServiceCharge refuses
 	  -> 403 C3's reprint refusal (reprint_needs_senior) / no waive permission (waiver_required)
 
 	============================================================================
@@ -793,8 +809,10 @@ app.post("/bills/service-charge-waiver/:id/reverse", validateAction(PERM_SERVICE
 	  5. the waive permission, checked HERE rather than in the guard chain,
 	     because step 3 needs none. The guard is "Add Orders", the print's own —
 	     the manifest shows one gate, and this is the second;
-	  6. the kind, the reason and the authoriser, then resolveActors — the same
-	     400/403 answers the waiver route gives.
+	  6. the kind and the authoriser, then resolveActors — the same 400/403
+	     answers the waiver route gives. The reason is optional where migration
+	     051 has made the column nullable, and required, as it always was, where
+	     it has not.
 
 	Steps 5 and 6 refuse an attempt on a charge that IS on the bill, so each of
 	their refusals files a REFUSED line first (auditRefusedServiceChargeRemoval)
@@ -842,7 +860,7 @@ app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449
 	const restaurantId = extractRestaurantId(req);
 	const outletId = extractOutletId(req);
 	if (!restaurantId || !outletId) { res.status(400).json({ error: "Missing restaurant/outlet" }); return; }
-	const body = req.body as { table_name: string; waiver_kind?: string; reason?: string; authorised_by?: string; render?: string };
+	const body = req.body as { table_name: string; waiver_kind?: string; reason?: string | null; authorised_by?: string; render?: string };
 	const tableName = String(body.table_name ?? "").trim();
 	if (!tableName) { res.status(400).json({ error: "table_name is required" }); return; }
 	const render = body.render === "client" ? "client" : "thermal";
@@ -889,9 +907,20 @@ app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449
 		const kind = String(body.waiver_kind ?? "").trim();
 		const reason = String(body.reason ?? "").trim();
 		if (!kind || !reason) {
-			await auditRefusedServiceChargeRemoval(req, tableName, "reason_required", basis, null);
-			res.status(400).json({ error: "Say why the service charge is coming off — waiver_kind and reason are required." });
-			return;
+			// Something is missing, and whether that is a refusal is the schema's
+			// answer (migration 051). A complete form never asks, so it is today's
+			// request on every server.
+			if (!(await resolveServiceChargeWaiverReasonOptional())) {
+				// Before 051: today's refusal, byte for byte.
+				await auditRefusedServiceChargeRemoval(req, tableName, "reason_required", basis, null);
+				res.status(400).json({ error: "Say why the service charge is coming off — waiver_kind and reason are required." });
+				return;
+			}
+			if (!kind) {
+				await auditRefusedServiceChargeRemoval(req, tableName, "kind_required", basis, null);
+				res.status(400).json({ error: "Say why the service charge is coming off — waiver_kind is required." });
+				return;
+			}
 		}
 		const who = await resolveActors(
 			req, res, restaurantId, PERM_SERVICE_CHARGE_WAIVER, "a service-charge waiver",
@@ -903,7 +932,7 @@ app.post("/bills/service-charge-waiver/print", validateAction("4ad474d4-5230-449
 			const result = await WaiveServiceCharge(restaurantId, {
 				table_name: tableName,
 				waiver_kind: kind,
-				reason,
+				reason: reason || null,
 				actor: {
 					employee_id: who.employee_id,
 					username: who.username,
