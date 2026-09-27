@@ -38,6 +38,21 @@
  * table-wise report reads "12"); money never does.
  *
  * ============================================================================
+ * HOW MANY ROWS A NUMBER MAY HOLD — round-3 item 4, and its follow-up
+ * ============================================================================
+ * "A duplicate should come only once per BILL PRINTED", and "2 running tables
+ * shouldn't be the case."
+ *
+ * So the family may hold one card per printed, unsettled bill — at a restaurant
+ * that settles at night, 12's paper and "12 #2"'s paper are both out for hours
+ * and both have to be reachable — plus ONE seat for whoever is at the table now.
+ * Nothing else. Two rules keep it there, and they are the two ends of the same
+ * sentence: partyStillAtTheTable refuses to MINT a second seat for a bill that
+ * has already had one (a reprint used to mint another), and
+ * planNextPartyFloorHidden refuses to DRAW a second running card, or any free
+ * card at all, while somebody is sitting at the number.
+ *
+ * ============================================================================
  * THE NAME
  * ============================================================================
  * `<root> #<n>`, n >= 2. The separator is " #" and NOT "-": the print ledger's
@@ -211,7 +226,7 @@ export function planNextPartyRetirement(family: readonly NextPartyFamilyMember[]
 }
 
 // ---------------------------------------------------------------------------
-// WHAT THE FLOOR SHOWS OF A FAMILY — round-3 client item 4.
+// WHAT THE FLOOR SHOWS OF A FAMILY — round-3 client item 4, then its refinement.
 // ---------------------------------------------------------------------------
 
 /**
@@ -221,57 +236,146 @@ export function planNextPartyRetirement(family: readonly NextPartyFamilyMember[]
  */
 export interface NextPartyFloorMember extends NextPartyFamilyMember {
 	printCount: number;
+	/**
+	 * When THIS row's current party arrived — GetTables' own seatingStartFor in
+	 * milliseconds, the same bound its print state is read under. Null when the
+	 * row has no seating to date, which is every free card. Used for one
+	 * decision only: which of two live parties at one number is the real one.
+	 */
+	seatingStart?: number | null;
 }
 
+/** Earliest party first; a row with no seating to date, and then the root, last. */
+const byArrival = (a: NextPartyFloorMember, b: NextPartyFloorMember): number => {
+	const at = a.seatingStart ?? null;
+	const bt = b.seatingStart ?? null;
+	if (at !== bt) {
+		if (at === null) { return 1; }
+		if (bt === null) { return -1; }
+		return at - bt;
+	}
+	return bySeq(a, b);
+};
+
 /**
- * THE CARDS A FAMILY IS ALLOWED ON THE FLOOR — round-3 client item 4.
+ * THE CARDS A FAMILY IS ALLOWED ON THE FLOOR — round-3 client item 4, and the
+ * client's follow-up on the same photo.
  *
  * "Duplication of tables should only be done when a table was occupied and the
  * bill was not settled. Once it is settled, the prior duplication has to be
- * deleted. … If there's a running table, no duplication should be there. Only
- * when its bill is printed but not settled should it be there."
+ * deleted. … If there's a running table, no duplication should be there."
+ * And then, of table 11 drawn three times: "2 RUNNING TABLES SHOULDN'T BE THE
+ * CASE. A DUPLICATE SHOULD COME ONLY ONCE PER BILL PRINTED."
  *
- * THE PHOTO: a green, FREE "14" card sitting beside a running "14 #2". That is
- * 14 settled while its next party is still eating, and the free card is the
- * dangerous one — a waiter reads an empty table and seats a party on top of the
- * one already sitting there, which is the whole reason the client filed this.
+ * THE SECOND PHOTO: "11" running, "11 #2" with its bill printed, "11 #3"
+ * running. Three cards, two of them live parties, for one table in the room.
+ * The first version of this rule showed EVERY card as soon as any bill in the
+ * family was printed and unsettled, which is how the third card got drawn as a
+ * free seat and how a waiter came to seat a party on top of the one at #2.
  *
- * WHY THE ROW IS NOT DELETED INSTEAD. The busy card is where the second party's
- * money is; the free card is a real physical table that a settle has finished
- * with. Neither can be dropped from the database — one holds a bill, the other
- * holds the floor plan — so the FLOOR drops the one that is not a seat, and
- * planNextPartyRetirement deletes the sibling row for good as soon as its own
- * party leaves. Nothing here decides money; it decides which cards are drawn.
+ * WHY THE ROW IS NOT DELETED INSTEAD. Every card here is somebody's money — a
+ * printed bill, a running tab, or a real physical table a settle has finished
+ * with. Nothing may be dropped from the database, so the FLOOR drops the cards
+ * that are not seats, and planNextPartyRetirement deletes a sibling row for good
+ * once its own party leaves. Nothing here decides money; it decides which cards
+ * are drawn, and every route still addresses a hidden row by name exactly as
+ * before (GET /orders, GET /bill-for-table, POST /print/bill, the settle).
  *
- * THE RULE, and it is the client's sentence:
+ * THE RULE, in the three states a number can be in:
  *
- *   * a printed, unsettled bill anywhere in the family -> show everything. This
- *     is the state the duplicate exists FOR: the printed party's orange card and
- *     the green seat the next party is taken on. Both are real, both are needed,
- *     and the free one of the two is a seat rather than a lie.
- *   * otherwise, somebody is sitting at this number -> show only the rows that
- *     have a party on them. A free card beside them is a second card for a table
- *     that is already taken.
- *   * otherwise the whole number is idle -> ONE card, the root's (the sibling is
- *     about to be retired anyway, and until it is it must not double the table).
+ *   * PAPER OUT — a row whose current bill has been printed and not settled is
+ *     ALWAYS drawn, however many of them there are. That is the duplicate the
+ *     client asked for, one per bill printed: the paper is in a guest's hand or
+ *     in the manager's tray, and a card the floor stops drawing is a bill
+ *     nobody on the floor can reach.
+ *   * ONE RUNNING CARD — of the rows with a party and no paper out, exactly one
+ *     is drawn: the one whose party arrived FIRST. There is one table 11 in the
+ *     room, so only one of them can be sitting at it; a second live row can only
+ *     have been opened after the first was already taken (the phantom seat this
+ *     round removes) or by a stray write landing on the wrong row of the family
+ *     — the table's QR is signed for the root, so a guest who scans it while the
+ *     party is being served on "11 #2" puts an order on "11". Either way the
+ *     EARLIER party is the one that has been eating at the number, so its card
+ *     is the honest one and the later card is the one that should never have
+ *     been drawn. The hidden row keeps its money: it is not deleted, every route
+ *     still names it, and it is drawn again the moment its own bill is printed
+ *     (paper out is never hidden) or the party ahead of it leaves.
+ *   * FREE CARDS — one at most, and none at all while a party is running at this
+ *     number. A free card is an invitation to seat somebody; offering one while
+ *     11 is occupied is the whole defect. With no party running, the one free
+ *     card is the seat the next party is taken on: the root's, or the lowest
+ *     sibling when the root has gone.
  *
- * Returns the ids the floor must leave out. A family of one — every ordinary
- * table in the restaurant — is never touched.
+ * Returns the ids the floor must leave out, in family order. A family of one —
+ * every ordinary table in the restaurant — is never touched.
  */
 export function planNextPartyFloorHidden(family: readonly NextPartyFloorMember[]): string[] {
 	if (family.length < 2) { return []; }
-	// The one thing that earns a second card. Read off the BUSY rows: a settled
-	// table's seating is over, so its print count is 0 and it earns nothing.
-	if (family.some((m) => !m.free && m.printCount > 0)) { return []; }
+	// Read off the BUSY rows: a settled table's seating is over, so its print
+	// count is 0 and it is not paper out — it is a free card or a new party.
+	const running = family.filter((m) => !m.free && !(m.printCount > 0));
 	const free = family.filter((m) => m.free);
-	if (free.length === 0) { return []; }
-	// Somebody is at this number and no paper is out: every free row is a
-	// duplicate of a table that is taken.
-	if (free.length < family.length) { return free.map((m) => m.id); }
-	// The whole family is idle: keep the root, or the lowest sibling when the
-	// root has gone, and hide the rest.
-	const keep = free.find((m) => m.party_seq === null) ?? [...free].sort(bySeq)[0];
-	return free.filter((m) => m.id !== keep?.id).map((m) => m.id);
+	const hide = new Set<string>();
+	// ONE RUNNING CARD. The earliest party keeps it; see the header.
+	const staying = running.length > 0 ? [...running].sort(byArrival)[0] : null;
+	for (const m of running) { if (m.id !== staying?.id) { hide.add(m.id); } }
+	// FREE CARDS. None beside a running party; otherwise the one seat, root first.
+	if (free.length > 0) {
+		const seat = staying ? null : (free.find((m) => m.party_seq === null) ?? [...free].sort(bySeq)[0] ?? null);
+		for (const m of free) { if (m.id !== seat?.id) { hide.add(m.id); } }
+	}
+	return family.filter((m) => hide.has(m.id)).map((m) => m.id);
+}
+
+// ---------------------------------------------------------------------------
+// WHEN A PRINT MAY OPEN A SEAT AT ALL — "a duplicate only once per bill printed".
+// ---------------------------------------------------------------------------
+
+/**
+ * One live row of a family as EnsureNextPartyTable's locked read has it, plus
+ * whether THIS row's own current bill has been printed.
+ */
+export interface NextPartySeatMember extends NextPartyFamilyMember {
+	/** Paper out on this row's current seating — GetOrderingPrintGuard's count > 0. */
+	printed: boolean;
+}
+
+/**
+ * IS SOMEBODY STILL SITTING AT THIS NUMBER? — the row that stops a print from
+ * opening a SECOND next-party seat.
+ *
+ * "A duplicate should come only once per bill printed." A seat is opened when a
+ * bill is printed and the family has none free; nothing recorded WHICH bill
+ * opened it, so a second print of the SAME bill — a reprint after a paper jam, a
+ * duplicate for the guest, the reprint a waiter is told to do after adding to
+ * printed paper, or the refusal path's own call — found the first seat taken by
+ * the next party and minted another. That is how table 11 reached "11 #3": one
+ * bill, two seats, and the spare drawn on the floor as a free card for a waiter
+ * to seat a third party on.
+ *
+ * THE QUESTION THAT REPLACES THE MISSING RECORD. A seat is for the party that
+ * comes NEXT, so it is only ever owed when nobody is at the table now. Every row
+ * of the family with paper out is a party that has left or is paying — that is
+ * what printing means here, and those bills sit unsettled for hours at a
+ * restaurant that settles at night, which is why the family is allowed to hold
+ * one per printed bill. A row that is busy with NO paper out is a party still
+ * eating: the table is occupied, the next party has nowhere to go, and a seat
+ * minted for them is a card that lies. So the answer to "did this bill already
+ * open its seat?" is "is its seat, or the room itself, still in use?".
+ *
+ * [askingId] is the row whose bill was just printed. It is never its own
+ * blocker, and — deliberately — its print state is never consulted: the ledger
+ * write and this call race on the print path, and the FIRST seat at a number
+ * must not depend on who won.
+ *
+ * Returns the row that is still at the table, or null when the seat may be made.
+ */
+export function partyStillAtTheTable(
+	family: readonly NextPartySeatMember[],
+	askingId: string,
+): NextPartySeatMember | null {
+	const asking = String(askingId ?? "");
+	return family.find((m) => m.id !== asking && !m.free && !m.printed) ?? null;
 }
 
 // ---------------------------------------------------------------------------

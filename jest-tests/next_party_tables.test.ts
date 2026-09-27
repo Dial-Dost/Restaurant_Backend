@@ -128,27 +128,58 @@ describe("1. creation", () => {
     expect(out).toEqual({ table_name: "12", parent_table: "12", party_no: null, created: false });
   });
 
-  test("the whole family busy: a print of '12 #2' makes '12 #3', never a sibling of a sibling", async () => {
-    busyTwelve();
+  test("EVERY PRINTED BILL EARNS ITS SEAT: 12 printed, its next party printed too -> '12 #3'", async () => {
+    // Gaia Global settles at night, so a printed bill sits unsettled for hours
+    // and the number really can owe two of them at once. One duplicate per bill
+    // printed is exactly what the client asked for.
+    busyTwelve({ printed: true });
     await db.EnsureNextPartyTable(SLUG, "12");
     seat("12 #2", 2);
     addOrder("12 #2", 600);
+    tick(4);
+    addPrint(`12 #2-${String(Date.now())}`);
     const out = await db.EnsureNextPartyTable(SLUG, "12 #2");
     expect(out).toEqual({ table_name: "12 #3", parent_table: "12", party_no: 3, created: true });
     expect(liveTable("12 #3").parent_table_id).toBe(liveTable("12").id);
   });
 
-  test("an unseated '12 #2' that still OWES is not a free seat: the next party gets '12 #3'", async () => {
+  test("A SECOND PRINT OF THE SAME BILL MAKES NOTHING once the next party is on its seat", async () => {
+    // THE BUG, in four steps: print 12, seat the next party on "12 #2", print 12
+    // AGAIN (a reprint, a duplicate for the guest, or the reprint a waiter is
+    // told to do after adding to printed paper) — and the family used to mint a
+    // second seat, "12 #3", for a bill that had already had one.
+    busyTwelve({ printed: true });
+    expect(await db.EnsureNextPartyTable(SLUG, "12")).toMatchObject({ table_name: "12 #2", created: true });
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    tick(4);
+    addPrint(`12-${String(Date.now())}`);
+    expect(await db.EnsureNextPartyTable(SLUG, "12")).toBeNull();
+    expect(names(liveSiblingsOf("12"))).toEqual(["12 #2"]);
+    expect(statements().filter((q) => q.startsWith('insert into "tables"'))).toHaveLength(1);
+  });
+
+  test("…and the same while the party on the seat has only been SEATED, nothing rung yet", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    tick(4);
+    addPrint(`12-${String(Date.now())}`);
+    expect(await db.EnsureNextPartyTable(SLUG, "12")).toBeNull();
+  });
+
+  test("an unseated '12 #2' that still OWES is neither a free seat nor a reason to mint", async () => {
     // Freed by hand with the bill unpaid. Handing that seat to a new party would
     // put their food on somebody else's bill, so "free" is decided by the row's
-    // money as well as its occupancy.
-    busyTwelve();
+    // money as well as its occupancy — and money with no paper out is a party
+    // this number has not finished with, so no third card is minted either.
+    busyTwelve({ printed: true });
     await db.EnsureNextPartyTable(SLUG, "12");
     seat("12 #2", 2);
     addOrder("12 #2", 600);
     liveTable("12 #2").is_occupied = false;
-    const out = await db.EnsureNextPartyTable(SLUG, "12");
-    expect(out).toEqual({ table_name: "12 #3", parent_table: "12", party_no: 3, created: true });
+    expect(await db.EnsureNextPartyTable(SLUG, "12")).toBeNull();
+    expect(names(liveSiblingsOf("12"))).toEqual(["12 #2"]);
   });
 
   test("TWO TILLS AT ONCE: the root row lock makes one sibling, and both tills name it", async () => {
@@ -253,8 +284,11 @@ describe("2. retirement: at most one free seat per family, preferring the root",
   });
 
   test("two free siblings beside a busy 12 -> the higher number retires, '12 #2' stays", async () => {
+    // Two seats at one number is a shape a print can no longer leave behind (one
+    // per printed bill, once), but a floor that ran an older build can hold it,
+    // so the retirement rule still has to answer for it.
     await familyOf12({ siblingSeated: true });
-    await db.EnsureNextPartyTable(SLUG, "12 #2"); // makes "12 #3"
+    addTable({ table_name: "12 #3", parent_table_id: liveTable("12").id, party_seq: 3 });
     await db.ReleaseTable(SLUG, "12 #2");
     expect(names(liveSiblingsOf("12"))).toEqual(["12 #2"]);
   });
@@ -568,6 +602,69 @@ describe("4. the floor", () => {
     expect(await floor()).toEqual(["12", "15"]);
   });
 
+  // -------------------------------------------------------------------------
+  // THE SECOND PHOTO — "2 running tables shouldn't be the case."
+  //
+  // Table 11 drawn three times: "11" running, "11 #2" with its bill printed,
+  // "11 #3" running. Two live parties and a printed one, for one table in the
+  // room. Both halves of that are held here: the spare seat a second print used
+  // to mint, and the floor that used to draw it because paper was out somewhere
+  // in the family.
+  // -------------------------------------------------------------------------
+
+  test("A REPRINT NO LONGER PUTS A SPARE FREE CARD BESIDE A RUNNING SEAT", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12"); // "12 #2", the seat
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    tick(4);
+    addPrint(`12-${String(Date.now())}`); // the SAME bill, printed again
+    await db.EnsureNextPartyTable(SLUG, "12");
+    // Two cards: the paper, and the party sitting at the number. No third.
+    expect(await floor()).toEqual(["12", "12 #2", "15"]);
+  });
+
+  test("TWO LIVE PARTIES AT ONE NUMBER: the later card goes, and its money is still reachable", async () => {
+    // How the data gets there even with the mint fixed: 12 is settled and freed
+    // while "12 #2" eats, and an order lands on 12 anyway — the table's QR is
+    // signed for the ROOT, so a guest who scans the card on the table puts it
+    // there. Two running cards for one table; the floor draws one.
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    await db.ReleaseTable(SLUG, "12");
+    tick(20);
+    seat("12", 2);
+    addOrder("12", 300);
+    expect(liveTable("12").is_occupied).toBe(true);
+    expect(liveTable("12 #2").is_occupied).toBe(true);
+
+    const rows = (await db.GetTables(SLUG))!;
+    expect(rows.map((r) => r.table_name)).toEqual(["12 #2", "15"]);
+    expect(rows.filter((r) => r.display_name === "12")).toHaveLength(1);
+    // HIDDEN, NOT DELETED, and not out of reach: the row is live and every
+    // name-keyed reader still answers for it.
+    expect(liveTable("12").is_deleted).toBe(false);
+    expect((await db.GetBillForTable(SLUG, "12"))?.subtotal).toBe(300);
+    expect((await db.GetBillForTable(SLUG, "12 #2"))?.subtotal).toBe(600);
+  });
+
+  test("…and printing the hidden party's bill brings its card straight back", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    await db.ReleaseTable(SLUG, "12");
+    tick(20);
+    seat("12", 2);
+    addOrder("12", 300);
+    expect(await floor()).toEqual(["12 #2", "15"]);
+    tick(4);
+    addPrint(`12-${String(Date.now())}`);
+    expect(await floor()).toEqual(["12", "12 #2", "15"]);
+  });
+
   test("the two parties still bill apart while both cards are up", async () => {
     busyTwelve({ printed: true });
     await db.EnsureNextPartyTable(SLUG, "12");
@@ -576,6 +673,52 @@ describe("4. the floor", () => {
     expect(await floor()).toEqual(["12", "12 #2", "15"]);
     expect((await db.GetBillForTable(SLUG, "12"))?.subtotal).toBe(1000);
     expect((await db.GetBillForTable(SLUG, "12 #2"))?.subtotal).toBe(600);
+  });
+
+  // THE INVARIANT, over sequences rather than shapes: whatever order a service
+  // prints, seats and settles table 12 in, the floor draws at most ONE running
+  // card for it. Every state next_party.test.ts enumerates by hand is reachable
+  // here through the SHIPPED paths — EnsureNextPartyTable, ReleaseTable and
+  // GetTables — including the ones a stray write makes (a seating on a row the
+  // floor is not drawing is exactly what a QR order on a hidden root is).
+  test.each([1, 2, 3, 4, 5, 6, 7, 8])("for any sequence of print/seat/settle, one running card (seed %i)", async (seed) => {
+    let rng = seed * 2654435761;
+    const next = (n: number): number => { rng = (rng * 1103515245 + 12345) & 0x7fffffff; return rng % n; };
+    busyTwelve();
+    const owing = (id: string): boolean => orders().some((o) => o.table_id === id && !["4", "5", "7"].includes(o.status));
+
+    for (let step = 0; step < 24; step += 1) {
+      const family = liveTables().filter((t) => t.table_name === "12" || t.parent_table_id === liveTable("12").id);
+      const pick = family[next(family.length)]!;
+      const busy = pick.is_occupied || owing(pick.id);
+      const op = next(3);
+      try {
+        if (op === 0 && busy) {
+          addPrint(`${pick.table_name}-${String(Date.now())}`);
+          await db.EnsureNextPartyTable(SLUG, pick.table_name);
+        } else if (op === 1) {
+          seat(pick.table_name, 2);
+          addOrder(pick.table_name, 100 + next(9) * 100);
+        } else {
+          await db.ReleaseTable(SLUG, pick.table_name);
+        }
+      } catch { /* a nonsense op on a nonsense state is still a state the floor must answer for */ }
+      tick(3 + next(7));
+
+      const rows = (await db.GetTables(SLUG))!.filter((r) => r.display_name === "12");
+      const running = rows.filter((r) => (r.occupied || r.has_order) && (r.print_count ?? 0) === 0);
+      expect(running.length).toBeLessThanOrEqual(1);
+      // ...and never a free card beside a party, and never no card at all.
+      if (running.length > 0) { expect(rows.filter((r) => !r.occupied && !r.has_order)).toHaveLength(0); }
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      // Every bill whose paper is out keeps a card: the floor can always reach it.
+      const paperOut = liveTables()
+        .filter((t) => (t.table_name === "12" || t.parent_table_id === liveTable("12").id) && (t.is_occupied || owing(t.id)));
+      for (const t of paperOut) {
+        const drawn = rows.find((r) => r.table_name === t.table_name);
+        if (!drawn) { expect((await db.GetOrderingPrintGuard(SLUG, t.table_name))?.print_count ?? 0).toBe(0); }
+      }
+    }
   });
 
   test("an ordinary table is never touched by the rule — no family, no hiding", async () => {

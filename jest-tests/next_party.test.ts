@@ -31,6 +31,7 @@ import {
   orderOnPrintedBillVerdict,
   orderUpsertAddsToBill,
   parseNextPartyName,
+  partyStillAtTheTable,
   planNextPartyFloorHidden,
   planNextPartyRetirement,
   printedBillAdditionAudit,
@@ -43,6 +44,7 @@ import {
   takeItOnNextPartyLabel,
   type NextPartyFamilyMember,
   type NextPartyFloorMember,
+  type NextPartySeatMember,
 } from "../next_party";
 import { billPrintFallbackPrefix, billPrintJobBelongsToSeating, seatingStartOf } from "../bill_print_state";
 import { buildReceiptBase64 } from "../escpos";
@@ -161,21 +163,33 @@ describe("the retirement rule — at most one free seat per family, preferring t
   });
 });
 
-describe("the floor rule (round-3 item 4) — two cards for one table only while its paper is out", () => {
-  const f = (id: string, party_seq: number | null, free: boolean, printCount = 0): NextPartyFloorMember =>
-    ({ id, table_name: id, party_seq, free, printCount });
+describe("the floor rule (round-3 item 4) — one card per bill printed, and never two running", () => {
+  const f = (id: string, party_seq: number | null, free: boolean, printCount = 0, seatingStart: number | null = null): NextPartyFloorMember =>
+    ({ id, table_name: id, party_seq, free, printCount, seatingStart });
 
   test.each([
     // THE STATE THE DUPLICATE EXISTS FOR: 12's bill is printed and unsettled,
     // and the green seat beside it is where the next party is taken.
     ["printed and unsettled, seat free -> both cards", [f("r", null, false, 1), f("s2", 2, true)], []],
     ["printed and unsettled, both parties in -> both cards", [f("r", null, false, 1), f("s2", 2, false)], []],
-    // THE CLIENT'S PHOTO: 12 settled (its seating over, so no prints) while the
+    // THE FIRST PHOTO: 12 settled (its seating over, so no prints) while the
     // next party is still eating. The free card is a table that is taken.
     ["SETTLED beside a running next party -> the free root goes", [f("r", null, true), f("s2", 2, false)], ["r"]],
     ["…and the next party's own printed bill brings the seat back", [f("r", null, true), f("s2", 2, false, 1)], []],
     // A running table with nothing printed has not earned a second card at all.
     ["running, nothing printed -> the free seat goes", [f("r", null, false), f("s2", 2, true)], ["s2"]],
+    // THE SECOND PHOTO, card for card: 11 running, "11 #2" printed, "11 #3"
+    // running. The paper stays; the LATER of the two live parties goes.
+    ["printed in the middle, two running -> the later party's card goes",
+      [f("r", null, false, 0, 300), f("s2", 2, false, 1, 100), f("s3", 3, false, 0, 500)], ["s3"]],
+    ["…and it is the later one whichever row it is",
+      [f("r", null, false, 0, 700), f("s2", 2, false, 1, 100), f("s3", 3, false, 0, 500)], ["r"]],
+    // The spare seat the second print used to mint, before anybody sat on it.
+    ["printed, a party running, a spare seat -> the spare goes",
+      [f("r", null, false, 1), f("s2", 2, false), f("s3", 3, true)], ["s3"]],
+    // Two bills printed and nobody sitting: one card per bill, plus the seat.
+    ["two printed bills and a free seat -> every card stays",
+      [f("r", null, false, 1), f("s2", 2, false, 2), f("s3", 3, true)], []],
     // Idle: one card, the root's. (Retirement deletes the row next; until then
     // the floor must not draw 12 twice.)
     ["the whole number idle -> the root keeps the card", [f("r", null, true), f("s2", 2, true)], ["s2"]],
@@ -187,33 +201,69 @@ describe("the floor rule (round-3 item 4) — two cards for one table only while
     expect(planNextPartyFloorHidden(family as NextPartyFloorMember[])).toEqual(hidden);
   });
 
-  test("a row with a party on it is NEVER hidden, whatever else is true", () => {
+  test("a row with PAPER OUT is never hidden — a bill the floor stops drawing is a bill nobody can reach", () => {
     for (const rootFree of [true, false]) {
-      for (const printed of [0, 1]) {
-        for (let n = 0; n < 4; n += 1) {
-          const family = [
-            f("r", null, rootFree, printed),
-            ...Array.from({ length: 4 }, (_, i) => f(`s${String(i + 2)}`, i + 2, i !== n)),
-          ];
-          expect(planNextPartyFloorHidden(family)).not.toContain(`s${String(n + 2)}`);
-          if (!rootFree) { expect(planNextPartyFloorHidden(family)).not.toContain("r"); }
-        }
+      for (let n = 0; n < 4; n += 1) {
+        const family = [
+          f("r", null, rootFree, rootFree ? 0 : 1),
+          ...Array.from({ length: 4 }, (_, i) => f(`s${String(i + 2)}`, i + 2, false, i === n ? 3 : 0, i * 10)),
+        ];
+        expect(planNextPartyFloorHidden(family)).not.toContain(`s${String(n + 2)}`);
+        if (!rootFree) { expect(planNextPartyFloorHidden(family)).not.toContain("r"); }
       }
     }
   });
 
-  test("at most one card survives when no paper is out — the client's 'no duplication' in one line", () => {
-    for (const root of [true, false]) {
-      for (const s2 of [true, false]) {
-        for (const s3 of [true, false]) {
-          const family = [f("r", null, root), f("s2", 2, s2), f("s3", 3, s3)];
+  test("THE INVARIANT: at most one RUNNING card per family, for any shape of family at all", () => {
+    const free = [true, false];
+    const prints = [0, 2];
+    for (const rf of free) { for (const rp of prints) {
+      for (const af of free) { for (const ap of prints) {
+        for (const bf of free) { for (const bp of prints) {
+          const family = [
+            f("r", null, rf, rf ? 0 : rp, 100),
+            f("s2", 2, af, af ? 0 : ap, 200),
+            f("s3", 3, bf, bf ? 0 : bp, 300),
+          ];
           const hidden = new Set(planNextPartyFloorHidden(family));
           const shown = family.filter((m) => !hidden.has(m.id));
-          const busy = family.filter((m) => !m.free).length;
-          expect(shown.length).toBe(Math.max(1, busy));
-        }
-      }
-    }
+          // Never two live parties at one number...
+          expect(shown.filter((m) => !m.free && m.printCount === 0)).toHaveLength(
+            family.some((m) => !m.free && m.printCount === 0) ? 1 : 0);
+          // ...never two free cards, and none at all beside a running party...
+          expect(shown.filter((m) => m.free).length).toBeLessThanOrEqual(
+            shown.some((m) => !m.free && m.printCount === 0) ? 0 : 1);
+          // ...every bill that has paper out keeps its card...
+          for (const m of family.filter((x) => !x.free && x.printCount > 0)) { expect(shown).toContain(m); }
+          // ...and the floor is never left drawing nothing at all.
+          expect(shown.length).toBeGreaterThanOrEqual(1);
+        }}
+      }}
+    }}
+  });
+});
+
+describe("one seat per bill printed (partyStillAtTheTable)", () => {
+  const m = (id: string, party_seq: number | null, free: boolean, printed: boolean): NextPartySeatMember =>
+    ({ id, table_name: id, party_seq, free, printed });
+
+  test("the first print at a number is never blocked — its own row is not consulted", () => {
+    expect(partyStillAtTheTable([m("r", null, false, false)], "r")).toBeNull();
+    expect(partyStillAtTheTable([m("r", null, false, true)], "r")).toBeNull();
+  });
+
+  test("a SECOND print of the same bill is blocked by the party sitting on its seat", () => {
+    const family = [m("r", null, false, true), m("s2", 2, false, false)];
+    expect(partyStillAtTheTable(family, "r")?.table_name).toBe("s2");
+  });
+
+  test("a second PRINTED bill still earns its own seat — that is the duplicate the client asked for", () => {
+    const family = [m("r", null, false, true), m("s2", 2, false, true)];
+    expect(partyStillAtTheTable(family, "s2")).toBeNull();
+  });
+
+  test("a free row never blocks: freeFamilySeat would have handed it out first", () => {
+    expect(partyStillAtTheTable([m("r", null, true, false), m("s2", 2, false, true)], "s2")).toBeNull();
   });
 });
 

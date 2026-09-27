@@ -177,12 +177,14 @@ import {
   nextPartyLabel,
   nextPartyName,
   parseNextPartyName,
+  partyStillAtTheTable,
   planNextPartyFloorHidden,
   planNextPartyRetirement,
   storedOrderLines,
   tableDisplayName,
   type NextPartyFamilyMember,
   type NextPartyFloorMember,
+  type NextPartySeatMember,
   type StoredOrderLine,
 } from "./next_party.js";
 // The floor-section ordering rules (migration 041). Kept out of SQL on purpose:
@@ -4062,6 +4064,48 @@ export async function EnsureNextPartyTable(restaurantId: string, tableName: stri
   }
 }
 
+/**
+ * THE ROW THAT STOPS A PRINT FROM OPENING A SECOND SEAT, or null.
+ *
+ * partyStillAtTheTable holds the rule and argues it; this puts the family in
+ * front of it with each row's OWN print state, read through the shipped
+ * currentSeatingPrintState so the seat and the Print button can never disagree
+ * about which bills are paper out (the same reason the floor grid and
+ * /bill-for-table share billPrintStateForSeatings).
+ *
+ * [askingId] — the row whose bill was just printed — is skipped, so the FIRST
+ * seat at a number costs no ledger read at all and never races the print's own
+ * "PrintJobs" write.
+ *
+ * THE READ IS ITS OWN SAVEPOINT. This runs inside ensureNextPartySeat's
+ * transaction with the root row locked, and a ledger one migration behind raises
+ * 42P01/42703 — which would poison the transaction and lose the seat. Nested
+ * withTransaction is a savepoint, so a failed read rolls back to here and is
+ * answered "paper out": a family whose print state cannot be read mints exactly
+ * as it did before this guard existed, rather than stopping a print from ever
+ * seating the next party.
+ */
+async function nextPartySeatBlocker(
+  context: RestaurantContext,
+  live: readonly NextPartyFamilyRow[],
+  askingId: string,
+): Promise<NextPartySeatMember | null> {
+  const others = live.filter((r) => r.id !== askingId && (r.is_occupied || r.has_money));
+  if (others.length === 0) {return null;}
+  const members: NextPartySeatMember[] = [];
+  for (const r of others) {
+    const printed = await withTransaction(async () => {
+      const { prints } = await currentSeatingPrintState(context, { id: r.id, table_name: r.table_name });
+      return prints.print_count > 0;
+    }).catch((err: unknown) => {
+      logger.warn({ err: (err as { message?: string } | null)?.message ?? err, table: r.table_name }, "next_party_seat_print_state_failed");
+      return true;
+    });
+    members.push({ ...familyMember(r), printed });
+  }
+  return partyStillAtTheTable(members, askingId);
+}
+
 async function ensureNextPartySeat(context: RestaurantContext, tableName: string): Promise<NextPartyTable | null> {
   return withTransaction(async (client) => {
     const hit = await runQuery<{ id: string; parent_table_id: string | null }>(
@@ -4100,6 +4144,18 @@ async function ensureNextPartySeat(context: RestaurantContext, tableName: string
     const seat = freeFamilySeat(live.map(familyMember));
     if (seat) {
       return { table_name: seat.table_name, parent_table: root.table_name, party_no: seat.party_seq, created: false };
+    }
+
+    // ONE SEAT PER PRINTED BILL, ONCE — the client's "a duplicate should come
+    // only once per bill printed". Nothing free, so this call would MINT; it may
+    // only do so when nobody is still sitting at the number. A second print of a
+    // bill whose seat the next party has already taken finds that party here and
+    // makes nothing, which is how "12 #3" used to appear beside a running
+    // "12 #2" and then get seated as a third card. partyStillAtTheTable argues it.
+    const blocker = await nextPartySeatBlocker(context, live, hit[0].id);
+    if (blocker) {
+      logger.info({ table: tableName, seated: blocker.table_name }, "next_party_seat_not_needed");
+      return null;
     }
 
     // Every name already in use under this root's prefix, sibling or not — a
@@ -6495,6 +6551,11 @@ export async function GetTables(
   // floor.
   const seatingByTable = await openSeatingStarts(context, null);
   const printSeatings: BillPrintSeating[] = [];
+  // ...and WHEN each row's current party arrived, kept as it is computed. The
+  // duplicate rule below breaks a tie between two live parties at one number
+  // with it, and it must be the SAME bound the print state is read under or the
+  // two would disagree about which seating the floor is looking at.
+  const seatingStartByTable = new Map<string, number>();
   for (const row of tableRows) {
     const bill = openBillByTable.get(row.id) ?? null;
     const start = seatingStartFor({
@@ -6504,6 +6565,8 @@ export async function GetTables(
       firstArrivalAt: firstArrivalByTable.get(row.id) ?? null,
     });
     if (start === null) { continue; }
+    const startedAt = new Date(start).getTime();
+    if (Number.isFinite(startedAt)) { seatingStartByTable.set(row.id, startedAt); }
     printSeatings.push({ open_bill_id: bill?.id ?? null, table_name: row.table_name, seating_start: start });
   }
   // Never fails the floor plan: billPrintStateForSeatings already degrades to
@@ -6588,11 +6651,15 @@ export async function GetTables(
       return GetTables(restaurantId, time, { backfillNextParty: false });
     }
   }
-  // TWO CARDS FOR ONE TABLE ONLY WHILE ITS PAPER IS OUT — round-3 client item 4.
+  // TWO CARDS FOR ONE TABLE ONLY WHILE ITS PAPER IS OUT, AND NEVER TWO RUNNING
+  // ONES — round-3 client item 4 and the client's follow-up on the same photo.
   //
   // The client photographed a green, FREE "14" beside a running "14 #2": 14 was
   // settled while its next party was still eating, and a waiter reading that
-  // free card seats a party on a table that is already taken.
+  // free card seats a party on a table that is already taken. Then table 11
+  // arrived drawn three times — running, bill printed, running — because the
+  // first version of this rule drew EVERY card as soon as any bill in the family
+  // was printed, spare seats included, and one of those spares was seated.
   // planNextPartyFloorHidden has the rule and argues it; here the family is put
   // in front of it, WITH each row's own print count, and the rows it names are
   // left off the floor.
@@ -6610,6 +6677,7 @@ export async function GetTables(
       party_seq: r.parent_table_id ? (Math.round(parseNumeric(r.party_seq)) || null) : null,
       free: !inUse(r),
       printCount: printStateByTable.get(r.table_name)?.print_count ?? 0,
+      seatingStart: seatingStartByTable.get(r.id) ?? null,
     });
     for (const [rootId, siblings] of siblingsByRoot) {
       const root = liveById.get(rootId);
