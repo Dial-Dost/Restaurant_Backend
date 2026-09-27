@@ -5,7 +5,8 @@
 // ============================================================================
 // WHAT WAS ACTUALLY HAPPENING
 // ============================================================================
-// "Remove from bill" is drawn PER LINE, inside a KOT block, so the admin taps
+// The control (named "Remove from KOT" since round 4 item 2) is drawn PER
+// LINE, inside a KOT block, so the admin taps
 // one dish on one ticket. The request carried only that dish's name and its
 // price, and removeItemFromTableOrders took every line on the table answering
 // to that name — on EVERY order, because one order is one KOT.

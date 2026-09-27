@@ -355,6 +355,33 @@ async function query(connId: number, sqlRaw: string, params: unknown[] = []): Pr
     });
     return { rows: [{ id: `job-${String(printJobRows.length)}` }] };
   }
+  // THE KOT-NUMBER LINK READ (migration 043) — GetKotNumbersForOrders'
+  // `select bill_id, kot_no … group by bill_id, kot_no order by min(seq)`.
+  //
+  // MODELLED BECAUSE IT IS NOW A PRODUCER'S INPUT AND NOT ONLY A SCREEN'S.
+  // The reprint of an EDITED ticket asks it "what number is already on the
+  // paper for this order?" — the one question the ticket key cannot answer
+  // once a line has left the set — so a fixture that answered it empty would
+  // let the reprint fall back to minting and the suite would pass vacuously.
+  // `seq` is the insert order of printJobRows, which is what the real bigserial
+  // gives; DISTINCT per (bill_id, kot_no), as the real `group by` does, so the
+  // N station dockets of one ticket count once.
+  if (s.startsWith('select bill_id, kot_no from "printjobs"')) {
+    const wantOutlet = params[1] === null || params[1] === undefined ? null : str(params[1]);
+    const wantBills = new Set((Array.isArray(params[2]) ? params[2] : []).map((b) => str(b)));
+    const seen = new Set<string>();
+    const rows: { bill_id: string; kot_no: number }[] = [];
+    for (const job of printJobRows) {
+      if (job.kot_no === null) {continue;}
+      if (wantOutlet !== null && job.outlet_id !== wantOutlet) {continue;}
+      if (!wantBills.has(job.bill_id)) {continue;}
+      const dedupe = `${job.bill_id}|${String(job.kot_no)}`;
+      if (seen.has(dedupe)) {continue;}
+      seen.add(dedupe);
+      rows.push({ bill_id: job.bill_id, kot_no: job.kot_no });
+    }
+    return { rows };
+  }
   if (s.includes('"printjobs"')) {
     // Any other PrintJobs statement — a routed assignment read, an ack, the
     // reaper. Not this fixture's subject; answer empty rather than throwing, so

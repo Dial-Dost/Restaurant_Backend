@@ -14,7 +14,7 @@ import { isNcSettleMethod } from "../payment_methods.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
 import { CUSTOMER_ADDRESS_ERROR, CustomerAddressInvalidError, CustomerAddressSchemaPendingError, normalizeCustomerAddress } from "../customer_address.js";
-import { dispatchCancellationKot, dispatchKot, kotLineOfStored, logKotDispatched } from "../kot_print.js";
+import { dispatchCancellationKot, dispatchKot, kotLineOfStored, kotNumberOnPaperForOrder, logKotDispatched } from "../kot_print.js";
 import { printKotItemMove, resolveMoveSourceKots, type KotMoveOutcome } from "../kot_move.js";
 import { moveItemAuditSentence } from "../order_moves.js";
 import { kotStamp } from "../kot_numbers.js";
@@ -2227,11 +2227,38 @@ app.post('/print/ack', validateAction("4ad474d4-5230-449c-874f-6a238b833bca"), v
 	since taken a second order it would hand the kitchen the first order's food a
 	second time.
 
-	IT IS A REPRINT IN THE STRICT SENSE, and that is the whole point. The ticket
-	key is (outlet, business day, table, item set), so an unchanged order resolves
-	to the number already on paper via migration 029's memo and comes back with
-	reprint:true. The kitchen gets the SAME docket, not a new ticket that happens
-	to list the same food.
+	IT IS A REPRINT IN THE STRICT SENSE, and that is the whole point. The kitchen
+	gets the SAME docket, not a new ticket that happens to list the same food.
+
+	ROUND 4 ITEM 2 — "changes should be made accordingly for the reprint of that
+	edited KOT too."
+
+	  * WHAT IT PRINTS was already right: the docket is built from the order as
+	    it stands NOW (GetOrderKotContext reads "Orders".food live), so a dish
+	    taken off by POST /bills/remove-item is gone from the paper the moment it
+	    is gone from the bill. Nothing here replays a stored original.
+
+	  * WHAT IT WAS CALLED was not. The number came from allocateKotNumber
+	    against the ticket key — a fingerprint of the item SET — so the instant
+	    one line left, the key stopped matching and the "reprint" MINTED THE NEXT
+	    GAPLESS NUMBER. The pass holding KOT-12 was handed a KOT-13 listing the
+	    surviving dishes: not a correction, a second order, for food already
+	    being cooked. Removing two lines and reprinting between them burned three
+	    numbers for one ticket. Worse, each mint MEMOISED the edited set, so the
+	    next removal's CANCELLED slip named the ticket the reprint had just
+	    invented instead of the paper on the rail.
+
+	    So the number is RESOLVED, not minted: kotNumberOnPaperForOrder reads it
+	    back from "PrintJobs" (migration 043), which does not move when the food
+	    does, and it is pinned. An edited ticket reprints as itself.
+
+	  * AN ORDER WITH NOTHING LEFT does not reprint at all — see the 400 below.
+
+	WHEN NOTHING IS ON PAPER YET the route allocates exactly as it always has: an
+	order whose placement docket never reached the queue (an enqueue that threw,
+	or a deployment without 027/043) still has its migration-029 memo, so the
+	unchanged key resolves to the number that was allocated and the button is
+	still the repair it exists to be.
 
 	Gated on the existing print permission (4ad474d4...), like every other print
 	route: whoever may print may reprint. Minting a new Action id would strip the
@@ -2244,13 +2271,27 @@ app.post('/print/kot/order/:id', validateAction("4ad474d4-5230-449c-874f-6a238b8
 	const orderId = String(req.params.id ?? "").trim();
 	if (!orderId) { res.status(400).json({ error: 'order id is required' }); return; }
 	try {
-		const [order, settings, profile] = await Promise.all([
+		const [order, settings, profile, onPaper] = await Promise.all([
 			GetOrderKotContext(restaurantId, orderId),
 			GetRestaurantSettings(restaurantId).catch(() => ({ currency: "\u20b9" } as any)),
 			GetRestaurantProfile(restaurantId).catch(() => null),
+			// Read BESIDE the order, not after it: it is a pure read of
+			// "PrintJobs" and it is needed for every reprint, edited or not.
+			kotNumberOnPaperForOrder(restaurantId, orderId),
 		]);
 		if (!order) { res.status(404).json({ error: 'Order not found' }); return; }
-		if (order.items.length === 0) { res.status(400).json({ error: 'This order has no items to print' }); return; }
+		// NOTHING LEFT TO REPRINT, and that is the honest answer rather than a
+		// failure to paper over. Removing the LAST line off a ticket cancels the
+		// order (RemoveBillItem flips it to status 5) and the kitchen has already
+		// been handed the CANCELLED slip for that dish \u2014 so the ticket the pass
+		// holds is dead, and re-issuing an empty docket under its number would
+		// tell the kitchen to cook nothing while looking exactly like an order.
+		// The sentence says which of the two it is, because "no items" reads like
+		// a glitch to the person who has just emptied the ticket on purpose.
+		if (order.items.length === 0) {
+			res.status(400).json({ error: 'Every dish has been taken off this KOT, so there is nothing to reprint. The kitchen already has the CANCELLED slip for it.' });
+			return;
+		}
 		const waiterCtx = order.table_name
 			? await GetTableFeedbackContext(restaurantId, order.table_name).catch(() => null)
 			: null;
@@ -2275,6 +2316,13 @@ app.post('/print/kot/order/:id', validateAction("4ad474d4-5230-449c-874f-6a238b8
 			currency: settings.currency ?? "\u20b9",
 			cols: settings.bill_paper_width === "58mm" ? 32 : 48,
 			tz: settings.timezone || 'Asia/Kolkata',
+			// THE NUMBER THE PASS ALREADY CALLS THIS TICKET BY. Spread
+			// conditionally so an order with nothing on paper yet hands
+			// dispatchKot the object it handed it before this existed, and
+			// allocates exactly as it always has. `neverAllocate` rides with the
+			// pin rather than alone: together they say "print this number and
+			// mint nothing", which is the whole of a reprint.
+			...(onPaper !== null ? { pinnedKotNo: onPaper, neverAllocate: true } : {}),
 		});
 		logKotDispatched("print_kot_order", dispatched, { resId: restaurantId, outletId, orderId });
 		const kotLabel = dispatched.kotNo ? `KOT-${dispatched.kotNo}${dispatched.reprint ? ' (reprint)' : ''}` : 'KOT';
@@ -2290,10 +2338,23 @@ app.post('/print/kot/order/:id', validateAction("4ad474d4-5230-449c-874f-6a238b8
 });
 
 /*
-	Admin: remove a wrongly-added item from a table's running bill.
+	Admin: take one wrongly-added dish OFF A KOT (and therefore off the bill).
 
 	CLIENT ITEMS 1 AND 2 — "if we try deleting 1 item, the whole KOT (all items in
 	the KOT) gets deleted", and "the cancelled KOT is not getting printed".
+
+	ROUND 4 ITEM 2 — WHY THE CONTROL IS NO LONGER CALLED "REMOVE FROM BILL". The
+	client's words: 'Remove from bill makes it sound like the item is going to be
+	served but only removed from bill.' That is the description of a COMP, which
+	this product has as a separate, differently-gated act (POST
+	/orders/:id/items/:itemId/non-chargeable — the dish IS cooked and carried, and
+	the house eats the cost). This door does the opposite: the dish comes off the
+	ticket, the pass is told to stop cooking it, and nothing is plated. Both
+	clients now read "Remove from KOT", and the audit sentence names the ticket.
+
+	THE ROUTE PATH AND THE REQUEST BODY ARE UNCHANGED. Every till in the field
+	posts to /bills/remove-item and will keep doing so for months — a rename of a
+	label must never become a rename of a contract.
 
 	  * ONE LINE. The button is drawn per line inside a KOT block, but the request
 	    named only a dish and a price, and the writer took EVERY line on the table
@@ -2355,9 +2416,19 @@ app.post('/bills/remove-item', validateBody(sBillRemoveItem), async (req: Reques
 			})
 			: null;
 		try {
+			// "Removed item " IS A LOAD-BEARING PREFIX, not prose: the Bill Edits
+			// MIS report classifies this line by /^removed item /i
+			// (classifyBillEdit, mis_report_math.ts) because the catch-all action
+			// id cannot tell one floor edit from another. Everything AFTER it is
+			// free, and round 4 item 2 spends that freedom saying which KOT the
+			// dish came off — the fact a manager reading the log actually wants,
+			// and the one that makes it unmistakably not a comp. The table stays
+			// in the sentence and in `details.table`, which is where every reader
+			// takes it from.
+			const off = cancelPrint?.kot_no ? `KOT-${String(cancelPrint.kot_no)}` : "the KOT";
 			await log_audit(
 				req, "4ad474d4-5230-449c-874f-6a238b833bca",
-				`Removed item ${result.removed.name} from table ${tableName}`,
+				`Removed item ${result.removed.name} from ${off} on table ${tableName}`,
 				Audit_log_category.Bill,
 				{
 					table: tableName, item: itemName,

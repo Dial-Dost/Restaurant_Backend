@@ -15759,7 +15759,8 @@ function billLineMatcher(itemName: string, itemPrice: number): (it: unknown) => 
  * CLIENT ITEM 1 — WHICH LINE A REMOVAL MEANS, when the tenant has more than one
  * that answers to the same name.
  *
- * "Remove from bill" is drawn per LINE, inside a KOT block, so the admin taps
+ * "Remove from KOT" (named "Remove from bill" until round 4 item 2) is drawn
+ * per LINE, inside a KOT block, so the admin taps
  * one dish on one ticket. The request carried only that dish's name and price,
  * and billLineMatcher answers "every line on this table called that" — which is
  * the right answer for a MOVE (see the header below) and the wrong one here.
