@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "2.0.2";
+const LATEST = "2.0.3";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,14 +118,13 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"A table whose bill is printed now stays on the waiter's floor in orange, with a green table of the same "+
-		"number for the next guests. Waiters can add dishes to a printed bill (print it again, marked UPDATED BILL, "+
-		"before taking payment) and can move a table, but can no longer cancel a KOT. Moved orders show their "+
-		"dish names. The kitchen ticket uses a narrower typeface, closer to your sample, and Settings has a Print a "+
-		"test KOT button. The x now clears every search box. A bill can carry the guest's address with the name "+
-		"and GSTIN, and old bills can be reprinted from History. Reports has a new Email reports area to send reports "+
-		"to the addresses you choose, daily at a set time or right away, once email sending is switched on. Everything in Today at a glance now opens its details. Screens also "+
-		"fit better on small phones and with large text.",
+		"Six fixes from the floor. Taking one dish off a bill now takes that dish only — it used to " +
+		"delete the whole kitchen ticket — and the kitchen gets a CANCELLED slip naming it. A party " +
+		"bigger than the table can be seated and its order still reaches the kitchen. A table that has " +
+		"been settled no longer leaves a second card on the floor, and a kitchen ticket now prints the " +
+		"plain table number. Moving a table prints a short correction saying the order moved, instead of " +
+		"the whole order again, which the kitchen was cooking twice. On Windows, an update that fails to " +
+		"install now says so instead of asking again every time you open the app.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
