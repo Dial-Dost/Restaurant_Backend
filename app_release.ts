@@ -88,7 +88,7 @@ const dashboardAsset = (file: string): string =>
 	`https://experiosolutions.dialdost.com/downloads/${file}`;
 
 /** The version the manifest advertises. Bump this and the URLs follow. */
-const LATEST = "2.0.3";
+const LATEST = "2.0.4";
 
 /** One platform's download URL, or "" when that platform has no build. */
 export interface AppDownloads {
@@ -118,13 +118,11 @@ export const APP_RELEASE: AppReleaseManifest = {
 	// genuinely broken — it takes the choice away from the owner mid-service.
 	min_supported: "0.0.0",
 	notes:
-		"Six fixes from the floor. Taking one dish off a bill now takes that dish only — it used to " +
-		"delete the whole kitchen ticket — and the kitchen gets a CANCELLED slip naming it. A party " +
-		"bigger than the table can be seated and its order still reaches the kitchen. A table that has " +
-		"been settled no longer leaves a second card on the floor, and a kitchen ticket now prints the " +
-		"plain table number. Moving a table prints a short correction saying the order moved, instead of " +
-		"the whole order again, which the kitchen was cooking twice. On Windows, an update that fails to " +
-		"install now says so instead of asking again every time you open the app.",
+		"The kitchen menu now says Remove from KOT, not Remove from bill: it takes the dish off the " +
+		"ticket so it is never cooked, and the message names the KOT the cancellation slip prints under. " +
+		"To serve a dish free of charge instead, use Non-chargeable. A table whose card is hidden from " +
+		"the floor still appears in the floor plan, the booking picker and the occupancy counts. Printing " +
+		"the same bill twice no longer opens a second card for the table.",
 	downloads: {
 		windows: dashboardAsset("RestaurantDash-Windows.zip"),
 		android: dashboardAsset("RestaurantDash-Android.apk"),
