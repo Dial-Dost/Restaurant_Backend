@@ -15755,6 +15755,94 @@ function billLineMatcher(itemName: string, itemPrice: number): (it: unknown) => 
   };
 }
 
+/**
+ * CLIENT ITEM 1 — WHICH LINE A REMOVAL MEANS, when the tenant has more than one
+ * that answers to the same name.
+ *
+ * "Remove from bill" is drawn per LINE, inside a KOT block, so the admin taps
+ * one dish on one ticket. The request carried only that dish's name and price,
+ * and billLineMatcher answers "every line on this table called that" — which is
+ * the right answer for a MOVE (see the header below) and the wrong one here.
+ * A table holding Tandoori Roti on KOT 2 and on KOT 3 lost BOTH for one tap;
+ * when the other ticket held nothing else, the whole KOT went with it (the
+ * empty-order branch flips it to Cancelled(5), and a cancelled order is off
+ * every screen). That is the floor's report, verbatim: "if we try deleting 1
+ * item, the whole KOT gets deleted".
+ *
+ * So a removal now says WHICH line: the order it sits on and the line's own id,
+ * both of which the KOT block the button lives in already knows. Neither is
+ * required — a shipped till that sends neither still works, and still only
+ * takes ONE line off (the first match, oldest ticket first), because taking a
+ * second one was never what the button offered.
+ */
+export interface RemovedLineRef {
+  /** "Orders".id — the ticket the tapped line is on. */
+  orderId?: string | null;
+  /** "Orders".food.items[].id — the line itself. */
+  itemId?: string | null;
+}
+
+/** A stored line's own id, as every writer spells it, or "" for an old id-less line. */
+function billLineId(raw: unknown): string {
+  const it = (raw ?? {}) as { id?: unknown };
+  return typeof it.id === "string" ? it.id.trim() : typeof it.id === "number" ? String(it.id) : "";
+}
+
+/**
+ * THE ONE LINE A REMOVAL TAKES OFF — the single rule, used by the write below
+ * and by the pre-read the route prints its slip from, so the slip can never
+ * name a dish other than the one that left.
+ *
+ * The id wins where the client sent one: it is exact, and an id that is no
+ * longer on the table means the line has already gone, NOT "take the next thing
+ * with this name" — that fallback would delete a dish somebody is eating.
+ * Without an id, the first matching line on the named order, or on the oldest
+ * ticket that has one.
+ */
+function pickRemovedLine(
+  orders: readonly { id: string; food: unknown }[],
+  matches: (it: unknown) => boolean,
+  only?: RemovedLineRef | null,
+): { order_id: string; index: number; line: Record<string, unknown> } | null {
+  const wantOrder = (only?.orderId ?? "").trim();
+  const wantItem = (only?.itemId ?? "").trim();
+  for (const o of orders) {
+    if (wantOrder && o.id !== wantOrder) {continue;}
+    const f = (parseJsonObject(o.food) ?? {}) as Record<string, unknown>;
+    const items: unknown[] = Array.isArray(f.items) ? (f.items as unknown[]) : [];
+    const index = wantItem
+      ? items.findIndex((it) => billLineId(it) === wantItem)
+      : items.findIndex((it) => matches(it));
+    if (index < 0) {continue;}
+    return { order_id: o.id, index, line: ((items[index] ?? {}) as Record<string, unknown>) };
+  }
+  return null;
+}
+
+/**
+ * Does this line belong to the set that was taken off? ONE occurrence per line
+ * taken, so a removal of one of two identical lines strips one of them from the
+ * Served/Preparing split too. The identity is linesTakenOff's (mis_report_math):
+ * the line's id when it has one, else dish, size and price.
+ */
+function takenLineDropper(taken: readonly unknown[]): (it: unknown) => boolean {
+  const keyOf = (raw: unknown): string => {
+    const id = billLineId(raw);
+    if (id) {return `id:${id}`;}
+    const { name, variation } = voidLineIdentity(raw);
+    return `line:${name}|${variation ?? ""}|${String(Number((raw as { price?: unknown })?.price) || 0)}`;
+  };
+  const left = new Map<string, number>();
+  for (const line of taken) { const k = keyOf(line); left.set(k, (left.get(k) ?? 0) + 1); }
+  return (it: unknown) => {
+    const k = keyOf(it);
+    const n = left.get(k) ?? 0;
+    if (n <= 0) {return false;}
+    left.set(k, n - 1);
+    return true;
+  };
+}
+
 /** One source order a move took lines off, with those lines WHOLE. */
 interface MovedLineSource {
   order_id: string;
@@ -15817,6 +15905,8 @@ async function removeItemFromTableOrders(
    * source order.
    */
   moveTo?: { to_table: string; orderIdFor: (sourceOrderId: string) => string } | null,
+  /** A REMOVE only (client item 1): which line the admin tapped. See RemovedLineRef. */
+  only?: RemovedLineRef | null,
 ): Promise<{ name: string; price: number; quantity: number; lines: RemovedBillLine[]; value: number; sources: MovedLineSource[] } | null> {
   const orders = await runQuery<{ id: string; food: unknown; status: unknown; barked_at: Date | string | null }>(
     `select id, food, status, barked_at from "Orders"
@@ -15848,14 +15938,34 @@ async function removeItemFromTableOrders(
   const removedLines: RemovedBillLine[] = [];
   const sources: MovedLineSource[] = [];
 
+  // WHICH LINES COME OFF, AND OFF WHICH ORDER — the one place the two writers
+  // differ. A MOVE takes every line the name (and the price, when one was sent)
+  // matches, on every ticket the table has open: the header above is the money
+  // hole that rule closes. A REMOVE takes exactly ONE line, the one the admin
+  // tapped (client item 1, RemovedLineRef).
+  const taking = new Map<string, Set<number>>();
+  if (mode === "move") {
+    for (const o of orders) {
+      const f = (parseJsonObject(o.food) ?? {}) as Record<string, unknown>;
+      const items: unknown[] = Array.isArray(f.items) ? (f.items as unknown[]) : [];
+      const hits = new Set<number>();
+      items.forEach((it, i) => { if (matches(it)) {hits.add(i);} });
+      if (hits.size > 0) {taking.set(o.id, hits);}
+    }
+  } else {
+    const picked = pickRemovedLine(orders, matches, only);
+    if (picked) {taking.set(picked.order_id, new Set([picked.index]));}
+  }
+
   for (const o of orders) {
     const f = (parseJsonObject(o.food) ?? {}) as Record<string, any>;
     const items: any[] = Array.isArray(f.items) ? f.items : [];
-    const keep = items.filter((it) => !matches(it));
-    if (keep.length === items.length) {continue;} // nothing removed from this order
+    const drop = taking.get(o.id);
+    if (!drop || drop.size === 0) {continue;} // nothing removed from this order
+    const keep = items.filter((_, i) => !drop.has(i));
+    const taken = items.filter((_, i) => drop.has(i));
     const wholeLines: Record<string, unknown>[] = [];
-    for (const it of items) {
-      if (!matches(it)) {continue;}
+    for (const it of taken) {
       const lineName = String(it?.name ?? "Item");
       // Clamped for the same reason order entry is: a line that somehow carries a
       // negative price must not pay the guest on the way to another table.
@@ -15882,7 +15992,10 @@ async function removeItemFromTableOrders(
           if (matches(it) && it?.id != null) {splitLabels.set(String(it.id), String(t[0] ?? ""));}
         }
       }
-      split = split.map((t: any) => Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter((it: any) => !matches(it))] : t);
+      // The SAME lines as `taken`, not "everything the name matches": a removal
+      // of one of two identical lines leaves the other one on its course.
+      const dropsLine = takenLineDropper(taken);
+      split = split.map((t: any) => Array.isArray(t) ? [t[0], (Array.isArray(t[1]) ? t[1] : []).filter((it: any) => !dropsLine(it))] : t);
     }
     sources.push({ order_id: o.id, status: o.status, barked_at: o.barked_at, food: { ...f }, lines: wholeLines, splitLabels });
     // OVER THE CHARGEABLE LINES (migration 034), as every other order writer
@@ -15895,7 +16008,7 @@ async function removeItemFromTableOrders(
     const { nc_subtotal: _staleNc, ...rest } = f;
     const newFood: Record<string, any> = stampLineRemoval(
       { ...rest, items: keep, subtotal, total: subtotal, ...(ncLeft > 0 ? { nc_subtotal: ncLeft } : {}) },
-      items.filter((it) => matches(it)),
+      taken,
       mode,
       keep.length === 0,
       new Date().toISOString(),
@@ -15962,6 +16075,42 @@ export async function GetMovableLineSources(
     out.push({ order_id: r.id, lines: hit.map((it) => ({ ...((it ?? {}) as Record<string, unknown>) })) });
   }
   return out;
+}
+
+/**
+ * WHICH LINE A REMOVE-ITEM WILL TAKE OFF, AND OFF WHICH TICKET — read BEFORE
+ * the write (client item 2).
+ *
+ * POST /bills/remove-item has to put a CANCELLED slip on the pass for the dish
+ * that left, under the number the kitchen already knows the ticket by. That
+ * number is found by the order's ticket key, a fingerprint of its item SET,
+ * which stops matching the instant the line goes — so the route asks this
+ * first, reads the order's KOT context, and only then removes. Exactly the
+ * shape and the reason GetMovableLineSources exists in for the move, and the
+ * same trap DELETE /orders/:id/items/:itemId reads around.
+ *
+ * The SAME statement, the SAME matcher and the SAME pick as the write, so the
+ * slip can never name a dish other than the one that actually left. A read only.
+ */
+export async function GetRemovableBillLine(
+  restaurantId: string,
+  tableName: string,
+  itemName: string,
+  itemPrice: number,
+  only?: RemovedLineRef | null,
+): Promise<{ order_id: string; line: Record<string, unknown> } | null> {
+  const context = await requireRestaurantContext(restaurantId);
+  const tableId = await tableIdByName(context, tableName);
+  if (!tableId) {return null;}
+  const rows = await runQuery<{ id: string; food: unknown }>(
+    `select id, food from "Orders"
+        where res_id = $1 and outlet_id = $2 and table_id = $3
+          and ${stillOwesStatusSql()}
+        order by created_at asc`,
+    [context.res_id, context.outlet_id, tableId],
+  );
+  const picked = pickRemovedLine(rows, billLineMatcher(itemName, itemPrice), only);
+  return picked ? { order_id: picked.order_id, line: { ...picked.line } } : null;
 }
 
 // Admin: remove a wrongly-added item (by name+price) from a table's bill.
@@ -16032,17 +16181,27 @@ export async function RemoveBillItem(
   tableName: string,
   itemName: string,
   itemPrice: number,
-): Promise<{ success: true; removed: { name: string; price: number; quantity: number } }> {
+  /** CLIENT ITEM 1 — which line the admin tapped. See RemovedLineRef. */
+  only?: RemovedLineRef | null,
+): Promise<{
+  success: true;
+  removed: { name: string; price: number; quantity: number };
+  /** The ticket the line came off and the line as it stood, for the CANCELLED slip. */
+  taken: { order_id: string; lines: Record<string, unknown>[] }[];
+}> {
   return withTransaction(async (client) => {
     const context = await requireRestaurantContext(restaurantId, client);
     const tableId = await tableIdByName(context, tableName, client);
     if (!tableId) {throw new Error("Table not found");}
     await assertBillEditable(context, tableId, client);
-    const found = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove");
+    const found = await removeItemFromTableOrders(context, tableId, itemName, itemPrice, client, "remove", null, only);
     if (!found) {throw new Error("Item not found on this table's bill");}
-    // The whole source orders are the move's business, not this answer's.
-    const { sources: _sources, ...removed } = found;
-    return { success: true, removed };
+    // The whole source orders are the move's business, not this answer's — but
+    // WHICH ticket lost WHICH line is this one's: it is what the kitchen has to
+    // be told (client item 2), and after the write there is nowhere left to
+    // read it from.
+    const { sources, ...removed } = found;
+    return { success: true, removed, taken: sources.map((s) => ({ order_id: s.order_id, lines: s.lines })) };
   });
 }
 

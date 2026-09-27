@@ -6,7 +6,7 @@
 import type { Express, Request, Response } from "express";
 import type { BillSectionAxis, BillTenderState, ClosedBillDetail, OpenBillChargeConfig } from "../database_supabase.js";
 import { z } from "zod";
-import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMovableLineSources, GetOrderKotContext, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable, RecordBillPrintPaper, CopyBillPrintPaper } from "../database_supabase.js";
+import { AddBill, AddNotification, ApplyCouponToBill, ApproveBillPaymentByAdmin, Audit_log_category, BILL_SECTION_AXES, CloseBillByOrder, ConfirmBillPaymentByWaiter, GetBillByOrder, GetBillForTable, GetBillPaymentLedger, GetBillTenderState, GetClosedBill, GetTipLedger, GetEmployeeDetailsFromEmpID, GetKotTableContext, GetMovableLineSources, GetOrderKotContext, GetRemovableBillLine, GetOutlets, GetRestaurantProfile, GetRestaurantRazorpayKeys, GetRestaurantSettings, GetTableFeedbackContext, ListBillingCounters, ListClosedBills, ListOpenBills, MergeTableBills, MoveBillItem, RecordBillTenders, RecordClientRenderedBillPrint, RefundBill, RemoveBillItem, ReopenBill, ReplaceBill, SetBillCounter, SetBillDiscountWithApproval, SetBillCustomerName, SetBillItemNote, SetBillRefundRef, SetClosedBillCustomerDetails, SplitBillForTable, SplitBillForTableBySection, UpdateBillStatusByOrder, UpdateOrderItemsSplit, UpsertBillingCounter, VoidBillTender, computeBillCharges, GetBillChargeConfigForTable, RecordBillPrintPaper, CopyBillPrintPaper } from "../database_supabase.js";
 import { buildReceiptBase64, buildSplitReceiptsBase64, type ReceiptOptions, type SplitReceiptPart } from "../escpos.js";
 import { ncSettlementPrintJobId } from "../bill_print_state.js";
 import { billLinesDigest, billPaperDigest, billPrintedClock, paperStale, replacesBillLine, type BillPaperRecord } from "../bill_paper_digest.js";
@@ -14,7 +14,7 @@ import { isNcSettleMethod } from "../payment_methods.js";
 import { computeSectionSplit, round2 } from "../billing_math.js";
 import { CUSTOMER_GSTIN_ERROR, CustomerGstinInvalidError, CustomerGstinSchemaPendingError, normalizeCustomerGstin } from "../customer_gstin.js";
 import { CUSTOMER_ADDRESS_ERROR, CustomerAddressInvalidError, CustomerAddressSchemaPendingError, normalizeCustomerAddress } from "../customer_address.js";
-import { dispatchKot, logKotDispatched } from "../kot_print.js";
+import { dispatchCancellationKot, dispatchKot, kotLineOfStored, logKotDispatched } from "../kot_print.js";
 import { printKotItemMove, resolveMoveSourceKots, type KotMoveOutcome } from "../kot_move.js";
 import { moveItemAuditSentence } from "../order_moves.js";
 import { kotStamp } from "../kot_numbers.js";
@@ -34,7 +34,9 @@ import { ACCOUNTING_PERM, PERM_CLOSE_BILL, PERM_NON_CHARGEABLE, PERM_SETTINGS, R
 // the required identifiers are present + the right type, returning a structured 400
 // instead of a vague downstream error. Authz is enforced separately (validateAction
 // / enforceRoles / enforceAdmin in the handlers).
-const sBillRemoveItem = z.object({ table_name: z.string(), item_name: z.string() }).passthrough();
+// `order_id` / `item_id` name the ONE line the admin tapped (client item 1).
+// Optional: a shipped till that sends neither still removes one line.
+const sBillRemoveItem = z.object({ table_name: z.string(), item_name: z.string(), order_id: z.string().optional(), item_id: z.string().optional() }).passthrough();
 const sBillMoveItem = z.object({ from_table: z.string(), to_table: z.string(), item_name: z.string() }).passthrough();
 const sBillDiscount = z.object({ table_name: z.string() }).passthrough();
 const sBillApplyCoupon = z.object({ table_name: z.string(), code: z.string() }).passthrough();
@@ -2287,7 +2289,38 @@ app.post('/print/kot/order/:id', validateAction("4ad474d4-5230-449c-874f-6a238b8
 	}
 });
 
-// Admin: remove a wrongly-added item from a table's running bill.
+/*
+	Admin: remove a wrongly-added item from a table's running bill.
+
+	CLIENT ITEMS 1 AND 2 — "if we try deleting 1 item, the whole KOT (all items in
+	the KOT) gets deleted", and "the cancelled KOT is not getting printed".
+
+	  * ONE LINE. The button is drawn per line inside a KOT block, but the request
+	    named only a dish and a price, and the writer took EVERY line on the table
+	    answering to that name. A table holding Tandoori Roti on two tickets lost
+	    both for one tap; where the other ticket held nothing else, emptying it
+	    flipped it to Cancelled and the whole KOT left every screen. The line's
+	    ticket and its own id now travel with the request (`order_id`, `item_id`),
+	    and exactly one line comes off — see RemovedLineRef. A till that sends
+	    neither still works and still takes only one line.
+
+	  * THE KITCHEN IS TOLD. A dish that was cancelled off a ticket the pass is
+	    holding is a dish that gets cooked unless paper says otherwise, and this
+	    door printed nothing at all. It now puts the SAME CANCELLED slip on the
+	    pass that requirement 1.1 built for a cancelled KOT and DELETE
+	    /orders/:id/items/:itemId puts there for one line — dispatchCancellationKot,
+	    narrowed to the removed dish, under the number already on the paper for
+	    that ticket, routed to the station that is cooking it. A line that was
+	    never ticketed (a pending order, or a tenant with auto-print off) prints
+	    nothing: there is no paper at the pass to correct.
+
+	  * AFTER THE COMMIT, AND NEVER FATAL. The removal has happened and the money
+	    is right; a printer that is unreachable is reported in the answer
+	    (`kot_cancelled`, `kot_no`), not raised.
+
+	The gate is unchanged: admin only, and an approved or closed bill is still
+	final (assertBillEditable).
+*/
 app.post('/bills/remove-item', validateBody(sBillRemoveItem), async (req: Request, res: Response) => {
 	const auth = await enforceRoles(req, res, ["admin"]);
 	if (!auth) {return;}
@@ -2295,12 +2328,57 @@ app.post('/bills/remove-item', validateBody(sBillRemoveItem), async (req: Reques
 	const tableName = typeof body.table_name === "string" ? body.table_name.trim() : "";
 	const itemName = typeof body.item_name === "string" ? body.item_name.trim() : "";
 	const price = Number(body.price ?? 0) || 0;
+	const orderId = typeof body.order_id === "string" ? body.order_id.trim() : "";
+	const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
 	if (!tableName || !itemName) { res.status(400).json({ error: "table_name and item_name are required" }); return; }
 	try {
-		const result = await RemoveBillItem(auth.restaurantId, tableName, itemName, price);
+		// READ BEFORE THE WRITE: which ticket the line is on, and that ticket's
+		// facts. A KOT number is found by a fingerprint of the order's item SET,
+		// which stops matching the moment the line leaves, so the slip's number
+		// has to be resolvable from a context read now. Best-effort — an
+		// unreadable context costs the number, never the removal. The same
+		// pre-read shape /bills/move-item uses (GetMovableLineSources).
+		const only = { orderId: orderId || null, itemId: itemId || null };
+		const target = await GetRemovableBillLine(auth.restaurantId, tableName, itemName, price, only).catch(() => null);
+		const kotContext = target ? await GetOrderKotContext(auth.restaurantId, target.order_id).catch(() => null) : null;
+		const result = await RemoveBillItem(auth.restaurantId, tableName, itemName, price, { ...only, orderId: target?.order_id ?? only.orderId });
 		try { emitRestaurant(auth.restaurantId, "bill:updated", { table: tableName }); } catch {/* ignore */}
-		try { await log_audit(req, "4ad474d4-5230-449c-874f-6a238b833bca", `Removed item ${result.removed.name} from table ${tableName}`, Audit_log_category.Bill, { table: tableName, item: itemName }); } catch {/* ignore */}
-		res.json(result);
+		// THE CANCELLED SLIP FOR THE DISH THAT LEFT — that dish alone, not the
+		// ticket it came off, which is still being cooked.
+		const taken = result.taken[0];
+		const takenLine = taken?.lines[0] ?? null;
+		const cancelPrint = taken && takenLine
+			? await dispatchCancellationKot({
+				restaurantId: auth.restaurantId, orderId: taken.order_id, where: "bill_item_removed",
+				order: kotContext, only: [kotLineOfStored(takenLine)],
+				itemId: typeof takenLine.id === "string" ? takenLine.id : null,
+			})
+			: null;
+		try {
+			await log_audit(
+				req, "4ad474d4-5230-449c-874f-6a238b833bca",
+				`Removed item ${result.removed.name} from table ${tableName}`,
+				Audit_log_category.Bill,
+				{
+					table: tableName, item: itemName,
+					order_id: taken?.order_id ?? null, item_id: itemId || null,
+					quantity: result.removed.quantity,
+					// What the pass was told, so a manager reading the log can see
+					// whether the kitchen got paper for this.
+					kot_cancelled: cancelPrint?.printed ?? false,
+					kot_no: cancelPrint?.kot_no ?? null,
+					...(cancelPrint?.reason ? { kot_skipped: cancelPrint.reason } : {}),
+				},
+			);
+		} catch {/* ignore */}
+		res.json({
+			success: result.success, removed: result.removed,
+			order_id: taken?.order_id ?? null,
+			kot_cancelled: cancelPrint?.printed ?? false,
+			kot_no: cancelPrint?.kot_no ?? null,
+			kot_tickets: cancelPrint?.tickets ?? 0,
+			...(cancelPrint?.reason ? { kot_skipped: cancelPrint.reason } : {}),
+		});
 	} catch (e: any) {
 		logger.error({ err: e }, 'remove_bill_item_failed');
 		res.status(400).json({ error: String(e?.message ?? 'Unable to remove item') });

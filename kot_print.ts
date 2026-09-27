@@ -857,6 +857,39 @@ export async function autoPrintOrderKot(opts: {
 /** The order facts a slip needs, exactly as GetOrderKotContext hands them over. */
 export type OrderKotContext = NonNullable<Awaited<ReturnType<typeof GetOrderKotContext>>>;
 
+/**
+ * A STORED ORDER LINE AS A DOCKET LINE, for a slip that names one dish.
+ *
+ * THE FOUR FIELDS THE TICKET KEY HASHES — name, quantity, note, variation — are
+ * built here the SAME way POST /orders/:id/items builds them, down to the trim,
+ * because the docket a cancellation slip cancels may well be that route's
+ * added-line ticket, scoped by the line's own id. Anything spelled differently
+ * misses that ticket and the slip prints unnumbered. (price and menu_id are not
+ * part of the key: price is never printed on a KOT, and menu_id rides along so a
+ * since-renamed dish still routes to the station cooking it.)
+ *
+ * "Orders".food holds free-form JSON written by four clients over three years,
+ * so every field arrives `unknown` and is narrowed here — the alternative is an
+ * `any` that lets a number where a dish name belongs reach the printer as
+ * "[object Object]". DELETE /orders/:id/items/:itemId still builds the same
+ * shape inline; this is the copy new callers share.
+ */
+export function kotLineOfStored(raw: unknown): KotLine {
+  const it = (raw ?? {}) as Record<string, unknown>;
+  const text = (v: unknown): string => (typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "");
+  const note = text(it.note);
+  const variation = text(it.variation_name);
+  const menuId = text(it.menu_id);
+  return {
+    name: typeof it.name === "string" ? it.name : "Item",
+    quantity: Number(it.quantity ?? 1),
+    price: Number(it.price ?? 0),
+    ...(note ? { note } : {}),
+    ...(variation ? { variation } : {}),
+    ...(menuId ? { menu_id: menuId } : {}),
+  };
+}
+
 export interface CancellationKotOutcome {
   /** True when a slip was built and queued by this call. */
   printed: boolean;

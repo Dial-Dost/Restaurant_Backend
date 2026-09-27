@@ -268,7 +268,7 @@ mw08 USE     *                                                      | <inline(re
 0246 POST    /print/bill/settled                                    | validateAction(ACCOUNTING_PERM)                | 87b9be68
 0247 POST    /print/ack                                             | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sPrintAck) | 07728a6e
 0248 POST    /print/kot/order/:id                                   | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") | 754ac87a
-0249 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 61865428
+0249 POST    /bills/remove-item                                     | validateBody(sBillRemoveItem)                  | 817ae11d
 0250 POST    /bills/move-item                                       | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillMoveItem) | eb045991
 0251 POST    /bills/discount                                        | validateAction("4ad474d4-5230-449c-874f-6a238b833bca") -> validateBody(sBillDiscount) | b2f8567d
 0252 POST    /print/devices/register                                | validateAction(PERM_PRINT)                     | 6e17326c
