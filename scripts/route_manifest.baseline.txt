@@ -99,7 +99,7 @@ mw08 USE     *                                                      | <inline(re
 0077 GET     /table-status                                          | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | f9dc6d2b
 0078 GET     /bill-for-table                                        | validateAction("98b10bde-802d-4a5b-a726-53a826424f79") | df2d271a
 0079 POST    /add-booking                                           | validateAction("3ec33182-ceb4-4d07-ac7e-84214adcf104") | 50dd87aa
-0080 GET     /get-tables                                            | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | d82e728f
+0080 GET     /get-tables                                            | validateAction("090ea8d4-e348-4e1b-9723-11131a73a085") | 873a3449
 0081 GET     /get-bookings                                          | validate                                       | 6b4f0227
 0082 GET     /valet-info                                            | validateAction("9e37297d-408b-446d-a51b-7892ad216b7d") | ec849c3e
 0083 PATCH   /booking/:id/status                                    | validateAction("fdeecab6-7c3a-4239-b87c-99a96f50c551") | ba7d143b

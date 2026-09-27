@@ -6281,8 +6281,28 @@ async function getBookingsWithTableMeta(
 export async function GetTables(
   restaurantId: string,
   time?: string | Date | null,
-  /** Internal: false on the one re-read after a backfill made a seat. */
-  opts: { backfillNextParty?: boolean } = {},
+  opts: {
+    /** Internal: false on the one re-read after a backfill made a seat. */
+    backfillNextParty?: boolean;
+    /**
+     * THE WHOLE ROOM, NOT THE SERVICE FLOOR — round-3 item 4's follow-up.
+     *
+     * The duplicate rule (planNextPartyFloorHidden) leaves cards OFF this
+     * payload so one table number draws one card, and the card it leaves off is
+     * sometimes the ROOT's — a settled "14" beside a running "14 #2" is the
+     * client's own photo. Every non-service surface in both clients builds its
+     * list of TABLES out of this same payload by dropping the rows that carry a
+     * `parent_table`, so a family whose root is hidden loses its number
+     * entirely: no "14" in the floor-plan editor, none in the booking picker,
+     * none in "N of M tables occupied". An owner reads that as a deleted table.
+     *
+     * True asks for every live row, hidden cards included. It is NOT the floor:
+     * a caller that draws cards must never set it, or the duplicate comes back.
+     * Deliberately opt-in so a shipped 2.0.x till, which never asks, keeps
+     * exactly the floor it has today (see GET /get-tables?include_hidden=1).
+     */
+    includeFloorHidden?: boolean;
+  } = {},
 ): Promise<{ table_name: string; capacity: number | null; max_capacity?: number; section?: string | null; section_position?: number | null; section_created_at?: string | null; booked?: boolean; reserved?: boolean; occupied?: boolean; seated?: boolean; has_order?: boolean; covers?: number; payment_pending?: boolean; table_total?: number; table_apc?: number; target_apc?: number; apc_status?: string; qr_sig?: string; qr_token?: string; otp_required?: boolean; order_otp?: string | null; print_count: number; bill_printed_at: string | null; printed_at: string | null; paper_stale: boolean | null; printed_as: string | null; parent_table: string | null; party_no: number | null; display_name: string }[] | null> {
   const at = time ? new Date(time) : new Date();
   if (Number.isNaN(at.getTime())) {return null;}
@@ -6585,7 +6605,7 @@ export async function GetTables(
       }
     }
     if (made) {
-      return GetTables(restaurantId, time, { backfillNextParty: false });
+      return GetTables(restaurantId, time, { backfillNextParty: false, includeFloorHidden: opts.includeFloorHidden });
     }
   }
   // TWO CARDS FOR ONE TABLE ONLY WHILE ITS PAPER IS OUT — round-3 client item 4.
@@ -6602,8 +6622,13 @@ export async function GetTables(
   // sibling row for good once its own party leaves. This decides cards, not
   // money — every route still addresses a hidden row by name exactly as before,
   // and a family of one (every ordinary table) is untouched.
+  //
+  // ...UNLESS THE CALLER IS NOT DRAWING CARDS. `includeFloorHidden` is the
+  // floor-plan editor, the booking picker and the room counts, which list
+  // TABLES rather than cards and lose a table number outright when the card
+  // this rule drops is the root's. See the opt's own comment.
   const hiddenByFloor = new Set<string>();
-  if (withParty) {
+  if (withParty && opts.includeFloorHidden !== true) {
     const floorMember = (r: (typeof tableRows)[number]): NextPartyFloorMember => ({
       id: r.id,
       table_name: r.table_name,

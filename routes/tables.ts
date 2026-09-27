@@ -1313,8 +1313,26 @@ app.get("/get-tables", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"), a
 
 	const timeQuery = Array.isArray(req.query.time) ? req.query.time[0] : req.query.time;
 	const requestedTime = typeof timeQuery === "string" ? timeQuery : undefined;
+	// ROUND-3 ITEM 4'S FOLLOW-UP — `?include_hidden=1` IS THE ROOM, NOT THE FLOOR.
+	//
+	// The duplicate rule (planNextPartyFloorHidden) keeps one card per table
+	// number by leaving rows OFF this payload, and the row it leaves off is
+	// sometimes the ROOT's — a settled "14" beside a running "14 #2" is the
+	// client's photo. Both clients build their non-service lists out of this
+	// payload by dropping every row with a `parent_table`, so a family whose
+	// root is hidden loses its number from the floor-plan editor, the delete
+	// picker, the booking picker and "N of M tables occupied": the table reads
+	// as deleted.
+	//
+	// So the surfaces that list TABLES ask for every live row, and the surfaces
+	// that draw CARDS do not. It is a flag rather than the default precisely
+	// because an installed 2.0.x till cannot be patched in the field: it never
+	// sends this, it gets byte-identical bytes to today's, and the duplicate
+	// cards this round removed do not come back on it. The clients that draw a
+	// floor must never send it either — the hidden rows are hidden for a reason.
+	const includeHidden = req.query.include_hidden === "1" || req.query.include_hidden === "true";
 	try {
-		const tables = await GetTables(restaurantId, requestedTime);
+		const tables = await GetTables(restaurantId, requestedTime, { includeFloorHidden: includeHidden });
 		try {
 			/* read action — not audited (avoids log clutter) */
 		} catch (err) {
