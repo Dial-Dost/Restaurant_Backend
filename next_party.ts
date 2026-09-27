@@ -47,11 +47,13 @@
  * start with "12 #2-".
  *
  * The name is the internal handle — every route addresses a table by name, so
- * it must be unique — and it is what the KOT, the bill and every cashier list
- * print, so two open bills for "12" stay distinguishable at the till. The
- * waiter's tile shows the root's number big with a "Next party" chip; that is
- * `display_name` plus `parent_table`, and both clients say it in the same words
- * (NEXT_PARTY_CHIP, nextPartyLabel).
+ * it must be unique — and it is what the bill and every cashier list print, so
+ * two open bills for "12" stay distinguishable at the till. NOT the KITCHEN
+ * DOCKET, since round-3 item 5: the runner walks to one table 12, and the
+ * suffix is a till fact (kotTableName). The waiter's tile shows the root's
+ * number big with a "Next party" chip; that is `display_name` plus
+ * `parent_table`, and both clients say it in the same words (NEXT_PARTY_CHIP,
+ * nextPartyLabel).
  *
  * A name that already ENDS in " #<digits>" is reserved for this and refused on
  * create. Production had none on 2026-09-16 (the only lookalikes, 31A/32A/33A,
@@ -206,6 +208,95 @@ export function planNextPartyRetirement(family: readonly NextPartyFamilyMember[]
 	// delete guard refuses): nothing to prefer, so keep one seat as if it were busy.
 	const keep = root?.free === true ? 0 : 1;
 	return freeSiblings.slice(keep).map((m) => m.id);
+}
+
+// ---------------------------------------------------------------------------
+// WHAT THE FLOOR SHOWS OF A FAMILY — round-3 client item 4.
+// ---------------------------------------------------------------------------
+
+/**
+ * One live row of a family as the FLOOR read has it: the family member, plus
+ * the prints on THIS row's own current seating — GetTables' `print_count`,
+ * which is 0 again the moment the bill is settled and the seating ends.
+ */
+export interface NextPartyFloorMember extends NextPartyFamilyMember {
+	printCount: number;
+}
+
+/**
+ * THE CARDS A FAMILY IS ALLOWED ON THE FLOOR — round-3 client item 4.
+ *
+ * "Duplication of tables should only be done when a table was occupied and the
+ * bill was not settled. Once it is settled, the prior duplication has to be
+ * deleted. … If there's a running table, no duplication should be there. Only
+ * when its bill is printed but not settled should it be there."
+ *
+ * THE PHOTO: a green, FREE "14" card sitting beside a running "14 #2". That is
+ * 14 settled while its next party is still eating, and the free card is the
+ * dangerous one — a waiter reads an empty table and seats a party on top of the
+ * one already sitting there, which is the whole reason the client filed this.
+ *
+ * WHY THE ROW IS NOT DELETED INSTEAD. The busy card is where the second party's
+ * money is; the free card is a real physical table that a settle has finished
+ * with. Neither can be dropped from the database — one holds a bill, the other
+ * holds the floor plan — so the FLOOR drops the one that is not a seat, and
+ * planNextPartyRetirement deletes the sibling row for good as soon as its own
+ * party leaves. Nothing here decides money; it decides which cards are drawn.
+ *
+ * THE RULE, and it is the client's sentence:
+ *
+ *   * a printed, unsettled bill anywhere in the family -> show everything. This
+ *     is the state the duplicate exists FOR: the printed party's orange card and
+ *     the green seat the next party is taken on. Both are real, both are needed,
+ *     and the free one of the two is a seat rather than a lie.
+ *   * otherwise, somebody is sitting at this number -> show only the rows that
+ *     have a party on them. A free card beside them is a second card for a table
+ *     that is already taken.
+ *   * otherwise the whole number is idle -> ONE card, the root's (the sibling is
+ *     about to be retired anyway, and until it is it must not double the table).
+ *
+ * Returns the ids the floor must leave out. A family of one — every ordinary
+ * table in the restaurant — is never touched.
+ */
+export function planNextPartyFloorHidden(family: readonly NextPartyFloorMember[]): string[] {
+	if (family.length < 2) { return []; }
+	// The one thing that earns a second card. Read off the BUSY rows: a settled
+	// table's seating is over, so its print count is 0 and it earns nothing.
+	if (family.some((m) => !m.free && m.printCount > 0)) { return []; }
+	const free = family.filter((m) => m.free);
+	if (free.length === 0) { return []; }
+	// Somebody is at this number and no paper is out: every free row is a
+	// duplicate of a table that is taken.
+	if (free.length < family.length) { return free.map((m) => m.id); }
+	// The whole family is idle: keep the root, or the lowest sibling when the
+	// root has gone, and hide the rest.
+	const keep = free.find((m) => m.party_seq === null) ?? [...free].sort(bySeq)[0];
+	return free.filter((m) => m.id !== keep?.id).map((m) => m.id);
+}
+
+// ---------------------------------------------------------------------------
+// The name the KITCHEN is given.
+// ---------------------------------------------------------------------------
+
+/**
+ * THE TABLE AS THE KITCHEN NAMES IT — "12 #2" -> "12". Round-3 client item 5.
+ *
+ * "In a KOT the duplicate table number should not be shown." The client's photo
+ * is a docket reading `Table No: 4 #2` with the suffix circled.
+ *
+ * The suffix is a BILLING handle — it is what keeps two open bills for 12
+ * apart at the till, and why the second party can never be settled with the
+ * first one's printed paper (see the header). The kitchen has none of that
+ * problem: there is one table 12 in the room, the runner walks to it, and a
+ * number the floor does not use is a number the runner has to decode. So the
+ * docket prints the root's name and the ledger keeps the handle.
+ *
+ * NOT the bill, and not the cashier's lists: those are exactly where the two
+ * parties have to stay distinguishable.
+ */
+export function kotTableName(table: unknown): string {
+	const name = String(table ?? "").trim();
+	return parseNextPartyName(name)?.root ?? name;
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ import {
   billPrintedRefusal,
   freeFamilySeat,
   isReservedPartyName,
+  kotTableName,
   nextFreePartySeq,
   nextPartyAfterPrintMessage,
   nextPartyLabel,
@@ -30,6 +31,7 @@ import {
   orderOnPrintedBillVerdict,
   orderUpsertAddsToBill,
   parseNextPartyName,
+  planNextPartyFloorHidden,
   planNextPartyRetirement,
   printedBillAdditionAudit,
   reprintNeededMessage,
@@ -40,6 +42,7 @@ import {
   tableSentenceName,
   takeItOnNextPartyLabel,
   type NextPartyFamilyMember,
+  type NextPartyFloorMember,
 } from "../next_party";
 import { billPrintFallbackPrefix, billPrintJobBelongsToSeating, seatingStartOf } from "../bill_print_state";
 import { buildReceiptBase64 } from "../escpos";
@@ -155,6 +158,94 @@ describe("the retirement rule — at most one free seat per family, preferring t
         expect(retired).not.toContain(`s${String(n + 2)}`);
       }
     }
+  });
+});
+
+describe("the floor rule (round-3 item 4) — two cards for one table only while its paper is out", () => {
+  const f = (id: string, party_seq: number | null, free: boolean, printCount = 0): NextPartyFloorMember =>
+    ({ id, table_name: id, party_seq, free, printCount });
+
+  test.each([
+    // THE STATE THE DUPLICATE EXISTS FOR: 12's bill is printed and unsettled,
+    // and the green seat beside it is where the next party is taken.
+    ["printed and unsettled, seat free -> both cards", [f("r", null, false, 1), f("s2", 2, true)], []],
+    ["printed and unsettled, both parties in -> both cards", [f("r", null, false, 1), f("s2", 2, false)], []],
+    // THE CLIENT'S PHOTO: 12 settled (its seating over, so no prints) while the
+    // next party is still eating. The free card is a table that is taken.
+    ["SETTLED beside a running next party -> the free root goes", [f("r", null, true), f("s2", 2, false)], ["r"]],
+    ["…and the next party's own printed bill brings the seat back", [f("r", null, true), f("s2", 2, false, 1)], []],
+    // A running table with nothing printed has not earned a second card at all.
+    ["running, nothing printed -> the free seat goes", [f("r", null, false), f("s2", 2, true)], ["s2"]],
+    // Idle: one card, the root's. (Retirement deletes the row next; until then
+    // the floor must not draw 12 twice.)
+    ["the whole number idle -> the root keeps the card", [f("r", null, true), f("s2", 2, true)], ["s2"]],
+    ["…and the lowest sibling when the root has gone", [f("s2", 2, true), f("s3", 3, true)], ["s3"]],
+    // Every ordinary table in the restaurant.
+    ["a family of one -> never touched", [f("r", null, true)], []],
+    ["a family of one, busy -> never touched", [f("r", null, false)], []],
+  ])("%s", (_label, family, hidden) => {
+    expect(planNextPartyFloorHidden(family as NextPartyFloorMember[])).toEqual(hidden);
+  });
+
+  test("a row with a party on it is NEVER hidden, whatever else is true", () => {
+    for (const rootFree of [true, false]) {
+      for (const printed of [0, 1]) {
+        for (let n = 0; n < 4; n += 1) {
+          const family = [
+            f("r", null, rootFree, printed),
+            ...Array.from({ length: 4 }, (_, i) => f(`s${String(i + 2)}`, i + 2, i !== n)),
+          ];
+          expect(planNextPartyFloorHidden(family)).not.toContain(`s${String(n + 2)}`);
+          if (!rootFree) { expect(planNextPartyFloorHidden(family)).not.toContain("r"); }
+        }
+      }
+    }
+  });
+
+  test("at most one card survives when no paper is out — the client's 'no duplication' in one line", () => {
+    for (const root of [true, false]) {
+      for (const s2 of [true, false]) {
+        for (const s3 of [true, false]) {
+          const family = [f("r", null, root), f("s2", 2, s2), f("s3", 3, s3)];
+          const hidden = new Set(planNextPartyFloorHidden(family));
+          const shown = family.filter((m) => !hidden.has(m.id));
+          const busy = family.filter((m) => !m.free).length;
+          expect(shown.length).toBe(Math.max(1, busy));
+        }
+      }
+    }
+  });
+});
+
+describe("the table as the kitchen names it (round-3 item 5)", () => {
+  test.each([
+    ["12 #2", "12"],
+    ["12 #13", "12"],
+    ["Patio 4 #2", "Patio 4"],
+    ["  12 #2  ", "12"],
+    // Not the reserved shape, so not a sibling and not touched.
+    ["12", "12"],
+    ["Terrace-04", "Terrace-04"],
+    ["Swiggy-88214-Delivery", "Swiggy-88214-Delivery"],
+    ["31A", "31A"],
+    ["12 #1", "12 #1"],
+    ["12 #", "12 #"],
+    ["", ""],
+  ])("%s -> %s", (name, kitchen) => {
+    expect(kotTableName(name)).toBe(kitchen);
+  });
+
+  test("it is exactly the root parseNextPartyName reads, so the two can never drift", () => {
+    for (const root of ["12", "Patio 4", "31A"]) {
+      for (let seq = FIRST_NEXT_PARTY_SEQ; seq <= 5; seq += 1) {
+        expect(kotTableName(nextPartyName(root, seq))).toBe(root);
+      }
+    }
+  });
+
+  test("null and undefined are the empty name the docket prints 'N/A' for", () => {
+    expect(kotTableName(null)).toBe("");
+    expect(kotTableName(undefined)).toBe("");
   });
 });
 
@@ -417,8 +508,21 @@ describe("the seating start — the earlier of the bill row and the first owing 
   });
 });
 
-describe("the kitchen docket names the next party in full", () => {
-  test("'Table No: 12 #2' in the big type, under 'Running Table'", () => {
+/**
+ * ROUND-3 CLIENT ITEM 5 REVERSES THIS BLOCK. It used to pin "Table No: 12 #2"
+ * on the kitchen docket, on the reasoning that the ticket should name the row
+ * the money hangs off. The client, with a photo of a docket reading
+ * "Table No: 4 #2" and the suffix circled: "In a KOT the duplicate table number
+ * should not be shown."
+ *
+ * They are right, and the reasoning was about the till rather than the pass:
+ * the runner walks to ONE table 12, and a number that is not written on the
+ * floor is a number they have to decode. The suffix stays on the bill, on the
+ * cashier's lists and in the ledger, which is where two open bills for 12 have
+ * to stay apart. See kotTableName.
+ */
+describe("the kitchen docket never shows the next party's suffix", () => {
+  test("'Table No: 12' in the big type, under 'Running Table' — never '12 #2'", () => {
     const opts = {
       restaurantName: "GGV",
       currency: "₹",
@@ -443,9 +547,27 @@ describe("the kitchen docket names the next party in full", () => {
     ];
     for (const raw of papers) {
       expect(raw).toContain("Running Table");
-      expect(raw).toContain("Table No: 12 #2");
-      expect(raw).not.toMatch(/Table No: 12\s*\n/);
+      expect(raw).toContain("Table No: 12");
+      // The circled thing in the client's photo, off BOTH dockets — and off the
+      // whole page, not just off that line.
+      expect(raw).not.toContain("#2");
+      expect(raw).not.toContain("12 #");
     }
+  });
+
+  test("the guest's BILL keeps the suffix — that is where two open bills for 12 are told apart", () => {
+    const bill = {
+      restaurantName: "GGV",
+      currency: "₹",
+      table: "12 #2",
+      covers: 2,
+      items: [{ name: "Thali", quantity: 2, price: 300 }],
+      total: 600,
+      kind: "bill" as const,
+      splitPart: { index: 1, of: 2, label: "Garden" },
+    };
+    const raw = Buffer.from(buildReceiptBase64(bill), "base64").toString("latin1");
+    expect(raw).toContain("Table 12 #2");
   });
 });
 

@@ -177,10 +177,12 @@ import {
   nextPartyLabel,
   nextPartyName,
   parseNextPartyName,
+  planNextPartyFloorHidden,
   planNextPartyRetirement,
   storedOrderLines,
   tableDisplayName,
   type NextPartyFamilyMember,
+  type NextPartyFloorMember,
   type StoredOrderLine,
 } from "./next_party.js";
 // The floor-section ordering rules (migration 041). Kept out of SQL on purpose:
@@ -6480,9 +6482,12 @@ export async function GetTables(
   // is tried at most once per table per NEXT_PARTY_BACKFILL_RETRY_MS so a seat
   // that cannot be made does not cost every poll a transaction, and — when it
   // made one — the floor is read ONCE more so the new tile is in this answer.
+  // "THIS ROW HAS A PARTY, AN ORDER OR AN OPEN BILL ON IT" — the floor's own
+  // reading of busy, shared by the backfill below and by the duplicate rule
+  // under it so the two can never disagree about which card is a free seat.
+  const inUse = (r: (typeof tableRows)[number]): boolean =>
+    r.is_occupied || orderedTables.has(r.id) || openBillByTable.has(r.id);
   if (withParty && opts.backfillNextParty !== false && (tenantStorage.getStore()?.txnDepth ?? 0) === 0) {
-    const inUse = (r: (typeof tableRows)[number]): boolean =>
-      r.is_occupied || orderedTables.has(r.id) || openBillByTable.has(r.id);
     let made = false;
     for (const r of tableRows) {
       if (r.parent_table_id || siblingsByRoot.has(r.id) || !inUse(r)) {continue;}
@@ -6498,13 +6503,46 @@ export async function GetTables(
       return GetTables(restaurantId, time, { backfillNextParty: false });
     }
   }
+  // TWO CARDS FOR ONE TABLE ONLY WHILE ITS PAPER IS OUT — round-3 client item 4.
+  //
+  // The client photographed a green, FREE "14" beside a running "14 #2": 14 was
+  // settled while its next party was still eating, and a waiter reading that
+  // free card seats a party on a table that is already taken.
+  // planNextPartyFloorHidden has the rule and argues it; here the family is put
+  // in front of it, WITH each row's own print count, and the rows it names are
+  // left off the floor.
+  //
+  // THE ROWS ARE NOT DELETED. The busy one holds a bill and the free one is a
+  // real table in the room; retirement (planNextPartyRetirement) deletes the
+  // sibling row for good once its own party leaves. This decides cards, not
+  // money — every route still addresses a hidden row by name exactly as before,
+  // and a family of one (every ordinary table) is untouched.
+  const hiddenByFloor = new Set<string>();
+  if (withParty) {
+    const floorMember = (r: (typeof tableRows)[number]): NextPartyFloorMember => ({
+      id: r.id,
+      table_name: r.table_name,
+      party_seq: r.parent_table_id ? (Math.round(parseNumeric(r.party_seq)) || null) : null,
+      free: !inUse(r),
+      printCount: printStateByTable.get(r.table_name)?.print_count ?? 0,
+    });
+    for (const [rootId, siblings] of siblingsByRoot) {
+      const root = liveById.get(rootId);
+      if (!root) {continue;}
+      for (const id of planNextPartyFloorHidden([root, ...siblings].map(floorMember))) {
+        hiddenByFloor.add(id);
+      }
+    }
+  }
   const ordered: (typeof tableRows)[number][] = [];
   for (const r of tableRows) {
     if (rootOf(r)) {continue;}
-    ordered.push(r);
+    if (!hiddenByFloor.has(r.id)) {ordered.push(r);}
     const siblings = siblingsByRoot.get(r.id);
     if (siblings) {
-      ordered.push(...siblings.sort((a, z) => parseNumeric(a.party_seq) - parseNumeric(z.party_seq)));
+      ordered.push(...siblings
+        .filter((s) => !hiddenByFloor.has(s.id))
+        .sort((a, z) => parseNumeric(a.party_seq) - parseNumeric(z.party_seq)));
     }
   }
 

@@ -15,6 +15,8 @@
 import { KOT_ATLAS, type KotFace, type KotGlyph } from "./kot_glyph_atlas.js";
 // The banner a bill that REPLACES an out-of-date paper carries (client items 1 and 2).
 import { UPDATED_BILL_MARKER } from "./bill_paper_digest.js";
+// "12 #2" -> "12" for the KITCHEN only (round-3 client item 5). Pure, like this file.
+import { kotTableName } from "./next_party.js";
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -951,7 +953,10 @@ export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
   const mode = present(opts.serviceMode) || "Dine In";
   const section = present(opts.section);
   line(section ? `${mode}: ${section}` : mode, "center", true);
-  line(`Table No: ${present(opts.table) || "N/A"}`, "center", true);
+  // THE ROOT'S NUMBER, NEVER THE NEXT PARTY'S SUFFIX (round-3 client item 5):
+  // "4 #2" reached the pass as `Table No: 4 #2` and the kitchen has one table 4.
+  // kotTableName says why the ledger keeps the suffix and the paper does not.
+  line(`Table No: ${kotTableName(present(opts.table)) || "N/A"}`, "center", true);
   // Covers, counted ONCE PER TABLE ("Tables".num_covers) — the number the bill
   // divides by for APC. Printed only when the table records one: defaulting an
   // unknown count to 1 told the kitchen a party size nobody entered.
@@ -1800,7 +1805,9 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // question a chef asks a docket after "what do I cook" — where does it go —
     // and it used to sit third in a block of same-sized lines, below the
     // service mode. Reading it now costs a glance instead of a search.
-    big(`Table No: ${opts.table || "N/A"}`, width);
+    // The root's number alone here too — see layoutKot's line for why the
+    // next party's " #2" is a till handle and never kitchen paper.
+    big(`Table No: ${kotTableName(opts.table) || "N/A"}`, width);
     // WHERE the food is going. The service-mode line carries the floor section
     // as its value when there is one ("Dine In: FRONT"); with no section
     // configured the mode stands alone rather than repeating itself.

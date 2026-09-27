@@ -142,6 +142,27 @@ describe("layoutKot — the docket's own identity", () => {
     expect(out).not.toContain("C   Running Table");
   });
 
+  /**
+   * ROUND-3 CLIENT ITEM 5, with a photo of a docket reading "Table No: 4 #2"
+   * and the suffix circled. " #2" is the next party's BILLING handle — it keeps
+   * two open bills for table 4 apart at the till — and the kitchen has one
+   * table 4. See kotTableName in next_party.ts.
+   */
+  test("THE NEXT PARTY'S SUFFIX IS NOT KITCHEN PAPER: '4 #2' is laid out as 'Table No: 4'", () => {
+    const out = shapes(rows({ table: "4 #2", covers: 2 }));
+    expect(out).toContain("C*  Table No: 4");
+    expect(words(rows({ table: "4 #2", covers: 2 }))).not.toContain("#");
+    // The rest of the docket is the reference's, line for line: only the table
+    // line moved.
+    expect(out).toEqual(shapes(rows({ table: "4", covers: 2 })));
+  });
+
+  test("…and a table whose real name merely contains a hash or a dash keeps it", () => {
+    for (const table of ["Terrace-04", "31A", "Swiggy-88214-Delivery", "4 #1", "#4"]) {
+      expect(shapes(rows({ table }))).toContain(`C*  Table No: ${table}`);
+    }
+  });
+
   test("a caller that resolved no stamp still prints a time rather than a blank line", () => {
     const out = rows({ printedAt: null });
     const stamp = out[2];

@@ -775,15 +775,19 @@ describe("a next-party table's name is one word on the docket", () => {
         }
       });
 
-      test(`'Table No:' never loses the party number — ${rollName(cols)}, ${size}`, () => {
-        for (const table of ["12 #2", "Patio 4 #13", "SmokeTableA305017 #2"]) {
+      // ROUND-3 CLIENT ITEM 5 — "in a KOT the duplicate table number should not
+      // be shown", photographed as a docket reading "Table No: 4 #2". The party
+      // number never reaches this line now, so there is nothing here to keep
+      // whole; the wrapping above still matters, because the table-move slip's
+      // context line (the tests above this one) does name the old seat in full.
+      test(`'Table No:' carries the root's name alone — ${rollName(cols)}, ${size}`, () => {
+        for (const [table, root] of [["12 #2", "12"], ["Patio 4 #13", "Patio 4"], ["SmokeTableA305017 #2", "SmokeTableA305017"]]) {
           const lines = kotPaper(buildReceiptBase64({ ...docket, table, kotTextSize: size }, cols), cols, size).split("\n");
           const at = lines.findIndex((l) => l.startsWith("Table No:"));
           expect(at).toBeGreaterThan(-1);
           const said = [lines[at]!, lines[at + 1] ?? ""].join("\n");
-          const unit = table.split(" ").slice(-2).join(" ");
-          expect({ table, said, whole: said.split("\n").some((l) => l.includes(unit)) }).toMatchObject({ whole: true });
-          expect({ table, said, orphan: /\n#\d/.test(said) }).toMatchObject({ orphan: false });
+          expect({ table, said, named: said.replace(/\n/g, "").includes(root!) }).toMatchObject({ named: true });
+          expect({ table, said, suffix: said.includes("#") }).toMatchObject({ suffix: false });
         }
       });
     }
