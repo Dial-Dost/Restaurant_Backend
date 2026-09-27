@@ -4480,11 +4480,49 @@ async function ensureTableOtpOnOccupy(context: RestaurantContext, tableId: strin
 }
 
 /**
- * A table may not be seated beyond its maximum. The override is deliberate and
- * role-gated: someone with table-management permission raises the table's
- * `max_capacity` (PATCH /table/:name) — seating simply cannot exceed whatever
- * that number currently is. Enforced HERE, in the data layer, so every caller
- * (POS, owner app, QR flow, waitlist seating) is covered rather than one route.
+ * Is this party bigger than the table is set for? The one place that decides it,
+ * so every caller below agrees about what a table holds.
+ *
+ * `max_capacity` is the role-gated override someone with table-management
+ * permission raises (PATCH /table/:name); `capacity` is the comfortable seating
+ * it falls back to.
+ */
+function coversOverCapacity(
+  covers: number | null,
+  capacity: unknown,
+  maxCapacity: unknown,
+): { max: number; over: boolean } {
+  const max = effectiveMaxCapacity(capacity, maxCapacity);
+  return { max, over: covers != null && covers > max };
+}
+
+/**
+ * CLIENT ITEM 3 — CAPACITY IS A SEATING GUIDE, NOT A GATE TO THE KITCHEN.
+ *
+ * This used to refuse every over-capacity seating, and the refusal landed in the
+ * worst possible place. Both order pads seat the table and THEN send the order
+ * (occupy first, order second — the TableSessions trigger fires on the
+ * free -> occupied transition, and every reader that ties money to a seating
+ * needs the session to predate the bill). So a 400 from the seating took the
+ * KOT down with it: six people at a two-top, and the kitchen never heard about
+ * their food. What the floor reported was not "I cannot seat them" but "the KOT
+ * won't get punched".
+ *
+ * So an over-capacity party is SEATED, with its TRUE head count written, and the
+ * caller gets `covers_warning` to show. Clamping covers to the max instead would
+ * have been the worse bug of the two: covers is the APC denominator, so six
+ * guests recorded as two doubles the APC of every bill on that table and lies in
+ * the cover-size report for good.
+ *
+ * WHERE IT STILL REFUSES, and why that is not the same question:
+ *   - MoveTableParty — the destination is CHOSEN, and there is always another
+ *     one. Nothing is in front of the kitchen; the party is already seated and
+ *     already ordering.
+ *   - SeatWaitlistEntry / UpdateBookingStatus — the host is picking a table for a
+ *     party that is not sitting anywhere yet, and picking a bigger one is the
+ *     whole job of that screen.
+ * Those three keep throwing; they share the wording through coversOverCapacity so
+ * "T1 seats up to 2" can never disagree with the warning about the same table.
  */
 function assertCoversFitTable(
   tableName: string,
@@ -4493,12 +4531,30 @@ function assertCoversFitTable(
   maxCapacity: unknown,
 ): void {
   if (covers == null) {return;}
-  const max = effectiveMaxCapacity(capacity, maxCapacity);
-  if (covers > max) {
+  const { max, over } = coversOverCapacity(covers, capacity, maxCapacity);
+  if (over) {
     throw new Error(
       `${tableName} seats up to ${max}. To seat ${covers}, raise this table's max seats (needs table-management permission) or combine tables.`,
     );
   }
+}
+
+/**
+ * The same fact, said instead of thrown — for the seating paths that must let
+ * the order through (see assertCoversFitTable). Null when the party fits, or
+ * when the caller passed no covers at all (the order flow's re-occupy, which has
+ * no opinion about the head count and must not invent a warning about one).
+ */
+function coversOverCapacityWarning(
+  tableName: string,
+  covers: number | null,
+  capacity: unknown,
+  maxCapacity: unknown,
+): string | null {
+  if (covers == null) {return null;}
+  const { max, over } = coversOverCapacity(covers, capacity, maxCapacity);
+  if (!over) {return null;}
+  return `${tableName} is set for ${max}, and ${covers} covers have been recorded. The order goes through; raise this table's max seats (needs table-management permission) or combine tables if this is the real seating.`;
 }
 
 /**
@@ -4578,6 +4634,11 @@ export async function OccupyTable(
    *  seating at all (the order flow's re-occupy of an already-seated table).
    *  Additive — older clients ignore it. */
   assignment: TableAssignmentOutcome | null;
+  /** CLIENT ITEM 3. Set when the party is bigger than the table is set for —
+   *  the seating went through and the true covers were written, and this is the
+   *  sentence to put in front of whoever made the call. Null otherwise.
+   *  Additive; older clients ignore it and simply stop being refused. */
+  covers_warning: string | null;
 }> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
@@ -4611,13 +4672,20 @@ export async function OccupyTable(
     const revived = await reviveRetiredNextPartyTable(context, normalized);
     if (revived) {rows = [revived];}
   }
-  if (rows[0]) {
-    assertCoversFitTable(normalized, coversParam, rows[0].capacity, rows[0].max_capacity);
-  }
-
   if (!rows[0]) {
     throw new Error("Table not found");
   }
+
+  // CLIENT ITEM 3. Over capacity is a WARNING here, never a refusal: the order
+  // pad seats the table before it sends the order, so refusing the seating
+  // refuses the KOT. The true covers are written below regardless — they are the
+  // APC denominator and must stay honest.
+  const coversWarning = coversOverCapacityWarning(
+    normalized,
+    coversParam,
+    rows[0].capacity,
+    rows[0].max_capacity,
+  );
 
   const tableId = rows[0].id;
   // Was this call the one that actually SEATED the party? /occupy-table is sent
@@ -4682,6 +4750,7 @@ export async function OccupyTable(
     num_covers: result?.num_covers ?? coversParam ?? 1,
     linked_order_id: result?.linked_order_id ?? null,
     assignment,
+    covers_warning: coversWarning,
   };
 }
 
@@ -4689,7 +4758,13 @@ export async function UpdateTableCovers(
   restaurantId: string,
   table_name: string,
   num_covers: number,
-): Promise<{ table_id: string; num_covers: number }> {
+): Promise<{
+  table_id: string;
+  num_covers: number;
+  /** CLIENT ITEM 3, same contract as OccupyTable: the correction is accepted and
+   *  the true head count stored; this says the table is set for fewer. */
+  covers_warning: string | null;
+}> {
   const context = await requireRestaurantContext(restaurantId);
   await ensureTableOccupancyColumns();
 
@@ -4717,7 +4792,16 @@ export async function UpdateTableCovers(
     throw new Error("Table not found");
   }
 
-  assertCoversFitTable(normalized, Math.round(num_covers), rows[0].capacity, rows[0].max_capacity);
+  // CLIENT ITEM 3. Correcting a head count upward is how a waiter keeps the APC
+  // denominator honest after a party grows; refusing it left the bill to settle
+  // against a number everyone on the floor knew was wrong. Warn, then record
+  // what they actually counted.
+  const coversWarning = coversOverCapacityWarning(
+    normalized,
+    Math.round(num_covers),
+    rows[0].capacity,
+    rows[0].max_capacity,
+  );
 
   const tableId = rows[0].id;
 
@@ -4735,6 +4819,7 @@ export async function UpdateTableCovers(
   return {
     table_id: tableId,
     num_covers: result?.num_covers ?? num_covers,
+    covers_warning: coversWarning,
   };
 }
 

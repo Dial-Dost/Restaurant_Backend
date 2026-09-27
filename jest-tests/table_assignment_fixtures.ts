@@ -160,6 +160,13 @@ export function assignedEmployeeFor(tableId: string): string | null {
   return store.assignments.get(tableId)?.employee_id ?? null;
 }
 
+/** The stored table row, for assertions about what was actually WRITTEN —
+ *  num_covers above all, because it is the APC denominator and the one number a
+ *  covers fix must not quietly round down (client item 3). */
+export function tableById(tableId: string): TableFix | undefined {
+  return store.tables.find((x) => x.id === tableId);
+}
+
 // ---------------------------------------------------------------------------
 // SQL dispatch
 // ---------------------------------------------------------------------------
@@ -353,6 +360,16 @@ function query(sqlRaw: string, params: unknown[] = []): { rows: unknown[] } {
     if (wasFree) {store.sessions.push({ table_id: t.id, seated_at: new Date(), left_at: null });}
     return { rows: [{ is_occupied: t.is_occupied, num_covers: t.num_covers, linked_order_id: t.linked_order_id }] };
   }
+  // UpdateTableCovers — a bare covers correction on a table that is already
+  // seated (PATCH /table-covers). It does not touch is_occupied, so it is its
+  // own branch; what it writes is the whole point of the covers tests.
+  if (s.includes('update "tables"') && s.includes("set num_covers =")) {
+    const t = store.tables.find((x) => x.id === str(params[0]));
+    if (!t) {return { rows: [] };}
+    t.num_covers = Math.max(1, Number(params[3]));
+    return { rows: [{ num_covers: t.num_covers }] };
+  }
+
   if (s.includes("select id, table_name") && s.includes('from "tables"')) {
     const t = store.tables.find((x) => lower(x.table_name) === lower(params[2]));
     return { rows: t ? [{ id: t.id, table_name: t.table_name }] : [] };
