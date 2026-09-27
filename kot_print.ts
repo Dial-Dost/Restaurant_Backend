@@ -245,6 +245,33 @@ export interface KotDispatchInput {
    */
   cancelled?: boolean;
   /**
+   * This docket CORRECTS THE ADDRESS of a ticket the kitchen already holds,
+   * because its order moved table (client item 6).
+   *
+   * Passed straight to the renderer, which banners it "** TABLE MOVED **" and
+   * prints NO DISH LIST — see ReceiptOptions.moved for why the list is the
+   * thing that has to go.
+   *
+   * THE ITEMS ARE STILL PASSED IN, and must be: they are what `withStations`
+   * and `groupKotItemsByStation` read to decide how many dockets this ticket
+   * becomes and which machine each one is aimed at. A correction for a ticket
+   * that printed at the tandoor and the bar reaches the tandoor and the bar,
+   * and the restaurants that route nothing get the one General docket they get
+   * for everything else.
+   *
+   * Absent (the default) on every ordinary docket, so their bytes are untouched.
+   */
+  moved?: boolean;
+  /**
+   * WITH `moved`: every KOT number this one correction re-addresses, when a
+   * single move carried more than one ticket — a whole party and its three
+   * rounds. `pinnedKotNo` stays the first of them, because that is the number
+   * this print job is filed under in "PrintJobs" (migration 043).
+   *
+   * Absent everywhere else, and a single-ticket move may simply leave it out.
+   */
+  movedKots?: number[];
+  /**
    * Overrides the line at the very top of the docket (normally "Running Table"
    * or the delivery channel - see kotOrderContext). Used to say, in the first
    * thing a chef reads, that this piece of paper replaces another one.
@@ -570,6 +597,11 @@ export async function dispatchKot(input: KotDispatchInput): Promise<KotDispatchR
     // `cancelled: false` so an ordinary docket's options object is byte-for-byte
     // the object it was before this field existed.
     ...(input.cancelled ? { cancelled: true } : {}),
+    // Set ONLY on a move correction, and spread-conditional for the same reason
+    // `cancelled` is: an ordinary docket's options object stays the object it
+    // was before this field existed.
+    ...(input.moved ? { moved: true } : {}),
+    ...(input.moved && input.movedKots && input.movedKots.length > 0 ? { movedKots: input.movedKots } : {}),
   };
   const tickets = buildKotBase64(renderOptions, input.cols);
 

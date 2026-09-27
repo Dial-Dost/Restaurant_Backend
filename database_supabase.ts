@@ -17894,6 +17894,18 @@ export async function MoveTableParty(
   success: true;
   from_table: string;
   to_table: string;
+  /**
+   * "Tables".id of the table the party LEFT — client item 6.
+   *
+   * The route needs it, and it has to come from here: a KOT's ticket key is
+   * built from the table it printed FROM, and by the time the route can ask,
+   * the orders are all on the destination. Looking the source up again by name
+   * would also be a second read of a row a concurrent seat may already have
+   * changed. Its counterpart `to_table_id` rides along for symmetry with
+   * MoveOrderToTable, which has answered both since it existed.
+   */
+  from_table_id: string;
+  to_table_id: string;
   covers: number;
   moved_orders: number;
   total_amt: number;
@@ -18142,6 +18154,8 @@ export async function MoveTableParty(
       success: true as const,
       from_table: src.table_name,
       to_table: dst.table_name,
+      from_table_id: src.id,
+      to_table_id: dst.id,
       covers,
       moved_orders: orders.length,
       total_amt: total,
