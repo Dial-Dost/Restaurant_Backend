@@ -49,6 +49,7 @@ const mockMoveParty = jest.fn<AnyAsync>();
 const mockAudit = jest.fn<AnyAsync>();
 const mockPaper = jest.fn<AnyAsync>();
 const mockCopyPaper = jest.fn<AnyAsync>();
+const mockGetTables = jest.fn<AnyAsync>();
 
 jest.mock("pg", () => {
   const query = async () => ({ rows: [] });
@@ -99,6 +100,7 @@ jest.mock("../database_supabase", () => {
     VerifyTableOtp: async () => ({ ok: true, required: false }),
     repriceFromMenu: async (_s: unknown, items: unknown[]) => items,
     AddNotification: async () => undefined,
+    GetTables: (...a: unknown[]) => mockGetTables(...a),
   };
 });
 jest.mock("../print_routing", () => ({
@@ -131,6 +133,8 @@ jest.mock("../auth/store", () => ({ __esModule: true, getStore: () => null }));
 const ADD_ORDERS = "4ad474d4-5230-449c-874f-6a238b833bca";
 const TABLE_ADDED = "194ce6ee-b867-4be3-b5f0-48c28ce0a81b";
 const CLOSE_BILL = "a953d044-31ba-4e31-b96f-99304fe43dfa";
+/** "View Tables" — the action GET /get-tables is gated on. */
+const VIEW_TABLES = "090ea8d4-e348-4e1b-9723-11131a73a085";
 const RES = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
 const OUTLET = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
 
@@ -178,12 +182,14 @@ beforeAll(async () => {
   orders.registerOrderRoutes(harness.app as never);
   guest.registerGuestOrderingRoutes(harness.app as never);
   tablesRoutes.registerTableRoutes(harness.app as never);
+  tablesRoutes.registerTableListRoute(harness.app as never);
 });
 
 beforeEach(() => {
-  for (const m of [mockGuard, mockEnsure, mockAddOrder, mockGetOrders, mockUpdateSplit, mockGetBill, mockAddTable, mockEmit, mockDispatch, mockMerge, mockMoveItem, mockMoveParty, mockAudit, mockPaper, mockCopyPaper]) {
+  for (const m of [mockGuard, mockEnsure, mockAddOrder, mockGetOrders, mockUpdateSplit, mockGetBill, mockAddTable, mockEmit, mockDispatch, mockMerge, mockMoveItem, mockMoveParty, mockAudit, mockPaper, mockCopyPaper, mockGetTables]) {
     m.mockReset();
   }
+  mockGetTables.mockResolvedValue([]);
   mockAudit.mockResolvedValue(undefined);
   mockPaper.mockResolvedValue(true);
   mockCopyPaper.mockResolvedValue(true);
@@ -912,6 +918,43 @@ describe("3. '12 #2' cannot be made by hand", () => {
     });
     expect(r.status).toBe(200);
     expect(mockAddTable).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ===========================================================================
+describe("3b. GET /get-tables?include_hidden — the room, for the surfaces that list tables", () => {
+  // Round-3 item 4 hides a CARD so one table number draws one card, and the
+  // card it hides is sometimes the root's. The floor-plan editor, the delete
+  // picker, the booking picker and "N of M tables occupied" list TABLES out of
+  // this payload, and a hidden root takes the number out of all four. They ask
+  // for the room with this flag; everyone who draws cards does not, so an
+  // installed till's floor is unchanged.
+  const FLOOR = identity("manager", ["manager"], [VIEW_TABLES]);
+  const call = (query: Record<string, string>) =>
+    harness.call("GET", "/get-tables", { query: { restaurantId: RES, ...query }, auth: FLOOR as never });
+  /** The third argument the handler hands the data layer. */
+  const opts = () => mockGetTables.mock.calls[0]?.[2];
+
+  test.each([["1"], ["true"]])("include_hidden=%s asks the data layer for every live row", async (v) => {
+    const r = await call({ include_hidden: v });
+    expect(r.status).toBe(200);
+    expect(opts()).toEqual({ includeFloorHidden: true });
+  });
+
+  test.each([
+    ["no flag at all — every shipped 2.0.x till", {}],
+    ["include_hidden=0", { include_hidden: "0" }],
+    ["include_hidden=yes, which is not the spelling", { include_hidden: "yes" }],
+  ])("%s gets the FLOOR, hidden cards and all still taken out", async (_name, query) => {
+    const r = await call(query);
+    expect(r.status).toBe(200);
+    expect(opts()).toEqual({ includeFloorHidden: false });
+  });
+
+  test("the rows are passed through untouched — this flag is a read, not a shape", async () => {
+    const rows = [{ table_name: "12", parent_table: null }, { table_name: "12 #2", parent_table: "12" }];
+    mockGetTables.mockResolvedValue(rows);
+    expect((await call({ include_hidden: "1" })).body).toEqual(rows);
   });
 });
 

@@ -729,6 +729,85 @@ describe("4. the floor", () => {
     expect(await floor()).toEqual(["7", "8"]);
   });
 
+  // -------------------------------------------------------------------------
+  // ...AND THE ROOM STILL HAS EVERY TABLE IN IT — the follow-up to item 4.
+  //
+  // The rule above hides CARDS, and the card it hides is sometimes the ROOT's.
+  // Both clients build their non-service lists — the floor-plan editor, the
+  // delete picker, the booking picker, "N of M tables occupied" — out of this
+  // same payload by dropping every row that carries a `parent_table`, so a
+  // family whose root is hidden loses its number from all four: the owner sees
+  // a table they never deleted go missing. `includeFloorHidden` is the read
+  // those surfaces make, and it is opt-in so the floor an installed till draws
+  // does not change by one byte.
+  // -------------------------------------------------------------------------
+
+  /** The rows the ROOM read lists, in order. */
+  const room = async (): Promise<string[]> =>
+    (await db.GetTables(SLUG, undefined, { includeFloorHidden: true }))!.map((r) => r.table_name);
+
+  test("THE CLIENT'S PHOTO, ASKED AS THE ROOM: the hidden 12 is still a table", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    await db.ReleaseTable(SLUG, "12");
+    // The FLOOR draws one card, as item 4 asks.
+    expect(await floor()).toEqual(["12 #2", "15"]);
+    // The ROOM still has table 12 in it, beside its sibling and its neighbour…
+    expect(await room()).toEqual(["12", "12 #2", "15"]);
+    // …and it is the real row, with 12's own seats and zone, so the floor-plan
+    // editor can still move it, re-size it and delete it BY NAME.
+    const twelve = (await db.GetTables(SLUG, undefined, { includeFloorHidden: true }))!
+      .find((r) => r.table_name === "12");
+    expect(twelve).toMatchObject({ table_name: "12", parent_table: null, capacity: 4, section: "Garden" });
+  });
+
+  test("ONE SURVIVING ROW IS EXACTLY ONE TABLE: dropping the siblings leaves every number once", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    await db.ReleaseTable(SLUG, "12");
+    // What the editor, the delete picker and the booking picker actually build:
+    // the room read with every `parent_table` row dropped.
+    const rooms = (await db.GetTables(SLUG, undefined, { includeFloorHidden: true }))!
+      .filter((r) => r.parent_table === null)
+      .map((r) => r.table_name);
+    expect(rooms).toEqual(["12", "15"]);
+    // And the counts that follow from it: 2 tables, 12 in use through its sibling.
+    expect(rooms).toHaveLength(liveTables().filter((t) => t.parent_table_id === null).length);
+  });
+
+  test("THE ROOM IS EVERY LIVE ROW, whatever the card rule decides — the invariant, not the case", async () => {
+    // Held across the four states a family can be in, so a later refinement of
+    // planNextPartyFloorHidden (one running card per number, one seat per
+    // printed bill) cannot quietly take a table out of the room again.
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    const live = () => liveTables().map((t) => t.table_name).sort();
+    expect((await room()).sort()).toEqual(live());          // printed + free seat
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    expect((await room()).sort()).toEqual(live());          // printed + running sibling
+    await db.ReleaseTable(SLUG, "12");
+    expect((await room()).sort()).toEqual(live());          // settled root + running sibling
+    tick(4);
+    addPrint(`12 #2-${String(Date.now())}`);
+    expect((await room()).sort()).toEqual(live());          // free root + printed sibling
+  });
+
+  test("THE DEFAULT READ IS UNTOUCHED — an installed till asks nothing and gets today's floor", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    await db.ReleaseTable(SLUG, "12");
+    expect(JSON.stringify(await db.GetTables(SLUG)))
+      .toEqual(JSON.stringify(await db.GetTables(SLUG, undefined, { includeFloorHidden: false })));
+    expect((await db.GetTables(SLUG))!.map((r) => r.table_name)).toEqual(["12 #2", "15"]);
+  });
+
   test("the room-counting readers never see a sibling: sections, bookings, seating suggestions", async () => {
     busyTwelve();
     await db.EnsureNextPartyTable(SLUG, "12");
@@ -772,8 +851,16 @@ describe("4. the floor", () => {
   test("the floor read's backfill runs only outside a transaction, and re-reads without backfilling", () => {
     const body = chunk("GetTables");
     expect(body).toMatch(/opts\.backfillNextParty !== false && \(tenantStorage\.getStore\(\)\?\.txnDepth \?\? 0\) === 0/);
-    expect(body).toMatch(/return GetTables\(restaurantId, time, \{ backfillNextParty: false \}\);/);
+    // …and the re-read carries the caller's own room/floor choice with it: a
+    // backfill on the ROOM read must not answer with the floor's hidden cards
+    // taken out.
+    expect(body).toMatch(/return GetTables\(restaurantId, time, \{ backfillNextParty: false, includeFloorHidden: opts\.includeFloorHidden \}\);/);
     expect(body).toMatch(/if \(!claimNextPartyBackfill\(context, r\.id\)\) \{continue;\}/);
+  });
+
+  test("the card rule is the FLOOR's only — the room read never enters it", () => {
+    const body = chunk("GetTables");
+    expect(body).toMatch(/if \(withParty && opts\.includeFloorHidden !== true\) \{/);
   });
 
   test("the table-wise turnaround folds a next party's seating into its table's label", () => {
