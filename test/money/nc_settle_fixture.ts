@@ -56,6 +56,15 @@ export interface NcFixtureOrder {
   subtotal?: number;
   total?: number;
   nc_subtotal?: number;
+  /**
+   * What a line removal stamped on the order (stampLineRemoval): the lines it
+   * took off, and which writer emptied it. Carried because the Void KOT report
+   * reads them off the order rather than off a ledger — so a fixture that
+   * dropped them would let a removal that records nothing pass.
+   */
+  removed_items?: unknown[];
+  moved_items?: unknown[];
+  emptied_by?: string;
 }
 
 export interface NcFixtureBill {
@@ -191,6 +200,9 @@ function foodOf(o: NcFixtureOrder): Record<string, unknown> {
     subtotal: sub,
     total: typeof o.total === "number" ? o.total : sub,
     ...(typeof o.nc_subtotal === "number" ? { nc_subtotal: o.nc_subtotal } : {}),
+    ...(o.removed_items ? { removed_items: o.removed_items } : {}),
+    ...(o.moved_items ? { moved_items: o.moved_items } : {}),
+    ...(o.emptied_by ? { emptied_by: o.emptied_by } : {}),
     status: "Served",
   };
 }
@@ -401,7 +413,9 @@ export function fixtureQuery(sql: string, params: unknown[] = []): { rows: unkno
   if (/^select count\(\*\)::int as n from "Orders" where res_id = \$1 and outlet_id = \$2 and table_id = \$3 and /i.test(q)) {
     return { rows: [{ n: s.orders.filter((o) => STILL_OWES(o.status)).length }] };
   }
-  if (/^update "Orders" set food = \$4::json where id = \$1 and res_id = \$2 and outlet_id = \$3$/i.test(q)) {
+  // removeItemFromTableOrders' two writes: the ordinary one, and the one that
+  // also cancels an order the removal emptied (status 5).
+  if (/^update "Orders" set food = \$4::json(, status = 5)? where id = \$1 and res_id = \$2 and outlet_id = \$3$/i.test(q)) {
     const o = s.orders.find((x) => x.id === params[0]);
     if (o) {
       const f = JSON.parse(String(params[3])) as Record<string, unknown>;
@@ -410,6 +424,10 @@ export function fixtureQuery(sql: string, params: unknown[] = []): { rows: unkno
       o.subtotal = Number(f.subtotal);
       o.total = Number(f.total);
       o.nc_subtotal = typeof f.nc_subtotal === "number" ? f.nc_subtotal : undefined;
+      o.removed_items = (f.removed_items as unknown[] | undefined) ?? undefined;
+      o.moved_items = (f.moved_items as unknown[] | undefined) ?? undefined;
+      o.emptied_by = typeof f.emptied_by === "string" ? f.emptied_by : undefined;
+      if (/status = 5/i.test(q)) { o.status = 5; }
     }
     return { rows: [] };
   }

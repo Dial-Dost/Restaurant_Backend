@@ -316,3 +316,61 @@ describe("the ordinary docket is untouched", () => {
     expect(text).not.toContain("CANCELLED");
   });
 });
+
+// ===========================================================================
+// CLIENT ITEM 2 — ONE LINE OFF A TICKET THE KITCHEN IS HOLDING.
+//
+// POST /bills/remove-item ("Remove from bill") printed nothing at all, so a
+// dish taken off the guest's bill went on being cooked. It now asks
+// dispatchCancellationKot for the SAME slip, narrowed to the removed dish —
+// which is a different piece of paper from "cancel the ticket", and has to be:
+// the rest of the ticket is still being cooked for a table that is waiting.
+// ===========================================================================
+describe("cancelling ONE dish off a ticket that is still being cooked", () => {
+  const WHOLE = [
+    { name: "Paneer Tikka", quantity: 1 },
+    { name: "Tandoori Roti", quantity: 1, note: "extra butter" },
+    { name: "Dark Chocolate Mousse", quantity: 1 },
+  ];
+  const ROTI = [WHOLE[1]!];
+
+  test("the slip names the ticket, the table and the removed dish — and not the two still on the pass", async () => {
+    seedMenu([]);
+    const original = await db.AllocateKotNumber(RESTAURANT_SLUG, keyFor(WHOLE), FIRED);
+
+    const out = await slip(original.kot_no, ROTI);
+
+    expect(out.tickets).toBe(1);
+    const text = paper(enqueued[0]!.esc_base64);
+    expect(text).toContain("CANCELLED");
+    expect(text).toContain("KOT - 1");
+    expect(text).toContain("Table No: T4");
+    expect(text).toContain("Tandoori Roti");
+    // THE REST OF THE TICKET IS NOT CANCELLED. A slip listing the whole ticket
+    // would have the kitchen bin two plates the table is still waiting for.
+    expect(text).not.toContain("Paneer Tikka");
+    expect(text).not.toContain("Dark Chocolate Mousse");
+  });
+
+  test("the number is found from the ticket as it stood BEFORE the line left", async () => {
+    // THE TRAP THE ROUTE'S PRE-READ EXISTS FOR. A ticket key is a fingerprint of
+    // the item SET, so the whole-order candidate only resolves while the order
+    // still holds all three dishes. Read the context after the write and the
+    // slip prints unnumbered — a slip the kitchen cannot match to any docket.
+    seedMenu([]);
+    await db.AllocateKotNumber(RESTAURANT_SLUG, keyFor(WHOLE), FIRED);
+    const order = { order_id: "o1", outlet_id: OUTLET_ID, table_id: T4, items: WHOLE } as never;
+
+    expect(await kp.resolveCancelledKotNumber(RESTAURANT_SLUG, order, {
+      cancelledLines: ROTI, itemId: "r2", firedAt: FIRED, tz: TZ,
+    })).toBe(1);
+
+    // The same read taken one moment too late: the Roti has gone from the set.
+    const after = { order_id: "o1", outlet_id: OUTLET_ID, table_id: T4, items: [WHOLE[0]!, WHOLE[2]!] } as never;
+    expect(await kp.resolveCancelledKotNumber(RESTAURANT_SLUG, after, {
+      cancelledLines: ROTI, itemId: "r2", firedAt: FIRED, tz: TZ,
+    })).toBeNull();
+    // And asking cost the day's sequence nothing, either way.
+    expect(tickets()).toHaveLength(1);
+  });
+});
