@@ -436,13 +436,32 @@ describe("re-opening a next party's bill after its seat was retired", () => {
     expect((await db.GetBillForTable(SLUG, "12"))?.order_ids ?? []).not.toContain(second.id);
   });
 
-  test("…and the next print of 12 does NOT mint a second live '12 #2': the next party gets '12 #3'", async () => {
+  test("…and the next print of 12 waits: the re-opened party is back AT the table", async () => {
+    // A re-opened bill puts a live party back on "12 #2" with no paper out, so
+    // the number is occupied and 12's print is owed no seat — "a duplicate only
+    // once per bill printed", and this bill's seat is the one being sat on.
     const { bill } = await retiredNextPartyBill();
     await db.ReopenBill(SLUG, bill.id, "nirav");
     seat("12", 3);
     addOrder("12", 450);
     tick(2);
     addPrint(`12-${String(Date.parse("2026-09-16T09:00:00.000Z"))}`);
+    expect(await db.EnsureNextPartyTable(SLUG, "12")).toBeNull();
+    const live = tables().filter((t) => !t.is_deleted).map((t) => t.table_name.toLowerCase());
+    expect(new Set(live).size).toBe(live.length);
+    expect(live.filter((n) => n === "12 #2")).toHaveLength(1);
+  });
+
+  test("…and once that party's own bill is printed too, the next one gets '12 #3'", async () => {
+    // Two printed bills at one number is the shape the duplicate exists for, and
+    // the revived "12 #2" must not have its name minted a second time.
+    const { bill } = await retiredNextPartyBill();
+    await db.ReopenBill(SLUG, bill.id, "nirav");
+    seat("12", 3);
+    addOrder("12", 450);
+    tick(2);
+    addPrint(`12-${String(Date.parse("2026-09-16T09:00:00.000Z"))}`);
+    addPrint(bill.id);
     const seatInfo = await db.EnsureNextPartyTable(SLUG, "12");
     expect(seatInfo).toMatchObject({ table_name: "12 #3", created: true });
     const live = tables().filter((t) => !t.is_deleted).map((t) => t.table_name.toLowerCase());
