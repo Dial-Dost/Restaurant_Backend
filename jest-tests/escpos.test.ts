@@ -755,6 +755,27 @@ describe("buildReceiptBase64 — KOT", () => {
       expect(printed(b64)).not.toContain("KOT - ");
     });
 
+    /**
+     * ROUND-3 CLIENT ITEM 5 — the bytes, not the model. The client photographed
+     * a docket reading "Table No: 4 #2" with the suffix circled; kot_layout
+     * pins what the renderer is asked for, and this pins what came out.
+     */
+    test("the next party's ' #2' never reaches the paper — 'Table No: 4' in the big type", () => {
+      const b64 = buildReceiptBase64({ ...kotBase, table: "4 #2" });
+      expect(doubled(b64)).toEqual(["KOT - 26", "Table No: 4"]);
+      expect(printed(b64)).toMatch(/^Table No: 4$/m);
+      expect(printed(b64)).not.toContain("#");
+      // Byte for byte the docket for a plain "4": only the table line changed.
+      expect(b64).toEqual(buildReceiptBase64({ ...kotBase, table: "4" }));
+    });
+
+    test("…while the guest's BILL still names '4 #2', where the two bills are told apart", () => {
+      const raw = decode(buildReceiptBase64({
+        ...kotBase, kind: "bill", table: "4 #2", splitPart: { index: 1, of: 2, label: "Garden" },
+      }));
+      expect(raw).toContain("Table 4 #2");
+    });
+
     test("a table name too long for the paper degrades instead of wrapping mid-word", () => {
       // Takeaway tables are named for their channel and their order id, and a
       // double-width line only fits when 2 x length <= width. Wrapping the one

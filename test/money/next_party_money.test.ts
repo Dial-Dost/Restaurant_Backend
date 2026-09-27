@@ -241,6 +241,75 @@ describe("each settle path closes only its own table's orders", () => {
   });
 });
 
+/**
+ * ROUND-3 CLIENT ITEM 4 — WHAT THE FLOOR SHOWS THE MOMENT THE MONEY LANDS.
+ *
+ * Every settle path above frees 12 while the next party is still eating, and
+ * the client photographed the result: a green, FREE "14" card beside a running
+ * "14 #2". A waiter reads that card as an empty table and seats a party on top
+ * of the one already sitting there. "Once it is settled, the prior duplication
+ * has to be deleted."
+ *
+ * Here because this is where the settles are driven; the rule itself is
+ * next_party.ts's planNextPartyFloorHidden, and the floor's own cases are in
+ * jest-tests/next_party_tables.test.ts.
+ */
+describe("the floor after a settle: one card for 12, and it is the one with the party on it", () => {
+  const floor = async (): Promise<string[]> => (await db.GetTables(SLUG))!.map((r) => r.table_name);
+
+  test("BEFORE the settle: 12's paper is out, so both cards are drawn", async () => {
+    await printedTwelveWithNextParty();
+    expect(await floor()).toEqual(["12", "12 #2", "15"]);
+  });
+
+  test("ADMIN APPROVAL of 12 -> the free 12 card goes, the running one stays", async () => {
+    const { first } = await printedTwelveWithNextParty();
+    const bill = addBill("12");
+    markWaiterConfirmed(bill.id);
+    await db.ApproveBillPaymentByAdmin(SLUG, first.id, "nirav");
+    expect(liveTable("12").is_occupied).toBe(false);
+    expect(await floor()).toEqual(["12 #2", "15"]);
+  });
+
+  test("CLOSE of 12's approved bill -> the same one card", async () => {
+    const { first } = await printedTwelveWithNextParty();
+    addBill("12", { admin_approved_at: "2026-09-16T08:20:00.000Z", total_amt: 1050, status: 2 });
+    await db.CloseBillByOrder(SLUG, first.id, "nirav");
+    expect(await floor()).toEqual(["12 #2", "15"]);
+  });
+
+  test("ONLINE PAYMENT for 12 -> the same one card", async () => {
+    await printedTwelveWithNextParty();
+    await db.FinalizeOnlinePayment(SLUG, "12", "pay_ggv_12");
+    expect(await floor()).toEqual(["12 #2", "15"]);
+  });
+
+  test("RELEASE of 12 (its orders voided) -> the same one card", async () => {
+    await printedTwelveWithNextParty();
+    await db.ReleaseTable(SLUG, "12");
+    expect(await floor()).toEqual(["12 #2", "15"]);
+  });
+
+  test("…and when the NEXT party settles too, 12 is one free card and the sibling row is gone", async () => {
+    const { first, second } = await printedTwelveWithNextParty();
+    await db.FinalizeOnlinePayment(SLUG, "12", "pay_a");
+    await db.FinalizeOnlinePayment(SLUG, "12 #2", "pay_b");
+    expect(statusOf(first.id)).toBe("4");
+    expect(statusOf(second.id)).toBe("4");
+    expect(liveSiblingsOf("12")).toEqual([]);
+    expect(await floor()).toEqual(["12", "15"]);
+  });
+
+  test("the money is untouched by any of it — the bills still belong to their own party", async () => {
+    await printedTwelveWithNextParty();
+    await db.FinalizeOnlinePayment(SLUG, "12", "pay_ggv_12");
+    // 12 is off the floor and still fully addressable by name everywhere else.
+    expect(await db.GetBillForTable(SLUG, "12 #2")).toMatchObject({ subtotal: 600, print_count: 0 });
+    expect(liveTable("12").is_deleted).toBe(false);
+    expect(liveTable("12 #2").is_occupied).toBe(true);
+  });
+});
+
 describe("paper == drawer == report, one party at a time", () => {
   test("both parties settle; the sales report books exactly the two printed totals", async () => {
     const { first, second } = await printedTwelveWithNextParty();

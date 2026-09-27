@@ -38,9 +38,11 @@ import {
   liveSiblingsOf,
   liveTable,
   liveTables,
+  orders,
   resetStore,
   seat,
   setColumnsPresent,
+  setOrderStatus,
   setRowLocking,
   statements,
   tables,
@@ -377,9 +379,13 @@ describe("3. the money guard's read", () => {
 
 // ===========================================================================
 describe("4. the floor", () => {
+  // PRINTED, because round-3 item 4 is that a second card is drawn only while
+  // the first party's paper is out. An unprinted 12 with a free "12 #2" beside
+  // it is a state a print can no longer leave behind, and the floor no longer
+  // draws it (see "no paper, no second card" below).
   test("/get-tables names the sibling and lists it straight after its root, with the root's zone and booking", async () => {
     addTable({ table_name: "10" });
-    busyTwelve();
+    busyTwelve({ printed: true });
     addTable({ table_name: "120" });
     await db.EnsureNextPartyTable(SLUG, "12");
     liveTable("12 #2").section = "Somewhere stale";
@@ -424,7 +430,9 @@ describe("4. the floor", () => {
     ["booked (a reservation running now)", -10, "booked"],
     ["reserved (a reservation later today)", 60, "reserved"],
   ] as const)("a sibling carries its ROOT's booking state — %s", async (_l, offsetMin, field) => {
-    busyTwelve();
+    // PRINTED, so both cards are drawn: round-3 item 4 hides the free one of a
+    // family whose paper is not out (see "no paper, no second card").
+    busyTwelve({ printed: true });
     await db.EnsureNextPartyTable(SLUG, "12");
     const at = new Date();
     at.setHours(12, 0, 0, 0);
@@ -472,6 +480,110 @@ describe("4. the floor", () => {
     await db.GetTables(SLUG);
     expect(liveSiblingsOf("12")).toEqual([]);
     expect(statements().filter((q) => q.startsWith('insert into "tables"'))).toHaveLength(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // ROUND-3 CLIENT ITEM 4 — two cards for one table only while its paper is out.
+  //
+  // The client's photo: a green, FREE "14" card beside a running "14 #2". 14 had
+  // been settled minutes before and its next party was still eating, and the
+  // free card is how a waiter seats a party on a table that is already taken.
+  // "If there's a running table, no duplication should be there. Only when its
+  // bill is printed but not settled should it be there."
+  // -------------------------------------------------------------------------
+
+  /** The table cards /get-tables draws, in the order it draws them. */
+  const floor = async (): Promise<string[]> => (await db.GetTables(SLUG))!.map((r) => r.table_name);
+
+  test("PRINTED AND UNSETTLED: 12 and its green seat are both cards — the duplicate the feature is for", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    expect(await floor()).toEqual(["12", "12 #2", "15"]);
+  });
+
+  test("THE CLIENT'S PHOTO: 12 settled while its next party eats -> the free 12 card goes", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    // 12 is paid and cleared; its seating — and with it its print count — is over.
+    await db.ReleaseTable(SLUG, "12");
+    expect(liveTable("12").is_occupied).toBe(false);
+    expect(liveTable("12 #2").is_occupied).toBe(true);
+
+    // ONE card for the number, and it is the one with the party on it.
+    const rows = (await db.GetTables(SLUG))!;
+    expect(rows.map((r) => r.table_name)).toEqual(["12 #2", "15"]);
+    expect(rows.filter((r) => r.display_name === "12")).toHaveLength(1);
+    expect(rows.find((r) => r.table_name === "12 #2")).toMatchObject({ display_name: "12", occupied: true });
+    // The ROW is still there — it holds a bill's worth of history and the floor
+    // plan — and it is still addressable by name everywhere else.
+    expect(liveTable("12").is_deleted).toBe(false);
+    expect(await db.GetBillForTable(SLUG, "12 #2")).toMatchObject({ subtotal: 600 });
+  });
+
+  test("…and once the next party's OWN bill is printed, 12 is a card again: it is the seat", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    await db.ReleaseTable(SLUG, "12");
+    tick(4);
+    addPrint(`12 #2-${String(Date.now())}`);
+    expect(await floor()).toEqual(["12", "12 #2", "15"]);
+    // And the seat a print of "12 #2" hands out IS that free root, not a "12 #3".
+    expect(await db.EnsureNextPartyTable(SLUG, "12 #2"))
+      .toEqual({ table_name: "12", parent_table: "12", party_no: null, created: false });
+  });
+
+  test("NO PAPER, NO SECOND CARD: a running 12 with nothing printed shows once", async () => {
+    busyTwelve();
+    // A seat left behind by a settle whose tidy-up was missed (retirement is
+    // self-healing, and until it heals the floor must not draw 12 twice).
+    await db.EnsureNextPartyTable(SLUG, "12");
+    expect(names(liveSiblingsOf("12"))).toEqual(["12 #2"]);
+    expect(await floor()).toEqual(["12", "15"]);
+  });
+
+  test("AN IDLE NUMBER SHOWS ONCE, as the root, while its sibling waits to be retired", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    liveTable("12").is_occupied = false;
+    const twelve = liveTable("12").id;
+    for (const o of orders().filter((x) => x.table_id === twelve)) { setOrderStatus(o.id, "7"); }
+    expect(await floor()).toEqual(["12", "15"]);
+  });
+
+  test("SETTLE, VOID AND RELEASE ALL LAND ON ONE CARD — the sibling row goes with the party", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    const second = addOrder("12 #2", 600);
+    await db.ReleaseTable(SLUG, "12");
+    expect(await floor()).toEqual(["12 #2", "15"]);
+    // The next party leaves: the row is retired for good and 12 is the free card.
+    setOrderStatus(second.id, "7");
+    await db.ReleaseTable(SLUG, "12 #2");
+    expect(liveSiblingsOf("12")).toEqual([]);
+    expect(await floor()).toEqual(["12", "15"]);
+  });
+
+  test("the two parties still bill apart while both cards are up", async () => {
+    busyTwelve({ printed: true });
+    await db.EnsureNextPartyTable(SLUG, "12");
+    seat("12 #2", 2);
+    addOrder("12 #2", 600);
+    expect(await floor()).toEqual(["12", "12 #2", "15"]);
+    expect((await db.GetBillForTable(SLUG, "12"))?.subtotal).toBe(1000);
+    expect((await db.GetBillForTable(SLUG, "12 #2"))?.subtotal).toBe(600);
+  });
+
+  test("an ordinary table is never touched by the rule — no family, no hiding", async () => {
+    addTable({ table_name: "7" });
+    addTable({ table_name: "8" });
+    seat("8", 2);
+    addOrder("8", 200);
+    expect(await floor()).toEqual(["7", "8"]);
   });
 
   test("the room-counting readers never see a sibling: sections, bookings, seating suggestions", async () => {
