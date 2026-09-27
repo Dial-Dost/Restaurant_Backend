@@ -12,9 +12,17 @@
 // kot_numbering.test.ts uses:
 //
 //   1. AN ALREADY-TICKETED ORDER GETS PAPER, and that paper carries the NEW
-//      table in the big type, the OLD table in the context line, and THE SAME
-//      KOT NUMBER — which is the only thing that lets a chef pair the two
-//      pieces of paper.
+//      table in the big type, both tables in the context line, THE SAME KOT
+//      NUMBER — which is the only thing that lets a chef pair the two pieces of
+//      paper — and, since client item 6, NO DISH LIST and a banner. "After we
+//      move a table, the entire order of the table gets reprinted, which the
+//      kitchen will consider a new order during busy times": a numbered dish
+//      list under a KOT header IS an order to a pass reading forty an hour,
+//      whatever the line above it says.
+//
+//   1b. AND IT REACHES EXACTLY THE RAILS THE ORIGINAL DID. The items are still
+//      handed to dispatchKot — unprinted — because they are what the station
+//      split is computed from. One station, one correction; two, two.
 //
 //   2. AN ORDER THE KITCHEN NEVER SAW GETS NOTHING, and — the part that would
 //      be easy to get wrong — asking the question does not BURN a number. A
@@ -88,12 +96,14 @@ type Db = typeof import("../database_supabase");
 type KotPrint = typeof import("../kot_print");
 let db: Db;
 let kp: KotPrint;
+let km: typeof import("../kot_move");
 
 beforeAll(async () => {
   process.env.SUPABASE_DIRECT_URL =
     process.env.SUPABASE_DIRECT_URL || "postgres://fixture:fixture@localhost:5432/fixture";
   db = await import("../database_supabase");
   kp = await import("../kot_print");
+  km = await import("../kot_move");
 });
 
 beforeEach(() => { resetStore(); enqueued.length = 0; });
@@ -128,7 +138,7 @@ const keyFor = (tableId: string) =>
   kp.buildKotTicketKey({ outletId: OUTLET_ID, tableId, items: ITEMS, firedAt: FIRED, tz: TZ });
 
 /** The correction docket, exactly as kot_move.ts builds it. */
-async function correction(kotNo: number, wasTable: string) {
+async function correction(kotNo: number, wasTable: string, over: Partial<Parameters<typeof kp.dispatchKot>[0]> = {}) {
   return kp.dispatchKot({
     restaurantId: RESTAURANT_SLUG,
     outletId: OUTLET_ID,
@@ -148,8 +158,10 @@ async function correction(kotNo: number, wasTable: string) {
     tz: TZ,
     firedAt: FIRED,
     pinnedKotNo: kotNo,
-    contextLine: `*** TABLE CHANGED - WAS ${wasTable} ***`,
+    contextLine: km.movedContextLine(wasTable, "T7"),
+    moved: true,
     skipIfTicketed: false,
+    ...over,
   });
 }
 
@@ -168,7 +180,7 @@ describe("an order the kitchen already has", () => {
     expect(tickets()).toHaveLength(1);
   });
 
-  test("the correction names the new table BIG, the old one at the top, and keeps the number", async () => {
+  test("the correction names the new table BIG, both tables at the top, and keeps the number", async () => {
     seedMenu([]);
     const original = await db.AllocateKotNumber(RESTAURANT_SLUG, keyFor(T4), FIRED);
 
@@ -186,16 +198,109 @@ describe("an order the kitchen already has", () => {
     // are all there, and a chef reads a wrapped line fine. What would not be
     // fine is any of them MISSING, which is what these assert.
     const flat = text.replace(/\s+/g, " ");
-    // The three things a chef has to read off it.
-    expect(flat).toContain("TABLE CHANGED - WAS T4");
+    // The four things a chef has to read off it.
+    expect(flat).toContain("** TABLE MOVED **");
+    expect(flat).toContain("WAS T4 - NOW T7");
     expect(flat).toContain("KOT - 1");
     expect(flat).toContain("Table No: T7");
-    // And the food, so the docket stands on its own if the old one is binned.
-    expect(flat).toContain("Paneer Tikka");
-    expect(flat).toContain("no onion");
     // The ordinary "Running Table" context line is REPLACED, not appended: the
     // top line has one job and it is now the correction.
     expect(text).not.toContain("Running Table");
+  });
+
+  /*
+    CLIENT ITEM 6 — THE DEFECT, AND THE ONE ASSERTION THAT PINS IT SHUT.
+
+    "After we move a table, the entire order of the table gets reprinted, which
+    the kitchen will consider a new order during busy times." It did: the
+    correction was the ORDINARY docket with a context line on top, so what came
+    off the roll was a numbered dish list under a KOT header — which is what an
+    order looks like. The banner above it lost to the seven lines of food below.
+  */
+  test("it does NOT reprint the order: no dish list, no quantities, and it says so in the biggest type", async () => {
+    seedMenu([]);
+    await db.AllocateKotNumber(RESTAURANT_SLUG, keyFor(T4), FIRED);
+    await correction(1, "T4");
+    const flat = paper(enqueued[0]!.esc_base64).replace(/\s+/g, " ");
+
+    expect(flat).not.toContain("Paneer Tikka");
+    expect(flat).not.toContain("Masala Papad");
+    expect(flat).not.toContain("no onion");
+    // The item table's own furniture is gone with it: no header row, no total.
+    expect(flat).not.toContain("Total Qty");
+    expect(flat).not.toContain("No.Item");
+    // …and the paper says what it IS, in the same type CANCELLED and REPRINT use.
+    expect(flat).toContain("** TABLE MOVED **");
+    expect(flat).toContain("NOT A NEW ORDER - DO NOT COOK AGAIN");
+    expect(flat).toContain("SAME FOOD - ALREADY ORDERED");
+  });
+
+  test("an ordinary docket is untouched: the dish list is exactly where it was", async () => {
+    // The guard on the above. `moved` is the only thing that removes the items,
+    // and every other docket in the product must still carry them.
+    seedMenu([]);
+    await correction(0, "T4", { moved: false, contextLine: null, pinnedKotNo: null });
+    const flat = paper(enqueued[0]!.esc_base64).replace(/\s+/g, " ");
+    expect(flat).toContain("Paneer Tikka");
+    expect(flat).toContain("no onion");
+    expect(flat).toContain("Total Qty");
+    expect(flat).not.toContain("TABLE MOVED");
+  });
+
+  /*
+    ONE DOCKET PER MOVE — AND PER STATION ONLY WHEN THE ORIGINAL WAS SPLIT.
+
+    A ticket is one piece of paper per KITCHEN STATION (groupKotItemsByStation),
+    each aimed at its own machine by print_routing.ts. So the correction's
+    fan-out must be the ticket's fan-out: the bar is holding paper for the
+    cocktail and has to be told; a restaurant that routes nothing is holding one
+    docket and must get one slip, not one per dish.
+  */
+  test("an unrouted restaurant gets ONE correction for the whole ticket", async () => {
+    seedMenu([]); // no stations at all — everything falls under "General"
+    await db.AllocateKotNumber(RESTAURANT_SLUG, keyFor(T4), FIRED);
+    const out = await correction(1, "T4");
+    expect(out.tickets).toBe(1);
+    expect(out.stations).toEqual(["General"]);
+    expect(enqueued).toHaveLength(1);
+  });
+
+  test("a ticket split across two stations is corrected at both, under the one number", async () => {
+    seedMenu([
+      { id: "m-1", name: "Paneer Tikka", station: "Tandoor" },
+      { id: "m-2", name: "Masala Papad", station: "Bar" },
+    ]);
+    await db.AllocateKotNumber(RESTAURANT_SLUG, keyFor(T4), FIRED);
+    const out = await correction(1, "T4");
+    expect(out.tickets).toBe(2);
+    expect(out.stations).toEqual(["Tandoor", "Bar"]);
+    // Both slips name the same ticket and the same new table, and NEITHER lists
+    // the dish that sent it there — the station header is what says whose it is.
+    for (const job of enqueued) {
+      const flat = paper(job.esc_base64).replace(/\s+/g, " ");
+      expect(flat).toContain("** TABLE MOVED **");
+      expect(flat).toContain("KOT - 1");
+      expect(flat).toContain("Table No: T7");
+      expect(flat).not.toContain("Paneer Tikka");
+      expect(flat).not.toContain("Masala Papad");
+    }
+    expect(paper(enqueued[0]!.esc_base64)).toContain("[ TANDOOR ]");
+    expect(paper(enqueued[1]!.esc_base64)).toContain("[ BAR ]");
+  });
+
+  test("a party that moved three tickets gets ONE slip naming all three", async () => {
+    // The whole-party move (printKotPartyMove): the party moved once, to one
+    // table, at one moment, so the pass gets one thing to read and three
+    // tickets to re-address — not three near-identical slips to collate.
+    seedMenu([]);
+    await db.AllocateKotNumber(RESTAURANT_SLUG, keyFor(T4), FIRED);
+    const out = await correction(1, "T4", { movedKots: [1, 4, 9] });
+    expect(out.tickets).toBe(1);
+    const flat = paper(enqueued[0]!.esc_base64).replace(/\s+/g, " ");
+    expect(flat).toContain("KOT - 1, 4, 9");
+    expect(flat).toContain("WAS T4 - NOW T7");
+    // Still the one number this print job is filed under (migration 043).
+    expect(out.kotNo).toBe(1);
   });
 
   test("printing the correction does not burn a number or memoise the new table", async () => {

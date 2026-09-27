@@ -25,6 +25,7 @@ const mockKotNos = jest.fn<AnyAsync>();
 const mockGuard = jest.fn<AnyAsync>();
 const mockSources = jest.fn<AnyAsync>();
 const mockMoveSlip = jest.fn<AnyAsync>();
+const mockPartySlip = jest.fn<AnyAsync>();
 const mockResolveKots = jest.fn<AnyAsync>();
 const mockItemSlip = jest.fn<AnyAsync>();
 const mockEmit = jest.fn<(...a: unknown[]) => void>();
@@ -61,6 +62,7 @@ jest.mock("../database_supabase", () => {
 jest.mock("../kot_move", () => ({
   __esModule: true,
   printKotTableChange: (...a: unknown[]) => mockMoveSlip(...a),
+  printKotPartyMove: (...a: unknown[]) => mockPartySlip(...a),
   resolveMoveSourceKots: (...a: unknown[]) => mockResolveKots(...a),
   printKotItemMove: (...a: unknown[]) => mockItemSlip(...a),
 }));
@@ -106,13 +108,14 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  for (const m of [mockAudit, mockMoveOrder, mockMoveParty, mockMoveItem, mockCtx, mockKotNos, mockGuard, mockSources, mockMoveSlip, mockResolveKots, mockItemSlip, mockEmit]) { m.mockReset(); }
+  for (const m of [mockAudit, mockMoveOrder, mockMoveParty, mockMoveItem, mockCtx, mockKotNos, mockGuard, mockSources, mockMoveSlip, mockPartySlip, mockResolveKots, mockItemSlip, mockEmit]) { m.mockReset(); }
   mockAudit.mockResolvedValue(true);
   mockMoveOrder.mockResolvedValue(moved());
   mockCtx.mockResolvedValue({ order_id: ORDER, table_name: "12", items: [] });
   mockKotNos.mockResolvedValue(new Map());
   mockGuard.mockImplementation(async (_r: unknown, table: unknown) => unprinted(table));
   mockMoveSlip.mockResolvedValue({ printed: true, kot_no: 65, tickets: 1 });
+  mockPartySlip.mockResolvedValue({ printed: true, kot_no: 3, kot_nos: [3, 5], tickets: 1 });
   mockSources.mockResolvedValue([{ order_id: "src-1", lines: [{ id: "l1", name: "NOT YOUR PUCHKA", price: 469, quantity: 1 }] }]);
   mockResolveKots.mockResolvedValue(new Map([["src-1", [35]]]));
   mockMoveItem.mockResolvedValue({
@@ -253,23 +256,74 @@ describe("POST /tables/move-order — the ticket, by name", () => {
 
 // ===========================================================================
 describe("POST /tables/move — the party's tickets on the record", () => {
-  test("the audit details carry the KOT numbers and the dishes; the sentence is unchanged", async () => {
-    mockMoveParty.mockResolvedValue({
-      success: true, from_table: "15", to_table: "12", covers: 2, moved_orders: 2, total_amt: 900,
-      moved_bill: true, moved_session: true, moved_waiter: true,
-      moved_order_ids: ["o1", "o2"],
-      moved_items: [{ name: "Dal", variation: "Half", quantity: 2 }, { name: "Naan", variation: null, quantity: 1 }],
-    });
+  const party = (over: Record<string, unknown> = {}) => ({
+    success: true, from_table: "15", to_table: "12", from_table_id: "t-15", to_table_id: "t-12",
+    covers: 2, moved_orders: 2, total_amt: 900,
+    moved_bill: true, moved_session: true, moved_waiter: true,
+    moved_order_ids: ["o1", "o2"],
+    moved_items: [{ name: "Dal", variation: "Half", quantity: 2 }, { name: "Naan", variation: null, quantity: 1 }],
+    ...over,
+  });
+
+  test("the audit details carry the KOT numbers and the dishes, and the sentence names the correction", async () => {
+    mockMoveParty.mockResolvedValue(party());
     mockKotNos.mockResolvedValue(new Map([["o1", [3]], ["o2", [5, 3]]]));
     const r = await h.call("POST", "/tables/move", { body: { from_table: "15", to_table: "12" }, auth: WAITER as never });
     expect(r.status).toBe(200);
     const { reason, details } = lastAudit();
-    expect(reason).toBe("Moved the party at 15 to 12 (2 covers, 2 orders, bill carried)");
+    expect(reason).toBe("Moved the party at 15 to 12 (2 covers, 2 orders, bill carried, correction docket printed for KOT-3, KOT-5)");
     expect(details).toMatchObject({ kot_nos: [3, 5], items: "Dal (Half) x2; Naan x1", moved_order_ids: ["o1", "o2"] });
   });
 
+  /*
+    CLIENT ITEM 6 — THE KITCHEN IS TOLD, AND IT IS TOLD FROM THE SOURCE TABLE.
+
+    This route used to print NOTHING. A party moved from 15 to 12 left every
+    docket on the rail saying 15, with no paper anywhere saying otherwise — the
+    exact failure POST /tables/move-order has printed a correction for since
+    item 22, on the route the floor actually presses.
+
+    The previous TABLE ID is the load-bearing argument: a KOT's ticket key is
+    built from the table it printed FROM, so a correction keyed to the
+    destination looks up paper that has never existed and concludes, wrongly,
+    that the kitchen has none.
+  */
+  test("the kitchen gets a correction, keyed to the table the party LEFT, after the move has committed", async () => {
+    const order: string[] = [];
+    mockMoveParty.mockImplementation(async () => { order.push("move"); return party(); });
+    mockPartySlip.mockImplementation(async () => { order.push("print"); return { printed: true, kot_no: 3, kot_nos: [3, 5], tickets: 1 }; });
+    const r = await h.call("POST", "/tables/move", { body: { from_table: "15", to_table: "12" }, auth: WAITER as never });
+    expect(r.status).toBe(200);
+    expect(order).toEqual(["move", "print"]);
+    expect(mockPartySlip).toHaveBeenCalledWith({
+      restaurantId: RES,
+      orderIds: ["o1", "o2"],
+      previousTableId: "t-15",
+      previousTableName: "15",
+    });
+    // The till can say what the kitchen was told, exactly as move-order's does.
+    expect(r.body).toMatchObject({ print: { printed: true, kot_no: 3, kot_nos: [3, 5] } });
+  });
+
+  test("nothing on the pass to correct: the move still succeeds and the line says why", async () => {
+    mockMoveParty.mockResolvedValue(party());
+    mockPartySlip.mockResolvedValue({ printed: false, kot_no: null, tickets: 0, reason: "never_ticketed" });
+    const r = await h.call("POST", "/tables/move", { body: { from_table: "15", to_table: "12" }, auth: WAITER as never });
+    expect(r.status).toBe(200);
+    expect(lastAudit().reason).toBe("Moved the party at 15 to 12 (2 covers, 2 orders, bill carried, no docket was on the pass)");
+  });
+
+  test("a party with no orders is moved silently — no printer, no clause", async () => {
+    mockMoveParty.mockResolvedValue(party({ moved_orders: 0, moved_order_ids: [], moved_items: [], moved_bill: false }));
+    mockPartySlip.mockResolvedValue({ printed: false, kot_no: null, tickets: 0, reason: "no_orders" });
+    const r = await h.call("POST", "/tables/move", { body: { from_table: "15", to_table: "12" }, auth: WAITER as never });
+    expect(r.status).toBe(200);
+    expect(lastAudit().reason).toBe("Moved the party at 15 to 12 (2 covers, 0 orders, no bill yet)");
+  });
+
   test("an unreadable KOT number costs the detail, never the move", async () => {
-    mockMoveParty.mockResolvedValue({ success: true, from_table: "15", to_table: "12", covers: 2, moved_orders: 0, total_amt: 0, moved_bill: false, moved_session: false, moved_waiter: false, moved_order_ids: [], moved_items: [] });
+    mockMoveParty.mockResolvedValue(party({ moved_orders: 0, moved_bill: false, moved_session: false, moved_waiter: false, moved_order_ids: [], moved_items: [], total_amt: 0 }));
+    mockPartySlip.mockResolvedValue({ printed: false, kot_no: null, tickets: 0, reason: "no_orders" });
     mockKotNos.mockRejectedValue(new Error("down"));
     const r = await h.call("POST", "/tables/move", { body: { from_table: "15", to_table: "12" }, auth: WAITER as never });
     expect(r.status).toBe(200);

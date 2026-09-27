@@ -201,6 +201,33 @@ export function moveOrderAuditSentence(input: {
 }
 
 /**
+ * WHAT THE PARTY MOVE'S AUDIT LINE SAYS ABOUT THE KITCHEN — client item 6.
+ *
+ *   ", correction docket printed for KOT-5, KOT-7"
+ *   ", no docket was on the pass"
+ *   ""                                  (the party had not ordered at all)
+ *
+ * A CLAUSE RATHER THAN A SENTENCE, because POST /tables/move's audit line is
+ * already one long parenthesis of everything that travelled and this is one more
+ * item in it. Empty for a party with no orders: "no docket was on the pass" is
+ * true but says nothing, and a floor moving empty tables around would fill the
+ * log with it.
+ */
+export function movePartyPrintSentence(print: {
+	printed: boolean;
+	kot_no?: number | null;
+	kot_nos?: readonly number[];
+	reason?: string | null;
+}): string {
+	if (print.printed) {
+		const handle = kotHandles(print.kot_nos ?? (print.kot_no ? [print.kot_no] : []));
+		return `, correction docket printed${handle ? ` for ${handle}` : ""}`;
+	}
+	if ((print.reason ?? "") === "no_orders") { return ""; }
+	return `, ${noCorrectionWhy(print.reason)}`;
+}
+
+/**
  * THE MOVE-ITEM AUDIT LINE:
  *
  *   Moved item NOT YOUR PUCHKA x1 from 31A (KOT-35) to 31

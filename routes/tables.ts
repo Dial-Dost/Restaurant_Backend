@@ -5,7 +5,7 @@
 import type { Express, Request, Response } from "express";
 import { AddTable, Audit_log_category, DeleteTableSection, GetBillForTable, GetOrderKotContext, GetOrderKotNumbers, GetSeatingSuggestion, GetTableReleaseImpact, GetTableSections, GetTableStatus, GetTables, MoveOrderToTable, MoveTableParty, OccupyTable, ReleaseTable, RemoveTable, RenameTableSection, ReorderTableSections, TableSectionExists, UpdateTable, UpdateTableCovers, normalizeTableSection, runTenantQuery, runTenantTransaction, type TableSectionSummary } from "../database_supabase.js";
 import { idempotent } from "../idempotency.js";
-import { printKotTableChange } from "../kot_move.js";
+import { printKotPartyMove, printKotTableChange } from "../kot_move.js";
 import { logger } from "../observability.js";
 import { emitRestaurant } from "../realtime.js";
 import { hidesPrices, redactBillForTable, redactMoveAnswer, redactTableList } from "../price_scope.js";
@@ -15,7 +15,7 @@ import { SectionOrderRequestError, compareTableSections, readSectionOrderRequest
 import { billPaperStale } from "./bills.js";
 import { AUDIT_TABLE_UPDATED, PERM_CLOSE_BILL, PERM_TABLE_SECTIONS, extractEmployeeId, extractEmployeeUsername, extractRestaurantId, log_audit, moveReprintFields, nextPartyAfterPrint, nextPartyPrintMessage, noteAdditionToPrintedBill, refuseOrderOnPrintedBill, validateAction, type PrintedBillGuard } from "./_shared.js";
 import { voidItemsText } from "../mis_report_math.js";
-import { moveOrderAuditSentence } from "../order_moves.js";
+import { moveOrderAuditSentence, movePartyPrintSentence } from "../order_moves.js";
 import { RESERVED_TABLE_NAME_ERROR, isReservedPartyName } from "../next_party.js";
 
 
@@ -867,6 +867,21 @@ app.patch("/table-covers", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"
 	names it. A move into the table's own family ("12" to "12 #2") is refused:
 	they are one table.
 
+	AND THE KITCHEN IS TOLD — CLIENT ITEM 6. This route used to print nothing at
+	all, which is the silent half of the defect the client reported: the party
+	arrives at 20 and every docket on the rail still says 12, with no paper
+	anywhere saying otherwise and a system that now believes 12 is wrong. So
+	printKotPartyMove puts ONE correction on the pass, carrying the numbers of
+	every ticket that travelled and NO dish list — the loud half of the same
+	defect was that /tables/move-order's correction reprinted the whole order,
+	which a busy pass reads as a second order for food it is already cooking.
+	Nothing prints when nothing was ever ticketed. The outcome rides back in
+	`print` and on the audit line, so the till can say what the kitchen was told
+	instead of leaving staff to guess.
+
+	The print is AFTER the commit and can never fail the move: the party really
+	is at 20 by then, and a jammed printer must not undo that.
+
 	NO idempotent() AND NO OFFLINE QUEUE, deliberately, on both counts:
 
 	  * A REPLAY IS ALREADY SAFE. The precondition this write needs — the source
@@ -895,6 +910,14 @@ app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"),
 
 	try {
 		const result = await MoveTableParty(restaurantId, fromTable, toTable);
+		// CLIENT ITEM 6 — AND THEN THE KITCHEN IS TOLD. See the header. After the
+		// commit and unable to fail it, exactly like POST /tables/move-order's.
+		const print = await printKotPartyMove({
+			restaurantId,
+			orderIds: result.moved_order_ids,
+			previousTableId: result.from_table_id,
+			previousTableName: result.from_table,
+		});
 		// The printed party's number needs its green seat (see the header). Never
 		// throws and never fails the move: the party has already moved.
 		const nextPartyTable = result.printed ? await nextPartyAfterPrint(req, restaurantId, result.to_table) : null;
@@ -918,12 +941,12 @@ app.post("/tables/move", validateAction("090ea8d4-e348-4e1b-9723-11131a73a085"),
 			await log_audit(
 				req,
 				"090ea8d4-e348-4e1b-9723-11131a73a085",
-				`Moved the party at ${result.from_table} to ${result.to_table} (${String(result.covers)} covers, ${String(result.moved_orders)} order${result.moved_orders === 1 ? "" : "s"}, ${result.moved_bill ? "bill carried" : "no bill yet"}${result.printed ? `, printed bill carried${result.printed_as ? ` — the paper says ${result.printed_as}` : ""}` : ""})`,
+				`Moved the party at ${result.from_table} to ${result.to_table} (${String(result.covers)} covers, ${String(result.moved_orders)} order${result.moved_orders === 1 ? "" : "s"}, ${result.moved_bill ? "bill carried" : "no bill yet"}${result.printed ? `, printed bill carried${result.printed_as ? ` — the paper says ${result.printed_as}` : ""}` : ""}${movePartyPrintSentence(print)})`,
 				Audit_log_category.Tables,
-				{ ...result, next_party_table: nextPartyTable, kot_nos: movedKots, items: voidItemsText(result.moved_items) },
+				{ ...result, next_party_table: nextPartyTable, kot_nos: movedKots, items: voidItemsText(result.moved_items), print },
 			);
 		} catch (err) { logger.warn({ err }, "log_audit move-table failed"); }
-		res.json({ ...result, next_party_table: nextPartyTable, next_party_message: nextPartyPrintMessage(nextPartyTable) });
+		res.json({ ...result, print, next_party_table: nextPartyTable, next_party_message: nextPartyPrintMessage(nextPartyTable) });
 	} catch (error: any) {
 		logger.error({ err: error }, "move_table_failed");
 		res.status(400).json({ error: String(error?.message ?? "Unable to move the table") });

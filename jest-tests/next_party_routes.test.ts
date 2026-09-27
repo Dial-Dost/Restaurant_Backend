@@ -699,8 +699,12 @@ describe("2f. moving a PRINTED party opens the green seat at the destination", (
     expect(mockEnsure).toHaveBeenCalledWith(RES, "20");
     expect(mockEnsure.mock.invocationCallOrder[0]).toBeGreaterThan(mockMoveParty.mock.invocationCallOrder[0]!);
     expect(tableAdded()).toEqual([[RES, "table:added", { table_name: "20 #2", parent_table: "20", party_no: 2 }]]);
+    // The trailing clause is client item 6: POST /tables/move now tells the
+    // KITCHEN too, and the line says what it was told. Nothing is on the pass
+    // for this fixture's orders, so nothing printed — and the record says so
+    // rather than leaving "did the kitchen hear?" unanswered.
     expect(audited().find((d) => d.startsWith("Moved the party"))).toBe(
-      "Moved the party at 12 to 20 (4 covers, 2 orders, no bill yet, printed bill carried — the paper says 12)",
+      "Moved the party at 12 to 20 (4 covers, 2 orders, no bill yet, printed bill carried — the paper says 12, no docket was on the pass)",
     );
   });
 

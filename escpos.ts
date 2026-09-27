@@ -214,6 +214,44 @@ export interface ReceiptOptions {
    */
   cancelled?: boolean;
   /**
+   * KOT ONLY: this docket CORRECTS THE ADDRESS of a ticket the kitchen already
+   * holds, because its order moved table (client item 6).
+   *
+   * WHY IT IS NOT SHAPED LIKE THE CANCELLATION SLIP ABOVE. A cancellation keeps
+   * the ordinary layout on purpose: it has to be MATCHED against the paper on
+   * the rail, and a chef matches on the dish names. A move correction has the
+   * KOT NUMBER to match on — that is the whole reason kot_move.ts pins it — and
+   * the dish list buys nothing that the number does not already buy. What it
+   * COSTS is the defect the client reported: "after we move a table, the entire
+   * order of the table gets reprinted, which the kitchen will consider a new
+   * order during busy times". A docket carrying a full numbered dish list IS an
+   * order to a pass reading forty of them an hour, whatever the line above it
+   * says. So this one carries no dish list at all: the banner, the context line
+   * the caller worded ("*** WAS T2 - NOW T4 ***"), the number, the new table in
+   * the big type, and one line saying there is nothing new to cook.
+   *
+   * THE ITEMS ARE STILL PASSED TO buildKotBase64 and still decide the STATION
+   * SPLIT — they are simply not laid out. A ticket that printed at the tandoor
+   * and the bar is corrected at the tandoor and the bar, and nowhere else.
+   *
+   * Absent or false prints nothing and renders byte-identically to any docket
+   * printed before this field existed.
+   */
+  moved?: boolean;
+  /**
+   * KOT ONLY, WITH `moved`: every KOT number this one correction re-addresses.
+   *
+   * A whole party carries every ticket it has ever fired, so one move can be
+   * three pieces of paper on the rail. They move together, to one table, at one
+   * moment — so they are corrected by ONE docket naming all three, rather than
+   * by three near-identical slips the pass has to collate. The header's
+   * "KOT - n" line becomes "KOT - 5, 7, 9".
+   *
+   * Absent (and on every move of a single ticket) the header prints `kotNo`
+   * exactly as it always has.
+   */
+  movedKots?: number[];
+  /**
    * KOT ONLY: WHICH DOCKET THIS IS, and the owner's escape hatch from the one
    * that needs a raster.
    *
@@ -880,8 +918,9 @@ export const KOT_HOLD_LINE = "[Hold]";
  * of them stops the kitchen cooking the wrong thing:
  *   - the "[Hold]" line under a held dish, and the Hold Qty total apart from
  *     Total Qty, without which hold-and-fire is defeated by its own docket;
- *   - the ** REPRINT ** and ** CANCELLED ** banners (an unmarked second copy is
- *     cooked twice; an unmarked cancellation is cooked at all);
+ *   - the ** REPRINT **, ** CANCELLED ** and ** TABLE MOVED ** banners (an
+ *     unmarked second copy is cooked twice; an unmarked cancellation is cooked
+ *     at all; an unmarked move correction is cooked again);
  *   - the "** NOTE **" block for an order-level instruction, which is where an
  *     allergy reaches the pass — dropping it to match a photo would be trading a
  *     safety line for a layout detail;
@@ -902,6 +941,26 @@ export const KOT_HOLD_LINE = "[Hold]";
  * letter before it is measured — and anything left over becomes a VISIBLE '?'
  * rather than a silent gap, which is the same rule the text docket obeys.
  */
+/**
+ * THE TICKET NUMBERS A MOVE CORRECTION RE-ADDRESSES — `movedKots` when the move
+ * carried several tickets, else the pinned `kotNo`, else nothing.
+ *
+ * Shared by both dockets (the reference raster and the classic text one) so the
+ * two can never come to disagree about which pieces of paper a slip names —
+ * which is the one fact on it the pass acts on. Non-positive and unparseable
+ * values are dropped and duplicates collapse, for the reason the orders grid's
+ * own KOT label gives: a number the kitchen cannot find on the rail sends
+ * somebody hunting for a ticket that was never fired.
+ */
+function movedTicketNos(opts: ReceiptOptions): number[] {
+  const many = (opts.movedKots ?? [])
+    .map((n) => Math.round(Number(n)))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (many.length > 0) { return [...new Set(many)]; }
+  const one = Math.round(Number(opts.kotNo));
+  return Number.isFinite(one) && one > 0 ? [one] : [];
+}
+
 export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
   // `profile` is not read today: both rolls and all three text sizes carry the
   // same rows and differ only in how large the type is, which the encoder
@@ -930,6 +989,14 @@ export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
     line("DO NOT COOK - THIS TICKET IS OFF", "center", true, "body");
     rule();
   }
+  // …and the third one, for the same reason in the other direction: an unmarked
+  // move correction is cooked A SECOND TIME. It is the one docket on the rail
+  // that asks for no food at all, so it has to say so before anything else.
+  if (opts.moved === true) {
+    line("** TABLE MOVED **", "center", true, "banner");
+    line("NOT A NEW ORDER - DO NOT COOK AGAIN", "center", true, "body");
+    rule();
+  }
 
   // --- The centred header block, in the reference's order ------------------
   line(present(opts.orderContext), "center", false);
@@ -940,7 +1007,14 @@ export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
   // with no number simply carries none. A ticket with the wrong number is worse
   // than a ticket with none.
   const numbered = typeof opts.kotNo === "number" && Number.isFinite(opts.kotNo) && opts.kotNo > 0;
-  if (numbered) { line(`KOT - ${Math.round(opts.kotNo as number)}`, "center", false); }
+  // A move correction names EVERY ticket it re-addresses on this one line — see
+  // ReceiptOptions.movedKots. One number renders the line it always rendered.
+  const movedNos = movedTicketNos(opts);
+  if (opts.moved === true && movedNos.length > 0) {
+    line(`KOT - ${movedNos.join(", ")}`, "center", false);
+  } else if (numbered) {
+    line(`KOT - ${Math.round(opts.kotNo as number)}`, "center", false);
+  }
   // ONLY A REAL SPLIT NAMES ITS STATION. groupKotItemsByStation buckets every
   // unrouted line under "General", so a station line taken straight from that
   // key printed "[ GENERAL ]" on every docket of every restaurant that has
@@ -977,6 +1051,20 @@ export function layoutKot(opts: ReceiptOptions, profile: KotProfile): KotRow[] {
     line("** NOTE **", "center", true);
     line(orderNote, "left", false);
     rule();
+  }
+
+  // --- A MOVE CORRECTION STOPS HERE: NO DISH LIST -------------------------
+  //
+  // See ReceiptOptions.moved. Everything a chef has to do with this piece of
+  // paper has already been said — which tickets (the KOT line), where they go
+  // now (the table line, in the biggest type on the docket) and where they came
+  // from (the context line). A numbered dish list under all of that is the one
+  // thing that makes it read as an order.
+  if (opts.moved === true) {
+    line("SAME FOOD - ALREADY ORDERED", "center", true);
+    line("Re-address the ticket above; nothing new to cook.", "center", false);
+    rule();
+    return rows;
   }
 
   // --- The item table ------------------------------------------------------
@@ -1688,6 +1776,14 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
       body("DO NOT COOK — THIS TICKET IS OFF");
       line(sep);
     }
+    // The move correction's banner sits in exactly the same place, for exactly
+    // the same reason: below the context line is already too late. See
+    // ReceiptOptions.moved.
+    if (opts.moved === true) {
+      big("** TABLE MOVED **", width);
+      body("NOT A NEW ORDER - DO NOT COOK AGAIN");
+      line(sep);
+    }
     // Context first, then the ticket's own identity — the order the reference
     // thermal KOT prints them in, and the order a chef reads them in: what kind
     // of order this is, which ticket it is, when it was fired, and which station
@@ -1703,7 +1799,11 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
     // unapplied). Omitted rather than faked, as before: a ticket with no number
     // is honest, a ticket with the wrong number is not.
     const numbered = typeof opts.kotNo === "number" && Number.isFinite(opts.kotNo) && opts.kotNo > 0;
-    big(numbered ? `KOT - ${Math.round(opts.kotNo as number)}` : "KOT", width);
+    // A move correction names every ticket it re-addresses here, the same way
+    // the reference docket does (movedTicketNos); one number is the line this
+    // has always printed.
+    const movedNos = opts.moved === true ? movedTicketNos(opts) : [];
+    big(movedNos.length > 0 ? `KOT - ${movedNos.join(", ")}` : numbered ? `KOT - ${Math.round(opts.kotNo as number)}` : "KOT", width);
     // Restaurant-zone stamp when the caller resolved one. The server-clock
     // fallback is what every ticket printed before kotStamp existed, kept so a
     // caller that has not been updated still prints a time rather than nothing.
@@ -1904,7 +2004,15 @@ export function buildReceiptBase64(opts: ReceiptOptions, width = 48): string {
   }
 
   // --- Items ----------------------------------------------------------------
-  if (isKot) {
+  // A MOVE CORRECTION HAS NO ITEM BLOCK AT ALL — the same decision the reference
+  // docket makes a few hundred lines above, for the same reason (see
+  // ReceiptOptions.moved): a numbered dish list is what makes the pass read a
+  // correction as an order.
+  if (isKot && opts.moved === true) {
+    body("SAME FOOD - ALREADY ORDERED");
+    body("Re-address the ticket above; nothing new to cook.");
+    line(sep);
+  } else if (isKot) {
     // Kitchen ticket: a NUMBERED line per dish with the quantity right-aligned
     // in its own column, and never a price. The numbering is what lets the pass
     // call a line out loud ("hold 3 on 26") and what makes a short docket
