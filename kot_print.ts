@@ -55,6 +55,7 @@ import {
   GetKotTextSize,
   GetMenuItems,
   GetOrderKotContext,
+  GetOrderKotNumbers,
   GetRestaurantProfile,
   GetRestaurantSettings,
   GetTableFeedbackContext,
@@ -986,10 +987,14 @@ function cancellationBanner(reason: string | null | undefined, cols: number): st
  * there is nothing else to ask. The slip then prints unnumbered — which still
  * names the table and the dishes, and is what the requirement asks for.
  *
- * WHEN "PrintJobs".kot_no LANDS, this is where it goes: the jobs for this order
- * are already grouped under bill_id `order-<id>`, so the distinct kot_no across
- * them is a direct, edit-proof answer and becomes candidate 0. Nothing else in
- * this function needs to change.
+ * "PrintJobs".kot_no HAS LANDED (migration 043) and answers exactly that miss —
+ * but it is deliberately NOT folded in here, because the two candidates above
+ * are MORE precise than it is: an order can own several numbers (its placement
+ * docket plus one per line added later), and only the key can say WHICH of them
+ * the cancelled dish is printed on. So this function stays a pure key lookup
+ * and every caller that wants the edit-proof answer asks for it afterwards —
+ * kotNumberOnPaperForOrder below, which is what kot_move.ts's
+ * resolveMoveSourceKots and dispatchCancellationKot both do.
  *
  * EXPORTED for kot_move.ts (client item 4): a dish moved to another table is
  * re-docketed under the number already on the paper for it, and "which number
@@ -1026,6 +1031,45 @@ export async function resolveCancelledKotNumber(
     if (hit) {return hit.kot_no;}
   }
   return null;
+}
+
+/**
+ * THE NUMBER ALREADY ON THE PAPER FOR AN ORDER — the edit-proof answer.
+ *
+ * ROUND 4 ITEM 2: "changes should be made accordingly for the reprint of that
+ * edited KOT too."
+ *
+ * WHY THE TICKET KEY CANNOT ANSWER THIS. A key is a fingerprint of the item
+ * SET, so the instant a line is removed (POST /bills/remove-item), added (POST
+ * /orders/:id/items) or re-quantified, the order stops hashing to the key its
+ * docket was minted under. Every caller that has to name the paper the kitchen
+ * is HOLDING — not the paper this content would mint — therefore needs a handle
+ * that does not move when the food does.
+ *
+ * "PrintJobs" IS THAT HANDLE (migration 043). Every docket this file dispatches
+ * is enqueued under bill_id `order-<id>` carrying its kot_no, so the numbers a
+ * given order has ever put on paper can be read straight back. THE FIRST one in
+ * allocation order is the one the pass calls the ticket by: it is the placement
+ * docket, the whole-order paper, the thing a chef means by "KOT-26". Later
+ * entries are the added-line dockets, which have their own, more precise
+ * resolution through resolveCancelledKotNumber's scoped candidate.
+ *
+ * NEVER MINTS AND NEVER THROWS. GetOrderKotNumbers is a read that degrades to an
+ * empty map when 043 (or 027) is not applied here, and null out of this function
+ * means only "nothing has been printed for this order that I can see" — every
+ * caller then does what it did before this existed.
+ */
+export async function kotNumberOnPaperForOrder(restaurantId: string, orderId: string): Promise<number | null> {
+  const id = String(orderId ?? "").trim();
+  if (!id) {return null;}
+  try {
+    const printed = await GetOrderKotNumbers(restaurantId, [id]);
+    const first = printed.get(id)?.[0];
+    return typeof first === "number" && Number.isFinite(first) && first > 0 ? Math.round(first) : null;
+  } catch (err) {
+    logger.warn({ err, orderId: id }, "kot_number_on_paper_lookup_failed");
+    return null;
+  }
 }
 
 /**
@@ -1087,9 +1131,25 @@ export async function dispatchCancellationKot(opts: {
     const tz = settings.timezone || "Asia/Kolkata";
     const cols = settings.bill_paper_width === "58mm" ? 32 : 48;
     const firedAt = new Date();
+    // THE KEY FIRST, THE PRINT QUEUE SECOND — the same two-step, in the same
+    // order, that kot_move.ts's resolveMoveSourceKots makes for a moved dish.
+    //
+    // WHY THE SECOND STEP HAD TO BE ADDED HERE TOO (round 4 item 2). A slip is
+    // a piece of paper ABOUT another piece of paper, and the key can only find
+    // that other paper while the order still holds the item set it was minted
+    // under. Take a SECOND dish off the same ticket and the key misses, so the
+    // slip printed unnumbered — a correction the pass cannot match to anything
+    // on the rail. kotNumberOnPaperForOrder answers from "PrintJobs" instead,
+    // which does not move when the food does.
+    //
+    // ORDERED, NOT MERGED. The key is strictly more precise: it distinguishes
+    // an added line's OWN docket from the placement docket, and this fallback
+    // cannot. So it is only ever consulted when the key found nothing, which
+    // means every slip that resolves today resolves to exactly the number it
+    // resolves to today.
     const kotNo = await resolveCancelledKotNumber(restaurantId, order, {
       cancelledLines, itemId: opts.itemId ?? null, firedAt, tz,
-    });
+    }) ?? await kotNumberOnPaperForOrder(restaurantId, order.order_id);
 
     const [profile, waiterCtx] = await Promise.all([
       GetRestaurantProfile(restaurantId).catch(() => null),

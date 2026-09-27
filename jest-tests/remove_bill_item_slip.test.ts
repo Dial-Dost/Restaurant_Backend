@@ -6,7 +6,7 @@
 // ============================================================================
 // Requirement 1.1 already puts a CANCELLED slip on the pass when a whole KOT is
 // cancelled, and DELETE /orders/:id/items/:itemId puts one there for a single
-// line. POST /bills/remove-item — the "Remove from bill" the floor actually
+// line. POST /bills/remove-item — the "Remove from KOT" the floor actually
 // uses — printed NOTHING. The docket stayed on the rail, so the dish the admin
 // had just taken off the guest's bill went on being cooked, plated and carried
 // out: food cost the house eats, and a plate the guest never ordered.
@@ -179,11 +179,30 @@ describe("the kitchen is told about the dish that left", () => {
     expect(mockSlip).toHaveBeenCalledTimes(1);
   });
 
-  test("the audit line records whether the kitchen got paper", async () => {
+  test("the audit line names the KOT the dish came off, and records whether the kitchen got paper", async () => {
     await remove(BODY);
     const { reason, details } = lastAudit();
-    expect(reason).toBe("Removed item Tandoori Roti from table T7");
+    // ROUND 4 ITEM 2. "from table T7" alone described a BILL edit, which is the
+    // reading the client asked us to stop inviting; the ticket is now named.
+    expect(reason).toBe("Removed item Tandoori Roti from KOT-3 on table T7");
     expect(details).toMatchObject({ table: "T7", order_id: KOT3, item_id: "r2", quantity: 1, kot_cancelled: true, kot_no: 3 });
+  });
+
+  test("the sentence still starts with the prefix the Bill Edits report classifies on", async () => {
+    // classifyBillEdit keys this line on /^removed item /i, because the
+    // catch-all action id cannot tell one floor edit from another. Reworded
+    // prose that dropped the prefix would silently stop the removal appearing
+    // in the control report at all — a rename losing an audit trail.
+    const { classifyBillEdit } = await import("../mis_report_math");
+    await remove(BODY);
+    expect(classifyBillEdit("4ad474d4-5230-449c-874f-6a238b833bca", lastAudit().reason, lastAudit().details))
+      .toMatchObject({ kind: "item_removed", label: "Item removed", table: "T7", item: "Tandoori Roti" });
+  });
+
+  test("a line that never reached the pass still audits, without inventing a number", async () => {
+    mockSlip.mockResolvedValue({ printed: false, kot_no: null, tickets: 0, reason: "never_ticketed" });
+    await remove(BODY);
+    expect(lastAudit().reason).toBe("Removed item Tandoori Roti from the KOT on table T7");
   });
 });
 

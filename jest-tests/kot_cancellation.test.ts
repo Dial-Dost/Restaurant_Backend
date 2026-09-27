@@ -320,7 +320,7 @@ describe("the ordinary docket is untouched", () => {
 // ===========================================================================
 // CLIENT ITEM 2 — ONE LINE OFF A TICKET THE KITCHEN IS HOLDING.
 //
-// POST /bills/remove-item ("Remove from bill") printed nothing at all, so a
+// POST /bills/remove-item ("Remove from KOT") printed nothing at all, so a
 // dish taken off the guest's bill went on being cooked. It now asks
 // dispatchCancellationKot for the SAME slip, narrowed to the removed dish —
 // which is a different piece of paper from "cancel the ticket", and has to be:
