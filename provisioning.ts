@@ -83,10 +83,15 @@ export async function provisionRestaurant(
   // EXISTENCE PRE-CHECK — A SECURITY CONTROL, NOT A UX NICETY. DO NOT REMOVE.
   //
   // EnsureRestaurantSeed is an UPSERT: on an existing slug it UPDATES res_name
-  // and main_office_add, UPDATES the matching employee, and OVERWRITES that
-  // employee's emp_pass (database_supabase.ts:25025, :25146, :25172). Without
-  // this check, anyone who can reach a provisioning route could rename a live
-  // tenant and take over its owner login, with no error and no visible symptom.
+  // and main_office_add and UPDATES the matching employee's name, roles and
+  // contact details. Without this check, anyone who can reach a provisioning
+  // route could rename a live tenant and rewrite its owner's record, with no
+  // error and no visible symptom.
+  //
+  // It no longer overwrites that employee's emp_pass — the seed's own UPDATE
+  // branch refuses to touch an existing credential, so the takeover half of this
+  // is closed on both sides now. This check is the one that keeps a duplicate
+  // slug from mutating a live tenant at all, which is reason enough to keep it.
   //
   // The check is a direct read of the UNIQUE column the database itself
   // protects. It is still TOCTOU — two concurrent callers can both pass it — and

@@ -769,9 +769,15 @@ export function optionalMobile10(res: Response, raw: unknown): { ok: true; value
 
 // Minimum password policy for account-creation / reset paths. Returns an error
 // message, or null when the password is acceptable.
+//
+// The demo seed's old published default is deliberately NOT listed. It is eight
+// characters, so the length rule below rejects it before this Set is consulted —
+// the entry protected nothing — and spelling it out in a public repository is the
+// exact thing the seed was just changed to stop doing. Any new entry has to be at
+// least ten characters to be reachable at all.
 const COMMON_WEAK_PASSWORDS = new Set([
 	"password", "password1", "password123", "12345678", "123456789", "1234567890",
-	"qwerty123", "admin123", "letmein1", "welcome1", "iloveyou", "changeme",
+	"qwerty123", "letmein1", "welcome1", "iloveyou", "changeme",
 ]);
 export function passwordPolicyError(pw: string): string | null {
 	if (typeof pw !== "string" || pw.length < 10) {

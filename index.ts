@@ -558,18 +558,34 @@ async function bootstrap(): Promise<void> {
 	// mid-incident — after editing .env and restarting and seeing no change — is
 	// the worst possible moment to learn it.
 	warnAboutLegacyReleaseEnv(logger);
-	// The CSR Organics demo tenant (admin/admin123) must NOT be auto-created on a
-	// production/turnkey deploy. Seed only when explicitly opted in, or outside
-	// production. EnsureRestaurantSeed is idempotent, so existing tenants are safe.
+	// The CSR Organics demo tenant must NOT be auto-created on a production/turnkey
+	// deploy. Seed only when explicitly opted in, or outside production.
+	//
+	// THE DEMO ADMIN PASSWORD IS NOT IN THIS FILE, AND THERE IS NO DEFAULT FOR IT.
+	//
+	// It was a literal here, and the gate on the next line is the only reason that
+	// was ever survivable: NODE_ENV is unset on a great many boxes, so this runs
+	// far more often than the word "demo" suggests, and everything it reached got
+	// the same credential. All three repositories are public, so a literal here is
+	// a published password — on the `admin` login, the most valuable one a tenant
+	// has. Reading it takes a GitHub search, not an attack.
+	//
+	// So the password comes from SEED_DEMO_ADMIN_PASSWORD and from nowhere else,
+	// with NO FALLBACK: a baked-in default is the same published secret under a
+	// different name, and the one thing worse than having no demo tenant is having
+	// one that the whole internet can sign into. Unset or blank therefore SKIPS the
+	// seed and SAYS SO, naming the variable — a silent skip looks exactly like a
+	// database that is unreachable, which is the wrong thing to go debugging.
 	const shouldSeedDemo = process.env.SEED_DEMO === "true" || process.env.NODE_ENV !== "production";
-	if (shouldSeedDemo) {
+	const demoAdminPassword = (process.env.SEED_DEMO_ADMIN_PASSWORD ?? "").trim();
+	if (shouldSeedDemo && demoAdminPassword.length > 0) {
 		try {
 			await EnsureRestaurantSeed({
 				name: "CSR Organics",
 				admin: {
 					employeeId: "admin",
 					name: "Admin",
-					password: "admin123",
+					password: demoAdminPassword,
 				},
 				tables: [
 					{ name: "T1", capacity: 2 },
@@ -588,6 +604,8 @@ async function bootstrap(): Promise<void> {
 		} catch (error) {
 			logger.error({ err: error }, "Failed to ensure CSR Organics seed");
 		}
+	} else if (shouldSeedDemo) {
+		logger.warn("Skipping demo seed: set SEED_DEMO_ADMIN_PASSWORD to a password of your own to seed the CSR Organics demo tenant");
 	} else {
 		logger.info("Skipping demo seed (production; set SEED_DEMO=true to override)");
 	}

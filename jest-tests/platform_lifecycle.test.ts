@@ -17,7 +17,10 @@
 // Creation is tested for one thing above all: that the duplicate-slug path fails
 // CLEANLY. EnsureRestaurantSeed is an UPSERT, so a create route that lost its
 // existence pre-check would not error — it would quietly rename a live tenant and
-// overwrite its owner's password hash.
+// rewrite its owner's employee record. (It no longer resets that owner's
+// password: the seed refuses to touch an existing credential, and
+// demo_seed_password_env.test.ts holds it to that. The pre-check is still what
+// keeps everything ELSE about a live tenant from moving.)
 
 import { describe, test, expect, beforeAll, beforeEach } from "@jest/globals";
 import {
@@ -349,10 +352,12 @@ describe("create", () => {
 // ---------------------------------------------------------------------------
 describe("create against a slug that already exists", () => {
   test("fails with 409 and leaves the existing tenant completely untouched", async () => {
-    // EnsureRestaurantSeed's UPDATE branches rename the restaurant and OVERWRITE
-    // the owner's emp_pass. If the existence pre-check ever goes missing, this
-    // route becomes a tenant-takeover primitive with no error and no symptom —
-    // so the assertion is not just "409", it is "nothing moved".
+    // EnsureRestaurantSeed's UPDATE branches rename the restaurant and rewrite
+    // the owner's employee row. If the existence pre-check ever goes missing,
+    // this route mutates a live tenant with no error and no symptom — so the
+    // assertion is not just "409", it is "nothing moved". The password hash is
+    // asserted alongside the rest; it is now defended twice, here and in the
+    // seed itself.
     const first = await create({ res_name: "Joe's Pizza", res_username: "joespizza", owner_name: "Joe P", owner_username: "joe" });
     expect(first.status).toBe(201);
     const resId = restaurantBySlug("joespizza")!.id;
@@ -989,8 +994,9 @@ describe("POST /auth/register-restaurant (public self-serve)", () => {
     expect(again.status).toBe(409);
     expect(again.body).toEqual({ error: `Restaurant "Joe's Pizza" is already registered.` });
     // And the pre-check that produced it is a security control: EnsureRestaurantSeed
-    // is an UPSERT whose update branches rename the tenant and overwrite the owner's
-    // password hash.
+    // is an UPSERT whose update branches rename the tenant and rewrite the owner's
+    // employee row. The password survives either way now — the seed will not touch
+    // an existing credential — which is why the sign-in below is still the proof.
     expect(restaurants()).toHaveLength(1);
     expect(restaurantBySlug("joespizza")?.res_name).toBe("Joe's Pizza");
     expect((await login("joespizza", "joe", "correct-horse-9")).status).toBe(200);

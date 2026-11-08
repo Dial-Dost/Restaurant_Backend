@@ -350,7 +350,7 @@ A `git clean -fd`, a fresh clone, or a disk failure deletes ~277 route handlers 
 
 `.github/workflows/backend-ci.yml:16-18` sets `SUPABASE_DIRECT_URL`, `DATABASE_URL` and `DIRECT_URL` all to the `secrets.SUPABASE_DIRECT_URL` repo secret, writes them to `.env` (`:44-49`), runs `docker compose up -d --build` (`:56`), then runs `test:feedback_api` and `test:valet_api` (`:68-72`) — which create valet records, add bays and delete a bay (`test/valet_api_test.ts:50,116,183,204`).
 
-`docker-compose.yml` sets no `NODE_ENV` for the node service, so `index.ts:487` evaluates `process.env.NODE_ENV !== "production"` as true and `bootstrap()` seeds "CSR Organics" with `employeeId: "admin", password: "admin123"` (`index.ts:490-509`). The 24 lazy `create table` and 94 `add column` blocks also execute against that database.
+`docker-compose.yml` sets no `NODE_ENV` for the node service, so `index.ts:487` evaluates `process.env.NODE_ENV !== "production"` as true and `bootstrap()` seeds "CSR Organics" with `employeeId: "admin"` and a password that was, at the time of this audit, a plaintext literal in `index.ts` — and therefore a published default (`index.ts:490-509`). The 24 lazy `create table` and 94 `add column` blocks also execute against that database.
 
 **Whether `SUPABASE_DIRECT_URL` points at the database serving real restaurants is UNVERIFIED** — the secret cannot be read. That uncertainty is itself the finding: nobody can tell from the repository, and the consequence if it is the live database is severe. `ci.yml` already does this correctly against an ephemeral `postgres:16` service.
 
@@ -1550,7 +1550,7 @@ In strict order: commit the untracked work; stop CI writing to a production-cand
 | **Processes writing tenant data** | 2 (Node + unauthenticated Python) | **1** |
 | **Deployment units** | 0 deployed; laptop + dev tunnel | 4: app ×2, worker ×1, cron ×1, managed state |
 | **Route layer** | 37 files, ~277 registrations, **untracked in git** | Same files, **committed** |
-| **CI** | 2 contradictory workflows; one writes to the `SUPABASE_DIRECT_URL` secret on every push and seeds `admin/admin123` | Both against an ephemeral Postgres; demo seed opt-in |
+| **CI** | 2 contradictory workflows; one writes to the `SUPABASE_DIRECT_URL` secret on every push and seeds an `admin` login with a published default password | Both against an ephemeral Postgres; demo seed opt-in |
 | **Backups / staging** | none | PITR plus a rehearsed restore that *is* the staging environment |
 | **Sessions** | process memory; a restart logs out every user in every tenant | Redis; survives restarts, enables 2 replicas |
 | **Tenant isolation** | RLS policies exist but the runtime is superuser; isolation rests on hand-written predicates; `runQuery` silently falls back to a contextless pool | RLS enforced under `app_runtime`; `runQuery` throws instead of falling back; `WITH CHECK` no longer fails open |
@@ -1590,7 +1590,7 @@ Three things, and only three.
 ## 20.2 Why each major change is necessary
 
 - **Commit the untracked work** — because 277 route handlers and the entire deployment plan exist in exactly one place, and `index.ts` already imports files that are not in git.
-- **Stop CI writing to a production-candidate database** — because every push to `main` runs write-capable tests and seeds an `admin/admin123` account against a secret nobody can audit from the repository.
+- **Stop CI writing to a production-candidate database** — because every push to `main` runs write-capable tests and seeds an `admin` account, with a published default password, against a secret nobody can audit from the repository.
 - **Backups and a rehearsed restore** — because every later phase is a one-way door without them, and because the restored copy is the staging environment this project lacks.
 - **Redis** — because a restart currently logs out every user in every tenant, and because the Socket.IO adapter, the rate limiter and the session store all already have Redis implementations waiting on one variable.
 - **Print durability** — because a waiter currently gets a green tick and no receipt, with no log line and no metric.

@@ -37011,15 +37011,21 @@ export async function EnsureRestaurantSeed(seed: RestaurantSeedInput): Promise<v
         client,
       );
 
-      await runQuery(
-        `
-          update "Login"
-          set emp_pass = $4
-          where res_id = $1 and outlet_id = $2 and lower(emp_username) = lower($3)
-        `,
-        [resId, outletId, adminUsername, await hashPassword(seed.admin.password)],
-        client,
-      );
+      // AN EXISTING LOGIN'S PASSWORD IS NEVER TOUCHED HERE. DO NOT PUT IT BACK.
+      //
+      // This branch used to `update "Login" set emp_pass` with a fresh hash of
+      // seed.admin.password. That made re-running a seed over a tenant that
+      // already exists a silent password reset on its `admin` login — and, on a
+      // provisioning route, a tenant-takeover primitive: name someone else's
+      // slug and their owner's credential becomes yours, with no error and no
+      // symptom. provisionRestaurant's existence pre-check was the ONLY thing
+      // standing in front of that, and a single TOCTOU window wide.
+      //
+      // The pre-check stays (it is still what turns a duplicate slug into a
+      // clean 409), but it is now defence in depth rather than the whole defence.
+      // Only the FIRST seed of a login writes a password — the insert above —
+      // after which the credential belongs to whoever owns the tenant. Changing
+      // it is the password-change route's job, not a boot step's.
     }
 
     for (const table of seed.tables) {

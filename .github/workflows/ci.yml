@@ -34,13 +34,13 @@
 #      production deploy key stays invisible to everything in this file. If you
 #      remove `workflow_call:` from the trigger list, the deploy pipeline breaks.
 #   4. NEVER set NODE_ENV=test or NODE_ENV=development for the compose stack.
-#      Dockerfile.node:41 bakes NODE_ENV=production, and that is the ONLY thing
-#      currently disabling the demo seed:
-#          index.ts:487  shouldSeedDemo = SEED_DEMO === "true" || NODE_ENV !== "production"
-#      On an EXISTING tenant that seed is not a no-op — EnsureRestaurantSeed
-#      unconditionally runs `update "Login" set emp_pass = <hash("admin123")>`
-#      (database_supabase.ts:~25172) and overwrites the restaurant/outlet
-#      profile. Against production that silently resets the owner's password.
+#      Dockerfile.node:41 bakes NODE_ENV=production, which is one of the two
+#      things disabling the demo seed:
+#          index.ts  shouldSeedDemo = SEED_DEMO === "true" || NODE_ENV !== "production"
+#      The other is SEED_DEMO_ADMIN_PASSWORD: it has no default, so with it unset
+#      the seed skips and logs regardless of NODE_ENV. On an EXISTING tenant the
+#      seed is still not a no-op — it overwrites the restaurant/outlet profile and
+#      the owner's employee record (it no longer touches that login's password).
 #      Keep NODE_ENV alone and keep the database throwaway.
 # =============================================================================
 name: CI
