@@ -10,6 +10,7 @@ package-lock.json
 build/
 bin/
 obj/
+*.tsbuildinfo
 
 # Python-generated files
 __pycache__/
