@@ -23,13 +23,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy package files first for layer caching.
-# The asterisk means package-lock.json is optional.
+# Package manifests first, so a source-only change reuses the install layer.
+# The asterisk stays, but it no longer means "the lockfile is optional": it means
+# a missing lockfile reaches `npm ci` below, which says so in one clear line,
+# instead of failing here as an unexplained cache-key error.
 COPY package.json package-lock.json* tsconfig.build.json tsconfig.json ./
 
-# Install ALL dependencies (incl. devDependencies needed for the build).
-# npm install is fallback-safe when the lockfile is absent.
-RUN npm install
+# `npm ci`, and deliberately with NO `|| npm install` fallback.
+#
+# docker-compose.yml names this file, so whatever resolves here is what runs in
+# production. `npm install` re-resolves every semver range against the registry
+# at build time, which means production could run a dependency tree that CI never
+# tested. That is not hypothetical: on 2026-11-08 an install silently produced a
+# different tree, reported success, and the build died two steps later.
+# `npm ci` installs package-lock.json and nothing else, so the image matches the
+# tree the tests ran against.
+#
+# A fallback would undo the whole point. `npm ci` fails in exactly one situation
+# — the lockfile is missing, or out of step with package.json — and falling back
+# to `npm install` there is choosing to ship the untested tree rather than say so.
+# Let it fail. The fix is to commit the lockfile npm asks for, not to route
+# around it.
+#
+# --include=dev because `npm run build` needs typescript. The dev tree is
+# stripped again by `npm prune --omit=dev` further down, so nothing extra ships.
+RUN npm ci --include=dev
 
 # Prove the native addon actually LOADS before anything is shipped. `npm run
 # build` below already fails when sharp is missing from node_modules, but a sharp
