@@ -416,14 +416,14 @@ applied and nothing is deployed.
 ### `secrets.DEPLOY_SSH_KEY` — **environment** secret on `production`, both repos
 
 The **private** half of the ed25519 keypair whose public half is in
-`/home/deploy/.ssh/authorized_keys`.
+`/home/<DEPLOY_USER>/.ssh/authorized_keys`.
 
-**What it grants:** an SSH session to the `deploy` account that is immediately
+**What it grants:** an SSH session to the `<DEPLOY_USER>` account that is immediately
 replaced by the forced command `/usr/local/sbin/rd-entry`. Its entire vocabulary
 is `status`, `revision`, `logs [svc]`, `check-migrations`, and
 `update|deploy|rollback <svc>` with `svc` in `backend|dashboard|python`. It
 cannot open a shell, cannot forward a port to Valkey or Postgres, cannot read an
-env file, cannot run `docker` (the `deploy` user is not in the docker group), and
+env file, cannot run `docker` (the `<DEPLOY_USER>` account is not in the docker group), and
 cannot run any program other than `rd-deploy`.
 
 It must be an **environment** secret, not a repository secret, so a workflow on a
@@ -437,11 +437,17 @@ either deploy workflow any more. Nothing in this pipeline talks to a registry.
 `vars.*`, not secrets. None is confidential; the risk in each is its *absence* or
 a wrong value, not its disclosure.
 
+The three values below are not written out in this file — these repositories are
+public, and a runbook that names the box, the account and the port hands a reader
+two thirds of a login attempt for nothing in return. Read the real values from the
+repository variables (`gh variable list`); every command in this file uses the
+same placeholders, so you can paste them in once and the runbook works unchanged.
+
 | Name | Value | Notes |
 |---|---|---|
-| `DEPLOY_HOST` | `103.212.120.44` | not a secret |
-| `DEPLOY_USER` | `deploy` | the restricted identity |
-| `DEPLOY_PORT` | `22` | may be omitted; defaults to 22 |
+| `DEPLOY_HOST` | `<VPS_IP>` | the box's public address |
+| `DEPLOY_USER` | `<DEPLOY_USER>` | the restricted identity; `install.sh` names the account it expects |
+| `DEPLOY_PORT` | `<SSH_PORT>` | may be omitted; the workflow then uses 22 |
 | `SSH_KNOWN_HOSTS` | output of `ssh-keyscan` | the workflow **refuses to run** without it. Never `StrictHostKeyChecking=no` — that would let anyone on the runner's network path present their own host key and collect the deploy key |
 | `MIGRATION_APPLY_MODE` | `auto` \| `manual` \| unset | **set this to `manual` in the BACKEND repo until `/usr/local/sbin/rd-migrate` is installed** (done — set 2026-09-06). Unset means `auto`. Only the backend workflow reads it: the dashboard runs `check-migrations` and refuses on a pending migration, but never calls `migrate`, so setting it there does nothing. Any other value is a hard failure in both jobs — a typo must not decide whether production migrates itself. See *What the gates DO with the answer* |
 
@@ -490,7 +496,7 @@ gh secret set DEPLOY_SSH_KEY --env production --repo Dial-Dost/Restaurant_Backen
 gh secret set DEPLOY_SSH_KEY --env production --repo Dial-Dost/Restaurant_Dashboard_UI < ci-deploy
 
 # Host key pin.
-ssh-keyscan -p 22 103.212.120.44 > known_hosts.txt
+ssh-keyscan -p <SSH_PORT> <VPS_IP> > known_hosts.txt
 gh variable set SSH_KNOWN_HOSTS --repo Dial-Dost/Restaurant_Backend      < known_hosts.txt
 gh variable set SSH_KNOWN_HOSTS --repo Dial-Dost/Restaurant_Dashboard_UI < known_hosts.txt
 ```
@@ -501,8 +507,8 @@ click before every production deploy.
 
 ### The exact `authorized_keys` line
 
-Installed as the **only** line in `/home/deploy/.ssh/authorized_keys`
-(`deploy:deploy`, mode `0600`):
+Installed as the **only** line in `/home/<DEPLOY_USER>/.ssh/authorized_keys`
+(owned by that account and its own group, mode `0600`):
 
 ```
 restrict,command="/usr/local/sbin/rd-entry" ssh-ed25519 AAAA...<PUBKEY>... github-actions-deploy
@@ -560,7 +566,7 @@ To re-verify, on the VPS:
 ```sh
 sudo /usr/local/sbin/rd-deploy status
 sudo /usr/local/sbin/rd-deploy revision
-sudo -u deploy sudo -n /usr/local/sbin/rd-deploy status      # the sudoers grant
+sudo -u <DEPLOY_USER> sudo -n /usr/local/sbin/rd-deploy status # the sudoers grant
 git -C /opt/restaurant-dash/Restaurant_Backend status --short --branch
 git -C /opt/restaurant-dash/Restaurant_Dashboard_UI status --short --branch
 ```
@@ -569,15 +575,15 @@ And from a workstation, proving the key can do that and nothing else — **every
 one of these must fail**:
 
 ```sh
-ssh -i ci-deploy deploy@103.212.120.44 revision                     # works
-ssh -i ci-deploy deploy@103.212.120.44                              # no shell
-ssh -i ci-deploy deploy@103.212.120.44 'cat /opt/restaurant-dash/.env'
-ssh -i ci-deploy deploy@103.212.120.44 'docker ps'                  # unknown verb
-ssh -i ci-deploy deploy@103.212.120.44 update                       # bare update
-ssh -i ci-deploy deploy@103.212.120.44 'update valkey'
-ssh -i ci-deploy deploy@103.212.120.44 'deploy; sh'                 # charset reject
-ssh -i ci-deploy -L 6379:127.0.0.1:6379 deploy@103.212.120.44 status # no forwarding
-sudo -u deploy docker ps                                             # not in docker group
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP> revision                      # works
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP>                               # no shell
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP> 'cat /opt/restaurant-dash/.env'
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP> 'docker ps'                   # unknown verb
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP> update                        # bare update
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP> 'update valkey'
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP> 'deploy; sh'                  # charset reject
+ssh -i ci-deploy -L 6379:127.0.0.1:6379 <DEPLOY_USER>@<VPS_IP> status # no forwarding
+sudo -u <DEPLOY_USER> docker ps                                       # not in docker group
 ```
 
 `install.sh` in this directory checks all of the above and is current for the
@@ -596,7 +602,7 @@ git transport. It verifies, and does not assume:
 * `.env.migrate` is present and root-only; `public/downloads` is non-empty;
   no `command:`/`entrypoint:` override on an application service and no
   `start:prod` anywhere; sudoers is wildcard-free and `visudo -c` is clean;
-  `deploy` is not in the docker group; `cloudflared` is up.
+  the deploy account is not in the docker group; `cloudflared` is up.
 
 It **writes only** `/usr/local/sbin/rd-entry` and the `authorized_keys` line. It
 will not create `rd-deploy` or the sudoers file — those are the security
@@ -755,8 +761,8 @@ Then re-install the forced command so `rd-entry` accepts the new verb, and let
 the installer check the whole thing:
 
 ```sh
-scp -r deploy/vps root@<host>:/tmp/rd-vps
-ssh root@<host> 'bash /tmp/rd-vps/install.sh /tmp/rd-vps/ci-deploy.pub'
+scp -r deploy/vps root@<VPS_IP>:/tmp/rd-vps
+ssh root@<VPS_IP> 'bash /tmp/rd-vps/install.sh /tmp/rd-vps/ci-deploy.pub'
 ```
 
 `install.sh` treats an absent `rd-migrate` as a **supported state, not a
@@ -773,7 +779,7 @@ sudo /usr/local/sbin/rd-deploy migrate backend ; echo "expect 64, got $?"
 stat -c '%U:%G %a' /usr/local/sbin/rd-migrate  ; # expect root:root 755
 
 # From a workstation, with the CI key — proves the pipeline can reach it.
-ssh -i ci-deploy deploy@<host> 'migrate backend'   # expect 64 from rd-entry
+ssh -i ci-deploy <DEPLOY_USER>@<VPS_IP> 'migrate backend'  # expect 64 from rd-entry
 ```
 
 **Do not "test" it with a bare `sudo rd-deploy migrate`.** With nothing pending
