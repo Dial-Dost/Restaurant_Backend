@@ -32,43 +32,36 @@ FROM --platform=linux/amd64 node:22-bookworm-slim AS builder
 WORKDIR /build
 
 # ---------------------------------------------------------------------------
-# WHY THERE IS NO libvips-dev HERE, AND WHY THIS ENV VAR IS NOT OPTIONAL
+# WHY THERE IS NO libvips HERE, IN EITHER STAGE
 # ---------------------------------------------------------------------------
-# sharp is pinned at ^0.32.1 and resolves to 0.32.6 — the pre-0.33 line, which
-# still has the "use the globally-installed libvips if you find one" install
-# path. Its install script is:
+# sharp is pinned at ^0.35.5, and from 0.33 onwards sharp ships its own libvips
+# as ordinary npm packages (@img/sharp-linux-x64 plus its
+# @img/sharp-libvips-linux-x64, both recorded in package-lock.json). It has NO
+# install script: nothing is downloaded and nothing is compiled at install time,
+# and the addon links its own libvips by RPATH. That makes the artifact
+# base-image independent — identical bytes work on the Debian realtime target and
+# on the Amazon Linux 2023 lambda target.
 #
-#   (node install/libvips && node install/dll-copy && prebuild-install)
-#     || (node install/can-compile && node-gyp rebuild && node install/dll-copy)
+# Base-image independence is the whole point here, because `sharp` is a STATIC
+# top-level import (database_supabase.ts:28), reached from lambda.ts -> index.ts.
+# A sharp that cannot load its libvips throws during module evaluation, so EVERY
+# HTTP invocation 502s before a single route is reachable. /socket.io/*, /print/*
+# and /publish/* are served by Fargate, so printing would keep working and the
+# outage would look partial rather than total.
 #
-# node_modules/sharp/install/libvips.js calls libvips.useGlobalLibvips(); when a
-# global libvips is present it logs "Building from source via node-gyp" and
-# process.exit(1)s, so npm takes the `||` branch and node-gyp links sharp.node
-# DYNAMICALLY against THIS builder's /usr/lib/x86_64-linux-gnu/libvips.so.42.
+# DO NOT ADD libvips-dev BACK. Modern sharp ignores a system libvips unless
+# SHARP_FORCE_GLOBAL_LIBVIPS is set, so the package would cost build time and
+# image size and change nothing. The SHARP_IGNORE_GLOBAL_LIBVIPS=1 that used to
+# be set here existed for sharp 0.32's "use the global libvips if you find one"
+# install path. That path is gone, so the variable is a no-op — which is why it
+# was removed rather than kept "just in case".
 #
-# That binary then travels inside node_modules into BOTH targets. The realtime
-# target is Debian and would survive it. The lambda target is Amazon Linux 2023,
-# which has no libvips and no vips package in its default repos — and `sharp` is
-# a STATIC top-level import (database_supabase.ts:27), reached from
-# lambda.ts -> index.ts, so the container throws
-# "libvips.so.42: cannot open shared object file" during module evaluation and
-# EVERY HTTP invocation 502s before a single route is reachable. Because
-# /socket.io/*, /print/* and /publish/* are served by Fargate, printing keeps
-# working and the outage looks partial rather than total.
+# sharp is also a plain `dependency` now, not an `optionalDependency`. npm treats
+# a failed optional install as success, so the previous declaration meant a sharp
+# that did not install produced a GREEN install and then a build that died on
+# `Cannot find module 'sharp'` — which is exactly what happened on 2026-11-08.
 #
-# SHARP_IGNORE_GLOBAL_LIBVIPS=1 makes useGlobalLibvips() return false
-# (node_modules/sharp/lib/libvips.js:114-116). sharp then fetches its own
-# self-contained libvips into node_modules/sharp/vendor/ plus the matching
-# prebuilt sharp.node, which links to it by RPATH. That artifact is base-image
-# independent: identical bytes work on AL2023 and on Debian. It must be set
-# BEFORE `npm ci`, because the install script is what reads it.
-#
-# The toolchain below stays for the `||` fallback (and for @node-rs/argon2). With
-# the flag set, that fallback compiles against the vendored headers under
-# node_modules/sharp/vendor/, which — unlike the global path — does not shell out
-# to pkg-config (see node_modules/sharp/binding.gyp, the
-# `use_global_libvips == "true"` condition), so pkg-config is not needed either.
-ENV SHARP_IGNORE_GLOBAL_LIBVIPS=1
+# The toolchain below stays for @node-rs/argon2.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential python3 make g++ \
@@ -140,9 +133,10 @@ COPY --from=builder /build/eng.traineddata   ${LAMBDA_TASK_ROOT}/eng.traineddata
 # request path must never carry the ability to run DDL.
 
 # Prove, at BUILD time and on the real Amazon Linux 2023 base, that the native
-# addon actually loads. This is the check that would have caught the libvips
-# blocker: without SHARP_IGNORE_GLOBAL_LIBVIPS in the builder, this line fails
-# here instead of 502ing every request after the stack is paid for.
+# addon actually loads. This is the check that catches a sharp whose libvips does
+# not travel: it fails HERE instead of 502ing every request after the stack is
+# paid for. Keep it even though the prebuilt packages make that unlikely — it
+# costs one second and it is the only thing that tests the runtime base.
 #
 # Dynamic import, not `require`: package.json carries "type": "module", and this
 # way the check is correct whether `node -e` evaluates as CJS or ESM.
@@ -168,12 +162,11 @@ WORKDIR /app
 
 # curl, for the container healthcheck below.
 #
-# No libvips package here either, and that is deliberate: with
-# SHARP_IGNORE_GLOBAL_LIBVIPS=1 in the builder, sharp carries its own libvips in
-# node_modules/sharp/vendor/ and resolves it by RPATH, so a system libvips would
-# be ignored at runtime while still adding ~50 MB and a second copy to patch. The
-# two targets now share one sharp artifact instead of accidentally shipping a
-# Debian-linked binary to an Amazon Linux runtime.
+# No libvips package here either, and that is deliberate: sharp carries its own
+# libvips inside @img/sharp-libvips-linux-x64 and resolves it by RPATH, so a
+# system libvips would be ignored at runtime while still adding ~50 MB and a
+# second copy to patch. The two targets share one sharp artifact instead of
+# accidentally shipping a Debian-linked binary to an Amazon Linux runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*

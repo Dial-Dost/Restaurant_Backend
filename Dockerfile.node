@@ -3,18 +3,24 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build
 # Pinned to Node 22 (current LTS, "Jod") on Debian Bookworm slim so native
-# packages like Sharp can use pre-built binaries against a stable glibc.
+# packages like sharp and @node-rs/argon2 use prebuilt binaries against a stable
+# glibc instead of compiling here.
 # ---------------------------------------------------------------------------
 FROM node:22-bookworm-slim AS builder
 WORKDIR /app
 
-# Install build tools and libvips for Sharp (native image processing)
+# Build tools for @node-rs/argon2. NOT libvips: sharp >= 0.33 ships its own as
+# ordinary npm packages (@img/sharp-linux-x64 + @img/sharp-libvips-linux-x64,
+# both recorded in package-lock.json), installs with no download and no compile
+# step, and IGNORES a system libvips unless SHARP_FORCE_GLOBAL_LIBVIPS is set.
+# libvips-dev used to be here for sharp 0.32, which preferred a global libvips
+# and linked against it. That install path no longer exists, so the package would
+# only cost build time and image size. Do not add it back.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3 \
     make \
     g++ \
-    libvips-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package files first for layer caching.
@@ -24,6 +30,14 @@ COPY package.json package-lock.json* tsconfig.build.json tsconfig.json ./
 # Install ALL dependencies (incl. devDependencies needed for the build).
 # npm install is fallback-safe when the lockfile is absent.
 RUN npm install
+
+# Prove the native addon actually LOADS before anything is shipped. `npm run
+# build` below already fails when sharp is missing from node_modules, but a sharp
+# that installed and cannot load its libvips would type-check fine and then throw
+# during module evaluation at boot — and because `sharp` is a static top-level
+# import (database_supabase.ts:28) that takes the whole server down, not just
+# image processing. Dynamic import, not require: package.json is "type": "module".
+RUN node -e "import('sharp').then((m) => console.log('sharp ok, libvips ' + m.default.versions.vips)).catch((e) => { console.error(e); process.exit(1); })"
 
 # Copy source and build the TypeScript code (tsc -> build/index.js)
 COPY . .
@@ -40,9 +54,12 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
-# Runtime libs: libvips for Sharp, curl for the container HEALTHCHECK.
+# curl, for the container HEALTHCHECK. NOT libvips: sharp carries its own inside
+# @img/sharp-libvips-linux-x64 and resolves it by RPATH, so a system libvips is
+# ignored at runtime while still adding ~50 MB and a second copy to patch. The
+# builder's `import('sharp')` check above is the proof — it runs in a stage with
+# no system libvips at all, so a green build means this stage does not need one.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libvips \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
